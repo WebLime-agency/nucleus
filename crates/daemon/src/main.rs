@@ -3366,8 +3366,7 @@ mod tests {
     #[tokio::test]
     async fn resolves_route_targets_from_cached_runtimes_when_creating_sessions() {
         let state_dir = test_state_dir("session-target-cache");
-        let store =
-            Arc::new(StateStore::initialize_at(&state_dir).expect("store should initialize"));
+        let store = initialize_test_store(&state_dir);
         let (events, _) = broadcast::channel(4);
         let runtimes = Arc::new(RuntimeManager::default());
         runtimes
@@ -3423,8 +3422,7 @@ mod tests {
     async fn creates_sessions_from_cached_default_provider_without_forcing_runtime_refresh() {
         let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
         let state_dir = test_state_dir("create-session-cache");
-        let store =
-            Arc::new(StateStore::initialize_at(&state_dir).expect("store should initialize"));
+        let store = initialize_test_store(&state_dir);
         store
             .update_workspace(None, None, Some("provider:claude"), None)
             .expect("workspace target should update");
@@ -3484,8 +3482,7 @@ mod tests {
     async fn creates_sessions_from_default_workspace_profile() {
         let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
         let state_dir = test_state_dir("create-session-default-profile");
-        let store =
-            Arc::new(StateStore::initialize_at(&state_dir).expect("store should initialize"));
+        let store = initialize_test_store(&state_dir);
 
         let (events, _) = broadcast::channel(4);
         let runtimes = Arc::new(RuntimeManager::default());
@@ -3543,8 +3540,7 @@ mod tests {
     #[tokio::test]
     async fn creates_sessions_from_openai_compatible_workspace_profiles() {
         let state_dir = test_state_dir("create-session-openai-profile");
-        let store =
-            Arc::new(StateStore::initialize_at(&state_dir).expect("store should initialize"));
+        let store = initialize_test_store(&state_dir);
         store
             .create_workspace_profile(nucleus_storage::WorkspaceProfilePatch {
                 title: "Gateway".to_string(),
@@ -3611,8 +3607,7 @@ mod tests {
     async fn resolves_direct_prompt_targets_from_cached_runtime_without_forcing_refresh() {
         let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
         let state_dir = test_state_dir("prompt-target-direct-cache");
-        let store =
-            Arc::new(StateStore::initialize_at(&state_dir).expect("store should initialize"));
+        let store = initialize_test_store(&state_dir);
         let (events, _) = broadcast::channel(4);
         let runtimes = Arc::new(RuntimeManager::default());
         runtimes
@@ -3697,8 +3692,7 @@ mod tests {
     async fn resolves_route_prompt_targets_from_cached_runtime_without_forcing_refresh() {
         let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
         let state_dir = test_state_dir("prompt-target-route-cache");
-        let store =
-            Arc::new(StateStore::initialize_at(&state_dir).expect("store should initialize"));
+        let store = initialize_test_store(&state_dir);
         let (events, _) = broadcast::channel(4);
         let runtimes = Arc::new(RuntimeManager::default());
         runtimes
@@ -3784,6 +3778,27 @@ mod tests {
             .expect("time should be monotonic")
             .as_nanos();
         std::env::temp_dir().join(format!("nucleus-{label}-{}-{suffix}", std::process::id()))
+    }
+
+    fn initialize_test_store(state_dir: &std::path::Path) -> Arc<StateStore> {
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace root should exist");
+
+        let store =
+            Arc::new(StateStore::initialize_at(state_dir).expect("store should initialize"));
+        store
+            .update_workspace(
+                Some(
+                    workspace_root
+                        .to_str()
+                        .expect("workspace root should serialize as utf-8"),
+                ),
+                None,
+                None,
+                None,
+            )
+            .expect("workspace root should update");
+        store
     }
 
     fn test_instance_runtime() -> InstanceRuntime {
