@@ -1,15 +1,18 @@
 use std::{
-    fs,
+    collections::HashSet,
+    env, fs,
     path::{Path, PathBuf},
     process::Stdio,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use futures_util::StreamExt;
 use nucleus_core::AdapterKind;
-use nucleus_protocol::{RuntimeSummary, SessionSummary, SessionTurnImage};
+use nucleus_protocol::{RuntimeSummary, SessionSummary, SessionTurn, SessionTurnImage};
+use reqwest::header::AUTHORIZATION;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, BufReader},
     process::Command,
@@ -79,6 +82,7 @@ impl RuntimeManager {
     pub async fn execute_prompt_stream(
         &self,
         session: &SessionSummary,
+        history: &[SessionTurn],
         prompt: &str,
         images: &[SessionTurnImage],
         events: mpsc::UnboundedSender<PromptStreamEvent>,
@@ -89,6 +93,9 @@ impl RuntimeManager {
         match runtime {
             AdapterKind::Claude => execute_claude_prompt(session, prompt, images, events).await,
             AdapterKind::Codex => execute_codex_prompt(session, prompt, images, events).await,
+            AdapterKind::OpenAiCompatible => {
+                execute_openai_compatible_prompt(session, history, prompt, images, events).await
+            }
             AdapterKind::System => bail!(
                 "provider '{}' does not support daemon-managed prompting yet",
                 session.provider
@@ -115,6 +122,7 @@ async fn probe_runtimes(base_runtimes: Vec<RuntimeSummary>) -> Vec<RuntimeSummar
         let next = match AdapterKind::parse(&runtime.id) {
             Some(AdapterKind::Claude) => probe_claude_runtime(runtime).await,
             Some(AdapterKind::Codex) => probe_codex_runtime(runtime).await,
+            Some(AdapterKind::OpenAiCompatible) => runtime,
             Some(AdapterKind::System) => probe_system_runtime(runtime),
             None => runtime,
         };
@@ -457,6 +465,238 @@ async fn execute_codex_prompt_stream(
     })
 }
 
+async fn execute_openai_compatible_prompt(
+    session: &SessionSummary,
+    history: &[SessionTurn],
+    prompt: &str,
+    images: &[SessionTurnImage],
+    events: mpsc::UnboundedSender<PromptStreamEvent>,
+) -> Result<ProviderTurnResult> {
+    validate_working_directory(&session.working_dir)?;
+
+    let base_url = session.provider_base_url.trim().trim_end_matches('/');
+    if base_url.is_empty() {
+        bail!("OpenAI-compatible sessions require a base URL");
+    }
+
+    if session.model.trim().is_empty() {
+        bail!("OpenAI-compatible sessions require a model name");
+    }
+
+    let url = format!("{base_url}/chat/completions");
+    let client = reqwest::Client::builder()
+        .timeout(PROMPT_TIMEOUT)
+        .build()
+        .context("failed to build OpenAI-compatible HTTP client")?;
+
+    let mut request = client.post(url).json(&json!({
+        "model": session.model,
+        "stream": true,
+        "messages": build_openai_messages(history, prompt, images),
+    }));
+
+    if !session.provider_api_key.trim().is_empty() {
+        request = request.header(
+            AUTHORIZATION,
+            format!("Bearer {}", session.provider_api_key.trim()),
+        );
+    }
+
+    let response = request
+        .send()
+        .await
+        .context("failed to reach the OpenAI-compatible endpoint")?;
+    let status = response.status();
+
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let detail = if body.trim().is_empty() {
+            format!("HTTP {}", status.as_u16())
+        } else {
+            truncate(body, 200)
+        };
+        bail!("OpenAI-compatible endpoint failed: {detail}");
+    }
+
+    let mut provider_session_id = String::new();
+    let mut content = String::new();
+    let mut pending = String::new();
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.context("failed while reading the response stream")?;
+        pending.push_str(
+            std::str::from_utf8(&bytes).context("OpenAI-compatible stream was not valid UTF-8")?,
+        );
+
+        while let Some(index) = pending.find('\n') {
+            let line = pending[..index].trim().trim_end_matches('\r').to_string();
+            pending = pending[index + 1..].to_string();
+
+            if line.is_empty() || !line.starts_with("data:") {
+                continue;
+            }
+
+            let payload = line["data:".len()..].trim();
+            if payload == "[DONE]" {
+                continue;
+            }
+
+            let chunk = serde_json::from_str::<OpenAiStreamChunk>(payload)
+                .with_context(|| "failed to decode OpenAI-compatible stream chunk".to_string())?;
+
+            if provider_session_id.is_empty() {
+                provider_session_id = chunk.id.clone().unwrap_or_default();
+            }
+
+            for choice in chunk.choices {
+                if let Some(reasoning) = choice.delta.reasoning_text() {
+                    let _ = events.send(PromptStreamEvent::ReasoningSnapshot { text: reasoning });
+                }
+
+                if let Some(delta) = choice.delta.content.or(choice.message.and_then(|m| m.content)) {
+                    content.push_str(&delta);
+                    let _ = events.send(PromptStreamEvent::AssistantChunk { text: delta });
+                }
+            }
+        }
+    }
+
+    if !pending.trim().is_empty() {
+        let payload = pending.trim().trim_start_matches("data:").trim();
+        if payload != "[DONE]" {
+            let chunk = serde_json::from_str::<OpenAiStreamChunk>(payload)
+                .with_context(|| "failed to decode trailing OpenAI-compatible chunk".to_string())?;
+            if provider_session_id.is_empty() {
+                provider_session_id = chunk.id.unwrap_or_default();
+            }
+            for choice in chunk.choices {
+                if let Some(reasoning) = choice.delta.reasoning_text() {
+                    let _ = events.send(PromptStreamEvent::ReasoningSnapshot { text: reasoning });
+                }
+                if let Some(delta) = choice.delta.content.or(choice.message.and_then(|m| m.content)) {
+                    content.push_str(&delta);
+                    let _ = events.send(PromptStreamEvent::AssistantChunk { text: delta });
+                }
+            }
+        }
+    }
+
+    let content = content.trim().to_string();
+    if content.is_empty() {
+        bail!("OpenAI-compatible endpoint returned an empty response.");
+    }
+
+    Ok(ProviderTurnResult {
+        provider_session_id,
+        content,
+    })
+}
+
+fn build_openai_messages(
+    history: &[SessionTurn],
+    prompt: &str,
+    images: &[SessionTurnImage],
+) -> Vec<Value> {
+    let mut messages = Vec::new();
+
+    for turn in history {
+        if !matches!(turn.role.as_str(), "user" | "assistant" | "system") {
+            continue;
+        }
+
+        messages.push(json!({
+            "role": turn.role,
+            "content": openai_message_content(&turn.content, &turn.images),
+        }));
+    }
+
+    messages.push(json!({
+        "role": "user",
+        "content": openai_message_content(prompt, images),
+    }));
+
+    messages
+}
+
+fn openai_message_content(text: &str, images: &[SessionTurnImage]) -> Value {
+    if images.is_empty() {
+        return Value::String(text.to_string());
+    }
+
+    let caption = if text.trim().is_empty() {
+        if images.len() == 1 {
+            "Review the attached image and respond with the most useful analysis.".to_string()
+        } else {
+            format!(
+                "Review the {} attached images and respond with the most useful analysis.",
+                images.len()
+            )
+        }
+    } else {
+        text.to_string()
+    };
+
+    let mut parts = vec![json!({
+        "type": "text",
+        "text": caption,
+    })];
+
+    for image in images {
+        parts.push(json!({
+            "type": "image_url",
+            "image_url": {
+                "url": image.data_url,
+            },
+        }));
+    }
+
+    Value::Array(parts)
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamChunk {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    choices: Vec<OpenAiChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiChoice {
+    #[serde(default)]
+    delta: OpenAiDelta,
+    #[serde(default)]
+    message: Option<OpenAiMessage>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenAiDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+}
+
+impl OpenAiDelta {
+    fn reasoning_text(&self) -> Option<String> {
+        self.reasoning
+            .as_deref()
+            .or(self.reasoning_content.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiMessage {
+    #[serde(default)]
+    content: Option<String>,
+}
+
 async fn claude_auth_state() -> Result<ClaudeAuthStatus> {
     let stdout = command_stdout("claude", &["auth", "status"], None, PROBE_TIMEOUT).await?;
     serde_json::from_str::<ClaudeAuthStatus>(&stdout).context("failed to decode Claude auth status")
@@ -478,10 +718,7 @@ async fn codex_auth_state() -> Result<String> {
 }
 
 async fn which(command: &str) -> Option<String> {
-    command_stdout("which", &[command], None, PROBE_TIMEOUT)
-        .await
-        .ok()
-        .filter(|value| !value.is_empty())
+    resolve_command_path(command).map(|path| path.display().to_string())
 }
 
 async fn command_stdout(
@@ -500,12 +737,17 @@ async fn run_command(
     cwd: Option<&str>,
     timeout_window: Duration,
 ) -> Result<CommandOutput> {
-    let mut child = Command::new(command);
+    let resolved_command = resolve_command_path(command).unwrap_or_else(|| PathBuf::from(command));
+    let mut child = Command::new(&resolved_command);
     child
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    if let Some(path) = augmented_path_env() {
+        child.env("PATH", path);
+    }
 
     if let Some(path) = cwd {
         child.current_dir(path);
@@ -548,6 +790,101 @@ async fn run_command(
     }
 
     Ok(CommandOutput { stdout, stderr })
+}
+
+fn resolve_command_path(command: &str) -> Option<PathBuf> {
+    let candidate = PathBuf::from(command);
+    if candidate.is_absolute() || command.contains(std::path::MAIN_SEPARATOR) {
+        return is_executable_file(&candidate).then_some(candidate);
+    }
+
+    runtime_search_paths().into_iter().find_map(|directory| {
+        let candidate = directory.join(command);
+        is_executable_file(&candidate).then_some(candidate)
+    })
+}
+
+fn augmented_path_env() -> Option<std::ffi::OsString> {
+    let paths = runtime_search_paths();
+    if paths.is_empty() {
+        return None;
+    }
+
+    env::join_paths(paths).ok()
+}
+
+fn runtime_search_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(current) = env::var_os("PATH") {
+        for path in env::split_paths(&current) {
+            push_unique_path(&mut paths, &mut seen, path);
+        }
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        for suffix in [
+            ".local/bin",
+            ".cargo/bin",
+            ".bun/bin",
+            ".asdf/shims",
+            ".npm-global/bin",
+            ".volta/bin",
+            "bin",
+        ] {
+            push_unique_path(&mut paths, &mut seen, home.join(suffix));
+        }
+
+        let nvm_root = home.join(".nvm/versions/node");
+        let mut node_bins = fs::read_dir(&nvm_root)
+            .ok()
+            .into_iter()
+            .flat_map(|entries| entries.filter_map(Result::ok))
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .map(|path| path.join("bin"))
+            .collect::<Vec<_>>();
+        node_bins.sort();
+        node_bins.reverse();
+
+        for path in node_bins {
+            push_unique_path(&mut paths, &mut seen, path);
+        }
+    }
+
+    paths
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, path: PathBuf) {
+    if path.as_os_str().is_empty() || !path.is_dir() {
+        return;
+    }
+
+    if seen.insert(path.clone()) {
+        paths.push(path);
+    }
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+
+    if !metadata.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 async fn run_json_stream_command<F>(
@@ -860,6 +1197,14 @@ struct CommandOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        env,
+        fs,
+        sync::Mutex,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn parses_codex_jsonl_output() {
@@ -876,5 +1221,68 @@ mod tests {
     fn rejects_empty_codex_output() {
         let error = parse_codex_output("{}").expect_err("missing message should fail");
         assert!(error.to_string().contains("empty response"));
+    }
+
+    #[tokio::test]
+    async fn command_stdout_uses_augmented_home_paths() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let root = test_dir("runtime-path");
+        let home = root.join("home");
+        let local_bin = home.join(".local/bin");
+        let script = local_bin.join("mocktool");
+
+        fs::create_dir_all(&local_bin).expect("local bin should exist");
+        fs::write(&script, "#!/bin/sh\necho nucleus-runtime-ok\n")
+            .expect("mock tool should write");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script)
+                .expect("script metadata should load")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).expect("script should be executable");
+        }
+
+        let original_home = env::var_os("HOME");
+        let original_path = env::var_os("PATH");
+        unsafe {
+            env::set_var("HOME", &home);
+            env::set_var("PATH", "/usr/bin:/bin");
+        }
+
+        let output = command_stdout("mocktool", &[], None, PROBE_TIMEOUT)
+            .await
+            .expect("augmented runtime path should find mocktool");
+
+        match original_home {
+            Some(value) => unsafe {
+                env::set_var("HOME", value);
+            },
+            None => unsafe {
+                env::remove_var("HOME");
+            },
+        }
+        match original_path {
+            Some(value) => unsafe {
+                env::set_var("PATH", value);
+            },
+            None => unsafe {
+                env::remove_var("PATH");
+            },
+        }
+
+        assert_eq!(output.trim(), "nucleus-runtime-ok");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn test_dir(label: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        env::temp_dir().join(format!("nucleus-runtime-{label}-{}-{suffix}", std::process::id()))
     }
 }

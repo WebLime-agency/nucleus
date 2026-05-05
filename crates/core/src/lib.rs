@@ -7,17 +7,19 @@ pub const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:42240";
 pub enum AdapterKind {
     Claude,
     Codex,
+    OpenAiCompatible,
     System,
 }
 
 impl AdapterKind {
-    pub const ALL: [AdapterKind; 3] =
+    pub const RUNTIME_PROBE_ALL: [AdapterKind; 3] =
         [AdapterKind::Claude, AdapterKind::Codex, AdapterKind::System];
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
+            "openai_compatible" => Some(Self::OpenAiCompatible),
             "system" => Some(Self::System),
             _ => None,
         }
@@ -27,6 +29,7 @@ impl AdapterKind {
         match self {
             AdapterKind::Claude => "claude",
             AdapterKind::Codex => "codex",
+            AdapterKind::OpenAiCompatible => "openai_compatible",
             AdapterKind::System => "system",
         }
     }
@@ -35,6 +38,7 @@ impl AdapterKind {
         match self {
             AdapterKind::Claude => "Anthropic Claude session adapter",
             AdapterKind::Codex => "OpenAI Codex session adapter",
+            AdapterKind::OpenAiCompatible => "OpenAI-compatible HTTP session adapter",
             AdapterKind::System => "Host automation and observability adapter",
         }
     }
@@ -43,16 +47,23 @@ impl AdapterKind {
         match self {
             AdapterKind::Claude => "sonnet",
             AdapterKind::Codex => "",
+            AdapterKind::OpenAiCompatible => "",
             AdapterKind::System => "",
         }
     }
 
     pub fn supports_sessions(self) -> bool {
-        matches!(self, AdapterKind::Claude | AdapterKind::Codex)
+        matches!(
+            self,
+            AdapterKind::Claude | AdapterKind::Codex | AdapterKind::OpenAiCompatible
+        )
     }
 
     pub fn supports_prompting(self) -> bool {
-        matches!(self, AdapterKind::Claude | AdapterKind::Codex)
+        matches!(
+            self,
+            AdapterKind::Claude | AdapterKind::Codex | AdapterKind::OpenAiCompatible
+        )
     }
 }
 

@@ -10,7 +10,7 @@ use nucleus_core::{AdapterKind, PRODUCT_SLUG};
 use nucleus_protocol::{
     AuditEvent, ProjectSummary, RouteTarget, RouterProfileSummary, RuntimeSummary, SessionDetail,
     SessionProjectSummary, SessionSummary, SessionTurn, SessionTurnImage, StorageSummary,
-    WorkspaceSummary,
+    WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
@@ -35,6 +35,8 @@ pub struct StoragePlan {
 pub struct SessionRecord {
     pub id: String,
     pub title: String,
+    pub profile_id: String,
+    pub profile_title: String,
     pub route_id: String,
     pub route_title: String,
     pub scope: String,
@@ -44,6 +46,8 @@ pub struct SessionRecord {
     pub project_ids: Vec<String>,
     pub provider: String,
     pub model: String,
+    pub provider_base_url: String,
+    pub provider_api_key: String,
     pub working_dir: String,
     pub working_dir_kind: String,
 }
@@ -51,6 +55,8 @@ pub struct SessionRecord {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionPatch {
     pub title: Option<String>,
+    pub profile_id: Option<String>,
+    pub profile_title: Option<String>,
     pub route_id: Option<String>,
     pub route_title: Option<String>,
     pub scope: Option<String>,
@@ -60,6 +66,8 @@ pub struct SessionPatch {
     pub project_ids: Option<Vec<String>>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub provider_base_url: Option<String>,
+    pub provider_api_key: Option<String>,
     pub working_dir: Option<String>,
     pub working_dir_kind: Option<String>,
     pub state: Option<String>,
@@ -70,6 +78,14 @@ pub struct SessionPatch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectPatch {
     pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceProfilePatch {
+    pub title: String,
+    pub main: WorkspaceModelConfig,
+    pub utility: WorkspaceModelConfig,
+    pub is_default: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +195,8 @@ impl StateStore {
         seed_runtimes(&connection)?;
         seed_router_profiles(&connection)?;
         seed_workspace_settings(&connection)?;
+        seed_workspace_profiles(&connection)?;
+        migrate_legacy_workspace_targets(&connection)?;
         ensure_local_auth_token_with_connection(&plan, &connection)?;
         sync_projects_with_connection(&connection)?;
 
@@ -265,12 +283,16 @@ impl StateStore {
     pub fn update_workspace(
         &self,
         root_path: Option<&str>,
+        default_profile_id: Option<&str>,
         main_target: Option<&str>,
         utility_target: Option<&str>,
     ) -> Result<WorkspaceSummary> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         if let Some(root_path) = root_path {
             set_workspace_root(&connection, root_path)?;
+        }
+        if let Some(default_profile_id) = default_profile_id {
+            set_workspace_default_profile_id(&connection, default_profile_id)?;
         }
         if let Some(main_target) = main_target {
             set_workspace_main_target(&connection, main_target)?;
@@ -279,6 +301,47 @@ impl StateStore {
             set_workspace_utility_target(&connection, utility_target)?;
         }
         sync_projects_with_connection(&connection)?;
+        load_workspace_summary(&connection)
+    }
+
+    pub fn create_workspace_profile(
+        &self,
+        patch: WorkspaceProfilePatch,
+    ) -> Result<WorkspaceProfileSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let profile_id = create_workspace_profile_with_connection(&connection, &patch)?;
+
+        if patch.is_default {
+            set_workspace_default_profile_id(&connection, &profile_id)?;
+        }
+
+        load_workspace_profile_summary(&connection, &profile_id)
+    }
+
+    pub fn update_workspace_profile(
+        &self,
+        profile_id: &str,
+        patch: WorkspaceProfilePatch,
+    ) -> Result<WorkspaceProfileSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        update_workspace_profile_with_connection(&connection, profile_id, &patch)?;
+
+        if patch.is_default {
+            set_workspace_default_profile_id(&connection, profile_id)?;
+        } else if workspace_default_profile_id_optional(&connection)?
+            .as_deref()
+            .is_some_and(|current| current == profile_id)
+        {
+            set_workspace_default_profile_id(&connection, profile_id)?;
+        }
+
+        load_workspace_profile_summary(&connection, profile_id)
+    }
+
+    pub fn delete_workspace_profile(&self, profile_id: &str) -> Result<WorkspaceSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        delete_workspace_profile_with_connection(&connection, profile_id)?;
+        ensure_workspace_default_profile(&connection)?;
         load_workspace_summary(&connection)
     }
 
@@ -351,6 +414,8 @@ impl StateStore {
             INSERT INTO sessions (
                 id,
                 title,
+                profile_id,
+                profile_title,
                 route_id,
                 route_title,
                 scope,
@@ -359,6 +424,8 @@ impl StateStore {
                 project_path,
                 provider,
                 model,
+                provider_base_url,
+                provider_api_key,
                 working_dir,
                 working_dir_kind,
                 state,
@@ -367,11 +434,13 @@ impl StateStore {
                 last_message_excerpt,
                 turn_count
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'active', '', '', '', 0)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'active', '', '', '', 0)
             ",
             params![
                 record.id,
                 record.title,
+                record.profile_id,
+                record.profile_title,
                 record.route_id,
                 record.route_title,
                 record.scope,
@@ -380,6 +449,8 @@ impl StateStore {
                 record.project_path,
                 record.provider,
                 record.model,
+                record.provider_base_url,
+                record.provider_api_key,
                 record.working_dir,
                 record.working_dir_kind,
             ],
@@ -399,6 +470,8 @@ impl StateStore {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         let current = load_session_summary(&connection, session_id)?;
         let next_title = patch.title.unwrap_or(current.title);
+        let next_profile_id = patch.profile_id.unwrap_or(current.profile_id);
+        let next_profile_title = patch.profile_title.unwrap_or(current.profile_title);
         let next_route_id = patch.route_id.unwrap_or(current.route_id);
         let next_route_title = patch.route_title.unwrap_or(current.route_title);
         let next_scope = patch.scope.unwrap_or(current.scope);
@@ -407,6 +480,10 @@ impl StateStore {
         let next_project_path = patch.project_path.unwrap_or(current.project_path);
         let next_provider = patch.provider.unwrap_or(current.provider);
         let next_model = patch.model.unwrap_or(current.model);
+        let next_provider_base_url =
+            patch.provider_base_url.unwrap_or(current.provider_base_url);
+        let next_provider_api_key =
+            patch.provider_api_key.unwrap_or(current.provider_api_key);
         let next_working_dir = patch.working_dir.unwrap_or(current.working_dir);
         let next_working_dir_kind = patch.working_dir_kind.unwrap_or(current.working_dir_kind);
         let next_state = patch.state.unwrap_or(current.state);
@@ -420,25 +497,31 @@ impl StateStore {
             UPDATE sessions
             SET
                 title = ?2,
-                route_id = ?3,
-                route_title = ?4,
-                scope = ?5,
-                project_id = ?6,
-                project_title = ?7,
-                project_path = ?8,
-                provider = ?9,
-                model = ?10,
-                working_dir = ?11,
-                working_dir_kind = ?12,
-                state = ?13,
-                provider_session_id = ?14,
-                last_error = ?15,
+                profile_id = ?3,
+                profile_title = ?4,
+                route_id = ?5,
+                route_title = ?6,
+                scope = ?7,
+                project_id = ?8,
+                project_title = ?9,
+                project_path = ?10,
+                provider = ?11,
+                model = ?12,
+                provider_base_url = ?13,
+                provider_api_key = ?14,
+                working_dir = ?15,
+                working_dir_kind = ?16,
+                state = ?17,
+                provider_session_id = ?18,
+                last_error = ?19,
                 updated_at = unixepoch()
             WHERE id = ?1
             ",
             params![
                 session_id,
                 next_title,
+                next_profile_id,
+                next_profile_title,
                 next_route_id,
                 next_route_title,
                 next_scope,
@@ -447,6 +530,8 @@ impl StateStore {
                 next_project_path,
                 next_provider,
                 next_model,
+                next_provider_base_url,
+                next_provider_api_key,
                 next_working_dir,
                 next_working_dir_kind,
                 next_state,
@@ -624,6 +709,8 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
+            profile_id TEXT NOT NULL DEFAULT '',
+            profile_title TEXT NOT NULL DEFAULT '',
             route_id TEXT NOT NULL DEFAULT '',
             route_title TEXT NOT NULL DEFAULT '',
             scope TEXT NOT NULL DEFAULT 'ad_hoc',
@@ -632,6 +719,8 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             project_path TEXT NOT NULL DEFAULT '',
             provider TEXT NOT NULL,
             model TEXT NOT NULL DEFAULT '',
+            provider_base_url TEXT NOT NULL DEFAULT '',
+            provider_api_key TEXT NOT NULL DEFAULT '',
             working_dir TEXT NOT NULL DEFAULT '',
             working_dir_kind TEXT NOT NULL DEFAULT 'workspace_scratch',
             state TEXT NOT NULL,
@@ -703,9 +792,30 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
+
+        CREATE TABLE IF NOT EXISTS workspace_profiles (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            main_model_json TEXT NOT NULL,
+            utility_model_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
         ",
     )?;
 
+    ensure_column(
+        connection,
+        "sessions",
+        "profile_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "sessions",
+        "profile_title",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
     ensure_column(
         connection,
         "sessions",
@@ -743,6 +853,18 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "TEXT NOT NULL DEFAULT ''",
     )?;
     ensure_column(connection, "sessions", "model", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(
+        connection,
+        "sessions",
+        "provider_base_url",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "sessions",
+        "provider_api_key",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
     ensure_column(
         connection,
         "sessions",
@@ -808,7 +930,7 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
 }
 
 fn seed_runtimes(connection: &Connection) -> Result<()> {
-    for adapter in AdapterKind::ALL {
+    for adapter in AdapterKind::RUNTIME_PROBE_ALL {
         connection.execute(
             "
             INSERT INTO runtimes (id, summary, state)
@@ -820,6 +942,16 @@ fn seed_runtimes(connection: &Connection) -> Result<()> {
             params![adapter.as_str(), adapter.summary()],
         )?;
     }
+
+    let runtime_ids = AdapterKind::RUNTIME_PROBE_ALL
+        .iter()
+        .map(|adapter| format!("'{}'", adapter.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    connection.execute(
+        &format!("DELETE FROM runtimes WHERE id NOT IN ({runtime_ids})"),
+        [],
+    )?;
 
     Ok(())
 }
@@ -896,6 +1028,125 @@ fn seed_workspace_settings(connection: &Connection) -> Result<()> {
         ",
         [],
     )?;
+    connection.execute(
+        "
+        INSERT INTO app_settings (key, value)
+        VALUES ('workspace_default_profile_id', 'default')
+        ON CONFLICT(key) DO NOTHING
+        ",
+        [],
+    )?;
+
+    Ok(())
+}
+
+fn seed_workspace_profiles(connection: &Connection) -> Result<()> {
+    let profiles = [
+        (
+            "default",
+            "Default",
+            WorkspaceModelConfig {
+                adapter: "claude".to_string(),
+                model: "sonnet".to_string(),
+                base_url: String::new(),
+                api_key: String::new(),
+            },
+            WorkspaceModelConfig {
+                adapter: "codex".to_string(),
+                model: String::new(),
+                base_url: String::new(),
+                api_key: String::new(),
+            },
+        ),
+        (
+            "researcher",
+            "Researcher",
+            WorkspaceModelConfig {
+                adapter: "claude".to_string(),
+                model: "sonnet".to_string(),
+                base_url: String::new(),
+                api_key: String::new(),
+            },
+            WorkspaceModelConfig {
+                adapter: "claude".to_string(),
+                model: "sonnet".to_string(),
+                base_url: String::new(),
+                api_key: String::new(),
+            },
+        ),
+        (
+            "developer",
+            "Developer",
+            WorkspaceModelConfig {
+                adapter: "codex".to_string(),
+                model: "gpt-5.4".to_string(),
+                base_url: String::new(),
+                api_key: String::new(),
+            },
+            WorkspaceModelConfig {
+                adapter: "codex".to_string(),
+                model: String::new(),
+                base_url: String::new(),
+                api_key: String::new(),
+            },
+        ),
+    ];
+
+    for (id, title, main, utility) in profiles {
+        connection.execute(
+            "
+            INSERT INTO workspace_profiles (id, title, main_model_json, utility_model_json)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                updated_at = unixepoch()
+            ",
+            params![
+                id,
+                title,
+                serde_json::to_string(&main)?,
+                serde_json::to_string(&utility)?,
+            ],
+        )?;
+    }
+
+    ensure_workspace_default_profile(connection)?;
+    Ok(())
+}
+
+fn migrate_legacy_workspace_targets(connection: &Connection) -> Result<()> {
+    if setting_value_optional(connection, "workspace_profiles_migrated")?
+        .as_deref()
+        .is_some_and(|value| value == "1")
+    {
+        return Ok(());
+    }
+
+    let default_profile_id = workspace_default_profile_id(connection)?;
+    let legacy_main = setting_value_optional(connection, "workspace_main_target")?;
+    let legacy_utility = setting_value_optional(connection, "workspace_utility_target")?;
+
+    let current = load_workspace_profile_summary(connection, &default_profile_id)?;
+    let next_main = legacy_main
+        .as_deref()
+        .and_then(|value| workspace_model_from_legacy_target(connection, value).ok())
+        .unwrap_or(current.main.clone());
+    let next_utility = legacy_utility
+        .as_deref()
+        .and_then(|value| workspace_model_from_legacy_target(connection, value).ok())
+        .unwrap_or(current.utility.clone());
+
+    update_workspace_profile_with_connection(
+        connection,
+        &default_profile_id,
+        &WorkspaceProfilePatch {
+            title: current.title,
+            main: next_main,
+            utility: next_utility,
+            is_default: true,
+        },
+    )?;
+    set_setting_value(connection, "workspace_profiles_migrated", "1")?;
 
     Ok(())
 }
@@ -961,10 +1212,13 @@ fn table_columns(connection: &Connection, table: &str) -> Result<HashSet<String>
 }
 
 fn load_workspace_summary(connection: &Connection) -> Result<WorkspaceSummary> {
+    let default_profile_id = workspace_default_profile_id(connection)?;
     Ok(WorkspaceSummary {
         root_path: workspace_root(connection)?,
+        default_profile_id: default_profile_id.clone(),
         main_target: workspace_main_target(connection)?,
         utility_target: workspace_utility_target(connection)?,
+        profiles: list_workspace_profiles_with_connection(connection, &default_profile_id)?,
         projects: list_projects_with_connection(connection)?,
     })
 }
@@ -986,6 +1240,36 @@ fn set_workspace_root(connection: &Connection, root_path: &str) -> Result<()> {
     Ok(())
 }
 
+fn workspace_default_profile_id(connection: &Connection) -> Result<String> {
+    ensure_workspace_default_profile(connection)?;
+    setting_value(connection, "workspace_default_profile_id")
+}
+
+fn workspace_default_profile_id_optional(connection: &Connection) -> Result<Option<String>> {
+    setting_value_optional(connection, "workspace_default_profile_id")
+}
+
+fn set_workspace_default_profile_id(connection: &Connection, profile_id: &str) -> Result<()> {
+    load_workspace_profile_summary(connection, profile_id)?;
+    set_setting_value(connection, "workspace_default_profile_id", profile_id)?;
+    Ok(())
+}
+
+fn ensure_workspace_default_profile(connection: &Connection) -> Result<()> {
+    let candidate = workspace_default_profile_id_optional(connection)?;
+    if let Some(profile_id) = candidate {
+        if load_workspace_profile_summary(connection, &profile_id).is_ok() {
+            return Ok(());
+        }
+    }
+
+    let fallback = list_workspace_profile_ids(connection)?
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "default".to_string());
+    set_setting_value(connection, "workspace_default_profile_id", &fallback)
+}
+
 fn workspace_main_target(connection: &Connection) -> Result<String> {
     setting_value(connection, "workspace_main_target")
 }
@@ -1000,6 +1284,248 @@ fn workspace_utility_target(connection: &Connection) -> Result<String> {
 
 fn set_workspace_utility_target(connection: &Connection, target: &str) -> Result<()> {
     set_setting_value(connection, "workspace_utility_target", target)
+}
+
+fn list_workspace_profile_ids(connection: &Connection) -> Result<Vec<String>> {
+    let mut statement =
+        connection.prepare("SELECT id FROM workspace_profiles ORDER BY created_at ASC, id ASC")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load workspace profile ids")
+}
+
+fn list_workspace_profiles_with_connection(
+    connection: &Connection,
+    default_profile_id: &str,
+) -> Result<Vec<WorkspaceProfileSummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id, title, main_model_json, utility_model_json, created_at, updated_at
+        FROM workspace_profiles
+        ORDER BY
+            CASE id
+                WHEN ?1 THEN 0
+                ELSE 1
+            END,
+            updated_at DESC,
+            created_at ASC,
+            title ASC
+        ",
+    )?;
+
+    let rows = statement.query_map(params![default_profile_id], |row| {
+        map_workspace_profile_row(row, default_profile_id)
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load workspace profiles")
+}
+
+fn load_workspace_profile_summary(
+    connection: &Connection,
+    profile_id: &str,
+) -> Result<WorkspaceProfileSummary> {
+    let default_profile_id = workspace_default_profile_id_optional(connection)?
+        .unwrap_or_else(|| "default".to_string());
+
+    connection
+        .query_row(
+            "
+            SELECT id, title, main_model_json, utility_model_json, created_at, updated_at
+            FROM workspace_profiles
+            WHERE id = ?1
+            ",
+            params![profile_id],
+            |row| map_workspace_profile_row(row, &default_profile_id),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("workspace profile '{profile_id}' was not found"))
+}
+
+fn map_workspace_profile_row(
+    row: &rusqlite::Row<'_>,
+    default_profile_id: &str,
+) -> rusqlite::Result<WorkspaceProfileSummary> {
+    let id: String = row.get(0)?;
+    let main_json: String = row.get(2)?;
+    let utility_json: String = row.get(3)?;
+    let main = decode_workspace_model_config(&main_json, 2)?;
+    let utility = decode_workspace_model_config(&utility_json, 3)?;
+
+    Ok(WorkspaceProfileSummary {
+        is_default: id == default_profile_id,
+        id,
+        title: row.get(1)?,
+        main,
+        utility,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+fn decode_workspace_model_config(
+    value: &str,
+    column_index: usize,
+) -> rusqlite::Result<WorkspaceModelConfig> {
+    serde_json::from_str::<WorkspaceModelConfig>(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column_index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+fn create_workspace_profile_with_connection(
+    connection: &Connection,
+    patch: &WorkspaceProfilePatch,
+) -> Result<String> {
+    let profile_id = unique_workspace_profile_id(connection, &patch.title)?;
+    connection.execute(
+        "
+        INSERT INTO workspace_profiles (id, title, main_model_json, utility_model_json)
+        VALUES (?1, ?2, ?3, ?4)
+        ",
+        params![
+            profile_id,
+            patch.title.trim(),
+            serde_json::to_string(&patch.main)?,
+            serde_json::to_string(&patch.utility)?,
+        ],
+    )?;
+    Ok(profile_id)
+}
+
+fn update_workspace_profile_with_connection(
+    connection: &Connection,
+    profile_id: &str,
+    patch: &WorkspaceProfilePatch,
+) -> Result<()> {
+    let updated = connection.execute(
+        "
+        UPDATE workspace_profiles
+        SET
+            title = ?2,
+            main_model_json = ?3,
+            utility_model_json = ?4,
+            updated_at = unixepoch()
+        WHERE id = ?1
+        ",
+        params![
+            profile_id,
+            patch.title.trim(),
+            serde_json::to_string(&patch.main)?,
+            serde_json::to_string(&patch.utility)?,
+        ],
+    )?;
+
+    if updated == 0 {
+        bail!("workspace profile '{profile_id}' was not found");
+    }
+
+    Ok(())
+}
+
+fn delete_workspace_profile_with_connection(connection: &Connection, profile_id: &str) -> Result<()> {
+    let ids = list_workspace_profile_ids(connection)?;
+    if ids.len() <= 1 {
+        bail!("at least one workspace profile is required");
+    }
+
+    let deleted = connection.execute(
+        "DELETE FROM workspace_profiles WHERE id = ?1",
+        params![profile_id],
+    )?;
+
+    if deleted == 0 {
+        bail!("workspace profile '{profile_id}' was not found");
+    }
+
+    if workspace_default_profile_id_optional(connection)?
+        .as_deref()
+        .is_some_and(|current| current == profile_id)
+    {
+        let fallback = list_workspace_profile_ids(connection)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("at least one workspace profile is required"))?;
+        set_setting_value(connection, "workspace_default_profile_id", &fallback)?;
+    }
+
+    Ok(())
+}
+
+fn unique_workspace_profile_id(connection: &Connection, title: &str) -> Result<String> {
+    let base = slugify_profile_title(title);
+    let mut candidate = base.clone();
+    let mut suffix = 2usize;
+
+    while load_workspace_profile_summary(connection, &candidate).is_ok() {
+        candidate = format!("{base}-{suffix}");
+        suffix += 1;
+    }
+
+    Ok(candidate)
+}
+
+fn slugify_profile_title(value: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+
+    for character in value.trim().chars() {
+        let next = character.to_ascii_lowercase();
+        if next.is_ascii_alphanumeric() {
+            slug.push(next);
+            last_was_dash = false;
+            continue;
+        }
+
+        if !last_was_dash {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        "profile".to_string()
+    } else {
+        slug
+    }
+}
+
+fn workspace_model_from_legacy_target(
+    connection: &Connection,
+    value: &str,
+) -> Result<WorkspaceModelConfig> {
+    let value = value.trim();
+
+    if let Some(route_id) = value.strip_prefix("route:").map(str::trim) {
+        let profile = load_router_profile(connection, route_id)?;
+        let target = profile
+            .targets
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("router profile '{route_id}' has no targets"))?;
+        return Ok(WorkspaceModelConfig {
+            adapter: target.provider,
+            model: target.model,
+            base_url: String::new(),
+            api_key: String::new(),
+        });
+    }
+
+    if let Some(provider) = value.strip_prefix("provider:").map(str::trim) {
+        return Ok(WorkspaceModelConfig {
+            adapter: provider.to_string(),
+            model: AdapterKind::parse(provider)
+                .map(|adapter| adapter.default_model().to_string())
+                .unwrap_or_default(),
+            base_url: String::new(),
+            api_key: String::new(),
+        });
+    }
+
+    bail!("unsupported legacy workspace target '{value}'")
 }
 
 fn setting_value(connection: &Connection, key: &str) -> Result<String> {
@@ -1522,6 +2048,8 @@ fn load_session_summary(connection: &Connection, session_id: &str) -> Result<Ses
             SELECT
                 id,
                 title,
+                profile_id,
+                profile_title,
                 route_id,
                 route_title,
                 scope,
@@ -1530,6 +2058,8 @@ fn load_session_summary(connection: &Connection, session_id: &str) -> Result<Ses
                 project_path,
                 provider,
                 model,
+                provider_base_url,
+                provider_api_key,
                 working_dir,
                 working_dir_kind,
                 state,
@@ -1567,25 +2097,29 @@ fn map_session_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionS
     Ok(SessionSummary {
         id: row.get(0)?,
         title: row.get(1)?,
-        route_id: row.get(2)?,
-        route_title: row.get(3)?,
-        scope: row.get(4)?,
-        project_id: row.get(5)?,
-        project_title: row.get(6)?,
-        project_path: row.get(7)?,
-        provider: row.get(8)?,
-        model: row.get(9)?,
-        working_dir: row.get(10)?,
-        working_dir_kind: row.get(11)?,
+        profile_id: row.get(2)?,
+        profile_title: row.get(3)?,
+        route_id: row.get(4)?,
+        route_title: row.get(5)?,
+        scope: row.get(6)?,
+        project_id: row.get(7)?,
+        project_title: row.get(8)?,
+        project_path: row.get(9)?,
+        provider: row.get(10)?,
+        model: row.get(11)?,
+        provider_base_url: row.get(12)?,
+        provider_api_key: row.get(13)?,
+        working_dir: row.get(14)?,
+        working_dir_kind: row.get(15)?,
         project_count: 0,
         projects: Vec::new(),
-        state: row.get(12)?,
-        provider_session_id: row.get(13)?,
-        last_error: row.get(14)?,
-        last_message_excerpt: row.get(15)?,
-        turn_count: row.get(16)?,
-        created_at: row.get(17)?,
-        updated_at: row.get(18)?,
+        state: row.get(16)?,
+        provider_session_id: row.get(17)?,
+        last_error: row.get(18)?,
+        last_message_excerpt: row.get(19)?,
+        turn_count: row.get(20)?,
+        created_at: row.get(21)?,
+        updated_at: row.get(22)?,
     })
 }
 
@@ -1934,6 +2468,88 @@ mod tests {
     }
 
     #[test]
+    fn seeds_workspace_profiles_and_default_profile() {
+        let state_dir = test_state_dir("workspace-profiles");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+
+        let workspace = store.workspace().expect("workspace should load");
+
+        assert_eq!(workspace.default_profile_id, "default");
+        assert_eq!(workspace.profiles.len(), 3);
+        assert_eq!(workspace.profiles[0].id, "default");
+        assert!(workspace.profiles[0].is_default);
+        assert_eq!(workspace.profiles[0].main.adapter, "claude");
+        assert_eq!(workspace.profiles[0].utility.adapter, "codex");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn prunes_stale_runtime_rows_on_initialize() {
+        let state_dir = test_state_dir("stale-runtime-prune");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let plan = StoragePlan::from_state_dir(&state_dir);
+        let connection =
+            Connection::open(&plan.database_path).expect("database should open directly");
+
+        connection
+            .execute(
+                "INSERT INTO runtimes (id, summary, state) VALUES (?1, ?2, ?3)",
+                params!["agent0", "Legacy adapter", "planned"],
+            )
+            .expect("stale runtime row should insert");
+        drop(connection);
+        drop(store);
+
+        let store = StateStore::initialize_at(&state_dir).expect("store should reinitialize");
+        let runtimes = store.list_runtimes().expect("runtimes should load");
+
+        assert!(!runtimes.iter().any(|runtime| runtime.id == "agent0"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn creates_and_promotes_workspace_profiles() {
+        let state_dir = test_state_dir("workspace-profile-promotion");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+
+        let created = store
+            .create_workspace_profile(WorkspaceProfilePatch {
+                title: "Research Ops".to_string(),
+                main: WorkspaceModelConfig {
+                    adapter: "openai_compatible".to_string(),
+                    model: "gpt-4.1-mini".to_string(),
+                    base_url: "http://127.0.0.1:20128/v1".to_string(),
+                    api_key: "secret-token".to_string(),
+                },
+                utility: WorkspaceModelConfig {
+                    adapter: "claude".to_string(),
+                    model: "sonnet".to_string(),
+                    base_url: String::new(),
+                    api_key: String::new(),
+                },
+                is_default: true,
+            })
+            .expect("workspace profile should create");
+
+        let workspace = store.workspace().expect("workspace should load");
+        let active = workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == created.id)
+            .expect("created profile should be listed");
+
+        assert_eq!(workspace.default_profile_id, created.id);
+        assert!(active.is_default);
+        assert_eq!(active.main.adapter, "openai_compatible");
+        assert_eq!(active.main.base_url, "http://127.0.0.1:20128/v1");
+        assert_eq!(active.main.api_key, "secret-token");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
     fn resolves_discovered_projects_without_global_activation() {
         let state_dir = test_state_dir("resolve-project");
         let workspace_root = state_dir.join("workspace");
@@ -1950,6 +2566,7 @@ mod tests {
                         .to_str()
                         .expect("workspace root should be utf-8"),
                 ),
+                None,
                 None,
                 None,
             )
@@ -1987,6 +2604,7 @@ mod tests {
                         .to_str()
                         .expect("workspace root should be utf-8"),
                 ),
+                None,
                 None,
                 None,
             )
@@ -2068,6 +2686,7 @@ mod tests {
                 ),
                 None,
                 None,
+                None,
             )
             .expect("workspace root should update");
         let project = workspace
@@ -2144,6 +2763,8 @@ mod tests {
         store
             .create_session(SessionRecord {
                 id: "stream-session".to_string(),
+                profile_id: String::new(),
+                profile_title: String::new(),
                 route_id: String::new(),
                 route_title: String::new(),
                 scope: "ad_hoc".to_string(),
@@ -2154,6 +2775,8 @@ mod tests {
                 title: "Streaming session".to_string(),
                 provider: "codex".to_string(),
                 model: "gpt-5.4".to_string(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
                 working_dir: scratch_dir,
                 working_dir_kind: "workspace_scratch".to_string(),
             })

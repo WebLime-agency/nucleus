@@ -1,102 +1,52 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { MemoryStick, RefreshCw, ShieldCheck } from 'lucide-svelte';
+  import { BookOpenText, Brain, Database, FileClock } from 'lucide-svelte';
 
-  import { Button } from '$lib/components/ui/button';
   import { Badge } from '$lib/components/ui/badge';
-  import { Card, CardContent, CardHeader, CardTitle } from '$lib/components/ui/card';
-  import ProcessTable from '$lib/components/dashboard/process-table.svelte';
-  import { fetchProcesses, fetchSystemStats, killProcess } from '$lib/nucleus/client';
-  import { clampPercent, formatBytes, formatClock, formatCount, formatPercent } from '$lib/nucleus/format';
+  import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '$lib/components/ui/card';
+  import { fetchOverview } from '$lib/nucleus/client';
+  import { compactPath } from '$lib/nucleus/format';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
-  import type { DaemonEvent, ProcessListResponse, SystemStats } from '$lib/nucleus/schemas';
+  import type { DaemonEvent, RuntimeOverview } from '$lib/nucleus/schemas';
 
-  let system = $state<SystemStats | null>(null);
-  let processData = $state<ProcessListResponse | null>(null);
+  let overview = $state<RuntimeOverview | null>(null);
   let loading = $state(true);
-  let refreshing = $state(false);
   let error = $state<string | null>(null);
-  let updatedAt = $state<number | null>(null);
-  let killingPid = $state<number | null>(null);
-  let killConfirmPid = $state<number | null>(null);
   let streamStatus = $state<StreamStatus>('connecting');
 
-  async function loadAll(silent = false) {
-    if (!silent) {
-      loading = system === null;
-    }
+  let storage = $derived(overview?.storage ?? null);
+  let statusLabel = $derived.by(() => {
+    if (loading) return 'Connecting';
+    if (streamStatus === 'reconnecting') return 'Reconnecting';
+    if (streamStatus === 'connecting') return 'Connecting';
+    if (error) return 'Degraded';
+    return 'Live';
+  });
 
-    refreshing = silent;
-
+  async function loadAll() {
     try {
-      const [nextSystem, nextProcesses] = await Promise.all([
-        fetchSystemStats(),
-        fetchProcesses({ sort: 'memory', limit: 30 })
-      ]);
-
-      system = nextSystem;
-      processData = nextProcesses;
-      updatedAt = Date.now();
+      overview = await fetchOverview();
       error = null;
     } catch (cause) {
-      error = cause instanceof Error ? cause.message : 'Failed to read memory telemetry.';
+      error = cause instanceof Error ? cause.message : 'Failed to load memory state.';
     } finally {
       loading = false;
-      refreshing = false;
-    }
-  }
-
-  async function refreshNow() {
-    killConfirmPid = null;
-    await loadAll(true);
-  }
-
-  async function handleKill(pid: number) {
-    if (killConfirmPid !== pid) {
-      killConfirmPid = pid;
-      return;
-    }
-
-    killingPid = pid;
-    killConfirmPid = null;
-
-    try {
-      await killProcess(pid);
-      await loadAll(true);
-    } catch (cause) {
-      error = cause instanceof Error ? cause.message : 'Failed to stop the process.';
-    } finally {
-      killingPid = null;
     }
   }
 
   function applyStreamEvent(event: DaemonEvent) {
-    switch (event.event) {
-      case 'connected':
-        error = null;
-        break;
-      case 'system.updated':
-        system = event.data;
-        updatedAt = Date.now();
-        error = null;
-        break;
-      case 'processes.updated':
-        if (event.data.sort === 'memory') {
-          processData = event.data.response;
-          updatedAt = Date.now();
-          error = null;
-        }
-        break;
-      case 'overview.updated':
-        break;
+    if (event.event !== 'overview.updated') {
+      return;
     }
 
+    overview = event.data;
     loading = false;
-    refreshing = false;
+    error = null;
   }
 
   onMount(() => {
     void loadAll();
+
     const disconnect = connectDaemonStream({
       onEvent: applyStreamEvent,
       onStatusChange: (status) => {
@@ -118,37 +68,15 @@
 </svelte:head>
 
 <div class="space-y-8">
-  <section class="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-    <div class="space-y-3">
-      <Badge variant={error ? 'destructive' : 'default'}>
-        {#if loading}
-          Connecting
-        {:else if error}
-          Degraded
-        {:else if refreshing}
-          Refreshing
-        {:else if streamStatus === 'reconnecting'}
-          Reconnecting
-        {:else if streamStatus === 'connecting'}
-          Connecting
-        {:else if updatedAt}
-          Updated {formatClock(updatedAt)}
-        {:else}
-          Waiting
-        {/if}
-      </Badge>
-      <div>
-        <h1 class="text-3xl font-semibold text-zinc-50">Memory</h1>
-        <p class="mt-2 max-w-3xl text-sm leading-6 text-zinc-400">
-          Live memory pressure, available headroom, and the heaviest user-owned processes on this host.
-        </p>
-      </div>
+  <section class="space-y-3">
+    <Badge variant={error ? 'destructive' : 'default'}>{statusLabel}</Badge>
+    <div>
+      <h1 class="text-3xl font-semibold text-zinc-50">Memory</h1>
+      <p class="mt-2 max-w-3xl text-sm leading-6 text-zinc-400">
+        This surface is reserved for long-term memory, reusable knowledge, and operator-managed
+        context. Host RAM moved into Diagnostics so the product language stays clean.
+      </p>
     </div>
-
-    <Button variant="outline" onclick={refreshNow} disabled={refreshing}>
-      <RefreshCw class={refreshing ? 'size-4 animate-spin' : 'size-4'} />
-      {refreshing ? 'Refreshing' : 'Refresh'}
-    </Button>
   </section>
 
   {#if error}
@@ -157,80 +85,73 @@
     </div>
   {/if}
 
-  <section class="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+  <section class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
     <Card>
       <CardHeader>
-        <CardTitle>{system ? formatBytes(system.memory.used_bytes) : '--'}</CardTitle>
+        <CardTitle class="flex items-center gap-2">
+          <Brain class="size-5 text-zinc-400" />
+          Memory Layer
+        </CardTitle>
+        <CardDescription>
+          Profile-scoped and workspace-scoped memory editing lands here next.
+        </CardDescription>
       </CardHeader>
-      <CardContent class="text-sm text-zinc-400">Used memory</CardContent>
+      <CardContent class="text-sm leading-6 text-zinc-400">
+        The daemon already owns the storage roots. The next pass is exposing user-editable memory
+        entries the way Agent0 surfaces durable context.
+      </CardContent>
     </Card>
+
     <Card>
       <CardHeader>
-        <CardTitle>{system ? formatBytes(system.memory.available_bytes) : '--'}</CardTitle>
+        <CardTitle class="flex items-center gap-2">
+          <Database class="size-5 text-zinc-400" />
+          Stored State
+        </CardTitle>
+        <CardDescription>
+          Nucleus keeps memory artifacts and structured state under its local storage root.
+        </CardDescription>
       </CardHeader>
-      <CardContent class="text-sm text-zinc-400">Available memory</CardContent>
+      <CardContent class="space-y-2 text-sm text-zinc-400">
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-xs text-zinc-500">
+          {storage ? compactPath(storage.memory_dir) : 'Waiting for storage details'}
+        </div>
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-xs text-zinc-500">
+          {storage ? compactPath(storage.transcripts_dir) : 'Waiting for transcript details'}
+        </div>
+      </CardContent>
     </Card>
+
     <Card>
       <CardHeader>
-        <CardTitle>{system ? formatBytes(system.memory.free_bytes) : '--'}</CardTitle>
+        <CardTitle class="flex items-center gap-2">
+          <BookOpenText class="size-5 text-zinc-400" />
+          Prompt Includes
+        </CardTitle>
+        <CardDescription>
+          Long-term memory will complement, not replace, the include and workspace knowledge model.
+        </CardDescription>
       </CardHeader>
-      <CardContent class="text-sm text-zinc-400">Free memory</CardContent>
-    </Card>
-    <Card>
-      <CardHeader>
-        <CardTitle>{system ? formatPercent(system.memory.used_percent) : '--'}</CardTitle>
-      </CardHeader>
-      <CardContent class="text-sm text-zinc-400">Overall memory pressure</CardContent>
+      <CardContent class="text-sm leading-6 text-zinc-400">
+        Include directories still shape prompt-time context. This page is for durable memory that an
+        operator explicitly wants Nucleus to preserve, edit, and apply over time.
+      </CardContent>
     </Card>
   </section>
 
   <Card>
     <CardHeader>
-      <CardTitle>Memory pressure</CardTitle>
+      <CardTitle class="flex items-center gap-2">
+        <FileClock class="size-5 text-zinc-400" />
+        Next Phase
+      </CardTitle>
+      <CardDescription>
+        The UI layer is ready for real memory controls once the daemon model is finalized.
+      </CardDescription>
     </CardHeader>
-    <CardContent>
-      {#if system}
-        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-4">
-          <div class="mb-3 flex items-center justify-between gap-3">
-            <div class="inline-flex items-center gap-2 text-zinc-200">
-              <MemoryStick class="size-4 text-zinc-500" />
-              In use
-            </div>
-            <div class="font-mono text-xs text-zinc-400">
-              {formatBytes(system.memory.used_bytes)} / {formatBytes(system.memory.total_bytes)}
-            </div>
-          </div>
-          <div class="h-3 rounded-full bg-zinc-900">
-            <div
-              class="h-3 rounded-full bg-cyan-300/80 transition-all"
-              style={`width: ${clampPercent(system.memory.used_percent)}%`}
-            ></div>
-          </div>
-          <div class="mt-3 flex items-center justify-between gap-3 text-xs text-zinc-500">
-            <span>{formatBytes(system.memory.available_bytes)} available</span>
-            <span class="inline-flex items-center gap-1">
-              <ShieldCheck class="size-3.5 text-lime-300/80" />
-              {formatCount(system.process_count)} total processes
-            </span>
-          </div>
-        </div>
-      {:else}
-        <div class="rounded-md border border-dashed border-zinc-800 px-4 py-8 text-sm text-zinc-500">
-          Waiting for memory telemetry.
-        </div>
-      {/if}
+    <CardContent class="text-sm leading-6 text-zinc-400">
+      Expect profile-aware memory entries, workspace-level notes, import and pruning controls, and a
+      clear distinction between prompt includes, transcripts, and durable memory records.
     </CardContent>
   </Card>
-
-  <ProcessTable
-    title="Top memory processes"
-    subtitle={processData
-      ? `Showing ${formatCount(processData.processes.length)} of ${formatCount(processData.meta.matching_processes)} processes for ${processData.meta.current_user}.`
-      : 'Waiting for daemon process data.'}
-    processes={processData?.processes ?? []}
-    sort="memory"
-    {killingPid}
-    {killConfirmPid}
-    onKill={handleKill}
-  />
 </div>

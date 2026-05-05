@@ -35,10 +35,14 @@ use nucleus_protocol::{
     ProcessKillRequest, ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate,
     ProjectUpdateRequest, PromptProgressUpdate, RouterProfileSummary, RuntimeOverview,
     RuntimeSummary, SessionDetail, SessionPromptRequest, SessionSummary, SettingsSummary,
-    StreamConnected, SystemStats, UpdateSessionRequest, UpdateStatus, WorkspaceSummary,
+    StreamConnected, SystemStats, UpdateSessionRequest, UpdateStatus, WorkspaceModelConfig,
+    WorkspaceProfileSummary, WorkspaceProfileWriteRequest, WorkspaceSummary,
     WorkspaceUpdateRequest,
 };
-use nucleus_storage::{AuditEventRecord, ProjectPatch, SessionPatch, SessionRecord, StateStore};
+use nucleus_storage::{
+    AuditEventRecord, ProjectPatch, SessionPatch, SessionRecord, StateStore,
+    WorkspaceProfilePatch,
+};
 use runtime::{PromptStreamEvent, RuntimeManager};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -128,6 +132,15 @@ fn app(state: AppState) -> Router {
             axum::routing::post(apply_update),
         )
         .route("/workspace", get(workspace).patch(update_workspace))
+        .route(
+            "/workspace/profiles",
+            axum::routing::post(create_workspace_profile),
+        )
+        .route(
+            "/workspace/profiles/{profile_id}",
+            axum::routing::patch(update_workspace_profile)
+                .delete(delete_workspace_profile),
+        )
         .route(
             "/workspace/projects/sync",
             axum::routing::post(sync_projects),
@@ -261,8 +274,15 @@ async fn update_workspace(
         Some(target) => Some(sanitize_workspace_target(&state, &route_profiles, target).await?),
         None => None,
     };
+    let default_profile_id = payload
+        .default_profile_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
     let workspace = state.store.update_workspace(
         root_path.as_deref(),
+        default_profile_id.as_deref(),
         main_target.as_deref(),
         utility_target.as_deref(),
     )?;
@@ -274,10 +294,86 @@ async fn update_workspace(
             status: "success".to_string(),
             summary: "Updated workspace settings.".to_string(),
             detail: format!(
-                "root_path={} main_target={} utility_target={}",
+                "root_path={} default_profile_id={} main_target={} utility_target={}",
                 root_path.unwrap_or_else(|| workspace.root_path.clone()),
+                default_profile_id.unwrap_or_else(|| workspace.default_profile_id.clone()),
                 main_target.unwrap_or_else(|| workspace.main_target.clone()),
                 utility_target.unwrap_or_else(|| workspace.utility_target.clone())
+            ),
+        },
+    )
+    .await;
+    let _ = publish_overview_event(&state).await;
+    Ok(Json(workspace))
+}
+
+async fn create_workspace_profile(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<WorkspaceProfileSummary>, ApiError> {
+    let payload = decode_json::<WorkspaceProfileWriteRequest>(&body)?;
+    let patch = sanitize_workspace_profile_patch(&payload)?;
+    let profile = state.store.create_workspace_profile(patch)?;
+    let _ = try_record_audit_event(
+        &state,
+        AuditEventRecord {
+            kind: "workspace.profile.created".to_string(),
+            target: format!("workspace_profile:{}", profile.id),
+            status: "success".to_string(),
+            summary: format!("Created workspace profile '{}'.", profile.title),
+            detail: format!(
+                "default={} main_adapter={} utility_adapter={}",
+                profile.is_default, profile.main.adapter, profile.utility.adapter
+            ),
+        },
+    )
+    .await;
+    let _ = publish_overview_event(&state).await;
+    Ok(Json(profile))
+}
+
+async fn update_workspace_profile(
+    State(state): State<AppState>,
+    Path(profile_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<WorkspaceProfileSummary>, ApiError> {
+    let payload = decode_json::<WorkspaceProfileWriteRequest>(&body)?;
+    let patch = sanitize_workspace_profile_patch(&payload)?;
+    let profile = state.store.update_workspace_profile(&profile_id, patch)?;
+    let _ = try_record_audit_event(
+        &state,
+        AuditEventRecord {
+            kind: "workspace.profile.updated".to_string(),
+            target: format!("workspace_profile:{profile_id}"),
+            status: "success".to_string(),
+            summary: format!("Updated workspace profile '{}'.", profile.title),
+            detail: format!(
+                "default={} main_adapter={} utility_adapter={}",
+                profile.is_default, profile.main.adapter, profile.utility.adapter
+            ),
+        },
+    )
+    .await;
+    let _ = publish_overview_event(&state).await;
+    Ok(Json(profile))
+}
+
+async fn delete_workspace_profile(
+    State(state): State<AppState>,
+    Path(profile_id): Path<String>,
+) -> Result<Json<WorkspaceSummary>, ApiError> {
+    let workspace = state.store.delete_workspace_profile(&profile_id)?;
+    let _ = try_record_audit_event(
+        &state,
+        AuditEventRecord {
+            kind: "workspace.profile.deleted".to_string(),
+            target: format!("workspace_profile:{profile_id}"),
+            status: "success".to_string(),
+            summary: "Deleted workspace profile.".to_string(),
+            detail: format!(
+                "deleted_profile_id={} remaining_profiles={}",
+                profile_id,
+                workspace.profiles.len()
             ),
         },
     )
@@ -369,8 +465,12 @@ async fn create_session(
         None,
     )?;
     let workspace = state.store.workspace()?;
-    let default_target = parse_target_selector(&workspace.main_target);
     let route_profiles = load_router_profiles(&state, false).await?;
+    let requested_profile_id = payload
+        .profile_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let requested_route_id = payload
         .route_id
         .as_deref()
@@ -381,20 +481,34 @@ async fn create_session(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let selection = resolve_session_target(
-        &state,
-        &route_profiles,
-        requested_route_id.or_else(|| {
-            if requested_provider.is_none() {
-                default_target.route_id.as_deref()
+    let selection = if let Some(profile_id) = requested_profile_id
+        .or_else(|| {
+            if requested_route_id.is_none() && requested_provider.is_none() {
+                Some(workspace.default_profile_id.as_str())
             } else {
                 None
             }
-        }),
-        requested_provider.or(default_target.provider.as_deref()),
-        payload.model.as_deref(),
-    )
-    .await?;
+        })
+    {
+        let profile = resolve_workspace_profile(&workspace, profile_id)?;
+        resolve_workspace_profile_target(&state, profile).await?
+    } else {
+        let default_target = parse_target_selector(&workspace.main_target);
+        resolve_session_target(
+            &state,
+            &route_profiles,
+            requested_route_id.or_else(|| {
+                if requested_provider.is_none() {
+                    default_target.route_id.as_deref()
+                } else {
+                    None
+                }
+            }),
+            requested_provider.or(default_target.provider.as_deref()),
+            payload.model.as_deref(),
+        )
+        .await?
+    };
     let provider = resolve_provider(&selection.provider)?;
     let title = payload
         .title
@@ -403,7 +517,9 @@ async fn create_session(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| {
-            if !selection.route_title.is_empty() {
+            if !selection.profile_title.is_empty() {
+                format!("{} session", selection.profile_title)
+            } else if !selection.route_title.is_empty() {
                 format!("{} session", selection.route_title)
             } else {
                 default_session_title(provider)
@@ -413,6 +529,8 @@ async fn create_session(
 
     state.store.create_session(SessionRecord {
         id: session_id.clone(),
+        profile_id: selection.profile_id,
+        profile_title: selection.profile_title,
         route_id: selection.route_id,
         route_title,
         scope: projects.scope.clone(),
@@ -423,6 +541,8 @@ async fn create_session(
         title,
         provider: selection.provider,
         model: selection.model,
+        provider_base_url: selection.provider_base_url,
+        provider_api_key: selection.provider_api_key,
         working_dir: projects.working_dir.clone(),
         working_dir_kind: projects.working_dir_kind.clone(),
     })?;
@@ -482,9 +602,25 @@ async fn update_session(
     } else {
         None
     };
+    let workspace = if payload.profile_id.is_some() {
+        Some(state.store.workspace()?)
+    } else {
+        None
+    };
+    let requested_profile_id = payload
+        .profile_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let route_id = payload.route_id.as_deref().map(str::trim);
     let provider = payload.provider.as_deref().map(str::trim);
-    let next_target = if route_id.is_some_and(|value| !value.is_empty())
+    let next_target = if let Some(profile_id) = requested_profile_id {
+        let workspace = workspace
+            .as_ref()
+            .ok_or_else(|| ApiError::internal_message("workspace state was not available"))?;
+        let profile = resolve_workspace_profile(workspace, profile_id)?;
+        Some(resolve_workspace_profile_target(&state, profile).await?)
+    } else if route_id.is_some_and(|value| !value.is_empty())
         || provider.is_some_and(|value| !value.is_empty())
     {
         let profiles = load_router_profiles(&state, false).await?;
@@ -507,6 +643,12 @@ async fn update_session(
     let reset_provider_session = project_selection.is_some() || next_target.is_some();
     let patch = SessionPatch {
         title: payload.title.map(|value| value.trim().to_string()),
+        profile_id: next_target
+            .as_ref()
+            .map(|selection| selection.profile_id.clone()),
+        profile_title: next_target
+            .as_ref()
+            .map(|selection| selection.profile_title.clone()),
         route_id: next_target
             .as_ref()
             .map(|selection| selection.route_id.clone()),
@@ -535,6 +677,12 @@ async fn update_session(
             Some(ref selection) => Some(selection.model.clone()),
             None => payload.model.map(|value| value.trim().to_string()),
         },
+        provider_base_url: next_target
+            .as_ref()
+            .map(|selection| selection.provider_base_url.clone()),
+        provider_api_key: next_target
+            .as_ref()
+            .map(|selection| selection.provider_api_key.clone()),
         working_dir: project_selection
             .as_ref()
             .map(|selection| selection.working_dir.clone()),
@@ -667,6 +815,8 @@ async fn prompt_session(
             },
             provider: current.session.provider.clone(),
             model: current.session.model.clone(),
+            profile_id: current.session.profile_id.clone(),
+            profile_title: current.session.profile_title.clone(),
             route_id: current.session.route_id.clone(),
             route_title: current.session.route_title.clone(),
             attempt: 0,
@@ -742,6 +892,8 @@ async fn process_prompt_job(
             detail: prompt_assembly.detail.clone(),
             provider: current.session.provider.clone(),
             model: current.session.model.clone(),
+            profile_id: current.session.profile_id.clone(),
+            profile_title: current.session.profile_title.clone(),
             route_id: current.session.route_id.clone(),
             route_title: current.session.route_title.clone(),
             attempt: 0,
@@ -778,6 +930,8 @@ async fn process_prompt_job(
             },
             provider: current.session.provider.clone(),
             model: current.session.model.clone(),
+            profile_id: current.session.profile_id.clone(),
+            profile_title: current.session.profile_title.clone(),
             route_id: current.session.route_id.clone(),
             route_title: current.session.route_title.clone(),
             attempt: 0,
@@ -814,6 +968,8 @@ async fn process_prompt_job(
                 ),
                 provider: target.provider.clone(),
                 model: target.model.clone(),
+                profile_id: target.profile_id.clone(),
+                profile_title: target.profile_title.clone(),
                 route_id: target.route_id.clone(),
                 route_title: target.route_title.clone(),
                 attempt,
@@ -827,6 +983,7 @@ async fn process_prompt_job(
             &state,
             session_id,
             &execution,
+            &current.turns,
             &prompt_body,
             &payload.images,
             &target,
@@ -889,6 +1046,8 @@ async fn process_prompt_job(
                         detail: format!("{} returned a response.", target.provider),
                         provider: target.provider.clone(),
                         model: target.model.clone(),
+                        profile_id: target.profile_id.clone(),
+                        profile_title: target.profile_title.clone(),
                         route_id: target.route_id.clone(),
                         route_title: target.route_title.clone(),
                         attempt,
@@ -937,6 +1096,8 @@ async fn process_prompt_job(
                         detail: excerpt(&error, 200),
                         provider: target.provider.clone(),
                         model: target.model.clone(),
+                        profile_id: target.profile_id.clone(),
+                        profile_title: target.profile_title.clone(),
                         route_id: target.route_id.clone(),
                         route_title: target.route_title.clone(),
                         attempt,
@@ -977,6 +1138,8 @@ async fn finalize_prompt_job_failure(
             detail: excerpt(error, 200),
             provider: session.provider.clone(),
             model: session.model.clone(),
+            profile_id: session.profile_id.clone(),
+            profile_title: session.profile_title.clone(),
             route_id: session.route_id.clone(),
             route_title: session.route_title.clone(),
             attempt: 0,
@@ -1014,6 +1177,7 @@ async fn run_prompt_attempt(
     state: &AppState,
     session_id: &str,
     execution: &SessionSummary,
+    history: &[nucleus_protocol::SessionTurn],
     prompt_body: &str,
     images: &[nucleus_protocol::SessionTurnImage],
     target: &PromptTarget,
@@ -1026,11 +1190,12 @@ async fn run_prompt_attempt(
     let (events, mut receiver) = mpsc::unbounded_channel();
     let runtimes = state.runtimes.clone();
     let execution = execution.clone();
+    let history = history.to_vec();
     let prompt_body = prompt_body.to_string();
     let images = images.to_vec();
     let handle = tokio::spawn(async move {
         runtimes
-            .execute_prompt_stream(&execution, &prompt_body, &images, events)
+            .execute_prompt_stream(&execution, &history, &prompt_body, &images, events)
             .await
     });
 
@@ -1097,6 +1262,8 @@ async fn apply_prompt_stream_event(
                         detail,
                         provider: target.provider.clone(),
                         model: target.model.clone(),
+                        profile_id: target.profile_id.clone(),
+                        profile_title: target.profile_title.clone(),
                         route_id: target.route_id.clone(),
                         route_title: target.route_title.clone(),
                         attempt,
@@ -1122,6 +1289,8 @@ async fn apply_prompt_stream_event(
                         ),
                         provider: target.provider.clone(),
                         model: target.model.clone(),
+                        profile_id: target.profile_id.clone(),
+                        profile_title: target.profile_title.clone(),
                         route_id: target.route_id.clone(),
                         route_title: target.route_title.clone(),
                         attempt,
@@ -1150,6 +1319,8 @@ async fn apply_prompt_stream_event(
                         ),
                         provider: target.provider.clone(),
                         model: target.model.clone(),
+                        profile_id: target.profile_id.clone(),
+                        profile_title: target.profile_title.clone(),
                         route_id: target.route_id.clone(),
                         route_title: target.route_title.clone(),
                         attempt,
@@ -1588,6 +1759,13 @@ async fn ensure_prompting_runtime(
     provider: &str,
     force_refresh: bool,
 ) -> Result<(), ApiError> {
+    if matches!(
+        AdapterKind::parse(provider),
+        Some(AdapterKind::OpenAiCompatible)
+    ) {
+        return Ok(());
+    }
+
     let runtimes = load_runtimes(state, force_refresh).await?;
     let runtime = runtimes
         .into_iter()
@@ -1638,12 +1816,85 @@ fn sanitize_workspace_root(value: &str) -> Result<String, ApiError> {
     Ok(path.to_string())
 }
 
+fn sanitize_workspace_profile_patch(
+    payload: &WorkspaceProfileWriteRequest,
+) -> Result<WorkspaceProfilePatch, ApiError> {
+    let title = payload.title.trim();
+    if title.is_empty() {
+        return Err(ApiError::bad_request("profile title is required"));
+    }
+
+    Ok(WorkspaceProfilePatch {
+        title: title.to_string(),
+        main: sanitize_workspace_model_config(&payload.main, "main")?,
+        utility: sanitize_workspace_model_config(&payload.utility, "utility")?,
+        is_default: payload.is_default.unwrap_or(false),
+    })
+}
+
+fn sanitize_workspace_model_config(
+    config: &WorkspaceModelConfig,
+    role: &str,
+) -> Result<WorkspaceModelConfig, ApiError> {
+    let adapter = resolve_provider(config.adapter.trim())?;
+    if !adapter.supports_prompting() {
+        return Err(ApiError::bad_request(format!(
+            "{role} model adapter '{}' cannot prompt sessions",
+            adapter.as_str()
+        )));
+    }
+
+    let mut model = config.model.trim().to_string();
+    let mut base_url = config.base_url.trim().trim_end_matches('/').to_string();
+    let api_key = config.api_key.trim().to_string();
+
+    match adapter {
+        AdapterKind::Claude => {
+            if model.is_empty() {
+                model = "sonnet".to_string();
+            }
+            base_url.clear();
+        }
+        AdapterKind::Codex => {
+            base_url.clear();
+        }
+        AdapterKind::OpenAiCompatible => {
+            if base_url.is_empty() {
+                return Err(ApiError::bad_request(format!(
+                    "{role} model base URL is required for OpenAI-compatible adapters",
+                )));
+            }
+            if model.is_empty() {
+                return Err(ApiError::bad_request(format!(
+                    "{role} model name is required for OpenAI-compatible adapters",
+                )));
+            }
+        }
+        AdapterKind::System => {
+            return Err(ApiError::bad_request(format!(
+                "{role} model cannot use the system adapter",
+            )));
+        }
+    }
+
+    Ok(WorkspaceModelConfig {
+        adapter: adapter.as_str().to_string(),
+        model,
+        base_url,
+        api_key,
+    })
+}
+
 #[derive(Debug, Clone)]
 struct SessionTargetSelection {
+    profile_id: String,
+    profile_title: String,
     route_id: String,
     route_title: String,
     provider: String,
     model: String,
+    provider_base_url: String,
+    provider_api_key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1667,6 +1918,8 @@ struct WorkspaceTargetSelection {
 struct PromptTarget {
     provider: String,
     model: String,
+    profile_id: String,
+    profile_title: String,
     route_id: String,
     route_title: String,
 }
@@ -1704,6 +1957,42 @@ impl PromptStreamState {
         self.last_reasoning_excerpt.clear();
         self.streaming_announced = false;
     }
+}
+
+fn resolve_workspace_profile<'a>(
+    workspace: &'a WorkspaceSummary,
+    profile_id: &str,
+) -> Result<&'a WorkspaceProfileSummary, ApiError> {
+    workspace
+        .profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+        .ok_or_else(|| ApiError::bad_request(format!("unknown workspace profile '{profile_id}'")))
+}
+
+async fn resolve_workspace_profile_target(
+    state: &AppState,
+    profile: &WorkspaceProfileSummary,
+) -> Result<SessionTargetSelection, ApiError> {
+    let provider = resolve_provider(&profile.main.adapter)?;
+    ensure_prompting_runtime(state, provider.as_str(), false).await?;
+
+    let model = if profile.main.model.trim().is_empty() {
+        provider.default_model().to_string()
+    } else {
+        profile.main.model.trim().to_string()
+    };
+
+    Ok(SessionTargetSelection {
+        profile_id: profile.id.clone(),
+        profile_title: profile.title.clone(),
+        route_id: String::new(),
+        route_title: String::new(),
+        provider: provider.as_str().to_string(),
+        model,
+        provider_base_url: profile.main.base_url.trim().to_string(),
+        provider_api_key: profile.main.api_key.trim().to_string(),
+    })
 }
 
 fn resolve_session_projects(
@@ -1898,6 +2187,8 @@ async fn resolve_session_target(
         })?;
 
         return Ok(SessionTargetSelection {
+            profile_id: String::new(),
+            profile_title: String::new(),
             route_id: route.id,
             route_title: route.title,
             provider: target.provider,
@@ -1906,6 +2197,8 @@ async fn resolve_session_target(
             } else {
                 target.model
             },
+            provider_base_url: String::new(),
+            provider_api_key: String::new(),
         });
     }
 
@@ -1925,6 +2218,8 @@ async fn resolve_session_target(
     ensure_prompting_runtime(state, provider.as_str(), false).await?;
 
     Ok(SessionTargetSelection {
+        profile_id: String::new(),
+        profile_title: String::new(),
         route_id: String::new(),
         route_title: String::new(),
         provider: provider.as_str().to_string(),
@@ -1933,6 +2228,8 @@ async fn resolve_session_target(
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| provider.default_model().to_string()),
+        provider_base_url: String::new(),
+        provider_api_key: String::new(),
     })
 }
 
@@ -1953,6 +2250,8 @@ async fn resolve_profile_targets(
         let item = PromptTarget {
             provider: target.provider.clone(),
             model: target.model.clone(),
+            profile_id: String::new(),
+            profile_title: String::new(),
             route_id: route.id.clone(),
             route_title: route.title.clone(),
         };
@@ -2023,6 +2322,8 @@ async fn resolve_prompt_targets(
     Ok(vec![PromptTarget {
         provider: session.provider.clone(),
         model: session.model.clone(),
+        profile_id: session.profile_id.clone(),
+        profile_title: session.profile_title.clone(),
         route_id: String::new(),
         route_title: String::new(),
     }])
@@ -2322,7 +2623,10 @@ fn compact_prompt_source_path(path: &PathBuf) -> String {
 }
 
 fn provider_supports_images(provider: &str) -> bool {
-    matches!(AdapterKind::parse(provider), Some(AdapterKind::Codex))
+    matches!(
+        AdapterKind::parse(provider),
+        Some(AdapterKind::Codex | AdapterKind::OpenAiCompatible)
+    )
 }
 
 fn effective_prompt_text(prompt: &str, image_count: usize) -> String {
@@ -2398,6 +2702,7 @@ fn default_session_title(provider: AdapterKind) -> String {
     match provider {
         AdapterKind::Claude => "Claude session".to_string(),
         AdapterKind::Codex => "Codex session".to_string(),
+        AdapterKind::OpenAiCompatible => "OpenAI session".to_string(),
         AdapterKind::System => "System session".to_string(),
     }
 }
@@ -2944,6 +3249,8 @@ mod tests {
         let before = SessionSummary {
             id: "session-1".to_string(),
             title: "Test".to_string(),
+            profile_id: String::new(),
+            profile_title: String::new(),
             route_id: String::new(),
             route_title: String::new(),
             scope: "project".to_string(),
@@ -2952,6 +3259,8 @@ mod tests {
             project_path: "/home/eba/dev-projects/project-one".to_string(),
             provider: "claude".to_string(),
             model: "sonnet".to_string(),
+            provider_base_url: String::new(),
+            provider_api_key: String::new(),
             working_dir: "/home/eba/dev-projects/project-one".to_string(),
             working_dir_kind: "project_root".to_string(),
             project_count: 1,
@@ -3089,7 +3398,7 @@ mod tests {
         let store =
             Arc::new(StateStore::initialize_at(&state_dir).expect("store should initialize"));
         store
-            .update_workspace(None, Some("provider:claude"), None)
+            .update_workspace(None, None, Some("provider:claude"), None)
             .expect("workspace target should update");
 
         let (events, _) = broadcast::channel(4);
@@ -3144,6 +3453,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn creates_sessions_from_default_workspace_profile() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let state_dir = test_state_dir("create-session-default-profile");
+        let store =
+            Arc::new(StateStore::initialize_at(&state_dir).expect("store should initialize"));
+
+        let (events, _) = broadcast::channel(4);
+        let runtimes = Arc::new(RuntimeManager::default());
+        runtimes
+            .seed_cache_for_test(vec![RuntimeSummary {
+                id: "claude".to_string(),
+                summary: "Claude Code".to_string(),
+                state: "ready".to_string(),
+                auth_state: "ready".to_string(),
+                version: "test".to_string(),
+                executable_path: "/tmp/claude".to_string(),
+                default_model: "sonnet".to_string(),
+                note: String::new(),
+                supports_sessions: true,
+                supports_prompting: true,
+            }])
+            .await;
+
+        let state = AppState {
+            version: "test".to_string(),
+            store,
+            host: Arc::new(HostEngine::new()),
+            runtimes,
+            updates: Arc::new(UpdateManager::new(test_instance_runtime())),
+            web_dist_dir: None,
+            tailscale_dns_name: None,
+            events,
+        };
+
+        let original_path = env::var_os("PATH");
+        unsafe {
+            env::set_var("PATH", "");
+        }
+
+        let result = create_session(State(state), Bytes::from_static(b"{}")).await;
+
+        match original_path {
+            Some(value) => unsafe {
+                env::set_var("PATH", value);
+            },
+            None => unsafe {
+                env::remove_var("PATH");
+            },
+        }
+
+        let detail = result.expect("default workspace profile should allow session creation");
+        assert_eq!(detail.0.session.profile_id, "default");
+        assert_eq!(detail.0.session.profile_title, "Default");
+        assert_eq!(detail.0.session.provider, "claude");
+        assert_eq!(detail.0.session.model, "sonnet");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn creates_sessions_from_openai_compatible_workspace_profiles() {
+        let state_dir = test_state_dir("create-session-openai-profile");
+        let store =
+            Arc::new(StateStore::initialize_at(&state_dir).expect("store should initialize"));
+        store
+            .create_workspace_profile(nucleus_storage::WorkspaceProfilePatch {
+                title: "Gateway".to_string(),
+                main: WorkspaceModelConfig {
+                    adapter: "openai_compatible".to_string(),
+                    model: "gpt-4.1-mini".to_string(),
+                    base_url: "http://127.0.0.1:20128/v1".to_string(),
+                    api_key: "nuctk_test".to_string(),
+                },
+                utility: WorkspaceModelConfig {
+                    adapter: "claude".to_string(),
+                    model: "sonnet".to_string(),
+                    base_url: String::new(),
+                    api_key: String::new(),
+                },
+                is_default: false,
+            })
+            .expect("workspace profile should create");
+
+        let (events, _) = broadcast::channel(4);
+        let state = AppState {
+            version: "test".to_string(),
+            store,
+            host: Arc::new(HostEngine::new()),
+            runtimes: Arc::new(RuntimeManager::default()),
+            updates: Arc::new(UpdateManager::new(test_instance_runtime())),
+            web_dist_dir: None,
+            tailscale_dns_name: None,
+            events,
+        };
+
+        let result = create_session(
+            State(state),
+            Bytes::from(
+                serde_json::to_vec(&CreateSessionRequest {
+                    profile_id: Some("gateway".to_string()),
+                    route_id: None,
+                    provider: None,
+                    title: None,
+                    model: None,
+                    project_id: None,
+                    primary_project_id: None,
+                    project_ids: None,
+                })
+                .expect("session payload should serialize"),
+            ),
+        )
+        .await
+        .expect("OpenAI-compatible profile should allow session creation");
+
+        assert_eq!(result.0.session.profile_id, "gateway");
+        assert_eq!(result.0.session.provider, "openai_compatible");
+        assert_eq!(result.0.session.model, "gpt-4.1-mini");
+        assert_eq!(result.0.session.provider_base_url, "http://127.0.0.1:20128/v1");
+        assert_eq!(result.0.session.provider_api_key, "nuctk_test");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
     async fn resolves_direct_prompt_targets_from_cached_runtime_without_forcing_refresh() {
         let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
         let state_dir = test_state_dir("prompt-target-direct-cache");
@@ -3180,6 +3613,8 @@ mod tests {
         let session = SessionSummary {
             id: "session-direct".to_string(),
             title: "Direct prompt".to_string(),
+            profile_id: String::new(),
+            profile_title: String::new(),
             route_id: String::new(),
             route_title: String::new(),
             scope: "ad_hoc".to_string(),
@@ -3188,6 +3623,8 @@ mod tests {
             project_path: String::new(),
             provider: "claude".to_string(),
             model: "sonnet".to_string(),
+            provider_base_url: String::new(),
+            provider_api_key: String::new(),
             working_dir: "/tmp".to_string(),
             working_dir_kind: "workspace_scratch".to_string(),
             project_count: 0,
@@ -3262,6 +3699,8 @@ mod tests {
         let session = SessionSummary {
             id: "session-route".to_string(),
             title: "Route prompt".to_string(),
+            profile_id: String::new(),
+            profile_title: String::new(),
             route_id: "balanced".to_string(),
             route_title: "Balanced".to_string(),
             scope: "ad_hoc".to_string(),
@@ -3270,6 +3709,8 @@ mod tests {
             project_path: String::new(),
             provider: "claude".to_string(),
             model: "sonnet".to_string(),
+            provider_base_url: String::new(),
+            provider_api_key: String::new(),
             working_dir: "/tmp".to_string(),
             working_dir_kind: "workspace_scratch".to_string(),
             project_count: 0,

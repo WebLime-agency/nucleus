@@ -42,7 +42,7 @@
     { href: '/', label: 'Overview', icon: Gauge },
     { href: '/sessions', label: 'Sessions', icon: MessagesSquare },
     { href: '/workspace', label: 'Workspace', icon: FolderTree },
-    { href: '/cpu', label: 'CPU', icon: Cpu },
+    { href: '/diagnostics', label: 'Diagnostics', icon: Cpu },
     { href: '/memory', label: 'Memory', icon: MemoryStick },
     { href: '/settings', label: 'Settings', icon: Settings2 }
   ];
@@ -66,6 +66,10 @@
   let pathname = $derived(page.url.pathname);
   let workspace = $derived(overview?.workspace ?? null);
   let discoveredProjects = $derived(workspace?.projects ?? []);
+  let defaultProfileTitle = $derived(
+    workspace?.profiles.find((profile) => profile.id === workspace.default_profile_id)?.title ??
+      'Default'
+  );
   let sessions = $derived(overview?.sessions ?? []);
   let instanceName = $derived(settings?.instance.name ?? 'Nucleus');
   let updateStatus = $derived(settings?.update ?? null);
@@ -82,7 +86,7 @@
   );
   let createSessionTitle = $derived.by(() => {
     if (!createProjectId) {
-      return 'New session';
+      return `New ${defaultProfileTitle} session`;
     }
 
     const project = discoveredProjects.find((item) => item.id === createProjectId);
@@ -91,7 +95,7 @@
       return 'New session';
     }
 
-    return `New session from ${project.title}`;
+    return `New ${defaultProfileTitle} session from ${project.title}`;
   });
   let statusLabel = $derived.by(() => {
     if (loading) return 'Connecting';

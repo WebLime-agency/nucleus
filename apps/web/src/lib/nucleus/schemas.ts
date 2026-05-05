@@ -31,6 +31,8 @@ export const sessionProjectSummarySchema = z.object({
 export const sessionSummarySchema = z.object({
   id: z.string(),
   title: z.string(),
+  profile_id: z.string(),
+  profile_title: z.string(),
   route_id: z.string(),
   route_title: z.string(),
   project_id: z.string(),
@@ -38,6 +40,8 @@ export const sessionSummarySchema = z.object({
   project_path: z.string(),
   provider: z.string(),
   model: z.string(),
+  provider_base_url: z.string(),
+  provider_api_key: z.string(),
   working_dir: z.string(),
   working_dir_kind: z.string(),
   scope: z.string(),
@@ -79,6 +83,8 @@ export const promptProgressUpdateSchema = z.object({
   detail: z.string(),
   provider: z.string(),
   model: z.string(),
+  profile_id: z.string(),
+  profile_title: z.string(),
   route_id: z.string(),
   route_title: z.string(),
   attempt: z.number().int().nonnegative(),
@@ -87,6 +93,7 @@ export const promptProgressUpdateSchema = z.object({
 });
 
 export const createSessionRequestSchema = z.object({
+  profile_id: z.string().trim().optional(),
   route_id: z.string().trim().optional(),
   provider: z.string().trim().optional(),
   title: z.string().trim().optional(),
@@ -98,6 +105,7 @@ export const createSessionRequestSchema = z.object({
 
 export const updateSessionRequestSchema = z.object({
   title: z.string().trim().optional(),
+  profile_id: z.string().trim().optional(),
   route_id: z.string().trim().optional(),
   provider: z.string().trim().optional(),
   model: z.string().trim().optional(),
@@ -155,15 +163,42 @@ export const projectSummarySchema = z.object({
   updated_at: z.number().int()
 });
 
+export const workspaceModelConfigSchema = z.object({
+  adapter: z.string().trim().min(1),
+  model: z.string(),
+  base_url: z.string(),
+  api_key: z.string()
+});
+
+export const workspaceProfileSummarySchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  is_default: z.boolean(),
+  main: workspaceModelConfigSchema,
+  utility: workspaceModelConfigSchema,
+  created_at: z.number().int(),
+  updated_at: z.number().int()
+});
+
+export const workspaceProfileWriteRequestSchema = z.object({
+  title: z.string().trim().min(1),
+  main: workspaceModelConfigSchema,
+  utility: workspaceModelConfigSchema,
+  is_default: z.boolean().optional()
+});
+
 export const workspaceSummarySchema = z.object({
   root_path: z.string(),
+  default_profile_id: z.string(),
   main_target: z.string(),
   utility_target: z.string(),
+  profiles: z.array(workspaceProfileSummarySchema),
   projects: z.array(projectSummarySchema)
 });
 
 export const workspaceUpdateRequestSchema = z.object({
   root_path: z.string().trim().min(1).optional(),
+  default_profile_id: z.string().trim().min(1).optional(),
   main_target: z.string().trim().min(1).optional(),
   utility_target: z.string().trim().min(1).optional()
 });
@@ -406,6 +441,8 @@ export type ActionRunResponse = z.infer<typeof actionRunResponseSchema>;
 export type AuditEvent = z.infer<typeof auditEventSchema>;
 export type ProjectSummary = z.infer<typeof projectSummarySchema>;
 export type WorkspaceSummary = z.infer<typeof workspaceSummarySchema>;
+export type WorkspaceModelConfig = z.infer<typeof workspaceModelConfigSchema>;
+export type WorkspaceProfileSummary = z.infer<typeof workspaceProfileSummarySchema>;
 export type RouterProfileSummary = z.infer<typeof routerProfileSummarySchema>;
 export type RouteTarget = z.infer<typeof routeTargetSchema>;
 export type SystemStats = z.infer<typeof systemStatsSchema>;

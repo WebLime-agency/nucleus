@@ -22,6 +22,8 @@ import {
   systemStatsSchema,
   updateStatusSchema,
   updateSessionRequestSchema,
+  workspaceProfileSummarySchema,
+  workspaceProfileWriteRequestSchema,
   workspaceSummarySchema,
   workspaceUpdateRequestSchema
 } from './schemas';
@@ -160,6 +162,55 @@ export async function updateWorkspace(
         accept: 'application/json'
       },
       body: JSON.stringify(payload)
+    }),
+    workspaceSummarySchema
+  );
+}
+
+export async function createWorkspaceProfile(
+  input: z.input<typeof workspaceProfileWriteRequestSchema>,
+  fetchImpl: FetchLike = fetch
+) {
+  const payload = workspaceProfileWriteRequestSchema.parse(input);
+
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/workspace/profiles', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json'
+      },
+      body: JSON.stringify(payload)
+    }),
+    workspaceProfileSummarySchema
+  );
+}
+
+export async function updateWorkspaceProfile(
+  profileId: string,
+  input: z.input<typeof workspaceProfileWriteRequestSchema>,
+  fetchImpl: FetchLike = fetch
+) {
+  const payload = workspaceProfileWriteRequestSchema.parse(input);
+
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/workspace/profiles/${profileId}`, {
+      method: 'PATCH',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json'
+      },
+      body: JSON.stringify(payload)
+    }),
+    workspaceProfileSummarySchema
+  );
+}
+
+export async function deleteWorkspaceProfile(profileId: string, fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/workspace/profiles/${profileId}`, {
+      method: 'DELETE',
+      headers: { accept: 'application/json' }
     }),
     workspaceSummarySchema
   );

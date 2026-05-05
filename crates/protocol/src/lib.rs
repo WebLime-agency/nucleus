@@ -46,6 +46,10 @@ pub struct SessionProjectSummary {
 pub struct SessionSummary {
     pub id: String,
     pub title: String,
+    #[serde(default)]
+    pub profile_id: String,
+    #[serde(default)]
+    pub profile_title: String,
     pub route_id: String,
     pub route_title: String,
     pub project_id: String,
@@ -53,6 +57,10 @@ pub struct SessionSummary {
     pub project_path: String,
     pub provider: String,
     pub model: String,
+    #[serde(default)]
+    pub provider_base_url: String,
+    #[serde(default)]
+    pub provider_api_key: String,
     pub working_dir: String,
     pub working_dir_kind: String,
     pub scope: String,
@@ -99,6 +107,10 @@ pub struct PromptProgressUpdate {
     pub detail: String,
     pub provider: String,
     pub model: String,
+    #[serde(default)]
+    pub profile_id: String,
+    #[serde(default)]
+    pub profile_title: String,
     pub route_id: String,
     pub route_title: String,
     pub attempt: usize,
@@ -108,6 +120,7 @@ pub struct PromptProgressUpdate {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateSessionRequest {
+    pub profile_id: Option<String>,
     pub route_id: Option<String>,
     pub provider: Option<String>,
     pub title: Option<String>,
@@ -120,6 +133,7 @@ pub struct CreateSessionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpdateSessionRequest {
     pub title: Option<String>,
+    pub profile_id: Option<String>,
     pub route_id: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -151,14 +165,17 @@ pub struct ProjectSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceSummary {
     pub root_path: String,
+    pub default_profile_id: String,
     pub main_target: String,
     pub utility_target: String,
+    pub profiles: Vec<WorkspaceProfileSummary>,
     pub projects: Vec<ProjectSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceUpdateRequest {
     pub root_path: Option<String>,
+    pub default_profile_id: Option<String>,
     pub main_target: Option<String>,
     pub utility_target: Option<String>,
 }
@@ -166,6 +183,33 @@ pub struct WorkspaceUpdateRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectUpdateRequest {
     pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceModelConfig {
+    pub adapter: String,
+    pub model: String,
+    pub base_url: String,
+    pub api_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceProfileSummary {
+    pub id: String,
+    pub title: String,
+    pub is_default: bool,
+    pub main: WorkspaceModelConfig,
+    pub utility: WorkspaceModelConfig,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceProfileWriteRequest {
+    pub title: String,
+    pub main: WorkspaceModelConfig,
+    pub utility: WorkspaceModelConfig,
+    pub is_default: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

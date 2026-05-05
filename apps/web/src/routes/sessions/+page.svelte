@@ -78,6 +78,7 @@
   let streamStatus = $state<StreamStatus>('connecting');
   let promptText = $state('');
   let draftTitle = $state('');
+  let draftProfileId = $state('');
   let actionFormValues = $state<Record<string, Record<string, string>>>({});
   let detailPanelOpen = $state(false);
   let dragOver = $state(false);
@@ -99,6 +100,11 @@
   let selectedRoute = $derived(
     routerProfiles.find((profile) => profile.id === selectedSession?.route_id) ?? null
   );
+  let workspaceProfiles = $derived(workspace?.profiles ?? []);
+  let selectedProfile = $derived(
+    workspaceProfiles.find((profile) => profile.id === (draftProfileId || selectedSession?.profile_id || '')) ??
+      null
+  );
   let attachedProjects = $derived(selectedSession?.projects ?? []);
   let selectedProject = $derived(attachedProjects.find((project) => project.is_primary) ?? null);
   let selectedProjectTitle = $derived(
@@ -106,21 +112,28 @@
       selectedSession?.project_title ??
       (selectedSession?.project_count === 0 ? 'Workspace scratch' : 'No primary project')
   );
-  let sessionSettingsDirty = $derived(selectedSession ? draftTitle !== selectedSession.title : false);
+  let sessionSettingsDirty = $derived(
+    selectedSession
+      ? draftTitle !== selectedSession.title || draftProfileId !== selectedSession.profile_id
+      : false
+  );
   let promptReady = $derived(promptText.trim().length > 0 || promptImages.length > 0);
   let sessionSupportsImages = $derived.by(() => {
     if (!selectedSession) {
       return false;
     }
 
+    const providerSupportsImages = (provider: string) =>
+      provider === 'codex' || provider === 'openai_compatible';
+
     if (selectedSession.route_id) {
       return (
-        selectedRoute?.targets.some((target) => target.provider === 'codex') ??
-        selectedSession.provider === 'codex'
+        selectedRoute?.targets.some((target) => providerSupportsImages(target.provider)) ??
+        providerSupportsImages(selectedSession.provider)
       );
     }
 
-    return selectedSession.provider === 'codex';
+    return providerSupportsImages(selectedSession.provider);
   });
   let composerHint = $derived.by(() => {
     if (!selectedSession) {
@@ -128,11 +141,15 @@
     }
 
     if (!sessionSupportsImages) {
-      return 'This session cannot accept image attachments until it uses a Codex-capable route.';
+      return 'This session cannot accept image attachments until it uses an image-capable profile or provider.';
     }
 
-    if (selectedSession.route_id && selectedSession.provider !== 'codex') {
-      return 'Image prompts on this route will switch onto a Codex-capable target automatically.';
+    if (
+      selectedSession.route_id &&
+      selectedSession.provider !== 'codex' &&
+      selectedSession.provider !== 'openai_compatible'
+    ) {
+      return 'Image prompts on this route will switch onto an image-capable target automatically.';
     }
 
     return 'Drop, paste, or attach images directly into the next turn.';
@@ -267,6 +284,7 @@
 
   function setSessionDrafts(session: SessionSummary | null) {
     draftTitle = session?.title ?? '';
+    draftProfileId = session?.profile_id ?? '';
   }
 
   function buildNextProjectState(
@@ -435,6 +453,8 @@
           : 'Passing prompt from the composer.',
         provider: session.provider,
         model: session.model,
+        profile_id: session.profile_id,
+        profile_title: session.profile_title,
         route_id: session.route_id,
         route_title: session.route_title,
         attempt: 0,
@@ -466,7 +486,7 @@
     }
 
     if (!sessionSupportsImages) {
-      error = 'This session needs a Codex-capable route before it can accept image attachments.';
+      error = 'This session needs an image-capable profile or provider before it can accept image attachments.';
       return;
     }
 
@@ -699,7 +719,8 @@
 
     try {
       const next = await updateSession(selectedSession.id, {
-        title: draftTitle
+        title: draftTitle,
+        profile_id: draftProfileId || undefined
       });
 
       syncSession(next);
@@ -1019,6 +1040,10 @@
                 </div>
                 <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-zinc-500">
                   <span class="inline-flex items-center gap-1.5">
+                    <Workflow class="size-3.5" />
+                    <span>{selectedSession.profile_title || selectedSession.route_title || 'Direct session'}</span>
+                  </span>
+                  <span class="inline-flex items-center gap-1.5">
                     <Bot class="size-3.5" />
                     <span>{formatState(selectedSession.provider)}</span>
                     {#if selectedSession.model}
@@ -1326,14 +1351,29 @@
                   />
                 </label>
 
+                <label class="block space-y-2">
+                  <span class="text-xs text-zinc-500">Profile</span>
+                  <select
+                    bind:value={draftProfileId}
+                    class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
+                  >
+                    {#if selectedSession.profile_id === ''}
+                      <option value="">Legacy or direct target</option>
+                    {/if}
+                    {#each workspaceProfiles as profile}
+                      <option value={profile.id}>{profile.title}</option>
+                    {/each}
+                  </select>
+                </label>
+
                 <div class="grid gap-3 sm:grid-cols-2">
                   <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
-                    <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Route</div>
+                    <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Provider</div>
                     <div class="mt-2 text-sm text-zinc-100">
-                      {selectedSession.route_title || 'Direct provider'}
+                      {formatState(selectedSession.provider)}
                     </div>
                     <div class="mt-1 text-xs text-zinc-500">
-                      {selectedSession.route_id || selectedSession.provider}
+                      {selectedSession.model || 'Provider default model'}
                     </div>
                   </div>
 
@@ -1345,6 +1385,24 @@
                     <div class="mt-1 text-xs text-zinc-500">
                       {formatState(selectedSession.working_dir_kind)}
                     </div>
+                  </div>
+                </div>
+
+                <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
+                  <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Routing</div>
+                  <div class="mt-2 text-sm text-zinc-100">
+                    {selectedSession.profile_title ||
+                      selectedSession.route_title ||
+                      'Direct session target'}
+                  </div>
+                  <div class="mt-1 text-xs text-zinc-500">
+                    {#if selectedProfile}
+                      {selectedProfile.main.adapter === 'openai_compatible'
+                        ? selectedProfile.main.base_url || 'OpenAI-compatible endpoint'
+                        : `${formatState(selectedProfile.main.adapter)} runtime`}
+                    {:else}
+                      {selectedSession.route_id || selectedSession.provider}
+                    {/if}
                   </div>
                 </div>
 
