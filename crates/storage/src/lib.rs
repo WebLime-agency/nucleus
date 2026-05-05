@@ -1626,8 +1626,12 @@ fn sync_projects_with_connection(connection: &Connection) -> Result<()> {
     let root_path = workspace_root(connection)?;
     let root = PathBuf::from(&root_path);
 
+    if !root.exists() {
+        return Ok(());
+    }
+
     if !root.is_dir() {
-        bail!("workspace root '{}' does not exist", root.display());
+        bail!("workspace root '{}' is not a directory", root.display());
     }
 
     for project in discover_projects(&root)? {
@@ -2438,9 +2442,12 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
     use std::{
-        fs,
+        env, fs,
+        sync::Mutex,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn persists_and_lists_audit_events() {
@@ -2844,6 +2851,42 @@ mod tests {
                 .validate_access_token("nuctk_invalid")
                 .expect("invalid token check should succeed")
         );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn initializes_even_when_default_workspace_root_is_missing() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let state_dir = test_state_dir("missing-default-workspace-root");
+        let temp_home = state_dir.join("home");
+        fs::create_dir_all(&temp_home).expect("temporary home should exist");
+
+        let original_home = env::var_os("HOME");
+        unsafe {
+            env::set_var("HOME", &temp_home);
+        }
+
+        let default_root = temp_home.join("dev-projects");
+
+        if default_root.exists() {
+            let _ = fs::remove_dir_all(&default_root);
+        }
+
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let workspace = store.workspace().expect("workspace should load");
+
+        assert_eq!(workspace.root_path, default_root.display().to_string());
+        assert!(workspace.projects.is_empty());
+
+        match original_home {
+            Some(value) => unsafe {
+                env::set_var("HOME", value);
+            },
+            None => unsafe {
+                env::remove_var("HOME");
+            },
+        }
 
         let _ = fs::remove_dir_all(&state_dir);
     }
