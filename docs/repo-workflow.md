@@ -18,6 +18,7 @@ Rules:
 - do not push directly to `dev` unless you are repairing the branch itself
 - keep feature branches narrow and disposable
 - let `main` move only through the nightly promotion path unless there is an explicit hotfix
+- the nightly `dev -> main` PR must use squash auto-merge because protected linear history blocks merge commits
 
 CI expectations:
 
