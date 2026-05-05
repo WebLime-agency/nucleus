@@ -554,7 +554,11 @@ async fn execute_openai_compatible_prompt(
                     let _ = events.send(PromptStreamEvent::ReasoningSnapshot { text: reasoning });
                 }
 
-                if let Some(delta) = choice.delta.content.or(choice.message.and_then(|m| m.content)) {
+                if let Some(delta) = choice
+                    .delta
+                    .content
+                    .or(choice.message.and_then(|m| m.content))
+                {
                     content.push_str(&delta);
                     let _ = events.send(PromptStreamEvent::AssistantChunk { text: delta });
                 }
@@ -574,7 +578,11 @@ async fn execute_openai_compatible_prompt(
                 if let Some(reasoning) = choice.delta.reasoning_text() {
                     let _ = events.send(PromptStreamEvent::ReasoningSnapshot { text: reasoning });
                 }
-                if let Some(delta) = choice.delta.content.or(choice.message.and_then(|m| m.content)) {
+                if let Some(delta) = choice
+                    .delta
+                    .content
+                    .or(choice.message.and_then(|m| m.content))
+                {
                     content.push_str(&delta);
                     let _ = events.send(PromptStreamEvent::AssistantChunk { text: delta });
                 }
@@ -1198,8 +1206,7 @@ struct CommandOutput {
 mod tests {
     use super::*;
     use std::{
-        env,
-        fs,
+        env, fs,
         sync::Mutex,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -1232,8 +1239,7 @@ mod tests {
         let script = local_bin.join("mocktool");
 
         fs::create_dir_all(&local_bin).expect("local bin should exist");
-        fs::write(&script, "#!/bin/sh\necho nucleus-runtime-ok\n")
-            .expect("mock tool should write");
+        fs::write(&script, "#!/bin/sh\necho nucleus-runtime-ok\n").expect("mock tool should write");
 
         #[cfg(unix)]
         {
@@ -1283,6 +1289,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time should be monotonic")
             .as_nanos();
-        env::temp_dir().join(format!("nucleus-runtime-{label}-{}-{suffix}", std::process::id()))
+        env::temp_dir().join(format!(
+            "nucleus-runtime-{label}-{}-{suffix}",
+            std::process::id()
+        ))
     }
 }

@@ -407,6 +407,8 @@ pub struct InstanceSummary {
     pub repo_root: String,
     pub daemon_bind: String,
     pub install_mode: String,
+    pub restart_mode: String,
+    pub restart_supported: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

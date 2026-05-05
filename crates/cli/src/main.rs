@@ -226,7 +226,10 @@ async fn run_setup_runtime(
 
     println!("{PRODUCT_NAME} setup complete");
     println!("Mode: {mode}");
-    println!("State dir: {}", state_dir_path(state_dir.as_deref())?.display());
+    println!(
+        "State dir: {}",
+        state_dir_path(state_dir.as_deref())?.display()
+    );
     println!("Bind: {bind}");
     println!("Web build: {}", web_dist_dir.display());
     println!("Token: {token}");
@@ -256,7 +259,10 @@ async fn run_setup_runtime(
 async fn run_setup_client(args: SetupClientArgs) -> Result<()> {
     let client = reqwest::Client::new();
     let settings = client
-        .get(format!("{}/api/settings", sanitize_server_url(&args.server_url)))
+        .get(format!(
+            "{}/api/settings",
+            sanitize_server_url(&args.server_url)
+        ))
         .header(AUTHORIZATION, format!("Bearer {}", args.token.trim()))
         .send()
         .await
@@ -418,7 +424,7 @@ fn install_service_unit(plan: &InstallPlan, enable: bool) -> Result<PathBuf> {
 
     let unit_path = user_systemd_dir.join(format!("{}.service", plan.service_name));
     let unit = format!(
-        "[Unit]\nDescription={} daemon\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory={}\nExecStart={}\nRestart=on-failure\nRestartSec=5\nEnvironment=HOME={}\nEnvironment=NUCLEUS_INSTANCE_NAME={}\nEnvironment=NUCLEUS_STATE_DIR={}\nEnvironment=NUCLEUS_BIND={}\nEnvironment=NUCLEUS_REPO_ROOT={}\nEnvironment=NUCLEUS_WEB_DIST_DIR={}\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription={} daemon\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory={}\nExecStart={}\nRestart=on-failure\nRestartSec=5\nEnvironment=HOME={}\nEnvironment=NUCLEUS_INSTANCE_NAME={}\nEnvironment=NUCLEUS_STATE_DIR={}\nEnvironment=NUCLEUS_BIND={}\nEnvironment=NUCLEUS_REPO_ROOT={}\nEnvironment=NUCLEUS_WEB_DIST_DIR={}\nEnvironment=NUCLEUS_SYSTEMD_UNIT={}.service\n\n[Install]\nWantedBy=default.target\n",
         PRODUCT_NAME,
         plan.repo_root.display(),
         plan.daemon_binary.display(),
@@ -428,11 +434,11 @@ fn install_service_unit(plan: &InstallPlan, enable: bool) -> Result<PathBuf> {
         plan.bind,
         plan.repo_root.display(),
         plan.web_dist_dir.display(),
+        plan.service_name,
     );
 
-    fs::write(&unit_path, unit).with_context(|| {
-        format!("failed to write service unit '{}'", unit_path.display())
-    })?;
+    fs::write(&unit_path, unit)
+        .with_context(|| format!("failed to write service unit '{}'", unit_path.display()))?;
 
     run_systemctl(&["--user", "daemon-reload"])?;
     if enable {
@@ -494,11 +500,7 @@ fn local_hostname() -> String {
             }
 
             let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if value.is_empty() {
-                None
-            } else {
-                Some(value)
-            }
+            if value.is_empty() { None } else { Some(value) }
         })
         .unwrap_or_else(|| "localhost".to_string())
 }
@@ -548,7 +550,10 @@ fn bind_port(bind: &str) -> Option<u16> {
     bind.parse::<SocketAddr>()
         .ok()
         .map(|addr| addr.port())
-        .or_else(|| bind.rsplit_once(':').and_then(|(_, port)| port.parse::<u16>().ok()))
+        .or_else(|| {
+            bind.rsplit_once(':')
+                .and_then(|(_, port)| port.parse::<u16>().ok())
+        })
 }
 
 fn bind_exposes_remote_access(bind: &str) -> bool {

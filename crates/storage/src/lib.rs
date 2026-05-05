@@ -480,10 +480,8 @@ impl StateStore {
         let next_project_path = patch.project_path.unwrap_or(current.project_path);
         let next_provider = patch.provider.unwrap_or(current.provider);
         let next_model = patch.model.unwrap_or(current.model);
-        let next_provider_base_url =
-            patch.provider_base_url.unwrap_or(current.provider_base_url);
-        let next_provider_api_key =
-            patch.provider_api_key.unwrap_or(current.provider_api_key);
+        let next_provider_base_url = patch.provider_base_url.unwrap_or(current.provider_base_url);
+        let next_provider_api_key = patch.provider_api_key.unwrap_or(current.provider_api_key);
         let next_working_dir = patch.working_dir.unwrap_or(current.working_dir);
         let next_working_dir_kind = patch.working_dir_kind.unwrap_or(current.working_dir_kind);
         let next_state = patch.state.unwrap_or(current.state);
@@ -1151,7 +1149,10 @@ fn migrate_legacy_workspace_targets(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn ensure_local_auth_token_with_connection(plan: &StoragePlan, connection: &Connection) -> Result<()> {
+fn ensure_local_auth_token_with_connection(
+    plan: &StoragePlan,
+    connection: &Connection,
+) -> Result<()> {
     let token_path = plan.state_dir.join(LOCAL_AUTH_TOKEN_FILE_NAME);
     let token_value = match setting_value_optional(connection, LOCAL_AUTH_TOKEN_HASH_KEY)? {
         Some(hash) => {
@@ -1162,14 +1163,22 @@ fn ensure_local_auth_token_with_connection(plan: &StoragePlan, connection: &Conn
             } else {
                 let next = generate_local_auth_token();
                 write_token_file(&token_path, &next)?;
-                set_setting_value(connection, LOCAL_AUTH_TOKEN_HASH_KEY, &hash_auth_token(&next))?;
+                set_setting_value(
+                    connection,
+                    LOCAL_AUTH_TOKEN_HASH_KEY,
+                    &hash_auth_token(&next),
+                )?;
                 next
             }
         }
         None => {
             let next = generate_local_auth_token();
             write_token_file(&token_path, &next)?;
-            set_setting_value(connection, LOCAL_AUTH_TOKEN_HASH_KEY, &hash_auth_token(&next))?;
+            set_setting_value(
+                connection,
+                LOCAL_AUTH_TOKEN_HASH_KEY,
+                &hash_auth_token(&next),
+            )?;
             next
         }
     };
@@ -1324,8 +1333,8 @@ fn load_workspace_profile_summary(
     connection: &Connection,
     profile_id: &str,
 ) -> Result<WorkspaceProfileSummary> {
-    let default_profile_id = workspace_default_profile_id_optional(connection)?
-        .unwrap_or_else(|| "default".to_string());
+    let default_profile_id =
+        workspace_default_profile_id_optional(connection)?.unwrap_or_else(|| "default".to_string());
 
     connection
         .query_row(
@@ -1425,7 +1434,10 @@ fn update_workspace_profile_with_connection(
     Ok(())
 }
 
-fn delete_workspace_profile_with_connection(connection: &Connection, profile_id: &str) -> Result<()> {
+fn delete_workspace_profile_with_connection(
+    connection: &Connection,
+    profile_id: &str,
+) -> Result<()> {
     let ids = list_workspace_profile_ids(connection)?;
     if ids.len() <= 1 {
         bail!("at least one workspace profile is required");

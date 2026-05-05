@@ -148,6 +148,16 @@ export async function applyUpdate(fetchImpl: FetchLike = fetch) {
   );
 }
 
+export async function restartDaemon(fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/settings/restart', {
+      method: 'POST',
+      headers: { accept: 'application/json' }
+    }),
+    updateStatusSchema
+  );
+}
+
 export async function updateWorkspace(
   input: z.input<typeof workspaceUpdateRequestSchema>,
   fetchImpl: FetchLike = fetch

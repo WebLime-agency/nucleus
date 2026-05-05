@@ -253,7 +253,9 @@ export const instanceSummarySchema = z.object({
   name: z.string(),
   repo_root: z.string(),
   daemon_bind: z.string(),
-  install_mode: z.string()
+  install_mode: z.string(),
+  restart_mode: z.string(),
+  restart_supported: z.boolean()
 });
 
 export const authSummarySchema = z.object({

@@ -17,8 +17,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{
-        Path, Query, State,
-        Request,
+        Path, Query, Request, State,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
@@ -40,8 +39,7 @@ use nucleus_protocol::{
     WorkspaceUpdateRequest,
 };
 use nucleus_storage::{
-    AuditEventRecord, ProjectPatch, SessionPatch, SessionRecord, StateStore,
-    WorkspaceProfilePatch,
+    AuditEventRecord, ProjectPatch, SessionPatch, SessionRecord, StateStore, WorkspaceProfilePatch,
 };
 use runtime::{PromptStreamEvent, RuntimeManager};
 use serde::{Deserialize, de::DeserializeOwned};
@@ -69,6 +67,7 @@ const MAX_PROMPT_INCLUDE_FILE_CHARS: usize = 6_000;
 const MAX_PROMPT_INCLUDE_TOTAL_CHARS: usize = 24_000;
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(900);
 const INITIAL_UPDATE_CHECK_DELAY: Duration = Duration::from_secs(3);
+const RESTART_AFTER_RESPONSE_DELAY: Duration = Duration::from_millis(800);
 
 #[derive(Clone)]
 struct AppState {
@@ -127,10 +126,8 @@ fn app(state: AppState) -> Router {
             "/settings/update/check",
             axum::routing::post(check_for_updates),
         )
-        .route(
-            "/settings/update/apply",
-            axum::routing::post(apply_update),
-        )
+        .route("/settings/update/apply", axum::routing::post(apply_update))
+        .route("/settings/restart", axum::routing::post(restart_daemon))
         .route("/workspace", get(workspace).patch(update_workspace))
         .route(
             "/workspace/profiles",
@@ -138,8 +135,7 @@ fn app(state: AppState) -> Router {
         )
         .route(
             "/workspace/profiles/{profile_id}",
-            axum::routing::patch(update_workspace_profile)
-                .delete(delete_workspace_profile),
+            axum::routing::patch(update_workspace_profile).delete(delete_workspace_profile),
         )
         .route(
             "/workspace/projects/sync",
@@ -152,10 +148,7 @@ fn app(state: AppState) -> Router {
         .route("/router/profiles", get(router_profiles))
         .route("/actions", get(actions))
         .route("/actions/{action_id}", get(action_detail))
-        .route(
-            "/actions/{action_id}/run",
-            axum::routing::post(run_action),
-        )
+        .route("/actions/{action_id}/run", axum::routing::post(run_action))
         .route("/audit", get(audit_events))
         .route("/sessions", get(list_sessions).post(create_session))
         .route(
@@ -248,6 +241,20 @@ async fn apply_update(State(state): State<AppState>) -> Result<Json<UpdateStatus
     let result = state.updates.apply().await;
     if result.changed {
         let _ = publish_update_event(&state, result.status.clone()).await;
+    }
+    if result.restart_requested {
+        schedule_daemon_restart(state.clone());
+    }
+    Ok(Json(result.status))
+}
+
+async fn restart_daemon(State(state): State<AppState>) -> Result<Json<UpdateStatus>, ApiError> {
+    let result = state.updates.request_restart().await;
+    if result.changed {
+        let _ = publish_update_event(&state, result.status.clone()).await;
+    }
+    if result.restart_requested {
+        schedule_daemon_restart(state.clone());
     }
     Ok(Json(result.status))
 }
@@ -481,15 +488,13 @@ async fn create_session(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let selection = if let Some(profile_id) = requested_profile_id
-        .or_else(|| {
-            if requested_route_id.is_none() && requested_provider.is_none() {
-                Some(workspace.default_profile_id.as_str())
-            } else {
-                None
-            }
-        })
-    {
+    let selection = if let Some(profile_id) = requested_profile_id.or_else(|| {
+        if requested_route_id.is_none() && requested_provider.is_none() {
+            Some(workspace.default_profile_id.as_str())
+        } else {
+            None
+        }
+    }) {
         let profile = resolve_workspace_profile(&workspace, profile_id)?;
         resolve_workspace_profile_target(&state, profile).await?
     } else {
@@ -1663,6 +1668,20 @@ async fn publish_audit_event(state: &AppState) -> anyhow::Result<()> {
 async fn publish_update_event(state: &AppState, update: UpdateStatus) -> anyhow::Result<()> {
     let _ = state.events.send(DaemonEvent::UpdateUpdated(update));
     Ok(())
+}
+
+fn schedule_daemon_restart(state: AppState) {
+    tokio::spawn(async move {
+        time::sleep(RESTART_AFTER_RESPONSE_DELAY).await;
+
+        if let Err(error) = state.updates.perform_restart().await {
+            warn!(error = %error, "daemon restart request failed");
+            let result = state.updates.mark_restart_failure(error.to_string()).await;
+            if result.changed {
+                let _ = publish_update_event(&state, result.status).await;
+            }
+        }
+    });
 }
 
 async fn build_settings_summary(state: &AppState) -> SettingsSummary {
@@ -3019,9 +3038,15 @@ fn authorize_access(
 ) -> Result<(), ApiError> {
     let token = bearer_token(headers)
         .or(query_token.map(str::trim).filter(|value| !value.is_empty()))
-        .ok_or_else(|| ApiError::unauthorized("Authentication required. Provide a bearer token."))?;
+        .ok_or_else(|| {
+            ApiError::unauthorized("Authentication required. Provide a bearer token.")
+        })?;
 
-    if state.store.validate_access_token(token).map_err(ApiError::from)? {
+    if state
+        .store
+        .validate_access_token(token)
+        .map_err(ApiError::from)?
+    {
         return Ok(());
     }
 
@@ -3123,7 +3148,10 @@ fn bind_port(bind: &str) -> Option<u16> {
     bind.parse::<SocketAddr>()
         .ok()
         .map(|addr| addr.port())
-        .or_else(|| bind.rsplit_once(':').and_then(|(_, port)| port.parse::<u16>().ok()))
+        .or_else(|| {
+            bind.rsplit_once(':')
+                .and_then(|(_, port)| port.parse::<u16>().ok())
+        })
 }
 
 fn bind_exposes_remote_access(bind: &str) -> bool {
@@ -3338,8 +3366,7 @@ mod tests {
     #[tokio::test]
     async fn resolves_route_targets_from_cached_runtimes_when_creating_sessions() {
         let state_dir = test_state_dir("session-target-cache");
-        let store =
-            Arc::new(StateStore::initialize_at(&state_dir).expect("store should initialize"));
+        let store = initialize_test_store(&state_dir);
         let (events, _) = broadcast::channel(4);
         let runtimes = Arc::new(RuntimeManager::default());
         runtimes
@@ -3395,8 +3422,7 @@ mod tests {
     async fn creates_sessions_from_cached_default_provider_without_forcing_runtime_refresh() {
         let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
         let state_dir = test_state_dir("create-session-cache");
-        let store =
-            Arc::new(StateStore::initialize_at(&state_dir).expect("store should initialize"));
+        let store = initialize_test_store(&state_dir);
         store
             .update_workspace(None, None, Some("provider:claude"), None)
             .expect("workspace target should update");
@@ -3456,8 +3482,7 @@ mod tests {
     async fn creates_sessions_from_default_workspace_profile() {
         let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
         let state_dir = test_state_dir("create-session-default-profile");
-        let store =
-            Arc::new(StateStore::initialize_at(&state_dir).expect("store should initialize"));
+        let store = initialize_test_store(&state_dir);
 
         let (events, _) = broadcast::channel(4);
         let runtimes = Arc::new(RuntimeManager::default());
@@ -3515,8 +3540,7 @@ mod tests {
     #[tokio::test]
     async fn creates_sessions_from_openai_compatible_workspace_profiles() {
         let state_dir = test_state_dir("create-session-openai-profile");
-        let store =
-            Arc::new(StateStore::initialize_at(&state_dir).expect("store should initialize"));
+        let store = initialize_test_store(&state_dir);
         store
             .create_workspace_profile(nucleus_storage::WorkspaceProfilePatch {
                 title: "Gateway".to_string(),
@@ -3570,7 +3594,10 @@ mod tests {
         assert_eq!(result.0.session.profile_id, "gateway");
         assert_eq!(result.0.session.provider, "openai_compatible");
         assert_eq!(result.0.session.model, "gpt-4.1-mini");
-        assert_eq!(result.0.session.provider_base_url, "http://127.0.0.1:20128/v1");
+        assert_eq!(
+            result.0.session.provider_base_url,
+            "http://127.0.0.1:20128/v1"
+        );
         assert_eq!(result.0.session.provider_api_key, "nuctk_test");
 
         let _ = fs::remove_dir_all(&state_dir);
@@ -3580,8 +3607,7 @@ mod tests {
     async fn resolves_direct_prompt_targets_from_cached_runtime_without_forcing_refresh() {
         let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
         let state_dir = test_state_dir("prompt-target-direct-cache");
-        let store =
-            Arc::new(StateStore::initialize_at(&state_dir).expect("store should initialize"));
+        let store = initialize_test_store(&state_dir);
         let (events, _) = broadcast::channel(4);
         let runtimes = Arc::new(RuntimeManager::default());
         runtimes
@@ -3666,8 +3692,7 @@ mod tests {
     async fn resolves_route_prompt_targets_from_cached_runtime_without_forcing_refresh() {
         let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
         let state_dir = test_state_dir("prompt-target-route-cache");
-        let store =
-            Arc::new(StateStore::initialize_at(&state_dir).expect("store should initialize"));
+        let store = initialize_test_store(&state_dir);
         let (events, _) = broadcast::channel(4);
         let runtimes = Arc::new(RuntimeManager::default());
         runtimes
@@ -3755,12 +3780,36 @@ mod tests {
         std::env::temp_dir().join(format!("nucleus-{label}-{}-{suffix}", std::process::id()))
     }
 
-    fn test_instance_runtime() -> InstanceRuntime {
-        InstanceRuntime {
-            name: "Test".to_string(),
-            repo_root: env::current_dir().expect("cwd should resolve"),
-            daemon_bind: "127.0.0.1:42240".to_string(),
-            install_mode: "unsupported".to_string(),
+    fn initialize_test_store(state_dir: &std::path::Path) -> Arc<StateStore> {
+        let workspace_root = state_dir.join("workspace");
+        if let Some(default_root) = dirs::home_dir().map(|path| path.join("dev-projects")) {
+            fs::create_dir_all(default_root).expect("default workspace root should exist");
         }
+        fs::create_dir_all(&workspace_root).expect("workspace root should exist");
+
+        let store =
+            Arc::new(StateStore::initialize_at(state_dir).expect("store should initialize"));
+        store
+            .update_workspace(
+                Some(
+                    workspace_root
+                        .to_str()
+                        .expect("workspace root should serialize as utf-8"),
+                ),
+                None,
+                None,
+                None,
+            )
+            .expect("workspace root should update");
+        store
+    }
+
+    fn test_instance_runtime() -> InstanceRuntime {
+        InstanceRuntime::for_test(
+            "Test",
+            env::current_dir().expect("cwd should resolve"),
+            "127.0.0.1:42240",
+            "unsupported",
+        )
     }
 }

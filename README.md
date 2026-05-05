@@ -4,6 +4,8 @@ Nucleus is a local AI control plane. The Rust daemon is the product core. It own
 
 The SvelteKit app in this repo is one client. Future native clients should talk to the same daemon contracts instead of reimplementing backend logic.
 
+Repo workflow lives in [docs/repo-workflow.md](docs/repo-workflow.md).
+
 ## Repo Layout
 
 ```text
@@ -143,6 +145,7 @@ That unit writes the key runtime env vars:
 - `NUCLEUS_BIND`
 - `NUCLEUS_REPO_ROOT`
 - `NUCLEUS_WEB_DIST_DIR`
+- `NUCLEUS_SYSTEMD_UNIT`
 
 ## Tailscale
 
@@ -174,6 +177,7 @@ The repo already includes:
 - background prompt jobs with live progress
 - include directory discovery for prompt assembly
 - daemon-managed update checks and apply flow for git installs
+- rebuild-and-restart controls for managed daemon installs
 
 ## License
 
