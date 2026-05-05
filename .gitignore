@@ -1,0 +1,11 @@
+node_modules/
+target/
+.DS_Store
+.run/
+test-results/
+.env
+.env.*
+
+apps/web/.svelte-kit/
+apps/web/build/
+apps/web/package-lock.json

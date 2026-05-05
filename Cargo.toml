@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/adapters-claude",
+  "crates/adapters-codex",
+  "crates/adapters-system",
+  "crates/cli",
+  "crates/core",
+  "crates/daemon",
+  "crates/protocol",
+  "crates/storage",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["WebLime"]
+homepage = "https://nucleus.weblime.com"
+repository = "https://github.com/WebLime-agency/nucleus"
+description = "Nucleus is a local AI control plane with a Rust daemon, web UI, and operator tooling."
+
+[workspace.dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["json", "macros", "ws"] }
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive", "env"] }
+dirs = "6"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = "0.37"
+tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+nucleus-adapters-claude = { path = "crates/adapters-claude" }
+nucleus-adapters-codex = { path = "crates/adapters-codex" }
+nucleus-adapters-system = { path = "crates/adapters-system" }
+nucleus-core = { path = "crates/core" }
+nucleus-protocol = { path = "crates/protocol" }
+nucleus-storage = { path = "crates/storage" }

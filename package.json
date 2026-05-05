@@ -1,0 +1,14 @@
+{
+  "name": "nucleus",
+  "description": "Nucleus is a local AI control plane monorepo.",
+  "license": "MIT",
+  "private": true,
+  "workspaces": [
+    "apps/web"
+  ],
+  "scripts": {
+    "dev:web": "npm run dev --workspace @nucleus/web",
+    "build:web": "npm run build --workspace @nucleus/web",
+    "check:web": "npm run check --workspace @nucleus/web"
+  }
+}
