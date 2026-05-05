@@ -3782,6 +3782,9 @@ mod tests {
 
     fn initialize_test_store(state_dir: &std::path::Path) -> Arc<StateStore> {
         let workspace_root = state_dir.join("workspace");
+        if let Some(default_root) = dirs::home_dir().map(|path| path.join("dev-projects")) {
+            fs::create_dir_all(default_root).expect("default workspace root should exist");
+        }
         fs::create_dir_all(&workspace_root).expect("workspace root should exist");
 
         let store =
