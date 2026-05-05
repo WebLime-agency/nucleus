@@ -1,0 +1,89 @@
+name: Nightly Promote
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: nightly-promote
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout dev
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Rust tests
+        run: cargo test --manifest-path Cargo.toml
+
+      - name: Web checks
+        run: npm run check:web
+
+      - name: Web build
+        run: npm run build:web
+
+      - name: Detect pending promotion
+        id: diff
+        run: |
+          git fetch origin main dev
+          if git diff --quiet origin/main..origin/dev; then
+            echo "pending=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "pending=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or update promotion PR
+        if: steps.diff.outputs.pending == 'true'
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          existing="$(gh pr list --base main --head dev --state open --json number --jq '.[0].number')"
+          if [ -n "$existing" ]; then
+            echo "number=$existing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          gh pr create \
+            --base main \
+            --head dev \
+            --title 'chore: promote dev to main' \
+            --body 'Nightly promotion from `dev` after CI passed.'
+
+          number="$(gh pr list --base main --head dev --state open --json number --jq '.[0].number')"
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+
+      - name: Enable auto-merge on promotion PR
+        if: steps.diff.outputs.pending == 'true' && steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr merge "${{ steps.pr.outputs.number }}" --squash --auto
