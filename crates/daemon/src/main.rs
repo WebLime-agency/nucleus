@@ -5,7 +5,9 @@ mod updates;
 use std::{
     collections::BTreeSet,
     env, fs,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
+    process::Command as StdCommand,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -16,22 +18,25 @@ use axum::{
     body::Bytes,
     extract::{
         Path, Query, State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        Request,
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
-    http::StatusCode,
-    response::IntoResponse,
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::get,
 };
 use futures_util::SinkExt;
 use host::{DEFAULT_PROCESS_LIMIT, HostEngine, ProcessSort, resolve_process_limit};
 use nucleus_core::{AdapterKind, DEFAULT_DAEMON_ADDR, PRODUCT_NAME, product_banner};
 use nucleus_protocol::{
-    ActionParameter, ActionRunRequest, ActionRunResponse, ActionSummary, AuditEvent,
-    CreateSessionRequest, DaemonEvent, HealthResponse, HostStatus, ProcessKillRequest,
-    ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate, ProjectUpdateRequest,
-    PromptProgressUpdate, RouterProfileSummary, RuntimeOverview, RuntimeSummary, SessionDetail,
-    SessionPromptRequest, SessionSummary, SettingsSummary, StreamConnected, SystemStats,
-    UpdateSessionRequest, UpdateStatus, WorkspaceSummary, WorkspaceUpdateRequest,
+    ActionParameter, ActionRunRequest, ActionRunResponse, ActionSummary, AuditEvent, AuthSummary,
+    ConnectionSummary, CreateSessionRequest, DaemonEvent, HealthResponse, HostStatus,
+    ProcessKillRequest, ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate,
+    ProjectUpdateRequest, PromptProgressUpdate, RouterProfileSummary, RuntimeOverview,
+    RuntimeSummary, SessionDetail, SessionPromptRequest, SessionSummary, SettingsSummary,
+    StreamConnected, SystemStats, UpdateSessionRequest, UpdateStatus, WorkspaceSummary,
+    WorkspaceUpdateRequest,
 };
 use nucleus_storage::{AuditEventRecord, ProjectPatch, SessionPatch, SessionRecord, StateStore};
 use runtime::{PromptStreamEvent, RuntimeManager};
@@ -41,7 +46,11 @@ use tokio::{
     sync::{broadcast, mpsc},
     time::{self, MissedTickBehavior},
 };
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    cors::CorsLayer,
+    services::{ServeDir, ServeFile},
+    trace::TraceLayer,
+};
 use tracing::{info, warn};
 use updates::{InstanceRuntime, UpdateManager};
 use uuid::Uuid;
@@ -64,6 +73,8 @@ struct AppState {
     host: Arc<HostEngine>,
     runtimes: Arc<RuntimeManager>,
     updates: Arc<UpdateManager>,
+    web_dist_dir: Option<PathBuf>,
+    tailscale_dns_name: Option<String>,
     events: broadcast::Sender<DaemonEvent>,
 }
 
@@ -73,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
 
     let bind = env::var("NUCLEUS_BIND").unwrap_or_else(|_| DEFAULT_DAEMON_ADDR.to_string());
     let instance = InstanceRuntime::detect(bind.clone());
+    let web_dist_dir = resolve_web_dist_dir(&instance);
     let updates = Arc::new(UpdateManager::new(instance.clone()));
     let (events, _) = broadcast::channel(32);
     let state = AppState {
@@ -81,6 +93,8 @@ async fn main() -> anyhow::Result<()> {
         host: Arc::new(HostEngine::new()),
         runtimes: Arc::new(RuntimeManager::default()),
         updates,
+        web_dist_dir,
+        tailscale_dns_name: detect_tailscale_dns_name(),
         events,
     };
     spawn_event_publisher(state.clone());
@@ -101,60 +115,80 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn app(state: AppState) -> Router {
-    Router::new()
-        .route("/", get(root))
-        .route("/health", get(health))
-        .route("/api/health", get(health))
-        .route("/api/overview", get(overview))
-        .route("/api/runtimes", get(runtimes))
-        .route("/api/settings", get(settings))
+    let protected_api = Router::new()
+        .route("/overview", get(overview))
+        .route("/runtimes", get(runtimes))
+        .route("/settings", get(settings))
         .route(
-            "/api/settings/update/check",
+            "/settings/update/check",
             axum::routing::post(check_for_updates),
         )
         .route(
-            "/api/settings/update/apply",
+            "/settings/update/apply",
             axum::routing::post(apply_update),
         )
-        .route("/api/workspace", get(workspace).patch(update_workspace))
+        .route("/workspace", get(workspace).patch(update_workspace))
         .route(
-            "/api/workspace/projects/sync",
+            "/workspace/projects/sync",
             axum::routing::post(sync_projects),
         )
         .route(
-            "/api/workspace/projects/{project_id}",
+            "/workspace/projects/{project_id}",
             axum::routing::patch(update_project),
         )
-        .route("/api/router/profiles", get(router_profiles))
-        .route("/api/actions", get(actions))
-        .route("/api/actions/{action_id}", get(action_detail))
+        .route("/router/profiles", get(router_profiles))
+        .route("/actions", get(actions))
+        .route("/actions/{action_id}", get(action_detail))
         .route(
-            "/api/actions/{action_id}/run",
+            "/actions/{action_id}/run",
             axum::routing::post(run_action),
         )
-        .route("/api/audit", get(audit_events))
-        .route("/api/sessions", get(list_sessions).post(create_session))
+        .route("/audit", get(audit_events))
+        .route("/sessions", get(list_sessions).post(create_session))
         .route(
-            "/api/sessions/{session_id}",
+            "/sessions/{session_id}",
             get(session_detail)
                 .patch(update_session)
                 .delete(delete_session),
         )
         .route(
-            "/api/sessions/{session_id}/prompt",
+            "/sessions/{session_id}/prompt",
             get(session_detail).post(prompt_session),
         )
-        .route("/api/host-status", get(host_status))
-        .route("/api/system", get(system_stats))
-        .route("/api/system/processes", get(processes).post(kill_process))
+        .route("/host-status", get(host_status))
+        .route("/system", get(system_stats))
+        .route("/system/processes", get(processes).post(kill_process))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_api_auth,
+        ));
+
+    let router = Router::new()
+        .route("/health", get(health))
+        .route("/api/health", get(health))
+        .nest("/api", protected_api)
         .route("/ws", get(stream_socket))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        .with_state(state.clone());
+
+    match &state.web_dist_dir {
+        Some(web_dist_dir) => router.fallback_service(static_web_service(web_dist_dir)),
+        None => router.route("/", get(root)),
+    }
 }
 
 async fn root() -> &'static str {
     "Nucleus daemon"
+}
+
+async fn require_api_auth(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    authorize_access(&state, request.headers(), None)?;
+    Ok(next.run(request).await)
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -170,6 +204,11 @@ async fn overview(State(state): State<AppState>) -> Result<Json<RuntimeOverview>
 #[derive(Debug, Deserialize)]
 struct RuntimeQuery {
     refresh: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct WebSocketAuthQuery {
+    token: Option<String>,
 }
 
 async fn runtimes(
@@ -1233,8 +1272,19 @@ async fn run_action(
     Ok(Json(execute_action(&state, &action_id, payload).await?))
 }
 
-async fn stream_socket(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_stream_socket(socket, state))
+async fn stream_socket(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Query(query): Query<WebSocketAuthQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    match authorize_access(&state, &headers, query.token.as_deref()) {
+        Ok(()) => ws.on_upgrade(move |socket| handle_stream_socket(socket, state)),
+        Err(error) => {
+            let reason = error.message.clone();
+            ws.on_upgrade(move |socket| handle_unauthorized_stream_socket(socket, reason))
+        }
+    }
 }
 
 async fn handle_stream_socket(mut socket: WebSocket, state: AppState) {
@@ -1292,6 +1342,16 @@ async fn handle_stream_socket(mut socket: WebSocket, state: AppState) {
             }
         }
     }
+}
+
+async fn handle_unauthorized_stream_socket(mut socket: WebSocket, reason: String) {
+    let _ = socket
+        .send(Message::Close(Some(CloseFrame {
+            code: 4401,
+            reason: reason.into(),
+        })))
+        .await;
+    let _ = socket.close().await;
 }
 
 async fn send_initial_stream_snapshot(
@@ -1435,11 +1495,24 @@ async fn publish_update_event(state: &AppState, update: UpdateStatus) -> anyhow:
 }
 
 async fn build_settings_summary(state: &AppState) -> SettingsSummary {
+    let instance = state.updates.instance_summary();
+    let hostname = state.host.host_status().hostname;
+
     SettingsSummary {
         product: PRODUCT_NAME.to_string(),
         version: state.version.clone(),
-        instance: state.updates.instance_summary(),
+        instance: instance.clone(),
         storage: state.store.storage_summary(),
+        auth: AuthSummary {
+            enabled: true,
+            token_path: state.store.local_auth_token_path(),
+        },
+        connection: build_connection_summary(
+            &instance.daemon_bind,
+            &hostname,
+            state.tailscale_dns_name.as_deref(),
+            state.web_dist_dir.as_ref(),
+        ),
         update: state.updates.current().await,
     }
 }
@@ -2634,6 +2707,134 @@ async fn shutdown_signal() {
     }
 }
 
+fn authorize_access(
+    state: &AppState,
+    headers: &HeaderMap,
+    query_token: Option<&str>,
+) -> Result<(), ApiError> {
+    let token = bearer_token(headers)
+        .or(query_token.map(str::trim).filter(|value| !value.is_empty()))
+        .ok_or_else(|| ApiError::unauthorized("Authentication required. Provide a bearer token."))?;
+
+    if state.store.validate_access_token(token).map_err(ApiError::from)? {
+        return Ok(());
+    }
+
+    Err(ApiError::unauthorized(
+        "Authentication required. The provided bearer token is invalid.",
+    ))
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn static_web_service(web_dist_dir: &PathBuf) -> ServeDir<ServeFile> {
+    let spa_fallback = if web_dist_dir.join("200.html").is_file() {
+        web_dist_dir.join("200.html")
+    } else {
+        web_dist_dir.join("index.html")
+    };
+
+    ServeDir::new(web_dist_dir)
+        .append_index_html_on_directories(true)
+        .fallback(ServeFile::new(spa_fallback))
+}
+
+fn resolve_web_dist_dir(instance: &InstanceRuntime) -> Option<PathBuf> {
+    let candidates = [
+        env::var("NUCLEUS_WEB_DIST_DIR").ok().map(PathBuf::from),
+        Some(instance.repo_root.join("apps/web/build")),
+    ];
+
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|candidate| candidate.join("index.html").is_file())
+}
+
+fn detect_tailscale_dns_name() -> Option<String> {
+    let output = StdCommand::new("tailscale")
+        .args(["status", "--json"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let payload: Value = serde_json::from_slice(&output.stdout).ok()?;
+    let dns_name = payload
+        .get("Self")
+        .and_then(|value| value.get("DNSName"))
+        .and_then(Value::as_str)
+        .map(|value| value.trim_end_matches('.').to_string())?;
+
+    if dns_name.is_empty() {
+        return None;
+    }
+
+    Some(dns_name)
+}
+
+fn build_connection_summary(
+    bind: &str,
+    hostname: &str,
+    tailscale_dns_name: Option<&str>,
+    web_dist_dir: Option<&PathBuf>,
+) -> ConnectionSummary {
+    let port = bind_port(bind).unwrap_or(80);
+    let local_url = format!("http://127.0.0.1:{port}");
+    let hostname_url = if bind_exposes_remote_access(bind) {
+        Some(format!("http://{hostname}:{port}"))
+    } else {
+        None
+    };
+    let tailscale_url = if bind_exposes_remote_access(bind) {
+        tailscale_dns_name.map(|value| format!("http://{value}:{port}"))
+    } else {
+        None
+    };
+
+    ConnectionSummary {
+        local_url,
+        hostname_url,
+        tailscale_url,
+        web_mode: if web_dist_dir.is_some() {
+            "embedded_static".to_string()
+        } else {
+            "api_only".to_string()
+        },
+        web_root: web_dist_dir.map(|path| path.display().to_string()),
+    }
+}
+
+fn bind_port(bind: &str) -> Option<u16> {
+    bind.parse::<SocketAddr>()
+        .ok()
+        .map(|addr| addr.port())
+        .or_else(|| bind.rsplit_once(':').and_then(|(_, port)| port.parse::<u16>().ok()))
+}
+
+fn bind_exposes_remote_access(bind: &str) -> bool {
+    if bind.starts_with("127.0.0.1:") || bind.starts_with("localhost:") {
+        return false;
+    }
+
+    match bind.parse::<SocketAddr>() {
+        Ok(addr) => match addr.ip() {
+            IpAddr::V4(ip) => !ip.is_loopback(),
+            IpAddr::V6(ip) => !ip.is_loopback(),
+        },
+        Err(_) => true,
+    }
+}
+
 #[derive(Debug)]
 struct ApiError {
     status: StatusCode,
@@ -2646,6 +2847,14 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             code: "bad_request",
+            message: message.into(),
+        }
+    }
+
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            code: "unauthorized",
             message: message.into(),
         }
     }
@@ -2845,6 +3054,8 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes,
             updates: Arc::new(UpdateManager::new(test_instance_runtime())),
+            web_dist_dir: None,
+            tailscale_dns_name: None,
             events,
         };
 
@@ -2904,6 +3115,8 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes,
             updates: Arc::new(UpdateManager::new(test_instance_runtime())),
+            web_dist_dir: None,
+            tailscale_dns_name: None,
             events,
         };
 
@@ -2959,6 +3172,8 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes,
             updates: Arc::new(UpdateManager::new(test_instance_runtime())),
+            web_dist_dir: None,
+            tailscale_dns_name: None,
             events,
         };
 
@@ -3039,6 +3254,8 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes,
             updates: Arc::new(UpdateManager::new(test_instance_runtime())),
+            web_dist_dir: None,
+            tailscale_dns_name: None,
             events,
         };
 

@@ -1,5 +1,6 @@
 import { z } from 'zod';
 
+import { NucleusAuthError, readAccessToken } from './auth';
 import {
   actionRunRequestSchema,
   actionRunResponseSchema,
@@ -28,9 +29,29 @@ import {
 type FetchLike = typeof fetch;
 type ProcessSort = 'cpu' | 'memory';
 
+async function daemonFetch(fetchImpl: FetchLike, input: string, init: RequestInit = {}) {
+  const headers = new Headers(init.headers ?? {});
+  const token = readAccessToken();
+
+  if (token) {
+    headers.set('authorization', `Bearer ${token}`);
+  }
+
+  return fetchImpl(input, {
+    ...init,
+    headers
+  });
+}
+
 async function parseJson<T>(response: Response, schema: z.ZodType<T>): Promise<T> {
   if (!response.ok) {
-    throw new Error(await readErrorMessage(response));
+    const message = await readErrorMessage(response);
+
+    if (response.status === 401) {
+      throw new NucleusAuthError(message);
+    }
+
+    throw new Error(message);
   }
 
   const payload = await response.json().catch(() => null);
@@ -44,6 +65,10 @@ async function parseJson<T>(response: Response, schema: z.ZodType<T>): Promise<T
 }
 
 async function readErrorMessage(response: Response): Promise<string> {
+  if (response.status === 401) {
+    return 'Authentication required. Enter a valid Nucleus access token.';
+  }
+
   const payload = await response.json().catch(() => null);
   const parsed = apiErrorSchema.safeParse(payload);
 
@@ -56,7 +81,7 @@ async function readErrorMessage(response: Response): Promise<string> {
 
 export async function fetchOverview(fetchImpl: FetchLike = fetch) {
   return parseJson(
-    await fetchImpl('/api/overview', {
+    await daemonFetch(fetchImpl, '/api/overview', {
       headers: { accept: 'application/json' }
     }),
     runtimeOverviewSchema
@@ -67,7 +92,7 @@ export async function fetchRuntimes(refresh = false, fetchImpl: FetchLike = fetc
   const query = refresh ? '?refresh=true' : '';
 
   return parseJson(
-    await fetchImpl(`/api/runtimes${query}`, {
+    await daemonFetch(fetchImpl, `/api/runtimes${query}`, {
       headers: { accept: 'application/json' }
     }),
     z.array(runtimeSummarySchema)
@@ -76,7 +101,7 @@ export async function fetchRuntimes(refresh = false, fetchImpl: FetchLike = fetc
 
 export async function fetchSessions(fetchImpl: FetchLike = fetch) {
   return parseJson(
-    await fetchImpl('/api/sessions', {
+    await daemonFetch(fetchImpl, '/api/sessions', {
       headers: { accept: 'application/json' }
     }),
     z.array(sessionSummarySchema)
@@ -85,7 +110,7 @@ export async function fetchSessions(fetchImpl: FetchLike = fetch) {
 
 export async function fetchWorkspace(fetchImpl: FetchLike = fetch) {
   return parseJson(
-    await fetchImpl('/api/workspace', {
+    await daemonFetch(fetchImpl, '/api/workspace', {
       headers: { accept: 'application/json' }
     }),
     workspaceSummarySchema
@@ -94,7 +119,7 @@ export async function fetchWorkspace(fetchImpl: FetchLike = fetch) {
 
 export async function fetchSettings(fetchImpl: FetchLike = fetch) {
   return parseJson(
-    await fetchImpl('/api/settings', {
+    await daemonFetch(fetchImpl, '/api/settings', {
       headers: { accept: 'application/json' }
     }),
     settingsSummarySchema
@@ -103,7 +128,7 @@ export async function fetchSettings(fetchImpl: FetchLike = fetch) {
 
 export async function checkForUpdates(fetchImpl: FetchLike = fetch) {
   return parseJson(
-    await fetchImpl('/api/settings/update/check', {
+    await daemonFetch(fetchImpl, '/api/settings/update/check', {
       method: 'POST',
       headers: { accept: 'application/json' }
     }),
@@ -113,7 +138,7 @@ export async function checkForUpdates(fetchImpl: FetchLike = fetch) {
 
 export async function applyUpdate(fetchImpl: FetchLike = fetch) {
   return parseJson(
-    await fetchImpl('/api/settings/update/apply', {
+    await daemonFetch(fetchImpl, '/api/settings/update/apply', {
       method: 'POST',
       headers: { accept: 'application/json' }
     }),
@@ -128,7 +153,7 @@ export async function updateWorkspace(
   const payload = workspaceUpdateRequestSchema.parse(input);
 
   return parseJson(
-    await fetchImpl('/api/workspace', {
+    await daemonFetch(fetchImpl, '/api/workspace', {
       method: 'PATCH',
       headers: {
         'content-type': 'application/json',
@@ -148,7 +173,7 @@ export async function updateProject(
   const payload = projectUpdateRequestSchema.parse(input);
 
   return parseJson(
-    await fetchImpl(`/api/workspace/projects/${projectId}`, {
+    await daemonFetch(fetchImpl, `/api/workspace/projects/${projectId}`, {
       method: 'PATCH',
       headers: {
         'content-type': 'application/json',
@@ -162,7 +187,7 @@ export async function updateProject(
 
 export async function fetchRouterProfiles(fetchImpl: FetchLike = fetch) {
   return parseJson(
-    await fetchImpl('/api/router/profiles', {
+    await daemonFetch(fetchImpl, '/api/router/profiles', {
       headers: { accept: 'application/json' }
     }),
     z.array(routerProfileSummarySchema)
@@ -171,7 +196,7 @@ export async function fetchRouterProfiles(fetchImpl: FetchLike = fetch) {
 
 export async function fetchActions(fetchImpl: FetchLike = fetch) {
   return parseJson(
-    await fetchImpl('/api/actions', {
+    await daemonFetch(fetchImpl, '/api/actions', {
       headers: { accept: 'application/json' }
     }),
     z.array(actionSummarySchema)
@@ -182,7 +207,7 @@ export async function fetchAuditEvents(limit = 20, fetchImpl: FetchLike = fetch)
   const params = new URLSearchParams({ limit: String(limit) });
 
   return parseJson(
-    await fetchImpl(`/api/audit?${params.toString()}`, {
+    await daemonFetch(fetchImpl, `/api/audit?${params.toString()}`, {
       headers: { accept: 'application/json' }
     }),
     z.array(auditEventSchema)
@@ -191,7 +216,7 @@ export async function fetchAuditEvents(limit = 20, fetchImpl: FetchLike = fetch)
 
 export async function fetchSessionDetail(sessionId: string, fetchImpl: FetchLike = fetch) {
   return parseJson(
-    await fetchImpl(`/api/sessions/${sessionId}`, {
+    await daemonFetch(fetchImpl, `/api/sessions/${sessionId}`, {
       headers: { accept: 'application/json' }
     }),
     sessionDetailSchema
@@ -205,7 +230,7 @@ export async function createSession(
   const payload = createSessionRequestSchema.parse(input);
 
   return parseJson(
-    await fetchImpl('/api/sessions', {
+    await daemonFetch(fetchImpl, '/api/sessions', {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -225,7 +250,7 @@ export async function updateSession(
   const payload = updateSessionRequestSchema.parse(input);
 
   return parseJson(
-    await fetchImpl(`/api/sessions/${sessionId}`, {
+    await daemonFetch(fetchImpl, `/api/sessions/${sessionId}`, {
       method: 'PATCH',
       headers: {
         'content-type': 'application/json',
@@ -238,13 +263,19 @@ export async function updateSession(
 }
 
 export async function deleteSession(sessionId: string, fetchImpl: FetchLike = fetch) {
-  const response = await fetchImpl(`/api/sessions/${sessionId}`, {
+  const response = await daemonFetch(fetchImpl, `/api/sessions/${sessionId}`, {
     method: 'DELETE',
     headers: { accept: 'application/json' }
   });
 
   if (!response.ok && response.status !== 204) {
-    throw new Error(await readErrorMessage(response));
+    const message = await readErrorMessage(response);
+
+    if (response.status === 401) {
+      throw new NucleusAuthError(message);
+    }
+
+    throw new Error(message);
   }
 }
 
@@ -256,7 +287,7 @@ export async function sendSessionPrompt(
   const payload = sessionPromptRequestSchema.parse(input);
 
   return parseJson(
-    await fetchImpl(`/api/sessions/${sessionId}/prompt`, {
+    await daemonFetch(fetchImpl, `/api/sessions/${sessionId}/prompt`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -276,7 +307,7 @@ export async function runAction(
   const payload = actionRunRequestSchema.parse(input);
 
   return parseJson(
-    await fetchImpl(`/api/actions/${actionId}/run`, {
+    await daemonFetch(fetchImpl, `/api/actions/${actionId}/run`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -290,7 +321,7 @@ export async function runAction(
 
 export async function fetchSystemStats(fetchImpl: FetchLike = fetch) {
   return parseJson(
-    await fetchImpl('/api/system', {
+    await daemonFetch(fetchImpl, '/api/system', {
       headers: { accept: 'application/json' }
     }),
     systemStatsSchema
@@ -314,7 +345,7 @@ export async function fetchProcesses(
   const query = params.size > 0 ? `?${params.toString()}` : '';
 
   return parseJson(
-    await fetchImpl(`/api/system/processes${query}`, {
+    await daemonFetch(fetchImpl, `/api/system/processes${query}`, {
       headers: { accept: 'application/json' }
     }),
     processListResponseSchema
@@ -325,7 +356,7 @@ export async function killProcess(pid: number, fetchImpl: FetchLike = fetch) {
   const payload = processKillRequestSchema.parse({ pid });
 
   return parseJson(
-    await fetchImpl('/api/system/processes', {
+    await daemonFetch(fetchImpl, '/api/system/processes', {
       method: 'POST',
       headers: {
         'content-type': 'application/json',

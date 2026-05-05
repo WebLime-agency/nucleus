@@ -5,6 +5,8 @@
     Download,
     GitBranch,
     HardDrive,
+    KeyRound,
+    Link,
     RefreshCcw,
     Settings2,
     Server,
@@ -21,7 +23,7 @@
     CardTitle
   } from '$lib/components/ui/card';
   import { applyUpdate, checkForUpdates, fetchSettings } from '$lib/nucleus/client';
-  import { compactPath } from '$lib/nucleus/format';
+  import { compactPath, formatState } from '$lib/nucleus/format';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
   import type { DaemonEvent, SettingsSummary } from '$lib/nucleus/schemas';
 
@@ -250,7 +252,7 @@
             <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Current</div>
             <div class="mt-2 text-sm font-medium text-zinc-50">
               {settings?.version ?? '0.0.0'}{#if update?.current_commit_short}
-                <span class="text-zinc-500"> · {update.current_commit_short}</span>
+                <span class="text-zinc-500"> - {update.current_commit_short}</span>
               {/if}
             </div>
           </div>
@@ -258,7 +260,7 @@
             <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Remote</div>
             <div class="mt-2 text-sm font-medium text-zinc-50">
               {#if update?.remote_commit_short}
-                {update.remote_name}/{update.branch || 'main'} · {update.remote_commit_short}
+                {update.remote_name}/{update.branch || 'main'} - {update.remote_commit_short}
               {:else}
                 Not checked yet
               {/if}
@@ -294,6 +296,89 @@
             <Download class={applying ? 'size-4 animate-spin' : 'size-4'} />
             {applying ? 'Updating' : 'Update now'}
           </Button>
+        </div>
+      </CardContent>
+    </Card>
+  </section>
+
+  <section class="grid gap-4 xl:grid-cols-[0.95fr_1.05fr]">
+    <Card>
+      <CardHeader>
+        <CardTitle>Connection</CardTitle>
+        <CardDescription>
+          These are the daemon-facing URLs for this instance and the current web delivery mode.
+        </CardDescription>
+      </CardHeader>
+      <CardContent class="space-y-3">
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+          <div class="flex items-center gap-2 text-xs uppercase tracking-[0.16em] text-zinc-500">
+            <Link class="size-3.5" />
+            <span>Local</span>
+          </div>
+          <div class="mt-2 text-sm text-zinc-100">{settings?.connection.local_url ?? 'Unavailable'}</div>
+        </div>
+
+        {#if settings?.connection.hostname_url}
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Host</div>
+            <div class="mt-2 text-sm text-zinc-100">{settings.connection.hostname_url}</div>
+          </div>
+        {/if}
+
+        {#if settings?.connection.tailscale_url}
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Tailscale</div>
+            <div class="mt-2 text-sm text-zinc-100">{settings.connection.tailscale_url}</div>
+          </div>
+        {/if}
+
+        <div class="grid gap-3 sm:grid-cols-2">
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Web mode</div>
+            <div class="mt-2 text-sm font-medium text-zinc-50">
+              {formatState(settings?.connection.web_mode ?? 'unknown')}
+            </div>
+          </div>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Auth</div>
+            <div class="mt-2 text-sm font-medium text-zinc-50">
+              {settings?.auth.enabled ? 'Bearer token required' : 'Disabled'}
+            </div>
+          </div>
+        </div>
+
+        {#if settings?.connection.web_root}
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Web build path</div>
+            <div class="mt-2 text-sm text-zinc-100" title={settings.connection.web_root}>
+              {compactPath(settings.connection.web_root)}
+            </div>
+          </div>
+        {/if}
+      </CardContent>
+    </Card>
+
+    <Card>
+      <CardHeader>
+        <CardTitle>Access</CardTitle>
+        <CardDescription>
+          The daemon owns bearer-token auth. The local token is stored outside the repository.
+        </CardDescription>
+      </CardHeader>
+      <CardContent class="space-y-3">
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+          <div class="flex items-center gap-2 text-xs uppercase tracking-[0.16em] text-zinc-500">
+            <KeyRound class="size-3.5" />
+            <span>Local token path</span>
+          </div>
+          <div class="mt-2 text-sm text-zinc-100" title={settings?.auth.token_path}>
+            {settings ? compactPath(settings.auth.token_path) : 'Unavailable'}
+          </div>
+        </div>
+
+        <div class="rounded-md border border-amber-400/20 bg-amber-400/10 px-4 py-3 text-sm text-amber-100">
+          Retrieve the current token with <code>nucleus auth local-token</code>, then use it in the
+          web UI or any future client.
         </div>
       </CardContent>
     </Card>

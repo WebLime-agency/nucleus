@@ -18,6 +18,12 @@
 
   import { Badge } from '$lib/components/ui/badge';
   import { Button } from '$lib/components/ui/button';
+  import {
+    clearAccessToken,
+    isAuthError,
+    readAccessToken,
+    writeAccessToken
+  } from '$lib/nucleus/auth';
   import { createSession, fetchOverview, fetchSettings } from '$lib/nucleus/client';
   import { compactPath, formatCount, formatState } from '$lib/nucleus/format';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
@@ -52,6 +58,10 @@
   let sidebarOpen = $state(false);
   let updateToastVisible = $state(false);
   let dismissedUpdateCommit = $state('');
+  let authPromptVisible = $state(false);
+  let authTokenInput = $state('');
+  let authSubmitting = $state(false);
+  let authMessage = $state<string | null>(null);
 
   let pathname = $derived(page.url.pathname);
   let workspace = $derived(overview?.workspace ?? null);
@@ -85,6 +95,7 @@
   });
   let statusLabel = $derived.by(() => {
     if (loading) return 'Connecting';
+    if (authPromptVisible) return 'Auth required';
     if (refreshing) return 'Refreshing';
     if (streamStatus === 'reconnecting') return 'Reconnecting';
     if (streamStatus === 'connecting') return 'Connecting';
@@ -137,9 +148,17 @@
     try {
       overview = await fetchOverview();
       syncCreateDefaults();
+      authPromptVisible = false;
+      authMessage = null;
       error = null;
     } catch (cause) {
-      error = cause instanceof Error ? cause.message : 'Failed to reach the daemon.';
+      if (isAuthError(cause)) {
+        authPromptVisible = true;
+        authMessage = cause.message;
+        error = null;
+      } else {
+        error = cause instanceof Error ? cause.message : 'Failed to reach the daemon.';
+      }
     } finally {
       loading = false;
       refreshing = false;
@@ -149,8 +168,11 @@
   async function loadSettings() {
     try {
       applySettings(await fetchSettings());
-    } catch {
-      // Leave the shell usable even if settings hydration fails.
+    } catch (cause) {
+      if (isAuthError(cause)) {
+        authPromptVisible = true;
+        authMessage = cause.message;
+      }
     }
   }
 
@@ -225,6 +247,33 @@
     }
   }
 
+  async function handleSaveAccessToken() {
+    authSubmitting = true;
+    authMessage = null;
+    writeAccessToken(authTokenInput);
+
+    try {
+      await fetchSettings();
+      window.location.reload();
+    } catch (cause) {
+      if (isAuthError(cause)) {
+        authPromptVisible = true;
+        authMessage = cause.message;
+      } else {
+        error = cause instanceof Error ? cause.message : 'Failed to validate the access token.';
+      }
+    } finally {
+      authSubmitting = false;
+    }
+  }
+
+  function handleClearAccessToken() {
+    clearAccessToken();
+    authTokenInput = '';
+    authPromptVisible = true;
+    authMessage = 'Enter the Nucleus access token for this server.';
+  }
+
   function applyStreamEvent(event: DaemonEvent) {
     if (event.event === 'overview.updated') {
       overview = event.data;
@@ -244,6 +293,7 @@
   }
 
   onMount(() => {
+    authTokenInput = readAccessToken();
     dismissedUpdateCommit = window.localStorage.getItem('nucleus.dismissedUpdateCommit') ?? '';
     void loadShell();
     void loadSettings();
@@ -255,6 +305,10 @@
       },
       onError: (message) => {
         error = message;
+      },
+      onAuthError: (message) => {
+        authPromptVisible = true;
+        authMessage = message;
       }
     });
 
@@ -420,7 +474,7 @@
           <FolderRoot class="size-3.5 text-zinc-600" />
           <span>{workspace ? formatCount(workspace.projects.length) : '0'} projects</span>
           {#if workspace}
-            <span>·</span>
+            <span>-</span>
             <span>{formatCount(sessionsWithProjects)} attached</span>
           {/if}
         </div>
@@ -473,7 +527,7 @@
       </div>
     </div>
 
-    {#if error}
+    {#if error && !authPromptVisible}
       <div class="mb-6 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">
         {error}
       </div>
@@ -486,6 +540,49 @@
     </div>
   </main>
 </div>
+
+{#if authPromptVisible}
+  <div class="fixed inset-0 z-[60] flex items-center justify-center bg-black/75 px-4">
+    <div class="w-full max-w-md rounded-lg border border-zinc-800 bg-zinc-950 p-5 shadow-2xl">
+      <div class="text-lg font-semibold text-zinc-50">Connect To Nucleus</div>
+      <div class="mt-2 text-sm leading-6 text-zinc-400">
+        This server requires a bearer token before the daemon APIs and session stream become available.
+      </div>
+
+      <div class="mt-4 space-y-2">
+        <label class="text-xs uppercase tracking-[0.16em] text-zinc-500" for="nucleus-access-token">
+          Access Token
+        </label>
+        <input
+          id="nucleus-access-token"
+          class="h-11 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
+          bind:value={authTokenInput}
+          placeholder="nuctk_..."
+          autocomplete="off"
+          autocapitalize="off"
+          spellcheck="false"
+        />
+      </div>
+
+      <div class="mt-3 rounded-md border border-zinc-800 bg-zinc-950/60 px-3 py-2 text-xs text-zinc-500">
+        Current origin: {page.url.origin}
+      </div>
+
+      {#if authMessage}
+        <div class="mt-3 rounded-md border border-amber-400/20 bg-amber-400/10 px-3 py-2 text-sm text-amber-100">
+          {authMessage}
+        </div>
+      {/if}
+
+      <div class="mt-5 flex items-center justify-end gap-2">
+        <Button variant="ghost" onclick={handleClearAccessToken}>Clear</Button>
+        <Button onclick={handleSaveAccessToken} disabled={authSubmitting || !authTokenInput.trim()}>
+          {authSubmitting ? 'Checking...' : 'Connect'}
+        </Button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 {#if updateToastVisible && settings}
   <div class="fixed bottom-4 right-4 z-50 w-[min(22rem,calc(100vw-2rem))] rounded-lg border border-lime-300/20 bg-zinc-950/95 px-4 py-3 shadow-2xl backdrop-blur">

@@ -5,6 +5,7 @@ target/
 test-results/
 .env
 .env.*
+.nucleus-local/
 
 apps/web/.svelte-kit/
 apps/web/build/

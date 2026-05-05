@@ -1,5 +1,6 @@
 import { browser } from '$app/environment';
 
+import { readAccessToken } from './auth';
 import { daemonEventSchema, type DaemonEvent } from './schemas';
 
 export type StreamStatus = 'connecting' | 'connected' | 'reconnecting' | 'closed';
@@ -8,6 +9,7 @@ interface StreamOptions {
   onEvent: (event: DaemonEvent) => void;
   onStatusChange?: (status: StreamStatus) => void;
   onError?: (message: string) => void;
+  onAuthError?: (message: string) => void;
 }
 
 export function connectDaemonStream(options: StreamOptions) {
@@ -45,8 +47,15 @@ export function connectDaemonStream(options: StreamOptions) {
     clearReconnectTimer();
     setStatus(socket === null ? 'connecting' : 'reconnecting');
 
+    const token = readAccessToken();
+    if (!token) {
+      setStatus('closed');
+      return;
+    }
+
     const url = new URL('/ws', window.location.href);
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    url.searchParams.set('token', token);
 
     socket = new WebSocket(url);
 
@@ -83,11 +92,19 @@ export function connectDaemonStream(options: StreamOptions) {
       socket?.close();
     };
 
-    socket.onclose = () => {
+    socket.onclose = (event) => {
       socket = null;
 
       if (disposed) {
         setStatus('closed');
+        return;
+      }
+
+      if (event.code === 4401) {
+        setStatus('closed');
+        options.onAuthError?.(
+          event.reason || 'Authentication required. Enter a valid Nucleus access token.'
+        );
         return;
       }
 

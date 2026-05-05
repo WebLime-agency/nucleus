@@ -14,6 +14,11 @@ use nucleus_protocol::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+const LOCAL_AUTH_TOKEN_HASH_KEY: &str = "auth.local_token_hash";
+const LOCAL_AUTH_TOKEN_FILE_NAME: &str = "local-auth-token";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoragePlan {
@@ -174,6 +179,7 @@ impl StateStore {
         seed_runtimes(&connection)?;
         seed_router_profiles(&connection)?;
         seed_workspace_settings(&connection)?;
+        ensure_local_auth_token_with_connection(&plan, &connection)?;
         sync_projects_with_connection(&connection)?;
 
         Ok(Self {
@@ -184,6 +190,26 @@ impl StateStore {
 
     pub fn storage_summary(&self) -> StorageSummary {
         self.plan.summary()
+    }
+
+    pub fn local_auth_token_path(&self) -> String {
+        display(&self.plan.state_dir.join(LOCAL_AUTH_TOKEN_FILE_NAME))
+    }
+
+    pub fn read_local_auth_token(&self) -> Result<String> {
+        fs::read_to_string(self.plan.state_dir.join(LOCAL_AUTH_TOKEN_FILE_NAME))
+            .with_context(|| "failed to read local auth token".to_string())
+            .map(|value| value.trim().to_string())
+    }
+
+    pub fn validate_access_token(&self, token: &str) -> Result<bool> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let Some(expected_hash) = setting_value_optional(&connection, LOCAL_AUTH_TOKEN_HASH_KEY)?
+        else {
+            return Ok(false);
+        };
+
+        Ok(hash_auth_token(token) == expected_hash)
     }
 
     pub fn list_runtimes(&self) -> Result<Vec<RuntimeSummary>> {
@@ -874,6 +900,36 @@ fn seed_workspace_settings(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_local_auth_token_with_connection(plan: &StoragePlan, connection: &Connection) -> Result<()> {
+    let token_path = plan.state_dir.join(LOCAL_AUTH_TOKEN_FILE_NAME);
+    let token_value = match setting_value_optional(connection, LOCAL_AUTH_TOKEN_HASH_KEY)? {
+        Some(hash) => {
+            let file_token = read_token_file(&token_path)?;
+
+            if !file_token.is_empty() && hash_auth_token(&file_token) == hash {
+                file_token
+            } else {
+                let next = generate_local_auth_token();
+                write_token_file(&token_path, &next)?;
+                set_setting_value(connection, LOCAL_AUTH_TOKEN_HASH_KEY, &hash_auth_token(&next))?;
+                next
+            }
+        }
+        None => {
+            let next = generate_local_auth_token();
+            write_token_file(&token_path, &next)?;
+            set_setting_value(connection, LOCAL_AUTH_TOKEN_HASH_KEY, &hash_auth_token(&next))?;
+            next
+        }
+    };
+
+    if !token_value.is_empty() {
+        write_token_file(&token_path, &token_value)?;
+    }
+
+    Ok(())
+}
+
 fn ensure_column(
     connection: &Connection,
     table: &str,
@@ -947,15 +1003,20 @@ fn set_workspace_utility_target(connection: &Connection, target: &str) -> Result
 }
 
 fn setting_value(connection: &Connection, key: &str) -> Result<String> {
+    setting_value_optional(connection, key)?
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("setting '{key}' is not configured"))
+}
+
+fn setting_value_optional(connection: &Connection, key: &str) -> Result<Option<String>> {
     connection
         .query_row(
             "SELECT value FROM app_settings WHERE key = ?1",
             params![key],
             |row| row.get::<_, String>(0),
         )
-        .optional()?
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow!("setting '{key}' is not configured"))
+        .optional()
+        .context("failed to load setting")
 }
 
 fn set_setting_value(connection: &Connection, key: &str, value: &str) -> Result<()> {
@@ -969,6 +1030,57 @@ fn set_setting_value(connection: &Connection, key: &str, value: &str) -> Result<
         ",
         params![key, value],
     )?;
+    Ok(())
+}
+
+fn generate_local_auth_token() -> String {
+    format!(
+        "nuctk_{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    )
+}
+
+fn hash_auth_token(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    let digest = hasher.finalize();
+    let mut output = String::with_capacity(digest.len() * 2);
+
+    for byte in digest {
+        output.push_str(&format!("{byte:02x}"));
+    }
+
+    output
+}
+
+fn read_token_file(path: &Path) -> Result<String> {
+    if !path.exists() {
+        return Ok(String::new());
+    }
+
+    fs::read_to_string(path)
+        .with_context(|| format!("failed to read token file '{}'", path.display()))
+        .map(|value| value.trim().to_string())
+}
+
+fn write_token_file(path: &Path, token: &str) -> Result<()> {
+    fs::write(path, format!("{token}\n"))
+        .with_context(|| format!("failed to write token file '{}'", path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let permissions = fs::Permissions::from_mode(0o600);
+        fs::set_permissions(path, permissions).with_context(|| {
+            format!(
+                "failed to set permissions on token file '{}'",
+                path.display()
+            )
+        })?;
+    }
+
     Ok(())
 }
 
@@ -2071,6 +2183,32 @@ mod tests {
             "Hi there"
         );
         assert_eq!(session.session.last_message_excerpt, "Hi there");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn provisions_and_validates_local_auth_token() {
+        let state_dir = test_state_dir("local-auth-token");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+
+        let token_path = PathBuf::from(store.local_auth_token_path());
+        let token = store
+            .read_local_auth_token()
+            .expect("local auth token should exist");
+
+        assert!(token_path.is_file());
+        assert!(token.starts_with("nuctk_"));
+        assert!(
+            store
+                .validate_access_token(&token)
+                .expect("token validation should succeed")
+        );
+        assert!(
+            !store
+                .validate_access_token("nuctk_invalid")
+                .expect("invalid token check should succeed")
+        );
 
         let _ = fs::remove_dir_all(&state_dir);
     }

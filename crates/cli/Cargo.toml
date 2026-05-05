@@ -5,11 +5,17 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "nucleus"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+dirs.workspace = true
 nucleus-core.workspace = true
 nucleus-protocol.workspace = true
+nucleus-storage.workspace = true
 reqwest.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
-

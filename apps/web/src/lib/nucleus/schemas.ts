@@ -221,6 +221,19 @@ export const instanceSummarySchema = z.object({
   install_mode: z.string()
 });
 
+export const authSummarySchema = z.object({
+  enabled: z.boolean(),
+  token_path: z.string()
+});
+
+export const connectionSummarySchema = z.object({
+  local_url: z.string(),
+  hostname_url: z.string().nullable(),
+  tailscale_url: z.string().nullable(),
+  web_mode: z.string(),
+  web_root: z.string().nullable()
+});
+
 export const updateStatusSchema = z.object({
   install_mode: z.string(),
   repo_root: z.string(),
@@ -244,6 +257,8 @@ export const settingsSummarySchema = z.object({
   version: z.string(),
   instance: instanceSummarySchema,
   storage: storageSummarySchema,
+  auth: authSummarySchema,
+  connection: connectionSummarySchema,
   update: updateStatusSchema
 });
 

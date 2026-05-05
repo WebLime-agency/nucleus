@@ -1,173 +1,179 @@
 # Nucleus
 
-Nucleus is a local AI control plane. It is being built to unify local session control, routing, and machine operations inside one daemon-owned system.
+Nucleus is a local AI control plane. The Rust daemon is the product core. It owns sessions, routing, machine operations, auth, persistence, and the HTTP/WebSocket contracts that every client uses.
 
-## Current Focus
+The SvelteKit app in this repo is one client. Future native clients should talk to the same daemon contracts instead of reimplementing backend logic.
 
-V1 is intentionally narrow:
-
-- replace the daily local AI session surface currently handled by older local tooling
-- replace the current Mission Control host dashboards for CPU, memory, and process operations
-
-The long-term direction is one daemon-owned system of record for local agent work, model routing, approvals, automation, and host visibility.
-
-## What Is In This Repo
-
-This repository is a monorepo for the Nucleus runtime and clients:
-
-- Rust daemon
-- operator CLI
-- SvelteKit web UI
-- shared protocol and domain crates
-- future native clients
+## Repo Layout
 
 ```text
 apps/
-  web/           SvelteKit web UI
+  web/           SvelteKit web client
 clients/         future native clients
 crates/
   daemon/        Rust HTTP/WebSocket server
   cli/           operator CLI
-  core/          shared product constants and domain concepts
-  protocol/      wire types shared across surfaces
-  storage/       persistence planning and state layout
+  core/          shared constants and product-level helpers
+  protocol/      shared wire types
+  storage/       SQLite + state-dir planning
   adapters-*/    provider and compatibility adapters
 docs/
-  rfc/           architecture and product RFCs
-  backlog/       implementation checklists
-migrations/      database migrations
-scripts/         repo automation
+  rfc/           focused design documents
+  backlog/       implementation checkpoints
 ```
 
-## Architecture
+## Current Product Shape
 
-Core runtime rules:
-
-- the Rust daemon owns runtime truth and persistence
-- the web app is a client, not the backend
+- bearer-token auth is enforced on `/api/*` and `/ws`
+- `GET /health` stays public
+- the daemon can serve the built web app directly from `apps/web/build`
 - REST handles bootstrap reads and mutations
-- WebSocket handles live state and event streaming
+- WebSocket handles live telemetry, session updates, and prompt progress
+- structured operational truth lives in SQLite
+- larger artifacts live in the state directory on disk
 
-Current frontend defaults:
+## State Directory
 
-- Zod at the SvelteKit boundary
-- Tailwind CSS for styling
-- shadcn-svelte style primitives for reusable UI structure
+Default state root:
 
-## Persistence
+```text
+~/.nucleus
+```
 
-Nucleus uses a hybrid persistence model:
+Important paths:
 
-- SQLite for structured operational truth
-- filesystem storage for transcripts, attachments, playbooks, memory documents, and other artifacts
-- optional indexing and search later
+- database: `~/.nucleus/nucleus.db`
+- local auth token: `~/.nucleus/local-auth-token`
+- transcripts: `~/.nucleus/transcripts/`
+- memory docs: `~/.nucleus/memory/`
+- scratch work: `~/.nucleus/scratch/`
 
-Default local state lives outside the repository:
+To isolate multiple installs on the same machine, set `NUCLEUS_STATE_DIR` per instance.
 
-- state root: `~/.nucleus`
-- SQLite database: `~/.nucleus/nucleus.db`
+## CLI
 
-If you want multiple local installs on the same machine, set `NUCLEUS_STATE_DIR` per install so each runtime gets its own isolated state tree.
+The binary name is `nucleus`.
 
-## Instance Configuration
-
-These environment variables let multiple Nucleus installs run side by side without sharing state or ports:
-
-- `NUCLEUS_INSTANCE_NAME` - label shown in the UI
-- `NUCLEUS_STATE_DIR` - state root for SQLite, scratch, transcripts, and artifacts
-- `NUCLEUS_BIND` - daemon bind address, for example `127.0.0.1:42240`
-- `NUCLEUS_REPO_ROOT` - explicit git checkout root for update checks
-- `NUCLEUS_WEB_PORT` - Vite dev server port
-- `NUCLEUS_DAEMON_ORIGIN` - web-to-daemon proxy target, for example `http://127.0.0.1:42240`
-
-Example split for two local installs:
+Current commands:
 
 ```bash
-# upstream / official checkout
-export NUCLEUS_INSTANCE_NAME="Nucleus Dev"
-export NUCLEUS_STATE_DIR="$HOME/.nucleus-dev"
-export NUCLEUS_BIND="127.0.0.1:42240"
-export NUCLEUS_WEB_PORT="5202"
-export NUCLEUS_DAEMON_ORIGIN="http://127.0.0.1:42240"
-
-# personal daily-use checkout
-export NUCLEUS_INSTANCE_NAME="Nucleus EBA"
-export NUCLEUS_STATE_DIR="$HOME/.nucleus-eba"
-export NUCLEUS_BIND="127.0.0.1:42241"
-export NUCLEUS_WEB_PORT="5201"
-export NUCLEUS_DAEMON_ORIGIN="http://127.0.0.1:42241"
+nucleus health
+nucleus auth local-token
+nucleus setup local
+nucleus setup server
+nucleus setup client --server-url http://mini-server:5201 --token <TOKEN>
+nucleus install-service --enable
 ```
+
+What they do:
+
+- `auth local-token` prints the current local bearer token
+- `setup local` prepares a same-machine instance
+- `setup server` prepares a remotely reachable instance and prints the local, host, and Tailscale URLs when available
+- `setup client` validates a server URL and token
+- `install-service` writes a `systemd --user` unit on Linux and can enable it immediately
 
 ## Local Development
 
-Prerequisites:
+Development still uses a split runtime:
 
-- Rust toolchain
-- Node.js and npm
-- provider CLIs you intend to route through, such as `codex` or `claude`
+- daemon on `127.0.0.1:42240`
+- Vite dev server on `http://mini-server:5201`
 
-Rust workspace:
+Rust:
 
 ```bash
-cargo check
-cargo run -p nucleus-daemon
+cargo test
 ```
 
-Web UI:
+Web:
 
 ```bash
 source ~/.nvm/nvm.sh
-npm install
+npm run check:web
+npm run build:web
+```
+
+If you want the Vite client during development:
+
+```bash
+source ~/.nvm/nvm.sh
 npm run dev:web
 ```
 
-Assigned web port: `5201`
+## Production-Style Local Run
 
-Useful access URLs while the dev server is running:
-
-- `http://127.0.0.1:5201`
-- `http://localhost:5201`
-
-If you bind the web dev server to `0.0.0.0`, you can also reach it from your LAN or tailnet using your machine hostname or IP on port `5201`.
-
-The daemon binds to `127.0.0.1:42240` by default. Override it with `NUCLEUS_BIND`.
-
-The web app reads `NUCLEUS_WEB_PORT` and `NUCLEUS_DAEMON_ORIGIN` during development, so separate checkouts can point at different daemons cleanly.
-
-## Current Runtime Surface
-
-Today there are two practical ways to talk to Nucleus:
-
-- terminal checks through the CLI and raw daemon APIs
-- the browser dashboard
-
-Current browser surfaces:
-
-- host overview, CPU, memory, and process operations
-- daemon-managed sessions on `/sessions`
-- daemon audit visibility and runtime status
-
-Useful smoke checks:
+Build the web app first:
 
 ```bash
-cargo run -q -p nucleus-cli -- health
-curl http://127.0.0.1:42240/api/health
-curl http://127.0.0.1:42240/api/overview
+source ~/.nvm/nvm.sh
+npm run build:web
 ```
+
+Then run the daemon with the built web output:
+
+```bash
+NUCLEUS_BIND=0.0.0.0:5201 \
+NUCLEUS_WEB_DIST_DIR=/home/eba/tools/nucleus/apps/web/build \
+cargo run -p nucleus-daemon
+```
+
+The web UI, REST API, and WebSocket stream now come from the same server.
+
+Retrieve the access token:
+
+```bash
+cargo run -p nucleus-cli --bin nucleus -- auth local-token
+```
+
+## Service Install
+
+On Linux, the CLI can install a `systemd --user` service that runs the daemon and serves the production web build:
+
+```bash
+source ~/.nvm/nvm.sh
+npm run build:web
+cargo run -p nucleus-cli --bin nucleus -- install-service --enable --bind 0.0.0.0:5201
+```
+
+That unit writes the key runtime env vars:
+
+- `NUCLEUS_INSTANCE_NAME`
+- `NUCLEUS_STATE_DIR`
+- `NUCLEUS_BIND`
+- `NUCLEUS_REPO_ROOT`
+- `NUCLEUS_WEB_DIST_DIR`
+
+## Tailscale
+
+Nucleus does not need a separate web server for tailnet access. Bind the daemon to a reachable address, then use the server URL and bearer token from another device.
+
+Typical direct tailnet URL:
+
+```text
+http://mini-server:5201
+```
+
+When Tailscale MagicDNS is available, `nucleus setup server` also prints the fully qualified Tailscale hostname.
+
+## Auth Model
+
+- the daemon auto-provisions a local bearer token on first start
+- the token hash is stored in SQLite
+- the plaintext token is stored in the state directory outside the repo
+- the browser client stores the token locally and sends it on every API request and WebSocket connection
 
 ## Status
 
-The project is in active early development. Expect API churn while the daemon contracts and session model settle.
+The repo already includes:
 
-The current repo already includes:
-
-- daemon-owned host telemetry
-- process inspection and termination flows
-- workspace and project discovery
-- router profiles and workspace model defaults
-- background prompt jobs with live websocket progress
-- prompt include discovery from workspace, project, and session roots
-- daemon-owned update checks plus in-app update notifications for git-based installs
+- host telemetry
+- CPU, memory, and process control surfaces
+- daemon-owned sessions
+- router profiles and workspace defaults
+- background prompt jobs with live progress
+- include directory discovery for prompt assembly
+- daemon-managed update checks and apply flow for git installs
 
 ## License
 

@@ -366,6 +366,21 @@ pub struct InstanceSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthSummary {
+    pub enabled: bool,
+    pub token_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConnectionSummary {
+    pub local_url: String,
+    pub hostname_url: Option<String>,
+    pub tailscale_url: Option<String>,
+    pub web_mode: String,
+    pub web_root: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpdateStatus {
     pub install_mode: String,
     pub repo_root: String,
@@ -390,6 +405,8 @@ pub struct SettingsSummary {
     pub version: String,
     pub instance: InstanceSummary,
     pub storage: StorageSummary,
+    pub auth: AuthSummary,
+    pub connection: ConnectionSummary,
     pub update: UpdateStatus,
 }
 
