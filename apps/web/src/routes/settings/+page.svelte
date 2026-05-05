@@ -7,6 +7,7 @@
     HardDrive,
     KeyRound,
     Link,
+    Power,
     RefreshCcw,
     Settings2,
     Server,
@@ -22,7 +23,7 @@
     CardHeader,
     CardTitle
   } from '$lib/components/ui/card';
-  import { applyUpdate, checkForUpdates, fetchSettings } from '$lib/nucleus/client';
+  import { applyUpdate, checkForUpdates, fetchSettings, restartDaemon } from '$lib/nucleus/client';
   import { compactPath, formatState } from '$lib/nucleus/format';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
   import type { DaemonEvent, SettingsSummary } from '$lib/nucleus/schemas';
@@ -31,6 +32,7 @@
   let loading = $state(true);
   let checking = $state(false);
   let applying = $state(false);
+  let restarting = $state(false);
   let error = $state<string | null>(null);
   let success = $state<string | null>(null);
   let streamStatus = $state<StreamStatus>('connecting');
@@ -40,13 +42,19 @@
     if (loading) return 'Connecting';
     if (checking) return 'Checking';
     if (applying) return 'Updating';
+    if (restarting || update?.state === 'restarting') return 'Restarting';
     if (streamStatus === 'reconnecting') return 'Reconnecting';
     if (streamStatus === 'connecting') return 'Connecting';
     if (error) return 'Degraded';
     return 'Live';
   });
   let canCheck = $derived(
-    !!settings && settings.update.install_mode === 'git' && !checking && !applying
+    !!settings &&
+      settings.update.install_mode === 'git' &&
+      !checking &&
+      !applying &&
+      !restarting &&
+      settings.update.state !== 'restarting'
   );
   let canApply = $derived(
     !!update &&
@@ -55,23 +63,47 @@
       !update.dirty_worktree &&
       !update.restart_required &&
       !checking &&
-      !applying
+      !applying &&
+      !restarting &&
+      update.state !== 'restarting'
+  );
+  let canRestart = $derived(
+    !!settings &&
+      settings.instance.restart_supported &&
+      !checking &&
+      !applying &&
+      !restarting &&
+      settings.update.state !== 'restarting'
   );
 
   function updateStateVariant(
     value: string
   ): 'default' | 'secondary' | 'warning' | 'destructive' {
     if (value === 'ready') return 'default';
-    if (value === 'checking' || value === 'applying') return 'warning';
+    if (value === 'checking' || value === 'applying' || value === 'restarting') return 'warning';
     if (value === 'unsupported' || value === 'idle') return 'secondary';
     return 'destructive';
+  }
+
+  function restartModeLabel(value: string) {
+    if (value === 'systemd') return 'Systemd service';
+    if (value === 'self-reexec') return 'Managed process';
+    return 'Manual only';
+  }
+
+  function applySettings(next: SettingsSummary) {
+    settings = next;
+
+    if (next.update.state !== 'restarting') {
+      restarting = false;
+    }
   }
 
   async function loadSettings() {
     loading = settings === null;
 
     try {
-      settings = await fetchSettings();
+      applySettings(await fetchSettings());
       error = null;
     } catch (cause) {
       error = cause instanceof Error ? cause.message : 'Failed to load settings.';
@@ -86,7 +118,9 @@
 
     try {
       const next = await checkForUpdates();
-      settings = settings ? { ...settings, update: next } : settings;
+      if (settings) {
+        applySettings({ ...settings, update: next });
+      }
       error = null;
       success = next.message;
     } catch (cause) {
@@ -102,7 +136,10 @@
 
     try {
       const next = await applyUpdate();
-      settings = settings ? { ...settings, update: next } : settings;
+      if (settings) {
+        applySettings({ ...settings, update: next });
+      }
+      restarting = next.state === 'restarting';
       error = null;
       success = next.message;
     } catch (cause) {
@@ -112,15 +149,32 @@
     }
   }
 
+  async function handleRestartDaemon() {
+    restarting = true;
+    success = null;
+
+    try {
+      const next = await restartDaemon();
+      if (settings) {
+        applySettings({ ...settings, update: next });
+      }
+      error = null;
+      success = next.message;
+    } catch (cause) {
+      restarting = false;
+      error = cause instanceof Error ? cause.message : 'Failed to restart the daemon.';
+    }
+  }
+
   function applyStreamEvent(event: DaemonEvent) {
     if (event.event !== 'update.updated' || !settings) {
       return;
     }
 
-    settings = {
+    applySettings({
       ...settings,
       update: event.data
-    };
+    });
   }
 
   onMount(() => {
@@ -196,6 +250,15 @@
               {settings?.instance.daemon_bind ?? 'Unavailable'}
             </div>
           </div>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+            <div class="flex items-center gap-2 text-xs uppercase tracking-[0.16em] text-zinc-500">
+              <Power class="size-3.5" />
+              <span>Restart Control</span>
+            </div>
+            <div class="mt-2 text-sm font-medium text-zinc-50">
+              {settings ? restartModeLabel(settings.instance.restart_mode) : 'Unavailable'}
+            </div>
+          </div>
         </div>
 
         <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
@@ -224,7 +287,8 @@
       <CardHeader>
         <CardTitle>Updates</CardTitle>
         <CardDescription>
-          Source-based installs can check the origin remote and fast-forward the checkout from here.
+          Git installs can pull from origin, rebuild the daemon, rebuild the embedded web bundle
+          when this instance owns it, and restart automatically when restart control is available.
         </CardDescription>
       </CardHeader>
       <CardContent class="space-y-4">
@@ -270,7 +334,14 @@
 
         {#if update?.restart_required}
           <div class="rounded-md border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-sm text-amber-100">
-            The checkout is updated. Restart the daemon and web process to load the new code.
+            The checkout is updated, but this instance could not restart itself automatically.
+            Restart the daemon after resolving the issue.
+          </div>
+        {/if}
+
+        {#if update?.state === 'restarting' || restarting}
+          <div class="rounded-md border border-sky-400/30 bg-sky-400/10 px-4 py-3 text-sm text-sky-100">
+            Nucleus is restarting now. This page should reconnect automatically.
           </div>
         {/if}
 
@@ -295,6 +366,11 @@
           <Button variant="secondary" onclick={handleApplyUpdate} disabled={!canApply}>
             <Download class={applying ? 'size-4 animate-spin' : 'size-4'} />
             {applying ? 'Updating' : 'Update now'}
+          </Button>
+
+          <Button variant="secondary" onclick={handleRestartDaemon} disabled={!canRestart}>
+            <Power class={restarting || update?.state === 'restarting' ? 'size-4 animate-pulse' : 'size-4'} />
+            {restarting || update?.state === 'restarting' ? 'Restarting' : 'Restart daemon'}
           </Button>
         </div>
       </CardContent>
