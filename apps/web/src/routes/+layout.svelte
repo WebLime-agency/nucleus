@@ -11,16 +11,22 @@
     MemoryStick,
     MessageSquarePlus,
     MessagesSquare,
+    Settings2,
     ServerCog,
     X
   } from 'lucide-svelte';
 
   import { Badge } from '$lib/components/ui/badge';
   import { Button } from '$lib/components/ui/button';
-  import { createSession, fetchOverview } from '$lib/nucleus/client';
+  import { createSession, fetchOverview, fetchSettings } from '$lib/nucleus/client';
   import { compactPath, formatCount, formatState } from '$lib/nucleus/format';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
-  import type { DaemonEvent, RuntimeOverview, SessionSummary } from '$lib/nucleus/schemas';
+  import type {
+    DaemonEvent,
+    RuntimeOverview,
+    SessionSummary,
+    SettingsSummary
+  } from '$lib/nucleus/schemas';
   import { cn } from '$lib/utils';
   import '../app.css';
 
@@ -31,10 +37,12 @@
     { href: '/sessions', label: 'Sessions', icon: MessagesSquare },
     { href: '/workspace', label: 'Workspace', icon: FolderTree },
     { href: '/cpu', label: 'CPU', icon: Cpu },
-    { href: '/memory', label: 'Memory', icon: MemoryStick }
+    { href: '/memory', label: 'Memory', icon: MemoryStick },
+    { href: '/settings', label: 'Settings', icon: Settings2 }
   ];
 
   let overview = $state<RuntimeOverview | null>(null);
+  let settings = $state<SettingsSummary | null>(null);
   let loading = $state(true);
   let refreshing = $state(false);
   let creating = $state(false);
@@ -42,11 +50,17 @@
   let streamStatus = $state<StreamStatus>('connecting');
   let createProjectId = $state('');
   let sidebarOpen = $state(false);
+  let updateToastVisible = $state(false);
+  let dismissedUpdateCommit = $state('');
 
   let pathname = $derived(page.url.pathname);
   let workspace = $derived(overview?.workspace ?? null);
   let discoveredProjects = $derived(workspace?.projects ?? []);
   let sessions = $derived(overview?.sessions ?? []);
+  let instanceName = $derived(settings?.instance.name ?? 'Nucleus');
+  let updateStatus = $derived(settings?.update ?? null);
+  let hasUpdateAvailable = $derived(updateStatus?.update_available ?? false);
+  let restartRequired = $derived(updateStatus?.restart_required ?? false);
   let activeNavItem = $derived(navigation.find((item) => item.href === pathname) ?? navigation[0]);
   let usesFullHeightContent = $derived(pathname === '/sessions');
   let sessionsWithProjects = $derived(
@@ -132,6 +146,14 @@
     }
   }
 
+  async function loadSettings() {
+    try {
+      applySettings(await fetchSettings());
+    } catch {
+      // Leave the shell usable even if settings hydration fails.
+    }
+  }
+
   function prependSession(session: SessionSummary) {
     if (!overview) {
       return;
@@ -177,20 +199,54 @@
     await goto(href);
   }
 
-  function applyStreamEvent(event: DaemonEvent) {
-    if (event.event !== 'overview.updated') {
+  function applySettings(next: SettingsSummary) {
+    settings = next;
+    syncUpdateToast(next);
+  }
+
+  function syncUpdateToast(next: SettingsSummary) {
+    const remoteCommit = next.update.remote_commit;
+
+    if (!next.update.update_available || next.update.restart_required || !remoteCommit) {
+      updateToastVisible = false;
       return;
     }
 
-    overview = event.data;
-    syncCreateDefaults();
-    loading = false;
-    refreshing = false;
-    error = null;
+    updateToastVisible = remoteCommit !== dismissedUpdateCommit;
+  }
+
+  function dismissUpdateToast() {
+    const remoteCommit = settings?.update.remote_commit ?? '';
+    dismissedUpdateCommit = remoteCommit;
+    updateToastVisible = false;
+
+    if (remoteCommit) {
+      window.localStorage.setItem('nucleus.dismissedUpdateCommit', remoteCommit);
+    }
+  }
+
+  function applyStreamEvent(event: DaemonEvent) {
+    if (event.event === 'overview.updated') {
+      overview = event.data;
+      syncCreateDefaults();
+      loading = false;
+      refreshing = false;
+      error = null;
+      return;
+    }
+
+    if (event.event === 'update.updated' && settings) {
+      applySettings({
+        ...settings,
+        update: event.data
+      });
+    }
   }
 
   onMount(() => {
+    dismissedUpdateCommit = window.localStorage.getItem('nucleus.dismissedUpdateCommit') ?? '';
     void loadShell();
+    void loadSettings();
 
     const disconnect = connectDaemonStream({
       onEvent: applyStreamEvent,
@@ -233,7 +289,7 @@
             <div class="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-zinc-800 bg-zinc-950">
               <ServerCog class="size-4.5 text-lime-300/80" />
             </div>
-            <div class="truncate text-base font-semibold text-zinc-50">Nucleus</div>
+            <div class="truncate text-base font-semibold text-zinc-50">{instanceName}</div>
           </div>
 
           <div class="flex items-center gap-2">
@@ -332,7 +388,7 @@
       </div>
 
       <div class="sticky bottom-0 shrink-0 border-t border-zinc-900 bg-zinc-950/95 px-3 py-2.5 backdrop-blur">
-        <nav class="grid grid-cols-5 gap-2">
+        <nav class="grid grid-cols-6 gap-2">
           {#each navigation as item}
             <button
               type="button"
@@ -340,7 +396,7 @@
               aria-label={item.label}
               title={item.label}
               class={cn(
-                'inline-flex h-10 items-center justify-center rounded-md border transition-colors',
+                'relative inline-flex h-10 items-center justify-center rounded-md border transition-colors',
                 pathname === item.href
                   ? 'border-lime-300/30 bg-lime-300/10 text-lime-100'
                   : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:bg-zinc-900 hover:text-zinc-100'
@@ -348,6 +404,14 @@
               onclick={() => openNavigation(item.href)}
             >
               <item.icon class="size-4" />
+              {#if item.href === '/settings' && (hasUpdateAvailable || restartRequired)}
+                <span
+                  class={cn(
+                    'absolute right-2 top-2 h-2 w-2 rounded-full',
+                    restartRequired ? 'bg-amber-300' : 'bg-lime-300'
+                  )}
+                ></span>
+              {/if}
             </button>
           {/each}
         </nav>
@@ -364,6 +428,11 @@
           <div class="mt-1 truncate text-[11px] text-zinc-600" title={workspace.root_path}>
             {compactPath(workspace.root_path)}
           </div>
+        {/if}
+        {#if restartRequired}
+          <div class="mt-2 text-[11px] text-amber-300/80">Restart required to load the latest update.</div>
+        {:else if hasUpdateAvailable}
+          <div class="mt-2 text-[11px] text-lime-300/80">Update available.</div>
         {/if}
       </div>
     </div>
@@ -417,3 +486,23 @@
     </div>
   </main>
 </div>
+
+{#if updateToastVisible && settings}
+  <div class="fixed bottom-4 right-4 z-50 w-[min(22rem,calc(100vw-2rem))] rounded-lg border border-lime-300/20 bg-zinc-950/95 px-4 py-3 shadow-2xl backdrop-blur">
+    <div class="text-sm font-medium text-zinc-50">Update available</div>
+    <div class="mt-1 text-xs leading-5 text-zinc-400">
+      {settings.update.remote_commit_short || 'A newer build'} is available on {settings.update.branch || 'main'}.
+    </div>
+    <div class="mt-3 flex items-center gap-2">
+      <Button
+        size="sm"
+        onclick={() => {
+          void openNavigation('/settings');
+        }}
+      >
+        Open settings
+      </Button>
+      <Button size="sm" variant="ghost" onclick={dismissUpdateToast}>Dismiss</Button>
+    </div>
+  </div>
+{/if}

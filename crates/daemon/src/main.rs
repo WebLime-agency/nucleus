@@ -1,5 +1,6 @@
 mod host;
 mod runtime;
+mod updates;
 
 use std::{
     collections::BTreeSet,
@@ -29,8 +30,8 @@ use nucleus_protocol::{
     CreateSessionRequest, DaemonEvent, HealthResponse, HostStatus, ProcessKillRequest,
     ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate, ProjectUpdateRequest,
     PromptProgressUpdate, RouterProfileSummary, RuntimeOverview, RuntimeSummary, SessionDetail,
-    SessionPromptRequest, SessionSummary, StreamConnected, SystemStats, UpdateSessionRequest,
-    WorkspaceSummary, WorkspaceUpdateRequest,
+    SessionPromptRequest, SessionSummary, SettingsSummary, StreamConnected, SystemStats,
+    UpdateSessionRequest, UpdateStatus, WorkspaceSummary, WorkspaceUpdateRequest,
 };
 use nucleus_storage::{AuditEventRecord, ProjectPatch, SessionPatch, SessionRecord, StateStore};
 use runtime::{PromptStreamEvent, RuntimeManager};
@@ -42,6 +43,7 @@ use tokio::{
 };
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{info, warn};
+use updates::{InstanceRuntime, UpdateManager};
 use uuid::Uuid;
 
 const STREAM_PROCESS_LIMIT: usize = DEFAULT_PROCESS_LIMIT;
@@ -52,6 +54,8 @@ const STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(90);
 const MAX_PROMPT_INCLUDE_FILES: usize = 24;
 const MAX_PROMPT_INCLUDE_FILE_CHARS: usize = 6_000;
 const MAX_PROMPT_INCLUDE_TOTAL_CHARS: usize = 24_000;
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(900);
+const INITIAL_UPDATE_CHECK_DELAY: Duration = Duration::from_secs(3);
 
 #[derive(Clone)]
 struct AppState {
@@ -59,6 +63,7 @@ struct AppState {
     store: Arc<StateStore>,
     host: Arc<HostEngine>,
     runtimes: Arc<RuntimeManager>,
+    updates: Arc<UpdateManager>,
     events: broadcast::Sender<DaemonEvent>,
 }
 
@@ -67,15 +72,19 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let bind = env::var("NUCLEUS_BIND").unwrap_or_else(|_| DEFAULT_DAEMON_ADDR.to_string());
+    let instance = InstanceRuntime::detect(bind.clone());
+    let updates = Arc::new(UpdateManager::new(instance.clone()));
     let (events, _) = broadcast::channel(32);
     let state = AppState {
         version: env!("CARGO_PKG_VERSION").to_string(),
         store: Arc::new(StateStore::initialize().context("failed to initialize state store")?),
         host: Arc::new(HostEngine::new()),
         runtimes: Arc::new(RuntimeManager::default()),
+        updates,
         events,
     };
     spawn_event_publisher(state.clone());
+    spawn_update_monitor(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
@@ -98,6 +107,15 @@ fn app(state: AppState) -> Router {
         .route("/api/health", get(health))
         .route("/api/overview", get(overview))
         .route("/api/runtimes", get(runtimes))
+        .route("/api/settings", get(settings))
+        .route(
+            "/api/settings/update/check",
+            axum::routing::post(check_for_updates),
+        )
+        .route(
+            "/api/settings/update/apply",
+            axum::routing::post(apply_update),
+        )
         .route("/api/workspace", get(workspace).patch(update_workspace))
         .route(
             "/api/workspace/projects/sync",
@@ -160,6 +178,26 @@ async fn runtimes(
 ) -> Result<Json<Vec<RuntimeSummary>>, ApiError> {
     let force_refresh = query.refresh.unwrap_or(false);
     Ok(Json(load_runtimes(&state, force_refresh).await?))
+}
+
+async fn settings(State(state): State<AppState>) -> Result<Json<SettingsSummary>, ApiError> {
+    Ok(Json(build_settings_summary(&state).await))
+}
+
+async fn check_for_updates(State(state): State<AppState>) -> Result<Json<UpdateStatus>, ApiError> {
+    let result = state.updates.check().await;
+    if result.changed {
+        let _ = publish_update_event(&state, result.status.clone()).await;
+    }
+    Ok(Json(result.status))
+}
+
+async fn apply_update(State(state): State<AppState>) -> Result<Json<UpdateStatus>, ApiError> {
+    let result = state.updates.apply().await;
+    if result.changed {
+        let _ = publish_update_event(&state, result.status.clone()).await;
+    }
+    Ok(Json(result.status))
 }
 
 async fn workspace(State(state): State<AppState>) -> Result<Json<WorkspaceSummary>, ApiError> {
@@ -1283,6 +1321,11 @@ async fn send_initial_stream_snapshot(
         }),
     )
     .await?;
+    send_event(
+        socket,
+        DaemonEvent::UpdateUpdated(state.updates.current().await),
+    )
+    .await?;
 
     Ok(())
 }
@@ -1309,6 +1352,29 @@ fn spawn_event_publisher(state: AppState) {
 
             if let Err(error) = publish_stream_snapshot(&state).await {
                 warn!(error = %error, "failed to publish daemon stream snapshot");
+            }
+        }
+    });
+}
+
+fn spawn_update_monitor(state: AppState) {
+    tokio::spawn(async move {
+        time::sleep(INITIAL_UPDATE_CHECK_DELAY).await;
+
+        let initial = state.updates.check().await;
+        if initial.changed {
+            let _ = publish_update_event(&state, initial.status).await;
+        }
+
+        let mut interval = time::interval(UPDATE_CHECK_INTERVAL);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            let next = state.updates.check().await;
+
+            if next.changed {
+                let _ = publish_update_event(&state, next.status).await;
             }
         }
     });
@@ -1361,6 +1427,21 @@ async fn publish_audit_event(state: &AppState) -> anyhow::Result<()> {
     let audit = state.store.list_audit_events(DEFAULT_AUDIT_LIMIT)?;
     let _ = state.events.send(DaemonEvent::AuditUpdated(audit));
     Ok(())
+}
+
+async fn publish_update_event(state: &AppState, update: UpdateStatus) -> anyhow::Result<()> {
+    let _ = state.events.send(DaemonEvent::UpdateUpdated(update));
+    Ok(())
+}
+
+async fn build_settings_summary(state: &AppState) -> SettingsSummary {
+    SettingsSummary {
+        product: PRODUCT_NAME.to_string(),
+        version: state.version.clone(),
+        instance: state.updates.instance_summary(),
+        storage: state.store.storage_summary(),
+        update: state.updates.current().await,
+    }
 }
 
 async fn build_runtime_overview(
@@ -2254,8 +2335,7 @@ fn action_catalog() -> Vec<ActionSummary> {
             id: "runtime.refresh".to_string(),
             title: "Refresh runtimes".to_string(),
             category: "runtime".to_string(),
-            summary: "Probe Claude, Codex, and system runtime readiness immediately."
-                .to_string(),
+            summary: "Probe Claude, Codex, and system runtime readiness immediately.".to_string(),
             risk: "safe".to_string(),
             requires_confirmation: false,
             parameters: Vec::new(),
@@ -2764,6 +2844,7 @@ mod tests {
             store,
             host: Arc::new(HostEngine::new()),
             runtimes,
+            updates: Arc::new(UpdateManager::new(test_instance_runtime())),
             events,
         };
 
@@ -2822,6 +2903,7 @@ mod tests {
             store,
             host: Arc::new(HostEngine::new()),
             runtimes,
+            updates: Arc::new(UpdateManager::new(test_instance_runtime())),
             events,
         };
 
@@ -2876,6 +2958,7 @@ mod tests {
             store,
             host: Arc::new(HostEngine::new()),
             runtimes,
+            updates: Arc::new(UpdateManager::new(test_instance_runtime())),
             events,
         };
 
@@ -2955,6 +3038,7 @@ mod tests {
             store,
             host: Arc::new(HostEngine::new()),
             runtimes,
+            updates: Arc::new(UpdateManager::new(test_instance_runtime())),
             events,
         };
 
@@ -3011,5 +3095,14 @@ mod tests {
             .expect("time should be monotonic")
             .as_nanos();
         std::env::temp_dir().join(format!("nucleus-{label}-{}-{suffix}", std::process::id()))
+    }
+
+    fn test_instance_runtime() -> InstanceRuntime {
+        InstanceRuntime {
+            name: "Test".to_string(),
+            repo_root: env::current_dir().expect("cwd should resolve"),
+            daemon_bind: "127.0.0.1:42240".to_string(),
+            install_mode: "unsupported".to_string(),
+        }
     }
 }

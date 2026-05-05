@@ -357,6 +357,42 @@ pub struct StorageSummary {
     pub scratch_dir: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstanceSummary {
+    pub name: String,
+    pub repo_root: String,
+    pub daemon_bind: String,
+    pub install_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateStatus {
+    pub install_mode: String,
+    pub repo_root: String,
+    pub branch: String,
+    pub remote_name: String,
+    pub remote_url: String,
+    pub current_commit: String,
+    pub current_commit_short: String,
+    pub remote_commit: String,
+    pub remote_commit_short: String,
+    pub update_available: bool,
+    pub dirty_worktree: bool,
+    pub restart_required: bool,
+    pub checked_at: Option<i64>,
+    pub state: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SettingsSummary {
+    pub product: String,
+    pub version: String,
+    pub instance: InstanceSummary,
+    pub storage: StorageSummary,
+    pub update: UpdateStatus,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RuntimeOverview {
     pub product: String,
@@ -386,4 +422,6 @@ pub enum DaemonEvent {
     SystemUpdated(SystemStats),
     #[serde(rename = "processes.updated")]
     ProcessesUpdated(ProcessStreamUpdate),
+    #[serde(rename = "update.updated")]
+    UpdateUpdated(UpdateStatus),
 }

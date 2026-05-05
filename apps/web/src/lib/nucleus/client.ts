@@ -17,7 +17,9 @@ import {
   sessionDetailSchema,
   sessionPromptRequestSchema,
   sessionSummarySchema,
+  settingsSummarySchema,
   systemStatsSchema,
+  updateStatusSchema,
   updateSessionRequestSchema,
   workspaceSummarySchema,
   workspaceUpdateRequestSchema
@@ -87,6 +89,35 @@ export async function fetchWorkspace(fetchImpl: FetchLike = fetch) {
       headers: { accept: 'application/json' }
     }),
     workspaceSummarySchema
+  );
+}
+
+export async function fetchSettings(fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await fetchImpl('/api/settings', {
+      headers: { accept: 'application/json' }
+    }),
+    settingsSummarySchema
+  );
+}
+
+export async function checkForUpdates(fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await fetchImpl('/api/settings/update/check', {
+      method: 'POST',
+      headers: { accept: 'application/json' }
+    }),
+    updateStatusSchema
+  );
+}
+
+export async function applyUpdate(fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await fetchImpl('/api/settings/update/apply', {
+      method: 'POST',
+      headers: { accept: 'application/json' }
+    }),
+    updateStatusSchema
   );
 }
 

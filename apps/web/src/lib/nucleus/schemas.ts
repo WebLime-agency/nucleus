@@ -214,6 +214,39 @@ export const storageSummarySchema = z.object({
   scratch_dir: z.string()
 });
 
+export const instanceSummarySchema = z.object({
+  name: z.string(),
+  repo_root: z.string(),
+  daemon_bind: z.string(),
+  install_mode: z.string()
+});
+
+export const updateStatusSchema = z.object({
+  install_mode: z.string(),
+  repo_root: z.string(),
+  branch: z.string(),
+  remote_name: z.string(),
+  remote_url: z.string(),
+  current_commit: z.string(),
+  current_commit_short: z.string(),
+  remote_commit: z.string(),
+  remote_commit_short: z.string(),
+  update_available: z.boolean(),
+  dirty_worktree: z.boolean(),
+  restart_required: z.boolean(),
+  checked_at: z.number().int().nullable(),
+  state: z.string(),
+  message: z.string()
+});
+
+export const settingsSummarySchema = z.object({
+  product: z.string(),
+  version: z.string(),
+  instance: instanceSummarySchema,
+  storage: storageSummarySchema,
+  update: updateStatusSchema
+});
+
 export const runtimeOverviewSchema = z.object({
   product: z.string(),
   version: z.string(),
@@ -333,6 +366,10 @@ export const daemonEventSchema = z.discriminatedUnion('event', [
   z.object({
     event: z.literal('processes.updated'),
     data: processStreamUpdateSchema
+  }),
+  z.object({
+    event: z.literal('update.updated'),
+    data: updateStatusSchema
   })
 ]);
 
@@ -360,4 +397,6 @@ export type SystemStats = z.infer<typeof systemStatsSchema>;
 export type ProcessListResponse = z.infer<typeof processListResponseSchema>;
 export type ProcessSnapshot = z.infer<typeof processSnapshotSchema>;
 export type DiskStat = z.infer<typeof diskStatSchema>;
+export type SettingsSummary = z.infer<typeof settingsSummarySchema>;
+export type UpdateStatus = z.infer<typeof updateStatusSchema>;
 export type DaemonEvent = z.infer<typeof daemonEventSchema>;

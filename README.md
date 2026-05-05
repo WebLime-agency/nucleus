@@ -69,6 +69,35 @@ Default local state lives outside the repository:
 
 If you want multiple local installs on the same machine, set `NUCLEUS_STATE_DIR` per install so each runtime gets its own isolated state tree.
 
+## Instance Configuration
+
+These environment variables let multiple Nucleus installs run side by side without sharing state or ports:
+
+- `NUCLEUS_INSTANCE_NAME` - label shown in the UI
+- `NUCLEUS_STATE_DIR` - state root for SQLite, scratch, transcripts, and artifacts
+- `NUCLEUS_BIND` - daemon bind address, for example `127.0.0.1:42240`
+- `NUCLEUS_REPO_ROOT` - explicit git checkout root for update checks
+- `NUCLEUS_WEB_PORT` - Vite dev server port
+- `NUCLEUS_DAEMON_ORIGIN` - web-to-daemon proxy target, for example `http://127.0.0.1:42240`
+
+Example split for two local installs:
+
+```bash
+# upstream / official checkout
+export NUCLEUS_INSTANCE_NAME="Nucleus Dev"
+export NUCLEUS_STATE_DIR="$HOME/.nucleus-dev"
+export NUCLEUS_BIND="127.0.0.1:42240"
+export NUCLEUS_WEB_PORT="5202"
+export NUCLEUS_DAEMON_ORIGIN="http://127.0.0.1:42240"
+
+# personal daily-use checkout
+export NUCLEUS_INSTANCE_NAME="Nucleus EBA"
+export NUCLEUS_STATE_DIR="$HOME/.nucleus-eba"
+export NUCLEUS_BIND="127.0.0.1:42241"
+export NUCLEUS_WEB_PORT="5201"
+export NUCLEUS_DAEMON_ORIGIN="http://127.0.0.1:42241"
+```
+
 ## Local Development
 
 Prerequisites:
@@ -103,6 +132,8 @@ If you bind the web dev server to `0.0.0.0`, you can also reach it from your LAN
 
 The daemon binds to `127.0.0.1:42240` by default. Override it with `NUCLEUS_BIND`.
 
+The web app reads `NUCLEUS_WEB_PORT` and `NUCLEUS_DAEMON_ORIGIN` during development, so separate checkouts can point at different daemons cleanly.
+
 ## Current Runtime Surface
 
 Today there are two practical ways to talk to Nucleus:
@@ -136,6 +167,7 @@ The current repo already includes:
 - router profiles and workspace model defaults
 - background prompt jobs with live websocket progress
 - prompt include discovery from workspace, project, and session roots
+- daemon-owned update checks plus in-app update notifications for git-based installs
 
 ## License
 
