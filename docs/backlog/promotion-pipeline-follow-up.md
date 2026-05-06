@@ -1,6 +1,6 @@
 # Promotion Pipeline Follow-Up
 
-Status: parked follow-up plan
+Status: completed in this implementation pass
 
 This document captures the near-term workflow fixes discovered while promoting the managed release
 update-contract work from `dev` to `main`.
@@ -8,7 +8,18 @@ update-contract work from `dev` to `main`.
 These items are intentionally separate from the managed release updater backlog because they belong
 to the GitHub promotion pipeline rather than the daemon/client update model.
 
-## Priority Order
+## Delivered
+
+- `scripts/validate-promotion-bootstrap.sh` now validates bootstrap candidates against both direct
+  hotfix-equivalent history and explicit cherry-pick metadata preserved in earlier promotion
+  commits on `main`
+- `Nightly Promote` now verifies the disposable promotion branch itself and publishes the required
+  `Rust` and `Web` check-runs directly onto the promotion head, so branch protection no longer
+  needs an extra trigger commit
+- GitHub Actions workflow dependencies were refreshed to `actions/checkout@v6` and
+  `actions/setup-node@v6`, removing the Node 20 runner deprecation path that showed up in CI
+
+## Completed Work
 
 ### 1. Harden bootstrap cursor validation
 
@@ -17,7 +28,7 @@ to the GitHub promotion pipeline rather than the daemon/client update model.
 - prefer validation against the actual promotion PR history or a durable recorded cursor source
 - add a regression case that covers mixed history after earlier squash promotions
 
-Why this is next:
+Why this mattered:
 - the first rerun of `Nightly Promote` on 2026-05-06 failed because the bootstrap cursor was
   derived too early in the `dev` history, which caused the workflow to re-cherry-pick commits that
   had already landed in `main`
@@ -29,7 +40,7 @@ Why this is next:
 - remove the need for an extra empty `chore: trigger release ci` commit on `promote/dev-to-main`
 - verify auto-merge can complete end to end immediately after the workflow creates or updates the PR
 
-Why this is next:
+Why this mattered:
 - the repaired promotion PR on 2026-05-06 was correct, but GitHub kept it `BLOCKED` until a normal
   `pull_request` CI run was attached to the promotion head
 
@@ -39,11 +50,11 @@ Why this is next:
 - upgrade workflow actions where current releases are available
 - keep the promotion and CI workflows free of runner deprecation warnings
 
-Why this is next:
+Why this mattered:
 - the successful promotion CI run emitted a Node 20 deprecation warning, which is not breaking yet
   but will become avoidable maintenance churn
 
-## Suggested Acceptance Checks
+## Acceptance Checks
 
 - a bootstrap run against a repo with earlier squash promotions creates the correct promotion PR on
   the first attempt
