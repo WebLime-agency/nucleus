@@ -18,7 +18,9 @@ Rules:
 - do not push directly to `dev` unless you are repairing the branch itself
 - keep feature branches narrow and disposable
 - let `main` move only through the nightly promotion path unless there is an explicit hotfix
-- the nightly `dev -> main` PR must use squash auto-merge because protected linear history blocks merge commits
+- `dev` should keep linear history
+- `main` should stay protected, but it must allow merge-commit promotion from `dev`
+- the nightly `dev -> main` PR must use merge auto-merge so promotion keeps shared ancestry between the branches
 
 CI expectations:
 
@@ -30,3 +32,4 @@ Branch settings that should stay in place:
 - `dev` protected with required PRs and CI
 - `main` protected with required PRs and CI
 - repo auto-merge enabled so the nightly promotion PR can land itself once checks finish
+- `main` must not enforce linear history, because nightly promotion relies on merge commits
