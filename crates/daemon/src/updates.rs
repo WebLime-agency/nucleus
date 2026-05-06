@@ -18,6 +18,12 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(900);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct RelaunchBehavior {
+    detach_stdio: bool,
+    detach_process_group: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RestartMode {
     Systemd { unit: String },
     SelfReexec,
@@ -490,11 +496,20 @@ async fn restart_systemd_unit(unit: &str) -> Result<()> {
 }
 
 async fn relaunch_current_daemon(instance: &InstanceRuntime) -> Result<()> {
+    let behavior = relaunch_behavior();
     let mut command = Command::new(&instance.daemon_binary);
     command
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
+        .stdout(if behavior.detach_stdio {
+            std::process::Stdio::null()
+        } else {
+            std::process::Stdio::inherit()
+        })
+        .stderr(if behavior.detach_stdio {
+            std::process::Stdio::null()
+        } else {
+            std::process::Stdio::inherit()
+        })
         .current_dir(&instance.repo_root)
         .env("NUCLEUS_INSTANCE_NAME", &instance.name)
         .env("NUCLEUS_BIND", &instance.daemon_bind)
@@ -508,6 +523,11 @@ async fn relaunch_current_daemon(instance: &InstanceRuntime) -> Result<()> {
         command.env("NUCLEUS_WEB_DIST_DIR", web_dist_dir);
     }
 
+    #[cfg(unix)]
+    if behavior.detach_process_group {
+        command.process_group(0);
+    }
+
     command.spawn().with_context(|| {
         format!(
             "failed to relaunch {} from {}",
@@ -517,6 +537,13 @@ async fn relaunch_current_daemon(instance: &InstanceRuntime) -> Result<()> {
     })?;
 
     std::process::exit(0);
+}
+
+fn relaunch_behavior() -> RelaunchBehavior {
+    RelaunchBehavior {
+        detach_stdio: true,
+        detach_process_group: true,
+    }
 }
 
 fn idle_status(instance: &InstanceRuntime) -> UpdateStatus {
@@ -777,8 +804,8 @@ fn unix_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        InstanceRuntime, RestartMode, UpdateStatus, finalize_updated_status, idle_status,
-        short_commit, systemd_unit_matches,
+        InstanceRuntime, RelaunchBehavior, RestartMode, UpdateStatus, finalize_updated_status,
+        idle_status, relaunch_behavior, short_commit, systemd_unit_matches,
     };
     use std::path::PathBuf;
 
@@ -862,6 +889,19 @@ mod tests {
         assert_eq!(
             next.message,
             "Update applied. Restart Nucleus to load the new code."
+        );
+    }
+
+    #[test]
+    fn self_reexec_relaunch_detaches_from_parent_process() {
+        let behavior = relaunch_behavior();
+
+        assert_eq!(
+            behavior,
+            RelaunchBehavior {
+                detach_stdio: true,
+                detach_process_group: true,
+            }
         );
     }
 
