@@ -86,4 +86,4 @@ jobs:
         if: steps.diff.outputs.pending == 'true' && steps.pr.outputs.number != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh pr merge "${{ steps.pr.outputs.number }}" --squash --auto
+        run: gh pr merge "${{ steps.pr.outputs.number }}" --merge --auto
