@@ -992,7 +992,7 @@
   });
 </script>
 
-<div class="-mx-4 -my-6 flex h-full min-h-0 overflow-hidden sm:-mx-6 lg:-mx-8">
+<div class="-my-6 flex h-full min-h-0 overflow-hidden">
   <div class="flex min-w-0 flex-1 overflow-hidden border-y border-zinc-900 bg-zinc-950/70 lg:border-x">
     {#if loading && sessions.length === 0}
       <div class="flex flex-1 items-center justify-center px-8">
@@ -1137,7 +1137,9 @@
                         {/if}
 
                         {#if turn.content}
-                          <div class="whitespace-pre-wrap text-sm leading-6">{turn.content}</div>
+                          <div class="break-words whitespace-pre-wrap text-sm leading-6">
+                            {turn.content}
+                          </div>
                         {/if}
                       </div>
                     </div>

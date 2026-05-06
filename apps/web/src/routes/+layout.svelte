@@ -537,8 +537,17 @@
       </div>
     {/if}
 
-    <div class={cn('min-h-0 flex-1', usesFullHeightContent ? 'overflow-hidden' : 'overflow-y-auto')}>
-      <div class={cn(!usesFullHeightContent && 'pb-8')}>
+    <div
+      class={cn(
+        'min-h-0 flex-1',
+        usesFullHeightContent ? 'flex overflow-hidden' : 'overflow-y-auto'
+      )}
+    >
+      <div
+        class={cn(
+          usesFullHeightContent ? 'flex min-h-0 flex-1 overflow-hidden' : 'pb-8'
+        )}
+      >
         {@render children()}
       </div>
     </div>
