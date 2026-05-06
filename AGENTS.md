@@ -21,6 +21,8 @@ Durable product rules:
 
 - the daemon owns sessions, routing, auth, persistence, updates, and machine actions
 - clients render and steer, but they do not become a second backend
+- the web client is a first-class client until native apps exist, so responsive phone and desktop behavior is release-blocking
+- prefer shadcn/ui primitives and fix layout bugs at the shell/container level before adding page-specific patches
 - stable product decisions belong in `docs/decisions/`
 - roadmap changes belong in `docs/roadmap.md`
 - prompt-time summaries should stay concise and live in `include/`

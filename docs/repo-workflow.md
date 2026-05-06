@@ -10,7 +10,9 @@ Daily work happens on short-lived feature branches:
 2. open a PR back into `dev`
 3. let CI pass on the PR
 4. merge into `dev`
-5. let the nightly promotion workflow open or update the `dev -> main` PR and enable auto-merge
+5. let the nightly promotion workflow cut a disposable promotion branch from `main`
+6. let that workflow cherry-pick the patch-unique commits from `dev`
+7. let the promotion PR back into `main` auto-merge after CI passes
 
 Rules:
 
@@ -19,8 +21,9 @@ Rules:
 - keep feature branches narrow and disposable
 - let `main` move only through the nightly promotion path unless there is an explicit hotfix
 - `dev` should keep linear history
-- `main` should stay protected, but it must allow merge-commit promotion from `dev`
-- the nightly `dev -> main` PR must use merge auto-merge so promotion keeps shared ancestry between the branches
+- the nightly promotion branch must start from `main`, not `dev`
+- nightly promotion must use patch-based cherry-picks so `main` hotfixes do not poison future promotions
+- the promotion PR should auto-merge with squash so the release branch stays disposable
 
 CI expectations:
 
@@ -32,4 +35,11 @@ Branch settings that should stay in place:
 - `dev` protected with required PRs and CI
 - `main` protected with required PRs and CI
 - repo auto-merge enabled so the nightly promotion PR can land itself once checks finish
-- `main` must not enforce linear history, because nightly promotion relies on merge commits
+- `main` may keep linear history on or off; the promotion path no longer depends on merge commits
+
+Promotion branch contract:
+
+- branch name: `promote/dev-to-main`
+- base branch: `main`
+- commits on the branch are created by nightly cherry-picking the patch-unique `dev` commits onto `main`
+- the PR is disposable and should be recreated or force-updated by the workflow as needed
