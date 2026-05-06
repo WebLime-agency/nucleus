@@ -905,13 +905,18 @@ async fn run_json_stream_command<F>(
 where
     F: FnMut(&str) -> Result<()>,
 {
-    let mut child = Command::new(command);
+    let resolved_command = resolve_command_path(command).unwrap_or_else(|| PathBuf::from(command));
+    let mut child = Command::new(&resolved_command);
     child
         .kill_on_drop(true)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    if let Some(path) = augmented_path_env() {
+        child.env("PATH", path);
+    }
 
     if let Some(path) = cwd {
         child.current_dir(path);
@@ -1280,6 +1285,65 @@ mod tests {
         }
 
         assert_eq!(output.trim(), "nucleus-runtime-ok");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn json_stream_command_uses_augmented_home_paths() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let root = test_dir("runtime-json-stream-path");
+        let home = root.join("home");
+        let local_bin = home.join(".local/bin");
+        let script = local_bin.join("mockstream");
+
+        fs::create_dir_all(&local_bin).expect("local bin should exist");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"stream ok\"}}\\n'\n",
+        )
+        .expect("mock stream should write");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script)
+                .expect("script metadata should load")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).expect("script should be executable");
+        }
+
+        let original_home = env::var_os("HOME");
+        let original_path = env::var_os("PATH");
+        unsafe {
+            env::set_var("HOME", &home);
+            env::set_var("PATH", "/usr/bin:/bin");
+        }
+
+        let output =
+            run_json_stream_command("mockstream", &[], None, PROBE_TIMEOUT, |_line| Ok(()))
+                .await
+                .expect("augmented runtime path should find mockstream");
+
+        match original_home {
+            Some(value) => unsafe {
+                env::set_var("HOME", value);
+            },
+            None => unsafe {
+                env::remove_var("HOME");
+            },
+        }
+        match original_path {
+            Some(value) => unsafe {
+                env::set_var("PATH", value);
+            },
+            None => unsafe {
+                env::remove_var("PATH");
+            },
+        }
+
+        assert!(output.stdout.contains("stream ok"));
 
         let _ = fs::remove_dir_all(&root);
     }
