@@ -1,0 +1,68 @@
+name: Advance Promotion Cursor
+
+on:
+  pull_request_target:
+    types:
+      - closed
+
+permissions:
+  contents: write
+  pull-requests: read
+
+env:
+  PROMOTION_BRANCH: promote/dev-to-main
+  # This tag points at the latest dev commit that has successfully landed in main.
+  PROMOTION_CURSOR_TAG: promotion/dev-last-promoted
+
+jobs:
+  advance:
+    if: >
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.ref == 'promote/dev-to-main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Advance promotion cursor tag
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin main dev
+          git fetch origin "refs/tags/${PROMOTION_CURSOR_TAG}:refs/tags/${PROMOTION_CURSOR_TAG}" || true
+
+          pr_body="$(jq -r '.pull_request.body // ""' "${GITHUB_EVENT_PATH}")"
+          cursor_sha="$(printf '%s\n' "${pr_body}" | sed -n 's/^<!-- promotion-cursor-base-sha: \([0-9a-f]\{40\}\) -->$/\1/p' | head -n 1)"
+          target_sha="$(printf '%s\n' "${pr_body}" | sed -n 's/^<!-- promotion-target-dev-sha: \([0-9a-f]\{40\}\) -->$/\1/p' | head -n 1)"
+
+          if [ -z "${cursor_sha}" ] || [ -z "${target_sha}" ]; then
+            echo "::error::Promotion PR body is missing cursor metadata."
+            exit 1
+          fi
+
+          git rev-parse --verify "${cursor_sha}^{commit}" >/dev/null
+          git rev-parse --verify "${target_sha}^{commit}" >/dev/null
+
+          if ! git merge-base --is-ancestor "${target_sha}" origin/dev; then
+            echo "::error::Promotion target ${target_sha} is not an ancestor of origin/dev."
+            exit 1
+          fi
+
+          if git rev-parse -q --verify "refs/tags/${PROMOTION_CURSOR_TAG}^{commit}" >/dev/null; then
+            current_cursor="$(git rev-parse "refs/tags/${PROMOTION_CURSOR_TAG}^{commit}")"
+            if [ "${current_cursor}" != "${cursor_sha}" ]; then
+              echo "::error::Promotion cursor tag already moved from ${cursor_sha} to ${current_cursor}."
+              exit 1
+            fi
+          fi
+
+          git tag -fa "${PROMOTION_CURSOR_TAG}" "${target_sha}" \
+            -m "Promoted dev through ${target_sha} via #${{ github.event.pull_request.number }}"
+          git push --force origin "refs/tags/${PROMOTION_CURSOR_TAG}"
