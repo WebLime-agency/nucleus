@@ -12,8 +12,8 @@ use nucleus_release::{
     DEFAULT_RELEASE_CHANNEL, INSTALL_KIND_DEV_CHECKOUT, INSTALL_KIND_MANAGED_RELEASE,
     ManagedReleaseManifest, SelectedRelease, activate_release, current_platform_target,
     current_release_binary_path, current_release_dir, current_release_id, current_release_web_dir,
-    load_manifest, read_installed_release_metadata, select_release, stage_release_archive,
-    verify_sha256,
+    default_channel_manifest_url, load_manifest, read_installed_release_metadata, select_release,
+    stage_release_archive, verify_sha256,
 };
 use nucleus_storage::{StateStore, StoredUpdateState};
 use tokio::{
@@ -84,18 +84,15 @@ impl InstanceRuntime {
         let install_kind = detect_install_kind(&repo_root);
         let install_root = env::var("NUCLEUS_INSTALL_ROOT").ok().map(PathBuf::from);
         let release_manifest_url = env::var("NUCLEUS_RELEASE_MANIFEST_URL").ok();
-        let managed_web_dist_dir = env::var("NUCLEUS_WEB_DIST_DIR")
-            .ok()
-            .map(PathBuf::from)
-            .or_else(|| {
-                if install_kind == INSTALL_KIND_MANAGED_RELEASE {
-                    install_root
-                        .as_ref()
-                        .map(|path| current_release_web_dir(path))
-                } else {
-                    None
-                }
-            });
+        let explicit_web_dist_dir = env::var("NUCLEUS_WEB_DIST_DIR").ok().map(PathBuf::from);
+        let managed_web_dist_dir = if install_kind == INSTALL_KIND_MANAGED_RELEASE {
+            install_root
+                .as_ref()
+                .map(|path| current_release_web_dir(path))
+                .or(explicit_web_dist_dir)
+        } else {
+            explicit_web_dist_dir
+        };
         let restart_mode = detect_restart_mode(
             &daemon_binary,
             state_dir.as_deref(),
@@ -438,11 +435,17 @@ impl UpdateManager {
     }
 
     fn managed_release_manifest_url(&self) -> Option<String> {
-        self.store
-            .read_update_state()
-            .ok()
-            .and_then(|state| state.release_manifest_url)
+        let stored = self.store.read_update_state().ok();
+        let stored_url = stored
+            .as_ref()
+            .and_then(|state| state.release_manifest_url.clone());
+        let tracked_channel = stored
+            .and_then(|state| state.tracked_channel)
+            .unwrap_or_else(|| DEFAULT_RELEASE_CHANNEL.to_string());
+
+        stored_url
             .or_else(|| self.instance.release_manifest_url.clone())
+            .or_else(|| default_channel_manifest_url(&tracked_channel).ok())
     }
 
     async fn apply_managed_release(&self, inspected: UpdateStatus) -> UpdateRefresh {
@@ -509,15 +512,25 @@ impl UpdateManager {
         };
 
         if let Err(error) =
-            verify_sha256(&archive_path, &selected.artifact.sha256).and_then(|size| {
-                if size != downloaded_size {
+            verify_sha256(&archive_path, &selected.artifact.sha256).and_then(|verified_size| {
+                if verified_size != downloaded_size {
                     bail!(
-                        "artifact size mismatch for {}: expected {} bytes, got {}",
+                        "artifact size mismatch for {}: downloaded {} bytes, verified {} bytes",
                         archive_path.display(),
                         downloaded_size,
-                        size
+                        verified_size
                     );
                 }
+
+                if verified_size != selected.artifact.size_bytes {
+                    bail!(
+                        "artifact size mismatch for {}: manifest expected {} bytes, got {}",
+                        archive_path.display(),
+                        selected.artifact.size_bytes,
+                        verified_size
+                    );
+                }
+
                 Ok(())
             })
         {
@@ -909,7 +922,7 @@ fn initial_status(instance: &InstanceRuntime, stored: &StoredUpdateState) -> Upd
 fn initial_message(
     instance: &InstanceRuntime,
     restart_required: bool,
-    release_manifest_url: Option<&str>,
+    _release_manifest_url: Option<&str>,
 ) -> String {
     if restart_required {
         return "Update applied. Restart Nucleus to load the new code.".to_string();
@@ -919,12 +932,7 @@ fn initial_message(
         return "Automatic update checks are ready for this checkout.".to_string();
     }
 
-    if release_manifest_url.is_some() || instance.release_manifest_url.is_some() {
-        return "This managed release tracks a release channel and can fetch signed release artifacts."
-            .to_string();
-    }
-
-    "This managed release tracks a release channel, but no release manifest URL is configured yet."
+    "This managed release tracks a release channel and fetches verified release artifacts."
         .to_string()
 }
 
@@ -1569,6 +1577,38 @@ mod tests {
     }
 
     #[test]
+    fn managed_release_defaults_to_public_channel_manifest_url() {
+        let root = test_root("default-manifest");
+        let state_dir = root.join("state");
+        let install_root = root.join("install");
+        let store =
+            Arc::new(StateStore::initialize_at(&state_dir).expect("store should initialize"));
+        let instance = InstanceRuntime {
+            name: "Nucleus".to_string(),
+            repo_root: root.clone(),
+            daemon_bind: "127.0.0.1:42240".to_string(),
+            install_kind: INSTALL_KIND_MANAGED_RELEASE.to_string(),
+            install_root: Some(install_root),
+            release_manifest_url: None,
+            state_dir: Some(state_dir),
+            daemon_binary: PathBuf::from("/tmp/nucleus-daemon"),
+            managed_web_dist_dir: None,
+            restart_mode: RestartMode::Unsupported,
+        };
+        let manager = super::UpdateManager::new(instance, store);
+
+        assert!(manager.auto_check_enabled());
+        assert_eq!(
+            manager.managed_release_manifest_url().as_deref(),
+            Some(
+                "https://github.com/WebLime-agency/nucleus/releases/download/nucleus-channel-stable/manifest-stable.json"
+            )
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn finalized_update_requests_restart_when_restart_control_exists() {
         let next =
             finalize_updated_status(&sample_instance(RestartMode::SelfReexec), sample_status());
@@ -1643,6 +1683,7 @@ mod tests {
             version: "0.1.0".to_string(),
             channel: DEFAULT_RELEASE_CHANNEL.to_string(),
             daemon_binary: current_binary,
+            cli_binary: None,
             web_dist_dir: current_web,
             output_dir: output_dir.clone(),
             artifact_base_url: None,
@@ -1664,6 +1705,7 @@ mod tests {
             version: "0.2.0".to_string(),
             channel: DEFAULT_RELEASE_CHANNEL.to_string(),
             daemon_binary: next_binary,
+            cli_binary: None,
             web_dist_dir: next_web,
             output_dir: output_dir.clone(),
             artifact_base_url: None,

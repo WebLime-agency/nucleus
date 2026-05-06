@@ -14,6 +14,7 @@ Daily work happens on short-lived feature branches:
 6. let that workflow cherry-pick the exact `dev` range recorded by the promotion cursor
 7. let the promotion PR back into `main` auto-merge after CI passes
 8. let the cursor-advance workflow move the promotion cursor only after that PR merges successfully
+9. publish managed release artifacts through the explicit channel workflow when a product channel should move
 
 Rules:
 
@@ -28,6 +29,7 @@ Rules:
 - the promotion PR should auto-merge with squash so the release branch stays disposable
 - nightly promotion must verify the disposable promotion branch itself and publish the required `Rust` and `Web` checks on that promotion head
 - do not rely on `pull_request` or `push` workflows firing from `GITHUB_TOKEN` activity during promotion
+- do not publish public product artifacts from feature branches
 
 CI expectations:
 
@@ -64,3 +66,14 @@ Bootstrap rule:
 - `bootstrap_sha` must be the latest `dev` commit already represented in `main`; if nothing past the branch point has landed yet, use `git merge-base origin/main origin/dev`
 - validate `bootstrap_sha` with `scripts/validate-promotion-bootstrap.sh`, which checks both direct hotfix-equivalent commits and explicit cherry-pick metadata preserved in earlier promotion history
 - after that first promotion PR merges, the cursor-advance workflow creates or updates the cursor tag automatically
+
+Managed release channel publishing:
+
+- workflow: `Publish Managed Release`
+- scheduled runs publish `nightly` from `dev`
+- manual `stable` runs default to `main`
+- manual `beta` and `nightly` runs default to `dev`
+- source refs can be overridden for recovery or staging, but public stable releases should normally come from promoted `main`
+- channel release tags are `nucleus-channel-stable`, `nucleus-channel-beta`, and `nucleus-channel-nightly`
+- channel manifests are release assets named `manifest-stable.json`, `manifest-beta.json`, and `manifest-nightly.json`
+- official channel artifacts include `bin/nucleus-daemon`, `bin/nucleus`, and the matching embedded web bundle

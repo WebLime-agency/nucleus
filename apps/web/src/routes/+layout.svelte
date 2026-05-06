@@ -18,7 +18,7 @@
 
   import { Badge } from '$lib/components/ui/badge';
   import { Button } from '$lib/components/ui/button';
-  import { describeCompatibilityWarning } from '$lib/nucleus/compatibility';
+  import { evaluateCompatibility } from '$lib/nucleus/compatibility';
   import {
     clearAccessToken,
     isAuthError,
@@ -116,9 +116,11 @@
   let activeSidebarSessionId = $derived(
     pathname === '/sessions' ? requestedSessionId || sessions[0]?.id || '' : ''
   );
-  let compatibilityWarning = $derived(
-    describeCompatibilityWarning(daemonCompatibility ?? settings?.compatibility ?? null)
+  let compatibility = $derived(
+    evaluateCompatibility(daemonCompatibility ?? settings?.compatibility ?? null)
   );
+  let compatibilityWarning = $derived(compatibility.message);
+  let compatibilityBlocked = $derived(compatibility.level === 'blocked');
   let createSessionTitle = $derived.by(() => {
     if (!createProjectId) {
       return `New ${defaultProfileTitle} session`;
@@ -138,7 +140,8 @@
     if (refreshing) return 'Refreshing';
     if (streamStatus === 'reconnecting') return 'Reconnecting';
     if (streamStatus === 'connecting') return 'Connecting';
-    if (compatibilityWarning) return 'Degraded';
+    if (compatibilityBlocked) return 'Incompatible';
+    if (compatibility.level === 'degraded') return 'Degraded';
     if (error) return 'Degraded';
     return 'Live';
   });
@@ -228,6 +231,10 @@
   }
 
   async function handleCreateSession() {
+    if (compatibilityBlocked) {
+      return;
+    }
+
     creating = true;
 
     try {
@@ -452,7 +459,7 @@
                 variant="outline"
                 class="h-10 w-10 shrink-0"
                 onclick={handleCreateSession}
-                disabled={creating}
+                disabled={creating || compatibilityBlocked}
                 aria-label={createSessionTitle}
                 title={createSessionTitle}
               >
@@ -589,14 +596,14 @@
         </div>
 
         <div class="flex items-center gap-2">
-          <Badge variant={error ? 'destructive' : 'default'}>{statusLabel}</Badge>
+          <Badge variant={error || compatibilityBlocked ? 'destructive' : 'default'}>{statusLabel}</Badge>
           <Button
             size="icon"
             variant="outline"
             class="h-10 w-10"
             aria-label={createSessionTitle}
             title={createSessionTitle}
-            disabled={creating}
+            disabled={creating || compatibilityBlocked}
             onclick={handleCreateSession}
           >
             <MessageSquarePlus class={creating ? 'size-4 animate-spin' : 'size-4'} />
@@ -612,7 +619,11 @@
     {/if}
 
     {#if compatibilityWarning}
-      <div class="mb-6 rounded-lg border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-sm text-amber-100">
+      <div
+        class={compatibilityBlocked
+          ? 'mb-6 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-100'
+          : 'mb-6 rounded-lg border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-sm text-amber-100'}
+      >
         {compatibilityWarning}
       </div>
     {/if}
@@ -628,7 +639,18 @@
           usesFullHeightContent ? 'flex min-h-0 min-w-0 flex-1 overflow-hidden' : 'pb-8'
         )}
       >
-        {@render children()}
+        {#if compatibilityBlocked}
+          <section class="mx-auto flex min-h-[22rem] max-w-2xl flex-col justify-center py-12">
+            <div class="rounded-lg border border-red-500/30 bg-red-500/10 px-5 py-4">
+              <div class="text-base font-semibold text-red-100">Incompatible Client</div>
+              <p class="mt-2 text-sm leading-6 text-red-100/85">
+                {compatibilityWarning}
+              </p>
+            </div>
+          </section>
+        {:else}
+          {@render children()}
+        {/if}
       </div>
     </div>
   </main>

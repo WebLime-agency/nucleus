@@ -8,6 +8,8 @@ Repo workflow lives in [docs/repo-workflow.md](docs/repo-workflow.md).
 
 Shared product context starts in [AGENTS.md](AGENTS.md).
 
+Managed release install and recovery docs live in [docs/managed-release.md](docs/managed-release.md).
+
 ## Repo Layout
 
 ```text
@@ -80,6 +82,7 @@ nucleus setup local
 nucleus setup server
 nucleus setup client --server-url http://mini-server:5201 --token <TOKEN>
 nucleus install-service --enable
+nucleus release install --channel stable --enable
 ```
 
 What they do:
@@ -89,6 +92,7 @@ What they do:
 - `setup server` prepares a remotely reachable instance and prints the local, host, and Tailscale URLs when available
 - `setup client` validates a server URL and token
 - `install-service` writes a `systemd --user` unit on Linux and can enable it immediately
+- `release install` installs a managed release from the selected product channel
 
 ## Local Development
 
@@ -162,6 +166,22 @@ That unit writes the key runtime env vars:
 - `NUCLEUS_WEB_DIST_DIR`
 - `NUCLEUS_SYSTEMD_UNIT`
 
+## Managed Release Install
+
+Managed releases are the public product install path. They track release channels rather than git branches.
+
+```bash
+nucleus release install --channel stable --enable --bind 0.0.0.0:5201
+```
+
+The default channel manifests are published as GitHub release assets:
+
+- `stable`: `https://github.com/WebLime-agency/nucleus/releases/download/nucleus-channel-stable/manifest-stable.json`
+- `beta`: `https://github.com/WebLime-agency/nucleus/releases/download/nucleus-channel-beta/manifest-beta.json`
+- `nightly`: `https://github.com/WebLime-agency/nucleus/releases/download/nucleus-channel-nightly/manifest-nightly.json`
+
+The managed artifact includes the daemon, the operator CLI, and the matching embedded web bundle. See [docs/managed-release.md](docs/managed-release.md) for channel switching, update, publishing, and rollback details.
+
 ## Tailscale
 
 Nucleus does not need a separate web server for tailnet access. Bind the daemon to a reachable address, then use the server URL and bearer token from another device.
@@ -191,8 +211,9 @@ The repo already includes:
 - router profiles and workspace defaults
 - background prompt jobs with live progress
 - include directory discovery for prompt assembly
-- daemon-managed update checks and apply flow for git installs
-- rebuild-and-restart controls for managed daemon installs
+- daemon-managed update checks and apply flow for contributor git installs
+- managed-release install/update/restart flow for channel artifacts
+- stable, beta, and nightly channel publishing automation
 
 ## License
 

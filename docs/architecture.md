@@ -32,8 +32,11 @@ This exists for UI iteration speed.
 - built web assets served by the daemon
 - REST and WebSocket on the same origin
 - token auth on `/api/*` and `/ws`
+- managed releases tracking `stable`, `beta`, or `nightly` channel manifests
 
 That is the target deployment model because it keeps the boundary clean and makes future clients easier to ship.
+
+The daemon serves the web bundle from the active managed release. The installed product does not pull git branches or rebuild from source.
 
 ## Product Boundary
 
