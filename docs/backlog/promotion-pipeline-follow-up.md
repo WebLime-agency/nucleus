@@ -16,6 +16,9 @@ to the GitHub promotion pipeline rather than the daemon/client update model.
 - `Nightly Promote` now verifies the disposable promotion branch itself and publishes the required
   `Rust` and `Web` check-runs directly onto the promotion head, so branch protection no longer
   needs an extra trigger commit
+- `Nightly Promote` now waits for its auto-merged promotion PR and advances
+  `promotion/dev-last-promoted` in the same workflow run, because GitHub does not reliably trigger
+  the separate cursor workflow from `GITHUB_TOKEN` PR activity
 - GitHub Actions workflow dependencies were refreshed to `actions/checkout@v6` and
   `actions/setup-node@v6`, removing the Node 20 runner deprecation path that showed up in CI
 
@@ -60,5 +63,5 @@ Why this mattered:
   the first attempt
 - `Nightly Promote` can create or update the promotion PR and enable auto-merge without any manual
   branch pushes
-- the promotion PR merges after `Rust` and `Web` pass, and `Advance Promotion Cursor` moves
-  `promotion/dev-last-promoted` to the promoted `dev` head
+- the promotion PR merges after `Rust` and `Web` pass, and `Nightly Promote` moves
+  `promotion/dev-last-promoted` to the promoted `dev` head in the same run
