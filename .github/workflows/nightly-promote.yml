@@ -55,10 +55,52 @@ jobs:
         id: diff
         run: |
           git fetch origin main dev
-          if git diff --quiet origin/main..origin/dev; then
+          mapfile -t commits < <(git rev-list --reverse --right-only --cherry-pick origin/main...origin/dev)
+          if [ "${#commits[@]}" -eq 0 ]; then
             echo "pending=false" >> "$GITHUB_OUTPUT"
           else
             echo "pending=true" >> "$GITHUB_OUTPUT"
+            {
+              echo 'commits<<EOF'
+              printf '%s\n' "${commits[@]}"
+              echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Close stale promotion PR
+        if: steps.diff.outputs.pending != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          existing="$(gh pr list --base main --head promote/dev-to-main --state open --json number --jq '.[0].number')"
+          if [ -n "$existing" ]; then
+            gh pr close "$existing" --comment 'Closing stale promotion PR because `main` already contains the patch set from `dev`.'
+          fi
+
+      - name: Build promotion branch
+        if: steps.diff.outputs.pending == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git checkout -B promote/dev-to-main origin/main
+
+          while IFS= read -r commit; do
+            [ -n "$commit" ] || continue
+            git cherry-pick -x "$commit"
+          done <<'EOF'
+          ${{ steps.diff.outputs.commits }}
+          EOF
+
+          git push --force-with-lease origin HEAD:promote/dev-to-main
+
+      - name: Close legacy promotion PR
+        if: steps.diff.outputs.pending == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          existing="$(gh pr list --base main --head dev --state open --json number --jq '.[0].number')"
+          if [ -n "$existing" ]; then
+            gh pr close "$existing" --comment 'Superseded by the patch-based `promote/dev-to-main` workflow.'
           fi
 
       - name: Create or update promotion PR
@@ -67,23 +109,26 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          existing="$(gh pr list --base main --head dev --state open --json number --jq '.[0].number')"
+          existing="$(gh pr list --base main --head promote/dev-to-main --state open --json number --jq '.[0].number')"
           if [ -n "$existing" ]; then
+            gh pr edit "$existing" \
+              --title 'chore: promote dev to main' \
+              --body 'Nightly promotion from `dev` after CI passed. This PR is cut from `main` and cherry-picks the patch-unique commits from `dev`.'
             echo "number=$existing" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           gh pr create \
             --base main \
-            --head dev \
+            --head promote/dev-to-main \
             --title 'chore: promote dev to main' \
-            --body 'Nightly promotion from `dev` after CI passed.'
+            --body 'Nightly promotion from `dev` after CI passed. This PR is cut from `main` and cherry-picks the patch-unique commits from `dev`.'
 
-          number="$(gh pr list --base main --head dev --state open --json number --jq '.[0].number')"
+          number="$(gh pr list --base main --head promote/dev-to-main --state open --json number --jq '.[0].number')"
           echo "number=$number" >> "$GITHUB_OUTPUT"
 
       - name: Enable auto-merge on promotion PR
         if: steps.diff.outputs.pending == 'true' && steps.pr.outputs.number != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh pr merge "${{ steps.pr.outputs.number }}" --merge --auto
+        run: gh pr merge "${{ steps.pr.outputs.number }}" --squash --auto
