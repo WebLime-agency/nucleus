@@ -88,7 +88,16 @@ jobs:
 
           while IFS= read -r commit; do
             [ -n "$commit" ] || continue
-            git cherry-pick -x "$commit"
+            if git cherry-pick -x "$commit"; then
+              continue
+            fi
+
+            if git diff --quiet && git diff --cached --quiet; then
+              git cherry-pick --skip
+              continue
+            fi
+
+            exit 1
           done <<'EOF'
           ${{ steps.diff.outputs.commits }}
           EOF
