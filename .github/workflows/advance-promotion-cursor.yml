@@ -50,6 +50,11 @@ jobs:
           git rev-parse --verify "${cursor_sha}^{commit}" >/dev/null
           git rev-parse --verify "${target_sha}^{commit}" >/dev/null
 
+          if ! git merge-base --is-ancestor "${cursor_sha}" "${target_sha}"; then
+            echo "::error::Promotion target ${target_sha} is behind cursor base ${cursor_sha}."
+            exit 1
+          fi
+
           if ! git merge-base --is-ancestor "${target_sha}" origin/dev; then
             echo "::error::Promotion target ${target_sha} is not an ancestor of origin/dev."
             exit 1

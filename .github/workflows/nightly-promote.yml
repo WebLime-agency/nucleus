@@ -91,6 +91,49 @@ jobs:
             exit 1
           fi
 
+          if [ "${cursor_source}" = "workflow_dispatch bootstrap" ]; then
+            branch_point="$(git merge-base origin/main origin/dev)"
+            expected_bootstrap_sha="${branch_point}"
+            saw_unpromoted_commit=false
+            declare -A cherry_status=()
+
+            while read -r status sha _; do
+              [ -n "${status}" ] || continue
+              cherry_status["${sha}"]="${status}"
+            done < <(git cherry -v origin/main origin/dev)
+
+            while read -r commit; do
+              [ -n "${commit}" ] || continue
+
+              status="${cherry_status[${commit}]:-}"
+              if [ -z "${status}" ]; then
+                echo "::error::Could not determine whether dev commit ${commit} is already represented in origin/main."
+                exit 1
+              fi
+
+              case "${status}" in
+                -)
+                  if [ "${saw_unpromoted_commit}" = false ]; then
+                    expected_bootstrap_sha="${commit}"
+                  fi
+                  ;;
+                +)
+                  saw_unpromoted_commit=true
+                  ;;
+                *)
+                  echo "::error::Unexpected git cherry status '${status}' for dev commit ${commit}."
+                  exit 1
+                  ;;
+              esac
+            done < <(git rev-list --reverse --ancestry-path "${branch_point}..origin/dev")
+
+            if [ "${cursor_sha}" != "${expected_bootstrap_sha}" ]; then
+              echo "::error::Bootstrap cursor ${cursor_sha} is not the latest dev commit already represented in origin/main."
+              echo "::error::Use bootstrap_sha=${expected_bootstrap_sha} instead."
+              exit 1
+            fi
+          fi
+
           target_sha="$(git rev-parse origin/dev)"
 
           {

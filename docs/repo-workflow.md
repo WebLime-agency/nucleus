@@ -58,5 +58,6 @@ Promotion cursor contract:
 Bootstrap rule:
 
 - the first run after enabling the cursor-based workflow must provide a known-good `bootstrap_sha`
-- `bootstrap_sha` must be the last `dev` commit that is already present in `main`
+- `bootstrap_sha` must be the latest `dev` commit already represented in `main`; if nothing past the branch point has landed yet, use `git merge-base origin/main origin/dev`
+- to derive `bootstrap_sha`, run `git cherry -v origin/main origin/dev` and choose the last leading `-` commit before the first `+`
 - after that first promotion PR merges, the cursor-advance workflow creates or updates the cursor tag automatically
