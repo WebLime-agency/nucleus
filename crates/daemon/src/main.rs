@@ -30,14 +30,15 @@ use host::{DEFAULT_PROCESS_LIMIT, HostEngine, ProcessSort, resolve_process_limit
 use nucleus_core::{AdapterKind, DEFAULT_DAEMON_ADDR, PRODUCT_NAME, product_banner};
 use nucleus_protocol::{
     ActionParameter, ActionRunRequest, ActionRunResponse, ActionSummary, AuditEvent, AuthSummary,
-    ConnectionSummary, CreateSessionRequest, DaemonEvent, HealthResponse, HostStatus,
-    ProcessKillRequest, ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate,
+    CompatibilitySummary, ConnectionSummary, CreateSessionRequest, DaemonEvent, HealthResponse,
+    HostStatus, ProcessKillRequest, ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate,
     ProjectUpdateRequest, PromptProgressUpdate, RouterProfileSummary, RuntimeOverview,
     RuntimeSummary, SessionDetail, SessionPromptRequest, SessionSummary, SettingsSummary,
-    StreamConnected, SystemStats, UpdateSessionRequest, UpdateStatus, WorkspaceModelConfig,
-    WorkspaceProfileSummary, WorkspaceProfileWriteRequest, WorkspaceSummary,
+    StreamConnected, SystemStats, UpdateConfigRequest, UpdateSessionRequest, UpdateStatus,
+    WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceProfileWriteRequest, WorkspaceSummary,
     WorkspaceUpdateRequest,
 };
+use nucleus_release::read_installed_release_metadata;
 use nucleus_storage::{
     AuditEventRecord, ProjectPatch, SessionPatch, SessionRecord, StateStore, WorkspaceProfilePatch,
 };
@@ -88,11 +89,12 @@ async fn main() -> anyhow::Result<()> {
     let bind = env::var("NUCLEUS_BIND").unwrap_or_else(|_| DEFAULT_DAEMON_ADDR.to_string());
     let instance = InstanceRuntime::detect(bind.clone());
     let web_dist_dir = resolve_web_dist_dir(&instance);
-    let updates = Arc::new(UpdateManager::new(instance.clone()));
+    let store = Arc::new(StateStore::initialize().context("failed to initialize state store")?);
+    let updates = Arc::new(UpdateManager::new(instance.clone(), store.clone()));
     let (events, _) = broadcast::channel(32);
     let state = AppState {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        store: Arc::new(StateStore::initialize().context("failed to initialize state store")?),
+        store,
         host: Arc::new(HostEngine::new()),
         runtimes: Arc::new(RuntimeManager::default()),
         updates,
@@ -125,6 +127,10 @@ fn app(state: AppState) -> Router {
         .route(
             "/settings/update/check",
             axum::routing::post(check_for_updates),
+        )
+        .route(
+            "/settings/update-config",
+            axum::routing::patch(update_update_config),
         )
         .route("/settings/update/apply", axum::routing::post(apply_update))
         .route("/settings/restart", axum::routing::post(restart_daemon))
@@ -231,6 +237,21 @@ async fn settings(State(state): State<AppState>) -> Result<Json<SettingsSummary>
 
 async fn check_for_updates(State(state): State<AppState>) -> Result<Json<UpdateStatus>, ApiError> {
     let result = state.updates.check().await;
+    if result.changed {
+        let _ = publish_update_event(&state, result.status.clone()).await;
+    }
+    Ok(Json(result.status))
+}
+
+async fn update_update_config(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<UpdateStatus>, ApiError> {
+    let payload = decode_json::<UpdateConfigRequest>(&body)?;
+    let result = state
+        .updates
+        .configure(payload.tracked_channel, payload.tracked_ref)
+        .await?;
     if result.changed {
         let _ = publish_update_event(&state, result.status.clone()).await;
     }
@@ -1469,6 +1490,10 @@ async fn handle_stream_socket(mut socket: WebSocket, state: AppState) {
         DaemonEvent::Connected(StreamConnected {
             service: PRODUCT_NAME.to_string(),
             version: state.version.clone(),
+            compatibility: build_compatibility_summary(
+                &state.version,
+                &state.updates.instance_summary(),
+            ),
         }),
     )
     .await
@@ -1594,6 +1619,10 @@ fn spawn_event_publisher(state: AppState) {
 }
 
 fn spawn_update_monitor(state: AppState) {
+    if !state.updates.auto_check_enabled() {
+        return;
+    }
+
     tokio::spawn(async move {
         time::sleep(INITIAL_UPDATE_CHECK_DELAY).await;
 
@@ -1703,7 +1732,44 @@ async fn build_settings_summary(state: &AppState) -> SettingsSummary {
             state.tailscale_dns_name.as_deref(),
             state.web_dist_dir.as_ref(),
         ),
+        compatibility: build_compatibility_summary(
+            &state.version,
+            &state.updates.instance_summary(),
+        ),
         update: state.updates.current().await,
+    }
+}
+
+fn build_compatibility_summary(
+    version: &str,
+    instance: &nucleus_protocol::InstanceSummary,
+) -> CompatibilitySummary {
+    let mut capability_flags = BTreeSet::from([
+        "daemon-owned-update-state".to_string(),
+        "embedded-web-build".to_string(),
+        "install-kind-contract".to_string(),
+    ]);
+    let mut minimum_client_version = None;
+    let mut minimum_server_version = None;
+
+    if instance.install_kind == nucleus_release::INSTALL_KIND_MANAGED_RELEASE {
+        if let Ok(install_root) = env::var("NUCLEUS_INSTALL_ROOT") {
+            if let Ok(Some(metadata)) =
+                read_installed_release_metadata(&PathBuf::from(install_root))
+            {
+                minimum_client_version = metadata.minimum_client_version;
+                minimum_server_version = metadata.minimum_server_version;
+                capability_flags.extend(metadata.capability_flags);
+            }
+        }
+    }
+
+    CompatibilitySummary {
+        server_version: version.to_string(),
+        minimum_client_version,
+        minimum_server_version,
+        surface_version: "2026-05-managed-release-v1".to_string(),
+        capability_flags: capability_flags.into_iter().collect(),
     }
 }
 
@@ -3089,6 +3155,11 @@ fn static_web_service(web_dist_dir: &PathBuf) -> ServeDir<ServeFile> {
 fn resolve_web_dist_dir(instance: &InstanceRuntime) -> Option<PathBuf> {
     let candidates = [
         env::var("NUCLEUS_WEB_DIST_DIR").ok().map(PathBuf::from),
+        instance.managed_web_dist_dir.clone(),
+        instance
+            .install_root
+            .as_ref()
+            .map(|install_root| nucleus_release::current_release_web_dir(install_root)),
         Some(instance.repo_root.join("apps/web/build")),
     ];
 
@@ -3399,10 +3470,10 @@ mod tests {
 
         let state = AppState {
             version: "test".to_string(),
-            store,
+            store: store.clone(),
             host: Arc::new(HostEngine::new()),
             runtimes,
-            updates: Arc::new(UpdateManager::new(test_instance_runtime())),
+            updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -3459,10 +3530,10 @@ mod tests {
 
         let state = AppState {
             version: "test".to_string(),
-            store,
+            store: store.clone(),
             host: Arc::new(HostEngine::new()),
             runtimes,
-            updates: Arc::new(UpdateManager::new(test_instance_runtime())),
+            updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -3516,10 +3587,10 @@ mod tests {
 
         let state = AppState {
             version: "test".to_string(),
-            store,
+            store: store.clone(),
             host: Arc::new(HostEngine::new()),
             runtimes,
-            updates: Arc::new(UpdateManager::new(test_instance_runtime())),
+            updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -3576,10 +3647,10 @@ mod tests {
         let (events, _) = broadcast::channel(4);
         let state = AppState {
             version: "test".to_string(),
-            store,
+            store: store.clone(),
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
-            updates: Arc::new(UpdateManager::new(test_instance_runtime())),
+            updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -3640,10 +3711,10 @@ mod tests {
 
         let state = AppState {
             version: "test".to_string(),
-            store,
+            store: store.clone(),
             host: Arc::new(HostEngine::new()),
             runtimes,
-            updates: Arc::new(UpdateManager::new(test_instance_runtime())),
+            updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -3725,10 +3796,10 @@ mod tests {
 
         let state = AppState {
             version: "test".to_string(),
-            store,
+            store: store.clone(),
             host: Arc::new(HostEngine::new()),
             runtimes,
-            updates: Arc::new(UpdateManager::new(test_instance_runtime())),
+            updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -3822,7 +3893,7 @@ mod tests {
             "Test",
             env::current_dir().expect("cwd should resolve"),
             "127.0.0.1:42240",
-            "unsupported",
+            "managed_release",
         )
     }
 }

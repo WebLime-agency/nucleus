@@ -13,6 +13,7 @@ dirs.workspace = true
 futures-util.workspace = true
 nucleus-core.workspace = true
 nucleus-protocol.workspace = true
+nucleus-release.workspace = true
 nucleus-storage.workspace = true
 reqwest.workspace = true
 serde.workspace = true
