@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -137,6 +138,12 @@ jobs:
 
           number="$(gh pr list --base main --head promote/dev-to-main --state open --json number --jq '.[0].number')"
           echo "number=$number" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger CI for promotion branch
+        if: steps.diff.outputs.pending == 'true' && steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run CI --ref promote/dev-to-main
 
       - name: Enable auto-merge on promotion PR
         if: steps.diff.outputs.pending == 'true' && steps.pr.outputs.number != ''
