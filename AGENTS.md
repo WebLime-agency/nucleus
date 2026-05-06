@@ -8,6 +8,8 @@ Read these first:
 - [docs/workspace-model.md](docs/workspace-model.md)
 - [docs/roadmap.md](docs/roadmap.md)
 - [docs/decisions/0001-product-foundations.md](docs/decisions/0001-product-foundations.md)
+- [docs/decisions/0002-managed-release-update-model.md](docs/decisions/0002-managed-release-update-model.md)
+- [docs/managed-release.md](docs/managed-release.md)
 - [docs/repo-workflow.md](docs/repo-workflow.md)
 
 Prompt-time context rules:
