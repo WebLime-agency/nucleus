@@ -6,6 +6,8 @@ The SvelteKit app in this repo is one client. Future native clients should talk 
 
 Repo workflow lives in [docs/repo-workflow.md](docs/repo-workflow.md).
 
+Shared product context starts in [AGENTS.md](AGENTS.md).
+
 ## Repo Layout
 
 ```text
@@ -22,6 +24,8 @@ crates/
 docs/
   rfc/           focused design documents
   backlog/       implementation checkpoints
+  decisions/     durable product decisions
+include/         committed prompt-time product context
 ```
 
 ## Current Product Shape
@@ -51,6 +55,17 @@ Important paths:
 - scratch work: `~/.nucleus/scratch/`
 
 To isolate multiple installs on the same machine, set `NUCLEUS_STATE_DIR` per instance.
+
+## Product Context
+
+Nucleus keeps durable product context in two layers:
+
+- public repo context in `AGENTS.md`, `docs/`, and `include/`
+- private local operator context in `.nucleus/include/`
+
+Use the public layer for architecture, stable decisions, and roadmap material that should ship with the project.
+
+Use the private layer for local deployment notes, active priorities, and operator-specific context that should not be committed.
 
 ## CLI
 
