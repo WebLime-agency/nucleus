@@ -227,11 +227,17 @@ jobs:
 
           install_root="${RUNNER_TEMP}/nucleus-managed-install"
           state_dir="${RUNNER_TEMP}/nucleus-managed-state"
+          validation_manifest="${RUNNER_TEMP}/${MANIFEST_NAME}"
+
+          jq \
+            --arg artifact_root "${GITHUB_WORKSPACE}/dist/releases" \
+            '.releases |= map(.artifacts |= map(.download_url = ("file://" + $artifact_root + "/" + (.download_url | split("/")[-1]))))' \
+            "dist/releases/${MANIFEST_NAME}" > "${validation_manifest}"
 
           target/release/nucleus \
             --state-dir "${state_dir}" \
             release install \
-            --manifest-url "file://${GITHUB_WORKSPACE}/dist/releases/${MANIFEST_NAME}" \
+            --manifest-url "file://${validation_manifest}" \
             --channel "${CHANNEL}" \
             --install-root "${install_root}" \
             --install-service false \
@@ -304,6 +310,39 @@ jobs:
           done <<EOF
           ${PRUNED_ASSETS}
           EOF
+
+      - name: Validate published install
+        env:
+          CHANNEL: ${{ steps.release.outputs.channel }}
+        run: |
+          set -euo pipefail
+
+          install_root="${RUNNER_TEMP}/nucleus-published-install"
+          state_dir="${RUNNER_TEMP}/nucleus-published-state"
+
+          for attempt in 1 2 3 4 5 6; do
+            rm -rf "${install_root}" "${state_dir}"
+            if target/release/nucleus \
+              --state-dir "${state_dir}" \
+              release install \
+              --channel "${CHANNEL}" \
+              --install-root "${install_root}" \
+              --install-service false \
+              --bind 127.0.0.1:5202
+            then
+              break
+            fi
+
+            if [ "${attempt}" = "6" ]; then
+              echo "::error::Published channel install did not succeed after ${attempt} attempts"
+              exit 1
+            fi
+            sleep 10
+          done
+
+          test -x "${install_root}/current/bin/nucleus-daemon"
+          test -x "${install_root}/current/bin/nucleus"
+          test -f "${install_root}/current/web/index.html"
 
       - name: Summarize release
         env:
