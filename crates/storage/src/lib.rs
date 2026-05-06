@@ -13,12 +13,14 @@ use nucleus_protocol::{
     WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const LOCAL_AUTH_TOKEN_HASH_KEY: &str = "auth.local_token_hash";
 const LOCAL_AUTH_TOKEN_FILE_NAME: &str = "local-auth-token";
+const UPDATE_STATE_KEY: &str = "updates.state.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoragePlan {
@@ -104,6 +106,23 @@ pub struct ResolvedProject {
     pub slug: String,
     pub relative_path: String,
     pub absolute_path: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoredUpdateState {
+    pub tracked_channel: Option<String>,
+    pub tracked_ref: Option<String>,
+    pub release_manifest_url: Option<String>,
+    pub update_available: bool,
+    pub last_successful_check_at: Option<i64>,
+    pub last_successful_target_version: Option<String>,
+    pub last_successful_target_release_id: Option<String>,
+    pub last_successful_target_commit: Option<String>,
+    pub last_attempted_check_at: Option<i64>,
+    pub last_attempt_result: Option<String>,
+    pub latest_error: Option<String>,
+    pub latest_error_at: Option<i64>,
+    pub restart_required: bool,
 }
 
 impl StoragePlan {
@@ -210,6 +229,10 @@ impl StateStore {
         self.plan.summary()
     }
 
+    pub fn artifacts_dir_path(&self) -> PathBuf {
+        self.plan.artifacts_dir.clone()
+    }
+
     pub fn local_auth_token_path(&self) -> String {
         display(&self.plan.state_dir.join(LOCAL_AUTH_TOKEN_FILE_NAME))
     }
@@ -228,6 +251,22 @@ impl StateStore {
         };
 
         Ok(hash_auth_token(token) == expected_hash)
+    }
+
+    pub fn read_update_state(&self) -> Result<StoredUpdateState> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let Some(payload) = setting_value_optional(&connection, UPDATE_STATE_KEY)? else {
+            return Ok(StoredUpdateState::default());
+        };
+
+        serde_json::from_str(&payload).context("failed to decode stored update state")
+    }
+
+    pub fn write_update_state(&self, state: &StoredUpdateState) -> Result<()> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let payload =
+            serde_json::to_string(state).context("failed to serialize stored update state")?;
+        set_setting_value(&connection, UPDATE_STATE_KEY, &payload)
     }
 
     pub fn list_runtimes(&self) -> Result<Vec<RuntimeSummary>> {
@@ -2851,6 +2890,47 @@ mod tests {
                 .validate_access_token("nuctk_invalid")
                 .expect("invalid token check should succeed")
         );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn persists_update_state_across_reinitialization() {
+        let state_dir = test_state_dir("update-state");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+
+        store
+            .write_update_state(&StoredUpdateState {
+                tracked_channel: Some("stable".to_string()),
+                tracked_ref: Some("main".to_string()),
+                release_manifest_url: Some("file:///tmp/manifest-stable.json".to_string()),
+                update_available: true,
+                last_successful_check_at: Some(123),
+                last_successful_target_version: Some("0.2.0".to_string()),
+                last_successful_target_release_id: Some("rel_123".to_string()),
+                last_successful_target_commit: Some("abcdef1234567890".to_string()),
+                last_attempted_check_at: Some(124),
+                last_attempt_result: Some("success".to_string()),
+                latest_error: None,
+                latest_error_at: None,
+                restart_required: true,
+            })
+            .expect("update state should persist");
+        drop(store);
+
+        let store = StateStore::initialize_at(&state_dir).expect("store should reinitialize");
+        let state = store
+            .read_update_state()
+            .expect("update state should reload");
+
+        assert_eq!(state.tracked_channel.as_deref(), Some("stable"));
+        assert_eq!(state.tracked_ref.as_deref(), Some("main"));
+        assert!(state.update_available);
+        assert_eq!(
+            state.last_successful_target_version.as_deref(),
+            Some("0.2.0")
+        );
+        assert!(state.restart_required);
 
         let _ = fs::remove_dir_all(&state_dir);
     }
