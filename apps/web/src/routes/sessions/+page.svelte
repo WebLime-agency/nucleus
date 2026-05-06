@@ -993,7 +993,7 @@
 </script>
 
 <div class="flex h-full min-h-0 min-w-0 flex-1 overflow-hidden">
-  <div class="flex min-w-0 flex-1 overflow-hidden border-y border-zinc-900 bg-zinc-950/70 lg:border-x">
+  <div class="flex min-h-0 min-w-0 flex-1 overflow-hidden border-y border-zinc-900 bg-zinc-950/70 lg:border-x">
     {#if loading && sessions.length === 0}
       <div class="flex flex-1 items-center justify-center px-8">
         <div class="max-w-md text-center">
@@ -1024,12 +1024,12 @@
         </div>
       </div>
     {:else}
-      <div class="relative flex min-w-0 flex-1 overflow-hidden">
-        <div class="flex min-w-0 flex-1 flex-col overflow-hidden">
-          <header class="border-b border-zinc-900 bg-zinc-950/90 px-5 py-4 sm:px-6">
-            <div class="flex items-start justify-between gap-3">
+      <div class="relative flex min-h-0 min-w-0 flex-1 overflow-hidden">
+        <div class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+          <header class="shrink-0 border-b border-zinc-900 bg-zinc-950/90 px-4 py-3 sm:px-6 sm:py-4">
+            <div class="flex items-start gap-3">
               <div class="min-w-0 flex-1">
-                <div class="flex flex-wrap items-center gap-2">
+                <div class="flex min-w-0 flex-wrap items-center gap-2">
                   <div class="truncate text-lg font-semibold text-zinc-50">{selectedSession.title}</div>
                   <Badge variant={badgeVariantForSession(selectedSession.state)}>
                     {formatState(selectedSession.state)}
@@ -1038,29 +1038,9 @@
                     <Badge variant="secondary">Provider thread linked</Badge>
                   {/if}
                 </div>
-                <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-zinc-500">
-                  <span class="inline-flex items-center gap-1.5">
-                    <Workflow class="size-3.5" />
-                    <span>{selectedSession.profile_title || selectedSession.route_title || 'Direct session'}</span>
-                  </span>
-                  <span class="inline-flex items-center gap-1.5">
-                    <Bot class="size-3.5" />
-                    <span>{formatState(selectedSession.provider)}</span>
-                    {#if selectedSession.model}
-                      <span class="text-zinc-700">/</span>
-                      <span>{selectedSession.model}</span>
-                    {/if}
-                  </span>
-                  <span class="inline-flex items-center gap-1.5">
-                    <FolderTree class="size-3.5" />
-                    <span>{selectedProjectTitle}</span>
-                  </span>
-                  <span>{selectedSession.turn_count} turns</span>
-                  <span>{formatDateTime(selectedSession.updated_at)}</span>
-                </div>
               </div>
 
-              <div class="flex shrink-0 items-center gap-2">
+              <div class="flex shrink-0 items-center gap-2 self-start">
                 {#if sessionLoading}
                   <div class="inline-flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-900/70 px-3 py-1 text-xs text-zinc-500">
                     <RotateCcw class="size-3.5 animate-spin" />
@@ -1083,10 +1063,31 @@
                 </Button>
               </div>
             </div>
+
+            <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-zinc-500">
+              <span class="inline-flex items-center gap-1.5">
+                <Workflow class="size-3.5" />
+                <span>{selectedSession.profile_title || selectedSession.route_title || 'Direct session'}</span>
+              </span>
+              <span class="inline-flex items-center gap-1.5">
+                <Bot class="size-3.5" />
+                <span>{formatState(selectedSession.provider)}</span>
+                {#if selectedSession.model}
+                  <span class="text-zinc-700">/</span>
+                  <span>{selectedSession.model}</span>
+                {/if}
+              </span>
+              <span class="inline-flex items-center gap-1.5">
+                <FolderTree class="size-3.5" />
+                <span>{selectedProjectTitle}</span>
+              </span>
+              <span>{selectedSession.turn_count} turns</span>
+              <span>{formatDateTime(selectedSession.updated_at)}</span>
+            </div>
           </header>
 
           {#if error || actionResultMessage || selectedSession.last_error}
-            <div class="border-b border-zinc-900 bg-zinc-950/75 px-5 py-3 sm:px-6">
+            <div class="shrink-0 border-b border-zinc-900 bg-zinc-950/75 px-4 py-3 sm:px-6">
               {#if error}
                 <div class="rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-2 text-sm text-red-200">
                   {error}
@@ -1107,7 +1108,7 @@
             </div>
           {/if}
 
-          <div bind:this={transcriptElement} class="min-h-0 flex-1 overflow-y-auto px-5 py-6 sm:px-6">
+          <div bind:this={transcriptElement} class="min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-6 sm:py-6">
             {#if detail?.turns.length}
               <div class="space-y-6">
                 {#each detail.turns as turn (turn.id)}
@@ -1196,7 +1197,7 @@
                 {/if}
               </div>
             {:else}
-              <div class="flex h-full min-h-[22rem] items-center justify-center">
+              <div class="flex h-full min-h-[16rem] items-center justify-center sm:min-h-[22rem]">
                 <div class="max-w-md text-center">
                   <div class="inline-flex h-12 w-12 items-center justify-center rounded-full border border-zinc-800 bg-zinc-900/80">
                     <Workflow class="size-5 text-zinc-400" />
@@ -1210,7 +1211,7 @@
             {/if}
           </div>
 
-          <div class="border-t border-zinc-900 bg-zinc-950/92 px-5 py-4 sm:px-6">
+          <div class="shrink-0 border-t border-zinc-900 bg-zinc-950/92 px-4 py-3 sm:px-6 sm:py-4">
             {#if promptImages.length > 0}
               <div class="mb-3 flex gap-3 overflow-x-auto pb-1">
                 {#each promptImages as image}
@@ -1249,7 +1250,7 @@
             >
               <textarea
                 bind:value={promptText}
-                class="min-h-[7.5rem] w-full resize-none bg-transparent text-sm leading-6 text-zinc-100 outline-none placeholder:text-zinc-500"
+                class="min-h-[6rem] w-full resize-none bg-transparent text-sm leading-6 text-zinc-100 outline-none placeholder:text-zinc-500 sm:min-h-[7.5rem]"
                 placeholder="Send a message..."
                 spellcheck={false}
                 disabled={sending || selectedSession.state === 'archived'}
