@@ -345,7 +345,7 @@
           </div>
         {/if}
 
-        {#if update?.install_mode !== 'git'}
+        {#if update && update.install_mode !== 'git'}
           <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3 text-sm text-zinc-400">
             This install is not running from a git checkout, so one-click updates are unavailable.
           </div>
