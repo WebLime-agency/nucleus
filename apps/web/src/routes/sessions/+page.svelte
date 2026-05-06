@@ -1027,8 +1027,8 @@
       <div class="relative flex min-w-0 flex-1 overflow-hidden">
         <div class="flex min-w-0 flex-1 flex-col overflow-hidden">
           <header class="border-b border-zinc-900 bg-zinc-950/90 px-5 py-4 sm:px-6">
-            <div class="flex flex-wrap items-start justify-between gap-4">
-              <div class="min-w-0">
+            <div class="flex items-start justify-between gap-3">
+              <div class="min-w-0 flex-1">
                 <div class="flex flex-wrap items-center gap-2">
                   <div class="truncate text-lg font-semibold text-zinc-50">{selectedSession.title}</div>
                   <Badge variant={badgeVariantForSession(selectedSession.state)}>
@@ -1060,7 +1060,7 @@
                 </div>
               </div>
 
-              <div class="flex items-center gap-2">
+              <div class="flex shrink-0 items-center gap-2">
                 {#if sessionLoading}
                   <div class="inline-flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-900/70 px-3 py-1 text-xs text-zinc-500">
                     <RotateCcw class="size-3.5 animate-spin" />
@@ -1380,8 +1380,8 @@
                   </div>
 
                   <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
-                    <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Working Dir</div>
-                    <div class="mt-2 truncate text-sm text-zinc-100">
+                  <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Working Dir</div>
+                    <div class="mt-2 break-all text-sm text-zinc-100">
                       {compactPath(selectedSession.working_dir)}
                     </div>
                     <div class="mt-1 text-xs text-zinc-500">
@@ -1392,12 +1392,12 @@
 
                 <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
                   <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Routing</div>
-                  <div class="mt-2 text-sm text-zinc-100">
+                  <div class="mt-2 break-words text-sm text-zinc-100">
                     {selectedSession.profile_title ||
                       selectedSession.route_title ||
                       'Direct session target'}
                   </div>
-                  <div class="mt-1 text-xs text-zinc-500">
+                  <div class="mt-1 break-all text-xs text-zinc-500">
                     {#if selectedProfile}
                       {selectedProfile.main.adapter === 'openai_compatible'
                         ? selectedProfile.main.base_url || 'OpenAI-compatible endpoint'
@@ -1410,7 +1410,7 @@
 
                 <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
                   <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Provider Thread</div>
-                  <div class="mt-2 text-sm text-zinc-100">
+                  <div class="mt-2 break-all text-sm text-zinc-100">
                     {selectedSession.provider_session_id || 'Waiting for first successful turn'}
                   </div>
                 </div>

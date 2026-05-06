@@ -322,7 +322,7 @@
   });
 </script>
 
-<div class="h-screen overflow-hidden bg-zinc-950 text-zinc-100 lg:grid lg:grid-cols-[16.5rem_minmax(0,1fr)]">
+<div class="flex h-dvh min-h-0 flex-col overflow-hidden bg-zinc-950 text-zinc-100 lg:grid lg:grid-cols-[16.5rem_minmax(0,1fr)]">
   {#if sidebarOpen}
     <button
       type="button"
@@ -498,7 +498,7 @@
 
   <main
     class={cn(
-      'flex min-h-0 min-w-0 flex-col overflow-hidden',
+      'flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden',
       usesFullHeightContent ? 'px-0 py-0' : 'px-4 py-4 sm:px-6 lg:px-8 lg:py-6'
     )}
   >
