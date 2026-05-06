@@ -2,6 +2,10 @@
 
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "${script_dir}/.." && pwd)"
+validator_script="${repo_root}/scripts/validate-promotion-bootstrap.sh"
+
 repo_dir="$(mktemp -d)"
 cleanup() {
   rm -rf "${repo_dir}"
@@ -86,7 +90,7 @@ assert_invalid() {
 
   if output="$(
     cd "${repo_dir}"
-    /home/eba/tools/nucleus/scripts/validate-promotion-bootstrap.sh \
+    "${validator_script}" \
       --main-ref main \
       --dev-ref dev \
       --bootstrap-sha "${candidate}" \
@@ -109,7 +113,7 @@ assert_invalid "${future_sha}"
 
 (
   cd "${repo_dir}"
-  /home/eba/tools/nucleus/scripts/validate-promotion-bootstrap.sh \
+  "${validator_script}" \
     --main-ref main \
     --dev-ref dev \
     --bootstrap-sha "${promotion_sha}" \
