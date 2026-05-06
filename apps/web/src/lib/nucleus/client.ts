@@ -19,6 +19,7 @@ import {
   sessionPromptRequestSchema,
   sessionSummarySchema,
   settingsSummarySchema,
+  updateConfigRequestSchema,
   systemStatsSchema,
   updateStatusSchema,
   updateSessionRequestSchema,
@@ -153,6 +154,25 @@ export async function restartDaemon(fetchImpl: FetchLike = fetch) {
     await daemonFetch(fetchImpl, '/api/settings/restart', {
       method: 'POST',
       headers: { accept: 'application/json' }
+    }),
+    updateStatusSchema
+  );
+}
+
+export async function updateUpdateConfig(
+  input: z.input<typeof updateConfigRequestSchema>,
+  fetchImpl: FetchLike = fetch
+) {
+  const payload = updateConfigRequestSchema.parse(input);
+
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/settings/update-config', {
+      method: 'PATCH',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json'
+      },
+      body: JSON.stringify(payload)
     }),
     updateStatusSchema
   );

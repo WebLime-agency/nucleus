@@ -18,6 +18,7 @@
 
   import { Badge } from '$lib/components/ui/badge';
   import { Button } from '$lib/components/ui/button';
+  import { describeCompatibilityWarning } from '$lib/nucleus/compatibility';
   import {
     clearAccessToken,
     isAuthError,
@@ -28,6 +29,7 @@
   import { compactPath, formatCount, formatState } from '$lib/nucleus/format';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
   import type {
+    CompatibilitySummary,
     DaemonEvent,
     RuntimeOverview,
     SessionSummary,
@@ -57,11 +59,12 @@
   let createProjectId = $state('');
   let sidebarOpen = $state(false);
   let updateToastVisible = $state(false);
-  let dismissedUpdateCommit = $state('');
+  let dismissedUpdateTarget = $state('');
   let authPromptVisible = $state(false);
   let authTokenInput = $state('');
   let authSubmitting = $state(false);
   let authMessage = $state<string | null>(null);
+  let daemonCompatibility = $state<CompatibilitySummary | null>(null);
 
   let pathname = $derived(page.url.pathname);
   let workspace = $derived(overview?.workspace ?? null);
@@ -75,6 +78,35 @@
   let updateStatus = $derived(settings?.update ?? null);
   let hasUpdateAvailable = $derived(updateStatus?.update_available ?? false);
   let restartRequired = $derived(updateStatus?.restart_required ?? false);
+  let updateTargetId = $derived(
+    updateStatus?.latest_release_id ??
+      updateStatus?.latest_version ??
+      updateStatus?.latest_commit ??
+      ''
+  );
+  let updateTrackLabel = $derived.by(() => {
+    if (!updateStatus) {
+      return '';
+    }
+
+    if (updateStatus.tracked_channel) {
+      return updateStatus.tracked_channel;
+    }
+
+    return updateStatus.tracked_ref ?? '';
+  });
+  let updateTargetLabel = $derived.by(() => {
+    if (!updateStatus) {
+      return 'A newer build';
+    }
+
+    return (
+      updateStatus.latest_version ??
+      updateStatus.latest_commit_short ??
+      updateStatus.latest_commit ??
+      'A newer build'
+    );
+  });
   let activeNavItem = $derived(navigation.find((item) => item.href === pathname) ?? navigation[0]);
   let usesFullHeightContent = $derived(pathname === '/sessions');
   let sessionsWithProjects = $derived(
@@ -83,6 +115,9 @@
   let requestedSessionId = $derived(page.url.searchParams.get('session') ?? '');
   let activeSidebarSessionId = $derived(
     pathname === '/sessions' ? requestedSessionId || sessions[0]?.id || '' : ''
+  );
+  let compatibilityWarning = $derived(
+    describeCompatibilityWarning(daemonCompatibility ?? settings?.compatibility ?? null)
   );
   let createSessionTitle = $derived.by(() => {
     if (!createProjectId) {
@@ -103,6 +138,7 @@
     if (refreshing) return 'Refreshing';
     if (streamStatus === 'reconnecting') return 'Reconnecting';
     if (streamStatus === 'connecting') return 'Connecting';
+    if (compatibilityWarning) return 'Degraded';
     if (error) return 'Degraded';
     return 'Live';
   });
@@ -227,27 +263,38 @@
 
   function applySettings(next: SettingsSummary) {
     settings = next;
+    daemonCompatibility = next.compatibility;
     syncUpdateToast(next);
   }
 
   function syncUpdateToast(next: SettingsSummary) {
-    const remoteCommit = next.update.remote_commit;
+    const targetId =
+      next.update.latest_release_id ?? next.update.latest_version ?? next.update.latest_commit;
 
-    if (!next.update.update_available || next.update.restart_required || !remoteCommit) {
+    if (
+      !next.update.update_available ||
+      next.update.restart_required ||
+      next.update.last_attempt_result !== 'success' ||
+      !targetId
+    ) {
       updateToastVisible = false;
       return;
     }
 
-    updateToastVisible = remoteCommit !== dismissedUpdateCommit;
+    updateToastVisible = targetId !== dismissedUpdateTarget;
   }
 
   function dismissUpdateToast() {
-    const remoteCommit = settings?.update.remote_commit ?? '';
-    dismissedUpdateCommit = remoteCommit;
+    const targetId =
+      settings?.update.latest_release_id ??
+      settings?.update.latest_version ??
+      settings?.update.latest_commit ??
+      '';
+    dismissedUpdateTarget = targetId;
     updateToastVisible = false;
 
-    if (remoteCommit) {
-      window.localStorage.setItem('nucleus.dismissedUpdateCommit', remoteCommit);
+    if (targetId) {
+      window.localStorage.setItem('nucleus.dismissedUpdateTarget', targetId);
     }
   }
 
@@ -279,6 +326,19 @@
   }
 
   function applyStreamEvent(event: DaemonEvent) {
+    if (event.event === 'connected') {
+      daemonCompatibility = event.data.compatibility;
+
+      if (settings) {
+        settings = {
+          ...settings,
+          compatibility: event.data.compatibility
+        };
+      }
+
+      return;
+    }
+
     if (event.event === 'overview.updated') {
       overview = event.data;
       syncCreateDefaults();
@@ -298,7 +358,7 @@
 
   onMount(() => {
     authTokenInput = readAccessToken();
-    dismissedUpdateCommit = window.localStorage.getItem('nucleus.dismissedUpdateCommit') ?? '';
+    dismissedUpdateTarget = window.localStorage.getItem('nucleus.dismissedUpdateTarget') ?? '';
     void loadShell();
     void loadSettings();
 
@@ -490,7 +550,11 @@
         {#if restartRequired}
           <div class="mt-2 text-[11px] text-amber-300/80">Restart required to load the latest update.</div>
         {:else if hasUpdateAvailable}
-          <div class="mt-2 text-[11px] text-lime-300/80">Update available.</div>
+          <div class="mt-2 text-[11px] text-lime-300/80">
+            {updateStatus?.last_attempt_result === 'success'
+              ? `Update available on ${updateTrackLabel || 'the tracked target'}.`
+              : 'Last known update available.'}
+          </div>
         {/if}
       </div>
     </div>
@@ -544,6 +608,12 @@
     {#if error && !authPromptVisible}
       <div class="mb-6 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">
         {error}
+      </div>
+    {/if}
+
+    {#if compatibilityWarning}
+      <div class="mb-6 rounded-lg border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-sm text-amber-100">
+        {compatibilityWarning}
       </div>
     {/if}
 
@@ -611,7 +681,7 @@
   <div class="fixed bottom-4 right-4 z-50 w-[min(22rem,calc(100vw-2rem))] rounded-lg border border-lime-300/20 bg-zinc-950/95 px-4 py-3 shadow-2xl backdrop-blur">
     <div class="text-sm font-medium text-zinc-50">Update available</div>
     <div class="mt-1 text-xs leading-5 text-zinc-400">
-      {settings.update.remote_commit_short || 'A newer build'} is available on {settings.update.branch || 'main'}.
+      {updateTargetLabel} is available on {updateTrackLabel || 'the tracked target'}.
     </div>
     <div class="mt-3 flex items-center gap-2">
       <Button

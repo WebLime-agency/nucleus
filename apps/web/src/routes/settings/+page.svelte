@@ -23,21 +23,39 @@
     CardHeader,
     CardTitle
   } from '$lib/components/ui/card';
-  import { applyUpdate, checkForUpdates, fetchSettings, restartDaemon } from '$lib/nucleus/client';
-  import { compactPath, formatState } from '$lib/nucleus/format';
+  import {
+    CURRENT_CLIENT_SURFACE_VERSION,
+    describeCompatibilityWarning
+  } from '$lib/nucleus/compatibility';
+  import {
+    applyUpdate,
+    checkForUpdates,
+    fetchSettings,
+    restartDaemon,
+    updateUpdateConfig
+  } from '$lib/nucleus/client';
+  import { compactPath, formatDateTime, formatState } from '$lib/nucleus/format';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
   import type { DaemonEvent, SettingsSummary } from '$lib/nucleus/schemas';
+
+  const releaseChannels = ['stable', 'beta', 'nightly'] as const;
 
   let settings = $state<SettingsSummary | null>(null);
   let loading = $state(true);
   let checking = $state(false);
   let applying = $state(false);
   let restarting = $state(false);
+  let savingUpdateConfig = $state(false);
   let error = $state<string | null>(null);
   let success = $state<string | null>(null);
   let streamStatus = $state<StreamStatus>('connecting');
+  let trackedChannelInput = $state('stable');
+  let trackedRefInput = $state('');
 
   let update = $derived(settings?.update ?? null);
+  let compatibilityWarning = $derived(
+    describeCompatibilityWarning(settings?.compatibility ?? null)
+  );
   let statusLabel = $derived.by(() => {
     if (loading) return 'Connecting';
     if (checking) return 'Checking';
@@ -45,12 +63,61 @@
     if (restarting || update?.state === 'restarting') return 'Restarting';
     if (streamStatus === 'reconnecting') return 'Reconnecting';
     if (streamStatus === 'connecting') return 'Connecting';
+    if (compatibilityWarning) return 'Degraded';
     if (error) return 'Degraded';
     return 'Live';
   });
+  let isDevCheckout = $derived(update?.install_kind === 'dev_checkout');
+  let trackedTargetLabel = $derived.by(() => {
+    if (!update) {
+      return 'Unavailable';
+    }
+
+    if (update.tracked_channel) {
+      return update.tracked_channel;
+    }
+
+    return update.tracked_ref ?? 'Unavailable';
+  });
+  let latestTargetLabel = $derived.by(() => {
+    if (!update) {
+      return 'Not checked yet';
+    }
+
+    return (
+      update.latest_version ??
+      update.latest_release_id ??
+      update.latest_commit_short ??
+      update.latest_commit ??
+      'Not checked yet'
+    );
+  });
+  let currentTargetLabel = $derived(isDevCheckout ? 'Current Ref' : 'Current Release ID');
+  let updateConfigDirty = $derived.by(() => {
+    if (!update) {
+      return false;
+    }
+
+    if (update.install_kind === 'managed_release') {
+      return trackedChannelInput !== (update.tracked_channel ?? 'stable');
+    }
+
+    return trackedRefInput.trim() !== (update.tracked_ref ?? '');
+  });
+  let canSaveUpdateConfig = $derived(
+    !!update &&
+      !savingUpdateConfig &&
+      !checking &&
+      !applying &&
+      !restarting &&
+      update.state !== 'restarting' &&
+      updateConfigDirty &&
+      (update.install_kind === 'managed_release'
+        ? trackedChannelInput.trim().length > 0
+        : trackedRefInput.trim().length > 0)
+  );
   let canCheck = $derived(
     !!settings &&
-      settings.update.install_mode === 'git' &&
       !checking &&
       !applying &&
       !restarting &&
@@ -58,7 +125,6 @@
   );
   let canApply = $derived(
     !!update &&
-      update.install_mode === 'git' &&
       update.update_available &&
       !update.dirty_worktree &&
       !update.restart_required &&
@@ -91,8 +157,16 @@
     return 'Manual only';
   }
 
+  function installKindLabel(value: string) {
+    if (value === 'dev_checkout') return 'Dev checkout';
+    if (value === 'managed_release') return 'Managed release';
+    return formatState(value);
+  }
+
   function applySettings(next: SettingsSummary) {
     settings = next;
+    trackedChannelInput = next.update.tracked_channel ?? 'stable';
+    trackedRefInput = next.update.tracked_ref ?? '';
 
     if (next.update.state !== 'restarting') {
       restarting = false;
@@ -166,6 +240,31 @@
     }
   }
 
+  async function handleSaveUpdateConfig() {
+    if (!update) {
+      return;
+    }
+
+    savingUpdateConfig = true;
+    success = null;
+
+    try {
+      const next =
+        update.install_kind === 'managed_release'
+          ? await updateUpdateConfig({ tracked_channel: trackedChannelInput })
+          : await updateUpdateConfig({ tracked_ref: trackedRefInput.trim() });
+      if (settings) {
+        applySettings({ ...settings, update: next });
+      }
+      error = null;
+      success = next.message;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to update the tracked target.';
+    } finally {
+      savingUpdateConfig = false;
+    }
+  }
+
   function applyStreamEvent(event: DaemonEvent) {
     if (event.event !== 'update.updated' || !settings) {
       return;
@@ -206,8 +305,8 @@
     <div>
       <h1 class="text-3xl font-semibold text-zinc-50">Settings</h1>
       <p class="mt-2 max-w-3xl text-sm leading-6 text-zinc-400">
-        Nucleus runs as a daemon-owned instance. This page shows the active install wiring and the
-        source-checkout update state.
+        Nucleus runs as a daemon-owned instance. This page shows the active install wiring, the
+        tracked update target, and the daemon-owned update history.
       </p>
     </div>
   </section>
@@ -215,6 +314,12 @@
   {#if error}
     <div class="rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">
       {error}
+    </div>
+  {/if}
+
+  {#if compatibilityWarning}
+    <div class="rounded-lg border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-sm text-amber-100">
+      {compatibilityWarning}
     </div>
   {/if}
 
@@ -229,7 +334,7 @@
       <CardHeader>
         <CardTitle>Instance</CardTitle>
         <CardDescription>
-          These values define which daemon, state tree, and checkout this UI is steering.
+          These values define which daemon, state tree, and install shape this UI is steering.
         </CardDescription>
       </CardHeader>
       <CardContent class="space-y-3">
@@ -259,6 +364,15 @@
               {settings ? restartModeLabel(settings.instance.restart_mode) : 'Unavailable'}
             </div>
           </div>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+            <div class="flex items-center gap-2 text-xs uppercase tracking-[0.16em] text-zinc-500">
+              <GitBranch class="size-3.5" />
+              <span>Install Kind</span>
+            </div>
+            <div class="mt-2 text-sm font-medium text-zinc-50">
+              {settings ? installKindLabel(settings.instance.install_kind) : 'Unavailable'}
+            </div>
+          </div>
         </div>
 
         <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
@@ -271,15 +385,17 @@
           </div>
         </div>
 
-        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
-          <div class="flex items-center gap-2 text-xs uppercase tracking-[0.16em] text-zinc-500">
-            <GitBranch class="size-3.5" />
-            <span>Repository Root</span>
+        {#if settings?.instance.repo_root}
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+            <div class="flex items-center gap-2 text-xs uppercase tracking-[0.16em] text-zinc-500">
+              <GitBranch class="size-3.5" />
+              <span>Repository Root</span>
+            </div>
+            <div class="mt-2 text-sm text-zinc-100" title={settings.instance.repo_root}>
+              {compactPath(settings.instance.repo_root)}
+            </div>
           </div>
-          <div class="mt-2 text-sm text-zinc-100" title={settings?.instance.repo_root}>
-            {settings ? compactPath(settings.instance.repo_root) : 'Unavailable'}
-          </div>
-        </div>
+        {/if}
       </CardContent>
     </Card>
 
@@ -287,8 +403,8 @@
       <CardHeader>
         <CardTitle>Updates</CardTitle>
         <CardDescription>
-          Git installs can pull from origin, rebuild the daemon, rebuild the embedded web bundle
-          when this instance owns it, and restart automatically when restart control is available.
+          The daemon owns the tracked target, latest successful check, latest attempted check, and
+          restart requirement for this install.
         </CardDescription>
       </CardHeader>
       <CardContent class="space-y-4">
@@ -313,29 +429,101 @@
 
         <div class="grid gap-3 sm:grid-cols-2">
           <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
-            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Current</div>
+            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Current Version</div>
             <div class="mt-2 text-sm font-medium text-zinc-50">
-              {settings?.version ?? '0.0.0'}{#if update?.current_commit_short}
-                <span class="text-zinc-500"> - {update.current_commit_short}</span>
-              {/if}
+              {settings?.version ?? '0.0.0'}
+            </div>
+            {#if update?.current_commit_short}
+              <div class="mt-1 text-xs text-zinc-500">{update.current_commit_short}</div>
+            {/if}
+          </div>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Tracked Target</div>
+            <div class="mt-2 text-sm font-medium text-zinc-50">
+              {trackedTargetLabel}
             </div>
           </div>
           <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
-            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Remote</div>
+            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Latest Known Target</div>
+            <div class="mt-2 text-sm font-medium text-zinc-50">{latestTargetLabel}</div>
+          </div>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">{currentTargetLabel}</div>
             <div class="mt-2 text-sm font-medium text-zinc-50">
-              {#if update?.remote_commit_short}
-                {update.remote_name}/{update.branch || 'main'} - {update.remote_commit_short}
-              {:else}
-                Not checked yet
-              {/if}
+              {update?.current_ref ?? (isDevCheckout ? 'Detached or unknown' : 'Not applicable')}
+            </div>
+          </div>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Last Successful Check</div>
+            <div class="mt-2 text-sm font-medium text-zinc-50">
+              {update?.last_successful_check_at
+                ? formatDateTime(update.last_successful_check_at)
+                : 'Never'}
+            </div>
+          </div>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Last Attempted Check</div>
+            <div class="mt-2 text-sm font-medium text-zinc-50">
+              {update?.last_attempted_check_at
+                ? formatDateTime(update.last_attempted_check_at)
+                : 'Never'}
+            </div>
+            <div class="mt-1 text-xs text-zinc-500">
+              {update?.last_attempt_result ? formatState(update.last_attempt_result) : 'No attempts yet'}
             </div>
           </div>
         </div>
 
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-4">
+          <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">
+            {isDevCheckout ? 'Tracked Git Ref' : 'Tracked Release Channel'}
+          </div>
+
+          {#if update?.install_kind === 'managed_release'}
+            <div class="mt-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto]">
+              <select
+                class="h-11 rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
+                bind:value={trackedChannelInput}
+                aria-label="Tracked release channel"
+              >
+                {#each releaseChannels as channel}
+                  <option value={channel}>{channel}</option>
+                {/each}
+              </select>
+              <Button onclick={handleSaveUpdateConfig} disabled={!canSaveUpdateConfig}>
+                {savingUpdateConfig ? 'Saving' : 'Save target'}
+              </Button>
+            </div>
+            <div class="mt-3 text-xs leading-5 text-zinc-500">
+              Managed installs follow release channels, not git branches. The daemon stores the
+              tracked channel separately from the currently running release and reuses it across
+              reconnects and restarts.
+            </div>
+          {:else}
+            <div class="mt-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto]">
+              <input
+                class="h-11 rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
+                bind:value={trackedRefInput}
+                placeholder="main"
+                spellcheck="false"
+                autocapitalize="off"
+                aria-label="Tracked git ref"
+              />
+              <Button onclick={handleSaveUpdateConfig} disabled={!canSaveUpdateConfig}>
+                {savingUpdateConfig ? 'Saving' : 'Save target'}
+              </Button>
+            </div>
+            <div class="mt-3 text-xs leading-5 text-zinc-500">
+              Contributor installs can track an explicit ref such as <code>main</code>. The daemon
+              keeps this target separate from the live checkout so mismatch states stay visible.
+            </div>
+          {/if}
+        </div>
+
         {#if update?.restart_required}
           <div class="rounded-md border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-sm text-amber-100">
-            The checkout is updated, but this instance could not restart itself automatically.
-            Restart the daemon after resolving the issue.
+            The install payload is newer than the running daemon. Restart the daemon after
+            resolving the issue.
           </div>
         {/if}
 
@@ -345,15 +533,19 @@
           </div>
         {/if}
 
-        {#if update && update.install_mode !== 'git'}
-          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3 text-sm text-zinc-400">
-            This install is not running from a git checkout, so one-click updates are unavailable.
-          </div>
-        {/if}
-
         {#if update?.dirty_worktree}
           <div class="rounded-md border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">
             The working tree has local changes. Clean or commit them before applying an update.
+          </div>
+        {/if}
+
+        {#if update?.latest_error}
+          <div class="rounded-md border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">
+            <div class="font-medium text-red-100">Latest error</div>
+            <div class="mt-1">{update.latest_error}</div>
+            {#if update.latest_error_at}
+              <div class="mt-1 text-xs text-red-100/80">{formatDateTime(update.latest_error_at)}</div>
+            {/if}
           </div>
         {/if}
 
@@ -462,21 +654,78 @@
 
   <Card>
     <CardHeader>
+      <CardTitle>Compatibility</CardTitle>
+      <CardDescription>
+        Clients should rely on explicit daemon compatibility metadata instead of inferring support
+        from transport or decode failures.
+      </CardDescription>
+    </CardHeader>
+    <CardContent class="space-y-3">
+      <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+          <div class="flex items-center gap-2 text-xs uppercase tracking-[0.16em] text-zinc-500">
+            <ShieldAlert class="size-3.5" />
+            <span>Client Surface</span>
+          </div>
+          <div class="mt-2 text-sm font-medium text-zinc-50">{CURRENT_CLIENT_SURFACE_VERSION}</div>
+        </div>
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+          <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Daemon Surface</div>
+          <div class="mt-2 text-sm font-medium text-zinc-50">
+            {settings?.compatibility.surface_version ?? 'Unavailable'}
+          </div>
+        </div>
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+          <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Minimum Client</div>
+          <div class="mt-2 text-sm font-medium text-zinc-50">
+            {settings?.compatibility.minimum_client_version ?? 'Not set'}
+          </div>
+        </div>
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+          <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Minimum Server</div>
+          <div class="mt-2 text-sm font-medium text-zinc-50">
+            {settings?.compatibility.minimum_server_version ?? 'Not set'}
+          </div>
+        </div>
+      </div>
+
+      <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+        <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Capability Flags</div>
+        {#if settings?.compatibility.capability_flags.length}
+          <div class="mt-3 flex flex-wrap gap-2">
+            {#each settings.compatibility.capability_flags as capability}
+              <Badge variant="secondary">{capability}</Badge>
+            {/each}
+          </div>
+        {:else}
+          <div class="mt-2 text-sm text-zinc-500">No capability flags were published.</div>
+        {/if}
+      </div>
+    </CardContent>
+  </Card>
+
+  <Card>
+    <CardHeader>
       <CardTitle>Update Behavior</CardTitle>
       <CardDescription>
-        Nucleus checks for updates in the background and surfaces availability across the app.
+        Nucleus keeps update truth in the daemon and serves the embedded web client that matches
+        the running daemon release.
       </CardDescription>
     </CardHeader>
     <CardContent class="space-y-3 text-sm leading-6 text-zinc-400">
       <div class="flex items-start gap-3 rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
         <Check class="mt-0.5 size-4 shrink-0 text-lime-300/80" />
-        <p>Background checks update the cached daemon state and can raise an in-app toast.</p>
+        <p>
+          Background checks update daemon-owned state and only raise an in-app toast when the latest
+          successful check found a newer target.
+        </p>
       </div>
       <div class="flex items-start gap-3 rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
         <ShieldAlert class="mt-0.5 size-4 shrink-0 text-zinc-500" />
         <p>
-          Source-checkout updates fast-forward the repository only. A restart is still required to
-          load a new daemon build cleanly.
+          Dev checkouts may still use git-based updates. Managed releases now resolve channel
+          artifacts, verify them, swap them into place, and restart onto the matching embedded web
+          build instead of pulling branches directly.
         </p>
       </div>
     </CardContent>

@@ -382,6 +382,7 @@ pub struct ProcessKillResponse {
 pub struct StreamConnected {
     pub service: String,
     pub version: String,
+    pub compatibility: CompatibilitySummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -404,9 +405,9 @@ pub struct StorageSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InstanceSummary {
     pub name: String,
-    pub repo_root: String,
+    pub repo_root: Option<String>,
     pub daemon_bind: String,
-    pub install_mode: String,
+    pub install_kind: String,
     pub restart_mode: String,
     pub restart_supported: bool,
 }
@@ -427,20 +428,38 @@ pub struct ConnectionSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompatibilitySummary {
+    pub server_version: String,
+    pub minimum_client_version: Option<String>,
+    pub minimum_server_version: Option<String>,
+    pub surface_version: String,
+    #[serde(default)]
+    pub capability_flags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpdateStatus {
-    pub install_mode: String,
-    pub repo_root: String,
-    pub branch: String,
-    pub remote_name: String,
-    pub remote_url: String,
-    pub current_commit: String,
-    pub current_commit_short: String,
-    pub remote_commit: String,
-    pub remote_commit_short: String,
+    pub install_kind: String,
+    pub tracked_channel: Option<String>,
+    pub tracked_ref: Option<String>,
+    pub repo_root: Option<String>,
+    pub current_ref: Option<String>,
+    pub remote_name: Option<String>,
+    pub remote_url: Option<String>,
+    pub current_commit: Option<String>,
+    pub current_commit_short: Option<String>,
+    pub latest_commit: Option<String>,
+    pub latest_commit_short: Option<String>,
+    pub latest_version: Option<String>,
+    pub latest_release_id: Option<String>,
     pub update_available: bool,
     pub dirty_worktree: bool,
     pub restart_required: bool,
-    pub checked_at: Option<i64>,
+    pub last_successful_check_at: Option<i64>,
+    pub last_attempted_check_at: Option<i64>,
+    pub last_attempt_result: Option<String>,
+    pub latest_error: Option<String>,
+    pub latest_error_at: Option<i64>,
     pub state: String,
     pub message: String,
 }
@@ -453,7 +472,14 @@ pub struct SettingsSummary {
     pub storage: StorageSummary,
     pub auth: AuthSummary,
     pub connection: ConnectionSummary,
+    pub compatibility: CompatibilitySummary,
     pub update: UpdateStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateConfigRequest {
+    pub tracked_channel: Option<String>,
+    pub tracked_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
