@@ -2440,11 +2440,9 @@ fn collect_prompt_sources_from_root(
         return Ok(());
     }
 
-    for include_dir in [
-        root.join(".nucleus").join("include"),
-        root.join("promptinclude"),
-        root.join("include"),
-    ] {
+    // Shared repo context should land before local private overlays so the
+    // public product truth stays visible and `.nucleus/include` can refine it.
+    for include_dir in [root.join("include"), root.join("promptinclude")] {
         collect_include_directory_sources(scope, &include_dir, seen_files, sources, total_chars)?;
 
         if sources.len() >= MAX_PROMPT_INCLUDE_FILES
@@ -2455,6 +2453,18 @@ fn collect_prompt_sources_from_root(
     }
 
     collect_legacy_promptinclude_sources(scope, root, seen_files, sources, total_chars)?;
+
+    if sources.len() >= MAX_PROMPT_INCLUDE_FILES || *total_chars >= MAX_PROMPT_INCLUDE_TOTAL_CHARS {
+        return Ok(());
+    }
+
+    collect_include_directory_sources(
+        scope,
+        &root.join(".nucleus").join("include"),
+        seen_files,
+        sources,
+        total_chars,
+    )?;
     Ok(())
 }
 
@@ -3355,6 +3365,9 @@ mod tests {
         .expect("prompt sources should collect");
 
         assert_eq!(sources.len(), 3);
+        assert_eq!(sources[0].path, generic);
+        assert_eq!(sources[1].path, legacy);
+        assert_eq!(sources[2].path, namespaced.join("rules.md"));
         let rendered = render_prompt_with_sources("Ship it.", &sources);
         assert!(rendered.contains("Always do the right thing."));
         assert!(rendered.contains("Project-specific reminder."));
