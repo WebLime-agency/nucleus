@@ -26,6 +26,8 @@ Rules:
 - nightly promotion must use a durable promotion cursor instead of branch-diff heuristics
 - nightly promotion must cherry-pick the exact cursor range from `dev` so squash-merging the promotion PR does not requeue old `dev` commits
 - the promotion PR should auto-merge with squash so the release branch stays disposable
+- nightly promotion must verify the disposable promotion branch itself and publish the required `Rust` and `Web` checks on that promotion head
+- do not rely on `pull_request` or `push` workflows firing from `GITHUB_TOKEN` activity during promotion
 
 CI expectations:
 
@@ -45,6 +47,7 @@ Promotion branch contract:
 - base branch: `main`
 - commits on the branch are created by nightly cherry-picking the exact cursor range from `dev` onto `main`
 - the PR is disposable and should be recreated or force-updated by the workflow as needed
+- the workflow publishes the required `Rust` and `Web` checks directly onto the promotion head after verifying that branch
 
 Promotion cursor contract:
 
@@ -59,5 +62,5 @@ Bootstrap rule:
 
 - the first run after enabling the cursor-based workflow must provide a known-good `bootstrap_sha`
 - `bootstrap_sha` must be the latest `dev` commit already represented in `main`; if nothing past the branch point has landed yet, use `git merge-base origin/main origin/dev`
-- to derive `bootstrap_sha`, run `git cherry -v origin/main origin/dev` and choose the last leading `-` commit before the first `+`
+- validate `bootstrap_sha` with `scripts/validate-promotion-bootstrap.sh`, which checks both direct hotfix-equivalent commits and explicit cherry-pick metadata preserved in earlier promotion history
 - after that first promotion PR merges, the cursor-advance workflow creates or updates the cursor tag automatically

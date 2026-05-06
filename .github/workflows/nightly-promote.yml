@@ -2,7 +2,7 @@ name: Nightly Promote
 
 on:
   schedule:
-    - cron: '0 6 * * *'
+    - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
       bootstrap_sha:
@@ -13,7 +13,7 @@ on:
         type: string
 
 permissions:
-  actions: write
+  checks: write
   contents: write
   pull-requests: write
 
@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout dev
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: dev
           fetch-depth: 0
@@ -45,7 +45,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
@@ -92,46 +92,10 @@ jobs:
           fi
 
           if [ "${cursor_source}" = "workflow_dispatch bootstrap" ]; then
-            branch_point="$(git merge-base origin/main origin/dev)"
-            expected_bootstrap_sha="${branch_point}"
-            saw_unpromoted_commit=false
-            declare -A cherry_status=()
-
-            while read -r status sha _; do
-              [ -n "${status}" ] || continue
-              cherry_status["${sha}"]="${status}"
-            done < <(git cherry -v origin/main origin/dev)
-
-            while read -r commit; do
-              [ -n "${commit}" ] || continue
-
-              status="${cherry_status[${commit}]:-}"
-              if [ -z "${status}" ]; then
-                echo "::error::Could not determine whether dev commit ${commit} is already represented in origin/main."
-                exit 1
-              fi
-
-              case "${status}" in
-                -)
-                  if [ "${saw_unpromoted_commit}" = false ]; then
-                    expected_bootstrap_sha="${commit}"
-                  fi
-                  ;;
-                +)
-                  saw_unpromoted_commit=true
-                  ;;
-                *)
-                  echo "::error::Unexpected git cherry status '${status}' for dev commit ${commit}."
-                  exit 1
-                  ;;
-              esac
-            done < <(git rev-list --reverse --ancestry-path "${branch_point}..origin/dev")
-
-            if [ "${cursor_sha}" != "${expected_bootstrap_sha}" ]; then
-              echo "::error::Bootstrap cursor ${cursor_sha} is not the latest dev commit already represented in origin/main."
-              echo "::error::Use bootstrap_sha=${expected_bootstrap_sha} instead."
-              exit 1
-            fi
+            ./scripts/validate-promotion-bootstrap.sh \
+              --main-ref origin/main \
+              --dev-ref origin/dev \
+              --bootstrap-sha "${cursor_sha}"
           fi
 
           target_sha="$(git rev-parse origin/dev)"
@@ -184,6 +148,7 @@ jobs:
 
       - name: Build promotion branch
         if: steps.diff.outputs.pending == 'true'
+        id: promotion_branch
         run: |
           set -euo pipefail
 
@@ -220,6 +185,90 @@ jobs:
           EOF
 
           git push --force-with-lease origin "HEAD:${PROMOTION_BRANCH}"
+          echo "promotion_head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify promotion branch Rust
+        if: steps.diff.outputs.pending == 'true'
+        id: promotion_rust
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cargo fmt --all --check
+          cargo test --manifest-path Cargo.toml
+
+      - name: Verify promotion branch Web
+        if: steps.diff.outputs.pending == 'true'
+        id: promotion_web
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run check:web
+          npm run build:web
+
+      - name: Publish promotion branch check-runs
+        if: steps.diff.outputs.pending == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROMOTION_HEAD_SHA: ${{ steps.promotion_branch.outputs.promotion_head_sha }}
+          RUST_CONCLUSION: ${{ steps.promotion_rust.outcome == 'success' && 'success' || 'failure' }}
+          WEB_CONCLUSION: ${{ steps.promotion_web.outcome == 'success' && 'success' || 'failure' }}
+        run: |
+          set -euo pipefail
+
+          publish_check() {
+            local name="$1"
+            local conclusion="$2"
+            local summary="$3"
+
+            jq -n \
+              --arg name "${name}" \
+              --arg sha "${PROMOTION_HEAD_SHA}" \
+              --arg conclusion "${conclusion}" \
+              --arg details_url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              --arg summary "${summary}" \
+              '{
+                name: $name,
+                head_sha: $sha,
+                status: "completed",
+                conclusion: $conclusion,
+                details_url: $details_url,
+                output: {
+                  title: "Nightly Promote branch verification",
+                  summary: $summary
+                }
+              }' \
+              | gh api \
+                  --method POST \
+                  -H "Accept: application/vnd.github+json" \
+                  "repos/${{ github.repository }}/check-runs" \
+                  --input -
+          }
+
+          publish_check \
+            "Rust" \
+            "${RUST_CONCLUSION}" \
+            "Verified \`cargo fmt --all --check\` and \`cargo test --manifest-path Cargo.toml\` on \`${PROMOTION_BRANCH}\`."
+
+          publish_check \
+            "Web" \
+            "${WEB_CONCLUSION}" \
+            "Verified \`npm run check:web\` and \`npm run build:web\` on \`${PROMOTION_BRANCH}\`."
+
+      - name: Require promotion branch verification
+        if: steps.diff.outputs.pending == 'true'
+        run: |
+          set -euo pipefail
+
+          rust_outcome="${{ steps.promotion_rust.outcome }}"
+          web_outcome="${{ steps.promotion_web.outcome }}"
+
+          if [ "${rust_outcome}" != "success" ] || [ "${web_outcome}" != "success" ]; then
+            echo "::error::Promotion branch verification failed."
+            echo "::error::Rust outcome: ${rust_outcome}"
+            echo "::error::Web outcome: ${web_outcome}"
+            exit 1
+          fi
 
       - name: Close legacy promotion PR
         if: steps.diff.outputs.pending == 'true'
@@ -260,9 +309,17 @@ jobs:
 
           existing="$(gh pr list --base main --head "${PROMOTION_BRANCH}" --state open --json number --jq '.[0].number')"
           if [ -n "${existing}" ]; then
-            gh pr edit "${existing}" \
-              --title 'chore: promote dev to main' \
-              --body-file "${body_file}"
+            jq -n \
+              --rawfile body "${body_file}" \
+              '{
+                title: "chore: promote dev to main",
+                body: $body
+              }' \
+              | gh api \
+                  --method PATCH \
+                  -H "Accept: application/vnd.github+json" \
+                  "repos/${{ github.repository }}/pulls/${existing}" \
+                  --input -
             echo "number=${existing}" >> "$GITHUB_OUTPUT"
             rm -f "${body_file}"
             exit 0
@@ -279,14 +336,21 @@ jobs:
           number="$(gh pr list --base main --head "${PROMOTION_BRANCH}" --state open --json number --jq '.[0].number')"
           echo "number=${number}" >> "$GITHUB_OUTPUT"
 
-      - name: Trigger CI for promotion branch
-        if: steps.diff.outputs.pending == 'true' && steps.pr.outputs.number != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow run CI --ref "${PROMOTION_BRANCH}"
-
       - name: Enable auto-merge on promotion PR
         if: steps.diff.outputs.pending == 'true' && steps.pr.outputs.number != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh pr merge "${{ steps.pr.outputs.number }}" --squash --auto
+        run: |
+          set -euo pipefail
+
+          for attempt in 1 2 3; do
+            if gh pr merge "${{ steps.pr.outputs.number }}" --squash --auto; then
+              exit 0
+            fi
+
+            if [ "${attempt}" -lt 3 ]; then
+              sleep 5
+            fi
+          done
+
+          exit 1
