@@ -1749,16 +1749,20 @@ fn build_compatibility_summary(
         "embedded-web-build".to_string(),
         "install-kind-contract".to_string(),
     ]);
-    let mut minimum_client_version = None;
-    let mut minimum_server_version = None;
+    let mut minimum_client_version = Some(version.to_string());
+    let mut minimum_server_version = Some(version.to_string());
 
     if instance.install_kind == nucleus_release::INSTALL_KIND_MANAGED_RELEASE {
         if let Ok(install_root) = env::var("NUCLEUS_INSTALL_ROOT") {
             if let Ok(Some(metadata)) =
                 read_installed_release_metadata(&PathBuf::from(install_root))
             {
-                minimum_client_version = metadata.minimum_client_version;
-                minimum_server_version = metadata.minimum_server_version;
+                minimum_client_version = metadata
+                    .minimum_client_version
+                    .or_else(|| Some(version.to_string()));
+                minimum_server_version = metadata
+                    .minimum_server_version
+                    .or_else(|| Some(version.to_string()));
                 capability_flags.extend(metadata.capability_flags);
             }
         }
@@ -3153,15 +3157,24 @@ fn static_web_service(web_dist_dir: &PathBuf) -> ServeDir<ServeFile> {
 }
 
 fn resolve_web_dist_dir(instance: &InstanceRuntime) -> Option<PathBuf> {
-    let candidates = [
-        env::var("NUCLEUS_WEB_DIST_DIR").ok().map(PathBuf::from),
-        instance.managed_web_dist_dir.clone(),
-        instance
-            .install_root
-            .as_ref()
-            .map(|install_root| nucleus_release::current_release_web_dir(install_root)),
-        Some(instance.repo_root.join("apps/web/build")),
-    ];
+    let mut candidates = if instance.install_kind == nucleus_release::INSTALL_KIND_MANAGED_RELEASE {
+        vec![
+            instance.managed_web_dist_dir.clone(),
+            instance
+                .install_root
+                .as_ref()
+                .map(|install_root| nucleus_release::current_release_web_dir(install_root)),
+        ]
+    } else {
+        vec![
+            env::var("NUCLEUS_WEB_DIST_DIR").ok().map(PathBuf::from),
+            instance.managed_web_dist_dir.clone(),
+        ]
+    };
+
+    if instance.install_kind == nucleus_release::INSTALL_KIND_DEV_CHECKOUT {
+        candidates.push(Some(instance.repo_root.join("apps/web/build")));
+    }
 
     candidates
         .into_iter()

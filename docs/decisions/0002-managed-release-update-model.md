@@ -2,7 +2,9 @@
 
 ## Status
 
-Proposed
+Accepted
+
+Implemented through the managed-release finish-line pass on May 6, 2026.
 
 ## Context
 
@@ -227,6 +229,18 @@ Tradeoffs:
 - the daemon protocol will need new metadata fields
 - install-mode detection and migration must be designed carefully
 - there will be a transition period where both update models exist
+
+## Implementation Notes
+
+The shipped implementation includes:
+
+- daemon-owned persisted update state
+- explicit `dev_checkout` and `managed_release` install kinds
+- git-based update operations restricted to `dev_checkout`
+- artifact-based managed release install, update, activation, restart, and rollback links
+- stable, beta, and nightly channel manifests published through GitHub release assets
+- managed release artifacts containing `bin/nucleus-daemon`, `bin/nucleus`, and the matching embedded web bundle
+- explicit compatibility metadata consumed by the web client before enabling normal interaction
 
 ## Rollout Plan
 

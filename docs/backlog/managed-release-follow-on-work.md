@@ -1,6 +1,8 @@
 # Managed Release Follow-On Work
 
-Status: parked follow-up plan
+Status: Shipped
+
+The remaining managed-release finish-line work shipped on May 6, 2026. This file is retained as a completion record.
 
 This document captures the next work that should follow the managed release updater and daemon/client
 contract changes shipped in the current implementation pass.
@@ -10,6 +12,8 @@ These items are intentionally separate from the current update-model PR.
 ## Priority Order
 
 ### 1. Real systemd managed-release validation
+
+Status: Validated on Linux user systemd with a temporary managed-release service.
 
 - install a managed release onto a real Linux user session with `systemctl --user`
 - verify `enable --now`, restart from the Settings page, reconnect behavior, and daemon relaunch
@@ -21,6 +25,8 @@ Why this is next:
 
 ### 2. Browser-level update UX QA
 
+Status: Shipped with explicit channel/ref controls, fresh-check toast suppression, restart messaging, and compatibility warnings.
+
 - verify the Settings page wording and controls for both `dev_checkout` and `managed_release`
 - verify tracked-channel edits, tracked-ref edits, and update-state refresh behavior
 - verify update toast suppression after failed checks
@@ -30,6 +36,8 @@ Why this is next:
 - the web app builds and typechecks cleanly, but this still needs manual browser validation
 
 ### 3. Compatibility policy enforcement
+
+Status: Shipped with explicit minimum client/server version checks, surface-version checks, required capability checks, and a blocking web shell state for incompatible clients.
 
 - define when `minimum_client_version` must be set for a release
 - define when `minimum_server_version` matters for client-authored flows
@@ -41,6 +49,8 @@ Why this is next:
 
 ### 4. Release publishing and distribution automation
 
+Status: Shipped through the `Publish Managed Release` workflow and documented in `docs/managed-release.md`.
+
 - publish channel manifests and artifacts to the real distribution location
 - define artifact retention and rollback retention policy
 - add signing or stronger provenance guarantees if needed beyond checksum verification
@@ -51,7 +61,7 @@ Why this is next:
 
 ## Recommended Extras
 
-- add daemon tests for rollback/previous-link behavior after more than one managed release is installed
-- add integration checks for manifest channel mismatches and missing target artifacts
-- consider a cleanup policy for old `releases/` directories and downloaded archives
-- add operator docs for switching channels and recovering from a failed restart
+- rollback/previous-link behavior after more than one managed release is installed is covered in release tests
+- manifest channel mismatches and missing target artifacts are covered in release tests
+- channel manifest and GitHub release asset retention are handled by the publish workflow, defaulting to the newest 10 releases
+- operator docs for switching channels and recovering from a failed restart live in `docs/managed-release.md`

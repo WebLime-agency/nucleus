@@ -1,0 +1,325 @@
+name: Publish Managed Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Release channel to publish.
+        required: true
+        default: stable
+        type: choice
+        options:
+          - stable
+          - beta
+          - nightly
+      source_ref:
+        description: Optional source ref. Defaults to main for stable and dev for beta/nightly.
+        required: false
+        type: string
+      release_id:
+        description: Optional release identifier. Defaults to channel, version, timestamp, and source SHA.
+        required: false
+        type: string
+      version:
+        description: Optional product version override. Defaults to the workspace package version.
+        required: false
+        type: string
+      retention_count:
+        description: Number of releases to keep in the channel manifest and release assets.
+        required: false
+        default: "10"
+        type: string
+  schedule:
+    - cron: "30 7 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-managed-release-${{ github.event_name == 'schedule' && 'nightly' || github.event.inputs.channel || 'manual' }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  publish:
+    name: Publish Channel Artifact
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve channel source
+        id: release
+        env:
+          INPUT_CHANNEL: ${{ github.event.inputs.channel || '' }}
+          INPUT_SOURCE_REF: ${{ github.event.inputs.source_ref || '' }}
+          INPUT_RELEASE_ID: ${{ github.event.inputs.release_id || '' }}
+          INPUT_VERSION: ${{ github.event.inputs.version || '' }}
+          INPUT_RETENTION_COUNT: ${{ github.event.inputs.retention_count || '' }}
+        run: |
+          set -euo pipefail
+
+          git fetch origin main dev --tags
+
+          channel="${INPUT_CHANNEL:-nightly}"
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            channel="nightly"
+          fi
+
+          case "${channel}" in
+            stable|beta|nightly) ;;
+            *)
+              echo "::error::Unsupported release channel: ${channel}"
+              exit 1
+              ;;
+          esac
+
+          if [ -n "${INPUT_SOURCE_REF}" ]; then
+            source_ref="${INPUT_SOURCE_REF}"
+          elif [ "${channel}" = "stable" ]; then
+            source_ref="main"
+          else
+            source_ref="dev"
+          fi
+
+          if git rev-parse -q --verify "origin/${source_ref}^{commit}" >/dev/null; then
+            git checkout --detach "origin/${source_ref}"
+          else
+            git checkout --detach "${source_ref}"
+          fi
+
+          source_sha="$(git rev-parse HEAD)"
+          version="${INPUT_VERSION:-$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "nucleus-daemon") | .version')}"
+          timestamp="$(date -u +%Y%m%d%H%M%S)"
+          release_id="${INPUT_RELEASE_ID:-nucleus-${channel}-${version}-${timestamp}-${source_sha:0:12}}"
+          retention_count="${INPUT_RETENTION_COUNT:-10}"
+          channel_tag="nucleus-channel-${channel}"
+          manifest_name="manifest-${channel}.json"
+          artifact_base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${channel_tag}"
+
+          if ! [[ "${retention_count}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::retention_count must be a positive integer"
+            exit 1
+          fi
+
+          {
+            echo "channel=${channel}"
+            echo "source_ref=${source_ref}"
+            echo "source_sha=${source_sha}"
+            echo "source_short=${source_sha:0:12}"
+            echo "version=${version}"
+            echo "release_id=${release_id}"
+            echo "retention_count=${retention_count}"
+            echo "channel_tag=${channel_tag}"
+            echo "manifest_name=${manifest_name}"
+            echo "artifact_base_url=${artifact_base_url}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify Rust
+        run: |
+          cargo fmt --all --check
+          cargo test --manifest-path Cargo.toml
+
+      - name: Verify and build web
+        run: |
+          npm run check:web
+          npm run build:web
+
+      - name: Build release binaries
+        run: cargo build --release -p nucleus-daemon -p nucleus-cli
+
+      - name: Restore current channel manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL_TAG: ${{ steps.release.outputs.channel_tag }}
+          MANIFEST_NAME: ${{ steps.release.outputs.manifest_name }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist/releases
+          if gh release view "${CHANNEL_TAG}" >/dev/null 2>&1; then
+            gh release download "${CHANNEL_TAG}" \
+              --pattern "${MANIFEST_NAME}" \
+              --dir dist/releases \
+              --clobber || true
+          fi
+
+      - name: Package managed release
+        env:
+          CHANNEL: ${{ steps.release.outputs.channel }}
+          RELEASE_ID: ${{ steps.release.outputs.release_id }}
+          VERSION: ${{ steps.release.outputs.version }}
+          MANIFEST_NAME: ${{ steps.release.outputs.manifest_name }}
+          ARTIFACT_BASE_URL: ${{ steps.release.outputs.artifact_base_url }}
+        run: |
+          set -euo pipefail
+
+          target/release/nucleus release package \
+            --release-id "${RELEASE_ID}" \
+            --version "${VERSION}" \
+            --channel "${CHANNEL}" \
+            --daemon-binary target/release/nucleus-daemon \
+            --cli-binary target/release/nucleus \
+            --web-dist-dir apps/web/build \
+            --output-dir dist/releases \
+            --artifact-base-url "${ARTIFACT_BASE_URL}" \
+            --manifest-path "dist/releases/${MANIFEST_NAME}" \
+            --minimum-client-version "${VERSION}" \
+            --minimum-server-version "${VERSION}" \
+            --capability-flag daemon-owned-update-state \
+            --capability-flag embedded-web-build \
+            --capability-flag install-kind-contract
+
+      - name: Apply channel retention
+        id: retention
+        env:
+          MANIFEST_NAME: ${{ steps.release.outputs.manifest_name }}
+          RETENTION_COUNT: ${{ steps.release.outputs.retention_count }}
+        run: |
+          set -euo pipefail
+
+          manifest_path="dist/releases/${MANIFEST_NAME}"
+          pruned_assets="$(mktemp)"
+
+          jq -r \
+            --argjson keep "${RETENTION_COUNT}" \
+            '.releases | sort_by(.published_at) | reverse | .[$keep:][]?.artifacts[]?.download_url | split("/")[-1]' \
+            "${manifest_path}" > "${pruned_assets}"
+
+          jq \
+            --argjson keep "${RETENTION_COUNT}" \
+            '.releases = (.releases | sort_by(.published_at) | reverse | .[:$keep])' \
+            "${manifest_path}" > "${manifest_path}.tmp"
+          mv "${manifest_path}.tmp" "${manifest_path}"
+
+          {
+            echo 'pruned_assets<<EOF'
+            cat "${pruned_assets}"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Validate packaged install
+        env:
+          CHANNEL: ${{ steps.release.outputs.channel }}
+          MANIFEST_NAME: ${{ steps.release.outputs.manifest_name }}
+        run: |
+          set -euo pipefail
+
+          install_root="${RUNNER_TEMP}/nucleus-managed-install"
+          state_dir="${RUNNER_TEMP}/nucleus-managed-state"
+
+          target/release/nucleus \
+            --state-dir "${state_dir}" \
+            release install \
+            --manifest-url "file://${GITHUB_WORKSPACE}/dist/releases/${MANIFEST_NAME}" \
+            --channel "${CHANNEL}" \
+            --install-root "${install_root}" \
+            --install-service false \
+            --bind 127.0.0.1:5201
+
+          test -x "${install_root}/current/bin/nucleus-daemon"
+          test -x "${install_root}/current/bin/nucleus"
+          test -f "${install_root}/current/web/index.html"
+
+      - name: Publish channel release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ steps.release.outputs.channel }}
+          CHANNEL_TAG: ${{ steps.release.outputs.channel_tag }}
+          RELEASE_ID: ${{ steps.release.outputs.release_id }}
+          SOURCE_SHA: ${{ steps.release.outputs.source_sha }}
+          SOURCE_SHORT: ${{ steps.release.outputs.source_short }}
+          SOURCE_REF: ${{ steps.release.outputs.source_ref }}
+          VERSION: ${{ steps.release.outputs.version }}
+          MANIFEST_NAME: ${{ steps.release.outputs.manifest_name }}
+          ARTIFACT_BASE_URL: ${{ steps.release.outputs.artifact_base_url }}
+          PRUNED_ASSETS: ${{ steps.retention.outputs.pruned_assets }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -fa "${CHANNEL_TAG}" "${SOURCE_SHA}" \
+            -m "Nucleus ${CHANNEL} channel through ${SOURCE_SHA}"
+          git push --force origin "refs/tags/${CHANNEL_TAG}"
+
+          notes_file="$(mktemp)"
+          cat > "${notes_file}" <<EOF
+          Nucleus ${CHANNEL} channel manifest and artifacts.
+
+          - Channel: \`${CHANNEL}\`
+          - Release ID: \`${RELEASE_ID}\`
+          - Version: \`${VERSION}\`
+          - Source: \`${SOURCE_REF}\` at \`${SOURCE_SHORT}\`
+          - Manifest: \`${ARTIFACT_BASE_URL}/${MANIFEST_NAME}\`
+
+          Managed installs track this channel manifest rather than a git branch.
+          EOF
+
+          release_args=(--title "Nucleus ${CHANNEL} channel" --notes-file "${notes_file}")
+          if [ "${CHANNEL}" != "stable" ]; then
+            release_args+=(--prerelease)
+          fi
+
+          if gh release view "${CHANNEL_TAG}" >/dev/null 2>&1; then
+            gh release edit "${CHANNEL_TAG}" "${release_args[@]}"
+          else
+            gh release create "${CHANNEL_TAG}" --target "${SOURCE_SHA}" "${release_args[@]}"
+          fi
+
+          gh release upload "${CHANNEL_TAG}" \
+            "dist/releases/nucleus-${RELEASE_ID}-"*.tar.gz \
+            "dist/releases/${MANIFEST_NAME}" \
+            --clobber
+
+          while IFS= read -r asset_name; do
+            [ -n "${asset_name}" ] || continue
+            asset_id="$(gh release view "${CHANNEL_TAG}" --json assets --jq ".assets[] | select(.name == \"${asset_name}\") | .id" || true)"
+            if [ -n "${asset_id}" ]; then
+              gh api \
+                --method DELETE \
+                -H "Accept: application/vnd.github+json" \
+                "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
+            fi
+          done <<EOF
+          ${PRUNED_ASSETS}
+          EOF
+
+      - name: Summarize release
+        env:
+          CHANNEL: ${{ steps.release.outputs.channel }}
+          RELEASE_ID: ${{ steps.release.outputs.release_id }}
+          VERSION: ${{ steps.release.outputs.version }}
+          CHANNEL_TAG: ${{ steps.release.outputs.channel_tag }}
+          MANIFEST_NAME: ${{ steps.release.outputs.manifest_name }}
+          ARTIFACT_BASE_URL: ${{ steps.release.outputs.artifact_base_url }}
+        run: |
+          {
+            echo "## Managed Release Published"
+            echo
+            echo "- Channel: \`${CHANNEL}\`"
+            echo "- Release ID: \`${RELEASE_ID}\`"
+            echo "- Version: \`${VERSION}\`"
+            echo "- Channel tag: \`${CHANNEL_TAG}\`"
+            echo "- Manifest URL: \`${ARTIFACT_BASE_URL}/${MANIFEST_NAME}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

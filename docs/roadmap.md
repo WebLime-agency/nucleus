@@ -13,8 +13,10 @@ That means finishing and stabilizing:
 - router profiles and model settings
 - machine telemetry and process control
 - prompt assembly and durable context layering
-- auth, updates, and restart flows
+- auth, managed-release updates, and restart flows
 - web UI ergonomics for heavy daily use
+
+Managed-release channels are now part of the product baseline: public installs follow `stable`, `beta`, or `nightly` manifests, while source checkouts remain contributor-only.
 
 ## V1
 

@@ -22,6 +22,8 @@ pub const DEFAULT_RELEASE_CHANNEL: &str = "stable";
 pub const RELEASE_CHANNELS: [&str; 3] = ["stable", "beta", "nightly"];
 pub const RELEASE_FORMAT_TAR_GZ: &str = "tar.gz";
 pub const RELEASE_METADATA_FILE: &str = "release.json";
+pub const DEFAULT_RELEASE_REPOSITORY: &str = "WebLime-agency/nucleus";
+pub const RELEASE_CHANNEL_TAG_PREFIX: &str = "nucleus-channel-";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManagedReleaseManifest {
@@ -100,6 +102,7 @@ pub struct ReleasePackageInput {
     pub version: String,
     pub channel: String,
     pub daemon_binary: PathBuf,
+    pub cli_binary: Option<PathBuf>,
     pub web_dist_dir: PathBuf,
     pub output_dir: PathBuf,
     pub artifact_base_url: Option<String>,
@@ -117,6 +120,18 @@ pub fn default_install_root() -> Result<PathBuf> {
 
 pub fn current_platform_target() -> String {
     format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)
+}
+
+pub fn channel_release_tag(channel: &str) -> Result<String> {
+    validate_channel(channel)?;
+    Ok(format!("{RELEASE_CHANNEL_TAG_PREFIX}{channel}"))
+}
+
+pub fn default_channel_manifest_url(channel: &str) -> Result<String> {
+    let tag = channel_release_tag(channel)?;
+    Ok(format!(
+        "https://github.com/{DEFAULT_RELEASE_REPOSITORY}/releases/download/{tag}/manifest-{channel}.json"
+    ))
 }
 
 pub fn current_release_dir(install_root: &Path) -> PathBuf {
@@ -197,6 +212,16 @@ pub fn select_release(
     channel: &str,
     target: &str,
 ) -> Result<SelectedRelease> {
+    validate_channel(channel)?;
+
+    if manifest.channel != channel {
+        bail!(
+            "managed release manifest is for channel '{}', but this install tracks '{}'",
+            manifest.channel,
+            channel
+        );
+    }
+
     let mut matches = manifest
         .releases
         .iter()
@@ -424,6 +449,12 @@ pub fn package_release_artifact(input: ReleasePackageInput) -> Result<PackagedRe
         );
     }
 
+    if let Some(cli_binary) = &input.cli_binary {
+        if !cli_binary.is_file() {
+            bail!("CLI binary '{}' was not found", cli_binary.display());
+        }
+    }
+
     if !input.web_dist_dir.join("index.html").is_file() {
         bail!(
             "web build '{}' is missing index.html",
@@ -457,7 +488,20 @@ pub fn package_release_artifact(input: ReleasePackageInput) -> Result<PackagedRe
                 input.daemon_binary.display()
             )
         })?;
+    if let Some(cli_binary) = &input.cli_binary {
+        builder
+            .append_path_with_name(cli_binary, "bin/nucleus")
+            .with_context(|| format!("failed to append CLI binary {}", cli_binary.display()))?;
+    }
     append_directory_recursive(&mut builder, &input.web_dist_dir, &PathBuf::from("web"))?;
+    let minimum_client_version = input
+        .minimum_client_version
+        .clone()
+        .unwrap_or_else(|| input.version.clone());
+    let minimum_server_version = input
+        .minimum_server_version
+        .clone()
+        .unwrap_or_else(|| input.version.clone());
 
     let release_metadata = InstalledReleaseMetadata {
         product: PRODUCT_NAME.to_string(),
@@ -466,8 +510,8 @@ pub fn package_release_artifact(input: ReleasePackageInput) -> Result<PackagedRe
         channel: input.channel.clone(),
         target: target.clone(),
         built_at: published_at,
-        minimum_client_version: input.minimum_client_version.clone(),
-        minimum_server_version: input.minimum_server_version.clone(),
+        minimum_client_version: Some(minimum_client_version.clone()),
+        minimum_server_version: Some(minimum_server_version.clone()),
         capability_flags: input.capability_flags.clone(),
     };
     append_json_file(
@@ -493,7 +537,6 @@ pub fn package_release_artifact(input: ReleasePackageInput) -> Result<PackagedRe
         .artifact_base_url
         .map(|base| format!("{}/{}", base.trim_end_matches('/'), archive_name))
         .unwrap_or_else(|| format!("file://{}", archive_path.display()));
-
     let artifact = ManagedReleaseArtifact {
         target: target.clone(),
         format: RELEASE_FORMAT_TAR_GZ.to_string(),
@@ -506,8 +549,8 @@ pub fn package_release_artifact(input: ReleasePackageInput) -> Result<PackagedRe
         version: input.version.clone(),
         channel: input.channel.clone(),
         published_at,
-        minimum_client_version: input.minimum_client_version,
-        minimum_server_version: input.minimum_server_version,
+        minimum_client_version: Some(minimum_client_version),
+        minimum_server_version: Some(minimum_server_version),
         capability_flags: input.capability_flags,
         artifacts: vec![artifact.clone()],
     };
@@ -526,7 +569,14 @@ pub fn package_release_artifact(input: ReleasePackageInput) -> Result<PackagedRe
                     manifest_path.display()
                 )
             })?;
-        current.channel = input.channel.clone();
+        if current.channel != input.channel {
+            bail!(
+                "managed release manifest {} is for channel '{}', not '{}'",
+                manifest_path.display(),
+                current.channel,
+                input.channel
+            );
+        }
         current
             .releases
             .retain(|item| item.release_id != release.release_id);
@@ -714,6 +764,7 @@ mod tests {
         fs::create_dir_all(&bin_dir).expect("bin dir should exist");
         fs::create_dir_all(&web_dir).expect("web dir should exist");
         fs::write(bin_dir.join("nucleus-daemon"), "daemon").expect("daemon file should exist");
+        fs::write(bin_dir.join("nucleus"), "cli").expect("CLI file should exist");
         fs::write(web_dir.join("index.html"), "<html></html>").expect("web build should exist");
 
         let packaged = package_release_artifact(ReleasePackageInput {
@@ -721,6 +772,7 @@ mod tests {
             version: "0.1.0".to_string(),
             channel: DEFAULT_RELEASE_CHANNEL.to_string(),
             daemon_binary: bin_dir.join("nucleus-daemon"),
+            cli_binary: Some(bin_dir.join("nucleus")),
             web_dist_dir: web_dir,
             output_dir: output_dir.clone(),
             artifact_base_url: None,
@@ -741,7 +793,124 @@ mod tests {
         let selected = select_release(&manifest, DEFAULT_RELEASE_CHANNEL, "x86_64-linux")
             .expect("release should select");
         assert_eq!(selected.release.release_id, "rel_test");
+        assert_eq!(
+            selected.release.minimum_client_version.as_deref(),
+            Some("0.1.0")
+        );
+        assert_eq!(
+            selected.release.minimum_server_version.as_deref(),
+            Some("0.1.0")
+        );
         assert!(selected.artifact.download_url.starts_with("file://"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn default_channel_manifest_url_uses_public_channel_release_asset() {
+        let url = default_channel_manifest_url("beta").expect("channel should validate");
+
+        assert_eq!(
+            url,
+            "https://github.com/WebLime-agency/nucleus/releases/download/nucleus-channel-beta/manifest-beta.json"
+        );
+    }
+
+    #[test]
+    fn select_release_rejects_manifest_channel_mismatches() {
+        let manifest = ManagedReleaseManifest {
+            product: PRODUCT_NAME.to_string(),
+            channel: "stable".to_string(),
+            generated_at: 1,
+            releases: Vec::new(),
+        };
+
+        let error = select_release(&manifest, "beta", "x86_64-linux")
+            .expect_err("mismatched channel should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("manifest is for channel 'stable'")
+        );
+    }
+
+    #[test]
+    fn select_release_rejects_missing_target_artifacts() {
+        let manifest = ManagedReleaseManifest {
+            product: PRODUCT_NAME.to_string(),
+            channel: DEFAULT_RELEASE_CHANNEL.to_string(),
+            generated_at: 1,
+            releases: vec![ManagedReleaseVersion {
+                release_id: "rel_missing_target".to_string(),
+                version: "0.1.0".to_string(),
+                channel: DEFAULT_RELEASE_CHANNEL.to_string(),
+                published_at: 1,
+                minimum_client_version: Some("0.1.0".to_string()),
+                minimum_server_version: Some("0.1.0".to_string()),
+                capability_flags: Vec::new(),
+                artifacts: vec![ManagedReleaseArtifact {
+                    target: "aarch64-linux".to_string(),
+                    format: RELEASE_FORMAT_TAR_GZ.to_string(),
+                    download_url: "file:///tmp/does-not-matter.tar.gz".to_string(),
+                    sha256: "abc".to_string(),
+                    size_bytes: 1,
+                }],
+            }],
+        };
+
+        let error = select_release(&manifest, DEFAULT_RELEASE_CHANNEL, "x86_64-linux")
+            .expect_err("missing target should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("no managed release artifact was published")
+        );
+    }
+
+    #[test]
+    fn package_rejects_existing_manifest_from_other_channel() {
+        let root = std::env::temp_dir().join(format!("nucleus-release-channel-{}", Uuid::new_v4()));
+        let bin_dir = root.join("bin");
+        let web_dir = root.join("web");
+        let output_dir = root.join("dist");
+        let manifest_path = output_dir.join("manifest-stable.json");
+        fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+        fs::create_dir_all(&web_dir).expect("web dir should exist");
+        fs::create_dir_all(&output_dir).expect("output dir should exist");
+        fs::write(bin_dir.join("nucleus-daemon"), "daemon").expect("daemon file should exist");
+        fs::write(web_dir.join("index.html"), "<html></html>").expect("web build should exist");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&ManagedReleaseManifest {
+                product: PRODUCT_NAME.to_string(),
+                channel: "beta".to_string(),
+                generated_at: 1,
+                releases: Vec::new(),
+            })
+            .expect("manifest should serialize"),
+        )
+        .expect("manifest should write");
+
+        let error = package_release_artifact(ReleasePackageInput {
+            release_id: "rel_wrong_channel".to_string(),
+            version: "0.1.0".to_string(),
+            channel: DEFAULT_RELEASE_CHANNEL.to_string(),
+            daemon_binary: bin_dir.join("nucleus-daemon"),
+            cli_binary: None,
+            web_dist_dir: web_dir,
+            output_dir,
+            artifact_base_url: None,
+            manifest_path: Some(manifest_path),
+            target: Some("x86_64-linux".to_string()),
+            minimum_client_version: None,
+            minimum_server_version: None,
+            capability_flags: Vec::new(),
+        })
+        .expect_err("wrong channel manifest should fail");
+
+        assert!(error.to_string().contains("is for channel 'beta'"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -756,6 +925,7 @@ mod tests {
         fs::create_dir_all(&bin_dir).expect("bin dir should exist");
         fs::create_dir_all(&web_dir).expect("web dir should exist");
         fs::write(bin_dir.join("nucleus-daemon"), "daemon").expect("daemon file should exist");
+        fs::write(bin_dir.join("nucleus"), "cli").expect("CLI file should exist");
         fs::write(web_dir.join("index.html"), "<html></html>").expect("web build should exist");
 
         let packaged = package_release_artifact(ReleasePackageInput {
@@ -763,6 +933,7 @@ mod tests {
             version: "0.1.0".to_string(),
             channel: DEFAULT_RELEASE_CHANNEL.to_string(),
             daemon_binary: bin_dir.join("nucleus-daemon"),
+            cli_binary: Some(bin_dir.join("nucleus")),
             web_dist_dir: web_dir,
             output_dir,
             artifact_base_url: None,
@@ -783,9 +954,76 @@ mod tests {
         assert_eq!(activation.current_release_id, "rel_stage");
         assert!(current_release_binary_path(&install_root).exists());
         assert!(
+            current_release_dir(&install_root)
+                .join("bin/nucleus")
+                .is_file()
+        );
+        assert!(
             current_release_web_dir(&install_root)
                 .join("index.html")
                 .is_file()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn activation_tracks_previous_release_after_second_activation() {
+        let root =
+            std::env::temp_dir().join(format!("nucleus-release-previous-{}", Uuid::new_v4()));
+        let output_dir = root.join("dist");
+        let install_root = root.join("install");
+
+        for release_id in ["rel_one", "rel_two"] {
+            let bin_dir = root.join(format!("{release_id}-bin"));
+            let web_dir = root.join(format!("{release_id}-web"));
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+            fs::create_dir_all(&web_dir).expect("web dir should exist");
+            fs::write(
+                bin_dir.join("nucleus-daemon"),
+                format!("daemon-{release_id}"),
+            )
+            .expect("daemon file should exist");
+            fs::write(
+                web_dir.join("index.html"),
+                format!("<html>{release_id}</html>"),
+            )
+            .expect("web build should exist");
+
+            let packaged = package_release_artifact(ReleasePackageInput {
+                release_id: release_id.to_string(),
+                version: "0.1.0".to_string(),
+                channel: DEFAULT_RELEASE_CHANNEL.to_string(),
+                daemon_binary: bin_dir.join("nucleus-daemon"),
+                cli_binary: None,
+                web_dist_dir: web_dir,
+                output_dir: output_dir.clone(),
+                artifact_base_url: None,
+                manifest_path: None,
+                target: Some("x86_64-linux".to_string()),
+                minimum_client_version: None,
+                minimum_server_version: None,
+                capability_flags: Vec::new(),
+            })
+            .expect("package should succeed");
+
+            stage_release_archive(&packaged.archive_path, &install_root, release_id)
+                .expect("release should stage");
+        }
+
+        let first =
+            activate_release(&install_root, "rel_one").expect("first release should activate");
+        assert_eq!(first.previous_release_id, None);
+
+        let second =
+            activate_release(&install_root, "rel_two").expect("second release should activate");
+        assert_eq!(second.previous_release_id.as_deref(), Some("rel_one"));
+
+        let previous_target =
+            fs::read_link(install_root.join("previous")).expect("previous link should exist");
+        assert_eq!(
+            previous_target.file_name().and_then(|value| value.to_str()),
+            Some("rel_one")
         );
 
         let _ = fs::remove_dir_all(root);

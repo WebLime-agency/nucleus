@@ -1,6 +1,8 @@
 # Update System Follow-Up
 
-Status: Active plan
+Status: Shipped
+
+This plan is retained as historical implementation context. The managed-release updater, daemon/client update contract, compatibility metadata, and channel artifact flow shipped by May 6, 2026.
 
 ## Why Revisit This
 
@@ -170,6 +172,8 @@ If the latest attempt failed, keep the historical availability in Settings but s
 
 ### Slice 1 - Update-state correctness and protocol hardening
 
+Status: Shipped
+
 - add the persisted daemon-owned update-state record
 - expose `install_kind`
 - expose tracked channel/ref and explicit check timestamps
@@ -179,6 +183,8 @@ If the latest attempt failed, keep the historical availability in Settings but s
 
 ### Slice 2 - Install-mode split and configuration surfaces
 
+Status: Shipped
+
 - add install-time or CLI configuration for `tracked_channel` and `tracked_ref`
 - lock git-based update actions to `dev_checkout`
 - decide whether tracked refs become user-editable in the UI or CLI
@@ -186,12 +192,16 @@ If the latest attempt failed, keep the historical availability in Settings but s
 
 ### Slice 3 - Artifact-based managed release updater
 
+Status: Shipped
+
 - publish channel manifests and platform artifacts with checksums
 - resolve the latest compatible artifact for the tracked channel
 - download, verify, stage, swap, and preserve rollback state
 - restart the daemon onto the new artifact and embedded web bundle
 
 ### Slice 4 - Compatibility enforcement
+
+Status: Shipped
 
 - populate minimum client and server versions from policy
 - make the web client consume compatibility metadata instead of assuming support

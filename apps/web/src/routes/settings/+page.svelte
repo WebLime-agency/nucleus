@@ -24,8 +24,9 @@
     CardTitle
   } from '$lib/components/ui/card';
   import {
+    CURRENT_CLIENT_VERSION,
     CURRENT_CLIENT_SURFACE_VERSION,
-    describeCompatibilityWarning
+    evaluateCompatibility
   } from '$lib/nucleus/compatibility';
   import {
     applyUpdate,
@@ -53,9 +54,8 @@
   let trackedRefInput = $state('');
 
   let update = $derived(settings?.update ?? null);
-  let compatibilityWarning = $derived(
-    describeCompatibilityWarning(settings?.compatibility ?? null)
-  );
+  let compatibility = $derived(evaluateCompatibility(settings?.compatibility ?? null));
+  let compatibilityWarning = $derived(compatibility.message);
   let statusLabel = $derived.by(() => {
     if (loading) return 'Connecting';
     if (checking) return 'Checking';
@@ -63,7 +63,8 @@
     if (restarting || update?.state === 'restarting') return 'Restarting';
     if (streamStatus === 'reconnecting') return 'Reconnecting';
     if (streamStatus === 'connecting') return 'Connecting';
-    if (compatibilityWarning) return 'Degraded';
+    if (compatibility.level === 'blocked') return 'Incompatible';
+    if (compatibility.level === 'degraded') return 'Degraded';
     if (error) return 'Degraded';
     return 'Live';
   });
@@ -301,7 +302,7 @@
 
 <div class="space-y-8">
   <section class="space-y-3">
-    <Badge variant={error ? 'destructive' : 'default'}>{statusLabel}</Badge>
+    <Badge variant={error || compatibility.level === 'blocked' ? 'destructive' : 'default'}>{statusLabel}</Badge>
     <div>
       <h1 class="text-3xl font-semibold text-zinc-50">Settings</h1>
       <p class="mt-2 max-w-3xl text-sm leading-6 text-zinc-400">
@@ -318,7 +319,11 @@
   {/if}
 
   {#if compatibilityWarning}
-    <div class="rounded-lg border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-sm text-amber-100">
+    <div
+      class={compatibility.level === 'blocked'
+        ? 'rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-100'
+        : 'rounded-lg border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-sm text-amber-100'}
+    >
       {compatibilityWarning}
     </div>
   {/if}
@@ -661,7 +666,14 @@
       </CardDescription>
     </CardHeader>
     <CardContent class="space-y-3">
-      <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+          <div class="flex items-center gap-2 text-xs uppercase tracking-[0.16em] text-zinc-500">
+            <ShieldAlert class="size-3.5" />
+            <span>Client Version</span>
+          </div>
+          <div class="mt-2 text-sm font-medium text-zinc-50">{CURRENT_CLIENT_VERSION}</div>
+        </div>
         <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
           <div class="flex items-center gap-2 text-xs uppercase tracking-[0.16em] text-zinc-500">
             <ShieldAlert class="size-3.5" />
