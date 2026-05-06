@@ -207,6 +207,11 @@ export const projectUpdateRequestSchema = z.object({
   title: z.string().trim().optional()
 });
 
+export const updateConfigRequestSchema = z.object({
+  tracked_channel: z.string().trim().min(1).optional(),
+  tracked_ref: z.string().trim().min(1).optional()
+});
+
 export const routeTargetSchema = z.object({
   provider: z.string(),
   model: z.string()
@@ -251,9 +256,9 @@ export const storageSummarySchema = z.object({
 
 export const instanceSummarySchema = z.object({
   name: z.string(),
-  repo_root: z.string(),
+  repo_root: z.string().nullable(),
   daemon_bind: z.string(),
-  install_mode: z.string(),
+  install_kind: z.string(),
   restart_mode: z.string(),
   restart_supported: z.boolean()
 });
@@ -271,20 +276,36 @@ export const connectionSummarySchema = z.object({
   web_root: z.string().nullable()
 });
 
+export const compatibilitySummarySchema = z.object({
+  server_version: z.string(),
+  minimum_client_version: z.string().nullable(),
+  minimum_server_version: z.string().nullable(),
+  surface_version: z.string(),
+  capability_flags: z.array(z.string())
+});
+
 export const updateStatusSchema = z.object({
-  install_mode: z.string(),
-  repo_root: z.string(),
-  branch: z.string(),
-  remote_name: z.string(),
-  remote_url: z.string(),
-  current_commit: z.string(),
-  current_commit_short: z.string(),
-  remote_commit: z.string(),
-  remote_commit_short: z.string(),
+  install_kind: z.string(),
+  tracked_channel: z.string().nullable(),
+  tracked_ref: z.string().nullable(),
+  repo_root: z.string().nullable(),
+  current_ref: z.string().nullable(),
+  remote_name: z.string().nullable(),
+  remote_url: z.string().nullable(),
+  current_commit: z.string().nullable(),
+  current_commit_short: z.string().nullable(),
+  latest_commit: z.string().nullable(),
+  latest_commit_short: z.string().nullable(),
+  latest_version: z.string().nullable(),
+  latest_release_id: z.string().nullable(),
   update_available: z.boolean(),
   dirty_worktree: z.boolean(),
   restart_required: z.boolean(),
-  checked_at: z.number().int().nullable(),
+  last_successful_check_at: z.number().int().nullable(),
+  last_attempted_check_at: z.number().int().nullable(),
+  last_attempt_result: z.string().nullable(),
+  latest_error: z.string().nullable(),
+  latest_error_at: z.number().int().nullable(),
   state: z.string(),
   message: z.string()
 });
@@ -296,6 +317,7 @@ export const settingsSummarySchema = z.object({
   storage: storageSummarySchema,
   auth: authSummarySchema,
   connection: connectionSummarySchema,
+  compatibility: compatibilitySummarySchema,
   update: updateStatusSchema
 });
 
@@ -382,7 +404,8 @@ export const processKillResponseSchema = z.object({
 
 export const streamConnectedSchema = z.object({
   service: z.string(),
-  version: z.string()
+  version: z.string(),
+  compatibility: compatibilitySummarySchema
 });
 
 export const processStreamUpdateSchema = z.object({
@@ -452,5 +475,7 @@ export type ProcessListResponse = z.infer<typeof processListResponseSchema>;
 export type ProcessSnapshot = z.infer<typeof processSnapshotSchema>;
 export type DiskStat = z.infer<typeof diskStatSchema>;
 export type SettingsSummary = z.infer<typeof settingsSummarySchema>;
+export type CompatibilitySummary = z.infer<typeof compatibilitySummarySchema>;
 export type UpdateStatus = z.infer<typeof updateStatusSchema>;
+export type UpdateConfigRequest = z.infer<typeof updateConfigRequestSchema>;
 export type DaemonEvent = z.infer<typeof daemonEventSchema>;
