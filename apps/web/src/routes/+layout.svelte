@@ -496,8 +496,18 @@
     </div>
   </aside>
 
-  <main class="flex min-h-0 min-w-0 flex-col overflow-hidden px-4 py-4 sm:px-6 lg:px-8 lg:py-6">
-    <div class="sticky top-0 z-20 -mx-4 mb-4 border-b border-zinc-900 bg-zinc-950/95 px-4 py-2.5 backdrop-blur sm:-mx-6 sm:px-6 lg:hidden">
+  <main
+    class={cn(
+      'flex min-h-0 min-w-0 flex-col overflow-hidden',
+      usesFullHeightContent ? 'px-0 py-0' : 'px-4 py-4 sm:px-6 lg:px-8 lg:py-6'
+    )}
+  >
+    <div
+      class={cn(
+        'sticky top-0 z-20 mb-4 border-b border-zinc-900 bg-zinc-950/95 px-4 py-2.5 backdrop-blur sm:px-6 lg:hidden',
+        usesFullHeightContent ? '' : '-mx-4 sm:-mx-6'
+      )}
+    >
       <div class="flex items-center justify-between gap-3">
         <div class="flex min-w-0 items-center gap-3">
           <Button
@@ -539,13 +549,13 @@
 
     <div
       class={cn(
-        'min-h-0 flex-1',
+        'min-h-0 min-w-0 flex-1',
         usesFullHeightContent ? 'flex overflow-hidden' : 'overflow-y-auto'
       )}
     >
       <div
         class={cn(
-          usesFullHeightContent ? 'flex min-h-0 flex-1 overflow-hidden' : 'pb-8'
+          usesFullHeightContent ? 'flex min-h-0 min-w-0 flex-1 overflow-hidden' : 'pb-8'
         )}
       >
         {@render children()}
