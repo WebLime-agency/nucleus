@@ -11,8 +11,9 @@ Daily work happens on short-lived feature branches:
 3. let CI pass on the PR
 4. merge into `dev`
 5. let the nightly promotion workflow cut a disposable promotion branch from `main`
-6. let that workflow cherry-pick the patch-unique commits from `dev`
+6. let that workflow cherry-pick the exact `dev` range recorded by the promotion cursor
 7. let the promotion PR back into `main` auto-merge after CI passes
+8. let the cursor-advance workflow move the promotion cursor only after that PR merges successfully
 
 Rules:
 
@@ -22,7 +23,8 @@ Rules:
 - let `main` move only through the nightly promotion path unless there is an explicit hotfix
 - `dev` should keep linear history
 - the nightly promotion branch must start from `main`, not `dev`
-- nightly promotion must use patch-based cherry-picks so `main` hotfixes do not poison future promotions
+- nightly promotion must use a durable promotion cursor instead of branch-diff heuristics
+- nightly promotion must cherry-pick the exact cursor range from `dev` so squash-merging the promotion PR does not requeue old `dev` commits
 - the promotion PR should auto-merge with squash so the release branch stays disposable
 
 CI expectations:
@@ -41,5 +43,21 @@ Promotion branch contract:
 
 - branch name: `promote/dev-to-main`
 - base branch: `main`
-- commits on the branch are created by nightly cherry-picking the patch-unique `dev` commits onto `main`
+- commits on the branch are created by nightly cherry-picking the exact cursor range from `dev` onto `main`
 - the PR is disposable and should be recreated or force-updated by the workflow as needed
+
+Promotion cursor contract:
+
+- cursor ref: git tag `promotion/dev-last-promoted`
+- the tag points to the latest `dev` commit that has successfully landed in `main`
+- the nightly workflow builds the promotion branch from `origin/main`
+- the nightly workflow promotes the exact ordered range `promotion/dev-last-promoted..origin/dev`
+- the cursor advances only after the promotion PR merges successfully
+- squash-merging the promotion PR is safe because the cursor does not depend on `main` retaining `dev` ancestry
+
+Bootstrap rule:
+
+- the first run after enabling the cursor-based workflow must provide a known-good `bootstrap_sha`
+- `bootstrap_sha` must be the latest `dev` commit already represented in `main`; if nothing past the branch point has landed yet, use `git merge-base origin/main origin/dev`
+- to derive `bootstrap_sha`, run `git cherry -v origin/main origin/dev` and choose the last leading `-` commit before the first `+`
+- after that first promotion PR merges, the cursor-advance workflow creates or updates the cursor tag automatically
