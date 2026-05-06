@@ -12,9 +12,9 @@ use nucleus_core::{DEFAULT_DAEMON_ADDR, PRODUCT_NAME, PRODUCT_SLUG};
 use nucleus_protocol::{HealthResponse, SettingsSummary};
 use nucleus_release::{
     DEFAULT_RELEASE_CHANNEL, ReleasePackageInput, activate_release, current_platform_target,
-    current_release_binary_path, current_release_web_dir, default_install_root,
-    download_artifact_to_path, load_manifest, package_release_artifact, select_release,
-    stage_release_archive, validate_channel, verify_sha256,
+    current_release_binary_path, current_release_web_dir, default_channel_manifest_url,
+    default_install_root, download_artifact_to_path, load_manifest, package_release_artifact,
+    select_release, stage_release_archive, validate_channel, verify_sha256,
 };
 use nucleus_storage::{StateStore, StoredUpdateState};
 use reqwest::header::AUTHORIZATION;
@@ -158,6 +158,9 @@ struct ReleasePackageArgs {
     daemon_binary: Option<PathBuf>,
 
     #[arg(long)]
+    cli_binary: Option<PathBuf>,
+
+    #[arg(long)]
     web_dist_dir: Option<PathBuf>,
 
     #[arg(long)]
@@ -185,7 +188,7 @@ struct ReleasePackageArgs {
 #[derive(Debug, Clone, Args)]
 struct ReleaseInstallArgs {
     #[arg(long, env = "NUCLEUS_RELEASE_MANIFEST_URL")]
-    manifest_url: String,
+    manifest_url: Option<String>,
 
     #[arg(long, default_value = DEFAULT_RELEASE_CHANNEL)]
     channel: String,
@@ -429,6 +432,15 @@ fn run_release_package(args: ReleasePackageArgs) -> Result<()> {
         }
         None => resolve_daemon_binary(&repo_root)?,
     };
+    let cli_binary = match args.cli_binary.as_deref() {
+        Some(path) => {
+            if !path.is_file() {
+                bail!("CLI binary '{}' was not found", path.display());
+            }
+            Some(path.to_path_buf())
+        }
+        None => resolve_cli_binary(&repo_root).ok(),
+    };
     let web_dist_dir = resolve_web_dist_dir(args.web_dist_dir.as_deref(), &repo_root)?;
     let output_dir = args
         .output_dir
@@ -445,6 +457,7 @@ fn run_release_package(args: ReleasePackageArgs) -> Result<()> {
         version: version.clone(),
         channel: channel.to_string(),
         daemon_binary,
+        cli_binary,
         web_dist_dir,
         output_dir,
         artifact_base_url: args
@@ -494,7 +507,13 @@ async fn run_release_install(
 ) -> Result<()> {
     let channel = trim_nonempty(&args.channel, "release channel")?;
     validate_channel(channel)?;
-    let manifest_url = trim_nonempty(&args.manifest_url, "manifest URL")?.to_string();
+    let manifest_url = args
+        .manifest_url
+        .as_deref()
+        .map(|value| trim_nonempty(value, "manifest URL"))
+        .transpose()?
+        .map(ToOwned::to_owned)
+        .unwrap_or(default_channel_manifest_url(channel)?);
     let install_root = resolve_install_root(args.install_root.as_deref())?;
     let state_dir = state_dir_path(explicit_state_dir.as_deref())?;
     let store = open_store(Some(&state_dir))?;
@@ -711,6 +730,24 @@ fn resolve_daemon_binary(repo_root: &Path) -> Result<PathBuf> {
     bail!(
         "failed to locate `nucleus-daemon`. Build the Rust workspace first so the daemon binary exists."
     );
+}
+
+fn resolve_cli_binary(repo_root: &Path) -> Result<PathBuf> {
+    let current_exe = env::current_exe().context("failed to resolve the current executable")?;
+    if current_exe.file_name().and_then(|value| value.to_str()) == Some("nucleus") {
+        return Ok(current_exe);
+    }
+
+    for candidate in [
+        repo_root.join("target/debug/nucleus"),
+        repo_root.join("target/release/nucleus"),
+    ] {
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    bail!("failed to locate `nucleus` CLI binary");
 }
 
 fn install_service_unit(plan: &InstallPlan, enable: bool) -> Result<PathBuf> {
