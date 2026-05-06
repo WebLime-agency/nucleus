@@ -13,7 +13,7 @@ Daily work happens on short-lived feature branches:
 5. let the nightly promotion workflow cut a disposable promotion branch from `main`
 6. let that workflow cherry-pick the exact `dev` range recorded by the promotion cursor
 7. let the promotion PR back into `main` auto-merge after CI passes
-8. let the cursor-advance workflow move the promotion cursor only after that PR merges successfully
+8. let the nightly promotion workflow advance the cursor after the promotion PR merges successfully
 9. publish managed release artifacts through the explicit channel workflow when a product channel should move
 
 Rules:
@@ -58,6 +58,8 @@ Promotion cursor contract:
 - the nightly workflow builds the promotion branch from `origin/main`
 - the nightly workflow promotes the exact ordered range `promotion/dev-last-promoted..origin/dev`
 - the cursor advances only after the promotion PR merges successfully
+- `Nightly Promote` advances the cursor in the same workflow run after auto-merge because GitHub does not reliably fire follow-up workflows from `GITHUB_TOKEN` pull request activity
+- `Advance Promotion Cursor` remains a fallback for human-merged promotion PRs
 - squash-merging the promotion PR is safe because the cursor does not depend on `main` retaining `dev` ancestry
 
 Bootstrap rule:
@@ -65,7 +67,7 @@ Bootstrap rule:
 - the first run after enabling the cursor-based workflow must provide a known-good `bootstrap_sha`
 - `bootstrap_sha` must be the latest `dev` commit already represented in `main`; if nothing past the branch point has landed yet, use `git merge-base origin/main origin/dev`
 - validate `bootstrap_sha` with `scripts/validate-promotion-bootstrap.sh`, which checks both direct hotfix-equivalent commits and explicit cherry-pick metadata preserved in earlier promotion history
-- after that first promotion PR merges, the cursor-advance workflow creates or updates the cursor tag automatically
+- after that first promotion PR merges, the nightly workflow creates or updates the cursor tag automatically
 
 Managed release channel publishing:
 

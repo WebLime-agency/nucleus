@@ -354,3 +354,67 @@ jobs:
           done
 
           exit 1
+
+      - name: Advance cursor after auto-merge
+        if: steps.diff.outputs.pending == 'true' && steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURSOR_SHA: ${{ steps.cursor.outputs.cursor_sha }}
+          TARGET_SHA: ${{ steps.cursor.outputs.target_sha }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+
+          merged="false"
+          for attempt in $(seq 1 60); do
+            state="$(gh pr view "${PR_NUMBER}" --json state --jq '.state')"
+            if [ "${state}" = "MERGED" ]; then
+              merged="true"
+              break
+            fi
+
+            if [ "${state}" = "CLOSED" ]; then
+              echo "::error::Promotion PR #${PR_NUMBER} closed without merging."
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+          if [ "${merged}" != "true" ]; then
+            echo "::error::Promotion PR #${PR_NUMBER} did not merge before the cursor wait timed out."
+            exit 1
+          fi
+
+          git fetch origin main dev
+          git fetch origin "refs/tags/${PROMOTION_CURSOR_TAG}:refs/tags/${PROMOTION_CURSOR_TAG}" || true
+
+          git rev-parse --verify "${CURSOR_SHA}^{commit}" >/dev/null
+          git rev-parse --verify "${TARGET_SHA}^{commit}" >/dev/null
+
+          if ! git merge-base --is-ancestor "${CURSOR_SHA}" "${TARGET_SHA}"; then
+            echo "::error::Promotion target ${TARGET_SHA} is behind cursor base ${CURSOR_SHA}."
+            exit 1
+          fi
+
+          if ! git merge-base --is-ancestor "${TARGET_SHA}" origin/dev; then
+            echo "::error::Promotion target ${TARGET_SHA} is not an ancestor of origin/dev."
+            exit 1
+          fi
+
+          if git rev-parse -q --verify "refs/tags/${PROMOTION_CURSOR_TAG}^{commit}" >/dev/null; then
+            current_cursor="$(git rev-parse "refs/tags/${PROMOTION_CURSOR_TAG}^{commit}")"
+            if [ "${current_cursor}" = "${TARGET_SHA}" ]; then
+              echo "Promotion cursor already points at ${TARGET_SHA}."
+              exit 0
+            fi
+
+            if [ "${current_cursor}" != "${CURSOR_SHA}" ]; then
+              echo "::error::Promotion cursor tag already moved from ${CURSOR_SHA} to ${current_cursor}."
+              exit 1
+            fi
+          fi
+
+          git tag -fa "${PROMOTION_CURSOR_TAG}" "${TARGET_SHA}" \
+            -m "Promoted dev through ${TARGET_SHA} via #${PR_NUMBER}"
+          git push --force origin "refs/tags/${PROMOTION_CURSOR_TAG}"
