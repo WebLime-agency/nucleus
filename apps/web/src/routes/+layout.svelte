@@ -3,15 +3,12 @@
   import { page } from '$app/state';
   import { onMount } from 'svelte';
   import {
-    Cpu,
     FolderRoot,
     FolderTree,
     Gauge,
     Menu,
-    MemoryStick,
     MessageSquarePlus,
     MessagesSquare,
-    Settings2,
     ServerCog,
     Workflow,
     X
@@ -51,10 +48,7 @@
     { href: '/', label: 'Overview', icon: Gauge },
     { href: '/sessions', label: 'Sessions', icon: MessagesSquare },
     { href: '/automations', label: 'Automations', icon: Workflow },
-    { href: '/workspace', label: 'Workspace', icon: FolderTree },
-    { href: '/diagnostics', label: 'Diagnostics', icon: Cpu },
-    { href: '/memory', label: 'Memory', icon: MemoryStick },
-    { href: '/settings', label: 'Settings', icon: Settings2 }
+    { href: '/workspace', label: 'Workspace', icon: FolderTree }
   ];
 
   let overview = $state<RuntimeOverview | null>(null);
@@ -106,7 +100,15 @@
   let updateTargetLabel = $derived.by(() => {
     return formatLatestTargetLabel(updateStatus, 'A newer build');
   });
-  let activeNavItem = $derived(navigation.find((item) => item.href === pathname) ?? navigation[0]);
+  function isNavActive(href: string, currentPath: string) {
+    if (href === '/') {
+      return currentPath === '/';
+    }
+    return currentPath === href || currentPath.startsWith(`${href}/`);
+  }
+  let activeNavItem = $derived(
+    navigation.find((item) => isNavActive(item.href, pathname)) ?? navigation[0]
+  );
   let usesFullHeightContent = $derived(pathname === '/sessions');
   let sessionsWithProjects = $derived(
     overview?.sessions.filter((session) => session.project_count > 0).length ?? 0
@@ -512,23 +514,24 @@
       </div>
 
       <div class="sticky bottom-0 shrink-0 border-t border-zinc-900 bg-zinc-950/95 px-3 py-2.5 backdrop-blur">
-        <nav class="grid grid-cols-7 gap-2">
+        <nav class="grid grid-cols-4 gap-2">
           {#each navigation as item}
+            {@const navActive = isNavActive(item.href, pathname)}
             <button
               type="button"
-              aria-current={pathname === item.href ? 'page' : undefined}
+              aria-current={navActive ? 'page' : undefined}
               aria-label={item.label}
               title={item.label}
               class={cn(
                 'relative inline-flex h-10 items-center justify-center rounded-md border transition-colors',
-                pathname === item.href
+                navActive
                   ? 'border-lime-300/30 bg-lime-300/10 text-lime-100'
                   : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:bg-zinc-900 hover:text-zinc-100'
               )}
               onclick={() => openNavigation(item.href)}
             >
               <item.icon class="size-4" />
-              {#if item.href === '/settings' && (hasUpdateAvailable || restartRequired)}
+              {#if item.href === '/workspace' && (hasUpdateAvailable || restartRequired)}
                 <span
                   class={cn(
                     'absolute right-2 top-2 h-2 w-2 rounded-full',
@@ -708,7 +711,7 @@
       <Button
         size="sm"
         onclick={() => {
-          void openNavigation('/settings');
+          void openNavigation('/workspace/settings');
         }}
       >
         Open settings
