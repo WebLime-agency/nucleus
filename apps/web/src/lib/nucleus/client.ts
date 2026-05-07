@@ -7,6 +7,7 @@ import {
   actionSummarySchema,
   apiErrorSchema,
   auditEventSchema,
+  approvalResolutionRequestSchema,
   createSessionRequestSchema,
   jobDetailSchema,
   jobSummarySchema,
@@ -339,6 +340,46 @@ export async function resumeJob(jobId: string, fetchImpl: FetchLike = fetch) {
     await daemonFetch(fetchImpl, `/api/jobs/${jobId}/resume`, {
       method: 'POST',
       headers: { accept: 'application/json' }
+    }),
+    jobDetailSchema
+  );
+}
+
+export async function approveRequest(
+  approvalId: string,
+  input: z.input<typeof approvalResolutionRequestSchema> = {},
+  fetchImpl: FetchLike = fetch
+) {
+  const payload = approvalResolutionRequestSchema.parse(input);
+
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/approvals/${approvalId}/approve`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json'
+      },
+      body: JSON.stringify(payload)
+    }),
+    jobDetailSchema
+  );
+}
+
+export async function denyRequest(
+  approvalId: string,
+  input: z.input<typeof approvalResolutionRequestSchema> = {},
+  fetchImpl: FetchLike = fetch
+) {
+  const payload = approvalResolutionRequestSchema.parse(input);
+
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/approvals/${approvalId}/deny`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json'
+      },
+      body: JSON.stringify(payload)
     }),
     jobDetailSchema
   );

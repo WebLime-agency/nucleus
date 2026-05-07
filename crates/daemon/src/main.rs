@@ -30,14 +30,15 @@ use futures_util::SinkExt;
 use host::{DEFAULT_PROCESS_LIMIT, HostEngine, ProcessSort, resolve_process_limit};
 use nucleus_core::{AdapterKind, DEFAULT_DAEMON_ADDR, PRODUCT_NAME, product_banner};
 use nucleus_protocol::{
-    ActionParameter, ActionRunRequest, ActionRunResponse, ActionSummary, AuditEvent, AuthSummary,
-    CompatibilitySummary, ConnectionSummary, CreateSessionRequest, DaemonEvent, HealthResponse,
-    HostStatus, JobDetail, JobSummary, ProcessKillRequest, ProcessKillResponse,
-    ProcessListResponse, ProcessStreamUpdate, ProjectUpdateRequest, PromptProgressUpdate,
-    RouterProfileSummary, RuntimeOverview, RuntimeSummary, SessionDetail, SessionPromptRequest,
-    SessionSummary, SettingsSummary, StreamConnected, SystemStats, UpdateConfigRequest,
-    UpdateSessionRequest, UpdateStatus, WorkspaceModelConfig, WorkspaceProfileSummary,
-    WorkspaceProfileWriteRequest, WorkspaceSummary, WorkspaceUpdateRequest,
+    ActionParameter, ActionRunRequest, ActionRunResponse, ActionSummary, ApprovalRequestSummary,
+    ApprovalResolutionRequest, AuditEvent, AuthSummary, CompatibilitySummary, ConnectionSummary,
+    CreateSessionRequest, DaemonEvent, HealthResponse, HostStatus, JobDetail, JobSummary,
+    ProcessKillRequest, ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate,
+    ProjectUpdateRequest, PromptProgressUpdate, RouterProfileSummary, RuntimeOverview,
+    RuntimeSummary, SessionDetail, SessionPromptRequest, SessionSummary, SettingsSummary,
+    StreamConnected, SystemStats, UpdateConfigRequest, UpdateSessionRequest, UpdateStatus,
+    WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceProfileWriteRequest, WorkspaceSummary,
+    WorkspaceUpdateRequest,
 };
 use nucleus_release::read_installed_release_metadata;
 use nucleus_storage::{
@@ -160,6 +161,15 @@ fn app(state: AppState) -> Router {
         .route("/actions/{action_id}", get(action_detail))
         .route("/actions/{action_id}/run", axum::routing::post(run_action))
         .route("/audit", get(audit_events))
+        .route("/approvals", get(pending_approvals))
+        .route(
+            "/approvals/{approval_id}/approve",
+            axum::routing::post(approve_request),
+        )
+        .route(
+            "/approvals/{approval_id}/deny",
+            axum::routing::post(deny_request),
+        )
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{session_id}/jobs", get(session_jobs))
         .route(
@@ -813,6 +823,42 @@ async fn resume_job(
     Path(job_id): Path<String>,
 ) -> Result<Json<JobDetail>, ApiError> {
     Ok(Json(agent::resume_job(state, job_id).await?))
+}
+
+async fn pending_approvals(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ApprovalRequestSummary>>, ApiError> {
+    Ok(Json(agent::list_pending_approvals(state).await?))
+}
+
+async fn approve_request(
+    State(state): State<AppState>,
+    Path(approval_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<JobDetail>, ApiError> {
+    let payload = if body.is_empty() {
+        ApprovalResolutionRequest::default()
+    } else {
+        decode_json::<ApprovalResolutionRequest>(&body)?
+    };
+    Ok(Json(
+        agent::approve_request(state, approval_id, payload.note).await?,
+    ))
+}
+
+async fn deny_request(
+    State(state): State<AppState>,
+    Path(approval_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<JobDetail>, ApiError> {
+    let payload = if body.is_empty() {
+        ApprovalResolutionRequest::default()
+    } else {
+        decode_json::<ApprovalResolutionRequest>(&body)?
+    };
+    Ok(Json(
+        agent::deny_request(state, approval_id, payload.note).await?,
+    ))
 }
 
 async fn prompt_session(

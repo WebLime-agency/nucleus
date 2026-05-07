@@ -6,13 +6,14 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use nucleus_protocol::{
-    DaemonEvent, JobDetail, JobSummary, PromptProgressUpdate, SessionDetail, SessionPromptRequest,
-    SessionSummary, SessionTurn, SessionTurnImage, WorkerSummary, WorkspaceProfileSummary,
-    WorkspaceSummary,
+    ApprovalRequestSummary, ArtifactSummary, DaemonEvent, JobDetail, JobSummary,
+    PromptProgressUpdate, SessionDetail, SessionPromptRequest, SessionSummary, SessionTurn,
+    SessionTurnImage, WorkerSummary, WorkspaceProfileSummary, WorkspaceSummary,
 };
 use nucleus_storage::{
-    AuditEventRecord, JobEventRecord, JobPatch, JobRecord, PolicyDecisionRecord, SessionPatch,
-    ToolCallPatch, ToolCallRecord, ToolCapabilityGrantRecord, WorkerPatch, WorkerRecord,
+    ApprovalRequestRecord, AuditEventRecord, JobArtifactRecord, JobEventRecord, JobPatch,
+    JobRecord, PolicyDecisionRecord, SessionPatch, ToolCallPatch, ToolCallRecord,
+    ToolCapabilityGrantRecord, WorkerPatch, WorkerRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -37,6 +38,7 @@ const TOOL_OUTPUT_CHAR_LIMIT: usize = 8_000;
 const READ_FILE_CHAR_LIMIT: usize = 12_000;
 const LIST_LIMIT: usize = 120;
 const RG_LIMIT: usize = 80;
+const DIFF_PREVIEW_CHAR_LIMIT: usize = 12_000;
 
 #[derive(Default)]
 pub struct AgentRuntime {
@@ -58,12 +60,22 @@ struct WorkerCheckpoint {
     prompt_text: String,
     conversation: Vec<CheckpointMessage>,
     next_prompt: Option<String>,
+    pending_action: Option<PendingToolAction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CheckpointMessage {
     role: String,
     content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingToolAction {
+    tool_call_id: String,
+    approval_id: Option<String>,
+    summary: String,
+    tool: String,
+    args: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,6 +117,62 @@ struct RgSearchArgs {
 #[derive(Debug, Deserialize)]
 struct GitDiffArgs {
     pathspec: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PatchEditArgs {
+    find: String,
+    replace: String,
+    replace_all: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FsApplyPatchArgs {
+    path: String,
+    edits: Vec<PatchEditArgs>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FsWriteTextArgs {
+    path: String,
+    content: String,
+    create_parent_dirs: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FsMoveArgs {
+    from_path: String,
+    to_path: String,
+    overwrite: Option<bool>,
+    create_parent_dirs: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FsMkdirArgs {
+    path: String,
+    recursive: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitStagePatchArgs {
+    pathspecs: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct MutationPreview {
+    detail: String,
+    diff_preview: String,
+    artifact: Option<ArtifactDraft>,
+}
+
+#[derive(Debug, Clone)]
+struct ArtifactDraft {
+    kind: String,
+    title: String,
+    mime_type: String,
+    extension: String,
+    content: String,
+    preview_text: String,
 }
 
 pub async fn start_text_prompt_job(
@@ -182,7 +250,7 @@ pub async fn start_text_prompt_job(
     )?;
     state
         .store
-        .replace_tool_capability_grants(&root_worker_id, &read_only_capabilities())?;
+        .replace_tool_capability_grants(&root_worker_id, &root_worker_capabilities())?;
     let worker = state
         .store
         .get_job(&job_id)?
@@ -199,6 +267,7 @@ pub async fn start_text_prompt_job(
             content: worker_system_prompt(&worker),
         }],
         next_prompt: None,
+        pending_action: None,
     };
     state
         .store
@@ -272,6 +341,17 @@ pub async fn cancel_job(state: AppState, job_id: String) -> Result<JobDetail, Ap
             },
         );
     }
+    for approval in detail.approvals {
+        if approval.state == "pending" {
+            let _ = state.store.update_approval_request(
+                &approval.id,
+                "canceled",
+                Some("The job was canceled before this approval was resolved."),
+                Some("system"),
+                Some(unix_timestamp()),
+            );
+        }
+    }
     if let Some(session_id) = detail.job.session_id.as_deref() {
         let _ = state.store.update_session(
             session_id,
@@ -337,6 +417,28 @@ pub async fn resume_job(state: AppState, job_id: String) -> Result<JobDetail, Ap
     }
     spawn_job_task(state.clone(), job_id.clone());
     Ok(state.store.get_job(&job_id)?)
+}
+
+pub async fn list_pending_approvals(
+    state: AppState,
+) -> Result<Vec<ApprovalRequestSummary>, ApiError> {
+    Ok(state.store.list_pending_approvals()?)
+}
+
+pub async fn approve_request(
+    state: AppState,
+    approval_id: String,
+    note: Option<String>,
+) -> Result<JobDetail, ApiError> {
+    resolve_approval_request(state, approval_id, true, note).await
+}
+
+pub async fn deny_request(
+    state: AppState,
+    approval_id: String,
+    note: Option<String>,
+) -> Result<JobDetail, ApiError> {
+    resolve_approval_request(state, approval_id, false, note).await
 }
 
 pub async fn recover_interrupted_jobs(state: &AppState) -> Result<()> {
@@ -497,6 +599,20 @@ async fn run_job_loop(
             return Ok(());
         }
 
+        if let LoopDisposition::Return = handle_pending_action(
+            state,
+            &session,
+            job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            &mut tool_calls,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+
         if step >= worker.max_steps {
             bail!("hidden worker reached the maximum step budget");
         }
@@ -631,101 +747,340 @@ async fn run_job_loop(
                 tool,
                 args,
             } => {
-                tool_calls += 1;
-                let policy = auto_allow_policy_for_tool(&tool);
-                let tool_call_id = Uuid::new_v4().to_string();
-                state.store.create_tool_call(ToolCallRecord {
-                    id: tool_call_id.clone(),
-                    job_id: job_id.to_string(),
-                    worker_id: worker.id.clone(),
-                    tool_id: tool.clone(),
-                    status: "running".to_string(),
-                    summary: summary.clone(),
-                    args_json: args.clone(),
-                    result_json: None,
-                    policy_decision: Some(policy.clone()),
-                    artifact_ids: Vec::new(),
-                    error_class: String::new(),
-                    error_detail: String::new(),
-                    started_at: Some(unix_timestamp()),
-                    completed_at: None,
-                })?;
-                let _ = state.store.append_job_event(JobEventRecord {
-                    job_id: job_id.to_string(),
-                    worker_id: Some(worker.id.clone()),
-                    event_type: "tool.started".to_string(),
-                    status: "running".to_string(),
-                    summary: format!("Running {}", tool),
-                    detail: summary.clone(),
-                    data_json: json!({ "tool_id": tool, "args": args }),
-                });
-                publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
-                publish_prompt_status(
+                if let LoopDisposition::Return = handle_tool_call_proposal(
                     state,
-                    &session.session,
-                    &worker,
-                    "tooling",
-                    &format!("Running {}", tool),
-                    &summary,
+                    &session,
+                    job_id,
+                    &mut worker,
+                    &mut checkpoint,
+                    &mut step,
+                    &mut tool_calls,
+                    summary,
+                    tool,
+                    args,
                 )
-                .await;
+                .await?
+                {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
 
-                let tool_result =
-                    match execute_read_only_tool(state, &session, &worker, &tool, args).await {
-                        Ok(result) => result,
-                        Err(error) => {
-                            let _ = state.store.update_tool_call(
-                                &tool_call_id,
-                                ToolCallPatch {
-                                    status: Some("failed".to_string()),
-                                    error_class: Some("tool_error".to_string()),
-                                    error_detail: Some(error.to_string()),
-                                    completed_at: Some(Some(unix_timestamp())),
-                                    ..ToolCallPatch::default()
-                                },
-                            );
-                            return Err(error);
-                        }
-                    };
-                state.store.update_tool_call(
-                    &tool_call_id,
-                    ToolCallPatch {
-                        status: Some("completed".to_string()),
-                        result_json: Some(Some(tool_result.clone())),
-                        completed_at: Some(Some(unix_timestamp())),
-                        ..ToolCallPatch::default()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopDisposition {
+    Continue,
+    Return,
+}
+
+async fn handle_pending_action(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &mut WorkerSummary,
+    checkpoint: &mut WorkerCheckpoint,
+    step: &mut usize,
+    tool_calls: &mut usize,
+) -> Result<LoopDisposition> {
+    let Some(pending) = checkpoint.pending_action.clone() else {
+        return Ok(LoopDisposition::Continue);
+    };
+
+    if let Some(approval_id) = pending.approval_id.as_deref() {
+        let approval = state.store.get_approval_request(approval_id)?;
+        match approval.state.as_str() {
+            "pending" => {
+                let pause_reason = format!("Waiting for approval to run {}.", pending.tool);
+                state.store.update_job(
+                    job_id,
+                    JobPatch {
+                        state: Some("paused".to_string()),
+                        last_error: Some(pause_reason.clone()),
+                        ..JobPatch::default()
                     },
                 )?;
-                step += 1;
-                worker = state.store.update_worker(
+                *worker = state.store.update_worker(
                     &worker.id,
                     WorkerPatch {
-                        step_count: Some(step),
-                        tool_call_count: Some(tool_calls),
+                        state: Some("paused".to_string()),
+                        tool_call_count: Some(*tool_calls),
+                        last_error: Some(pause_reason.clone()),
                         ..WorkerPatch::default()
                     },
                 )?;
-                checkpoint.next_prompt =
-                    Some(build_tool_result_prompt(&tool, &summary, &tool_result));
+                state.store.update_session(
+                    &session.session.id,
+                    SessionPatch {
+                        state: Some("paused".to_string()),
+                        last_error: Some(pause_reason),
+                        ..SessionPatch::default()
+                    },
+                )?;
+                if let Ok(updated) = state.store.get_session(&session.session.id) {
+                    let _ = publish_session_event(state, updated).await;
+                }
+                publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+                publish_worker_updated(state, worker).await;
+                return Ok(LoopDisposition::Return);
+            }
+            "approved" => {}
+            _ => {
+                checkpoint.pending_action = None;
+                checkpoint.next_prompt = Some(build_tool_denied_prompt(
+                    &pending.tool,
+                    &pending.summary,
+                    fallback_note(
+                        approval.resolution_note.as_str(),
+                        "The approval request was not approved.",
+                    )
+                    .as_str(),
+                ));
                 state.store.write_worker_checkpoint(
                     &worker.id,
                     &serde_json::to_value(&checkpoint)
                         .context("failed to encode worker checkpoint")?,
                 )?;
+                state.store.update_tool_call(
+                    &pending.tool_call_id,
+                    ToolCallPatch {
+                        status: Some("denied".to_string()),
+                        error_class: Some("approval_denied".to_string()),
+                        error_detail: Some(fallback_note(
+                            &approval.resolution_note,
+                            "The approval request was denied.",
+                        )),
+                        completed_at: Some(Some(unix_timestamp())),
+                        ..ToolCallPatch::default()
+                    },
+                )?;
+                *step += 1;
+                *worker = state.store.update_worker(
+                    &worker.id,
+                    WorkerPatch {
+                        state: Some("running".to_string()),
+                        step_count: Some(*step),
+                        tool_call_count: Some(*tool_calls),
+                        last_error: Some(String::new()),
+                        ..WorkerPatch::default()
+                    },
+                )?;
                 let _ = state.store.append_job_event(JobEventRecord {
                     job_id: job_id.to_string(),
                     worker_id: Some(worker.id.clone()),
-                    event_type: "tool.completed".to_string(),
-                    status: "completed".to_string(),
-                    summary: format!("Completed {}", tool),
-                    detail: excerpt(&format_tool_result(&tool_result), 320),
-                    data_json: json!({ "tool_id": tool, "tool_call_id": tool_call_id }),
+                    event_type: "tool.denied".to_string(),
+                    status: "denied".to_string(),
+                    summary: format!("Denied {}", pending.tool),
+                    detail: fallback_note(&approval.resolution_note, &approval.detail),
+                    data_json: json!({
+                        "tool_id": pending.tool,
+                        "tool_call_id": pending.tool_call_id,
+                        "approval_id": approval.id,
+                    }),
                 });
                 publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
-                publish_worker_updated(state, &worker).await;
+                publish_worker_updated(state, worker).await;
+                return Ok(LoopDisposition::Continue);
             }
         }
     }
+
+    execute_pending_tool_action(
+        state, session, job_id, worker, checkpoint, step, tool_calls, pending,
+    )
+    .await?;
+    Ok(LoopDisposition::Continue)
+}
+
+async fn handle_tool_call_proposal(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &mut WorkerSummary,
+    checkpoint: &mut WorkerCheckpoint,
+    step: &mut usize,
+    tool_calls: &mut usize,
+    summary: String,
+    tool: String,
+    args: Value,
+) -> Result<LoopDisposition> {
+    *tool_calls += 1;
+    let policy = policy_for_tool(&tool);
+    let tool_call_id = Uuid::new_v4().to_string();
+    let requires_approval = policy.decision == "require_approval";
+    let mut tool_call = state.store.create_tool_call(ToolCallRecord {
+        id: tool_call_id.clone(),
+        job_id: job_id.to_string(),
+        worker_id: worker.id.clone(),
+        tool_id: tool.clone(),
+        status: if requires_approval {
+            "pending_approval".to_string()
+        } else {
+            "running".to_string()
+        },
+        summary: summary.clone(),
+        args_json: args.clone(),
+        result_json: None,
+        policy_decision: Some(policy.clone()),
+        artifact_ids: Vec::new(),
+        error_class: String::new(),
+        error_detail: String::new(),
+        started_at: Some(unix_timestamp()),
+        completed_at: None,
+    })?;
+
+    if requires_approval {
+        let preview = preview_mutating_tool(state, worker, &tool, &args)?;
+        let artifact_ids = if let Some(draft) = preview.artifact {
+            let artifact =
+                write_job_artifact(state, job_id, Some(&worker.id), Some(&tool_call_id), draft)?;
+            publish_artifact_added(state, &artifact).await;
+            vec![artifact.id]
+        } else {
+            Vec::new()
+        };
+        if !artifact_ids.is_empty() {
+            tool_call = state.store.update_tool_call(
+                &tool_call_id,
+                ToolCallPatch {
+                    artifact_ids: Some(artifact_ids),
+                    ..ToolCallPatch::default()
+                },
+            )?;
+        }
+
+        let approval = state.store.create_approval_request(ApprovalRequestRecord {
+            id: Uuid::new_v4().to_string(),
+            job_id: job_id.to_string(),
+            worker_id: worker.id.clone(),
+            tool_call_id: tool_call_id.clone(),
+            state: "pending".to_string(),
+            risk_level: policy.risk_level.clone(),
+            summary: summary.clone(),
+            detail: preview.detail,
+            diff_preview: preview.diff_preview,
+            policy_decision: policy.clone(),
+            resolution_note: String::new(),
+            resolved_by: String::new(),
+            resolved_at: None,
+        })?;
+
+        checkpoint.pending_action = Some(PendingToolAction {
+            tool_call_id: tool_call_id.clone(),
+            approval_id: Some(approval.id.clone()),
+            summary: summary.clone(),
+            tool: tool.clone(),
+            args,
+        });
+        state.store.write_worker_checkpoint(
+            &worker.id,
+            &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+        )?;
+
+        let pause_reason = format!("Waiting for approval to run {}.", tool);
+        state.store.update_job(
+            job_id,
+            JobPatch {
+                state: Some("paused".to_string()),
+                last_error: Some(pause_reason.clone()),
+                ..JobPatch::default()
+            },
+        )?;
+        *worker = state.store.update_worker(
+            &worker.id,
+            WorkerPatch {
+                state: Some("paused".to_string()),
+                tool_call_count: Some(*tool_calls),
+                last_error: Some(pause_reason.clone()),
+                ..WorkerPatch::default()
+            },
+        )?;
+        state.store.update_session(
+            &session.session.id,
+            SessionPatch {
+                state: Some("paused".to_string()),
+                last_error: Some(pause_reason.clone()),
+                ..SessionPatch::default()
+            },
+        )?;
+        let _ = state.store.append_job_event(JobEventRecord {
+            job_id: job_id.to_string(),
+            worker_id: Some(worker.id.clone()),
+            event_type: "approval.requested".to_string(),
+            status: "paused".to_string(),
+            summary: format!("Approval required for {}", tool),
+            detail: summary,
+            data_json: json!({
+                "tool_id": tool,
+                "tool_call_id": tool_call_id,
+                "approval_id": approval.id,
+            }),
+        });
+        let _ = try_record_audit_event(
+            state,
+            AuditEventRecord {
+                kind: "job.approval.requested".to_string(),
+                target: format!("approval:{}", approval.id),
+                status: "pending".to_string(),
+                summary: format!("Queued approval for {}.", tool),
+                detail: format!(
+                    "job_id={} worker_id={} tool_call_id={}",
+                    job_id, worker.id, tool_call.id
+                ),
+            },
+        )
+        .await;
+        if let Ok(updated) = state.store.get_session(&session.session.id) {
+            let _ = publish_session_event(state, updated).await;
+        }
+        publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+        publish_worker_updated(state, worker).await;
+        publish_approval_requested(state, &approval).await;
+        publish_prompt_status(
+            state,
+            &session.session,
+            worker,
+            "paused",
+            "Waiting for approval",
+            &pause_reason,
+        )
+        .await;
+        let _ = publish_overview_event(state).await;
+        return Ok(LoopDisposition::Return);
+    }
+
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: job_id.to_string(),
+        worker_id: Some(worker.id.clone()),
+        event_type: "tool.started".to_string(),
+        status: "running".to_string(),
+        summary: format!("Running {}", tool),
+        detail: summary.clone(),
+        data_json: json!({ "tool_id": tool, "args": args }),
+    });
+    publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+    publish_prompt_status(
+        state,
+        &session.session,
+        worker,
+        "tooling",
+        &format!("Running {}", tool),
+        &summary,
+    )
+    .await;
+
+    let pending = PendingToolAction {
+        tool_call_id,
+        approval_id: None,
+        summary,
+        tool,
+        args,
+    };
+    execute_pending_tool_action(
+        state, session, job_id, worker, checkpoint, step, tool_calls, pending,
+    )
+    .await?;
+    Ok(LoopDisposition::Continue)
 }
 
 fn build_initial_step_prompt(
@@ -783,6 +1138,14 @@ Decide the next single step. If the work is done, return final_answer.",
         tool,
         summary,
         format_tool_result(result)
+    )
+}
+
+fn build_tool_denied_prompt(tool: &str, summary: &str, reason: &str) -> String {
+    format!(
+        "The daemon did not allow {}.\nReason for the proposed call: {}\nResolution detail: {}\n\
+Choose the next best single step. If the work can still be completed without this mutation, return final_answer.",
+        tool, summary, reason
     )
 }
 
@@ -900,7 +1263,215 @@ struct ModelResponse {
     provider_session_id: String,
 }
 
-async fn execute_read_only_tool(
+async fn resolve_approval_request(
+    state: AppState,
+    approval_id: String,
+    approved: bool,
+    note: Option<String>,
+) -> Result<JobDetail, ApiError> {
+    let approval = state.store.get_approval_request(&approval_id)?;
+    if approval.state != "pending" {
+        return Ok(state.store.get_job(&approval.job_id)?);
+    }
+
+    let resolution_note = normalized_note(
+        note,
+        if approved {
+            "Approved by the operator."
+        } else {
+            "Denied by the operator."
+        },
+    );
+    let resolved_state = if approved { "approved" } else { "denied" };
+    let resolved = state.store.update_approval_request(
+        &approval_id,
+        resolved_state,
+        Some(&resolution_note),
+        Some("user"),
+        Some(unix_timestamp()),
+    )?;
+    let detail = state.store.get_job(&approval.job_id)?;
+    let pending = detail
+        .workers
+        .iter()
+        .find(|worker| worker.id == approval.worker_id)
+        .ok_or_else(|| ApiError::internal_message("approval worker was not found"))?;
+    let worker_id = pending.id.clone();
+
+    state.store.update_job(
+        &approval.job_id,
+        JobPatch {
+            state: Some("queued".to_string()),
+            last_error: Some(String::new()),
+            ..JobPatch::default()
+        },
+    )?;
+    if let Some(session_id) = detail.job.session_id.as_deref() {
+        state.store.update_session(
+            session_id,
+            SessionPatch {
+                state: Some("running".to_string()),
+                last_error: Some(String::new()),
+                ..SessionPatch::default()
+            },
+        )?;
+        if let Ok(session) = state.store.get_session(session_id) {
+            let _ = publish_session_event(&state, session).await;
+        }
+    }
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: approval.job_id.clone(),
+        worker_id: Some(approval.worker_id.clone()),
+        event_type: "approval.resolved".to_string(),
+        status: resolved.state.clone(),
+        summary: if approved {
+            format!("Approved {}", approval.summary)
+        } else {
+            format!("Denied {}", approval.summary)
+        },
+        detail: resolution_note.clone(),
+        data_json: json!({
+            "approval_id": resolved.id,
+            "tool_call_id": resolved.tool_call_id,
+            "resolved_by": resolved.resolved_by,
+        }),
+    });
+    let _ = try_record_audit_event(
+        &state,
+        AuditEventRecord {
+            kind: "job.approval.resolved".to_string(),
+            target: format!("approval:{}", resolved.id),
+            status: resolved.state.clone(),
+            summary: if approved {
+                "Approved a daemon-owned tool mutation.".to_string()
+            } else {
+                "Denied a daemon-owned tool mutation.".to_string()
+            },
+            detail: format!(
+                "job_id={} worker_id={} tool_call_id={} note={}",
+                resolved.job_id, resolved.worker_id, resolved.tool_call_id, resolution_note
+            ),
+        },
+    )
+    .await;
+    publish_approval_resolved(&state, &resolved).await;
+    publish_job_updated(&state, &state.store.get_job(&approval.job_id)?.job).await;
+    let worker = state.store.update_worker(
+        &worker_id,
+        WorkerPatch {
+            state: Some("queued".to_string()),
+            last_error: Some(String::new()),
+            ..WorkerPatch::default()
+        },
+    )?;
+    publish_worker_updated(&state, &worker).await;
+    let _ = publish_overview_event(&state).await;
+    spawn_job_task(state.clone(), approval.job_id.clone());
+    Ok(state.store.get_job(&approval.job_id)?)
+}
+
+async fn execute_pending_tool_action(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &mut WorkerSummary,
+    checkpoint: &mut WorkerCheckpoint,
+    step: &mut usize,
+    tool_calls: &mut usize,
+    pending: PendingToolAction,
+) -> Result<Value> {
+    let tool = pending.tool.clone();
+    let args = pending.args.clone();
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: job_id.to_string(),
+        worker_id: Some(worker.id.clone()),
+        event_type: "tool.started".to_string(),
+        status: "running".to_string(),
+        summary: format!("Running {}", tool),
+        detail: pending.summary.clone(),
+        data_json: json!({ "tool_id": tool, "tool_call_id": pending.tool_call_id, "args": args }),
+    });
+    publish_prompt_status(
+        state,
+        &session.session,
+        worker,
+        "tooling",
+        &format!("Running {}", tool),
+        &pending.summary,
+    )
+    .await;
+    state.store.update_tool_call(
+        &pending.tool_call_id,
+        ToolCallPatch {
+            status: Some("running".to_string()),
+            error_class: Some(String::new()),
+            error_detail: Some(String::new()),
+            ..ToolCallPatch::default()
+        },
+    )?;
+
+    let tool_result = match execute_granted_tool(state, session, worker, &tool, args).await {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = state.store.update_tool_call(
+                &pending.tool_call_id,
+                ToolCallPatch {
+                    status: Some("failed".to_string()),
+                    error_class: Some("tool_error".to_string()),
+                    error_detail: Some(error.to_string()),
+                    completed_at: Some(Some(unix_timestamp())),
+                    ..ToolCallPatch::default()
+                },
+            );
+            return Err(error);
+        }
+    };
+
+    state.store.update_tool_call(
+        &pending.tool_call_id,
+        ToolCallPatch {
+            status: Some("completed".to_string()),
+            result_json: Some(Some(tool_result.clone())),
+            completed_at: Some(Some(unix_timestamp())),
+            ..ToolCallPatch::default()
+        },
+    )?;
+    *step += 1;
+    *worker = state.store.update_worker(
+        &worker.id,
+        WorkerPatch {
+            state: Some("running".to_string()),
+            step_count: Some(*step),
+            tool_call_count: Some(*tool_calls),
+            last_error: Some(String::new()),
+            ..WorkerPatch::default()
+        },
+    )?;
+    checkpoint.pending_action = None;
+    checkpoint.next_prompt = Some(build_tool_result_prompt(
+        &tool,
+        &pending.summary,
+        &tool_result,
+    ));
+    state.store.write_worker_checkpoint(
+        &worker.id,
+        &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+    )?;
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: job_id.to_string(),
+        worker_id: Some(worker.id.clone()),
+        event_type: "tool.completed".to_string(),
+        status: "completed".to_string(),
+        summary: format!("Completed {}", tool),
+        detail: excerpt(&format_tool_result(&tool_result), 320),
+        data_json: json!({ "tool_id": tool, "tool_call_id": pending.tool_call_id }),
+    });
+    publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+    publish_worker_updated(state, worker).await;
+    Ok(tool_result)
+}
+
+async fn execute_granted_tool(
     _state: &AppState,
     session: &SessionDetail,
     worker: &WorkerSummary,
@@ -938,7 +1509,68 @@ async fn execute_read_only_tool(
                 serde_json::from_value::<GitDiffArgs>(args).context("invalid args for git.diff")?;
             execute_git_diff_tool(worker, args).await
         }
-        other => bail!("unsupported read-only tool '{}'", other),
+        "fs.apply_patch" => {
+            let args = serde_json::from_value::<FsApplyPatchArgs>(args)
+                .context("invalid args for fs.apply_patch")?;
+            execute_fs_apply_patch_tool(worker, args).await
+        }
+        "fs.write_text" => {
+            let args = serde_json::from_value::<FsWriteTextArgs>(args)
+                .context("invalid args for fs.write_text")?;
+            execute_fs_write_text_tool(worker, args).await
+        }
+        "fs.move" => {
+            let args =
+                serde_json::from_value::<FsMoveArgs>(args).context("invalid args for fs.move")?;
+            execute_fs_move_tool(worker, args).await
+        }
+        "fs.mkdir" => {
+            let args =
+                serde_json::from_value::<FsMkdirArgs>(args).context("invalid args for fs.mkdir")?;
+            execute_fs_mkdir_tool(worker, args).await
+        }
+        "git.stage_patch" => {
+            let args = serde_json::from_value::<GitStagePatchArgs>(args)
+                .context("invalid args for git.stage_patch")?;
+            execute_git_stage_patch_tool(worker, args).await
+        }
+        other => bail!("unsupported tool '{}'", other),
+    }
+}
+
+fn preview_mutating_tool(
+    _state: &AppState,
+    worker: &WorkerSummary,
+    tool: &str,
+    args: &Value,
+) -> Result<MutationPreview> {
+    match tool {
+        "fs.apply_patch" => {
+            let args = serde_json::from_value::<FsApplyPatchArgs>(args.clone())
+                .context("invalid args for fs.apply_patch")?;
+            preview_fs_apply_patch(worker, args)
+        }
+        "fs.write_text" => {
+            let args = serde_json::from_value::<FsWriteTextArgs>(args.clone())
+                .context("invalid args for fs.write_text")?;
+            preview_fs_write_text(worker, args)
+        }
+        "fs.move" => {
+            let args = serde_json::from_value::<FsMoveArgs>(args.clone())
+                .context("invalid args for fs.move")?;
+            preview_fs_move(worker, args)
+        }
+        "fs.mkdir" => {
+            let args = serde_json::from_value::<FsMkdirArgs>(args.clone())
+                .context("invalid args for fs.mkdir")?;
+            preview_fs_mkdir(worker, args)
+        }
+        "git.stage_patch" => {
+            let args = serde_json::from_value::<GitStagePatchArgs>(args.clone())
+                .context("invalid args for git.stage_patch")?;
+            preview_git_stage_patch(worker, args)
+        }
+        other => bail!("'{}' is not a mutating tool", other),
     }
 }
 
@@ -1128,44 +1760,407 @@ async fn execute_git_diff_tool(worker: &WorkerSummary, args: GitDiffArgs) -> Res
     }))
 }
 
+fn preview_fs_apply_patch(
+    worker: &WorkerSummary,
+    args: FsApplyPatchArgs,
+) -> Result<MutationPreview> {
+    let target = resolve_write_scoped_path(worker, &args.path, false)?;
+    if !target.is_file() {
+        bail!("'{}' is not a file", target.display());
+    }
+    let before = fs::read_to_string(&target)
+        .with_context(|| format!("failed to read '{}'", target.display()))?;
+    let after = apply_patch_edits(&before, &args.edits)?;
+    let diff = render_text_diff(&target, &before, &after)?;
+    Ok(MutationPreview {
+        detail: format!(
+            "Apply {} edit(s) to {}.",
+            args.edits.len(),
+            target.display()
+        ),
+        diff_preview: excerpt(&diff, DIFF_PREVIEW_CHAR_LIMIT),
+        artifact: Some(text_artifact(
+            "patch",
+            format!("Patch {}", target.display()),
+            "diff",
+            "text/x-diff",
+            diff,
+        )),
+    })
+}
+
+async fn execute_fs_apply_patch_tool(
+    worker: &WorkerSummary,
+    args: FsApplyPatchArgs,
+) -> Result<Value> {
+    let target = resolve_write_scoped_path(worker, &args.path, false)?;
+    let before = fs::read_to_string(&target)
+        .with_context(|| format!("failed to read '{}'", target.display()))?;
+    let after = apply_patch_edits(&before, &args.edits)?;
+    fs::write(&target, after.as_bytes())
+        .with_context(|| format!("failed to write '{}'", target.display()))?;
+    Ok(json!({
+        "path": target.display().to_string(),
+        "changed": before != after,
+        "bytes_written": after.len(),
+    }))
+}
+
+fn preview_fs_write_text(worker: &WorkerSummary, args: FsWriteTextArgs) -> Result<MutationPreview> {
+    let target = resolve_write_scoped_path(worker, &args.path, true)?;
+    ensure_parent_exists_or_allowed(&target, args.create_parent_dirs.unwrap_or(false))?;
+    let before = if target.is_file() {
+        fs::read_to_string(&target)
+            .with_context(|| format!("failed to read '{}'", target.display()))?
+    } else {
+        String::new()
+    };
+    let diff = render_text_diff(&target, &before, &args.content)?;
+    Ok(MutationPreview {
+        detail: format!(
+            "Write {} bytes to {}.",
+            args.content.len(),
+            target.display()
+        ),
+        diff_preview: excerpt(&diff, DIFF_PREVIEW_CHAR_LIMIT),
+        artifact: Some(text_artifact(
+            "patch",
+            format!("Write {}", target.display()),
+            "diff",
+            "text/x-diff",
+            diff,
+        )),
+    })
+}
+
+async fn execute_fs_write_text_tool(
+    worker: &WorkerSummary,
+    args: FsWriteTextArgs,
+) -> Result<Value> {
+    let target = resolve_write_scoped_path(worker, &args.path, true)?;
+    let create_parent_dirs = args.create_parent_dirs.unwrap_or(false);
+    if create_parent_dirs {
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create '{}'", parent.display()))?;
+        }
+    } else {
+        ensure_parent_exists_or_allowed(&target, false)?;
+    }
+    fs::write(&target, args.content.as_bytes())
+        .with_context(|| format!("failed to write '{}'", target.display()))?;
+    Ok(json!({
+        "path": target.display().to_string(),
+        "bytes_written": args.content.len(),
+    }))
+}
+
+fn preview_fs_move(worker: &WorkerSummary, args: FsMoveArgs) -> Result<MutationPreview> {
+    let source = resolve_write_scoped_path(worker, &args.from_path, false)?;
+    let destination = resolve_write_scoped_path(worker, &args.to_path, true)?;
+    if !source.exists() {
+        bail!("'{}' does not exist", source.display());
+    }
+    if destination.exists() && !args.overwrite.unwrap_or(false) {
+        bail!(
+            "destination '{}' already exists; set overwrite to true to replace it",
+            destination.display()
+        );
+    }
+    ensure_parent_exists_or_allowed(&destination, args.create_parent_dirs.unwrap_or(false))?;
+    let description = format!("Move {} to {}.", source.display(), destination.display());
+    Ok(MutationPreview {
+        detail: description.clone(),
+        diff_preview: description.clone(),
+        artifact: Some(text_artifact(
+            "move",
+            format!("Move {}", source.display()),
+            "txt",
+            "text/plain",
+            description,
+        )),
+    })
+}
+
+async fn execute_fs_move_tool(worker: &WorkerSummary, args: FsMoveArgs) -> Result<Value> {
+    let source = resolve_write_scoped_path(worker, &args.from_path, false)?;
+    let destination = resolve_write_scoped_path(worker, &args.to_path, true)?;
+    let create_parent_dirs = args.create_parent_dirs.unwrap_or(false);
+    if create_parent_dirs {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create '{}'", parent.display()))?;
+        }
+    } else {
+        ensure_parent_exists_or_allowed(&destination, false)?;
+    }
+    if destination.exists() {
+        if !args.overwrite.unwrap_or(false) {
+            bail!("destination '{}' already exists", destination.display());
+        }
+        if destination.is_dir() {
+            fs::remove_dir_all(&destination)
+                .with_context(|| format!("failed to remove '{}'", destination.display()))?;
+        } else {
+            fs::remove_file(&destination)
+                .with_context(|| format!("failed to remove '{}'", destination.display()))?;
+        }
+    }
+    fs::rename(&source, &destination).with_context(|| {
+        format!(
+            "failed to move '{}' to '{}'",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    Ok(json!({
+        "from_path": source.display().to_string(),
+        "to_path": destination.display().to_string(),
+    }))
+}
+
+fn preview_fs_mkdir(worker: &WorkerSummary, args: FsMkdirArgs) -> Result<MutationPreview> {
+    let target = resolve_write_scoped_path(worker, &args.path, true)?;
+    let description = format!("Create directory {}.", target.display());
+    Ok(MutationPreview {
+        detail: description.clone(),
+        diff_preview: description.clone(),
+        artifact: Some(text_artifact(
+            "mkdir",
+            format!("Create {}", target.display()),
+            "txt",
+            "text/plain",
+            description,
+        )),
+    })
+}
+
+async fn execute_fs_mkdir_tool(worker: &WorkerSummary, args: FsMkdirArgs) -> Result<Value> {
+    let target = resolve_write_scoped_path(worker, &args.path, true)?;
+    if args.recursive.unwrap_or(true) {
+        fs::create_dir_all(&target)
+            .with_context(|| format!("failed to create '{}'", target.display()))?;
+    } else {
+        fs::create_dir(&target)
+            .with_context(|| format!("failed to create '{}'", target.display()))?;
+    }
+    Ok(json!({
+        "path": target.display().to_string(),
+        "created": true,
+    }))
+}
+
+fn preview_git_stage_patch(
+    worker: &WorkerSummary,
+    args: GitStagePatchArgs,
+) -> Result<MutationPreview> {
+    let targets = validated_stage_paths(worker, &args.pathspecs)?;
+    let mut command_args = vec![
+        "-C".to_string(),
+        worker.working_dir.clone(),
+        "status".to_string(),
+        "--short".to_string(),
+        "--".to_string(),
+    ];
+    command_args.extend(targets.iter().map(|path| path.display().to_string()));
+    let refs = command_args.iter().map(String::as_str).collect::<Vec<_>>();
+    let summary = std::process::Command::new("git")
+        .args(refs)
+        .output()
+        .with_context(|| "failed to run git status".to_string())?;
+    let status_text = String::from_utf8_lossy(&summary.stdout).trim().to_string();
+    let preview = if status_text.is_empty() {
+        "No matching working tree changes were found to stage.".to_string()
+    } else {
+        status_text
+    };
+    Ok(MutationPreview {
+        detail: format!("Stage current changes for {} path(s).", targets.len()),
+        diff_preview: preview.clone(),
+        artifact: Some(text_artifact(
+            "git-stage",
+            "Stage current changes".to_string(),
+            "txt",
+            "text/plain",
+            preview,
+        )),
+    })
+}
+
+async fn execute_git_stage_patch_tool(
+    worker: &WorkerSummary,
+    args: GitStagePatchArgs,
+) -> Result<Value> {
+    let targets = validated_stage_paths(worker, &args.pathspecs)?;
+    let mut command_args = vec![
+        "-C".to_string(),
+        worker.working_dir.clone(),
+        "add".to_string(),
+        "--".to_string(),
+    ];
+    command_args.extend(targets.iter().map(|path| path.display().to_string()));
+    let refs = command_args.iter().map(String::as_str).collect::<Vec<_>>();
+    let _ = command_output("git", &refs).await?;
+    Ok(json!({
+        "paths": targets.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+        "staged": true,
+    }))
+}
+
+fn apply_patch_edits(content: &str, edits: &[PatchEditArgs]) -> Result<String> {
+    let mut next = content.to_string();
+    for edit in edits {
+        if edit.find.is_empty() {
+            bail!("patch edits require a non-empty 'find' value");
+        }
+        if edit.replace_all.unwrap_or(false) {
+            let matches = next.matches(&edit.find).count();
+            if matches == 0 {
+                bail!("patch edit did not match any content");
+            }
+            next = next.replace(&edit.find, &edit.replace);
+        } else {
+            let matches = next.match_indices(&edit.find).count();
+            if matches == 0 {
+                bail!("patch edit did not match any content");
+            }
+            if matches > 1 {
+                bail!("patch edit matched multiple locations; use replace_all to replace them all");
+            }
+            next = next.replacen(&edit.find, &edit.replace, 1);
+        }
+    }
+    Ok(next)
+}
+
+fn ensure_parent_exists_or_allowed(target: &Path, create_parent_dirs: bool) -> Result<()> {
+    let Some(parent) = target.parent() else {
+        return Ok(());
+    };
+    if parent.exists() || create_parent_dirs {
+        return Ok(());
+    }
+    bail!(
+        "parent directory '{}' does not exist; enable create_parent_dirs to create it",
+        parent.display()
+    );
+}
+
+fn validated_stage_paths(worker: &WorkerSummary, pathspecs: &[String]) -> Result<Vec<PathBuf>> {
+    if pathspecs.is_empty() {
+        bail!("git.stage_patch requires at least one pathspec");
+    }
+    pathspecs
+        .iter()
+        .map(|pathspec| resolve_write_scoped_path(worker, pathspec, true))
+        .collect()
+}
+
+fn text_artifact(
+    kind: &str,
+    title: String,
+    extension: &str,
+    mime_type: &str,
+    content: String,
+) -> ArtifactDraft {
+    ArtifactDraft {
+        kind: kind.to_string(),
+        title,
+        mime_type: mime_type.to_string(),
+        extension: extension.to_string(),
+        preview_text: excerpt(&content, DIFF_PREVIEW_CHAR_LIMIT),
+        content,
+    }
+}
+
+fn render_text_diff(path: &Path, before: &str, after: &str) -> Result<String> {
+    if before == after {
+        return Ok(format!("No changes for {}.", path.display()));
+    }
+
+    let temp_dir = std::env::temp_dir().join(format!("nucleus-diff-{}", Uuid::new_v4()));
+    fs::create_dir_all(&temp_dir)
+        .with_context(|| format!("failed to create '{}'", temp_dir.display()))?;
+    let before_path = temp_dir.join("before.txt");
+    let after_path = temp_dir.join("after.txt");
+    fs::write(&before_path, before)
+        .with_context(|| format!("failed to write '{}'", before_path.display()))?;
+    fs::write(&after_path, after)
+        .with_context(|| format!("failed to write '{}'", after_path.display()))?;
+
+    let output = std::process::Command::new("git")
+        .args([
+            "diff",
+            "--no-index",
+            "--no-ext-diff",
+            "--",
+            before_path.to_string_lossy().as_ref(),
+            after_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .with_context(|| "failed to render a text diff".to_string())?;
+    let status = output.status.code().unwrap_or(-1);
+    if status != 0 && status != 1 {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let _ = fs::remove_dir_all(&temp_dir);
+        bail!(
+            "git diff exited with {}{}",
+            status,
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", excerpt(&stderr, 240))
+            }
+        );
+    }
+
+    let mut diff = String::from_utf8_lossy(&output.stdout).to_string();
+    diff = diff.replace(
+        before_path.to_string_lossy().as_ref(),
+        &format!("a/{}", path.display()),
+    );
+    diff = diff.replace(
+        after_path.to_string_lossy().as_ref(),
+        &format!("b/{}", path.display()),
+    );
+    let _ = fs::remove_dir_all(&temp_dir);
+    Ok(diff.trim().to_string())
+}
+
+fn write_job_artifact(
+    state: &AppState,
+    job_id: &str,
+    worker_id: Option<&str>,
+    tool_call_id: Option<&str>,
+    draft: ArtifactDraft,
+) -> Result<ArtifactSummary> {
+    let artifact_id = Uuid::new_v4().to_string();
+    let artifact_dir = state.store.artifacts_dir_path().join(job_id);
+    fs::create_dir_all(&artifact_dir)
+        .with_context(|| format!("failed to create '{}'", artifact_dir.display()))?;
+    let artifact_path = artifact_dir.join(format!("{}.{}", artifact_id, draft.extension));
+    fs::write(&artifact_path, draft.content.as_bytes())
+        .with_context(|| format!("failed to write '{}'", artifact_path.display()))?;
+    state.store.create_job_artifact(JobArtifactRecord {
+        id: artifact_id,
+        job_id: job_id.to_string(),
+        worker_id: worker_id.map(ToOwned::to_owned),
+        tool_call_id: tool_call_id.map(ToOwned::to_owned),
+        kind: draft.kind,
+        title: draft.title,
+        path: artifact_path.display().to_string(),
+        mime_type: draft.mime_type,
+        size_bytes: draft.content.len() as u64,
+        preview_text: draft.preview_text,
+    })
+}
+
 fn resolve_scoped_path(
     worker: &WorkerSummary,
     input: &str,
     allow_missing: bool,
 ) -> Result<PathBuf> {
-    let raw = PathBuf::from(input);
-    let candidate = if raw.is_absolute() {
-        raw
-    } else {
-        Path::new(&worker.working_dir).join(raw)
-    };
-
-    let resolved = if allow_missing {
-        if let Some(parent) = candidate.parent() {
-            let parent = fs::canonicalize(parent)
-                .with_context(|| format!("failed to resolve '{}'", parent.display()))?;
-            parent.join(candidate.file_name().unwrap_or_default())
-        } else {
-            candidate
-        }
-    } else {
-        fs::canonicalize(&candidate)
-            .with_context(|| format!("failed to resolve '{}'", candidate.display()))?
-    };
-
-    let allowed = worker
-        .read_roots
-        .iter()
-        .filter_map(|root| fs::canonicalize(root).ok())
-        .any(|root| resolved.starts_with(&root));
-    if !allowed {
-        bail!(
-            "path '{}' is outside the worker read scope",
-            resolved.display()
-        );
-    }
-
-    Ok(resolved)
+    resolve_scoped_path_in_roots(worker, input, &worker.read_roots, allow_missing, "read")
 }
 
 async fn command_output(command: &str, args: &[&str]) -> Result<String> {
@@ -1196,14 +2191,111 @@ async fn command_output(command: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn auto_allow_policy_for_tool(tool: &str) -> PolicyDecisionRecord {
-    PolicyDecisionRecord {
-        decision: "allow".to_string(),
-        reason: "read-only tool inside the session scope".to_string(),
-        matched_rule: format!("auto-readonly:{tool}"),
-        scope_kind: "path".to_string(),
-        risk_level: "low".to_string(),
+fn normalized_note(note: Option<String>, default: &str) -> String {
+    note.map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+fn fallback_note(note: &str, default: &str) -> String {
+    let trimmed = note.trim();
+    if trimmed.is_empty() {
+        default.to_string()
+    } else {
+        trimmed.to_string()
     }
+}
+
+fn policy_for_tool(tool: &str) -> PolicyDecisionRecord {
+    if is_mutating_tool(tool) {
+        PolicyDecisionRecord {
+            decision: "require_approval".to_string(),
+            reason: "repo mutations require explicit operator approval".to_string(),
+            matched_rule: format!("approval:mutation:{tool}"),
+            scope_kind: "path".to_string(),
+            risk_level: "medium".to_string(),
+        }
+    } else {
+        PolicyDecisionRecord {
+            decision: "allow".to_string(),
+            reason: "read-only tool inside the session scope".to_string(),
+            matched_rule: format!("auto-readonly:{tool}"),
+            scope_kind: "path".to_string(),
+            risk_level: "low".to_string(),
+        }
+    }
+}
+
+fn is_mutating_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "fs.apply_patch" | "fs.write_text" | "fs.move" | "fs.mkdir" | "git.stage_patch"
+    )
+}
+
+fn resolve_write_scoped_path(
+    worker: &WorkerSummary,
+    input: &str,
+    allow_missing: bool,
+) -> Result<PathBuf> {
+    resolve_scoped_path_in_roots(worker, input, &worker.write_roots, allow_missing, "write")
+}
+
+fn resolve_scoped_path_in_roots(
+    worker: &WorkerSummary,
+    input: &str,
+    roots: &[String],
+    allow_missing: bool,
+    scope_label: &str,
+) -> Result<PathBuf> {
+    let raw = PathBuf::from(input);
+    let candidate = if raw.is_absolute() {
+        raw
+    } else {
+        Path::new(&worker.working_dir).join(raw)
+    };
+    let normalized = normalize_lexical_path(&candidate);
+    let resolved = if allow_missing {
+        normalized
+    } else {
+        fs::canonicalize(&normalized)
+            .with_context(|| format!("failed to resolve '{}'", normalized.display()))?
+    };
+    let allowed_roots = roots
+        .iter()
+        .map(|root| {
+            fs::canonicalize(root)
+                .with_context(|| format!("failed to resolve scope root '{}'", root))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let allowed = allowed_roots.iter().any(|root| resolved.starts_with(root));
+    if !allowed {
+        bail!(
+            "path '{}' is outside the worker {} scope",
+            resolved.display(),
+            scope_label
+        );
+    }
+
+    Ok(resolved)
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
 }
 
 fn format_tool_result(result: &Value) -> String {
@@ -1318,6 +2410,12 @@ fn worker_write_roots(session: &SessionSummary) -> Vec<String> {
     worker_read_roots(session)
 }
 
+fn root_worker_capabilities() -> Vec<ToolCapabilityGrantRecord> {
+    let mut capabilities = read_only_capabilities();
+    capabilities.extend(mutating_capabilities());
+    capabilities
+}
+
 fn read_only_capabilities() -> Vec<ToolCapabilityGrantRecord> {
     vec![
         ToolCapabilityGrantRecord {
@@ -1395,6 +2493,71 @@ fn read_only_capabilities() -> Vec<ToolCapabilityGrantRecord> {
     ]
 }
 
+fn mutating_capabilities() -> Vec<ToolCapabilityGrantRecord> {
+    vec![
+        ToolCapabilityGrantRecord {
+            tool_id: "fs.apply_patch".to_string(),
+            summary: "Apply scoped find-and-replace edits to a UTF-8 text file.".to_string(),
+            approval_mode: "explicit".to_string(),
+            risk_level: "medium".to_string(),
+            side_effect_level: "write".to_string(),
+            timeout_secs: 20,
+            max_output_bytes: 32_768,
+            supports_streaming: false,
+            concurrency_group: "fs-write".to_string(),
+            scope_kind: "path".to_string(),
+        },
+        ToolCapabilityGrantRecord {
+            tool_id: "fs.write_text".to_string(),
+            summary: "Create or overwrite a UTF-8 text file inside the write scope.".to_string(),
+            approval_mode: "explicit".to_string(),
+            risk_level: "medium".to_string(),
+            side_effect_level: "write".to_string(),
+            timeout_secs: 20,
+            max_output_bytes: 32_768,
+            supports_streaming: false,
+            concurrency_group: "fs-write".to_string(),
+            scope_kind: "path".to_string(),
+        },
+        ToolCapabilityGrantRecord {
+            tool_id: "fs.move".to_string(),
+            summary: "Move or rename a file or directory inside the write scope.".to_string(),
+            approval_mode: "explicit".to_string(),
+            risk_level: "medium".to_string(),
+            side_effect_level: "write".to_string(),
+            timeout_secs: 20,
+            max_output_bytes: 16_384,
+            supports_streaming: false,
+            concurrency_group: "fs-write".to_string(),
+            scope_kind: "path".to_string(),
+        },
+        ToolCapabilityGrantRecord {
+            tool_id: "fs.mkdir".to_string(),
+            summary: "Create a directory inside the write scope.".to_string(),
+            approval_mode: "explicit".to_string(),
+            risk_level: "medium".to_string(),
+            side_effect_level: "write".to_string(),
+            timeout_secs: 20,
+            max_output_bytes: 8_192,
+            supports_streaming: false,
+            concurrency_group: "fs-write".to_string(),
+            scope_kind: "path".to_string(),
+        },
+        ToolCapabilityGrantRecord {
+            tool_id: "git.stage_patch".to_string(),
+            summary: "Stage current working tree changes for selected paths.".to_string(),
+            approval_mode: "explicit".to_string(),
+            risk_level: "medium".to_string(),
+            side_effect_level: "repo".to_string(),
+            timeout_secs: 20,
+            max_output_bytes: 16_384,
+            supports_streaming: false,
+            concurrency_group: "git-write".to_string(),
+            scope_kind: "repo".to_string(),
+        },
+    ]
+}
+
 fn worker_system_prompt(worker: &WorkerSummary) -> String {
     let tool_help = worker
         .capabilities
@@ -1455,6 +2618,24 @@ async fn publish_worker_updated(state: &AppState, summary: &WorkerSummary) {
         .send(DaemonEvent::WorkerUpdated(summary.clone()));
 }
 
+async fn publish_approval_requested(state: &AppState, summary: &ApprovalRequestSummary) {
+    let _ = state
+        .events
+        .send(DaemonEvent::ApprovalRequested(summary.clone()));
+}
+
+async fn publish_approval_resolved(state: &AppState, summary: &ApprovalRequestSummary) {
+    let _ = state
+        .events
+        .send(DaemonEvent::ApprovalResolved(summary.clone()));
+}
+
+async fn publish_artifact_added(state: &AppState, summary: &ArtifactSummary) {
+    let _ = state
+        .events
+        .send(DaemonEvent::ArtifactAdded(summary.clone()));
+}
+
 async fn publish_prompt_status(
     state: &AppState,
     session: &SessionSummary,
@@ -1482,4 +2663,51 @@ async fn publish_prompt_status(
         },
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_patch_edits_replaces_one_match() {
+        let result = apply_patch_edits(
+            "alpha\nbeta\n",
+            &[PatchEditArgs {
+                find: "beta".to_string(),
+                replace: "gamma".to_string(),
+                replace_all: Some(false),
+            }],
+        )
+        .expect("patch edit should succeed");
+
+        assert_eq!(result, "alpha\ngamma\n");
+    }
+
+    #[test]
+    fn apply_patch_edits_rejects_ambiguous_single_replace() {
+        let error = apply_patch_edits(
+            "match\nmatch\n",
+            &[PatchEditArgs {
+                find: "match".to_string(),
+                replace: "next".to_string(),
+                replace_all: Some(false),
+            }],
+        )
+        .expect_err("patch edit should reject ambiguous replacements");
+
+        assert!(
+            error.to_string().contains("matched multiple locations"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn mutating_tools_require_approval() {
+        assert_eq!(
+            policy_for_tool("fs.write_text").decision,
+            "require_approval"
+        );
+        assert_eq!(policy_for_tool("fs.read_text").decision, "allow");
+    }
 }
