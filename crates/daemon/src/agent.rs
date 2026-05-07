@@ -2170,7 +2170,7 @@ async fn call_worker_model(
     let (events, mut receiver) = mpsc::unbounded_channel();
     let execution = build_execution_session(worker);
     let history = checkpoint_history(conversation, &execution.id);
-    let prompt_body = prompt.to_string();
+    let prompt_body = build_worker_prompt_input(worker, conversation, prompt);
     let runtimes = state.runtimes.clone();
     let execution_clone = execution.clone();
     let history_clone = history.clone();
@@ -2200,6 +2200,37 @@ async fn call_worker_model(
         raw: result.content,
         provider_session_id: result.provider_session_id,
     })
+}
+
+fn build_worker_prompt_input(
+    worker: &WorkerSummary,
+    conversation: &[CheckpointMessage],
+    prompt: &str,
+) -> String {
+    if worker.provider == "openai_compatible" || conversation.is_empty() {
+        return prompt.to_string();
+    }
+
+    let conversation_text = conversation
+        .iter()
+        .map(|message| {
+            format!(
+                "{}:\n{}",
+                message.role.to_uppercase(),
+                message.content.trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    format!(
+        "Replay the checkpoint conversation below as authoritative context.\n\
+SYSTEM entries are binding instructions that must still be followed.\n\n\
+Conversation so far:\n{}\n\n\
+Current prompt:\n{}",
+        conversation_text,
+        prompt.trim()
+    )
 }
 
 fn build_execution_session(worker: &WorkerSummary) -> SessionSummary {
@@ -6196,6 +6227,97 @@ mod tests {
 
         assert!(root_prompt.contains("spawn_child_jobs"));
         assert!(!child_prompt.contains("spawn_child_jobs"));
+    }
+
+    #[test]
+    fn hidden_worker_prompt_inlines_checkpoint_history_for_claude() {
+        let worker = WorkerSummary {
+            id: "root".to_string(),
+            job_id: "job".to_string(),
+            parent_worker_id: None,
+            title: "Root worker".to_string(),
+            lane: "utility".to_string(),
+            state: "queued".to_string(),
+            provider: "claude".to_string(),
+            model: "sonnet".to_string(),
+            provider_base_url: String::new(),
+            provider_api_key: String::new(),
+            provider_session_id: String::new(),
+            working_dir: "/tmp".to_string(),
+            read_roots: vec!["/tmp".to_string()],
+            write_roots: vec!["/tmp".to_string()],
+            max_steps: 10,
+            max_tool_calls: 10,
+            max_wall_clock_secs: 30,
+            step_count: 0,
+            tool_call_count: 0,
+            last_error: String::new(),
+            capabilities: Vec::new(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let conversation = vec![
+            CheckpointMessage {
+                role: "system".to_string(),
+                content: "Return exactly one JSON object and nothing else.".to_string(),
+            },
+            CheckpointMessage {
+                role: "assistant".to_string(),
+                content: "{\"kind\":\"tool_call\"}".to_string(),
+            },
+        ];
+
+        let prompt = build_worker_prompt_input(&worker, &conversation, "You there?");
+
+        assert!(
+            prompt.contains("Return exactly one JSON object and nothing else."),
+            "expected Claude prompt to inline the system contract: {prompt}"
+        );
+        assert!(
+            prompt.contains("{\"kind\":\"tool_call\"}"),
+            "expected Claude prompt to inline prior worker conversation: {prompt}"
+        );
+        assert!(
+            prompt.contains("You there?"),
+            "expected Claude prompt to include the current step prompt: {prompt}"
+        );
+    }
+
+    #[test]
+    fn hidden_worker_prompt_keeps_openai_compatible_prompt_body_clean() {
+        let worker = WorkerSummary {
+            id: "root".to_string(),
+            job_id: "job".to_string(),
+            parent_worker_id: None,
+            title: "Root worker".to_string(),
+            lane: "utility".to_string(),
+            state: "queued".to_string(),
+            provider: "openai_compatible".to_string(),
+            model: "cx/gpt-5.4".to_string(),
+            provider_base_url: "http://127.0.0.1:1234/v1".to_string(),
+            provider_api_key: "token".to_string(),
+            provider_session_id: String::new(),
+            working_dir: "/tmp".to_string(),
+            read_roots: vec!["/tmp".to_string()],
+            write_roots: vec!["/tmp".to_string()],
+            max_steps: 10,
+            max_tool_calls: 10,
+            max_wall_clock_secs: 30,
+            step_count: 0,
+            tool_call_count: 0,
+            last_error: String::new(),
+            capabilities: Vec::new(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let conversation = vec![CheckpointMessage {
+            role: "system".to_string(),
+            content: "Return exactly one JSON object and nothing else.".to_string(),
+        }];
+
+        let prompt = build_worker_prompt_input(&worker, &conversation, "You there?");
+
+        assert_eq!(prompt, "You there?");
     }
 
     #[tokio::test]
