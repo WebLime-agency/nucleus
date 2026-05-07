@@ -56,6 +56,7 @@ const COMMAND_MAX_OUTPUT_LIMIT_BYTES: usize = 524_288;
 const COMMAND_DEFAULT_WAIT_FOR_OUTPUT_MS: u64 = 250;
 const COMMAND_MAX_WAIT_FOR_OUTPUT_MS: u64 = 2_000;
 const COMMAND_STATE_SETTLE_WAIT_MS: u64 = 50;
+const WRITE_LOCK_POLL_INTERVAL_MS: u64 = 250;
 const COMMAND_TRUNCATED_NOTE: &str = "[output truncated by the daemon budget]";
 
 #[derive(Default)]
@@ -63,6 +64,7 @@ pub struct AgentRuntime {
     running_jobs: Mutex<BTreeSet<String>>,
     cancel_tokens: Mutex<BTreeMap<String, watch::Sender<bool>>>,
     command_sessions: Mutex<BTreeMap<String, ActiveCommandSessionHandle>>,
+    write_locks: StdMutex<BTreeMap<String, WriteLockClaim>>,
 }
 
 #[derive(Debug, Clone)]
@@ -259,6 +261,15 @@ struct ActiveCommandSessionHandle {
     job_id: String,
     control: mpsc::Sender<CommandControl>,
     done: watch::Receiver<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct WriteLockClaim {
+    owner_id: String,
+    job_id: String,
+    worker_id: String,
+    roots: Vec<PathBuf>,
+    reason: String,
 }
 
 #[derive(Debug)]
@@ -744,6 +755,74 @@ impl AgentRuntime {
     async fn finish_job(&self, job_id: &str) {
         self.running_jobs.lock().await.remove(job_id);
         self.cancel_tokens.lock().await.remove(job_id);
+    }
+
+    fn try_claim_write_lock(
+        &self,
+        owner_id: &str,
+        job_id: &str,
+        worker_id: &str,
+        roots: &[String],
+        reason: &str,
+    ) -> Result<Option<WriteLockClaim>> {
+        let normalized_roots = normalize_lock_roots(roots)?;
+        if normalized_roots.is_empty() {
+            return Ok(None);
+        }
+
+        let mut locks = self
+            .write_locks
+            .lock()
+            .expect("write lock registry mutex poisoned");
+        if locks.contains_key(owner_id) {
+            return Ok(None);
+        }
+
+        if let Some(conflict) = locks
+            .values()
+            .find(|claim| write_lock_roots_conflict(&claim.roots, &normalized_roots))
+            .cloned()
+        {
+            return Ok(Some(conflict));
+        }
+
+        locks.insert(
+            owner_id.to_string(),
+            WriteLockClaim {
+                owner_id: owner_id.to_string(),
+                job_id: job_id.to_string(),
+                worker_id: worker_id.to_string(),
+                roots: normalized_roots,
+                reason: reason.to_string(),
+            },
+        );
+        Ok(None)
+    }
+
+    fn transfer_write_lock(&self, from_owner_id: &str, to_owner_id: &str) -> Result<()> {
+        if from_owner_id == to_owner_id {
+            return Ok(());
+        }
+
+        let mut locks = self
+            .write_locks
+            .lock()
+            .expect("write lock registry mutex poisoned");
+        if locks.contains_key(to_owner_id) {
+            bail!("write lock owner '{}' already exists", to_owner_id);
+        }
+        if let Some(mut claim) = locks.remove(from_owner_id) {
+            claim.owner_id = to_owner_id.to_string();
+            locks.insert(to_owner_id.to_string(), claim);
+        }
+        Ok(())
+    }
+
+    fn release_write_lock(&self, owner_id: &str) {
+        self.write_locks
+            .lock()
+            .expect("write lock registry mutex poisoned")
+            .remove(owner_id);
     }
 
     async fn register_command_session(
@@ -1238,8 +1317,7 @@ async fn handle_pending_action(
     execute_pending_tool_action(
         state, session, job_id, worker, checkpoint, step, tool_calls, cancel_rx, pending,
     )
-    .await?;
-    Ok(LoopDisposition::Continue)
+    .await
 }
 
 async fn handle_tool_call_proposal(
@@ -1267,7 +1345,7 @@ async fn handle_tool_call_proposal(
         status: if requires_approval {
             "pending_approval".to_string()
         } else {
-            "running".to_string()
+            "queued".to_string()
         },
         summary: summary.clone(),
         args_json: args.clone(),
@@ -1276,7 +1354,7 @@ async fn handle_tool_call_proposal(
         artifact_ids: Vec::new(),
         error_class: String::new(),
         error_detail: String::new(),
-        started_at: Some(unix_timestamp()),
+        started_at: None,
         completed_at: None,
     })?;
 
@@ -1403,26 +1481,6 @@ async fn handle_tool_call_proposal(
         return Ok(LoopDisposition::Return);
     }
 
-    let _ = state.store.append_job_event(JobEventRecord {
-        job_id: job_id.to_string(),
-        worker_id: Some(worker.id.clone()),
-        event_type: "tool.started".to_string(),
-        status: "running".to_string(),
-        summary: format!("Running {}", tool),
-        detail: summary.clone(),
-        data_json: json!({ "tool_id": tool, "args": args }),
-    });
-    publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
-    publish_prompt_status(
-        state,
-        &session.session,
-        worker,
-        "tooling",
-        &format!("Running {}", tool),
-        &summary,
-    )
-    .await;
-
     let pending = PendingToolAction {
         action_kind: "tool".to_string(),
         tool_call_id,
@@ -1436,8 +1494,7 @@ async fn handle_tool_call_proposal(
     execute_pending_tool_action(
         state, session, job_id, worker, checkpoint, step, tool_calls, cancel_rx, pending,
     )
-    .await?;
-    Ok(LoopDisposition::Continue)
+    .await
 }
 
 async fn handle_child_job_proposal(
@@ -2112,6 +2169,96 @@ async fn resolve_approval_request(
     Ok(state.store.get_job(&approval.job_id)?)
 }
 
+async fn wait_for_write_lock(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &WorkerSummary,
+    pending: &PendingToolAction,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<LoopDisposition> {
+    if !requires_write_lock(&pending.tool) {
+        return Ok(LoopDisposition::Continue);
+    }
+
+    let reason = lock_reason_for_tool(&pending.tool, &pending.summary);
+    let mut waiting_on: Option<String> = None;
+
+    loop {
+        match state.agent.try_claim_write_lock(
+            &pending.tool_call_id,
+            job_id,
+            &worker.id,
+            &worker.write_roots,
+            &reason,
+        )? {
+            None => {
+                if waiting_on.is_some() {
+                    let _ = state.store.append_job_event(JobEventRecord {
+                        job_id: job_id.to_string(),
+                        worker_id: Some(worker.id.clone()),
+                        event_type: "job.lock.acquired".to_string(),
+                        status: "running".to_string(),
+                        summary: format!("Acquired write lock for {}", pending.tool.as_str()),
+                        detail: "Exclusive access to the worker write scope is available again."
+                            .to_string(),
+                        data_json: json!({
+                            "tool_id": pending.tool.clone(),
+                            "tool_call_id": pending.tool_call_id.clone(),
+                        }),
+                    });
+                    publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+                }
+                return Ok(LoopDisposition::Continue);
+            }
+            Some(conflict) => {
+                if waiting_on.as_deref() != Some(conflict.owner_id.as_str()) {
+                    let detail = format!(
+                        "Waiting for job {} to release an overlapping write scope before {} can run.",
+                        conflict.job_id,
+                        pending.tool.as_str()
+                    );
+                    let _ = state.store.append_job_event(JobEventRecord {
+                        job_id: job_id.to_string(),
+                        worker_id: Some(worker.id.clone()),
+                        event_type: "job.lock.waiting".to_string(),
+                        status: "running".to_string(),
+                        summary: format!("Waiting for write lock before {}", pending.tool.as_str()),
+                        detail: detail.clone(),
+                        data_json: json!({
+                            "tool_id": pending.tool.clone(),
+                            "tool_call_id": pending.tool_call_id.clone(),
+                            "blocking_job_id": conflict.job_id,
+                            "blocking_worker_id": conflict.worker_id,
+                            "blocking_reason": conflict.reason,
+                        }),
+                    });
+                    publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+                    publish_prompt_status(
+                        state,
+                        &session.session,
+                        worker,
+                        "running",
+                        "Waiting for write lock",
+                        &detail,
+                    )
+                    .await;
+                    waiting_on = Some(conflict.owner_id);
+                }
+
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(WRITE_LOCK_POLL_INTERVAL_MS)) => {}
+                    changed = cancel_rx.changed() => {
+                        if changed.is_ok() && *cancel_rx.borrow() {
+                            return Ok(LoopDisposition::Return);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn execute_pending_tool_action(
     state: &AppState,
     session: &SessionDetail,
@@ -2122,7 +2269,13 @@ async fn execute_pending_tool_action(
     tool_calls: &mut usize,
     cancel_rx: &mut watch::Receiver<bool>,
     pending: PendingToolAction,
-) -> Result<Value> {
+) -> Result<LoopDisposition> {
+    if let LoopDisposition::Return =
+        wait_for_write_lock(state, session, job_id, worker, &pending, cancel_rx).await?
+    {
+        return Ok(LoopDisposition::Return);
+    }
+
     let tool = pending.tool.clone();
     let args = pending.args.clone();
     let _ = state.store.append_job_event(JobEventRecord {
@@ -2132,7 +2285,11 @@ async fn execute_pending_tool_action(
         status: "running".to_string(),
         summary: format!("Running {}", tool),
         detail: pending.summary.clone(),
-        data_json: json!({ "tool_id": tool, "tool_call_id": pending.tool_call_id, "args": args }),
+        data_json: json!({
+            "tool_id": tool.clone(),
+            "tool_call_id": pending.tool_call_id.clone(),
+            "args": args,
+        }),
     });
     publish_prompt_status(
         state,
@@ -2143,15 +2300,19 @@ async fn execute_pending_tool_action(
         &pending.summary,
     )
     .await;
-    state.store.update_tool_call(
+    if let Err(error) = state.store.update_tool_call(
         &pending.tool_call_id,
         ToolCallPatch {
             status: Some("running".to_string()),
+            started_at: Some(Some(unix_timestamp())),
             error_class: Some(String::new()),
             error_detail: Some(String::new()),
             ..ToolCallPatch::default()
         },
-    )?;
+    ) {
+        state.agent.release_write_lock(&pending.tool_call_id);
+        return Err(error);
+    }
 
     let tool_result = match execute_granted_tool(
         state,
@@ -2168,6 +2329,7 @@ async fn execute_pending_tool_action(
     {
         Ok(result) => result,
         Err(error) => {
+            state.agent.release_write_lock(&pending.tool_call_id);
             let _ = state.store.update_tool_call(
                 &pending.tool_call_id,
                 ToolCallPatch {
@@ -2181,6 +2343,8 @@ async fn execute_pending_tool_action(
             return Err(error);
         }
     };
+
+    state.agent.release_write_lock(&pending.tool_call_id);
 
     state.store.update_tool_call(
         &pending.tool_call_id,
@@ -2219,11 +2383,14 @@ async fn execute_pending_tool_action(
         status: "completed".to_string(),
         summary: format!("Completed {}", tool),
         detail: excerpt(&format_tool_result(&tool_result), 320),
-        data_json: json!({ "tool_id": tool, "tool_call_id": pending.tool_call_id }),
+        data_json: json!({
+            "tool_id": tool.clone(),
+            "tool_call_id": pending.tool_call_id.clone(),
+        }),
     });
     publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
     publish_worker_updated(state, worker).await;
-    Ok(tool_result)
+    Ok(LoopDisposition::Continue)
 }
 
 async fn execute_granted_tool(
@@ -3202,6 +3369,10 @@ async fn run_bounded_command_tool(
     spec: ResolvedCommandSpec,
 ) -> Result<Value> {
     let started = start_command_session(state, job_id, worker, tool_call_id, &spec, false).await?;
+    state
+        .agent
+        .transfer_write_lock(tool_call_id, &started.id)
+        .context("failed to transfer the command write lock")?;
     if let Some(pending) = checkpoint.pending_action.as_mut() {
         pending.command_session_id = Some(started.id.clone());
         state.store.write_worker_checkpoint(
@@ -3242,6 +3413,10 @@ async fn execute_command_session_open_tool(
         false,
     )?;
     let started = start_command_session(state, job_id, worker, tool_call_id, &spec, true).await?;
+    state
+        .agent
+        .transfer_write_lock(tool_call_id, &started.id)
+        .context("failed to transfer the command write lock")?;
     let snapshot = snapshot_command_session(state, &started.id, wait_for_output_ms).await?;
     let latest = load_latest_command_session(state, &started.id).await?;
     Ok(command_session_result_json(&latest, &snapshot))
@@ -4043,6 +4218,7 @@ async fn run_command_session_controller(
         Err(error) => {
             warn!(command_session_id = %summary.id, error = %error, "failed to finalize command session");
             let _ = done_tx.send(true);
+            state.agent.release_write_lock(&summary.id);
             state.agent.finish_command_session(&summary.id).await;
             return;
         }
@@ -4090,6 +4266,7 @@ async fn run_command_session_controller(
     }
 
     let _ = done_tx.send(true);
+    state.agent.release_write_lock(&summary.id);
     state.agent.finish_command_session(&summary.id).await;
 }
 
@@ -4526,6 +4703,46 @@ fn is_mutating_tool(tool: &str) -> bool {
 
 fn is_command_follow_up_tool(tool: &str) -> bool {
     matches!(tool, "command.session.write" | "command.session.close")
+}
+
+fn requires_write_lock(tool: &str) -> bool {
+    is_mutating_tool(tool) || matches!(tool, "command.run" | "command.session.open" | "tests.run")
+}
+
+fn lock_reason_for_tool(tool: &str, summary: &str) -> String {
+    let detail = summary.trim();
+    if detail.is_empty() {
+        format!("daemon-owned {tool}")
+    } else {
+        format!("{tool}: {detail}")
+    }
+}
+
+fn normalize_lock_roots(roots: &[String]) -> Result<Vec<PathBuf>> {
+    let mut normalized = roots
+        .iter()
+        .map(|root| normalize_lock_root(root))
+        .collect::<Result<Vec<_>>>()?;
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+fn normalize_lock_root(root: &str) -> Result<PathBuf> {
+    let candidate = PathBuf::from(root);
+    if candidate.exists() {
+        return fs::canonicalize(&candidate)
+            .with_context(|| format!("failed to resolve write root '{}'", candidate.display()));
+    }
+    Ok(normalize_lexical_path(&candidate))
+}
+
+fn write_lock_roots_conflict(left: &[PathBuf], right: &[PathBuf]) -> bool {
+    left.iter().any(|left_root| {
+        right.iter().any(|right_root| {
+            left_root.starts_with(right_root) || right_root.starts_with(left_root)
+        })
+    })
 }
 
 fn resolve_write_scoped_path(
@@ -5164,6 +5381,79 @@ mod tests {
         );
         assert_eq!(policy_for_tool("command.session.write").decision, "allow");
         assert_eq!(policy_for_tool("fs.read_text").decision, "allow");
+    }
+
+    #[test]
+    fn write_lock_conflicts_on_overlapping_roots() {
+        assert!(write_lock_roots_conflict(
+            &[PathBuf::from("/tmp/repo")],
+            &[PathBuf::from("/tmp/repo/src")]
+        ));
+        assert!(!write_lock_roots_conflict(
+            &[PathBuf::from("/tmp/repo-a")],
+            &[PathBuf::from("/tmp/repo-b")]
+        ));
+    }
+
+    #[test]
+    fn agent_runtime_transfers_write_locks_between_tool_and_command_owners() {
+        let runtime = AgentRuntime::default();
+
+        assert!(
+            runtime
+                .try_claim_write_lock(
+                    "tool-call",
+                    "job-a",
+                    "worker-a",
+                    &[String::from("/tmp/repo")],
+                    "fs.write_text: update file",
+                )
+                .expect("first claim should succeed")
+                .is_none()
+        );
+
+        let conflict = runtime
+            .try_claim_write_lock(
+                "other-owner",
+                "job-b",
+                "worker-b",
+                &[String::from("/tmp/repo/src")],
+                "command.run: cargo test",
+            )
+            .expect("conflict check should succeed")
+            .expect("second owner should conflict");
+        assert_eq!(conflict.job_id, "job-a");
+
+        runtime
+            .transfer_write_lock("tool-call", "command-session")
+            .expect("lock transfer should succeed");
+
+        let conflict = runtime
+            .try_claim_write_lock(
+                "other-owner",
+                "job-b",
+                "worker-b",
+                &[String::from("/tmp/repo/src")],
+                "command.run: cargo test",
+            )
+            .expect("conflict check should succeed")
+            .expect("transferred owner should still conflict");
+        assert_eq!(conflict.owner_id, "command-session");
+
+        runtime.release_write_lock("command-session");
+
+        assert!(
+            runtime
+                .try_claim_write_lock(
+                    "other-owner",
+                    "job-b",
+                    "worker-b",
+                    &[String::from("/tmp/repo/src")],
+                    "command.run: cargo test",
+                )
+                .expect("claim after release should succeed")
+                .is_none()
+        );
     }
 
     #[test]
