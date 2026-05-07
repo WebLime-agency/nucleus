@@ -35,7 +35,12 @@
     restartDaemon,
     updateUpdateConfig
   } from '$lib/nucleus/client';
-  import { compactPath, formatDateTime, formatState } from '$lib/nucleus/format';
+  import {
+    compactPath,
+    formatDateTime,
+    formatLatestTargetLabel,
+    formatState
+  } from '$lib/nucleus/format';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
   import type { DaemonEvent, SettingsSummary } from '$lib/nucleus/schemas';
 
@@ -81,17 +86,7 @@
     return update.tracked_ref ?? 'Unavailable';
   });
   let latestTargetLabel = $derived.by(() => {
-    if (!update) {
-      return 'Not checked yet';
-    }
-
-    return (
-      update.latest_version ??
-      update.latest_release_id ??
-      update.latest_commit_short ??
-      update.latest_commit ??
-      'Not checked yet'
-    );
+    return formatLatestTargetLabel(update, 'Not checked yet');
   });
   let currentTargetLabel = $derived(isDevCheckout ? 'Current Ref' : 'Current Release ID');
   let updateConfigDirty = $derived.by(() => {

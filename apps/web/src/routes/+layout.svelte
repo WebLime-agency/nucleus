@@ -27,7 +27,12 @@
     writeAccessToken
   } from '$lib/nucleus/auth';
   import { createSession, fetchOverview, fetchSettings } from '$lib/nucleus/client';
-  import { compactPath, formatCount, formatState } from '$lib/nucleus/format';
+  import {
+    compactPath,
+    formatCount,
+    formatLatestTargetLabel,
+    formatState
+  } from '$lib/nucleus/format';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
   import type {
     CompatibilitySummary,
@@ -98,16 +103,7 @@
     return updateStatus.tracked_ref ?? '';
   });
   let updateTargetLabel = $derived.by(() => {
-    if (!updateStatus) {
-      return 'A newer build';
-    }
-
-    return (
-      updateStatus.latest_version ??
-      updateStatus.latest_commit_short ??
-      updateStatus.latest_commit ??
-      'A newer build'
-    );
+    return formatLatestTargetLabel(updateStatus, 'A newer build');
   });
   let activeNavItem = $derived(navigation.find((item) => item.href === pathname) ?? navigation[0]);
   let usesFullHeightContent = $derived(pathname === '/sessions');

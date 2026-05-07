@@ -557,6 +557,7 @@ async fn run_release_install(
         tracked_channel: Some(channel.to_string()),
         tracked_ref: None,
         release_manifest_url: Some(manifest_url.clone()),
+        pending_restart_release_id: None,
         update_available: false,
         last_successful_check_at: Some(checked_at),
         last_successful_target_version: Some(selected.release.version.clone()),

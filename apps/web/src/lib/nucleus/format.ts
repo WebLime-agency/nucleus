@@ -1,3 +1,5 @@
+import type { UpdateStatus } from './schemas';
+
 export function formatBytes(bytes: number): string {
   if (bytes <= 0) return '0 B';
 
@@ -51,4 +53,47 @@ export function clampPercent(value: number): number {
 
 export function compactPath(path: string): string {
   return path.replace(/^\/home\/eba\/?/, '') || path;
+}
+
+type UpdateTargetLike = Pick<
+  UpdateStatus,
+  'install_kind' | 'latest_version' | 'latest_release_id' | 'latest_commit_short' | 'latest_commit'
+>;
+
+export function formatLatestTargetLabel(
+  update: UpdateTargetLike | null | undefined,
+  fallback: string
+): string {
+  if (!update) {
+    return fallback;
+  }
+
+  if (update.install_kind === 'managed_release') {
+    const version = update.latest_version?.trim();
+    const releaseId = update.latest_release_id?.trim();
+
+    if (version && releaseId) {
+      return `${version} (${compactReleaseId(releaseId)})`;
+    }
+
+    if (version) {
+      return version;
+    }
+
+    if (releaseId) {
+      return releaseId;
+    }
+  }
+
+  return update.latest_version ?? update.latest_commit_short ?? update.latest_commit ?? fallback;
+}
+
+function compactReleaseId(releaseId: string): string {
+  const parts = releaseId.split('-');
+
+  if (parts.length >= 2) {
+    return parts.slice(-2).join('-');
+  }
+
+  return releaseId;
 }
