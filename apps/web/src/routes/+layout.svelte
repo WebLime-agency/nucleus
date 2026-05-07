@@ -13,6 +13,7 @@
     MessagesSquare,
     Settings2,
     ServerCog,
+    Workflow,
     X
   } from 'lucide-svelte';
 
@@ -43,6 +44,7 @@
   const navigation = [
     { href: '/', label: 'Overview', icon: Gauge },
     { href: '/sessions', label: 'Sessions', icon: MessagesSquare },
+    { href: '/automations', label: 'Automations', icon: Workflow },
     { href: '/workspace', label: 'Workspace', icon: FolderTree },
     { href: '/diagnostics', label: 'Diagnostics', icon: Cpu },
     { href: '/memory', label: 'Memory', icon: MemoryStick },
@@ -513,7 +515,7 @@
       </div>
 
       <div class="sticky bottom-0 shrink-0 border-t border-zinc-900 bg-zinc-950/95 px-3 py-2.5 backdrop-blur">
-        <nav class="grid grid-cols-6 gap-2">
+        <nav class="grid grid-cols-7 gap-2">
           {#each navigation as item}
             <button
               type="button"
