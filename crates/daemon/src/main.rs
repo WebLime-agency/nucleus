@@ -1,3 +1,4 @@
+mod agent;
 mod host;
 mod runtime;
 mod updates;
@@ -31,12 +32,12 @@ use nucleus_core::{AdapterKind, DEFAULT_DAEMON_ADDR, PRODUCT_NAME, product_banne
 use nucleus_protocol::{
     ActionParameter, ActionRunRequest, ActionRunResponse, ActionSummary, AuditEvent, AuthSummary,
     CompatibilitySummary, ConnectionSummary, CreateSessionRequest, DaemonEvent, HealthResponse,
-    HostStatus, ProcessKillRequest, ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate,
-    ProjectUpdateRequest, PromptProgressUpdate, RouterProfileSummary, RuntimeOverview,
-    RuntimeSummary, SessionDetail, SessionPromptRequest, SessionSummary, SettingsSummary,
-    StreamConnected, SystemStats, UpdateConfigRequest, UpdateSessionRequest, UpdateStatus,
-    WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceProfileWriteRequest, WorkspaceSummary,
-    WorkspaceUpdateRequest,
+    HostStatus, JobDetail, JobSummary, ProcessKillRequest, ProcessKillResponse,
+    ProcessListResponse, ProcessStreamUpdate, ProjectUpdateRequest, PromptProgressUpdate,
+    RouterProfileSummary, RuntimeOverview, RuntimeSummary, SessionDetail, SessionPromptRequest,
+    SessionSummary, SettingsSummary, StreamConnected, SystemStats, UpdateConfigRequest,
+    UpdateSessionRequest, UpdateStatus, WorkspaceModelConfig, WorkspaceProfileSummary,
+    WorkspaceProfileWriteRequest, WorkspaceSummary, WorkspaceUpdateRequest,
 };
 use nucleus_release::read_installed_release_metadata;
 use nucleus_storage::{
@@ -77,6 +78,7 @@ struct AppState {
     host: Arc<HostEngine>,
     runtimes: Arc<RuntimeManager>,
     updates: Arc<UpdateManager>,
+    agent: Arc<agent::AgentRuntime>,
     web_dist_dir: Option<PathBuf>,
     tailscale_dns_name: Option<String>,
     events: broadcast::Sender<DaemonEvent>,
@@ -98,10 +100,12 @@ async fn main() -> anyhow::Result<()> {
         host: Arc::new(HostEngine::new()),
         runtimes: Arc::new(RuntimeManager::default()),
         updates,
+        agent: Arc::new(agent::AgentRuntime::default()),
         web_dist_dir,
         tailscale_dns_name: detect_tailscale_dns_name(),
         events,
     };
+    agent::recover_interrupted_jobs(&state).await?;
     spawn_event_publisher(state.clone());
     spawn_update_monitor(state.clone());
 
@@ -157,12 +161,16 @@ fn app(state: AppState) -> Router {
         .route("/actions/{action_id}/run", axum::routing::post(run_action))
         .route("/audit", get(audit_events))
         .route("/sessions", get(list_sessions).post(create_session))
+        .route("/sessions/{session_id}/jobs", get(session_jobs))
         .route(
             "/sessions/{session_id}",
             get(session_detail)
                 .patch(update_session)
                 .delete(delete_session),
         )
+        .route("/jobs/{job_id}", get(job_detail))
+        .route("/jobs/{job_id}/cancel", axum::routing::post(cancel_job))
+        .route("/jobs/{job_id}/resume", axum::routing::post(resume_job))
         .route(
             "/sessions/{session_id}/prompt",
             get(session_detail).post(prompt_session),
@@ -779,6 +787,34 @@ async fn delete_session(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn session_jobs(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<Vec<JobSummary>>, ApiError> {
+    Ok(Json(state.store.list_jobs_for_session(&session_id)?))
+}
+
+async fn job_detail(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Result<Json<JobDetail>, ApiError> {
+    Ok(Json(state.store.get_job(&job_id)?))
+}
+
+async fn cancel_job(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Result<Json<JobDetail>, ApiError> {
+    Ok(Json(agent::cancel_job(state, job_id).await?))
+}
+
+async fn resume_job(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Result<Json<JobDetail>, ApiError> {
+    Ok(Json(agent::resume_job(state, job_id).await?))
+}
+
 async fn prompt_session(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -805,6 +841,13 @@ async fn prompt_session(
     if current.session.state == "running" {
         return Err(ApiError::bad_request(
             "this session is already processing a prompt",
+        ));
+    }
+
+    if payload.images.is_empty() {
+        return Ok(Json(
+            agent::start_text_prompt_job(state, session_id, payload, current, execution_prompt)
+                .await?,
         ));
     }
 
@@ -3487,6 +3530,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes,
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -3547,6 +3591,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes,
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -3604,6 +3649,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes,
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -3664,6 +3710,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -3728,6 +3775,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes,
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -3813,6 +3861,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes,
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,

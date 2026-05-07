@@ -8,6 +8,8 @@ import {
   apiErrorSchema,
   auditEventSchema,
   createSessionRequestSchema,
+  jobDetailSchema,
+  jobSummarySchema,
   processKillRequestSchema,
   processKillResponseSchema,
   processListResponseSchema,
@@ -301,6 +303,44 @@ export async function fetchSessionDetail(sessionId: string, fetchImpl: FetchLike
       headers: { accept: 'application/json' }
     }),
     sessionDetailSchema
+  );
+}
+
+export async function fetchSessionJobs(sessionId: string, fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/sessions/${sessionId}/jobs`, {
+      headers: { accept: 'application/json' }
+    }),
+    z.array(jobSummarySchema)
+  );
+}
+
+export async function fetchJobDetail(jobId: string, fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/jobs/${jobId}`, {
+      headers: { accept: 'application/json' }
+    }),
+    jobDetailSchema
+  );
+}
+
+export async function cancelJob(jobId: string, fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/jobs/${jobId}/cancel`, {
+      method: 'POST',
+      headers: { accept: 'application/json' }
+    }),
+    jobDetailSchema
+  );
+}
+
+export async function resumeJob(jobId: string, fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/jobs/${jobId}/resume`, {
+      method: 'POST',
+      headers: { accept: 'application/json' }
+    }),
+    jobDetailSchema
   );
 }
 
