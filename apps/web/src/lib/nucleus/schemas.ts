@@ -185,6 +185,7 @@ export const artifactSummarySchema = z.object({
   job_id: z.string(),
   worker_id: z.string().nullable(),
   tool_call_id: z.string().nullable(),
+  command_session_id: z.string().nullable(),
   kind: z.string(),
   title: z.string(),
   path: z.string(),
@@ -192,6 +193,30 @@ export const artifactSummarySchema = z.object({
   size_bytes: z.number().int().nonnegative(),
   preview_text: z.string(),
   created_at: z.number().int()
+});
+
+export const commandSessionSummarySchema = z.object({
+  id: z.string(),
+  job_id: z.string(),
+  worker_id: z.string(),
+  tool_call_id: z.string().nullable(),
+  mode: z.string(),
+  title: z.string(),
+  state: z.string(),
+  command: z.string(),
+  args: z.array(z.string()).default([]),
+  cwd: z.string(),
+  network_policy: z.string(),
+  timeout_secs: z.number().int().nonnegative(),
+  output_limit_bytes: z.number().int().nonnegative(),
+  last_error: z.string(),
+  exit_code: z.number().int().nullable(),
+  stdout_artifact_id: z.string().nullable(),
+  stderr_artifact_id: z.string().nullable(),
+  started_at: z.number().int().nullable(),
+  completed_at: z.number().int().nullable(),
+  created_at: z.number().int(),
+  updated_at: z.number().int()
 });
 
 export const jobEventSchema = z.object({
@@ -213,6 +238,7 @@ export const jobDetailSchema = z.object({
   tool_calls: z.array(toolCallSummarySchema).default([]),
   approvals: z.array(approvalRequestSummarySchema).default([]),
   artifacts: z.array(artifactSummarySchema).default([]),
+  command_sessions: z.array(commandSessionSummarySchema).default([]),
   events: z.array(jobEventSchema).default([])
 });
 
@@ -595,6 +621,10 @@ export const daemonEventSchema = z.discriminatedUnion('event', [
     data: artifactSummarySchema
   }),
   z.object({
+    event: z.literal('command_session.updated'),
+    data: commandSessionSummarySchema
+  }),
+  z.object({
     event: z.literal('job.completed'),
     data: jobSummarySchema
   }),
@@ -643,6 +673,7 @@ export type WorkerSummary = z.infer<typeof workerSummarySchema>;
 export type ToolCallSummary = z.infer<typeof toolCallSummarySchema>;
 export type ApprovalRequestSummary = z.infer<typeof approvalRequestSummarySchema>;
 export type ArtifactSummary = z.infer<typeof artifactSummarySchema>;
+export type CommandSessionSummary = z.infer<typeof commandSessionSummarySchema>;
 export type JobEvent = z.infer<typeof jobEventSchema>;
 export type JobDetail = z.infer<typeof jobDetailSchema>;
 export type PromptProgressUpdate = z.infer<typeof promptProgressUpdateSchema>;

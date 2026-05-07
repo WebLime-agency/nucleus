@@ -46,6 +46,7 @@
     ApprovalRequestSummary,
     ArtifactSummary,
     AuditEvent,
+    CommandSessionSummary,
     DaemonEvent,
     JobDetail,
     JobEvent,
@@ -231,7 +232,9 @@
   ): 'default' | 'secondary' | 'warning' | 'destructive' {
     if (state === 'completed') return 'default';
     if (state === 'running' || state === 'queued' || state === 'pending_approval') return 'warning';
-    if (state === 'canceled' || state === 'denied') return 'secondary';
+    if (state === 'canceled' || state === 'denied' || state === 'closed' || state === 'orphaned') {
+      return 'secondary';
+    }
     return 'destructive';
   }
 
@@ -1185,6 +1188,10 @@
     return artifact.title || artifact.kind;
   }
 
+  function formatCommandSessionSummary(commandSession: CommandSessionSummary) {
+    return commandSession.title || commandSession.command;
+  }
+
   function applyStreamEvent(event: DaemonEvent) {
     if (event.event === 'overview.updated') {
       syncOverview(event.data);
@@ -1226,7 +1233,8 @@
       event.event === 'worker.updated' ||
       event.event === 'approval.requested' ||
       event.event === 'approval.resolved' ||
-      event.event === 'artifact.added'
+      event.event === 'artifact.added' ||
+      event.event === 'command_session.updated'
     ) {
       if (jobDetail?.job.id === event.data.job_id || selectedJobSummary?.id === event.data.job_id) {
         void loadJob(event.data.job_id, true);
@@ -1995,6 +2003,51 @@
                                       </Button>
                                     </div>
                                   {/if}
+                                </div>
+                              {/each}
+                            {/if}
+                          </div>
+                        </div>
+
+                        <div>
+                          <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Command Sessions</div>
+                          <div class="mt-2 space-y-2">
+                            {#if jobDetail.command_sessions.length === 0}
+                              <div class="text-xs text-zinc-500">No daemon-owned command sessions were recorded for this job.</div>
+                            {:else}
+                              {#each [...jobDetail.command_sessions].reverse().slice(0, 6) as commandSession}
+                                <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2">
+                                  <div class="flex items-start justify-between gap-3">
+                                    <div class="min-w-0">
+                                      <div class="truncate text-sm text-zinc-100">{formatCommandSessionSummary(commandSession)}</div>
+                                      <div class="mt-1 text-xs leading-5 text-zinc-500">
+                                        {commandSession.command}
+                                        {#if commandSession.args.length > 0}
+                                          {' '}{commandSession.args.join(' ')}
+                                        {/if}
+                                      </div>
+                                    </div>
+                                    <Badge variant={badgeVariantForToolCall(commandSession.state)}>
+                                      {formatState(commandSession.state)}
+                                    </Badge>
+                                  </div>
+                                  <div class="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-zinc-600">
+                                    <span>{commandSession.mode}</span>
+                                    <span>{compactPath(commandSession.cwd)}</span>
+                                    <span>{commandSession.output_limit_bytes} byte cap</span>
+                                    <span>{commandSession.timeout_secs}s timeout</span>
+                                  </div>
+                                  {#if commandSession.last_error}
+                                    <div class="mt-2 text-xs leading-5 text-red-200">{commandSession.last_error}</div>
+                                  {/if}
+                                  <div class="mt-2 text-[11px] text-zinc-600">
+                                    {#if commandSession.started_at}
+                                      Started {formatDateTime(commandSession.started_at)}
+                                    {/if}
+                                    {#if commandSession.completed_at}
+                                      {' · '}Completed {formatDateTime(commandSession.completed_at)}
+                                    {/if}
+                                  </div>
                                 </div>
                               {/each}
                             {/if}
