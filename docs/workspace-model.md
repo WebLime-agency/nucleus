@@ -36,6 +36,7 @@ A session may be:
 - ad hoc with no attached project
 - anchored to one project
 - attached to multiple projects
+- hidden automation-backed for daemon-owned playbooks and background runs
 
 The working directory should come from the workspace and active-project model, not from arbitrary per-session free text.
 

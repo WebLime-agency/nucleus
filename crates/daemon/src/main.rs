@@ -1,3 +1,4 @@
+mod agent;
 mod host;
 mod runtime;
 mod updates;
@@ -29,12 +30,14 @@ use futures_util::SinkExt;
 use host::{DEFAULT_PROCESS_LIMIT, HostEngine, ProcessSort, resolve_process_limit};
 use nucleus_core::{AdapterKind, DEFAULT_DAEMON_ADDR, PRODUCT_NAME, product_banner};
 use nucleus_protocol::{
-    ActionParameter, ActionRunRequest, ActionRunResponse, ActionSummary, AuditEvent, AuthSummary,
-    CompatibilitySummary, ConnectionSummary, CreateSessionRequest, DaemonEvent, HealthResponse,
-    HostStatus, ProcessKillRequest, ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate,
-    ProjectUpdateRequest, PromptProgressUpdate, RouterProfileSummary, RuntimeOverview,
-    RuntimeSummary, SessionDetail, SessionPromptRequest, SessionSummary, SettingsSummary,
-    StreamConnected, SystemStats, UpdateConfigRequest, UpdateSessionRequest, UpdateStatus,
+    ActionParameter, ActionRunRequest, ActionRunResponse, ActionSummary, ApprovalRequestSummary,
+    ApprovalResolutionRequest, AuditEvent, AuthSummary, CompatibilitySummary, ConnectionSummary,
+    CreatePlaybookRequest, CreateSessionRequest, DaemonEvent, HealthResponse, HostStatus,
+    JobDetail, JobSummary, PlaybookDetail, PlaybookSummary, ProcessKillRequest,
+    ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate, ProjectUpdateRequest,
+    PromptProgressUpdate, RouterProfileSummary, RuntimeOverview, RuntimeSummary, SessionDetail,
+    SessionPromptRequest, SessionSummary, SettingsSummary, StreamConnected, SystemStats,
+    UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
     WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceProfileWriteRequest, WorkspaceSummary,
     WorkspaceUpdateRequest,
 };
@@ -77,6 +80,7 @@ struct AppState {
     host: Arc<HostEngine>,
     runtimes: Arc<RuntimeManager>,
     updates: Arc<UpdateManager>,
+    agent: Arc<agent::AgentRuntime>,
     web_dist_dir: Option<PathBuf>,
     tailscale_dns_name: Option<String>,
     events: broadcast::Sender<DaemonEvent>,
@@ -98,12 +102,15 @@ async fn main() -> anyhow::Result<()> {
         host: Arc::new(HostEngine::new()),
         runtimes: Arc::new(RuntimeManager::default()),
         updates,
+        agent: Arc::new(agent::AgentRuntime::default()),
         web_dist_dir,
         tailscale_dns_name: detect_tailscale_dns_name(),
         events,
     };
+    agent::recover_interrupted_jobs(&state).await?;
     spawn_event_publisher(state.clone());
     spawn_update_monitor(state.clone());
+    agent::spawn_playbook_scheduler(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
@@ -156,13 +163,37 @@ fn app(state: AppState) -> Router {
         .route("/actions/{action_id}", get(action_detail))
         .route("/actions/{action_id}/run", axum::routing::post(run_action))
         .route("/audit", get(audit_events))
+        .route("/approvals", get(pending_approvals))
+        .route(
+            "/approvals/{approval_id}/approve",
+            axum::routing::post(approve_request),
+        )
+        .route(
+            "/approvals/{approval_id}/deny",
+            axum::routing::post(deny_request),
+        )
+        .route("/playbooks", get(playbooks).post(create_playbook))
+        .route(
+            "/playbooks/{playbook_id}",
+            get(playbook_detail)
+                .patch(update_playbook)
+                .delete(delete_playbook),
+        )
+        .route(
+            "/playbooks/{playbook_id}/run",
+            axum::routing::post(run_playbook),
+        )
         .route("/sessions", get(list_sessions).post(create_session))
+        .route("/sessions/{session_id}/jobs", get(session_jobs))
         .route(
             "/sessions/{session_id}",
             get(session_detail)
                 .patch(update_session)
                 .delete(delete_session),
         )
+        .route("/jobs/{job_id}", get(job_detail))
+        .route("/jobs/{job_id}/cancel", axum::routing::post(cancel_job))
+        .route("/jobs/{job_id}/resume", axum::routing::post(resume_job))
         .route(
             "/sessions/{session_id}/prompt",
             get(session_detail).post(prompt_session),
@@ -423,6 +454,14 @@ async fn sync_projects(State(state): State<AppState>) -> Result<Json<WorkspaceSu
         },
     )
     .await;
+    if let Err(error) =
+        agent::dispatch_playbook_event(state.clone(), "workspace_projects_synced").await
+    {
+        warn!(
+            error = error.message.as_str(),
+            "failed to dispatch workspace_projects_synced playbooks"
+        );
+    }
     let _ = publish_overview_event(&state).await;
     Ok(Json(workspace))
 }
@@ -464,6 +503,50 @@ async fn list_sessions(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<SessionSummary>>, ApiError> {
     Ok(Json(state.store.list_sessions()?))
+}
+
+async fn playbooks(State(state): State<AppState>) -> Result<Json<Vec<PlaybookSummary>>, ApiError> {
+    Ok(Json(agent::list_playbooks(state).await?))
+}
+
+async fn playbook_detail(
+    State(state): State<AppState>,
+    Path(playbook_id): Path<String>,
+) -> Result<Json<PlaybookDetail>, ApiError> {
+    Ok(Json(agent::get_playbook(state, playbook_id).await?))
+}
+
+async fn create_playbook(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<PlaybookDetail>, ApiError> {
+    let payload = decode_json::<CreatePlaybookRequest>(&body)?;
+    Ok(Json(agent::create_playbook(state, payload).await?))
+}
+
+async fn update_playbook(
+    State(state): State<AppState>,
+    Path(playbook_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<PlaybookDetail>, ApiError> {
+    let payload = decode_json::<UpdatePlaybookRequest>(&body)?;
+    Ok(Json(
+        agent::update_playbook(state, playbook_id, payload).await?,
+    ))
+}
+
+async fn delete_playbook(
+    State(state): State<AppState>,
+    Path(playbook_id): Path<String>,
+) -> Result<Json<PlaybookDetail>, ApiError> {
+    Ok(Json(agent::delete_playbook(state, playbook_id).await?))
+}
+
+async fn run_playbook(
+    State(state): State<AppState>,
+    Path(playbook_id): Path<String>,
+) -> Result<Json<JobDetail>, ApiError> {
+    Ok(Json(agent::run_playbook(state, playbook_id).await?))
 }
 
 async fn actions() -> Json<Vec<ActionSummary>> {
@@ -779,6 +862,70 @@ async fn delete_session(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn session_jobs(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<Vec<JobSummary>>, ApiError> {
+    Ok(Json(state.store.list_jobs_for_session(&session_id)?))
+}
+
+async fn job_detail(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Result<Json<JobDetail>, ApiError> {
+    Ok(Json(state.store.get_job(&job_id)?))
+}
+
+async fn cancel_job(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Result<Json<JobDetail>, ApiError> {
+    Ok(Json(agent::cancel_job(state, job_id).await?))
+}
+
+async fn resume_job(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Result<Json<JobDetail>, ApiError> {
+    Ok(Json(agent::resume_job(state, job_id).await?))
+}
+
+async fn pending_approvals(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ApprovalRequestSummary>>, ApiError> {
+    Ok(Json(agent::list_pending_approvals(state).await?))
+}
+
+async fn approve_request(
+    State(state): State<AppState>,
+    Path(approval_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<JobDetail>, ApiError> {
+    let payload = if body.is_empty() {
+        ApprovalResolutionRequest::default()
+    } else {
+        decode_json::<ApprovalResolutionRequest>(&body)?
+    };
+    Ok(Json(
+        agent::approve_request(state, approval_id, payload.note).await?,
+    ))
+}
+
+async fn deny_request(
+    State(state): State<AppState>,
+    Path(approval_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<JobDetail>, ApiError> {
+    let payload = if body.is_empty() {
+        ApprovalResolutionRequest::default()
+    } else {
+        decode_json::<ApprovalResolutionRequest>(&body)?
+    };
+    Ok(Json(
+        agent::deny_request(state, approval_id, payload.note).await?,
+    ))
+}
+
 async fn prompt_session(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -805,6 +952,13 @@ async fn prompt_session(
     if current.session.state == "running" {
         return Err(ApiError::bad_request(
             "this session is already processing a prompt",
+        ));
+    }
+
+    if payload.images.is_empty() {
+        return Ok(Json(
+            agent::start_text_prompt_job(state, session_id, payload, current, execution_prompt)
+                .await?,
         ));
     }
 
@@ -3487,6 +3641,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes,
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -3547,6 +3702,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes,
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -3604,6 +3760,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes,
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -3664,6 +3821,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -3728,6 +3886,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes,
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -3813,6 +3972,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes,
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,

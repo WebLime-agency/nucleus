@@ -8,9 +8,12 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use nucleus_core::{AdapterKind, PRODUCT_SLUG};
 use nucleus_protocol::{
-    AuditEvent, ProjectSummary, RouteTarget, RouterProfileSummary, RuntimeSummary, SessionDetail,
-    SessionProjectSummary, SessionSummary, SessionTurn, SessionTurnImage, StorageSummary,
-    WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceSummary,
+    ApprovalRequestSummary, ArtifactSummary, AuditEvent, CommandSessionSummary, JobDetail,
+    JobEvent, JobSummary, PlaybookDetail, PlaybookSummary, PolicyDecisionSummary, ProjectSummary,
+    RouteTarget, RouterProfileSummary, RuntimeSummary, SessionDetail, SessionProjectSummary,
+    SessionSummary, SessionTurn, SessionTurnImage, StorageSummary, ToolCallSummary,
+    ToolCapabilitySummary, WorkerSummary, WorkspaceModelConfig, WorkspaceProfileSummary,
+    WorkspaceSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -21,6 +24,7 @@ use uuid::Uuid;
 const LOCAL_AUTH_TOKEN_HASH_KEY: &str = "auth.local_token_hash";
 const LOCAL_AUTH_TOKEN_FILE_NAME: &str = "local-auth-token";
 const UPDATE_STATE_KEY: &str = "updates.state.v1";
+const PLAYBOOK_RECENT_JOB_LIMIT: usize = 12;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoragePlan {
@@ -97,6 +101,249 @@ pub struct AuditEventRecord {
     pub status: String,
     pub summary: String,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyDecisionRecord {
+    pub decision: String,
+    pub reason: String,
+    pub matched_rule: String,
+    pub scope_kind: String,
+    pub risk_level: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobRecord {
+    pub id: String,
+    pub session_id: Option<String>,
+    pub parent_job_id: Option<String>,
+    pub template_id: Option<String>,
+    pub title: String,
+    pub purpose: String,
+    pub trigger_kind: String,
+    pub state: String,
+    pub requested_by: String,
+    pub prompt_excerpt: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobPatch {
+    pub state: Option<String>,
+    pub root_worker_id: Option<String>,
+    pub visible_turn_id: Option<String>,
+    pub result_summary: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerRecord {
+    pub id: String,
+    pub job_id: String,
+    pub parent_worker_id: Option<String>,
+    pub title: String,
+    pub lane: String,
+    pub state: String,
+    pub provider: String,
+    pub model: String,
+    pub provider_base_url: String,
+    pub provider_api_key: String,
+    pub provider_session_id: String,
+    pub working_dir: String,
+    pub read_roots: Vec<String>,
+    pub write_roots: Vec<String>,
+    pub max_steps: usize,
+    pub max_tool_calls: usize,
+    pub max_wall_clock_secs: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkerPatch {
+    pub state: Option<String>,
+    pub provider_session_id: Option<String>,
+    pub step_count: Option<usize>,
+    pub tool_call_count: Option<usize>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCapabilityGrantRecord {
+    pub tool_id: String,
+    pub summary: String,
+    pub approval_mode: String,
+    pub risk_level: String,
+    pub side_effect_level: String,
+    pub timeout_secs: u64,
+    pub max_output_bytes: usize,
+    pub supports_streaming: bool,
+    pub concurrency_group: String,
+    pub scope_kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCallRecord {
+    pub id: String,
+    pub job_id: String,
+    pub worker_id: String,
+    pub tool_id: String,
+    pub status: String,
+    pub summary: String,
+    pub args_json: serde_json::Value,
+    pub result_json: Option<serde_json::Value>,
+    pub policy_decision: Option<PolicyDecisionRecord>,
+    pub artifact_ids: Vec<String>,
+    pub error_class: String,
+    pub error_detail: String,
+    pub started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ToolCallPatch {
+    pub status: Option<String>,
+    pub summary: Option<String>,
+    pub result_json: Option<Option<serde_json::Value>>,
+    pub policy_decision: Option<Option<PolicyDecisionRecord>>,
+    pub artifact_ids: Option<Vec<String>>,
+    pub error_class: Option<String>,
+    pub error_detail: Option<String>,
+    pub started_at: Option<Option<i64>>,
+    pub completed_at: Option<Option<i64>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRequestRecord {
+    pub id: String,
+    pub job_id: String,
+    pub worker_id: String,
+    pub tool_call_id: String,
+    pub state: String,
+    pub risk_level: String,
+    pub summary: String,
+    pub detail: String,
+    pub diff_preview: String,
+    pub policy_decision: PolicyDecisionRecord,
+    pub resolution_note: String,
+    pub resolved_by: String,
+    pub resolved_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobArtifactRecord {
+    pub id: String,
+    pub job_id: String,
+    pub worker_id: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub command_session_id: Option<String>,
+    pub kind: String,
+    pub title: String,
+    pub path: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub preview_text: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobArtifactPatch {
+    pub kind: Option<String>,
+    pub title: Option<String>,
+    pub path: Option<String>,
+    pub mime_type: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub preview_text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaybookRecord {
+    pub id: String,
+    pub session_id: String,
+    pub title: String,
+    pub description: String,
+    pub prompt: String,
+    pub enabled: bool,
+    pub policy_bundle: String,
+    pub trigger_kind: String,
+    pub schedule_interval_secs: Option<u64>,
+    pub event_kind: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlaybookPatch {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub prompt: Option<String>,
+    pub session_id: Option<String>,
+    pub enabled: Option<bool>,
+    pub policy_bundle: Option<String>,
+    pub trigger_kind: Option<String>,
+    pub schedule_interval_secs: Option<Option<u64>>,
+    pub event_kind: Option<Option<String>>,
+    pub updated_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct StoredPlaybook {
+    id: String,
+    session_id: String,
+    title: String,
+    description: String,
+    prompt: String,
+    enabled: bool,
+    policy_bundle: String,
+    trigger_kind: String,
+    schedule_interval_secs: Option<u64>,
+    event_kind: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandSessionRecord {
+    pub id: String,
+    pub job_id: String,
+    pub worker_id: String,
+    pub tool_call_id: Option<String>,
+    pub mode: String,
+    pub title: String,
+    pub state: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub cwd: String,
+    pub env_json: serde_json::Value,
+    pub network_policy: String,
+    pub timeout_secs: u64,
+    pub output_limit_bytes: usize,
+    pub last_error: String,
+    pub exit_code: Option<i32>,
+    pub stdout_artifact_id: Option<String>,
+    pub stderr_artifact_id: Option<String>,
+    pub started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommandSessionPatch {
+    pub mode: Option<String>,
+    pub title: Option<String>,
+    pub state: Option<String>,
+    pub last_error: Option<String>,
+    pub exit_code: Option<Option<i32>>,
+    pub stdout_artifact_id: Option<Option<String>>,
+    pub stderr_artifact_id: Option<Option<String>>,
+    pub started_at: Option<Option<i64>>,
+    pub completed_at: Option<Option<i64>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobEventRecord {
+    pub job_id: String,
+    pub worker_id: Option<String>,
+    pub event_type: String,
+    pub status: String,
+    pub summary: String,
+    pub detail: String,
+    pub data_json: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,6 +478,10 @@ impl StateStore {
 
     pub fn artifacts_dir_path(&self) -> PathBuf {
         self.plan.artifacts_dir.clone()
+    }
+
+    pub fn playbooks_dir_path(&self) -> PathBuf {
+        self.plan.playbooks_dir.clone()
     }
 
     pub fn local_auth_token_path(&self) -> String {
@@ -596,6 +847,94 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn list_playbooks(&self) -> Result<Vec<PlaybookSummary>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_playbooks_with_connection(&connection, &self.plan.playbooks_dir)
+    }
+
+    pub fn get_playbook(&self, playbook_id: &str) -> Result<PlaybookDetail> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        load_playbook_detail(&connection, &self.plan.playbooks_dir, playbook_id)
+    }
+
+    pub fn create_playbook(&self, record: PlaybookRecord) -> Result<PlaybookDetail> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        ensure_session_exists(&connection, &record.session_id)?;
+        let stored = StoredPlaybook {
+            id: record.id,
+            session_id: record.session_id,
+            title: record.title,
+            description: record.description,
+            prompt: record.prompt,
+            enabled: record.enabled,
+            policy_bundle: record.policy_bundle,
+            trigger_kind: record.trigger_kind,
+            schedule_interval_secs: record.schedule_interval_secs,
+            event_kind: record.event_kind,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        };
+        write_playbook_file(&self.plan.playbooks_dir, &stored)?;
+        playbook_detail_from_stored(&connection, &stored)
+    }
+
+    pub fn update_playbook(
+        &self,
+        playbook_id: &str,
+        patch: PlaybookPatch,
+    ) -> Result<PlaybookDetail> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let mut stored = read_playbook_file(&self.plan.playbooks_dir, playbook_id)?;
+        if let Some(session_id) = patch.session_id {
+            ensure_session_exists(&connection, &session_id)?;
+            stored.session_id = session_id;
+        }
+        if let Some(title) = patch.title {
+            stored.title = title;
+        }
+        if let Some(description) = patch.description {
+            stored.description = description;
+        }
+        if let Some(prompt) = patch.prompt {
+            stored.prompt = prompt;
+        }
+        if let Some(enabled) = patch.enabled {
+            stored.enabled = enabled;
+        }
+        if let Some(policy_bundle) = patch.policy_bundle {
+            stored.policy_bundle = policy_bundle;
+        }
+        if let Some(trigger_kind) = patch.trigger_kind {
+            stored.trigger_kind = trigger_kind;
+        }
+        if let Some(schedule_interval_secs) = patch.schedule_interval_secs {
+            stored.schedule_interval_secs = schedule_interval_secs;
+        }
+        if let Some(event_kind) = patch.event_kind {
+            stored.event_kind = event_kind;
+        }
+        if let Some(updated_at) = patch.updated_at {
+            stored.updated_at = updated_at;
+        }
+        write_playbook_file(&self.plan.playbooks_dir, &stored)?;
+        playbook_detail_from_stored(&connection, &stored)
+    }
+
+    pub fn delete_playbook(&self, playbook_id: &str) -> Result<PlaybookDetail> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let detail = load_playbook_detail(&connection, &self.plan.playbooks_dir, playbook_id)?;
+        let deleted = connection.execute(
+            "DELETE FROM sessions WHERE id = ?1",
+            params![detail.session.id],
+        )?;
+        if deleted == 0 {
+            bail!("session '{}' was not found", detail.session.id);
+        }
+        fs::remove_file(playbook_file_path(&self.plan.playbooks_dir, playbook_id))
+            .with_context(|| format!("failed to delete playbook '{}'", playbook_id))?;
+        Ok(detail)
+    }
+
     pub fn append_session_turn(
         &self,
         session_id: &str,
@@ -692,6 +1031,735 @@ impl StateStore {
         let event_id = connection.last_insert_rowid();
         load_audit_event(&connection, event_id)
     }
+
+    pub fn list_jobs_for_session(&self, session_id: &str) -> Result<Vec<JobSummary>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_jobs_for_session_with_connection(&connection, session_id)
+    }
+
+    pub fn list_jobs_for_template(
+        &self,
+        template_id: &str,
+        limit: usize,
+    ) -> Result<Vec<JobSummary>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_jobs_for_template_with_connection(&connection, template_id, limit)
+    }
+
+    pub fn list_jobs_for_template_by_state(
+        &self,
+        template_id: &str,
+        states: &[&str],
+    ) -> Result<Vec<JobSummary>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_jobs_for_template_by_state_with_connection(&connection, template_id, states)
+    }
+
+    pub fn list_jobs_by_state(&self, states: &[&str]) -> Result<Vec<JobSummary>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_jobs_by_state_with_connection(&connection, states)
+    }
+
+    pub fn list_pending_approvals(&self) -> Result<Vec<ApprovalRequestSummary>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_pending_approvals_with_connection(&connection)
+    }
+
+    pub fn get_approval_request(&self, approval_id: &str) -> Result<ApprovalRequestSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        load_approval_request_summary(&connection, approval_id)
+    }
+
+    pub fn get_job(&self, job_id: &str) -> Result<JobDetail> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        load_job_detail(&connection, job_id)
+    }
+
+    pub fn list_command_sessions_by_state(
+        &self,
+        states: &[&str],
+    ) -> Result<Vec<CommandSessionSummary>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_command_sessions_by_state_with_connection(&connection, states)
+    }
+
+    pub fn get_command_session(&self, command_session_id: &str) -> Result<CommandSessionSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        load_command_session_summary(&connection, command_session_id)
+    }
+
+    pub fn get_job_artifact(&self, artifact_id: &str) -> Result<ArtifactSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        load_artifact_summary(&connection, artifact_id)
+    }
+
+    pub fn create_job(&self, record: JobRecord) -> Result<JobSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        if let Some(session_id) = record.session_id.as_deref() {
+            ensure_session_exists(&connection, session_id)?;
+        }
+        if let Some(parent_job_id) = record.parent_job_id.as_deref() {
+            ensure_job_exists(&connection, parent_job_id)?;
+        }
+
+        connection.execute(
+            "
+            INSERT INTO jobs (
+                id,
+                session_id,
+                parent_job_id,
+                template_id,
+                title,
+                purpose,
+                trigger_kind,
+                state,
+                requested_by,
+                prompt_excerpt
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ",
+            params![
+                record.id,
+                record.session_id,
+                record.parent_job_id,
+                record.template_id,
+                record.title,
+                record.purpose,
+                record.trigger_kind,
+                record.state,
+                record.requested_by,
+                record.prompt_excerpt,
+            ],
+        )?;
+
+        load_job_summary(&connection, &record.id)
+    }
+
+    pub fn update_job(&self, job_id: &str, patch: JobPatch) -> Result<JobSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let current = load_job_summary(&connection, job_id)?;
+        connection.execute(
+            "
+            UPDATE jobs
+            SET
+                state = ?2,
+                root_worker_id = ?3,
+                visible_turn_id = ?4,
+                result_summary = ?5,
+                last_error = ?6,
+                updated_at = unixepoch()
+            WHERE id = ?1
+            ",
+            params![
+                job_id,
+                patch.state.unwrap_or(current.state),
+                patch.root_worker_id.or(current.root_worker_id),
+                patch.visible_turn_id.or(current.visible_turn_id),
+                patch.result_summary.unwrap_or(current.result_summary),
+                patch.last_error.unwrap_or(current.last_error),
+            ],
+        )?;
+
+        load_job_summary(&connection, job_id)
+    }
+
+    pub fn create_worker(&self, record: WorkerRecord) -> Result<WorkerSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        ensure_job_exists(&connection, &record.job_id)?;
+        if let Some(parent_worker_id) = record.parent_worker_id.as_deref() {
+            ensure_worker_exists(&connection, parent_worker_id)?;
+        }
+        let read_roots_json =
+            serde_json::to_string(&record.read_roots).context("failed to serialize read roots")?;
+        let write_roots_json = serde_json::to_string(&record.write_roots)
+            .context("failed to serialize write roots")?;
+
+        connection.execute(
+            "
+            INSERT INTO job_workers (
+                id,
+                job_id,
+                parent_worker_id,
+                title,
+                lane,
+                state,
+                provider,
+                model,
+                provider_base_url,
+                provider_api_key,
+                provider_session_id,
+                working_dir,
+                read_roots_json,
+                write_roots_json,
+                max_steps,
+                max_tool_calls,
+                max_wall_clock_secs
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            ",
+            params![
+                record.id,
+                record.job_id,
+                record.parent_worker_id,
+                record.title,
+                record.lane,
+                record.state,
+                record.provider,
+                record.model,
+                record.provider_base_url,
+                record.provider_api_key,
+                record.provider_session_id,
+                record.working_dir,
+                read_roots_json,
+                write_roots_json,
+                record.max_steps as i64,
+                record.max_tool_calls as i64,
+                record.max_wall_clock_secs as i64,
+            ],
+        )?;
+
+        load_worker_summary(&connection, &record.id)
+    }
+
+    pub fn update_worker(&self, worker_id: &str, patch: WorkerPatch) -> Result<WorkerSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let current = load_worker_summary(&connection, worker_id)?;
+        connection.execute(
+            "
+            UPDATE job_workers
+            SET
+                state = ?2,
+                provider_session_id = ?3,
+                step_count = ?4,
+                tool_call_count = ?5,
+                last_error = ?6,
+                updated_at = unixepoch()
+            WHERE id = ?1
+            ",
+            params![
+                worker_id,
+                patch.state.unwrap_or(current.state),
+                patch
+                    .provider_session_id
+                    .unwrap_or(current.provider_session_id),
+                patch.step_count.unwrap_or(current.step_count) as i64,
+                patch.tool_call_count.unwrap_or(current.tool_call_count) as i64,
+                patch.last_error.unwrap_or(current.last_error),
+            ],
+        )?;
+
+        load_worker_summary(&connection, worker_id)
+    }
+
+    pub fn replace_tool_capability_grants(
+        &self,
+        worker_id: &str,
+        grants: &[ToolCapabilityGrantRecord],
+    ) -> Result<Vec<ToolCapabilitySummary>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        ensure_worker_exists(&connection, worker_id)?;
+        connection.execute(
+            "DELETE FROM tool_capability_grants WHERE worker_id = ?1",
+            params![worker_id],
+        )?;
+
+        for grant in grants {
+            connection.execute(
+                "
+                INSERT INTO tool_capability_grants (
+                    worker_id,
+                    tool_id,
+                    summary,
+                    approval_mode,
+                    risk_level,
+                    side_effect_level,
+                    timeout_secs,
+                    max_output_bytes,
+                    supports_streaming,
+                    concurrency_group,
+                    scope_kind
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                ",
+                params![
+                    worker_id,
+                    grant.tool_id,
+                    grant.summary,
+                    grant.approval_mode,
+                    grant.risk_level,
+                    grant.side_effect_level,
+                    grant.timeout_secs as i64,
+                    grant.max_output_bytes as i64,
+                    if grant.supports_streaming { 1 } else { 0 },
+                    grant.concurrency_group,
+                    grant.scope_kind,
+                ],
+            )?;
+        }
+
+        load_worker_capabilities(&connection, worker_id)
+    }
+
+    pub fn create_tool_call(&self, record: ToolCallRecord) -> Result<ToolCallSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        ensure_job_exists(&connection, &record.job_id)?;
+        ensure_worker_exists(&connection, &record.worker_id)?;
+        let args_json = serde_json::to_string(&record.args_json)
+            .context("failed to serialize tool call args")?;
+        let result_json = record
+            .result_json
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("failed to serialize tool call result")?;
+        let policy_decision_json = record
+            .policy_decision
+            .as_ref()
+            .map(policy_decision_to_json)
+            .transpose()?;
+        let artifact_ids_json = serde_json::to_string(&record.artifact_ids)
+            .context("failed to serialize tool call artifacts")?;
+
+        connection.execute(
+            "
+            INSERT INTO tool_calls (
+                id,
+                job_id,
+                worker_id,
+                tool_id,
+                status,
+                summary,
+                args_json,
+                result_json,
+                policy_decision_json,
+                artifact_ids_json,
+                error_class,
+                error_detail,
+                started_at,
+                completed_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            ",
+            params![
+                record.id,
+                record.job_id,
+                record.worker_id,
+                record.tool_id,
+                record.status,
+                record.summary,
+                args_json,
+                result_json,
+                policy_decision_json,
+                artifact_ids_json,
+                record.error_class,
+                record.error_detail,
+                record.started_at,
+                record.completed_at,
+            ],
+        )?;
+
+        load_tool_call_summary(&connection, &record.id)
+    }
+
+    pub fn update_tool_call(
+        &self,
+        tool_call_id: &str,
+        patch: ToolCallPatch,
+    ) -> Result<ToolCallSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let current = load_tool_call_summary(&connection, tool_call_id)?;
+        let next_result_json = match patch.result_json {
+            Some(Some(value)) => Some(
+                serde_json::to_string(&value).context("failed to serialize updated tool result")?,
+            ),
+            Some(None) => None,
+            None => current
+                .result_json
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .context("failed to serialize existing tool result")?,
+        };
+        let next_policy = match patch.policy_decision {
+            Some(Some(value)) => Some(policy_decision_to_json(&value)?),
+            Some(None) => None,
+            None => current
+                .policy_decision
+                .as_ref()
+                .map(policy_decision_summary_to_json)
+                .transpose()?,
+        };
+        let next_artifact_ids_json =
+            serde_json::to_string(&patch.artifact_ids.unwrap_or(current.artifact_ids))
+                .context("failed to serialize updated artifact ids")?;
+
+        connection.execute(
+            "
+            UPDATE tool_calls
+            SET
+                status = ?2,
+                summary = ?3,
+                result_json = ?4,
+                policy_decision_json = ?5,
+                artifact_ids_json = ?6,
+                error_class = ?7,
+                error_detail = ?8,
+                started_at = ?9,
+                completed_at = ?10
+            WHERE id = ?1
+            ",
+            params![
+                tool_call_id,
+                patch.status.unwrap_or(current.status),
+                patch.summary.unwrap_or(current.summary),
+                next_result_json,
+                next_policy,
+                next_artifact_ids_json,
+                patch.error_class.unwrap_or(current.error_class),
+                patch.error_detail.unwrap_or(current.error_detail),
+                patch.started_at.unwrap_or(current.started_at),
+                patch.completed_at.unwrap_or(current.completed_at),
+            ],
+        )?;
+
+        load_tool_call_summary(&connection, tool_call_id)
+    }
+
+    pub fn create_approval_request(
+        &self,
+        record: ApprovalRequestRecord,
+    ) -> Result<ApprovalRequestSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        ensure_job_exists(&connection, &record.job_id)?;
+        ensure_worker_exists(&connection, &record.worker_id)?;
+        ensure_tool_call_exists(&connection, &record.tool_call_id)?;
+        let policy_json = policy_decision_to_json(&record.policy_decision)?;
+        connection.execute(
+            "
+            INSERT INTO approval_requests (
+                id,
+                job_id,
+                worker_id,
+                tool_call_id,
+                state,
+                risk_level,
+                summary,
+                detail,
+                diff_preview,
+                policy_decision_json,
+                resolution_note,
+                resolved_by,
+                resolved_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            ",
+            params![
+                record.id,
+                record.job_id,
+                record.worker_id,
+                record.tool_call_id,
+                record.state,
+                record.risk_level,
+                record.summary,
+                record.detail,
+                record.diff_preview,
+                policy_json,
+                record.resolution_note,
+                record.resolved_by,
+                record.resolved_at,
+            ],
+        )?;
+
+        load_approval_request_summary(&connection, &record.id)
+    }
+
+    pub fn update_approval_request(
+        &self,
+        approval_id: &str,
+        state: &str,
+        resolution_note: Option<&str>,
+        resolved_by: Option<&str>,
+        resolved_at: Option<i64>,
+    ) -> Result<ApprovalRequestSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let current = load_approval_request_summary(&connection, approval_id)?;
+        connection.execute(
+            "
+            UPDATE approval_requests
+            SET
+                state = ?2,
+                resolution_note = ?3,
+                resolved_by = ?4,
+                resolved_at = ?5
+            WHERE id = ?1
+            ",
+            params![
+                approval_id,
+                state,
+                resolution_note.unwrap_or(&current.resolution_note),
+                resolved_by.unwrap_or(&current.resolved_by),
+                resolved_at.or(current.resolved_at),
+            ],
+        )?;
+
+        load_approval_request_summary(&connection, approval_id)
+    }
+
+    pub fn create_command_session(
+        &self,
+        record: CommandSessionRecord,
+    ) -> Result<CommandSessionSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        ensure_job_exists(&connection, &record.job_id)?;
+        ensure_worker_exists(&connection, &record.worker_id)?;
+        if let Some(tool_call_id) = record.tool_call_id.as_deref() {
+            ensure_tool_call_exists(&connection, tool_call_id)?;
+        }
+        let args_json =
+            serde_json::to_string(&record.args).context("failed to serialize command args")?;
+        let env_json = serde_json::to_string(&record.env_json)
+            .context("failed to serialize command environment")?;
+        connection.execute(
+            "
+            INSERT INTO command_sessions (
+                id,
+                job_id,
+                worker_id,
+                tool_call_id,
+                mode,
+                title,
+                state,
+                command,
+                args_json,
+                cwd,
+                env_json,
+                network_policy,
+                timeout_secs,
+                output_limit_bytes,
+                last_error,
+                exit_code,
+                stdout_artifact_id,
+                stderr_artifact_id,
+                started_at,
+                completed_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+            ",
+            params![
+                record.id,
+                record.job_id,
+                record.worker_id,
+                record.tool_call_id,
+                record.mode,
+                record.title,
+                record.state,
+                record.command,
+                args_json,
+                record.cwd,
+                env_json,
+                record.network_policy,
+                record.timeout_secs as i64,
+                record.output_limit_bytes as i64,
+                record.last_error,
+                record.exit_code,
+                record.stdout_artifact_id,
+                record.stderr_artifact_id,
+                record.started_at,
+                record.completed_at,
+            ],
+        )?;
+
+        load_command_session_summary(&connection, &record.id)
+    }
+
+    pub fn update_command_session(
+        &self,
+        command_session_id: &str,
+        patch: CommandSessionPatch,
+    ) -> Result<CommandSessionSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let current = load_command_session_summary(&connection, command_session_id)?;
+        connection.execute(
+            "
+            UPDATE command_sessions
+            SET
+                mode = ?2,
+                title = ?3,
+                state = ?4,
+                last_error = ?5,
+                exit_code = ?6,
+                stdout_artifact_id = ?7,
+                stderr_artifact_id = ?8,
+                started_at = ?9,
+                completed_at = ?10,
+                updated_at = unixepoch()
+            WHERE id = ?1
+            ",
+            params![
+                command_session_id,
+                patch.mode.unwrap_or(current.mode),
+                patch.title.unwrap_or(current.title),
+                patch.state.unwrap_or(current.state),
+                patch.last_error.unwrap_or(current.last_error),
+                patch.exit_code.unwrap_or(current.exit_code),
+                patch
+                    .stdout_artifact_id
+                    .unwrap_or(current.stdout_artifact_id),
+                patch
+                    .stderr_artifact_id
+                    .unwrap_or(current.stderr_artifact_id),
+                patch.started_at.unwrap_or(current.started_at),
+                patch.completed_at.unwrap_or(current.completed_at),
+            ],
+        )?;
+
+        load_command_session_summary(&connection, command_session_id)
+    }
+
+    pub fn create_job_artifact(&self, record: JobArtifactRecord) -> Result<ArtifactSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        ensure_job_exists(&connection, &record.job_id)?;
+        if let Some(worker_id) = record.worker_id.as_deref() {
+            ensure_worker_exists(&connection, worker_id)?;
+        }
+        if let Some(tool_call_id) = record.tool_call_id.as_deref() {
+            ensure_tool_call_exists(&connection, tool_call_id)?;
+        }
+        if let Some(command_session_id) = record.command_session_id.as_deref() {
+            ensure_command_session_exists(&connection, command_session_id)?;
+        }
+        connection.execute(
+            "
+            INSERT INTO job_artifacts (
+                id,
+                job_id,
+                worker_id,
+                tool_call_id,
+                command_session_id,
+                kind,
+                title,
+                path,
+                mime_type,
+                size_bytes,
+                preview_text
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ",
+            params![
+                record.id,
+                record.job_id,
+                record.worker_id,
+                record.tool_call_id,
+                record.command_session_id,
+                record.kind,
+                record.title,
+                record.path,
+                record.mime_type,
+                record.size_bytes as i64,
+                record.preview_text,
+            ],
+        )?;
+
+        load_artifact_summary(&connection, &record.id)
+    }
+
+    pub fn update_job_artifact(
+        &self,
+        artifact_id: &str,
+        patch: JobArtifactPatch,
+    ) -> Result<ArtifactSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let current = load_artifact_summary(&connection, artifact_id)?;
+        connection.execute(
+            "
+            UPDATE job_artifacts
+            SET
+                kind = ?2,
+                title = ?3,
+                path = ?4,
+                mime_type = ?5,
+                size_bytes = ?6,
+                preview_text = ?7
+            WHERE id = ?1
+            ",
+            params![
+                artifact_id,
+                patch.kind.unwrap_or(current.kind),
+                patch.title.unwrap_or(current.title),
+                patch.path.unwrap_or(current.path),
+                patch.mime_type.unwrap_or(current.mime_type),
+                patch.size_bytes.unwrap_or(current.size_bytes) as i64,
+                patch.preview_text.unwrap_or(current.preview_text),
+            ],
+        )?;
+
+        load_artifact_summary(&connection, artifact_id)
+    }
+
+    pub fn append_job_event(&self, record: JobEventRecord) -> Result<JobEvent> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        ensure_job_exists(&connection, &record.job_id)?;
+        if let Some(worker_id) = record.worker_id.as_deref() {
+            ensure_worker_exists(&connection, worker_id)?;
+        }
+        let data_json = serde_json::to_string(&record.data_json)
+            .context("failed to serialize job event data")?;
+        connection.execute(
+            "
+            INSERT INTO job_events (job_id, worker_id, event_type, status, summary, detail, data_json)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ",
+            params![
+                record.job_id,
+                record.worker_id,
+                record.event_type,
+                record.status,
+                record.summary,
+                record.detail,
+                data_json,
+            ],
+        )?;
+
+        let event_id = connection.last_insert_rowid();
+        load_job_event(&connection, event_id)
+    }
+
+    pub fn write_worker_checkpoint(
+        &self,
+        worker_id: &str,
+        checkpoint: &serde_json::Value,
+    ) -> Result<()> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        ensure_worker_exists(&connection, worker_id)?;
+        let checkpoint_json =
+            serde_json::to_string(checkpoint).context("failed to serialize worker checkpoint")?;
+        connection.execute(
+            "
+            INSERT INTO worker_checkpoints (worker_id, checkpoint_json, updated_at)
+            VALUES (?1, ?2, unixepoch())
+            ON CONFLICT(worker_id) DO UPDATE SET
+                checkpoint_json = excluded.checkpoint_json,
+                updated_at = unixepoch()
+            ",
+            params![worker_id, checkpoint_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn read_worker_checkpoint(&self, worker_id: &str) -> Result<Option<serde_json::Value>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        connection
+            .query_row(
+                "SELECT checkpoint_json FROM worker_checkpoints WHERE worker_id = ?1",
+                params![worker_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|payload| {
+                serde_json::from_str(&payload).context("failed to decode worker checkpoint")
+            })
+            .transpose()
+    }
 }
 
 fn default_state_dir() -> Result<PathBuf> {
@@ -780,6 +1848,195 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_session_turns_session_id_created_at
             ON session_turns(session_id, created_at, id);
+
+        CREATE TABLE IF NOT EXISTS jobs (
+            id TEXT PRIMARY KEY,
+            session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+            parent_job_id TEXT REFERENCES jobs(id) ON DELETE CASCADE,
+            template_id TEXT,
+            title TEXT NOT NULL,
+            purpose TEXT NOT NULL DEFAULT '',
+            trigger_kind TEXT NOT NULL DEFAULT 'session_prompt',
+            state TEXT NOT NULL,
+            requested_by TEXT NOT NULL DEFAULT 'user',
+            prompt_excerpt TEXT NOT NULL DEFAULT '',
+            root_worker_id TEXT,
+            visible_turn_id TEXT,
+            result_summary TEXT NOT NULL DEFAULT '',
+            last_error TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_jobs_session_id_created_at
+            ON jobs(session_id, created_at DESC, id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_jobs_parent_job_id_created_at
+            ON jobs(parent_job_id, created_at ASC, id ASC);
+
+        CREATE TABLE IF NOT EXISTS job_workers (
+            id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            parent_worker_id TEXT REFERENCES job_workers(id) ON DELETE SET NULL,
+            title TEXT NOT NULL,
+            lane TEXT NOT NULL DEFAULT 'utility',
+            state TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL DEFAULT '',
+            provider_base_url TEXT NOT NULL DEFAULT '',
+            provider_api_key TEXT NOT NULL DEFAULT '',
+            provider_session_id TEXT NOT NULL DEFAULT '',
+            working_dir TEXT NOT NULL,
+            read_roots_json TEXT NOT NULL DEFAULT '[]',
+            write_roots_json TEXT NOT NULL DEFAULT '[]',
+            max_steps INTEGER NOT NULL DEFAULT 12,
+            max_tool_calls INTEGER NOT NULL DEFAULT 24,
+            max_wall_clock_secs INTEGER NOT NULL DEFAULT 600,
+            step_count INTEGER NOT NULL DEFAULT 0,
+            tool_call_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_job_workers_job_id_created_at
+            ON job_workers(job_id, created_at ASC, id ASC);
+
+        CREATE TABLE IF NOT EXISTS tool_capability_grants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worker_id TEXT NOT NULL REFERENCES job_workers(id) ON DELETE CASCADE,
+            tool_id TEXT NOT NULL,
+            summary TEXT NOT NULL DEFAULT '',
+            approval_mode TEXT NOT NULL,
+            risk_level TEXT NOT NULL,
+            side_effect_level TEXT NOT NULL,
+            timeout_secs INTEGER NOT NULL DEFAULT 30,
+            max_output_bytes INTEGER NOT NULL DEFAULT 65536,
+            supports_streaming INTEGER NOT NULL DEFAULT 0,
+            concurrency_group TEXT NOT NULL DEFAULT '',
+            scope_kind TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_capability_grants_worker_tool
+            ON tool_capability_grants(worker_id, tool_id);
+
+        CREATE TABLE IF NOT EXISTS tool_calls (
+            id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            worker_id TEXT NOT NULL REFERENCES job_workers(id) ON DELETE CASCADE,
+            tool_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            summary TEXT NOT NULL DEFAULT '',
+            args_json TEXT NOT NULL,
+            result_json TEXT,
+            policy_decision_json TEXT,
+            artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+            error_class TEXT NOT NULL DEFAULT '',
+            error_detail TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            started_at INTEGER,
+            completed_at INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tool_calls_job_id_created_at
+            ON tool_calls(job_id, created_at ASC, id ASC);
+
+        CREATE INDEX IF NOT EXISTS idx_tool_calls_worker_id_created_at
+            ON tool_calls(worker_id, created_at ASC, id ASC);
+
+        CREATE TABLE IF NOT EXISTS approval_requests (
+            id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            worker_id TEXT NOT NULL REFERENCES job_workers(id) ON DELETE CASCADE,
+            tool_call_id TEXT NOT NULL REFERENCES tool_calls(id) ON DELETE CASCADE,
+            state TEXT NOT NULL,
+            risk_level TEXT NOT NULL,
+            summary TEXT NOT NULL DEFAULT '',
+            detail TEXT NOT NULL DEFAULT '',
+            diff_preview TEXT NOT NULL DEFAULT '',
+            policy_decision_json TEXT NOT NULL,
+            resolution_note TEXT NOT NULL DEFAULT '',
+            resolved_by TEXT NOT NULL DEFAULT '',
+            requested_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            resolved_at INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_approval_requests_job_id_requested_at
+            ON approval_requests(job_id, requested_at DESC, id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_approval_requests_state_requested_at
+            ON approval_requests(state, requested_at DESC, id DESC);
+
+        CREATE TABLE IF NOT EXISTS command_sessions (
+            id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            worker_id TEXT NOT NULL REFERENCES job_workers(id) ON DELETE CASCADE,
+            tool_call_id TEXT REFERENCES tool_calls(id) ON DELETE SET NULL,
+            mode TEXT NOT NULL DEFAULT 'oneshot',
+            title TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL,
+            command TEXT NOT NULL,
+            args_json TEXT NOT NULL DEFAULT '[]',
+            cwd TEXT NOT NULL,
+            env_json TEXT NOT NULL DEFAULT '{}',
+            network_policy TEXT NOT NULL DEFAULT 'inherit',
+            timeout_secs INTEGER NOT NULL DEFAULT 300,
+            output_limit_bytes INTEGER NOT NULL DEFAULT 131072,
+            last_error TEXT NOT NULL DEFAULT '',
+            exit_code INTEGER,
+            stdout_artifact_id TEXT REFERENCES job_artifacts(id) ON DELETE SET NULL,
+            stderr_artifact_id TEXT REFERENCES job_artifacts(id) ON DELETE SET NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_command_sessions_job_id_created_at
+            ON command_sessions(job_id, created_at ASC, id ASC);
+
+        CREATE INDEX IF NOT EXISTS idx_command_sessions_state_updated_at
+            ON command_sessions(state, updated_at DESC, id DESC);
+
+        CREATE TABLE IF NOT EXISTS job_artifacts (
+            id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            worker_id TEXT REFERENCES job_workers(id) ON DELETE SET NULL,
+            tool_call_id TEXT REFERENCES tool_calls(id) ON DELETE SET NULL,
+            command_session_id TEXT REFERENCES command_sessions(id) ON DELETE SET NULL,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            path TEXT NOT NULL,
+            mime_type TEXT NOT NULL DEFAULT 'text/plain',
+            size_bytes INTEGER NOT NULL DEFAULT 0,
+            preview_text TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_job_artifacts_job_id_created_at
+            ON job_artifacts(job_id, created_at ASC, id ASC);
+
+        CREATE TABLE IF NOT EXISTS job_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            worker_id TEXT REFERENCES job_workers(id) ON DELETE SET NULL,
+            event_type TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT '',
+            summary TEXT NOT NULL DEFAULT '',
+            detail TEXT NOT NULL DEFAULT '',
+            data_json TEXT NOT NULL DEFAULT '{}',
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_job_events_job_id_created_at
+            ON job_events(job_id, created_at ASC, id ASC);
+
+        CREATE TABLE IF NOT EXISTS worker_checkpoints (
+            worker_id TEXT PRIMARY KEY REFERENCES job_workers(id) ON DELETE CASCADE,
+            checkpoint_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
 
         CREATE TABLE IF NOT EXISTS session_projects (
             session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -961,6 +2218,12 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "session_turns",
         "images_json",
         "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column(
+        connection,
+        "job_artifacts",
+        "command_session_id",
+        "TEXT REFERENCES command_sessions(id) ON DELETE SET NULL",
     )?;
 
     Ok(())
@@ -1257,6 +2520,132 @@ fn table_columns(connection: &Connection, table: &str) -> Result<HashSet<String>
         .context("failed to inspect table columns")?;
 
     Ok(columns.into_iter().collect())
+}
+
+fn playbook_file_path(playbooks_dir: &Path, playbook_id: &str) -> PathBuf {
+    playbooks_dir.join(format!("{playbook_id}.json"))
+}
+
+fn read_playbook_file(playbooks_dir: &Path, playbook_id: &str) -> Result<StoredPlaybook> {
+    let path = playbook_file_path(playbooks_dir, playbook_id);
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read playbook '{}'", path.display()))?;
+    serde_json::from_str::<StoredPlaybook>(&content)
+        .with_context(|| format!("failed to decode playbook '{}'", path.display()))
+}
+
+fn write_playbook_file(playbooks_dir: &Path, playbook: &StoredPlaybook) -> Result<()> {
+    fs::create_dir_all(playbooks_dir).with_context(|| {
+        format!(
+            "failed to create playbook directory '{}'",
+            playbooks_dir.display()
+        )
+    })?;
+    let path = playbook_file_path(playbooks_dir, &playbook.id);
+    let encoded =
+        serde_json::to_string_pretty(playbook).context("failed to encode playbook JSON")?;
+    let temp_path = path.with_extension("json.tmp");
+    fs::write(&temp_path, encoded.as_bytes())
+        .with_context(|| format!("failed to write playbook '{}'", temp_path.display()))?;
+    fs::rename(&temp_path, &path)
+        .with_context(|| format!("failed to move playbook '{}' into place", path.display()))?;
+    Ok(())
+}
+
+fn list_playbooks_with_connection(
+    connection: &Connection,
+    playbooks_dir: &Path,
+) -> Result<Vec<PlaybookSummary>> {
+    if !playbooks_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut paths = fs::read_dir(playbooks_dir)
+        .with_context(|| format!("failed to read '{}'", playbooks_dir.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    let mut playbooks = paths
+        .into_iter()
+        .map(|path| {
+            let content = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read playbook '{}'", path.display()))?;
+            let stored = serde_json::from_str::<StoredPlaybook>(&content)
+                .with_context(|| format!("failed to decode playbook '{}'", path.display()))?;
+            playbook_summary_from_stored(connection, &stored)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    playbooks.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| right.created_at.cmp(&left.created_at))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(playbooks)
+}
+
+fn load_playbook_detail(
+    connection: &Connection,
+    playbooks_dir: &Path,
+    playbook_id: &str,
+) -> Result<PlaybookDetail> {
+    let stored = read_playbook_file(playbooks_dir, playbook_id)?;
+    playbook_detail_from_stored(connection, &stored)
+}
+
+fn playbook_detail_from_stored(
+    connection: &Connection,
+    stored: &StoredPlaybook,
+) -> Result<PlaybookDetail> {
+    Ok(PlaybookDetail {
+        playbook: playbook_summary_from_stored(connection, stored)?,
+        session: load_session_summary(connection, &stored.session_id)?,
+        prompt: stored.prompt.clone(),
+        recent_jobs: list_jobs_for_template_with_connection(
+            connection,
+            &stored.id,
+            PLAYBOOK_RECENT_JOB_LIMIT,
+        )?,
+    })
+}
+
+fn playbook_summary_from_stored(
+    connection: &Connection,
+    stored: &StoredPlaybook,
+) -> Result<PlaybookSummary> {
+    let session = load_session_summary(connection, &stored.session_id)?;
+    let recent_jobs = list_jobs_for_template_with_connection(connection, &stored.id, 1)?;
+    let latest = recent_jobs.first();
+    Ok(PlaybookSummary {
+        id: stored.id.clone(),
+        session_id: stored.session_id.clone(),
+        title: stored.title.clone(),
+        description: stored.description.clone(),
+        prompt_excerpt: excerpt(&stored.prompt, 160),
+        enabled: stored.enabled,
+        policy_bundle: stored.policy_bundle.clone(),
+        trigger_kind: stored.trigger_kind.clone(),
+        schedule_interval_secs: stored.schedule_interval_secs,
+        event_kind: stored.event_kind.clone(),
+        profile_id: session.profile_id,
+        profile_title: session.profile_title,
+        project_id: session.project_id,
+        project_title: session.project_title,
+        working_dir: session.working_dir,
+        job_count: count_jobs_for_template(connection, &stored.id)?,
+        last_job_id: latest.map(|job| job.id.clone()),
+        last_job_state: latest.map(|job| job.state.clone()).unwrap_or_default(),
+        last_run_at: latest.map(|job| job.created_at),
+        created_at: stored.created_at,
+        updated_at: stored.updated_at,
+    })
 }
 
 fn load_workspace_summary(connection: &Connection) -> Result<WorkspaceSummary> {
@@ -2081,6 +3470,7 @@ fn list_sessions_with_connection(connection: &Connection) -> Result<Vec<SessionS
         "
         SELECT id
         FROM sessions
+        WHERE scope != 'automation'
         ORDER BY updated_at DESC, created_at DESC, id DESC
         LIMIT 50
         ",
@@ -2277,6 +3667,10 @@ fn load_session_projects(
 }
 
 fn session_scope_from_projects(projects: &[SessionProjectSummary], stored_scope: &str) -> String {
+    if stored_scope == "automation" {
+        return "automation".to_string();
+    }
+
     if projects.is_empty() {
         if stored_scope.trim().is_empty() {
             "ad_hoc".to_string()
@@ -2335,6 +3729,785 @@ fn map_audit_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEvent> {
     })
 }
 
+fn list_jobs_for_session_with_connection(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<JobSummary>> {
+    ensure_session_exists(connection, session_id)?;
+    let mut statement = connection.prepare(
+        "
+        SELECT id
+        FROM jobs
+        WHERE session_id = ?1 AND parent_job_id IS NULL
+        ORDER BY created_at DESC, id DESC
+        ",
+    )?;
+    let rows = statement.query_map(params![session_id], |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load job ids")?
+        .into_iter()
+        .map(|job_id| load_job_summary(connection, &job_id))
+        .collect()
+}
+
+fn list_jobs_for_template_with_connection(
+    connection: &Connection,
+    template_id: &str,
+    limit: usize,
+) -> Result<Vec<JobSummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id
+        FROM jobs
+        WHERE template_id = ?1 AND parent_job_id IS NULL
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?2
+        ",
+    )?;
+    let rows = statement.query_map(params![template_id, limit as i64], |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load playbook job ids")?
+        .into_iter()
+        .map(|job_id| load_job_summary(connection, &job_id))
+        .collect()
+}
+
+fn list_jobs_for_template_by_state_with_connection(
+    connection: &Connection,
+    template_id: &str,
+    states: &[&str],
+) -> Result<Vec<JobSummary>> {
+    if states.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = (0..states.len())
+        .map(|index| format!("?{}", index + 2))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "
+        SELECT id
+        FROM jobs
+        WHERE template_id = ?1 AND parent_job_id IS NULL AND state IN ({placeholders})
+        ORDER BY created_at DESC, id DESC
+        "
+    );
+    let params = std::iter::once(template_id)
+        .chain(states.iter().copied())
+        .collect::<Vec<_>>();
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(rusqlite::params_from_iter(params), |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load playbook jobs by state")?
+        .into_iter()
+        .map(|job_id| load_job_summary(connection, &job_id))
+        .collect()
+}
+
+fn list_jobs_by_state_with_connection(
+    connection: &Connection,
+    states: &[&str],
+) -> Result<Vec<JobSummary>> {
+    if states.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = (0..states.len())
+        .map(|index| format!("?{}", index + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "
+        SELECT id
+        FROM jobs
+        WHERE state IN ({placeholders})
+        ORDER BY created_at ASC, id ASC
+        "
+    );
+    let params = rusqlite::params_from_iter(states.iter().copied());
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(params, |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load jobs by state")?
+        .into_iter()
+        .map(|job_id| load_job_summary(connection, &job_id))
+        .collect()
+}
+
+fn list_pending_approvals_with_connection(
+    connection: &Connection,
+) -> Result<Vec<ApprovalRequestSummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id
+        FROM approval_requests
+        WHERE state = 'pending'
+        ORDER BY requested_at DESC, id DESC
+        ",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load pending approval ids")?
+        .into_iter()
+        .map(|approval_id| load_approval_request_summary(connection, &approval_id))
+        .collect()
+}
+
+fn load_job_summary(connection: &Connection, job_id: &str) -> Result<JobSummary> {
+    let mut job = connection
+        .query_row(
+            "
+            SELECT
+                id,
+                session_id,
+                parent_job_id,
+                template_id,
+                title,
+                purpose,
+                trigger_kind,
+                state,
+                requested_by,
+                prompt_excerpt,
+                root_worker_id,
+                visible_turn_id,
+                result_summary,
+                last_error,
+                created_at,
+                updated_at
+            FROM jobs
+            WHERE id = ?1
+            ",
+            params![job_id],
+            map_job_summary_row,
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("job '{job_id}' was not found"))?;
+
+    job.worker_count = count_for_job(connection, "job_workers", job_id)?;
+    job.pending_approval_count = count_pending_approvals_for_job(connection, job_id)?;
+    job.artifact_count = count_for_job(connection, "job_artifacts", job_id)?;
+    Ok(job)
+}
+
+fn count_jobs_for_template(connection: &Connection, template_id: &str) -> Result<usize> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM jobs WHERE template_id = ?1 AND parent_job_id IS NULL",
+            params![template_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count.max(0) as usize)
+        .context("failed to count playbook jobs")
+}
+
+fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> {
+    Ok(JobSummary {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        parent_job_id: row.get(2)?,
+        template_id: row.get(3)?,
+        title: row.get(4)?,
+        purpose: row.get(5)?,
+        trigger_kind: row.get(6)?,
+        state: row.get(7)?,
+        requested_by: row.get(8)?,
+        prompt_excerpt: row.get(9)?,
+        root_worker_id: row.get(10)?,
+        visible_turn_id: row.get(11)?,
+        result_summary: row.get(12)?,
+        last_error: row.get(13)?,
+        worker_count: 0,
+        pending_approval_count: 0,
+        artifact_count: 0,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
+    })
+}
+
+fn count_for_job(connection: &Connection, table: &str, job_id: &str) -> Result<usize> {
+    connection
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE job_id = ?1"),
+            params![job_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count.max(0) as usize)
+        .context("failed to count job rows")
+}
+
+fn count_pending_approvals_for_job(connection: &Connection, job_id: &str) -> Result<usize> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM approval_requests WHERE job_id = ?1 AND state = 'pending'",
+            params![job_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count.max(0) as usize)
+        .context("failed to count pending approvals")
+}
+
+fn load_job_detail(connection: &Connection, job_id: &str) -> Result<JobDetail> {
+    let job = load_job_summary(connection, job_id)?;
+    let workers = load_workers_for_job(connection, job_id)?;
+    let child_jobs = load_child_jobs(connection, job_id)?;
+    let tool_calls = load_tool_calls_for_job(connection, job_id)?;
+    let approvals = load_approval_requests_for_job(connection, job_id)?;
+    let artifacts = load_artifacts_for_job(connection, job_id)?;
+    let command_sessions = load_command_sessions_for_job(connection, job_id)?;
+    let events = load_job_events_for_job(connection, job_id)?;
+
+    Ok(JobDetail {
+        job,
+        workers,
+        child_jobs,
+        tool_calls,
+        approvals,
+        artifacts,
+        command_sessions,
+        events,
+    })
+}
+
+fn load_child_jobs(connection: &Connection, parent_job_id: &str) -> Result<Vec<JobSummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id
+        FROM jobs
+        WHERE parent_job_id = ?1
+        ORDER BY created_at ASC, id ASC
+        ",
+    )?;
+    let rows = statement.query_map(params![parent_job_id], |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load child job ids")?
+        .into_iter()
+        .map(|job_id| load_job_summary(connection, &job_id))
+        .collect()
+}
+
+fn load_workers_for_job(connection: &Connection, job_id: &str) -> Result<Vec<WorkerSummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id
+        FROM job_workers
+        WHERE job_id = ?1
+        ORDER BY created_at ASC, id ASC
+        ",
+    )?;
+    let rows = statement.query_map(params![job_id], |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load worker ids")?
+        .into_iter()
+        .map(|worker_id| load_worker_summary(connection, &worker_id))
+        .collect()
+}
+
+fn load_worker_summary(connection: &Connection, worker_id: &str) -> Result<WorkerSummary> {
+    let mut worker = connection
+        .query_row(
+            "
+            SELECT
+                id,
+                job_id,
+                parent_worker_id,
+                title,
+                lane,
+                state,
+                provider,
+                model,
+                provider_base_url,
+                provider_api_key,
+                provider_session_id,
+                working_dir,
+                read_roots_json,
+                write_roots_json,
+                max_steps,
+                max_tool_calls,
+                max_wall_clock_secs,
+                step_count,
+                tool_call_count,
+                last_error,
+                created_at,
+                updated_at
+            FROM job_workers
+            WHERE id = ?1
+            ",
+            params![worker_id],
+            |row| {
+                Ok(WorkerSummary {
+                    id: row.get(0)?,
+                    job_id: row.get(1)?,
+                    parent_worker_id: row.get(2)?,
+                    title: row.get(3)?,
+                    lane: row.get(4)?,
+                    state: row.get(5)?,
+                    provider: row.get(6)?,
+                    model: row.get(7)?,
+                    provider_base_url: row.get(8)?,
+                    provider_api_key: row.get(9)?,
+                    provider_session_id: row.get(10)?,
+                    working_dir: row.get(11)?,
+                    read_roots: decode_string_list(row.get::<_, String>(12)?)?,
+                    write_roots: decode_string_list(row.get::<_, String>(13)?)?,
+                    max_steps: row.get::<_, i64>(14)?.max(0) as usize,
+                    max_tool_calls: row.get::<_, i64>(15)?.max(0) as usize,
+                    max_wall_clock_secs: row.get::<_, i64>(16)?.max(0) as u64,
+                    step_count: row.get::<_, i64>(17)?.max(0) as usize,
+                    tool_call_count: row.get::<_, i64>(18)?.max(0) as usize,
+                    last_error: row.get(19)?,
+                    capabilities: Vec::new(),
+                    created_at: row.get(20)?,
+                    updated_at: row.get(21)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("worker '{worker_id}' was not found"))?;
+    worker.capabilities = load_worker_capabilities(connection, worker_id)?;
+    Ok(worker)
+}
+
+fn load_worker_capabilities(
+    connection: &Connection,
+    worker_id: &str,
+) -> Result<Vec<ToolCapabilitySummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT
+            tool_id,
+            summary,
+            approval_mode,
+            risk_level,
+            side_effect_level,
+            timeout_secs,
+            max_output_bytes,
+            supports_streaming,
+            concurrency_group,
+            scope_kind
+        FROM tool_capability_grants
+        WHERE worker_id = ?1
+        ORDER BY tool_id ASC
+        ",
+    )?;
+    let rows = statement.query_map(params![worker_id], |row| {
+        Ok(ToolCapabilitySummary {
+            tool_id: row.get(0)?,
+            summary: row.get(1)?,
+            approval_mode: row.get(2)?,
+            risk_level: row.get(3)?,
+            side_effect_level: row.get(4)?,
+            timeout_secs: row.get::<_, i64>(5)?.max(0) as u64,
+            max_output_bytes: row.get::<_, i64>(6)?.max(0) as usize,
+            supports_streaming: row.get::<_, i64>(7)? != 0,
+            concurrency_group: row.get(8)?,
+            scope_kind: row.get(9)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load worker capabilities")
+}
+
+fn load_tool_calls_for_job(connection: &Connection, job_id: &str) -> Result<Vec<ToolCallSummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id
+        FROM tool_calls
+        WHERE job_id = ?1
+        ORDER BY created_at ASC, id ASC
+        ",
+    )?;
+    let rows = statement.query_map(params![job_id], |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load tool call ids")?
+        .into_iter()
+        .map(|call_id| load_tool_call_summary(connection, &call_id))
+        .collect()
+}
+
+fn load_tool_call_summary(connection: &Connection, tool_call_id: &str) -> Result<ToolCallSummary> {
+    connection
+        .query_row(
+            "
+            SELECT
+                id,
+                job_id,
+                worker_id,
+                tool_id,
+                status,
+                summary,
+                args_json,
+                result_json,
+                policy_decision_json,
+                artifact_ids_json,
+                error_class,
+                error_detail,
+                created_at,
+                started_at,
+                completed_at
+            FROM tool_calls
+            WHERE id = ?1
+            ",
+            params![tool_call_id],
+            |row| {
+                let result_json = row.get::<_, Option<String>>(7)?;
+                let policy_json = row.get::<_, Option<String>>(8)?;
+                Ok(ToolCallSummary {
+                    id: row.get(0)?,
+                    job_id: row.get(1)?,
+                    worker_id: row.get(2)?,
+                    tool_id: row.get(3)?,
+                    status: row.get(4)?,
+                    summary: row.get(5)?,
+                    args_json: decode_json_value(row.get::<_, String>(6)?)?,
+                    result_json: result_json.map(decode_json_value).transpose()?,
+                    policy_decision: policy_json.map(decode_policy_decision).transpose()?,
+                    artifact_ids: decode_string_list(row.get::<_, String>(9)?)?,
+                    error_class: row.get(10)?,
+                    error_detail: row.get(11)?,
+                    created_at: row.get(12)?,
+                    started_at: row.get(13)?,
+                    completed_at: row.get(14)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("tool call '{tool_call_id}' was not found"))
+}
+
+fn load_approval_requests_for_job(
+    connection: &Connection,
+    job_id: &str,
+) -> Result<Vec<ApprovalRequestSummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id
+        FROM approval_requests
+        WHERE job_id = ?1
+        ORDER BY requested_at DESC, id DESC
+        ",
+    )?;
+    let rows = statement.query_map(params![job_id], |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load approval ids")?
+        .into_iter()
+        .map(|approval_id| load_approval_request_summary(connection, &approval_id))
+        .collect()
+}
+
+fn load_approval_request_summary(
+    connection: &Connection,
+    approval_id: &str,
+) -> Result<ApprovalRequestSummary> {
+    connection
+        .query_row(
+            "
+            SELECT
+                id,
+                job_id,
+                worker_id,
+                tool_call_id,
+                state,
+                risk_level,
+                summary,
+                detail,
+                diff_preview,
+                policy_decision_json,
+                resolution_note,
+                resolved_by,
+                requested_at,
+                resolved_at
+            FROM approval_requests
+            WHERE id = ?1
+            ",
+            params![approval_id],
+            |row| {
+                Ok(ApprovalRequestSummary {
+                    id: row.get(0)?,
+                    job_id: row.get(1)?,
+                    worker_id: row.get(2)?,
+                    tool_call_id: row.get(3)?,
+                    state: row.get(4)?,
+                    risk_level: row.get(5)?,
+                    summary: row.get(6)?,
+                    detail: row.get(7)?,
+                    diff_preview: row.get(8)?,
+                    policy_decision: decode_policy_decision(row.get::<_, String>(9)?)?,
+                    resolution_note: row.get(10)?,
+                    resolved_by: row.get(11)?,
+                    requested_at: row.get(12)?,
+                    resolved_at: row.get(13)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("approval request '{approval_id}' was not found"))
+}
+
+fn load_artifacts_for_job(connection: &Connection, job_id: &str) -> Result<Vec<ArtifactSummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id
+        FROM job_artifacts
+        WHERE job_id = ?1
+        ORDER BY created_at ASC, id ASC
+        ",
+    )?;
+    let rows = statement.query_map(params![job_id], |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load artifact ids")?
+        .into_iter()
+        .map(|artifact_id| load_artifact_summary(connection, &artifact_id))
+        .collect()
+}
+
+fn load_artifact_summary(connection: &Connection, artifact_id: &str) -> Result<ArtifactSummary> {
+    connection
+        .query_row(
+            "
+            SELECT
+                id,
+                job_id,
+                worker_id,
+                tool_call_id,
+                command_session_id,
+                kind,
+                title,
+                path,
+                mime_type,
+                size_bytes,
+                preview_text,
+                created_at
+            FROM job_artifacts
+            WHERE id = ?1
+            ",
+            params![artifact_id],
+            |row| {
+                Ok(ArtifactSummary {
+                    id: row.get(0)?,
+                    job_id: row.get(1)?,
+                    worker_id: row.get(2)?,
+                    tool_call_id: row.get(3)?,
+                    command_session_id: row.get(4)?,
+                    kind: row.get(5)?,
+                    title: row.get(6)?,
+                    path: row.get(7)?,
+                    mime_type: row.get(8)?,
+                    size_bytes: row.get::<_, i64>(9)?.max(0) as u64,
+                    preview_text: row.get(10)?,
+                    created_at: row.get(11)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("artifact '{artifact_id}' was not found"))
+}
+
+fn load_command_sessions_for_job(
+    connection: &Connection,
+    job_id: &str,
+) -> Result<Vec<CommandSessionSummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id
+        FROM command_sessions
+        WHERE job_id = ?1
+        ORDER BY created_at ASC, id ASC
+        ",
+    )?;
+    let rows = statement.query_map(params![job_id], |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load command session ids")?
+        .into_iter()
+        .map(|command_session_id| load_command_session_summary(connection, &command_session_id))
+        .collect()
+}
+
+fn load_command_session_summary(
+    connection: &Connection,
+    command_session_id: &str,
+) -> Result<CommandSessionSummary> {
+    connection
+        .query_row(
+            "
+            SELECT
+                id,
+                job_id,
+                worker_id,
+                tool_call_id,
+                mode,
+                title,
+                state,
+                command,
+                args_json,
+                cwd,
+                network_policy,
+                timeout_secs,
+                output_limit_bytes,
+                last_error,
+                exit_code,
+                stdout_artifact_id,
+                stderr_artifact_id,
+                started_at,
+                completed_at,
+                created_at,
+                updated_at
+            FROM command_sessions
+            WHERE id = ?1
+            ",
+            params![command_session_id],
+            |row| {
+                Ok(CommandSessionSummary {
+                    id: row.get(0)?,
+                    job_id: row.get(1)?,
+                    worker_id: row.get(2)?,
+                    tool_call_id: row.get(3)?,
+                    mode: row.get(4)?,
+                    title: row.get(5)?,
+                    state: row.get(6)?,
+                    command: row.get(7)?,
+                    args: decode_string_list(row.get::<_, String>(8)?)?,
+                    cwd: row.get(9)?,
+                    network_policy: row.get(10)?,
+                    timeout_secs: row.get::<_, i64>(11)?.max(0) as u64,
+                    output_limit_bytes: row.get::<_, i64>(12)?.max(0) as usize,
+                    last_error: row.get(13)?,
+                    exit_code: row.get(14)?,
+                    stdout_artifact_id: row.get(15)?,
+                    stderr_artifact_id: row.get(16)?,
+                    started_at: row.get(17)?,
+                    completed_at: row.get(18)?,
+                    created_at: row.get(19)?,
+                    updated_at: row.get(20)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("command session '{command_session_id}' was not found"))
+}
+
+fn list_command_sessions_by_state_with_connection(
+    connection: &Connection,
+    states: &[&str],
+) -> Result<Vec<CommandSessionSummary>> {
+    if states.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = (0..states.len())
+        .map(|index| format!("?{}", index + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut statement = connection.prepare(&format!(
+        "
+        SELECT id
+        FROM command_sessions
+        WHERE state IN ({placeholders})
+        ORDER BY updated_at DESC, id DESC
+        "
+    ))?;
+    let rows = statement.query_map(rusqlite::params_from_iter(states.iter().copied()), |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load command sessions by state")?
+        .into_iter()
+        .map(|command_session_id| load_command_session_summary(connection, &command_session_id))
+        .collect()
+}
+
+fn load_job_events_for_job(connection: &Connection, job_id: &str) -> Result<Vec<JobEvent>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id, job_id, worker_id, event_type, status, summary, detail, data_json, created_at
+        FROM job_events
+        WHERE job_id = ?1
+        ORDER BY created_at ASC, id ASC
+        ",
+    )?;
+    let rows = statement.query_map(params![job_id], map_job_event)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load job events")
+}
+
+fn load_job_event(connection: &Connection, event_id: i64) -> Result<JobEvent> {
+    connection
+        .query_row(
+            "
+            SELECT id, job_id, worker_id, event_type, status, summary, detail, data_json, created_at
+            FROM job_events
+            WHERE id = ?1
+            ",
+            params![event_id],
+            map_job_event,
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("job event '{event_id}' was not found"))
+}
+
+fn map_job_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobEvent> {
+    Ok(JobEvent {
+        id: row.get(0)?,
+        job_id: row.get(1)?,
+        worker_id: row.get(2)?,
+        event_type: row.get(3)?,
+        status: row.get(4)?,
+        summary: row.get(5)?,
+        detail: row.get(6)?,
+        data_json: decode_json_value(row.get::<_, String>(7)?)?,
+        created_at: row.get(8)?,
+    })
+}
+
+fn decode_string_list(value: String) -> rusqlite::Result<Vec<String>> {
+    serde_json::from_str(&value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            value.len(),
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+fn decode_json_value(value: String) -> rusqlite::Result<serde_json::Value> {
+    serde_json::from_str(&value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            value.len(),
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+fn decode_policy_decision(value: String) -> rusqlite::Result<PolicyDecisionSummary> {
+    serde_json::from_str(&value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            value.len(),
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+fn policy_decision_to_json(record: &PolicyDecisionRecord) -> Result<String> {
+    serde_json::to_string(&PolicyDecisionSummary {
+        decision: record.decision.clone(),
+        reason: record.reason.clone(),
+        matched_rule: record.matched_rule.clone(),
+        scope_kind: record.scope_kind.clone(),
+        risk_level: record.risk_level.clone(),
+    })
+    .context("failed to serialize policy decision")
+}
+
+fn policy_decision_summary_to_json(summary: &PolicyDecisionSummary) -> Result<String> {
+    serde_json::to_string(summary).context("failed to serialize policy decision summary")
+}
+
 fn ensure_session_exists(connection: &Connection, session_id: &str) -> Result<()> {
     let found = connection
         .query_row(
@@ -2348,6 +4521,60 @@ fn ensure_session_exists(connection: &Connection, session_id: &str) -> Result<()
         bail!("session '{session_id}' was not found");
     }
 
+    Ok(())
+}
+
+fn ensure_job_exists(connection: &Connection, job_id: &str) -> Result<()> {
+    let found = connection
+        .query_row("SELECT 1 FROM jobs WHERE id = ?1", params![job_id], |row| {
+            row.get::<_, i64>(0)
+        })
+        .optional()?;
+    if found.is_none() {
+        bail!("job '{job_id}' was not found");
+    }
+    Ok(())
+}
+
+fn ensure_worker_exists(connection: &Connection, worker_id: &str) -> Result<()> {
+    let found = connection
+        .query_row(
+            "SELECT 1 FROM job_workers WHERE id = ?1",
+            params![worker_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if found.is_none() {
+        bail!("worker '{worker_id}' was not found");
+    }
+    Ok(())
+}
+
+fn ensure_tool_call_exists(connection: &Connection, tool_call_id: &str) -> Result<()> {
+    let found = connection
+        .query_row(
+            "SELECT 1 FROM tool_calls WHERE id = ?1",
+            params![tool_call_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if found.is_none() {
+        bail!("tool call '{tool_call_id}' was not found");
+    }
+    Ok(())
+}
+
+fn ensure_command_session_exists(connection: &Connection, command_session_id: &str) -> Result<()> {
+    let found = connection
+        .query_row(
+            "SELECT 1 FROM command_sessions WHERE id = ?1",
+            params![command_session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if found.is_none() {
+        bail!("command session '{command_session_id}' was not found");
+    }
     Ok(())
 }
 
@@ -2869,6 +5096,283 @@ mod tests {
     }
 
     #[test]
+    fn lists_only_root_jobs_for_a_session() {
+        let state_dir = test_state_dir("list-root-session-jobs");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let scratch_dir = store
+            .scratch_dir_for_session("session-jobs")
+            .expect("scratch dir should resolve");
+
+        store
+            .create_session(SessionRecord {
+                id: "session-jobs".to_string(),
+                profile_id: String::new(),
+                profile_title: String::new(),
+                route_id: String::new(),
+                route_title: String::new(),
+                scope: "ad_hoc".to_string(),
+                project_id: String::new(),
+                project_title: String::new(),
+                project_path: String::new(),
+                project_ids: Vec::new(),
+                title: "Session jobs".to_string(),
+                provider: "codex".to_string(),
+                model: "gpt-5.4".to_string(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                working_dir: scratch_dir,
+                working_dir_kind: "workspace_scratch".to_string(),
+            })
+            .expect("session should persist");
+
+        store
+            .create_job(JobRecord {
+                id: "root-job".to_string(),
+                session_id: Some("session-jobs".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Root job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "root".to_string(),
+            })
+            .expect("root job should persist");
+        store
+            .create_job(JobRecord {
+                id: "child-job".to_string(),
+                session_id: Some("session-jobs".to_string()),
+                parent_job_id: Some("root-job".to_string()),
+                template_id: None,
+                title: "Child job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "child_job".to_string(),
+                state: "completed".to_string(),
+                requested_by: "agent".to_string(),
+                prompt_excerpt: "child".to_string(),
+            })
+            .expect("child job should persist");
+
+        let jobs = store
+            .list_jobs_for_session("session-jobs")
+            .expect("session jobs should load");
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "root-job");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn excludes_automation_sessions_from_session_list() {
+        let state_dir = test_state_dir("automation-session-filter");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let visible_scratch = store
+            .scratch_dir_for_session("visible-session")
+            .expect("visible scratch dir should resolve");
+        let automation_scratch = store
+            .scratch_dir_for_session("automation-session")
+            .expect("automation scratch dir should resolve");
+
+        store
+            .create_session(test_session_record(
+                "visible-session",
+                "Visible session",
+                "ad_hoc",
+                visible_scratch,
+            ))
+            .expect("visible session should persist");
+        store
+            .create_session(test_session_record(
+                "automation-session",
+                "Automation session",
+                "automation",
+                automation_scratch,
+            ))
+            .expect("automation session should persist");
+
+        let sessions = store.list_sessions().expect("sessions should load");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "visible-session");
+        assert!(
+            sessions
+                .iter()
+                .all(|session| session.scope.as_str() != "automation")
+        );
+
+        let automation = store
+            .get_session("automation-session")
+            .expect("automation session should still be addressable");
+        assert_eq!(automation.session.scope, "automation");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn persists_playbooks_and_lists_jobs_by_template_state() {
+        let state_dir = test_state_dir("playbook-crud");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let working_dir = store
+            .scratch_dir_for_session("playbook-session")
+            .expect("playbook scratch dir should resolve");
+
+        store
+            .create_session(test_session_record(
+                "playbook-session",
+                "Playbook session",
+                "automation",
+                working_dir.clone(),
+            ))
+            .expect("playbook session should persist");
+
+        let created = store
+            .create_playbook(PlaybookRecord {
+                id: "playbook-1".to_string(),
+                session_id: "playbook-session".to_string(),
+                title: "Workspace Sync".to_string(),
+                description: "Refresh project metadata".to_string(),
+                prompt: "Inspect the workspace and summarize changes.".to_string(),
+                enabled: true,
+                policy_bundle: "command_runner".to_string(),
+                trigger_kind: "schedule".to_string(),
+                schedule_interval_secs: Some(900),
+                event_kind: None,
+                created_at: 100,
+                updated_at: 100,
+            })
+            .expect("playbook should persist");
+
+        assert_eq!(created.playbook.id, "playbook-1");
+        assert_eq!(created.playbook.job_count, 0);
+        assert_eq!(
+            store.playbooks_dir_path().join("playbook-1.json"),
+            playbook_file_path(&store.playbooks_dir_path(), "playbook-1")
+        );
+
+        let listed = store.list_playbooks().expect("playbooks should list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "playbook-1");
+        assert_eq!(listed[0].working_dir, working_dir);
+
+        let detail = store
+            .get_playbook("playbook-1")
+            .expect("playbook detail should load");
+        assert_eq!(
+            detail.prompt,
+            "Inspect the workspace and summarize changes."
+        );
+        assert_eq!(detail.session.scope, "automation");
+
+        let updated = store
+            .update_playbook(
+                "playbook-1",
+                PlaybookPatch {
+                    title: Some("Workspace sync and test".to_string()),
+                    prompt: Some("Run checks and summarize results.".to_string()),
+                    enabled: Some(false),
+                    trigger_kind: Some("event".to_string()),
+                    schedule_interval_secs: Some(None),
+                    event_kind: Some(Some("workspace_projects_synced".to_string())),
+                    updated_at: Some(200),
+                    ..PlaybookPatch::default()
+                },
+            )
+            .expect("playbook should update");
+        assert_eq!(updated.playbook.title, "Workspace sync and test");
+        assert_eq!(updated.playbook.enabled, false);
+        assert_eq!(updated.playbook.trigger_kind, "event");
+        assert_eq!(updated.playbook.schedule_interval_secs, None);
+        assert_eq!(
+            updated.playbook.event_kind.as_deref(),
+            Some("workspace_projects_synced")
+        );
+        assert_eq!(updated.prompt, "Run checks and summarize results.");
+
+        store
+            .create_job(JobRecord {
+                id: "playbook-job-b".to_string(),
+                session_id: Some("playbook-session".to_string()),
+                parent_job_id: None,
+                template_id: Some("playbook-1".to_string()),
+                title: "Playbook run".to_string(),
+                purpose: "automation".to_string(),
+                trigger_kind: "playbook_event".to_string(),
+                state: "running".to_string(),
+                requested_by: "system".to_string(),
+                prompt_excerpt: "summary".to_string(),
+            })
+            .expect("root playbook job should persist");
+        store
+            .create_job(JobRecord {
+                id: "playbook-job-a".to_string(),
+                session_id: Some("playbook-session".to_string()),
+                parent_job_id: None,
+                template_id: Some("playbook-1".to_string()),
+                title: "Playbook run complete".to_string(),
+                purpose: "automation".to_string(),
+                trigger_kind: "playbook_manual".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "summary".to_string(),
+            })
+            .expect("second root playbook job should persist");
+        store
+            .create_job(JobRecord {
+                id: "playbook-child".to_string(),
+                session_id: Some("playbook-session".to_string()),
+                parent_job_id: Some("playbook-job-a".to_string()),
+                template_id: Some("playbook-1".to_string()),
+                title: "Playbook child".to_string(),
+                purpose: "automation".to_string(),
+                trigger_kind: "child_job".to_string(),
+                state: "completed".to_string(),
+                requested_by: "agent".to_string(),
+                prompt_excerpt: "child".to_string(),
+            })
+            .expect("child job should persist");
+
+        let template_jobs = store
+            .list_jobs_for_template("playbook-1", 10)
+            .expect("template jobs should load");
+        assert_eq!(template_jobs.len(), 2);
+        assert!(
+            template_jobs
+                .iter()
+                .all(|job| job.parent_job_id.as_deref().is_none())
+        );
+
+        let running_jobs = store
+            .list_jobs_for_template_by_state("playbook-1", &["running"])
+            .expect("running playbook jobs should load");
+        assert_eq!(running_jobs.len(), 1);
+        assert_eq!(running_jobs[0].id, "playbook-job-b");
+
+        let with_jobs = store
+            .get_playbook("playbook-1")
+            .expect("playbook should reload with jobs");
+        assert_eq!(with_jobs.playbook.job_count, 2);
+        assert_eq!(with_jobs.recent_jobs.len(), 2);
+
+        let deleted = store
+            .delete_playbook("playbook-1")
+            .expect("playbook should delete");
+        assert_eq!(deleted.playbook.id, "playbook-1");
+        assert!(
+            store
+                .list_playbooks()
+                .expect("playbooks should reload")
+                .is_empty()
+        );
+        assert!(
+            store.get_session("playbook-session").is_err(),
+            "deleting a playbook should remove its hidden session"
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
     fn provisions_and_validates_local_auth_token() {
         let state_dir = test_state_dir("local-auth-token");
         let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
@@ -2977,5 +5481,32 @@ mod tests {
             .expect("time should be monotonic")
             .as_nanos();
         std::env::temp_dir().join(format!("nucleus-{label}-{}-{suffix}", std::process::id()))
+    }
+
+    fn test_session_record(
+        session_id: &str,
+        title: &str,
+        scope: &str,
+        working_dir: String,
+    ) -> SessionRecord {
+        SessionRecord {
+            id: session_id.to_string(),
+            title: title.to_string(),
+            profile_id: String::new(),
+            profile_title: String::new(),
+            route_id: String::new(),
+            route_title: String::new(),
+            scope: scope.to_string(),
+            project_id: String::new(),
+            project_title: String::new(),
+            project_path: String::new(),
+            project_ids: Vec::new(),
+            provider: "codex".to_string(),
+            model: "gpt-5.4".to_string(),
+            provider_base_url: String::new(),
+            provider_api_key: String::new(),
+            working_dir,
+            working_dir_kind: "workspace_scratch".to_string(),
+        }
     }
 }

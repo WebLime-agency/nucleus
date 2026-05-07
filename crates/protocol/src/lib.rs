@@ -100,6 +100,240 @@ pub struct SessionDetail {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PolicyDecisionSummary {
+    pub decision: String,
+    pub reason: String,
+    pub matched_rule: String,
+    pub scope_kind: String,
+    pub risk_level: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCapabilitySummary {
+    pub tool_id: String,
+    pub summary: String,
+    pub approval_mode: String,
+    pub risk_level: String,
+    pub side_effect_level: String,
+    pub timeout_secs: u64,
+    pub max_output_bytes: usize,
+    pub supports_streaming: bool,
+    pub concurrency_group: String,
+    pub scope_kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobSummary {
+    pub id: String,
+    pub session_id: Option<String>,
+    pub parent_job_id: Option<String>,
+    pub template_id: Option<String>,
+    pub title: String,
+    pub purpose: String,
+    pub trigger_kind: String,
+    pub state: String,
+    pub requested_by: String,
+    pub prompt_excerpt: String,
+    pub root_worker_id: Option<String>,
+    pub visible_turn_id: Option<String>,
+    pub result_summary: String,
+    pub last_error: String,
+    pub worker_count: usize,
+    pub pending_approval_count: usize,
+    pub artifact_count: usize,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerSummary {
+    pub id: String,
+    pub job_id: String,
+    pub parent_worker_id: Option<String>,
+    pub title: String,
+    pub lane: String,
+    pub state: String,
+    pub provider: String,
+    pub model: String,
+    #[serde(default)]
+    pub provider_base_url: String,
+    #[serde(default)]
+    pub provider_api_key: String,
+    #[serde(default)]
+    pub provider_session_id: String,
+    pub working_dir: String,
+    #[serde(default)]
+    pub read_roots: Vec<String>,
+    #[serde(default)]
+    pub write_roots: Vec<String>,
+    pub max_steps: usize,
+    pub max_tool_calls: usize,
+    pub max_wall_clock_secs: u64,
+    pub step_count: usize,
+    pub tool_call_count: usize,
+    #[serde(default)]
+    pub last_error: String,
+    #[serde(default)]
+    pub capabilities: Vec<ToolCapabilitySummary>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolCallSummary {
+    pub id: String,
+    pub job_id: String,
+    pub worker_id: String,
+    pub tool_id: String,
+    pub status: String,
+    #[serde(default)]
+    pub summary: String,
+    pub args_json: Value,
+    pub result_json: Option<Value>,
+    pub policy_decision: Option<PolicyDecisionSummary>,
+    #[serde(default)]
+    pub artifact_ids: Vec<String>,
+    #[serde(default)]
+    pub error_class: String,
+    #[serde(default)]
+    pub error_detail: String,
+    pub created_at: i64,
+    pub started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalRequestSummary {
+    pub id: String,
+    pub job_id: String,
+    pub worker_id: String,
+    pub tool_call_id: String,
+    pub state: String,
+    pub risk_level: String,
+    pub summary: String,
+    pub detail: String,
+    #[serde(default)]
+    pub diff_preview: String,
+    pub policy_decision: PolicyDecisionSummary,
+    #[serde(default)]
+    pub resolution_note: String,
+    #[serde(default)]
+    pub resolved_by: String,
+    pub requested_at: i64,
+    pub resolved_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactSummary {
+    pub id: String,
+    pub job_id: String,
+    pub worker_id: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub command_session_id: Option<String>,
+    pub kind: String,
+    pub title: String,
+    pub path: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub preview_text: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommandSessionSummary {
+    pub id: String,
+    pub job_id: String,
+    pub worker_id: String,
+    pub tool_call_id: Option<String>,
+    pub mode: String,
+    pub title: String,
+    pub state: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub cwd: String,
+    #[serde(default)]
+    pub network_policy: String,
+    pub timeout_secs: u64,
+    pub output_limit_bytes: usize,
+    #[serde(default)]
+    pub last_error: String,
+    pub exit_code: Option<i32>,
+    pub stdout_artifact_id: Option<String>,
+    pub stderr_artifact_id: Option<String>,
+    pub started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobEvent {
+    pub id: i64,
+    pub job_id: String,
+    pub worker_id: Option<String>,
+    pub event_type: String,
+    pub status: String,
+    pub summary: String,
+    pub detail: String,
+    pub data_json: Value,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobDetail {
+    pub job: JobSummary,
+    #[serde(default)]
+    pub workers: Vec<WorkerSummary>,
+    #[serde(default)]
+    pub child_jobs: Vec<JobSummary>,
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCallSummary>,
+    #[serde(default)]
+    pub approvals: Vec<ApprovalRequestSummary>,
+    #[serde(default)]
+    pub artifacts: Vec<ArtifactSummary>,
+    #[serde(default)]
+    pub command_sessions: Vec<CommandSessionSummary>,
+    #[serde(default)]
+    pub events: Vec<JobEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlaybookSummary {
+    pub id: String,
+    pub session_id: String,
+    pub title: String,
+    pub description: String,
+    pub prompt_excerpt: String,
+    pub enabled: bool,
+    pub policy_bundle: String,
+    pub trigger_kind: String,
+    pub schedule_interval_secs: Option<u64>,
+    pub event_kind: Option<String>,
+    pub profile_id: String,
+    pub profile_title: String,
+    pub project_id: String,
+    pub project_title: String,
+    pub working_dir: String,
+    pub job_count: usize,
+    pub last_job_id: Option<String>,
+    pub last_job_state: String,
+    pub last_run_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlaybookDetail {
+    pub playbook: PlaybookSummary,
+    pub session: SessionSummary,
+    pub prompt: String,
+    pub recent_jobs: Vec<JobSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PromptProgressUpdate {
     pub session_id: String,
     pub status: String,
@@ -149,6 +383,39 @@ pub struct SessionPromptRequest {
     pub prompt: String,
     #[serde(default)]
     pub images: Vec<SessionTurnImage>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalResolutionRequest {
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreatePlaybookRequest {
+    pub title: String,
+    pub description: Option<String>,
+    pub prompt: String,
+    pub profile_id: Option<String>,
+    pub project_id: Option<String>,
+    pub enabled: Option<bool>,
+    pub policy_bundle: String,
+    pub trigger_kind: String,
+    pub schedule_interval_secs: Option<u64>,
+    pub event_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdatePlaybookRequest {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub prompt: Option<String>,
+    pub profile_id: Option<String>,
+    pub project_id: Option<String>,
+    pub enabled: Option<bool>,
+    pub policy_bundle: Option<String>,
+    pub trigger_kind: Option<String>,
+    pub schedule_interval_secs: Option<Option<u64>>,
+    pub event_kind: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -503,6 +770,24 @@ pub enum DaemonEvent {
     OverviewUpdated(RuntimeOverview),
     #[serde(rename = "session.updated")]
     SessionUpdated(SessionDetail),
+    #[serde(rename = "job.created")]
+    JobCreated(JobSummary),
+    #[serde(rename = "job.updated")]
+    JobUpdated(JobSummary),
+    #[serde(rename = "worker.updated")]
+    WorkerUpdated(WorkerSummary),
+    #[serde(rename = "approval.requested")]
+    ApprovalRequested(ApprovalRequestSummary),
+    #[serde(rename = "approval.resolved")]
+    ApprovalResolved(ApprovalRequestSummary),
+    #[serde(rename = "artifact.added")]
+    ArtifactAdded(ArtifactSummary),
+    #[serde(rename = "command_session.updated")]
+    CommandSessionUpdated(CommandSessionSummary),
+    #[serde(rename = "job.completed")]
+    JobCompleted(JobSummary),
+    #[serde(rename = "job.failed")]
+    JobFailed(JobSummary),
     #[serde(rename = "prompt.progress")]
     PromptProgress(PromptProgressUpdate),
     #[serde(rename = "audit.updated")]
