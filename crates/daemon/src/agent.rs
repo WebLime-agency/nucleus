@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     sync::{Arc, Mutex as StdMutex},
 };
 
@@ -355,6 +355,7 @@ pub async fn start_text_prompt_job(
     payload: SessionPromptRequest,
     current: SessionDetail,
     execution_prompt: String,
+    compiler_role: String,
 ) -> Result<SessionDetail, ApiError> {
     if current.session.state == "paused" {
         return Err(ApiError::bad_request(
@@ -365,7 +366,7 @@ pub async fn start_text_prompt_job(
     let prompt_excerpt = excerpt(&execution_prompt, 160);
     let job_id = Uuid::new_v4().to_string();
     let root_worker_id = Uuid::new_v4().to_string();
-    let target = resolve_hidden_worker_target(&state, &current.session).await?;
+    let target = resolve_hidden_worker_target(&state, &current.session, &compiler_role).await?;
 
     state.store.update_session(
         &session_id,
@@ -400,8 +401,8 @@ pub async fn start_text_prompt_job(
         id: root_worker_id.clone(),
         job_id: job_id.clone(),
         parent_worker_id: None,
-        title: "Hidden utility worker".to_string(),
-        lane: "utility".to_string(),
+        title: format!("Hidden {compiler_role} worker"),
+        lane: compiler_role.clone(),
         state: "queued".to_string(),
         provider: target.provider.clone(),
         model: target.model.clone(),
@@ -2176,7 +2177,14 @@ async fn call_worker_model(
     let history_clone = history.clone();
     let handle = tokio::spawn(async move {
         runtimes
-            .execute_prompt_stream(&execution_clone, &history_clone, &prompt_body, &[], events)
+            .execute_prompt_stream(
+                &execution_clone,
+                &history_clone,
+                &prompt_body,
+                &[],
+                "utility",
+                events,
+            )
             .await
     });
 
@@ -4314,15 +4322,12 @@ async fn run_command_session_controller(
             status = child.wait() => {
                 match status {
                     Ok(status) => {
-                        exit_code = status.code();
-                        if final_state == "running" {
-                            if status.success() {
-                                final_state = "completed".to_string();
-                            } else {
-                                final_state = "failed".to_string();
-                                last_error = format_command_exit_error(status);
-                            }
-                        }
+                        apply_command_exit_status(
+                            &mut final_state,
+                            &mut last_error,
+                            &mut exit_code,
+                            status,
+                        );
                     }
                     Err(error) => {
                         final_state = "failed".to_string();
@@ -4349,7 +4354,26 @@ async fn run_command_session_controller(
                         if wait_for_output_ms > 0 {
                             tokio::time::sleep(Duration::from_millis(wait_for_output_ms)).await;
                         }
-                        let _ = reply.send(Ok(snapshot_live_command_output(&live_output)));
+                        let snapshot = snapshot_live_command_output(&live_output);
+                        let maybe_status = child.try_wait();
+                        let _ = reply.send(Ok(snapshot));
+                        match maybe_status {
+                            Ok(Some(status)) => {
+                                apply_command_exit_status(
+                                    &mut final_state,
+                                    &mut last_error,
+                                    &mut exit_code,
+                                    status,
+                                );
+                                break;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                final_state = "failed".to_string();
+                                last_error = error.to_string();
+                                break;
+                            }
+                        }
                     }
                     CommandControl::Write {
                         input,
@@ -4376,6 +4400,23 @@ async fn run_command_session_controller(
                         }
                         .await;
                         let _ = reply.send(result);
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                apply_command_exit_status(
+                                    &mut final_state,
+                                    &mut last_error,
+                                    &mut exit_code,
+                                    status,
+                                );
+                                break;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                final_state = "failed".to_string();
+                                last_error = error.to_string();
+                                break;
+                            }
+                        }
                     }
                     CommandControl::Close {
                         wait_for_exit_secs,
@@ -4641,6 +4682,25 @@ fn append_tail(target: &mut String, chunk: &str, limit: usize) {
         return;
     }
     *target = target.chars().skip(overflow).collect();
+}
+
+fn apply_command_exit_status(
+    final_state: &mut String,
+    last_error: &mut String,
+    exit_code: &mut Option<i32>,
+    status: ExitStatus,
+) {
+    *exit_code = status.code();
+    if final_state.as_str() != "running" {
+        return;
+    }
+
+    if status.success() {
+        *final_state = "completed".to_string();
+    } else {
+        *final_state = "failed".to_string();
+        *last_error = format_command_exit_error(status);
+    }
 }
 
 fn format_command_exit_error(status: std::process::ExitStatus) -> String {
@@ -5126,7 +5186,18 @@ async fn fail_job(state: &AppState, job_id: &str, error: &str) -> Result<()> {
 async fn resolve_hidden_worker_target(
     state: &AppState,
     session: &SessionSummary,
+    compiler_role: &str,
 ) -> Result<HiddenWorkerTarget, ApiError> {
+    if compiler_role == "main" {
+        ensure_prompting_runtime(state, &session.provider, false).await?;
+        return Ok(HiddenWorkerTarget {
+            provider: session.provider.clone(),
+            model: session.model.clone(),
+            provider_base_url: session.provider_base_url.clone(),
+            provider_api_key: session.provider_api_key.clone(),
+        });
+    }
+
     let workspace = state.store.workspace()?;
     let profile = resolve_hidden_worker_profile(&workspace, session);
 
@@ -5255,7 +5326,7 @@ async fn create_playbook_session(
         Some(profile_id) => resolve_workspace_profile(&workspace, profile_id)?,
         None => resolve_workspace_profile(&workspace, &workspace.default_profile_id)?,
     };
-    let target = resolve_workspace_profile_target(state, profile).await?;
+    let target = resolve_workspace_profile_target(state, profile, "main").await?;
     let projects =
         resolve_session_projects(state, project_id, project_id, None, Some(session_id), None)?;
 
@@ -5294,7 +5365,7 @@ async fn update_playbook_session(
         Some(profile_id) => resolve_workspace_profile(&workspace, profile_id)?,
         None => resolve_workspace_profile(&workspace, &workspace.default_profile_id)?,
     };
-    let target = resolve_workspace_profile_target(state, profile).await?;
+    let target = resolve_workspace_profile_target(state, profile, "main").await?;
     let projects = resolve_session_projects(
         state,
         project_id,
@@ -5485,7 +5556,7 @@ async fn queue_playbook_job(
     let prompt_excerpt = excerpt(&playbook.prompt, 160);
     let job_id = Uuid::new_v4().to_string();
     let root_worker_id = Uuid::new_v4().to_string();
-    let target = resolve_hidden_worker_target(state, &playbook.session).await?;
+    let target = resolve_hidden_worker_target(state, &playbook.session, "utility").await?;
 
     state.store.update_session(
         &session_id,
@@ -5847,7 +5918,7 @@ fn worker_system_prompt(worker: &WorkerSummary) -> String {
     };
 
     format!(
-        "You are the hidden Nucleus utility worker for a daemon-owned job.\n\
+        "You are the hidden Nucleus {} worker for a daemon-owned job.\n\
 Return exactly one JSON object and nothing else.\n\
 Allowed response shapes:\n\
 {}\n\
@@ -5862,7 +5933,7 @@ Rules:\n\
 Available tools:\n{}\n\
 Worker lane: {}\n\
 Working directory: {}\n",
-        action_shapes, child_job_rules, tool_help, worker.lane, worker.working_dir
+        worker.lane, action_shapes, child_job_rules, tool_help, worker.lane, worker.working_dir
     )
 }
 

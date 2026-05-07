@@ -314,7 +314,8 @@ export const updateSessionRequestSchema = z.object({
 
 export const sessionPromptRequestSchema = z.object({
   prompt: z.string().default(''),
-  images: z.array(sessionTurnImageSchema).default([])
+  images: z.array(sessionTurnImageSchema).default([]),
+  role: z.enum(['main', 'utility']).default('main')
 }).refine((value) => value.prompt.trim().length > 0 || value.images.length > 0, {
   message: 'A prompt or at least one image is required.'
 });
@@ -393,8 +394,8 @@ export const projectSummarySchema = z.object({
 export const workspaceModelConfigSchema = z.object({
   adapter: z.string().trim().min(1),
   model: z.string(),
-  base_url: z.string(),
-  api_key: z.string()
+  base_url: z.string().default(''),
+  api_key: z.string().default('')
 });
 
 export const workspaceProfileSummarySchema = z.object({
@@ -441,7 +442,38 @@ export const updateConfigRequestSchema = z.object({
 
 export const routeTargetSchema = z.object({
   provider: z.string(),
-  model: z.string()
+  model: z.string(),
+  base_url: z.string().default(''),
+  api_key: z.string().default('')
+});
+
+export const nucleusToolDescriptorSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  description: z.string(),
+  input_schema: z.unknown().default({}),
+  source: z.string()
+});
+
+export const skillManifestSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  description: z.string(),
+  activation_mode: z.string(),
+  triggers: z.array(z.string()).default([]),
+  include_paths: z.array(z.string()).default([]),
+  required_tools: z.array(z.string()).default([]),
+  required_mcps: z.array(z.string()).default([]),
+  project_filters: z.array(z.string()).default([]),
+  enabled: z.boolean()
+});
+
+export const mcpServerSummarySchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  enabled: z.boolean(),
+  tools: z.array(nucleusToolDescriptorSchema).default([]),
+  resources: z.array(z.string()).default([])
 });
 
 export const routerProfileSummarySchema = z.object({
@@ -748,6 +780,9 @@ export type WorkspaceModelConfig = z.infer<typeof workspaceModelConfigSchema>;
 export type WorkspaceProfileSummary = z.infer<typeof workspaceProfileSummarySchema>;
 export type RouterProfileSummary = z.infer<typeof routerProfileSummarySchema>;
 export type RouteTarget = z.infer<typeof routeTargetSchema>;
+export type NucleusToolDescriptor = z.infer<typeof nucleusToolDescriptorSchema>;
+export type SkillManifest = z.infer<typeof skillManifestSchema>;
+export type McpServerSummary = z.infer<typeof mcpServerSummarySchema>;
 export type SystemStats = z.infer<typeof systemStatsSchema>;
 export type ProcessListResponse = z.infer<typeof processListResponseSchema>;
 export type ProcessSnapshot = z.infer<typeof processSnapshotSchema>;
