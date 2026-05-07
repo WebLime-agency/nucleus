@@ -3449,7 +3449,7 @@ fn list_jobs_for_session_with_connection(
         "
         SELECT id
         FROM jobs
-        WHERE session_id = ?1
+        WHERE session_id = ?1 AND parent_job_id IS NULL
         ORDER BY created_at DESC, id DESC
         ",
     )?;
@@ -4732,6 +4732,75 @@ mod tests {
             "Hi there"
         );
         assert_eq!(session.session.last_message_excerpt, "Hi there");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn lists_only_root_jobs_for_a_session() {
+        let state_dir = test_state_dir("list-root-session-jobs");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let scratch_dir = store
+            .scratch_dir_for_session("session-jobs")
+            .expect("scratch dir should resolve");
+
+        store
+            .create_session(SessionRecord {
+                id: "session-jobs".to_string(),
+                profile_id: String::new(),
+                profile_title: String::new(),
+                route_id: String::new(),
+                route_title: String::new(),
+                scope: "ad_hoc".to_string(),
+                project_id: String::new(),
+                project_title: String::new(),
+                project_path: String::new(),
+                project_ids: Vec::new(),
+                title: "Session jobs".to_string(),
+                provider: "codex".to_string(),
+                model: "gpt-5.4".to_string(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                working_dir: scratch_dir,
+                working_dir_kind: "workspace_scratch".to_string(),
+            })
+            .expect("session should persist");
+
+        store
+            .create_job(JobRecord {
+                id: "root-job".to_string(),
+                session_id: Some("session-jobs".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Root job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "root".to_string(),
+            })
+            .expect("root job should persist");
+        store
+            .create_job(JobRecord {
+                id: "child-job".to_string(),
+                session_id: Some("session-jobs".to_string()),
+                parent_job_id: Some("root-job".to_string()),
+                template_id: None,
+                title: "Child job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "child_job".to_string(),
+                state: "completed".to_string(),
+                requested_by: "agent".to_string(),
+                prompt_excerpt: "child".to_string(),
+            })
+            .expect("child job should persist");
+
+        let jobs = store
+            .list_jobs_for_session("session-jobs")
+            .expect("session jobs should load");
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "root-job");
 
         let _ = fs::remove_dir_all(&state_dir);
     }
