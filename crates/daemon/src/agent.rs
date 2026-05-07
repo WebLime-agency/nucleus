@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex as StdMutex},
@@ -39,6 +39,10 @@ use crate::runtime::PromptStreamEvent;
 const JOB_MAX_STEPS: usize = 10;
 const JOB_MAX_TOOL_CALLS: usize = 20;
 const JOB_MAX_WALL_CLOCK_SECS: u64 = 300;
+const JOB_MAX_CHILDREN_PER_FANOUT: usize = 3;
+const CHILD_JOB_MAX_STEPS: usize = 6;
+const CHILD_JOB_MAX_TOOL_CALLS: usize = 12;
+const CHILD_JOB_POLL_INTERVAL_MS: u64 = 250;
 const TOOL_OUTPUT_CHAR_LIMIT: usize = 8_000;
 const READ_FILE_CHAR_LIMIT: usize = 12_000;
 const LIST_LIMIT: usize = 120;
@@ -86,9 +90,13 @@ struct CheckpointMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PendingToolAction {
+    #[serde(default)]
+    action_kind: String,
     tool_call_id: String,
     approval_id: Option<String>,
     command_session_id: Option<String>,
+    #[serde(default)]
+    child_job_ids: Vec<String>,
     summary: String,
     tool: String,
     args: Value,
@@ -103,10 +111,21 @@ enum WorkerAction {
         #[serde(default)]
         args: Value,
     },
+    SpawnChildJobs {
+        summary: String,
+        jobs: Vec<ChildJobProposal>,
+    },
     FinalAnswer {
         summary: String,
         final_answer: String,
     },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ChildJobProposal {
+    title: String,
+    prompt: String,
+    working_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -450,6 +469,19 @@ pub async fn start_text_prompt_job(
     Ok(state.store.get_session(&session_id)?)
 }
 
+fn collect_job_subtree_ids(state: &AppState, root_job_id: &str) -> Result<Vec<String>> {
+    let mut ordered = Vec::new();
+    let mut stack = vec![root_job_id.to_string()];
+    while let Some(job_id) = stack.pop() {
+        let detail = state.store.get_job(&job_id)?;
+        for child in detail.child_jobs.iter().rev() {
+            stack.push(child.id.clone());
+        }
+        ordered.push(job_id);
+    }
+    Ok(ordered)
+}
+
 pub async fn cancel_job(state: AppState, job_id: String) -> Result<JobDetail, ApiError> {
     let detail = state.store.get_job(&job_id)?;
     match detail.job.state.as_str() {
@@ -459,67 +491,85 @@ pub async fn cancel_job(state: AppState, job_id: String) -> Result<JobDetail, Ap
         _ => {}
     }
 
-    if let Some(sender) = state.agent.cancel_tokens.lock().await.get(&job_id).cloned() {
-        let _ = sender.send(true);
-    }
+    let subtree = collect_job_subtree_ids(&state, &job_id)?;
+    for child_job_id in subtree.iter().rev() {
+        let child_detail = state.store.get_job(child_job_id)?;
+        if let Some(sender) = state
+            .agent
+            .cancel_tokens
+            .lock()
+            .await
+            .get(child_job_id)
+            .cloned()
+        {
+            let _ = sender.send(true);
+        }
 
-    state.store.update_job(
-        &job_id,
-        JobPatch {
-            state: Some("canceled".to_string()),
-            last_error: Some(String::new()),
-            ..JobPatch::default()
-        },
-    )?;
-    for worker in detail.workers {
-        let _ = state.store.update_worker(
-            &worker.id,
-            WorkerPatch {
+        state.store.update_job(
+            child_job_id,
+            JobPatch {
                 state: Some("canceled".to_string()),
-                ..WorkerPatch::default()
+                last_error: Some(String::new()),
+                ..JobPatch::default()
             },
-        );
-    }
-    for approval in detail.approvals {
-        if approval.state == "pending" {
-            let _ = state.store.update_approval_request(
-                &approval.id,
-                "canceled",
-                Some("The job was canceled before this approval was resolved."),
-                Some("system"),
-                Some(unix_timestamp()),
+        )?;
+        for worker in child_detail.workers {
+            let _ = state.store.update_worker(
+                &worker.id,
+                WorkerPatch {
+                    state: Some("canceled".to_string()),
+                    ..WorkerPatch::default()
+                },
             );
         }
-    }
-    state
-        .agent
-        .terminate_job_command_sessions(
-            &job_id,
-            "The job was canceled before this command session finished.",
-            "canceled",
-        )
-        .await;
-    if let Some(session_id) = detail.job.session_id.as_deref() {
-        let _ = state.store.update_session(
-            session_id,
-            SessionPatch {
-                state: Some("active".to_string()),
-                ..SessionPatch::default()
-            },
-        );
-        if let Ok(session) = state.store.get_session(session_id) {
-            let _ = publish_session_event(&state, session).await;
+        for approval in child_detail.approvals {
+            if approval.state == "pending" {
+                let _ = state.store.update_approval_request(
+                    &approval.id,
+                    "canceled",
+                    Some("The job was canceled before this approval was resolved."),
+                    Some("system"),
+                    Some(unix_timestamp()),
+                );
+            }
+        }
+        state
+            .agent
+            .terminate_job_command_sessions(
+                child_job_id,
+                "The job was canceled before this command session finished.",
+                "canceled",
+            )
+            .await;
+        let _ = state.store.append_job_event(JobEventRecord {
+            job_id: child_job_id.clone(),
+            worker_id: None,
+            event_type: "job.canceled".to_string(),
+            status: "canceled".to_string(),
+            summary: "Canceled hidden worker job.".to_string(),
+            detail: "The daemon stopped the job before it finished.".to_string(),
+            data_json: json!({}),
+        });
+        publish_job_updated(&state, &state.store.get_job(child_job_id)?.job).await;
+        if let Some(parent_job_id) = child_detail.job.parent_job_id.as_deref() {
+            publish_job_updated(&state, &state.store.get_job(parent_job_id)?.job).await;
         }
     }
-    let _ = state.store.append_job_event(JobEventRecord {
-        job_id: job_id.clone(),
-        worker_id: None,
-        event_type: "job.canceled".to_string(),
-        status: "canceled".to_string(),
-        summary: "Canceled hidden worker job.".to_string(),
-        detail: "The daemon stopped the job before it finished.".to_string(),
-        data_json: json!({}),
-    });
+
+    if detail.job.parent_job_id.is_none() {
+        if let Some(session_id) = detail.job.session_id.as_deref() {
+            let _ = state.store.update_session(
+                session_id,
+                SessionPatch {
+                    state: Some("active".to_string()),
+                    ..SessionPatch::default()
+                },
+            );
+            if let Ok(session) = state.store.get_session(session_id) {
+                let _ = publish_session_event(&state, session).await;
+            }
+        }
+    }
     publish_job_updated(&state, &state.store.get_job(&job_id)?.job).await;
     let _ = publish_overview_event(&state).await;
     Ok(state.store.get_job(&job_id)?)
@@ -533,36 +583,49 @@ pub async fn resume_job(state: AppState, job_id: String) -> Result<JobDetail, Ap
         ));
     }
 
-    state.store.update_job(
-        &job_id,
-        JobPatch {
-            state: Some("queued".to_string()),
-            ..JobPatch::default()
-        },
-    )?;
-    for worker in detail.workers {
-        let _ = state.store.update_worker(
-            &worker.id,
-            WorkerPatch {
+    let subtree = collect_job_subtree_ids(&state, &job_id)?;
+    for child_job_id in subtree.iter().rev() {
+        let child_detail = state.store.get_job(child_job_id)?;
+        if child_detail.job.state != "paused" {
+            continue;
+        }
+        state.store.update_job(
+            child_job_id,
+            JobPatch {
                 state: Some("queued".to_string()),
-                ..WorkerPatch::default()
+                ..JobPatch::default()
             },
-        );
-    }
-    if let Some(session_id) = detail.job.session_id.as_deref() {
-        let _ = state.store.update_session(
-            session_id,
-            SessionPatch {
-                state: Some("running".to_string()),
-                last_error: Some(String::new()),
-                ..SessionPatch::default()
-            },
-        );
-        if let Ok(session) = state.store.get_session(session_id) {
-            let _ = publish_session_event(&state, session).await;
+        )?;
+        for worker in child_detail.workers {
+            let _ = state.store.update_worker(
+                &worker.id,
+                WorkerPatch {
+                    state: Some("queued".to_string()),
+                    ..WorkerPatch::default()
+                },
+            );
         }
     }
-    spawn_job_task(state.clone(), job_id.clone());
+    if detail.job.parent_job_id.is_none() {
+        if let Some(session_id) = detail.job.session_id.as_deref() {
+            let _ = state.store.update_session(
+                session_id,
+                SessionPatch {
+                    state: Some("running".to_string()),
+                    last_error: Some(String::new()),
+                    ..SessionPatch::default()
+                },
+            );
+            if let Ok(session) = state.store.get_session(session_id) {
+                let _ = publish_session_event(&state, session).await;
+            }
+        }
+    }
+    for child_job_id in subtree.iter().rev() {
+        if state.store.get_job(child_job_id)?.job.state == "queued" {
+            spawn_job_task(state.clone(), child_job_id.clone());
+        }
+    }
     Ok(state.store.get_job(&job_id)?)
 }
 
@@ -789,6 +852,9 @@ async fn run_job_loop(
         },
     )?;
     publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+    if let Some(parent_job_id) = detail.job.parent_job_id.as_deref() {
+        publish_job_updated(state, &state.store.get_job(parent_job_id)?.job).await;
+    }
     publish_worker_updated(state, &worker).await;
     publish_prompt_status(
         state,
@@ -875,99 +941,37 @@ async fn run_job_loop(
         }
 
         match response.action {
+            WorkerAction::SpawnChildJobs { summary, jobs } => {
+                if let LoopDisposition::Return = handle_child_job_proposal(
+                    state,
+                    &session,
+                    job_id,
+                    &mut worker,
+                    &mut checkpoint,
+                    &mut step,
+                    summary,
+                    jobs,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+            }
             WorkerAction::FinalAnswer {
                 summary,
                 final_answer,
             } => {
-                state
-                    .agent
-                    .terminate_job_command_sessions(
-                        job_id,
-                        "The job completed and closed any remaining daemon-owned command sessions.",
-                        "closed",
-                    )
-                    .await;
-                let final_turn_id = Uuid::new_v4().to_string();
-                state.store.append_session_turn(
-                    &session_id,
-                    &final_turn_id,
-                    "assistant",
-                    &final_answer,
-                    &[],
-                )?;
-                state.store.update_job(
+                complete_job_with_final_answer(
+                    state,
+                    &session,
                     job_id,
-                    JobPatch {
-                        state: Some("completed".to_string()),
-                        visible_turn_id: Some(final_turn_id),
-                        result_summary: Some(summary.clone()),
-                        last_error: Some(String::new()),
-                        ..JobPatch::default()
-                    },
-                )?;
-                worker = state.store.update_worker(
-                    &worker.id,
-                    WorkerPatch {
-                        state: Some("completed".to_string()),
-                        step_count: Some(step + 1),
-                        tool_call_count: Some(tool_calls),
-                        last_error: Some(String::new()),
-                        ..WorkerPatch::default()
-                    },
-                )?;
-                state.store.update_session(
-                    &session_id,
-                    SessionPatch {
-                        state: Some("active".to_string()),
-                        last_error: Some(String::new()),
-                        ..SessionPatch::default()
-                    },
-                )?;
-                let _ = state.store.append_job_event(JobEventRecord {
-                    job_id: job_id.to_string(),
-                    worker_id: Some(worker.id.clone()),
-                    event_type: "job.completed".to_string(),
-                    status: "completed".to_string(),
-                    summary: summary.clone(),
-                    detail: excerpt(&final_answer, 320),
-                    data_json: json!({ "step_count": step + 1, "tool_call_count": tool_calls }),
-                });
-                let _ = try_record_audit_event(
-                    state,
-                    AuditEventRecord {
-                        kind: "session.job.completed".to_string(),
-                        target: format!("job:{job_id}"),
-                        status: "success".to_string(),
-                        summary: format!(
-                            "Completed hidden worker job for session '{}'.",
-                            session.session.title
-                        ),
-                        detail: format!(
-                            "session_id={} provider={} model={} steps={} tool_calls={}",
-                            session_id,
-                            worker.provider,
-                            worker.model,
-                            step + 1,
-                            tool_calls
-                        ),
-                    },
+                    &mut worker,
+                    step + 1,
+                    tool_calls,
+                    &summary,
+                    &final_answer,
                 )
-                .await;
-                if let Ok(updated) = state.store.get_session(&session_id) {
-                    let _ = publish_session_event(state, updated).await;
-                }
-                publish_job_completed(state, &state.store.get_job(job_id)?.job).await;
-                publish_worker_updated(state, &worker).await;
-                publish_prompt_status(
-                    state,
-                    &session.session,
-                    &worker,
-                    "completed",
-                    "Hidden worker completed",
-                    "The daemon persisted a clean assistant turn from the worker result.",
-                )
-                .await;
-                let _ = publish_overview_event(state).await;
+                .await?;
                 return Ok(());
             }
             WorkerAction::ToolCall {
@@ -1016,6 +1020,65 @@ async fn handle_pending_action(
     let Some(pending) = checkpoint.pending_action.clone() else {
         return Ok(LoopDisposition::Continue);
     };
+
+    if is_pending_child_job_action(&pending) {
+        let child_details = pending
+            .child_job_ids
+            .iter()
+            .map(|child_job_id| state.store.get_job(child_job_id))
+            .collect::<Result<Vec<_>>>()?;
+        let all_complete = child_details.iter().all(|detail| {
+            matches!(
+                detail.job.state.as_str(),
+                "completed" | "failed" | "canceled"
+            )
+        });
+        if all_complete {
+            let results = child_details
+                .iter()
+                .map(child_job_result_json)
+                .collect::<Result<Vec<_>>>()?;
+            checkpoint.pending_action = None;
+            checkpoint.next_prompt =
+                Some(build_child_job_results_prompt(&pending.summary, &results));
+            state.store.write_worker_checkpoint(
+                &worker.id,
+                &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+            )?;
+            let completed_count = child_details
+                .iter()
+                .filter(|detail| detail.job.state == "completed")
+                .count();
+            let failed_count = child_details.len().saturating_sub(completed_count);
+            let _ = state.store.append_job_event(JobEventRecord {
+                job_id: job_id.to_string(),
+                worker_id: Some(worker.id.clone()),
+                event_type: "child.jobs.joined".to_string(),
+                status: "running".to_string(),
+                summary: format!("Joined {} child jobs", child_details.len()),
+                detail: format!(
+                    "{} child jobs completed and {} ended without success.",
+                    completed_count, failed_count
+                ),
+                data_json: json!({
+                    "child_job_ids": pending.child_job_ids,
+                }),
+            });
+            publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+            publish_worker_updated(state, worker).await;
+            return Ok(LoopDisposition::Continue);
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(CHILD_JOB_POLL_INTERVAL_MS)) => {}
+            changed = cancel_rx.changed() => {
+                if changed.is_ok() && *cancel_rx.borrow() {
+                    return Ok(LoopDisposition::Return);
+                }
+            }
+        }
+        return Ok(LoopDisposition::Continue);
+    }
 
     if let Some(approval_id) = pending.approval_id.as_deref() {
         let approval = state.store.get_approval_request(approval_id)?;
@@ -1254,9 +1317,11 @@ async fn handle_tool_call_proposal(
         })?;
 
         checkpoint.pending_action = Some(PendingToolAction {
+            action_kind: "tool".to_string(),
             tool_call_id: tool_call_id.clone(),
             approval_id: Some(approval.id.clone()),
             command_session_id: None,
+            child_job_ids: Vec::new(),
             summary: summary.clone(),
             tool: tool.clone(),
             args,
@@ -1359,9 +1424,11 @@ async fn handle_tool_call_proposal(
     .await;
 
     let pending = PendingToolAction {
+        action_kind: "tool".to_string(),
         tool_call_id,
         approval_id: None,
         command_session_id: None,
+        child_job_ids: Vec::new(),
         summary,
         tool,
         args,
@@ -1371,6 +1438,391 @@ async fn handle_tool_call_proposal(
     )
     .await?;
     Ok(LoopDisposition::Continue)
+}
+
+async fn handle_child_job_proposal(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &mut WorkerSummary,
+    checkpoint: &mut WorkerCheckpoint,
+    step: &mut usize,
+    summary: String,
+    jobs: Vec<ChildJobProposal>,
+) -> Result<LoopDisposition> {
+    if worker.parent_worker_id.is_some() {
+        bail!("only the root hidden worker may spawn child jobs");
+    }
+    if jobs.is_empty() {
+        bail!("spawn_child_jobs requires at least one child job");
+    }
+    if jobs.len() > JOB_MAX_CHILDREN_PER_FANOUT {
+        bail!(
+            "spawn_child_jobs supports at most {} child jobs per action",
+            JOB_MAX_CHILDREN_PER_FANOUT
+        );
+    }
+
+    let mut child_job_ids = Vec::with_capacity(jobs.len());
+    for proposal in jobs {
+        let child_job_id = create_child_job(state, session, job_id, worker, proposal).await?;
+        child_job_ids.push(child_job_id);
+    }
+
+    *step += 1;
+    *worker = state.store.update_worker(
+        &worker.id,
+        WorkerPatch {
+            step_count: Some(*step),
+            last_error: Some(String::new()),
+            ..WorkerPatch::default()
+        },
+    )?;
+    checkpoint.pending_action = Some(PendingToolAction {
+        action_kind: "child_jobs".to_string(),
+        tool_call_id: String::new(),
+        approval_id: None,
+        command_session_id: None,
+        child_job_ids: child_job_ids.clone(),
+        summary: summary.clone(),
+        tool: String::new(),
+        args: Value::Null,
+    });
+    state.store.write_worker_checkpoint(
+        &worker.id,
+        &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+    )?;
+
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: job_id.to_string(),
+        worker_id: Some(worker.id.clone()),
+        event_type: "child.jobs.spawned".to_string(),
+        status: "running".to_string(),
+        summary: format!("Spawned {} child jobs", child_job_ids.len()),
+        detail: summary.clone(),
+        data_json: json!({
+            "child_job_ids": child_job_ids,
+        }),
+    });
+    publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+    publish_worker_updated(state, worker).await;
+    publish_prompt_status(
+        state,
+        &session.session,
+        worker,
+        "running",
+        "Spawning child workers",
+        &summary,
+    )
+    .await;
+    Ok(LoopDisposition::Continue)
+}
+
+async fn create_child_job(
+    state: &AppState,
+    session: &SessionDetail,
+    parent_job_id: &str,
+    parent_worker: &WorkerSummary,
+    proposal: ChildJobProposal,
+) -> Result<String> {
+    let title = proposal.title.trim();
+    if title.is_empty() {
+        bail!("child job titles must not be empty");
+    }
+    let prompt = proposal.prompt.trim();
+    if prompt.is_empty() {
+        bail!("child job prompts must not be empty");
+    }
+    let working_dir = if let Some(value) = proposal.working_dir.as_deref() {
+        resolve_scoped_path_in_roots(
+            parent_worker,
+            value,
+            &parent_worker.read_roots,
+            false,
+            "read",
+        )?
+    } else {
+        PathBuf::from(&parent_worker.working_dir)
+    };
+    let read_roots = if proposal.working_dir.is_some() {
+        vec![working_dir.display().to_string()]
+    } else {
+        parent_worker.read_roots.clone()
+    };
+
+    let child_job_id = Uuid::new_v4().to_string();
+    let child_worker_id = Uuid::new_v4().to_string();
+    let child_job = state.store.create_job(JobRecord {
+        id: child_job_id.clone(),
+        session_id: Some(session.session.id.clone()),
+        parent_job_id: Some(parent_job_id.to_string()),
+        template_id: None,
+        title: format!("Child {}", title),
+        purpose: title.to_string(),
+        trigger_kind: "child_job".to_string(),
+        state: "queued".to_string(),
+        requested_by: "agent".to_string(),
+        prompt_excerpt: excerpt(prompt, 160),
+    })?;
+    state.store.create_worker(WorkerRecord {
+        id: child_worker_id.clone(),
+        job_id: child_job_id.clone(),
+        parent_worker_id: Some(parent_worker.id.clone()),
+        title: format!("Child utility worker: {}", title),
+        lane: "utility".to_string(),
+        state: "queued".to_string(),
+        provider: parent_worker.provider.clone(),
+        model: parent_worker.model.clone(),
+        provider_base_url: parent_worker.provider_base_url.clone(),
+        provider_api_key: parent_worker.provider_api_key.clone(),
+        provider_session_id: String::new(),
+        working_dir: working_dir.display().to_string(),
+        read_roots,
+        write_roots: Vec::new(),
+        max_steps: CHILD_JOB_MAX_STEPS,
+        max_tool_calls: CHILD_JOB_MAX_TOOL_CALLS,
+        max_wall_clock_secs: JOB_MAX_WALL_CLOCK_SECS,
+    })?;
+    state.store.update_job(
+        &child_job_id,
+        JobPatch {
+            root_worker_id: Some(child_worker_id.clone()),
+            ..JobPatch::default()
+        },
+    )?;
+    state
+        .store
+        .replace_tool_capability_grants(&child_worker_id, &child_worker_capabilities())?;
+    let child_worker = state
+        .store
+        .get_job(&child_job_id)?
+        .workers
+        .into_iter()
+        .find(|item| item.id == child_worker_id)
+        .ok_or_else(|| {
+            anyhow!(
+                "child worker '{}' was not found after creation",
+                child_worker_id
+            )
+        })?;
+
+    let checkpoint = WorkerCheckpoint {
+        session_id: session.session.id.clone(),
+        prompt_text: prompt.to_string(),
+        conversation: vec![CheckpointMessage {
+            role: "system".to_string(),
+            content: worker_system_prompt(&child_worker),
+        }],
+        next_prompt: None,
+        pending_action: None,
+    };
+    state.store.write_worker_checkpoint(
+        &child_worker.id,
+        &serde_json::to_value(checkpoint).context("failed to encode child worker checkpoint")?,
+    )?;
+
+    publish_job_created(state, &child_job).await;
+    publish_worker_updated(state, &child_worker).await;
+    publish_job_updated(state, &state.store.get_job(parent_job_id)?.job).await;
+    spawn_job_task(state.clone(), child_job_id.clone());
+    Ok(child_job_id)
+}
+
+fn build_child_job_results_prompt(summary: &str, results: &[Value]) -> String {
+    format!(
+        "Child job results are ready.\nReason for the fan-out: {}\nStructured results:\n{}\n\
+Decide the next single step. If the work is done, return final_answer.",
+        summary,
+        serde_json::to_string_pretty(results)
+            .unwrap_or_else(|_| Value::Array(results.to_vec()).to_string())
+    )
+}
+
+fn is_pending_child_job_action(pending: &PendingToolAction) -> bool {
+    pending.action_kind == "child_jobs" || !pending.child_job_ids.is_empty()
+}
+
+fn child_job_result_json(detail: &JobDetail) -> Result<Value> {
+    let report = detail
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == "child-report")
+        .map(|artifact| artifact.preview_text.clone())
+        .unwrap_or_default();
+    Ok(json!({
+        "job_id": detail.job.id,
+        "title": detail.job.title,
+        "state": detail.job.state,
+        "purpose": detail.job.purpose,
+        "result_summary": detail.job.result_summary,
+        "last_error": detail.job.last_error,
+        "worker_count": detail.job.worker_count,
+        "report": report,
+        "artifact_count": detail.job.artifact_count,
+        "command_session_count": detail.command_sessions.len(),
+        "tool_call_count": detail.tool_calls.len(),
+        "worker_notes": detail
+            .workers
+            .iter()
+            .map(|worker| json!({
+                "id": worker.id,
+                "title": worker.title,
+                "state": worker.state,
+                "working_dir": worker.working_dir,
+                "last_error": worker.last_error,
+            }))
+            .collect::<Vec<_>>(),
+        "events": detail
+            .events
+            .iter()
+            .rev()
+            .take(4)
+            .map(|event| json!({
+                "event_type": event.event_type,
+                "status": event.status,
+                "summary": event.summary,
+                "detail": event.detail,
+            }))
+            .collect::<Vec<_>>(),
+        "report_path": detail
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "child-report")
+            .map(|artifact| artifact.path.clone())
+            .unwrap_or_default(),
+    }))
+}
+
+async fn complete_job_with_final_answer(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &mut WorkerSummary,
+    step_count: usize,
+    tool_call_count: usize,
+    summary: &str,
+    final_answer: &str,
+) -> Result<()> {
+    let detail = state.store.get_job(job_id)?;
+    state
+        .agent
+        .terminate_job_command_sessions(
+            job_id,
+            "The job completed and closed any remaining daemon-owned command sessions.",
+            "closed",
+        )
+        .await;
+
+    let mut visible_turn_id = None;
+    let mut report_artifact = None;
+    if detail.job.parent_job_id.is_none() {
+        let final_turn_id = Uuid::new_v4().to_string();
+        state.store.append_session_turn(
+            &session.session.id,
+            &final_turn_id,
+            "assistant",
+            final_answer,
+            &[],
+        )?;
+        visible_turn_id = Some(final_turn_id);
+        state.store.update_session(
+            &session.session.id,
+            SessionPatch {
+                state: Some("active".to_string()),
+                last_error: Some(String::new()),
+                ..SessionPatch::default()
+            },
+        )?;
+    } else {
+        let artifact = write_job_artifact(
+            state,
+            job_id,
+            Some(&worker.id),
+            None,
+            text_artifact(
+                "child-report",
+                format!("{} report", detail.job.title),
+                "md",
+                "text/markdown",
+                final_answer.to_string(),
+            ),
+        )?;
+        report_artifact = Some(artifact);
+    }
+
+    state.store.update_job(
+        job_id,
+        JobPatch {
+            state: Some("completed".to_string()),
+            visible_turn_id,
+            result_summary: Some(summary.to_string()),
+            last_error: Some(String::new()),
+            ..JobPatch::default()
+        },
+    )?;
+    *worker = state.store.update_worker(
+        &worker.id,
+        WorkerPatch {
+            state: Some("completed".to_string()),
+            step_count: Some(step_count),
+            tool_call_count: Some(tool_call_count),
+            last_error: Some(String::new()),
+            ..WorkerPatch::default()
+        },
+    )?;
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: job_id.to_string(),
+        worker_id: Some(worker.id.clone()),
+        event_type: "job.completed".to_string(),
+        status: "completed".to_string(),
+        summary: summary.to_string(),
+        detail: excerpt(final_answer, 320),
+        data_json: json!({ "step_count": step_count, "tool_call_count": tool_call_count }),
+    });
+    let _ = try_record_audit_event(
+        state,
+        AuditEventRecord {
+            kind: "session.job.completed".to_string(),
+            target: format!("job:{job_id}"),
+            status: "success".to_string(),
+            summary: format!(
+                "Completed hidden worker job for session '{}'.",
+                session.session.title
+            ),
+            detail: format!(
+                "session_id={} provider={} model={} steps={} tool_calls={}",
+                session.session.id, worker.provider, worker.model, step_count, tool_call_count
+            ),
+        },
+    )
+    .await;
+
+    if detail.job.parent_job_id.is_none() {
+        if let Ok(updated) = state.store.get_session(&session.session.id) {
+            let _ = publish_session_event(state, updated).await;
+        }
+        publish_prompt_status(
+            state,
+            &session.session,
+            worker,
+            "completed",
+            "Hidden worker completed",
+            "The daemon persisted a clean assistant turn from the worker result.",
+        )
+        .await;
+    } else {
+        if let Some(artifact) = report_artifact.as_ref() {
+            publish_artifact_added(state, artifact).await;
+        }
+        if let Some(parent_job_id) = detail.job.parent_job_id.as_deref() {
+            publish_job_updated(state, &state.store.get_job(parent_job_id)?.job).await;
+        }
+    }
+
+    publish_job_completed(state, &state.store.get_job(job_id)?.job).await;
+    publish_worker_updated(state, worker).await;
+    let _ = publish_overview_event(state).await;
+    Ok(())
 }
 
 fn build_initial_step_prompt(
@@ -2993,6 +3445,9 @@ async fn start_command_session(
             Stdio::null()
         })
         .kill_on_drop(true);
+    if let Some(path) = command_path_env() {
+        command.env("PATH", path);
+    }
     for (key, value) in &spec.env {
         command.env(key, value);
     }
@@ -3958,8 +4413,12 @@ fn resolve_scoped_path(
 }
 
 async fn command_output(command: &str, args: &[&str]) -> Result<String> {
-    let output = Command::new(command)
-        .args(args)
+    let mut child = Command::new(command);
+    child.args(args);
+    if let Some(path) = command_path_env() {
+        child.env("PATH", path);
+    }
+    let output = child
         .output()
         .await
         .with_context(|| format!("failed to start '{}'", command))?;
@@ -4144,6 +4603,7 @@ fn limit_text(value: String, max_chars: usize) -> String {
 
 async fn fail_job(state: &AppState, job_id: &str, error: &str) -> Result<()> {
     let detail = state.store.get_job(job_id)?;
+    let is_root_job = detail.job.parent_job_id.is_none();
     state
         .agent
         .terminate_job_command_sessions(
@@ -4170,17 +4630,19 @@ async fn fail_job(state: &AppState, job_id: &str, error: &str) -> Result<()> {
             },
         );
     }
-    if let Some(session_id) = detail.job.session_id.as_deref() {
-        let _ = state.store.update_session(
-            session_id,
-            SessionPatch {
-                state: Some("error".to_string()),
-                last_error: Some(error.to_string()),
-                ..SessionPatch::default()
-            },
-        );
-        if let Ok(session) = state.store.get_session(session_id) {
-            let _ = publish_session_event(state, session).await;
+    if is_root_job {
+        if let Some(session_id) = detail.job.session_id.as_deref() {
+            let _ = state.store.update_session(
+                session_id,
+                SessionPatch {
+                    state: Some("error".to_string()),
+                    last_error: Some(error.to_string()),
+                    ..SessionPatch::default()
+                },
+            );
+            if let Ok(session) = state.store.get_session(session_id) {
+                let _ = publish_session_event(state, session).await;
+            }
         }
     }
     let _ = state.store.append_job_event(JobEventRecord {
@@ -4193,6 +4655,9 @@ async fn fail_job(state: &AppState, job_id: &str, error: &str) -> Result<()> {
         data_json: json!({ "error": error }),
     });
     publish_job_failed(state, &state.store.get_job(job_id)?.job).await;
+    if let Some(parent_job_id) = detail.job.parent_job_id.as_deref() {
+        publish_job_updated(state, &state.store.get_job(parent_job_id)?.job).await;
+    }
     let _ = publish_overview_event(state).await;
     Ok(())
 }
@@ -4259,6 +4724,10 @@ fn root_worker_capabilities() -> Vec<ToolCapabilityGrantRecord> {
     capabilities.extend(mutating_capabilities());
     capabilities.extend(execution_capabilities());
     capabilities
+}
+
+fn child_worker_capabilities() -> Vec<ToolCapabilityGrantRecord> {
+    read_only_capabilities()
 }
 
 fn read_only_capabilities() -> Vec<ToolCapabilityGrantRecord> {
@@ -4471,6 +4940,15 @@ fn execution_capabilities() -> Vec<ToolCapabilityGrantRecord> {
 }
 
 fn worker_system_prompt(worker: &WorkerSummary) -> String {
+    let is_root_worker = worker.parent_worker_id.is_none();
+    let action_shapes = if is_root_worker {
+        "{{\"kind\":\"tool_call\",\"summary\":\"why this tool is next\",\"tool\":\"tool.id\",\"args\":{{...}}}}\n\
+{{\"kind\":\"spawn_child_jobs\",\"summary\":\"why parallel exploration helps\",\"jobs\":[{{\"title\":\"focused subtask\",\"prompt\":\"precise child prompt\",\"working_dir\":\"optional/path/inside/scope\"}}]}}\n\
+{{\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\"}}"
+    } else {
+        "{{\"kind\":\"tool_call\",\"summary\":\"why this tool is next\",\"tool\":\"tool.id\",\"args\":{{...}}}}\n\
+{{\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\"}}"
+    };
     let tool_help = worker
         .capabilities
         .iter()
@@ -4485,25 +4963,65 @@ fn worker_system_prompt(worker: &WorkerSummary) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let child_job_rules = if is_root_worker {
+        "- Only root workers may fan out child jobs, and child jobs must stay read-only.\n\
+- Use at most 3 child jobs in a single spawn_child_jobs action.\n"
+    } else {
+        ""
+    };
 
     format!(
         "You are the hidden Nucleus utility worker for a daemon-owned job.\n\
 Return exactly one JSON object and nothing else.\n\
 Allowed response shapes:\n\
-{{\"kind\":\"tool_call\",\"summary\":\"why this tool is next\",\"tool\":\"tool.id\",\"args\":{{...}}}}\n\
-{{\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\"}}\n\
+{}\n\
 Rules:\n\
 - Prefer the smallest useful next step.\n\
 - Use tools only when they materially improve the answer.\n\
 - Never invent tool output.\n\
 - Stay inside the granted repo scope.\n\
+{}\
 - The visible chat will only receive final_answer, not your intermediate reasoning.\n\
 - Do not wrap JSON in markdown fences.\n\
 Available tools:\n{}\n\
 Worker lane: {}\n\
 Working directory: {}\n",
-        tool_help, worker.lane, worker.working_dir
+        action_shapes, child_job_rules, tool_help, worker.lane, worker.working_dir
     )
+}
+
+fn command_path_env() -> Option<std::ffi::OsString> {
+    const FALLBACK_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+
+    let mut paths = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    let current = env::var_os("PATH")
+        .filter(|value| !value.is_empty())
+        .or_else(|| Some(FALLBACK_PATH.into()));
+
+    if let Some(current) = current {
+        for path in env::split_paths(&current) {
+            if !path.as_os_str().is_empty() && seen.insert(path.clone()) {
+                paths.push(path);
+            }
+        }
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        for suffix in [".local/bin", ".cargo/bin", ".bun/bin", "bin"] {
+            let path = home.join(suffix);
+            if seen.insert(path.clone()) {
+                paths.push(path);
+            }
+        }
+    }
+
+    if paths.is_empty() {
+        return None;
+    }
+
+    env::join_paths(paths).ok()
 }
 
 async fn publish_job_created(state: &AppState, summary: &JobSummary) {
@@ -4646,6 +5164,46 @@ mod tests {
         );
         assert_eq!(policy_for_tool("command.session.write").decision, "allow");
         assert_eq!(policy_for_tool("fs.read_text").decision, "allow");
+    }
+
+    #[test]
+    fn worker_prompt_limits_child_job_fanout_to_root_workers() {
+        let root_worker = WorkerSummary {
+            id: "root".to_string(),
+            job_id: "job".to_string(),
+            parent_worker_id: None,
+            title: "Root worker".to_string(),
+            lane: "utility".to_string(),
+            state: "queued".to_string(),
+            provider: "test".to_string(),
+            model: "test".to_string(),
+            provider_base_url: String::new(),
+            provider_api_key: String::new(),
+            provider_session_id: String::new(),
+            working_dir: "/tmp".to_string(),
+            read_roots: vec!["/tmp".to_string()],
+            write_roots: vec!["/tmp".to_string()],
+            max_steps: 10,
+            max_tool_calls: 10,
+            max_wall_clock_secs: 30,
+            step_count: 0,
+            tool_call_count: 0,
+            last_error: String::new(),
+            capabilities: Vec::new(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let child_worker = WorkerSummary {
+            id: "child".to_string(),
+            parent_worker_id: Some("root".to_string()),
+            ..root_worker.clone()
+        };
+
+        let root_prompt = worker_system_prompt(&root_worker);
+        let child_prompt = worker_system_prompt(&child_worker);
+
+        assert!(root_prompt.contains("spawn_child_jobs"));
+        assert!(!child_prompt.contains("spawn_child_jobs"));
     }
 
     #[tokio::test]
