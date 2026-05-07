@@ -173,7 +173,20 @@ pub struct UpdateManager {
 
 impl UpdateManager {
     pub fn new(instance: InstanceRuntime, store: Arc<StateStore>) -> Self {
-        let initial = initial_status(&instance, &store.read_update_state().unwrap_or_default());
+        let stored = store.read_update_state().unwrap_or_default();
+        let initial = initial_status(&instance, &stored);
+        let mut reconciled = stored_state_from_status(&initial);
+        if reconciled.release_manifest_url.is_none() {
+            reconciled.release_manifest_url = stored.release_manifest_url.clone();
+        }
+        if initial.restart_required {
+            reconciled.pending_restart_release_id = stored.pending_restart_release_id.clone();
+        }
+        if reconciled != stored
+            && let Err(error) = store.write_update_state(&reconciled)
+        {
+            tracing::warn!(error = %error, "failed to reconcile persisted update state");
+        }
         Self {
             instance,
             store,
@@ -409,7 +422,12 @@ impl UpdateManager {
         let mut stored_state = stored_state_from_status(&next);
         if let Ok(existing) = self.store.read_update_state() {
             if stored_state.release_manifest_url.is_none() {
-                stored_state.release_manifest_url = existing.release_manifest_url;
+                stored_state.release_manifest_url = existing.release_manifest_url.clone();
+            }
+
+            if next.install_kind == INSTALL_KIND_MANAGED_RELEASE {
+                stored_state.pending_restart_release_id =
+                    next_pending_restart_release_id(&next, &existing);
             }
         }
 
@@ -869,6 +887,20 @@ fn initial_status(instance: &InstanceRuntime, stored: &StoredUpdateState) -> Upd
                 .unwrap_or_else(|| DEFAULT_RELEASE_CHANNEL.to_string()),
         )
     };
+    let current_ref = if instance.is_managed_release() {
+        instance
+            .install_root
+            .as_deref()
+            .and_then(|root| current_release_id(root).ok().flatten())
+    } else {
+        None
+    };
+    let restart_required = managed_restart_required_on_boot(
+        instance,
+        stored.restart_required,
+        current_ref.as_deref(),
+        stored.pending_restart_release_id.as_deref(),
+    );
 
     UpdateStatus {
         install_kind: instance.install_kind.clone(),
@@ -877,14 +909,7 @@ fn initial_status(instance: &InstanceRuntime, stored: &StoredUpdateState) -> Upd
         repo_root: instance
             .is_dev_checkout()
             .then(|| display_path(&instance.repo_root)),
-        current_ref: if instance.is_managed_release() {
-            instance
-                .install_root
-                .as_deref()
-                .and_then(|root| current_release_id(root).ok().flatten())
-        } else {
-            None
-        },
+        current_ref,
         remote_name: instance
             .is_dev_checkout()
             .then(|| DEFAULT_REMOTE_NAME.to_string()),
@@ -900,7 +925,7 @@ fn initial_status(instance: &InstanceRuntime, stored: &StoredUpdateState) -> Upd
         latest_release_id: stored.last_successful_target_release_id.clone(),
         update_available: stored.update_available,
         dirty_worktree: false,
-        restart_required: stored.restart_required,
+        restart_required,
         last_successful_check_at: stored.last_successful_check_at,
         last_attempted_check_at: stored.last_attempted_check_at,
         last_attempt_result: stored.last_attempt_result.clone(),
@@ -913,9 +938,32 @@ fn initial_status(instance: &InstanceRuntime, stored: &StoredUpdateState) -> Upd
         },
         message: initial_message(
             instance,
-            stored.restart_required,
+            restart_required,
             stored.release_manifest_url.as_deref(),
         ),
+    }
+}
+
+fn managed_restart_required_on_boot(
+    instance: &InstanceRuntime,
+    restart_required: bool,
+    current_ref: Option<&str>,
+    pending_restart_release_id: Option<&str>,
+) -> bool {
+    if !instance.is_managed_release() || !restart_required {
+        return restart_required;
+    }
+
+    match (
+        current_ref.and_then(non_empty),
+        pending_restart_release_id.and_then(non_empty),
+    ) {
+        (Some(current_ref), Some(pending_restart_release_id))
+            if current_ref == pending_restart_release_id =>
+        {
+            false
+        }
+        _ => true,
     }
 }
 
@@ -953,6 +1001,7 @@ fn record_unsupported_attempt(
 }
 
 fn clear_update_history_for_retarget(state: &mut StoredUpdateState) {
+    state.pending_restart_release_id = None;
     state.update_available = false;
     state.last_successful_check_at = None;
     state.last_successful_target_version = None;
@@ -970,6 +1019,7 @@ fn stored_state_from_status(status: &UpdateStatus) -> StoredUpdateState {
         tracked_channel: status.tracked_channel.clone(),
         tracked_ref: status.tracked_ref.clone(),
         release_manifest_url: None,
+        pending_restart_release_id: None,
         update_available: status.update_available,
         last_successful_check_at: status.last_successful_check_at,
         last_successful_target_version: status.latest_version.clone(),
@@ -981,6 +1031,20 @@ fn stored_state_from_status(status: &UpdateStatus) -> StoredUpdateState {
         latest_error_at: status.latest_error_at,
         restart_required: status.restart_required,
     }
+}
+
+fn next_pending_restart_release_id(
+    status: &UpdateStatus,
+    existing: &StoredUpdateState,
+) -> Option<String> {
+    if !status.restart_required && status.state != "restarting" {
+        return None;
+    }
+
+    existing
+        .pending_restart_release_id
+        .clone()
+        .or_else(|| status.latest_release_id.clone())
 }
 
 fn error_status(
@@ -1039,6 +1103,7 @@ async fn inspect_checkout(
                 tracked_channel: previous.tracked_channel.clone(),
                 tracked_ref: previous.tracked_ref.clone(),
                 release_manifest_url: None,
+                pending_restart_release_id: None,
                 update_available: previous.update_available,
                 last_successful_check_at: previous.last_successful_check_at,
                 last_successful_target_version: previous.latest_version.clone(),
@@ -1196,7 +1261,6 @@ async fn inspect_managed_release(
         .as_deref()
         .map(|current| current != selected.release.release_id)
         .unwrap_or(true);
-
     Ok(UpdateStatus {
         install_kind: instance.install_kind.clone(),
         tracked_channel: Some(tracked_channel.clone()),
@@ -1724,6 +1788,7 @@ mod tests {
                 tracked_channel: Some(DEFAULT_RELEASE_CHANNEL.to_string()),
                 tracked_ref: None,
                 release_manifest_url: Some(format!("file://{}", manifest_path.display())),
+                pending_restart_release_id: None,
                 update_available: false,
                 last_successful_check_at: None,
                 last_successful_target_version: None,
@@ -1749,7 +1814,7 @@ mod tests {
             managed_web_dist_dir: Some(current_release_web_dir(&install_root)),
             restart_mode: RestartMode::Unsupported,
         };
-        let manager = super::UpdateManager::new(instance, store.clone());
+        let manager = super::UpdateManager::new(instance.clone(), store.clone());
 
         let checked = manager.check().await;
         assert!(checked.status.update_available);
@@ -1782,18 +1847,63 @@ mod tests {
         );
         assert!(packaged_next.archive_path.is_file());
 
+        std::thread::sleep(Duration::from_secs(1));
+        let (newest_binary, newest_web) =
+            write_release_inputs(&root, "newest", "<html>newest</html>");
+        let packaged_newest = package_release_artifact(ReleasePackageInput {
+            release_id: "rel_newest".to_string(),
+            version: "0.3.0".to_string(),
+            channel: DEFAULT_RELEASE_CHANNEL.to_string(),
+            daemon_binary: newest_binary,
+            cli_binary: None,
+            web_dist_dir: newest_web,
+            output_dir: output_dir.clone(),
+            artifact_base_url: None,
+            manifest_path: Some(manifest_path.clone()),
+            target: Some(current_platform_target()),
+            minimum_client_version: None,
+            minimum_server_version: None,
+            capability_flags: Vec::new(),
+        })
+        .expect("newest package should succeed");
+        assert!(packaged_newest.archive_path.is_file());
+
         let post_apply = manager.check().await;
-        assert!(!post_apply.status.update_available);
+        assert!(post_apply.status.update_available);
         assert_eq!(post_apply.status.current_ref.as_deref(), Some("rel_next"));
+        assert_eq!(
+            post_apply.status.latest_release_id.as_deref(),
+            Some("rel_newest")
+        );
 
         let persisted = store
             .read_update_state()
             .expect("persisted update state should read");
         assert!(persisted.restart_required);
         assert_eq!(
-            persisted.last_successful_target_release_id.as_deref(),
+            persisted.pending_restart_release_id.as_deref(),
             Some("rel_next")
         );
+        assert_eq!(
+            persisted.last_successful_target_release_id.as_deref(),
+            Some("rel_newest")
+        );
+
+        let restarted = super::UpdateManager::new(instance, store.clone());
+        let restarted_status = restarted.current().await;
+        assert_eq!(restarted_status.current_ref.as_deref(), Some("rel_next"));
+        assert!(!restarted_status.restart_required, "{:?}", restarted_status);
+        assert!(restarted_status.update_available, "{:?}", restarted_status);
+        assert_eq!(
+            restarted_status.latest_release_id.as_deref(),
+            Some("rel_newest")
+        );
+
+        let reconciled = store
+            .read_update_state()
+            .expect("reconciled update state should read");
+        assert!(!reconciled.restart_required, "{:?}", reconciled);
+        assert_eq!(reconciled.pending_restart_release_id, None);
 
         let _ = fs::remove_dir_all(root);
     }
