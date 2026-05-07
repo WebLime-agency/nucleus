@@ -6,14 +6,16 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use nucleus_core::{AdapterKind, PRODUCT_SLUG};
+use nucleus_core::{
+    AdapterKind, DEFAULT_OPENAI_COMPATIBLE_BASE_URL, DEFAULT_OPENAI_COMPATIBLE_MODEL, PRODUCT_SLUG,
+};
 use nucleus_protocol::{
     ApprovalRequestSummary, ArtifactSummary, AuditEvent, CommandSessionSummary, JobDetail,
-    JobEvent, JobSummary, PlaybookDetail, PlaybookSummary, PolicyDecisionSummary, ProjectSummary,
-    RouteTarget, RouterProfileSummary, RuntimeSummary, SessionDetail, SessionProjectSummary,
-    SessionSummary, SessionTurn, SessionTurnImage, StorageSummary, ToolCallSummary,
-    ToolCapabilitySummary, WorkerSummary, WorkspaceModelConfig, WorkspaceProfileSummary,
-    WorkspaceSummary,
+    JobEvent, JobSummary, McpServerSummary, PlaybookDetail, PlaybookSummary, PolicyDecisionSummary,
+    ProjectSummary, RouteTarget, RouterProfileSummary, RuntimeSummary, SessionDetail,
+    SessionProjectSummary, SessionSummary, SessionTurn, SessionTurnImage, SkillManifest,
+    StorageSummary, ToolCallSummary, ToolCapabilitySummary, WorkerSummary, WorkspaceModelConfig,
+    WorkspaceProfileSummary, WorkspaceSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -464,6 +466,7 @@ impl StateStore {
         seed_workspace_settings(&connection)?;
         seed_workspace_profiles(&connection)?;
         migrate_legacy_workspace_targets(&connection)?;
+        migrate_seeded_cli_defaults_to_protocol(&connection)?;
         ensure_local_auth_token_with_connection(&plan, &connection)?;
         sync_projects_with_connection(&connection)?;
 
@@ -525,9 +528,10 @@ impl StateStore {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         let mut statement = connection.prepare(
             "SELECT id, summary, state FROM runtimes ORDER BY CASE id
-                WHEN 'claude' THEN 1
-                WHEN 'codex' THEN 2
-                WHEN 'system' THEN 3
+                WHEN 'openai_compatible' THEN 1
+                WHEN 'claude' THEN 2
+                WHEN 'codex' THEN 3
+                WHEN 'system' THEN 4
                 ELSE 100
              END, id",
         )?;
@@ -634,6 +638,78 @@ impl StateStore {
         delete_workspace_profile_with_connection(&connection, profile_id)?;
         ensure_workspace_default_profile(&connection)?;
         load_workspace_summary(&connection)
+    }
+
+    pub fn list_skill_manifests(&self) -> Result<Vec<SkillManifest>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_skill_manifests_with_connection(&connection)
+    }
+
+    pub fn upsert_skill_manifest(&self, manifest: &SkillManifest) -> Result<SkillManifest> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        connection.execute(
+            "
+            INSERT INTO skill_manifests (
+                id, title, description, activation_mode, triggers_json,
+                include_paths_json, required_tools_json, required_mcps_json,
+                project_filters_json, enabled
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                description = excluded.description,
+                activation_mode = excluded.activation_mode,
+                triggers_json = excluded.triggers_json,
+                include_paths_json = excluded.include_paths_json,
+                required_tools_json = excluded.required_tools_json,
+                required_mcps_json = excluded.required_mcps_json,
+                project_filters_json = excluded.project_filters_json,
+                enabled = excluded.enabled,
+                updated_at = unixepoch()
+            ",
+            params![
+                manifest.id,
+                manifest.title,
+                manifest.description,
+                manifest.activation_mode,
+                serde_json::to_string(&manifest.triggers)?,
+                serde_json::to_string(&manifest.include_paths)?,
+                serde_json::to_string(&manifest.required_tools)?,
+                serde_json::to_string(&manifest.required_mcps)?,
+                serde_json::to_string(&manifest.project_filters)?,
+                manifest.enabled as i64,
+            ],
+        )?;
+        load_skill_manifest(&connection, &manifest.id)
+    }
+
+    pub fn list_mcp_servers(&self) -> Result<Vec<McpServerSummary>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_mcp_servers_with_connection(&connection)
+    }
+
+    pub fn upsert_mcp_server(&self, server: &McpServerSummary) -> Result<McpServerSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        connection.execute(
+            "
+            INSERT INTO mcp_servers (id, title, enabled, tools_json, resources_json)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                enabled = excluded.enabled,
+                tools_json = excluded.tools_json,
+                resources_json = excluded.resources_json,
+                updated_at = unixepoch()
+            ",
+            params![
+                server.id,
+                server.title,
+                server.enabled as i64,
+                serde_json::to_string(&server.tools)?,
+                serde_json::to_string(&server.resources)?,
+            ],
+        )?;
+        load_mcp_server(&connection, &server.id)
     }
 
     pub fn sync_projects(&self) -> Result<WorkspaceSummary> {
@@ -1922,6 +1998,31 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_capability_grants_worker_tool
             ON tool_capability_grants(worker_id, tool_id);
 
+        CREATE TABLE IF NOT EXISTS skill_manifests (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            activation_mode TEXT NOT NULL DEFAULT 'manual',
+            triggers_json TEXT NOT NULL DEFAULT '[]',
+            include_paths_json TEXT NOT NULL DEFAULT '[]',
+            required_tools_json TEXT NOT NULL DEFAULT '[]',
+            required_mcps_json TEXT NOT NULL DEFAULT '[]',
+            project_filters_json TEXT NOT NULL DEFAULT '[]',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+
+        CREATE TABLE IF NOT EXISTS mcp_servers (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            tools_json TEXT NOT NULL DEFAULT '[]',
+            resources_json TEXT NOT NULL DEFAULT '[]',
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+
         CREATE TABLE IF NOT EXISTS tool_calls (
             id TEXT PRIMARY KEY,
             job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
@@ -2260,27 +2361,45 @@ fn seed_runtimes(connection: &Connection) -> Result<()> {
 fn seed_router_profiles(connection: &Connection) -> Result<()> {
     let profiles = [
         (
+            "local-openai",
+            "Local OpenAI-compatible",
+            "Default protocol route through the local OpenAI-compatible proxy.",
+            true,
+            json!([{
+                "provider": "openai_compatible",
+                "model": DEFAULT_OPENAI_COMPATIBLE_MODEL,
+                "base_url": DEFAULT_OPENAI_COMPATIBLE_BASE_URL,
+                "api_key": ""
+            }]),
+        ),
+        (
             "claude-sonnet",
             "Claude Sonnet",
-            "Direct Claude Sonnet route through the local Claude runtime.",
+            "Claude Sonnet route through a configured protocol backend.",
             true,
-            json!([{ "provider": "claude", "model": "sonnet" }]),
+            json!([{ "provider": "claude", "model": "sonnet", "base_url": "", "api_key": "" }]),
         ),
         (
             "codex-default",
             "Codex Default",
-            "Direct Codex route through the local Codex runtime default model.",
+            "Codex route through a configured protocol backend.",
             true,
-            json!([{ "provider": "codex", "model": "" }]),
+            json!([{ "provider": "codex", "model": "", "base_url": "", "api_key": "" }]),
         ),
         (
             "balanced",
             "Balanced",
-            "Prefer Claude Sonnet first, then fall back to Codex when needed.",
+            "Prefer the local OpenAI-compatible protocol route, with Claude/Codex reserved for future protocol backends.",
             true,
             json!([
-                { "provider": "claude", "model": "sonnet" },
-                { "provider": "codex", "model": "gpt-5.4" }
+                {
+                    "provider": "openai_compatible",
+                    "model": DEFAULT_OPENAI_COMPATIBLE_MODEL,
+                    "base_url": DEFAULT_OPENAI_COMPATIBLE_BASE_URL,
+                    "api_key": ""
+                },
+                { "provider": "claude", "model": "sonnet", "base_url": "", "api_key": "" },
+                { "provider": "codex", "model": "gpt-5.4", "base_url": "", "api_key": "" }
             ]),
         ),
     ];
@@ -2316,7 +2435,7 @@ fn seed_workspace_settings(connection: &Connection) -> Result<()> {
     connection.execute(
         "
         INSERT INTO app_settings (key, value)
-        VALUES ('workspace_main_target', 'route:balanced')
+        VALUES ('workspace_main_target', 'route:local-openai')
         ON CONFLICT(key) DO NOTHING
         ",
         [],
@@ -2324,7 +2443,7 @@ fn seed_workspace_settings(connection: &Connection) -> Result<()> {
     connection.execute(
         "
         INSERT INTO app_settings (key, value)
-        VALUES ('workspace_utility_target', 'route:codex-default')
+        VALUES ('workspace_utility_target', 'route:local-openai')
         ON CONFLICT(key) DO NOTHING
         ",
         [],
@@ -2342,54 +2461,30 @@ fn seed_workspace_settings(connection: &Connection) -> Result<()> {
 }
 
 fn seed_workspace_profiles(connection: &Connection) -> Result<()> {
+    let protocol_model = WorkspaceModelConfig {
+        adapter: "openai_compatible".to_string(),
+        model: DEFAULT_OPENAI_COMPATIBLE_MODEL.to_string(),
+        base_url: DEFAULT_OPENAI_COMPATIBLE_BASE_URL.to_string(),
+        api_key: String::new(),
+    };
     let profiles = [
         (
             "default",
             "Default",
-            WorkspaceModelConfig {
-                adapter: "claude".to_string(),
-                model: "sonnet".to_string(),
-                base_url: String::new(),
-                api_key: String::new(),
-            },
-            WorkspaceModelConfig {
-                adapter: "codex".to_string(),
-                model: String::new(),
-                base_url: String::new(),
-                api_key: String::new(),
-            },
+            protocol_model.clone(),
+            protocol_model.clone(),
         ),
         (
             "researcher",
             "Researcher",
-            WorkspaceModelConfig {
-                adapter: "claude".to_string(),
-                model: "sonnet".to_string(),
-                base_url: String::new(),
-                api_key: String::new(),
-            },
-            WorkspaceModelConfig {
-                adapter: "claude".to_string(),
-                model: "sonnet".to_string(),
-                base_url: String::new(),
-                api_key: String::new(),
-            },
+            protocol_model.clone(),
+            protocol_model.clone(),
         ),
         (
             "developer",
             "Developer",
-            WorkspaceModelConfig {
-                adapter: "codex".to_string(),
-                model: "gpt-5.4".to_string(),
-                base_url: String::new(),
-                api_key: String::new(),
-            },
-            WorkspaceModelConfig {
-                adapter: "codex".to_string(),
-                model: String::new(),
-                base_url: String::new(),
-                api_key: String::new(),
-            },
+            protocol_model.clone(),
+            protocol_model.clone(),
         ),
     ];
 
@@ -2450,6 +2545,87 @@ fn migrate_legacy_workspace_targets(connection: &Connection) -> Result<()> {
     set_setting_value(connection, "workspace_profiles_migrated", "1")?;
 
     Ok(())
+}
+
+fn migrate_seeded_cli_defaults_to_protocol(connection: &Connection) -> Result<()> {
+    let default_protocol_model = WorkspaceModelConfig {
+        adapter: "openai_compatible".to_string(),
+        model: DEFAULT_OPENAI_COMPATIBLE_MODEL.to_string(),
+        base_url: DEFAULT_OPENAI_COMPATIBLE_BASE_URL.to_string(),
+        api_key: String::new(),
+    };
+
+    for profile_id in ["default", "researcher", "developer"] {
+        let Ok(current) = load_workspace_profile_summary(connection, profile_id) else {
+            continue;
+        };
+        let next_main = if is_seeded_cli_model(&current.main)
+            || is_seeded_protocol_model_missing_transport(&current.main)
+        {
+            default_protocol_model.clone()
+        } else {
+            current.main.clone()
+        };
+        let next_utility = if is_seeded_cli_model(&current.utility)
+            || is_seeded_protocol_model_missing_transport(&current.utility)
+        {
+            default_protocol_model.clone()
+        } else {
+            current.utility.clone()
+        };
+
+        if next_main != current.main || next_utility != current.utility {
+            update_workspace_profile_with_connection(
+                connection,
+                profile_id,
+                &WorkspaceProfilePatch {
+                    title: current.title,
+                    main: next_main,
+                    utility: next_utility,
+                    is_default: current.is_default,
+                },
+            )?;
+        }
+    }
+
+    if setting_value_optional(connection, "workspace_main_target")?
+        .as_deref()
+        .is_some_and(is_seeded_cli_target)
+    {
+        set_workspace_main_target(connection, "route:local-openai")?;
+    }
+    if setting_value_optional(connection, "workspace_utility_target")?
+        .as_deref()
+        .is_some_and(is_seeded_cli_target)
+    {
+        set_workspace_utility_target(connection, "route:local-openai")?;
+    }
+
+    Ok(())
+}
+
+fn is_seeded_cli_model(config: &WorkspaceModelConfig) -> bool {
+    matches!(config.adapter.as_str(), "claude" | "codex")
+        && config.base_url.trim().is_empty()
+        && config.api_key.trim().is_empty()
+}
+
+fn is_seeded_protocol_model_missing_transport(config: &WorkspaceModelConfig) -> bool {
+    config.adapter == AdapterKind::OpenAiCompatible.as_str()
+        && config.model == DEFAULT_OPENAI_COMPATIBLE_MODEL
+        && config.base_url.trim().is_empty()
+        && config.api_key.trim().is_empty()
+}
+
+fn is_seeded_cli_target(value: &str) -> bool {
+    matches!(
+        value.trim(),
+        "route:balanced"
+            | "route:claude-sonnet"
+            | "route:codex-default"
+            | "provider:claude"
+            | "provider:codex"
+    )
 }
 
 fn ensure_local_auth_token_with_connection(
@@ -2950,18 +3126,23 @@ fn workspace_model_from_legacy_target(
         return Ok(WorkspaceModelConfig {
             adapter: target.provider,
             model: target.model,
-            base_url: String::new(),
-            api_key: String::new(),
+            base_url: target.base_url,
+            api_key: target.api_key,
         });
     }
 
     if let Some(provider) = value.strip_prefix("provider:").map(str::trim) {
+        let base_url = if provider == AdapterKind::OpenAiCompatible.as_str() {
+            DEFAULT_OPENAI_COMPATIBLE_BASE_URL.to_string()
+        } else {
+            String::new()
+        };
         return Ok(WorkspaceModelConfig {
             adapter: provider.to_string(),
             model: AdapterKind::parse(provider)
                 .map(|adapter| adapter.default_model().to_string())
                 .unwrap_or_default(),
-            base_url: String::new(),
+            base_url,
             api_key: String::new(),
         });
     }
@@ -3422,9 +3603,10 @@ fn list_router_profiles_with_connection(
         SELECT id, title, summary, enabled, targets_json
         FROM router_profiles
         ORDER BY CASE id
-            WHEN 'balanced' THEN 1
-            WHEN 'claude-sonnet' THEN 2
-            WHEN 'codex-default' THEN 3
+            WHEN 'local-openai' THEN 1
+            WHEN 'balanced' THEN 2
+            WHEN 'claude-sonnet' THEN 3
+            WHEN 'codex-default' THEN 4
             ELSE 100
         END, title ASC
         ",
@@ -3463,6 +3645,121 @@ fn map_router_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouterProfile
         enabled: row.get::<_, i64>(3)? != 0,
         state: "configured".to_string(),
         targets,
+    })
+}
+
+fn list_skill_manifests_with_connection(connection: &Connection) -> Result<Vec<SkillManifest>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id
+        FROM skill_manifests
+        ORDER BY enabled DESC, title COLLATE NOCASE, id
+        ",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let ids = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load skill manifest ids")?;
+    ids.into_iter()
+        .map(|id| load_skill_manifest(connection, &id))
+        .collect()
+}
+
+fn load_skill_manifest(connection: &Connection, id: &str) -> Result<SkillManifest> {
+    connection
+        .query_row(
+            "
+            SELECT
+                id, title, description, activation_mode, triggers_json,
+                include_paths_json, required_tools_json, required_mcps_json,
+                project_filters_json, enabled
+            FROM skill_manifests
+            WHERE id = ?1
+            ",
+            params![id],
+            map_skill_manifest,
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("skill manifest '{id}' was not found"))
+}
+
+fn map_skill_manifest(row: &rusqlite::Row<'_>) -> rusqlite::Result<SkillManifest> {
+    Ok(SkillManifest {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        description: row.get(2)?,
+        activation_mode: row.get(3)?,
+        triggers: decode_string_vec_column(row, 4)?,
+        include_paths: decode_string_vec_column(row, 5)?,
+        required_tools: decode_string_vec_column(row, 6)?,
+        required_mcps: decode_string_vec_column(row, 7)?,
+        project_filters: decode_string_vec_column(row, 8)?,
+        enabled: row.get::<_, i64>(9)? != 0,
+    })
+}
+
+fn list_mcp_servers_with_connection(connection: &Connection) -> Result<Vec<McpServerSummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id
+        FROM mcp_servers
+        ORDER BY enabled DESC, title COLLATE NOCASE, id
+        ",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let ids = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load MCP server ids")?;
+    ids.into_iter()
+        .map(|id| load_mcp_server(connection, &id))
+        .collect()
+}
+
+fn load_mcp_server(connection: &Connection, id: &str) -> Result<McpServerSummary> {
+    connection
+        .query_row(
+            "
+            SELECT id, title, enabled, tools_json, resources_json
+            FROM mcp_servers
+            WHERE id = ?1
+            ",
+            params![id],
+            map_mcp_server,
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("MCP server '{id}' was not found"))
+}
+
+fn map_mcp_server(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpServerSummary> {
+    let tools_json: String = row.get(3)?;
+    let resources_json: String = row.get(4)?;
+    let tools = serde_json::from_str(&tools_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let resources = serde_json::from_str(&resources_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+
+    Ok(McpServerSummary {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        enabled: row.get::<_, i64>(2)? != 0,
+        tools,
+        resources,
+    })
+}
+
+fn decode_string_vec_column(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Vec<String>> {
+    let value: String = row.get(index)?;
+    serde_json::from_str(&value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
     })
 }
 
@@ -4764,8 +5061,16 @@ mod tests {
         assert_eq!(workspace.profiles.len(), 3);
         assert_eq!(workspace.profiles[0].id, "default");
         assert!(workspace.profiles[0].is_default);
-        assert_eq!(workspace.profiles[0].main.adapter, "claude");
-        assert_eq!(workspace.profiles[0].utility.adapter, "codex");
+        assert_eq!(workspace.profiles[0].main.adapter, "openai_compatible");
+        assert_eq!(
+            workspace.profiles[0].main.model,
+            DEFAULT_OPENAI_COMPATIBLE_MODEL
+        );
+        assert_eq!(
+            workspace.profiles[0].main.base_url,
+            DEFAULT_OPENAI_COMPATIBLE_BASE_URL
+        );
+        assert_eq!(workspace.profiles[0].utility, workspace.profiles[0].main);
 
         let _ = fs::remove_dir_all(&state_dir);
     }

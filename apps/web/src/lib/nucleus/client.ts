@@ -12,6 +12,7 @@ import {
   createSessionRequestSchema,
   jobDetailSchema,
   jobSummarySchema,
+  mcpServerSummarySchema,
   playbookDetailSchema,
   playbookSummarySchema,
   processKillRequestSchema,
@@ -25,6 +26,7 @@ import {
   sessionPromptRequestSchema,
   sessionSummarySchema,
   settingsSummarySchema,
+  skillManifestSchema,
   updateConfigRequestSchema,
   systemStatsSchema,
   updateStatusSchema,
@@ -356,6 +358,62 @@ export async function fetchRouterProfiles(fetchImpl: FetchLike = fetch) {
       headers: { accept: 'application/json' }
     }),
     z.array(routerProfileSummarySchema)
+  );
+}
+
+export async function fetchSkills(fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/skills', {
+      headers: { accept: 'application/json' }
+    }),
+    z.array(skillManifestSchema)
+  );
+}
+
+export async function upsertSkill(
+  input: z.input<typeof skillManifestSchema>,
+  fetchImpl: FetchLike = fetch
+) {
+  const payload = skillManifestSchema.parse(input);
+
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/skills', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json'
+      },
+      body: JSON.stringify(payload)
+    }),
+    skillManifestSchema
+  );
+}
+
+export async function fetchMcpServers(fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/mcps', {
+      headers: { accept: 'application/json' }
+    }),
+    z.array(mcpServerSummarySchema)
+  );
+}
+
+export async function upsertMcpServer(
+  input: z.input<typeof mcpServerSummarySchema>,
+  fetchImpl: FetchLike = fetch
+) {
+  const payload = mcpServerSummarySchema.parse(input);
+
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/mcps', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json'
+      },
+      body: JSON.stringify(payload)
+    }),
+    mcpServerSummarySchema
   );
 }
 

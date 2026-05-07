@@ -383,6 +383,103 @@ pub struct SessionPromptRequest {
     pub prompt: String,
     #[serde(default)]
     pub images: Vec<SessionTurnImage>,
+    #[serde(default = "default_compiler_role")]
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompiledTurn {
+    pub id: String,
+    pub role: String,
+    pub provider_neutral: bool,
+    pub system_layers: Vec<CompiledPromptLayer>,
+    pub project_layers: Vec<CompiledPromptLayer>,
+    pub skill_layers: Vec<CompiledPromptLayer>,
+    pub tool_catalog: Vec<NucleusToolDescriptor>,
+    pub mcp_catalog: Vec<McpServerSummary>,
+    pub history: Vec<CompiledConversationTurn>,
+    pub user_turn: CompiledConversationTurn,
+    pub capabilities: CompiledTurnCapabilities,
+    pub debug_summary: CompiledTurnDebugSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompiledPromptLayer {
+    pub id: String,
+    pub kind: String,
+    pub scope: String,
+    pub title: String,
+    pub source_path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompiledConversationTurn {
+    pub role: String,
+    pub content: String,
+    #[serde(default)]
+    pub images: Vec<SessionTurnImage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompiledTurnCapabilities {
+    pub needs_images: bool,
+    pub needs_tools: bool,
+    pub needs_mcp: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompiledTurnDebugSummary {
+    pub include_count: usize,
+    pub skill_count: usize,
+    pub mcp_server_count: usize,
+    pub tool_count: usize,
+    pub layer_count: usize,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillManifest {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub activation_mode: String,
+    #[serde(default)]
+    pub triggers: Vec<String>,
+    #[serde(default)]
+    pub include_paths: Vec<String>,
+    #[serde(default)]
+    pub required_tools: Vec<String>,
+    #[serde(default)]
+    pub required_mcps: Vec<String>,
+    #[serde(default)]
+    pub project_filters: Vec<String>,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NucleusToolDescriptor {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    #[serde(default)]
+    pub input_schema: Value,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerSummary {
+    pub id: String,
+    pub title: String,
+    pub enabled: bool,
+    #[serde(default)]
+    pub tools: Vec<NucleusToolDescriptor>,
+    #[serde(default)]
+    pub resources: Vec<String>,
+}
+
+fn default_compiler_role() -> String {
+    "main".to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -456,7 +553,9 @@ pub struct ProjectUpdateRequest {
 pub struct WorkspaceModelConfig {
     pub adapter: String,
     pub model: String,
+    #[serde(default)]
     pub base_url: String,
+    #[serde(default)]
     pub api_key: String,
 }
 
@@ -483,6 +582,10 @@ pub struct WorkspaceProfileWriteRequest {
 pub struct RouteTarget {
     pub provider: String,
     pub model: String,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
