@@ -1901,6 +1901,44 @@
 
                       <div class="mt-4 space-y-3 border-t border-zinc-800 pt-4">
                         <div>
+                          <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Child Jobs</div>
+                          <div class="mt-2 space-y-2">
+                            {#if jobDetail.child_jobs.length === 0}
+                              <div class="text-xs text-zinc-500">No child jobs were recorded for this job.</div>
+                            {:else}
+                              {#each jobDetail.child_jobs as childJob}
+                                <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2">
+                                  <div class="flex items-start justify-between gap-3">
+                                    <div class="min-w-0">
+                                      <div class="truncate text-sm text-zinc-100">{childJob.title}</div>
+                                      <div class="mt-1 text-xs leading-5 text-zinc-500">
+                                        {childJob.purpose}
+                                        {#if childJob.result_summary}
+                                          {' · '}{childJob.result_summary}
+                                        {/if}
+                                      </div>
+                                    </div>
+                                    <Badge variant={badgeVariantForJobState(childJob.state)}>
+                                      {formatState(childJob.state)}
+                                    </Badge>
+                                  </div>
+                                  <div class="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-zinc-600">
+                                    <span>{childJob.worker_count} worker{childJob.worker_count === 1 ? '' : 's'}</span>
+                                    <span>{childJob.artifact_count} artifact{childJob.artifact_count === 1 ? '' : 's'}</span>
+                                    {#if childJob.updated_at}
+                                      <span>Updated {formatDateTime(childJob.updated_at)}</span>
+                                    {/if}
+                                  </div>
+                                  {#if childJob.last_error}
+                                    <div class="mt-2 text-xs leading-5 text-red-200">{childJob.last_error}</div>
+                                  {/if}
+                                </div>
+                              {/each}
+                            {/if}
+                          </div>
+                        </div>
+
+                        <div>
                           <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Workers</div>
                           <div class="mt-2 space-y-2">
                             {#each jobDetail.workers as worker}
