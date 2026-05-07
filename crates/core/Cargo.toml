@@ -6,4 +6,5 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-
+nucleus-protocol = { path = "../protocol" }
+serde_json.workspace = true

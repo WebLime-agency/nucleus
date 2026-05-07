@@ -986,6 +986,10 @@ dependencies = [
 [[package]]
 name = "nucleus-core"
 version = "0.1.0"
+dependencies = [
+ "nucleus-protocol",
+ "serde_json",
+]
 
 [[package]]
 name = "nucleus-daemon"
