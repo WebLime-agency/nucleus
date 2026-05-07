@@ -301,6 +301,39 @@ pub struct JobDetail {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlaybookSummary {
+    pub id: String,
+    pub session_id: String,
+    pub title: String,
+    pub description: String,
+    pub prompt_excerpt: String,
+    pub enabled: bool,
+    pub policy_bundle: String,
+    pub trigger_kind: String,
+    pub schedule_interval_secs: Option<u64>,
+    pub event_kind: Option<String>,
+    pub profile_id: String,
+    pub profile_title: String,
+    pub project_id: String,
+    pub project_title: String,
+    pub working_dir: String,
+    pub job_count: usize,
+    pub last_job_id: Option<String>,
+    pub last_job_state: String,
+    pub last_run_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlaybookDetail {
+    pub playbook: PlaybookSummary,
+    pub session: SessionSummary,
+    pub prompt: String,
+    pub recent_jobs: Vec<JobSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PromptProgressUpdate {
     pub session_id: String,
     pub status: String,
@@ -355,6 +388,34 @@ pub struct SessionPromptRequest {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApprovalResolutionRequest {
     pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreatePlaybookRequest {
+    pub title: String,
+    pub description: Option<String>,
+    pub prompt: String,
+    pub profile_id: Option<String>,
+    pub project_id: Option<String>,
+    pub enabled: Option<bool>,
+    pub policy_bundle: String,
+    pub trigger_kind: String,
+    pub schedule_interval_secs: Option<u64>,
+    pub event_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdatePlaybookRequest {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub prompt: Option<String>,
+    pub profile_id: Option<String>,
+    pub project_id: Option<String>,
+    pub enabled: Option<bool>,
+    pub policy_bundle: Option<String>,
+    pub trigger_kind: Option<String>,
+    pub schedule_interval_secs: Option<Option<u64>>,
+    pub event_kind: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

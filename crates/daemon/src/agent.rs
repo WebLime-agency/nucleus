@@ -8,15 +8,16 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use nucleus_protocol::{
-    ApprovalRequestSummary, ArtifactSummary, CommandSessionSummary, DaemonEvent, JobDetail,
-    JobSummary, PromptProgressUpdate, SessionDetail, SessionPromptRequest, SessionSummary,
-    SessionTurn, SessionTurnImage, WorkerSummary, WorkspaceProfileSummary, WorkspaceSummary,
+    ApprovalRequestSummary, ArtifactSummary, CommandSessionSummary, CreatePlaybookRequest,
+    DaemonEvent, JobDetail, JobSummary, PlaybookDetail, PlaybookSummary, PromptProgressUpdate,
+    SessionDetail, SessionPromptRequest, SessionSummary, SessionTurn, SessionTurnImage,
+    UpdatePlaybookRequest, WorkerSummary, WorkspaceProfileSummary, WorkspaceSummary,
 };
 use nucleus_storage::{
     ApprovalRequestRecord, AuditEventRecord, CommandSessionPatch, CommandSessionRecord,
-    JobArtifactPatch, JobArtifactRecord, JobEventRecord, JobPatch, JobRecord, PolicyDecisionRecord,
-    SessionPatch, ToolCallPatch, ToolCallRecord, ToolCapabilityGrantRecord, WorkerPatch,
-    WorkerRecord,
+    JobArtifactPatch, JobArtifactRecord, JobEventRecord, JobPatch, JobRecord, PlaybookPatch,
+    PlaybookRecord, PolicyDecisionRecord, SessionPatch, SessionRecord, ToolCallPatch,
+    ToolCallRecord, ToolCapabilityGrantRecord, WorkerPatch, WorkerRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -32,6 +33,7 @@ use uuid::Uuid;
 use super::{
     ApiError, AppState, assemble_prompt_input, ensure_prompting_runtime, excerpt,
     publish_overview_event, publish_prompt_progress_event, publish_session_event,
+    resolve_session_projects, resolve_workspace_profile, resolve_workspace_profile_target,
     try_record_audit_event, unix_timestamp,
 };
 use crate::runtime::PromptStreamEvent;
@@ -57,6 +59,9 @@ const COMMAND_DEFAULT_WAIT_FOR_OUTPUT_MS: u64 = 250;
 const COMMAND_MAX_WAIT_FOR_OUTPUT_MS: u64 = 2_000;
 const COMMAND_STATE_SETTLE_WAIT_MS: u64 = 50;
 const WRITE_LOCK_POLL_INTERVAL_MS: u64 = 250;
+const PLAYBOOK_SCHEDULER_INTERVAL_SECS: u64 = 30;
+const PLAYBOOK_MIN_INTERVAL_SECS: u64 = 60;
+const PLAYBOOK_MAX_INTERVAL_SECS: u64 = 86_400;
 const COMMAND_TRUNCATED_NOTE: &str = "[output truncated by the daemon budget]";
 
 #[derive(Default)]
@@ -660,6 +665,214 @@ pub async fn deny_request(
     note: Option<String>,
 ) -> Result<JobDetail, ApiError> {
     resolve_approval_request(state, approval_id, false, note).await
+}
+
+pub fn spawn_playbook_scheduler(state: AppState) {
+    tokio::spawn(async move {
+        if let Err(error) = dispatch_playbook_event_inner(&state, "daemon_started").await {
+            warn!(error = %error, "failed to dispatch daemon_started playbooks");
+        }
+
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(PLAYBOOK_SCHEDULER_INTERVAL_SECS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if let Err(error) = run_scheduled_playbooks(&state).await {
+                warn!(error = %error, "playbook scheduler tick failed");
+            }
+        }
+    });
+}
+
+pub async fn list_playbooks(state: AppState) -> Result<Vec<PlaybookSummary>, ApiError> {
+    Ok(state.store.list_playbooks()?)
+}
+
+pub async fn get_playbook(
+    state: AppState,
+    playbook_id: String,
+) -> Result<PlaybookDetail, ApiError> {
+    Ok(state.store.get_playbook(&playbook_id)?)
+}
+
+pub async fn create_playbook(
+    state: AppState,
+    payload: CreatePlaybookRequest,
+) -> Result<PlaybookDetail, ApiError> {
+    let title = normalize_playbook_title(&payload.title)?;
+    let prompt = normalize_playbook_prompt(&payload.prompt)?;
+    let description = normalize_playbook_description(payload.description.as_deref());
+    let policy_bundle = normalize_playbook_policy_bundle(&payload.policy_bundle)?;
+    let (trigger_kind, schedule_interval_secs, event_kind) = normalize_playbook_trigger(
+        &payload.trigger_kind,
+        payload.schedule_interval_secs,
+        payload.event_kind.as_deref(),
+    )?;
+
+    let session_id = Uuid::new_v4().to_string();
+    let session = create_playbook_session(
+        &state,
+        &session_id,
+        &title,
+        payload.profile_id.as_deref(),
+        payload.project_id.as_deref(),
+    )
+    .await?;
+    let created_at = unix_timestamp();
+    let detail = state.store.create_playbook(PlaybookRecord {
+        id: Uuid::new_v4().to_string(),
+        session_id,
+        title: title.clone(),
+        description: description.clone(),
+        prompt,
+        enabled: payload.enabled.unwrap_or(true),
+        policy_bundle,
+        trigger_kind: trigger_kind.clone(),
+        schedule_interval_secs,
+        event_kind: event_kind.clone(),
+        created_at,
+        updated_at: created_at,
+    })?;
+    let _ = try_record_audit_event(
+        &state,
+        AuditEventRecord {
+            kind: "playbook.created".to_string(),
+            target: format!("playbook:{}", detail.playbook.id),
+            status: "success".to_string(),
+            summary: format!("Created playbook '{}'.", detail.playbook.title),
+            detail: format!(
+                "session_id={} trigger_kind={} policy_bundle={} working_dir={}",
+                session.session.id,
+                trigger_kind,
+                detail.playbook.policy_bundle,
+                detail.playbook.working_dir
+            ),
+        },
+    )
+    .await;
+    Ok(detail)
+}
+
+pub async fn update_playbook(
+    state: AppState,
+    playbook_id: String,
+    payload: UpdatePlaybookRequest,
+) -> Result<PlaybookDetail, ApiError> {
+    ensure_no_active_playbook_jobs(&state, &playbook_id)?;
+    let before = state.store.get_playbook(&playbook_id)?;
+
+    let next_title = match payload.title {
+        Some(value) => normalize_playbook_title(&value)?,
+        None => before.playbook.title.clone(),
+    };
+    let next_prompt = match payload.prompt {
+        Some(value) => normalize_playbook_prompt(&value)?,
+        None => read_playbook_prompt(&state, &playbook_id)?,
+    };
+    let next_description = match payload.description {
+        Some(value) => normalize_playbook_description(Some(value.as_str())),
+        None => before.playbook.description.clone(),
+    };
+    let next_policy_bundle = match payload.policy_bundle {
+        Some(value) => normalize_playbook_policy_bundle(&value)?,
+        None => before.playbook.policy_bundle.clone(),
+    };
+    let next_trigger_kind_input = payload
+        .trigger_kind
+        .as_deref()
+        .unwrap_or(before.playbook.trigger_kind.as_str());
+    let next_schedule_input = match payload.schedule_interval_secs {
+        Some(value) => value,
+        None => before.playbook.schedule_interval_secs,
+    };
+    let next_event_input = match payload.event_kind {
+        Some(Some(value)) => Some(value),
+        Some(None) => None,
+        None => before.playbook.event_kind.clone(),
+    };
+    let (next_trigger_kind, next_schedule_interval_secs, next_event_kind) =
+        normalize_playbook_trigger(
+            next_trigger_kind_input,
+            next_schedule_input,
+            next_event_input.as_deref(),
+        )?;
+
+    let profile_id = payload
+        .profile_id
+        .as_deref()
+        .or(Some(before.session.profile_id.as_str()))
+        .filter(|value| !value.trim().is_empty());
+    let project_id = payload
+        .project_id
+        .as_deref()
+        .or(Some(before.session.project_id.as_str()))
+        .filter(|value| !value.trim().is_empty());
+
+    update_playbook_session(&state, &before.session, &next_title, profile_id, project_id).await?;
+
+    let detail = state.store.update_playbook(
+        &playbook_id,
+        PlaybookPatch {
+            title: Some(next_title.clone()),
+            description: Some(next_description),
+            prompt: Some(next_prompt),
+            enabled: payload.enabled,
+            policy_bundle: Some(next_policy_bundle),
+            trigger_kind: Some(next_trigger_kind),
+            schedule_interval_secs: Some(next_schedule_interval_secs),
+            event_kind: Some(next_event_kind),
+            updated_at: Some(unix_timestamp()),
+            ..PlaybookPatch::default()
+        },
+    )?;
+    let _ = try_record_audit_event(
+        &state,
+        AuditEventRecord {
+            kind: "playbook.updated".to_string(),
+            target: format!("playbook:{}", detail.playbook.id),
+            status: "success".to_string(),
+            summary: format!("Updated playbook '{}'.", detail.playbook.title),
+            detail: format!(
+                "trigger_kind={} policy_bundle={} enabled={}",
+                detail.playbook.trigger_kind,
+                detail.playbook.policy_bundle,
+                detail.playbook.enabled
+            ),
+        },
+    )
+    .await;
+    Ok(detail)
+}
+
+pub async fn delete_playbook(
+    state: AppState,
+    playbook_id: String,
+) -> Result<PlaybookDetail, ApiError> {
+    ensure_no_active_playbook_jobs(&state, &playbook_id)?;
+    let detail = state.store.delete_playbook(&playbook_id)?;
+    let _ = try_record_audit_event(
+        &state,
+        AuditEventRecord {
+            kind: "playbook.deleted".to_string(),
+            target: format!("playbook:{}", detail.playbook.id),
+            status: "success".to_string(),
+            summary: format!("Deleted playbook '{}'.", detail.playbook.title),
+            detail: format!("session_id={}", detail.session.id),
+        },
+    )
+    .await;
+    let _ = publish_overview_event(&state).await;
+    Ok(detail)
+}
+
+pub async fn run_playbook(state: AppState, playbook_id: String) -> Result<JobDetail, ApiError> {
+    queue_playbook_job(&state, &playbook_id, "playbook_manual", "user").await
+}
+
+pub async fn dispatch_playbook_event(state: AppState, event_kind: &str) -> Result<(), ApiError> {
+    dispatch_playbook_event_inner(&state, event_kind).await?;
+    Ok(())
 }
 
 pub async fn recover_interrupted_jobs(state: &AppState) -> Result<()> {
@@ -4920,6 +5133,272 @@ fn resolve_hidden_worker_profile<'a>(
         .find(|profile| profile.id == preferred_id)
 }
 
+fn normalize_playbook_title(value: &str) -> Result<String, ApiError> {
+    let title = value.trim();
+    if title.is_empty() {
+        return Err(ApiError::bad_request("playbook title is required"));
+    }
+    Ok(title.to_string())
+}
+
+fn normalize_playbook_description(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn normalize_playbook_prompt(value: &str) -> Result<String, ApiError> {
+    let prompt = value.trim();
+    if prompt.is_empty() {
+        return Err(ApiError::bad_request("playbook prompt is required"));
+    }
+    Ok(prompt.to_string())
+}
+
+fn normalize_playbook_policy_bundle(value: &str) -> Result<String, ApiError> {
+    let bundle = value.trim();
+    match bundle {
+        "read_only" | "repo_mutation" | "command_runner" | "full_agent" => Ok(bundle.to_string()),
+        _ => Err(ApiError::bad_request(format!(
+            "unknown playbook policy bundle '{}'",
+            value
+        ))),
+    }
+}
+
+fn normalize_playbook_trigger(
+    trigger_kind: &str,
+    schedule_interval_secs: Option<u64>,
+    event_kind: Option<&str>,
+) -> Result<(String, Option<u64>, Option<String>), ApiError> {
+    match trigger_kind.trim() {
+        "manual" => Ok(("manual".to_string(), None, None)),
+        "schedule" => {
+            let interval = schedule_interval_secs.ok_or_else(|| {
+                ApiError::bad_request("scheduled playbooks require schedule_interval_secs")
+            })?;
+            if !(PLAYBOOK_MIN_INTERVAL_SECS..=PLAYBOOK_MAX_INTERVAL_SECS).contains(&interval) {
+                return Err(ApiError::bad_request(format!(
+                    "schedule_interval_secs must be between {} and {} seconds",
+                    PLAYBOOK_MIN_INTERVAL_SECS, PLAYBOOK_MAX_INTERVAL_SECS
+                )));
+            }
+            Ok(("schedule".to_string(), Some(interval), None))
+        }
+        "event" => {
+            let event_kind = match event_kind.map(str::trim).filter(|value| !value.is_empty()) {
+                Some("daemon_started") => "daemon_started".to_string(),
+                Some("workspace_projects_synced") => "workspace_projects_synced".to_string(),
+                Some(other) => {
+                    return Err(ApiError::bad_request(format!(
+                        "unknown playbook event trigger '{}'",
+                        other
+                    )));
+                }
+                None => {
+                    return Err(ApiError::bad_request(
+                        "event-triggered playbooks require event_kind",
+                    ));
+                }
+            };
+            Ok(("event".to_string(), None, Some(event_kind)))
+        }
+        other => Err(ApiError::bad_request(format!(
+            "unknown playbook trigger kind '{}'",
+            other
+        ))),
+    }
+}
+
+async fn create_playbook_session(
+    state: &AppState,
+    session_id: &str,
+    title: &str,
+    profile_id: Option<&str>,
+    project_id: Option<&str>,
+) -> Result<SessionDetail, ApiError> {
+    let workspace = state.store.workspace()?;
+    let profile = match profile_id.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(profile_id) => resolve_workspace_profile(&workspace, profile_id)?,
+        None => resolve_workspace_profile(&workspace, &workspace.default_profile_id)?,
+    };
+    let target = resolve_workspace_profile_target(state, profile).await?;
+    let projects =
+        resolve_session_projects(state, project_id, project_id, None, Some(session_id), None)?;
+
+    state.store.create_session(SessionRecord {
+        id: session_id.to_string(),
+        profile_id: target.profile_id,
+        profile_title: target.profile_title,
+        route_id: target.route_id,
+        route_title: target.route_title,
+        scope: "automation".to_string(),
+        project_id: projects.primary_project_id.clone(),
+        project_title: projects.primary_project_title.clone(),
+        project_path: projects.primary_project_path.clone(),
+        project_ids: projects.project_ids.clone(),
+        title: format!("Playbook {}", title),
+        provider: target.provider,
+        model: target.model,
+        provider_base_url: target.provider_base_url,
+        provider_api_key: target.provider_api_key,
+        working_dir: projects.working_dir,
+        working_dir_kind: projects.working_dir_kind,
+    })?;
+
+    Ok(state.store.get_session(session_id)?)
+}
+
+async fn update_playbook_session(
+    state: &AppState,
+    session: &SessionSummary,
+    title: &str,
+    profile_id: Option<&str>,
+    project_id: Option<&str>,
+) -> Result<SessionDetail, ApiError> {
+    let workspace = state.store.workspace()?;
+    let profile = match profile_id.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(profile_id) => resolve_workspace_profile(&workspace, profile_id)?,
+        None => resolve_workspace_profile(&workspace, &workspace.default_profile_id)?,
+    };
+    let target = resolve_workspace_profile_target(state, profile).await?;
+    let projects = resolve_session_projects(
+        state,
+        project_id,
+        project_id,
+        None,
+        Some(&session.id),
+        Some(session),
+    )?;
+
+    state.store.update_session(
+        &session.id,
+        SessionPatch {
+            title: Some(format!("Playbook {}", title)),
+            profile_id: Some(target.profile_id),
+            profile_title: Some(target.profile_title),
+            route_id: Some(target.route_id),
+            route_title: Some(target.route_title),
+            scope: Some("automation".to_string()),
+            project_id: Some(projects.primary_project_id),
+            project_title: Some(projects.primary_project_title),
+            project_path: Some(projects.primary_project_path),
+            project_ids: Some(projects.project_ids),
+            provider: Some(target.provider),
+            model: Some(target.model),
+            provider_base_url: Some(target.provider_base_url),
+            provider_api_key: Some(target.provider_api_key),
+            working_dir: Some(projects.working_dir),
+            working_dir_kind: Some(projects.working_dir_kind),
+            provider_session_id: Some(String::new()),
+            last_error: Some(String::new()),
+            ..SessionPatch::default()
+        },
+    )?;
+
+    Ok(state.store.get_session(&session.id)?)
+}
+
+fn ensure_no_active_playbook_jobs(state: &AppState, playbook_id: &str) -> Result<(), ApiError> {
+    let active = state
+        .store
+        .list_jobs_for_template_by_state(playbook_id, &["queued", "running", "paused"])?;
+    if let Some(job) = active.first() {
+        return Err(ApiError::bad_request(format!(
+            "playbook '{}' already has an active job ({})",
+            playbook_id, job.id
+        )));
+    }
+    Ok(())
+}
+
+fn read_playbook_prompt(state: &AppState, playbook_id: &str) -> Result<String, ApiError> {
+    Ok(state.store.get_playbook(playbook_id)?.prompt)
+}
+
+async fn run_scheduled_playbooks(state: &AppState) -> Result<()> {
+    let now = unix_timestamp();
+    for playbook in state.store.list_playbooks()? {
+        if !playbook.enabled || playbook.trigger_kind != "schedule" {
+            continue;
+        }
+
+        if state
+            .store
+            .list_jobs_for_template_by_state(&playbook.id, &["queued", "running", "paused"])?
+            .is_empty()
+        {
+            let latest_scheduled = state
+                .store
+                .list_jobs_for_template(&playbook.id, 20)?
+                .into_iter()
+                .find(|job| job.trigger_kind == "playbook_schedule");
+            let should_run = latest_scheduled.map_or(true, |job| {
+                now.saturating_sub(job.created_at)
+                    >= playbook.schedule_interval_secs.unwrap_or(0) as i64
+            });
+            if should_run {
+                if let Err(error) =
+                    queue_playbook_job(state, &playbook.id, "playbook_schedule", "system").await
+                {
+                    let _ = try_record_audit_event(
+                        state,
+                        AuditEventRecord {
+                            kind: "playbook.schedule.failed".to_string(),
+                            target: format!("playbook:{}", playbook.id),
+                            status: "warning".to_string(),
+                            summary: format!(
+                                "Scheduled playbook '{}' did not start.",
+                                playbook.title
+                            ),
+                            detail: error.message,
+                        },
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn dispatch_playbook_event_inner(state: &AppState, event_kind: &str) -> Result<()> {
+    for playbook in state.store.list_playbooks()? {
+        if !playbook.enabled || playbook.trigger_kind != "event" {
+            continue;
+        }
+        if playbook.event_kind.as_deref() != Some(event_kind) {
+            continue;
+        }
+        if !state
+            .store
+            .list_jobs_for_template_by_state(&playbook.id, &["queued", "running", "paused"])?
+            .is_empty()
+        {
+            continue;
+        }
+
+        if let Err(error) =
+            queue_playbook_job(state, &playbook.id, "playbook_event", "system").await
+        {
+            let _ = try_record_audit_event(
+                state,
+                AuditEventRecord {
+                    kind: "playbook.event.failed".to_string(),
+                    target: format!("playbook:{}", playbook.id),
+                    status: "warning".to_string(),
+                    summary: format!("Event playbook '{}' did not start.", playbook.title),
+                    detail: error.message,
+                },
+            )
+            .await;
+        }
+    }
+    Ok(())
+}
+
 fn worker_read_roots(session: &SessionSummary) -> Vec<String> {
     if session.projects.is_empty() {
         return vec![session.working_dir.clone()];
@@ -4937,10 +5416,159 @@ fn worker_write_roots(session: &SessionSummary) -> Vec<String> {
 }
 
 fn root_worker_capabilities() -> Vec<ToolCapabilityGrantRecord> {
-    let mut capabilities = read_only_capabilities();
-    capabilities.extend(mutating_capabilities());
-    capabilities.extend(execution_capabilities());
-    capabilities
+    capabilities_for_policy_bundle("full_agent")
+}
+
+fn capabilities_for_policy_bundle(bundle: &str) -> Vec<ToolCapabilityGrantRecord> {
+    match bundle {
+        "read_only" => read_only_capabilities(),
+        "repo_mutation" => {
+            let mut capabilities = read_only_capabilities();
+            capabilities.extend(mutating_capabilities());
+            capabilities
+        }
+        "command_runner" => {
+            let mut capabilities = read_only_capabilities();
+            capabilities.extend(execution_capabilities());
+            capabilities
+        }
+        _ => {
+            let mut capabilities = read_only_capabilities();
+            capabilities.extend(mutating_capabilities());
+            capabilities.extend(execution_capabilities());
+            capabilities
+        }
+    }
+}
+
+async fn queue_playbook_job(
+    state: &AppState,
+    playbook_id: &str,
+    trigger_kind: &str,
+    requested_by: &str,
+) -> Result<JobDetail, ApiError> {
+    ensure_no_active_playbook_jobs(state, playbook_id)?;
+
+    let playbook = state.store.get_playbook(playbook_id)?;
+    let session_id = playbook.session.id.clone();
+    let prompt_excerpt = excerpt(&playbook.prompt, 160);
+    let job_id = Uuid::new_v4().to_string();
+    let root_worker_id = Uuid::new_v4().to_string();
+    let target = resolve_hidden_worker_target(state, &playbook.session).await?;
+
+    state.store.update_session(
+        &session_id,
+        SessionPatch {
+            state: Some("running".to_string()),
+            last_error: Some(String::new()),
+            ..SessionPatch::default()
+        },
+    )?;
+    state.store.append_session_turn(
+        &session_id,
+        &Uuid::new_v4().to_string(),
+        "user",
+        playbook.prompt.as_str(),
+        &[],
+    )?;
+
+    let job = state.store.create_job(JobRecord {
+        id: job_id.clone(),
+        session_id: Some(session_id.clone()),
+        parent_job_id: None,
+        template_id: Some(playbook.playbook.id.clone()),
+        title: format!("Playbook {}", playbook.playbook.title),
+        purpose: if playbook.playbook.description.is_empty() {
+            playbook.playbook.title.clone()
+        } else {
+            playbook.playbook.description.clone()
+        },
+        trigger_kind: trigger_kind.to_string(),
+        state: "queued".to_string(),
+        requested_by: requested_by.to_string(),
+        prompt_excerpt: prompt_excerpt.clone(),
+    })?;
+
+    let _created_worker = state.store.create_worker(WorkerRecord {
+        id: root_worker_id.clone(),
+        job_id: job_id.clone(),
+        parent_worker_id: None,
+        title: "Hidden automation worker".to_string(),
+        lane: "utility".to_string(),
+        state: "queued".to_string(),
+        provider: target.provider.clone(),
+        model: target.model.clone(),
+        provider_base_url: target.provider_base_url.clone(),
+        provider_api_key: target.provider_api_key.clone(),
+        provider_session_id: String::new(),
+        working_dir: playbook.session.working_dir.clone(),
+        read_roots: worker_read_roots(&playbook.session),
+        write_roots: worker_write_roots(&playbook.session),
+        max_steps: JOB_MAX_STEPS,
+        max_tool_calls: JOB_MAX_TOOL_CALLS,
+        max_wall_clock_secs: JOB_MAX_WALL_CLOCK_SECS,
+    })?;
+    state.store.update_job(
+        &job_id,
+        JobPatch {
+            root_worker_id: Some(root_worker_id.clone()),
+            ..JobPatch::default()
+        },
+    )?;
+    state.store.replace_tool_capability_grants(
+        &root_worker_id,
+        &capabilities_for_policy_bundle(&playbook.playbook.policy_bundle),
+    )?;
+    let worker = state
+        .store
+        .get_job(&job_id)?
+        .workers
+        .into_iter()
+        .find(|item| item.id == root_worker_id)
+        .ok_or_else(|| ApiError::internal_message("failed to reload hidden automation worker"))?;
+
+    let checkpoint = WorkerCheckpoint {
+        session_id: session_id.clone(),
+        prompt_text: playbook.prompt.clone(),
+        conversation: vec![CheckpointMessage {
+            role: "system".to_string(),
+            content: worker_system_prompt(&worker),
+        }],
+        next_prompt: None,
+        pending_action: None,
+    };
+    state
+        .store
+        .write_worker_checkpoint(&root_worker_id, &serde_json::to_value(checkpoint).unwrap())?;
+
+    if let Ok(updated) = state.store.get_session(&session_id) {
+        let _ = publish_session_event(state, updated).await;
+    }
+    publish_job_created(state, &job).await;
+    publish_worker_updated(state, &worker).await;
+    let _ = publish_overview_event(state).await;
+    let _ = try_record_audit_event(
+        state,
+        AuditEventRecord {
+            kind: "playbook.job.created".to_string(),
+            target: format!("job:{job_id}"),
+            status: "success".to_string(),
+            summary: format!("Queued playbook '{}' for execution.", playbook.playbook.title),
+            detail: format!(
+                "playbook_id={} session_id={} trigger_kind={} requested_by={} utility_provider={} utility_model={}",
+                playbook.playbook.id,
+                session_id,
+                trigger_kind,
+                requested_by,
+                target.provider,
+                target.model
+            ),
+        },
+    )
+    .await;
+
+    spawn_job_task(state.clone(), job_id.clone());
+    Ok(state.store.get_job(&job_id)?)
 }
 
 fn child_worker_capabilities() -> Vec<ToolCapabilityGrantRecord> {
@@ -5381,6 +6009,80 @@ mod tests {
         );
         assert_eq!(policy_for_tool("command.session.write").decision, "allow");
         assert_eq!(policy_for_tool("fs.read_text").decision, "allow");
+    }
+
+    #[test]
+    fn playbook_trigger_validation_rejects_invalid_inputs() {
+        let (trigger_kind, schedule_interval_secs, event_kind) =
+            normalize_playbook_trigger("schedule", Some(300), None)
+                .expect("scheduled playbook should validate");
+        assert_eq!(trigger_kind, "schedule");
+        assert_eq!(schedule_interval_secs, Some(300));
+        assert_eq!(event_kind, None);
+
+        let error = normalize_playbook_trigger("schedule", Some(30), None)
+            .expect_err("short schedule should be rejected");
+        assert!(error.message.contains("between 60 and 86400"));
+
+        let error = normalize_playbook_trigger("event", None, None)
+            .expect_err("event playbook should require an event kind");
+        assert!(error.message.contains("require event_kind"));
+
+        let error = normalize_playbook_trigger("event", None, Some("push_received"))
+            .expect_err("unknown event kind should be rejected");
+        assert!(error.message.contains("unknown playbook event trigger"));
+    }
+
+    #[test]
+    fn policy_bundles_select_expected_capabilities() {
+        let read_only = capabilities_for_policy_bundle("read_only");
+        assert!(
+            read_only
+                .iter()
+                .any(|grant| grant.tool_id == "fs.read_text")
+        );
+        assert!(
+            !read_only
+                .iter()
+                .any(|grant| grant.tool_id == "fs.write_text")
+        );
+        assert!(!read_only.iter().any(|grant| grant.tool_id == "command.run"));
+
+        let repo_mutation = capabilities_for_policy_bundle("repo_mutation");
+        assert!(
+            repo_mutation
+                .iter()
+                .any(|grant| grant.tool_id == "fs.write_text")
+        );
+        assert!(
+            !repo_mutation
+                .iter()
+                .any(|grant| grant.tool_id == "command.run")
+        );
+
+        let command_runner = capabilities_for_policy_bundle("command_runner");
+        assert!(
+            !command_runner
+                .iter()
+                .any(|grant| grant.tool_id == "fs.write_text")
+        );
+        assert!(
+            command_runner
+                .iter()
+                .any(|grant| grant.tool_id == "command.run")
+        );
+
+        let full_agent = capabilities_for_policy_bundle("full_agent");
+        assert!(
+            full_agent
+                .iter()
+                .any(|grant| grant.tool_id == "fs.write_text")
+        );
+        assert!(
+            full_agent
+                .iter()
+                .any(|grant| grant.tool_id == "command.run")
+        );
     }
 
     #[test]
