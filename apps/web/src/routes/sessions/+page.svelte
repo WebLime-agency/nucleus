@@ -24,11 +24,15 @@
   import { Badge } from '$lib/components/ui/badge';
   import { Button } from '$lib/components/ui/button';
   import {
+    cancelJob,
     deleteSession,
     fetchActions,
     fetchAuditEvents,
+    fetchJobDetail,
     fetchOverview,
+    fetchSessionJobs,
     fetchSessionDetail,
+    resumeJob,
     runAction,
     sendSessionPrompt,
     updateSession
@@ -39,12 +43,17 @@
     ActionSummary,
     AuditEvent,
     DaemonEvent,
+    JobDetail,
+    JobEvent,
+    JobSummary,
     PromptProgressUpdate,
     RuntimeOverview,
     SessionDetail,
     SessionSummary,
     SessionTurn,
-    SessionTurnImage
+    SessionTurnImage,
+    ToolCallSummary,
+    WorkerSummary
   } from '$lib/nucleus/schemas';
   import { cn } from '$lib/utils';
 
@@ -79,6 +88,11 @@
   let promptText = $state('');
   let draftTitle = $state('');
   let draftProfileId = $state('');
+  let jobSummaries = $state<JobSummary[]>([]);
+  let jobDetail = $state<JobDetail | null>(null);
+  let selectedJobId = $state('');
+  let jobLoading = $state(false);
+  let jobActioning = $state(false);
   let actionFormValues = $state<Record<string, Record<string, string>>>({});
   let detailPanelOpen = $state(false);
   let dragOver = $state(false);
@@ -104,6 +118,9 @@
   let selectedProfile = $derived(
     workspaceProfiles.find((profile) => profile.id === (draftProfileId || selectedSession?.profile_id || '')) ??
       null
+  );
+  let selectedJobSummary = $derived(
+    jobSummaries.find((job) => job.id === selectedJobId) ?? jobSummaries[0] ?? null
   );
   let attachedProjects = $derived(selectedSession?.projects ?? []);
   let selectedProject = $derived(attachedProjects.find((project) => project.is_primary) ?? null);
@@ -185,7 +202,26 @@
   ): 'default' | 'secondary' | 'warning' | 'destructive' {
     if (state === 'active') return 'default';
     if (state === 'running') return 'warning';
+    if (state === 'paused') return 'warning';
     if (state === 'archived') return 'secondary';
+    return 'destructive';
+  }
+
+  function badgeVariantForJobState(
+    state: string
+  ): 'default' | 'secondary' | 'warning' | 'destructive' {
+    if (state === 'completed') return 'default';
+    if (state === 'paused' || state === 'running' || state === 'queued') return 'warning';
+    if (state === 'canceled') return 'secondary';
+    return 'destructive';
+  }
+
+  function badgeVariantForToolCall(
+    state: string
+  ): 'default' | 'secondary' | 'warning' | 'destructive' {
+    if (state === 'completed') return 'default';
+    if (state === 'running' || state === 'queued') return 'warning';
+    if (state === 'canceled') return 'secondary';
     return 'destructive';
   }
 
@@ -287,6 +323,25 @@
     draftProfileId = session?.profile_id ?? '';
   }
 
+  function upsertJobSummary(next: JobSummary) {
+    const remaining = jobSummaries.filter((job) => job.id !== next.id);
+    jobSummaries = [next, ...remaining].sort((left, right) => {
+      if (right.updated_at !== left.updated_at) {
+        return right.updated_at - left.updated_at;
+      }
+
+      return right.created_at - left.created_at;
+    });
+  }
+
+  function syncJobDetail(next: JobDetail | null) {
+    jobDetail = next;
+    if (next) {
+      selectedJobId = next.job.id;
+      upsertJobSummary(next.job);
+    }
+  }
+
   function buildNextProjectState(
     projectId: string,
     intent: 'attach' | 'detach' | 'primary'
@@ -365,6 +420,9 @@
     if (!preferredId) {
       selectedSessionId = '';
       detail = null;
+      jobSummaries = [];
+      jobDetail = null;
+      selectedJobId = '';
       setSessionDrafts(null);
       return;
     }
@@ -615,6 +673,9 @@
       if (selectedSessionId || detail) {
         selectedSessionId = '';
         detail = null;
+        jobSummaries = [];
+        jobDetail = null;
+        selectedJobId = '';
         setSessionDrafts(null);
       }
       return;
@@ -654,6 +715,9 @@
     if (!sessionId) {
       selectedSessionId = '';
       detail = null;
+      jobSummaries = [];
+      jobDetail = null;
+      selectedJobId = '';
       setSessionDrafts(null);
       return;
     }
@@ -674,6 +738,7 @@
     try {
       detail = await fetchSessionDetail(sessionId);
       setSessionDrafts(detail.session);
+      await loadSessionJobs(sessionId, true);
       error = null;
     } catch (cause) {
       error = cause instanceof Error ? cause.message : 'Failed to load the selected session.';
@@ -700,6 +765,66 @@
       error = cause instanceof Error ? cause.message : 'Failed to load session state.';
     } finally {
       loading = false;
+    }
+  }
+
+  async function loadSessionJobs(sessionId: string, silent = false) {
+    if (!sessionId) {
+      jobSummaries = [];
+      jobDetail = null;
+      selectedJobId = '';
+      return;
+    }
+
+    if (!silent) {
+      jobLoading = true;
+    }
+
+    try {
+      const nextJobs = await fetchSessionJobs(sessionId);
+      jobSummaries = nextJobs;
+
+      if (nextJobs.length === 0) {
+        jobDetail = null;
+        selectedJobId = '';
+        return;
+      }
+
+      const preferredJobId =
+        (selectedJobId && nextJobs.some((job) => job.id === selectedJobId) && selectedJobId) ||
+        nextJobs[0]?.id ||
+        '';
+
+      if (preferredJobId) {
+        await loadJob(preferredJobId, true);
+      }
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to load the session jobs.';
+    } finally {
+      jobLoading = false;
+    }
+  }
+
+  async function loadJob(jobId: string, silent = false) {
+    if (!jobId) {
+      selectedJobId = '';
+      jobDetail = null;
+      return;
+    }
+
+    selectedJobId = jobId;
+
+    if (!silent) {
+      jobLoading = true;
+    }
+
+    try {
+      syncJobDetail(await fetchJobDetail(jobId));
+      error = null;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to load the selected job.';
+    } finally {
+      jobLoading = false;
     }
   }
 
@@ -760,7 +885,12 @@
   }
 
   async function handlePromptSubmit() {
-    if (!selectedSession || !promptReady || selectedSession.state === 'running') {
+    if (
+      !selectedSession ||
+      !promptReady ||
+      selectedSession.state === 'running' ||
+      selectedSession.state === 'paused'
+    ) {
       return;
     }
 
@@ -789,6 +919,7 @@
         }))
       });
       syncSession(next);
+      await loadSessionJobs(submittedSession.id, true);
       actionResultMessage = null;
       error = null;
     } catch (cause) {
@@ -934,6 +1065,62 @@
     await goto(`/sessions?session=${sessionId}`, { noScroll: true });
   }
 
+  async function handleCancelJob() {
+    if (!jobDetail || jobActioning) {
+      return;
+    }
+
+    jobActioning = true;
+
+    try {
+      const next = await cancelJob(jobDetail.job.id);
+      syncJobDetail(next);
+      if (selectedSessionId) {
+        await loadSelectedSession(selectedSessionId, true);
+        await loadSessionJobs(selectedSessionId, true);
+      }
+      error = null;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to cancel the job.';
+    } finally {
+      jobActioning = false;
+    }
+  }
+
+  async function handleResumeJob() {
+    if (!jobDetail || jobActioning) {
+      return;
+    }
+
+    jobActioning = true;
+
+    try {
+      const next = await resumeJob(jobDetail.job.id);
+      syncJobDetail(next);
+      if (selectedSessionId) {
+        await loadSelectedSession(selectedSessionId, true);
+        await loadSessionJobs(selectedSessionId, true);
+      }
+      error = null;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to resume the job.';
+    } finally {
+      jobActioning = false;
+    }
+  }
+
+  function formatWorkerSummary(worker: WorkerSummary) {
+    return `${formatState(worker.provider)}${worker.model ? ` / ${worker.model}` : ''}`;
+  }
+
+  function formatJobEvent(event: JobEvent) {
+    return event.summary || formatState(event.event_type);
+  }
+
+  function formatToolCallSummary(toolCall: ToolCallSummary) {
+    return toolCall.summary || toolCall.tool_id;
+  }
+
   function applyStreamEvent(event: DaemonEvent) {
     if (event.event === 'overview.updated') {
       syncOverview(event.data);
@@ -954,6 +1141,31 @@
     if (event.event === 'prompt.progress') {
       if (event.data.session_id === selectedSessionId || event.data.session_id === requestedSessionId) {
         stagePromptProgress(event.data);
+      }
+      return;
+    }
+
+    if (
+      event.event === 'job.created' ||
+      event.event === 'job.updated' ||
+      event.event === 'job.completed' ||
+      event.event === 'job.failed'
+    ) {
+      if (event.data.session_id === selectedSessionId || event.data.session_id === requestedSessionId) {
+        upsertJobSummary(event.data);
+        void loadSessionJobs(event.data.session_id ?? selectedSessionId, true);
+      }
+      return;
+    }
+
+    if (
+      event.event === 'worker.updated' ||
+      event.event === 'approval.requested' ||
+      event.event === 'approval.resolved' ||
+      event.event === 'artifact.added'
+    ) {
+      if (jobDetail?.job.id === event.data.job_id || selectedJobSummary?.id === event.data.job_id) {
+        void loadJob(event.data.job_id, true);
       }
       return;
     }
@@ -1147,7 +1359,7 @@
                   </div>
                 {/each}
 
-                {#if selectedSession.state === 'running' || activePromptProgress}
+                {#if selectedSession.state === 'running' || selectedSession.state === 'paused' || activePromptProgress}
                   <div class="flex justify-start">
                     <div class="flex max-w-3xl flex-col gap-2 items-start">
                       <div class="flex items-center gap-2 text-xs text-zinc-500">
@@ -1253,7 +1465,11 @@
                 class="min-h-[6rem] w-full resize-none bg-transparent text-sm leading-6 text-zinc-100 outline-none placeholder:text-zinc-500 sm:min-h-[7.5rem]"
                 placeholder="Send a message..."
                 spellcheck={false}
-                disabled={sending || selectedSession.state === 'archived'}
+                disabled={
+                  sending ||
+                  selectedSession.state === 'archived' ||
+                  selectedSession.state === 'paused'
+                }
                 onkeydown={handleComposerKeydown}
                 onpaste={handleComposerPaste}
               ></textarea>
@@ -1283,7 +1499,8 @@
                       !sessionSupportsImages ||
                       sending ||
                       selectedSession.state === 'archived' ||
-                      selectedSession.state === 'running'
+                      selectedSession.state === 'running' ||
+                      selectedSession.state === 'paused'
                     }
                     onclick={triggerImagePicker}
                   >
@@ -1295,7 +1512,8 @@
                       !promptReady ||
                       sending ||
                       selectedSession.state === 'archived' ||
-                      selectedSession.state === 'running'
+                      selectedSession.state === 'running' ||
+                      selectedSession.state === 'paused'
                     }
                     onclick={handlePromptSubmit}
                   >
@@ -1511,6 +1729,192 @@
                     </div>
                   {/each}
                 </div>
+              </section>
+
+              <section class="space-y-4 border-t border-zinc-900 pt-6">
+                <div class="space-y-1">
+                  <div class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Agent Jobs</div>
+                  <div class="text-sm text-zinc-400">
+                    Hidden worker history stays here instead of spilling tool chatter into the transcript.
+                  </div>
+                </div>
+
+                {#if jobLoading && jobSummaries.length === 0}
+                  <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-4 text-sm text-zinc-500">
+                    Loading daemon-owned job history...
+                  </div>
+                {:else if jobSummaries.length === 0}
+                  <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-4 text-sm text-zinc-500">
+                    No hidden worker jobs have been recorded for this session yet.
+                  </div>
+                {:else}
+                  <div class="space-y-3">
+                    {#each jobSummaries.slice(0, 4) as job}
+                      <button
+                        type="button"
+                        class={cn(
+                          'w-full rounded-xl border px-3 py-3 text-left transition-colors',
+                          selectedJobId === job.id
+                            ? 'border-lime-300/35 bg-lime-300/8'
+                            : 'border-zinc-800 bg-zinc-900/75 hover:border-zinc-700'
+                        )}
+                        onclick={() => {
+                          void loadJob(job.id);
+                        }}
+                      >
+                        <div class="flex items-start justify-between gap-3">
+                          <div class="min-w-0">
+                            <div class="truncate text-sm font-medium text-zinc-100">{job.title}</div>
+                            <div class="mt-1 text-xs text-zinc-500">{job.prompt_excerpt || job.purpose}</div>
+                          </div>
+                          <Badge variant={badgeVariantForJobState(job.state)}>
+                            {formatState(job.state)}
+                          </Badge>
+                        </div>
+                        <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-zinc-600">
+                          <span>{job.worker_count} workers</span>
+                          <span>{job.pending_approval_count} approvals</span>
+                          <span>{job.artifact_count} artifacts</span>
+                          <span>{formatDateTime(job.updated_at)}</span>
+                        </div>
+                      </button>
+                    {/each}
+                  </div>
+
+                  {#if jobDetail}
+                    <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
+                      <div class="flex items-start justify-between gap-3">
+                        <div class="min-w-0">
+                          <div class="truncate text-sm font-medium text-zinc-100">{jobDetail.job.title}</div>
+                          <div class="mt-1 text-xs leading-5 text-zinc-500">
+                            {jobDetail.job.result_summary || jobDetail.job.prompt_excerpt || jobDetail.job.purpose}
+                          </div>
+                        </div>
+                        <Badge variant={badgeVariantForJobState(jobDetail.job.state)}>
+                          {formatState(jobDetail.job.state)}
+                        </Badge>
+                      </div>
+
+                      {#if jobDetail.job.last_error}
+                        <div class="mt-3 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-200">
+                          {jobDetail.job.last_error}
+                        </div>
+                      {/if}
+
+                      <div class="mt-3 flex flex-wrap gap-2">
+                        {#if jobDetail.job.state === 'running' || jobDetail.job.state === 'queued'}
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={jobActioning}
+                            onclick={handleCancelJob}
+                          >
+                            <XCircle class="size-4" />
+                            <span>{jobActioning ? 'Stopping' : 'Cancel Job'}</span>
+                          </Button>
+                        {/if}
+
+                        {#if jobDetail.job.state === 'paused'}
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            disabled={jobActioning}
+                            onclick={handleResumeJob}
+                          >
+                            <RotateCcw class={cn('size-4', jobActioning && 'animate-spin')} />
+                            <span>{jobActioning ? 'Resuming' : 'Resume Job'}</span>
+                          </Button>
+                        {/if}
+                      </div>
+
+                      <div class="mt-4 space-y-3 border-t border-zinc-800 pt-4">
+                        <div>
+                          <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Workers</div>
+                          <div class="mt-2 space-y-2">
+                            {#each jobDetail.workers as worker}
+                              <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2">
+                                <div class="flex items-center justify-between gap-3">
+                                  <div class="min-w-0">
+                                    <div class="truncate text-sm text-zinc-100">{worker.title}</div>
+                                    <div class="mt-1 text-xs text-zinc-500">
+                                      {formatWorkerSummary(worker)}
+                                    </div>
+                                  </div>
+                                  <Badge variant={badgeVariantForJobState(worker.state)}>
+                                    {formatState(worker.state)}
+                                  </Badge>
+                                </div>
+                                <div class="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-zinc-600">
+                                  <span>{worker.step_count}/{worker.max_steps} steps</span>
+                                  <span>{worker.tool_call_count}/{worker.max_tool_calls} tool calls</span>
+                                  <span>{compactPath(worker.working_dir)}</span>
+                                </div>
+                              </div>
+                            {/each}
+                          </div>
+                        </div>
+
+                        <div>
+                          <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Tool Calls</div>
+                          <div class="mt-2 space-y-2">
+                            {#if jobDetail.tool_calls.length === 0}
+                              <div class="text-xs text-zinc-500">No tool calls were recorded for this job yet.</div>
+                            {:else}
+                              {#each [...jobDetail.tool_calls].reverse().slice(0, 6) as toolCall}
+                                <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2">
+                                  <div class="flex items-center justify-between gap-3">
+                                    <div class="min-w-0">
+                                      <div class="truncate text-sm text-zinc-100">{toolCall.tool_id}</div>
+                                      <div class="mt-1 text-xs text-zinc-500">
+                                        {formatToolCallSummary(toolCall)}
+                                      </div>
+                                    </div>
+                                    <Badge variant={badgeVariantForToolCall(toolCall.status)}>
+                                      {formatState(toolCall.status)}
+                                    </Badge>
+                                  </div>
+                                  {#if toolCall.error_detail}
+                                    <div class="mt-2 text-xs leading-5 text-red-200">{toolCall.error_detail}</div>
+                                  {:else if toolCall.result_json}
+                                    <div class="mt-2 text-xs leading-5 text-zinc-500">
+                                      {JSON.stringify(toolCall.result_json)}
+                                    </div>
+                                  {/if}
+                                </div>
+                              {/each}
+                            {/if}
+                          </div>
+                        </div>
+
+                        <div>
+                          <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Timeline</div>
+                          <div class="mt-2 space-y-2">
+                            {#if jobDetail.events.length === 0}
+                              <div class="text-xs text-zinc-500">No job events have been recorded yet.</div>
+                            {:else}
+                              {#each [...jobDetail.events].reverse().slice(0, 8) as event}
+                                <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2">
+                                  <div class="flex items-start justify-between gap-3">
+                                    <div class="min-w-0">
+                                      <div class="truncate text-sm text-zinc-100">{formatJobEvent(event)}</div>
+                                      {#if event.detail}
+                                        <div class="mt-1 text-xs leading-5 text-zinc-500">{event.detail}</div>
+                                      {/if}
+                                    </div>
+                                    <Badge variant={badgeVariantForJobState(event.status || 'queued')}>
+                                      {formatState(event.status || event.event_type)}
+                                    </Badge>
+                                  </div>
+                                  <div class="mt-2 text-[11px] text-zinc-600">{formatDateTime(event.created_at)}</div>
+                                </div>
+                              {/each}
+                            {/if}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  {/if}
+                {/if}
               </section>
 
               <section class="space-y-4 border-t border-zinc-900 pt-6">

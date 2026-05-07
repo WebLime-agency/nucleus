@@ -8,9 +8,11 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use nucleus_core::{AdapterKind, PRODUCT_SLUG};
 use nucleus_protocol::{
-    AuditEvent, ProjectSummary, RouteTarget, RouterProfileSummary, RuntimeSummary, SessionDetail,
-    SessionProjectSummary, SessionSummary, SessionTurn, SessionTurnImage, StorageSummary,
-    WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceSummary,
+    ApprovalRequestSummary, ArtifactSummary, AuditEvent, JobDetail, JobEvent, JobSummary,
+    PolicyDecisionSummary, ProjectSummary, RouteTarget, RouterProfileSummary, RuntimeSummary,
+    SessionDetail, SessionProjectSummary, SessionSummary, SessionTurn, SessionTurnImage,
+    StorageSummary, ToolCallSummary, ToolCapabilitySummary, WorkerSummary, WorkspaceModelConfig,
+    WorkspaceProfileSummary, WorkspaceSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -97,6 +99,155 @@ pub struct AuditEventRecord {
     pub status: String,
     pub summary: String,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyDecisionRecord {
+    pub decision: String,
+    pub reason: String,
+    pub matched_rule: String,
+    pub scope_kind: String,
+    pub risk_level: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobRecord {
+    pub id: String,
+    pub session_id: Option<String>,
+    pub parent_job_id: Option<String>,
+    pub template_id: Option<String>,
+    pub title: String,
+    pub purpose: String,
+    pub trigger_kind: String,
+    pub state: String,
+    pub requested_by: String,
+    pub prompt_excerpt: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobPatch {
+    pub state: Option<String>,
+    pub root_worker_id: Option<String>,
+    pub visible_turn_id: Option<String>,
+    pub result_summary: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerRecord {
+    pub id: String,
+    pub job_id: String,
+    pub parent_worker_id: Option<String>,
+    pub title: String,
+    pub lane: String,
+    pub state: String,
+    pub provider: String,
+    pub model: String,
+    pub provider_base_url: String,
+    pub provider_api_key: String,
+    pub provider_session_id: String,
+    pub working_dir: String,
+    pub read_roots: Vec<String>,
+    pub write_roots: Vec<String>,
+    pub max_steps: usize,
+    pub max_tool_calls: usize,
+    pub max_wall_clock_secs: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkerPatch {
+    pub state: Option<String>,
+    pub provider_session_id: Option<String>,
+    pub step_count: Option<usize>,
+    pub tool_call_count: Option<usize>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCapabilityGrantRecord {
+    pub tool_id: String,
+    pub summary: String,
+    pub approval_mode: String,
+    pub risk_level: String,
+    pub side_effect_level: String,
+    pub timeout_secs: u64,
+    pub max_output_bytes: usize,
+    pub supports_streaming: bool,
+    pub concurrency_group: String,
+    pub scope_kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCallRecord {
+    pub id: String,
+    pub job_id: String,
+    pub worker_id: String,
+    pub tool_id: String,
+    pub status: String,
+    pub summary: String,
+    pub args_json: serde_json::Value,
+    pub result_json: Option<serde_json::Value>,
+    pub policy_decision: Option<PolicyDecisionRecord>,
+    pub artifact_ids: Vec<String>,
+    pub error_class: String,
+    pub error_detail: String,
+    pub started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ToolCallPatch {
+    pub status: Option<String>,
+    pub summary: Option<String>,
+    pub result_json: Option<Option<serde_json::Value>>,
+    pub policy_decision: Option<Option<PolicyDecisionRecord>>,
+    pub artifact_ids: Option<Vec<String>>,
+    pub error_class: Option<String>,
+    pub error_detail: Option<String>,
+    pub started_at: Option<Option<i64>>,
+    pub completed_at: Option<Option<i64>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRequestRecord {
+    pub id: String,
+    pub job_id: String,
+    pub worker_id: String,
+    pub tool_call_id: String,
+    pub state: String,
+    pub risk_level: String,
+    pub summary: String,
+    pub detail: String,
+    pub diff_preview: String,
+    pub policy_decision: PolicyDecisionRecord,
+    pub resolution_note: String,
+    pub resolved_by: String,
+    pub resolved_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobArtifactRecord {
+    pub id: String,
+    pub job_id: String,
+    pub worker_id: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub kind: String,
+    pub title: String,
+    pub path: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub preview_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobEventRecord {
+    pub job_id: String,
+    pub worker_id: Option<String>,
+    pub event_type: String,
+    pub status: String,
+    pub summary: String,
+    pub detail: String,
+    pub data_json: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -692,6 +843,545 @@ impl StateStore {
         let event_id = connection.last_insert_rowid();
         load_audit_event(&connection, event_id)
     }
+
+    pub fn list_jobs_for_session(&self, session_id: &str) -> Result<Vec<JobSummary>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_jobs_for_session_with_connection(&connection, session_id)
+    }
+
+    pub fn list_jobs_by_state(&self, states: &[&str]) -> Result<Vec<JobSummary>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_jobs_by_state_with_connection(&connection, states)
+    }
+
+    pub fn list_pending_approvals(&self) -> Result<Vec<ApprovalRequestSummary>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_pending_approvals_with_connection(&connection)
+    }
+
+    pub fn get_job(&self, job_id: &str) -> Result<JobDetail> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        load_job_detail(&connection, job_id)
+    }
+
+    pub fn create_job(&self, record: JobRecord) -> Result<JobSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        if let Some(session_id) = record.session_id.as_deref() {
+            ensure_session_exists(&connection, session_id)?;
+        }
+        if let Some(parent_job_id) = record.parent_job_id.as_deref() {
+            ensure_job_exists(&connection, parent_job_id)?;
+        }
+
+        connection.execute(
+            "
+            INSERT INTO jobs (
+                id,
+                session_id,
+                parent_job_id,
+                template_id,
+                title,
+                purpose,
+                trigger_kind,
+                state,
+                requested_by,
+                prompt_excerpt
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ",
+            params![
+                record.id,
+                record.session_id,
+                record.parent_job_id,
+                record.template_id,
+                record.title,
+                record.purpose,
+                record.trigger_kind,
+                record.state,
+                record.requested_by,
+                record.prompt_excerpt,
+            ],
+        )?;
+
+        load_job_summary(&connection, &record.id)
+    }
+
+    pub fn update_job(&self, job_id: &str, patch: JobPatch) -> Result<JobSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let current = load_job_summary(&connection, job_id)?;
+        connection.execute(
+            "
+            UPDATE jobs
+            SET
+                state = ?2,
+                root_worker_id = ?3,
+                visible_turn_id = ?4,
+                result_summary = ?5,
+                last_error = ?6,
+                updated_at = unixepoch()
+            WHERE id = ?1
+            ",
+            params![
+                job_id,
+                patch.state.unwrap_or(current.state),
+                patch.root_worker_id.or(current.root_worker_id),
+                patch.visible_turn_id.or(current.visible_turn_id),
+                patch.result_summary.unwrap_or(current.result_summary),
+                patch.last_error.unwrap_or(current.last_error),
+            ],
+        )?;
+
+        load_job_summary(&connection, job_id)
+    }
+
+    pub fn create_worker(&self, record: WorkerRecord) -> Result<WorkerSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        ensure_job_exists(&connection, &record.job_id)?;
+        if let Some(parent_worker_id) = record.parent_worker_id.as_deref() {
+            ensure_worker_exists(&connection, parent_worker_id)?;
+        }
+        let read_roots_json =
+            serde_json::to_string(&record.read_roots).context("failed to serialize read roots")?;
+        let write_roots_json = serde_json::to_string(&record.write_roots)
+            .context("failed to serialize write roots")?;
+
+        connection.execute(
+            "
+            INSERT INTO job_workers (
+                id,
+                job_id,
+                parent_worker_id,
+                title,
+                lane,
+                state,
+                provider,
+                model,
+                provider_base_url,
+                provider_api_key,
+                provider_session_id,
+                working_dir,
+                read_roots_json,
+                write_roots_json,
+                max_steps,
+                max_tool_calls,
+                max_wall_clock_secs
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            ",
+            params![
+                record.id,
+                record.job_id,
+                record.parent_worker_id,
+                record.title,
+                record.lane,
+                record.state,
+                record.provider,
+                record.model,
+                record.provider_base_url,
+                record.provider_api_key,
+                record.provider_session_id,
+                record.working_dir,
+                read_roots_json,
+                write_roots_json,
+                record.max_steps as i64,
+                record.max_tool_calls as i64,
+                record.max_wall_clock_secs as i64,
+            ],
+        )?;
+
+        load_worker_summary(&connection, &record.id)
+    }
+
+    pub fn update_worker(&self, worker_id: &str, patch: WorkerPatch) -> Result<WorkerSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let current = load_worker_summary(&connection, worker_id)?;
+        connection.execute(
+            "
+            UPDATE job_workers
+            SET
+                state = ?2,
+                provider_session_id = ?3,
+                step_count = ?4,
+                tool_call_count = ?5,
+                last_error = ?6,
+                updated_at = unixepoch()
+            WHERE id = ?1
+            ",
+            params![
+                worker_id,
+                patch.state.unwrap_or(current.state),
+                patch
+                    .provider_session_id
+                    .unwrap_or(current.provider_session_id),
+                patch.step_count.unwrap_or(current.step_count) as i64,
+                patch.tool_call_count.unwrap_or(current.tool_call_count) as i64,
+                patch.last_error.unwrap_or(current.last_error),
+            ],
+        )?;
+
+        load_worker_summary(&connection, worker_id)
+    }
+
+    pub fn replace_tool_capability_grants(
+        &self,
+        worker_id: &str,
+        grants: &[ToolCapabilityGrantRecord],
+    ) -> Result<Vec<ToolCapabilitySummary>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        ensure_worker_exists(&connection, worker_id)?;
+        connection.execute(
+            "DELETE FROM tool_capability_grants WHERE worker_id = ?1",
+            params![worker_id],
+        )?;
+
+        for grant in grants {
+            connection.execute(
+                "
+                INSERT INTO tool_capability_grants (
+                    worker_id,
+                    tool_id,
+                    summary,
+                    approval_mode,
+                    risk_level,
+                    side_effect_level,
+                    timeout_secs,
+                    max_output_bytes,
+                    supports_streaming,
+                    concurrency_group,
+                    scope_kind
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                ",
+                params![
+                    worker_id,
+                    grant.tool_id,
+                    grant.summary,
+                    grant.approval_mode,
+                    grant.risk_level,
+                    grant.side_effect_level,
+                    grant.timeout_secs as i64,
+                    grant.max_output_bytes as i64,
+                    if grant.supports_streaming { 1 } else { 0 },
+                    grant.concurrency_group,
+                    grant.scope_kind,
+                ],
+            )?;
+        }
+
+        load_worker_capabilities(&connection, worker_id)
+    }
+
+    pub fn create_tool_call(&self, record: ToolCallRecord) -> Result<ToolCallSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        ensure_job_exists(&connection, &record.job_id)?;
+        ensure_worker_exists(&connection, &record.worker_id)?;
+        let args_json = serde_json::to_string(&record.args_json)
+            .context("failed to serialize tool call args")?;
+        let result_json = record
+            .result_json
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("failed to serialize tool call result")?;
+        let policy_decision_json = record
+            .policy_decision
+            .as_ref()
+            .map(policy_decision_to_json)
+            .transpose()?;
+        let artifact_ids_json = serde_json::to_string(&record.artifact_ids)
+            .context("failed to serialize tool call artifacts")?;
+
+        connection.execute(
+            "
+            INSERT INTO tool_calls (
+                id,
+                job_id,
+                worker_id,
+                tool_id,
+                status,
+                summary,
+                args_json,
+                result_json,
+                policy_decision_json,
+                artifact_ids_json,
+                error_class,
+                error_detail,
+                started_at,
+                completed_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            ",
+            params![
+                record.id,
+                record.job_id,
+                record.worker_id,
+                record.tool_id,
+                record.status,
+                record.summary,
+                args_json,
+                result_json,
+                policy_decision_json,
+                artifact_ids_json,
+                record.error_class,
+                record.error_detail,
+                record.started_at,
+                record.completed_at,
+            ],
+        )?;
+
+        load_tool_call_summary(&connection, &record.id)
+    }
+
+    pub fn update_tool_call(
+        &self,
+        tool_call_id: &str,
+        patch: ToolCallPatch,
+    ) -> Result<ToolCallSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let current = load_tool_call_summary(&connection, tool_call_id)?;
+        let next_result_json = match patch.result_json {
+            Some(Some(value)) => Some(
+                serde_json::to_string(&value).context("failed to serialize updated tool result")?,
+            ),
+            Some(None) => None,
+            None => current
+                .result_json
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .context("failed to serialize existing tool result")?,
+        };
+        let next_policy = match patch.policy_decision {
+            Some(Some(value)) => Some(policy_decision_to_json(&value)?),
+            Some(None) => None,
+            None => current
+                .policy_decision
+                .as_ref()
+                .map(policy_decision_summary_to_json)
+                .transpose()?,
+        };
+        let next_artifact_ids_json =
+            serde_json::to_string(&patch.artifact_ids.unwrap_or(current.artifact_ids))
+                .context("failed to serialize updated artifact ids")?;
+
+        connection.execute(
+            "
+            UPDATE tool_calls
+            SET
+                status = ?2,
+                summary = ?3,
+                result_json = ?4,
+                policy_decision_json = ?5,
+                artifact_ids_json = ?6,
+                error_class = ?7,
+                error_detail = ?8,
+                started_at = ?9,
+                completed_at = ?10
+            WHERE id = ?1
+            ",
+            params![
+                tool_call_id,
+                patch.status.unwrap_or(current.status),
+                patch.summary.unwrap_or(current.summary),
+                next_result_json,
+                next_policy,
+                next_artifact_ids_json,
+                patch.error_class.unwrap_or(current.error_class),
+                patch.error_detail.unwrap_or(current.error_detail),
+                patch.started_at.unwrap_or(current.started_at),
+                patch.completed_at.unwrap_or(current.completed_at),
+            ],
+        )?;
+
+        load_tool_call_summary(&connection, tool_call_id)
+    }
+
+    pub fn create_approval_request(
+        &self,
+        record: ApprovalRequestRecord,
+    ) -> Result<ApprovalRequestSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        ensure_job_exists(&connection, &record.job_id)?;
+        ensure_worker_exists(&connection, &record.worker_id)?;
+        ensure_tool_call_exists(&connection, &record.tool_call_id)?;
+        let policy_json = policy_decision_to_json(&record.policy_decision)?;
+        connection.execute(
+            "
+            INSERT INTO approval_requests (
+                id,
+                job_id,
+                worker_id,
+                tool_call_id,
+                state,
+                risk_level,
+                summary,
+                detail,
+                diff_preview,
+                policy_decision_json,
+                resolution_note,
+                resolved_by,
+                resolved_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            ",
+            params![
+                record.id,
+                record.job_id,
+                record.worker_id,
+                record.tool_call_id,
+                record.state,
+                record.risk_level,
+                record.summary,
+                record.detail,
+                record.diff_preview,
+                policy_json,
+                record.resolution_note,
+                record.resolved_by,
+                record.resolved_at,
+            ],
+        )?;
+
+        load_approval_request_summary(&connection, &record.id)
+    }
+
+    pub fn update_approval_request(
+        &self,
+        approval_id: &str,
+        state: &str,
+        resolution_note: Option<&str>,
+        resolved_by: Option<&str>,
+        resolved_at: Option<i64>,
+    ) -> Result<ApprovalRequestSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let current = load_approval_request_summary(&connection, approval_id)?;
+        connection.execute(
+            "
+            UPDATE approval_requests
+            SET
+                state = ?2,
+                resolution_note = ?3,
+                resolved_by = ?4,
+                resolved_at = ?5
+            WHERE id = ?1
+            ",
+            params![
+                approval_id,
+                state,
+                resolution_note.unwrap_or(&current.resolution_note),
+                resolved_by.unwrap_or(&current.resolved_by),
+                resolved_at.or(current.resolved_at),
+            ],
+        )?;
+
+        load_approval_request_summary(&connection, approval_id)
+    }
+
+    pub fn create_job_artifact(&self, record: JobArtifactRecord) -> Result<ArtifactSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        ensure_job_exists(&connection, &record.job_id)?;
+        if let Some(worker_id) = record.worker_id.as_deref() {
+            ensure_worker_exists(&connection, worker_id)?;
+        }
+        if let Some(tool_call_id) = record.tool_call_id.as_deref() {
+            ensure_tool_call_exists(&connection, tool_call_id)?;
+        }
+        connection.execute(
+            "
+            INSERT INTO job_artifacts (
+                id,
+                job_id,
+                worker_id,
+                tool_call_id,
+                kind,
+                title,
+                path,
+                mime_type,
+                size_bytes,
+                preview_text
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ",
+            params![
+                record.id,
+                record.job_id,
+                record.worker_id,
+                record.tool_call_id,
+                record.kind,
+                record.title,
+                record.path,
+                record.mime_type,
+                record.size_bytes as i64,
+                record.preview_text,
+            ],
+        )?;
+
+        load_artifact_summary(&connection, &record.id)
+    }
+
+    pub fn append_job_event(&self, record: JobEventRecord) -> Result<JobEvent> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        ensure_job_exists(&connection, &record.job_id)?;
+        if let Some(worker_id) = record.worker_id.as_deref() {
+            ensure_worker_exists(&connection, worker_id)?;
+        }
+        let data_json = serde_json::to_string(&record.data_json)
+            .context("failed to serialize job event data")?;
+        connection.execute(
+            "
+            INSERT INTO job_events (job_id, worker_id, event_type, status, summary, detail, data_json)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ",
+            params![
+                record.job_id,
+                record.worker_id,
+                record.event_type,
+                record.status,
+                record.summary,
+                record.detail,
+                data_json,
+            ],
+        )?;
+
+        let event_id = connection.last_insert_rowid();
+        load_job_event(&connection, event_id)
+    }
+
+    pub fn write_worker_checkpoint(
+        &self,
+        worker_id: &str,
+        checkpoint: &serde_json::Value,
+    ) -> Result<()> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        ensure_worker_exists(&connection, worker_id)?;
+        let checkpoint_json =
+            serde_json::to_string(checkpoint).context("failed to serialize worker checkpoint")?;
+        connection.execute(
+            "
+            INSERT INTO worker_checkpoints (worker_id, checkpoint_json, updated_at)
+            VALUES (?1, ?2, unixepoch())
+            ON CONFLICT(worker_id) DO UPDATE SET
+                checkpoint_json = excluded.checkpoint_json,
+                updated_at = unixepoch()
+            ",
+            params![worker_id, checkpoint_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn read_worker_checkpoint(&self, worker_id: &str) -> Result<Option<serde_json::Value>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        connection
+            .query_row(
+                "SELECT checkpoint_json FROM worker_checkpoints WHERE worker_id = ?1",
+                params![worker_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|payload| {
+                serde_json::from_str(&payload).context("failed to decode worker checkpoint")
+            })
+            .transpose()
+    }
 }
 
 fn default_state_dir() -> Result<PathBuf> {
@@ -780,6 +1470,163 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_session_turns_session_id_created_at
             ON session_turns(session_id, created_at, id);
+
+        CREATE TABLE IF NOT EXISTS jobs (
+            id TEXT PRIMARY KEY,
+            session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+            parent_job_id TEXT REFERENCES jobs(id) ON DELETE CASCADE,
+            template_id TEXT,
+            title TEXT NOT NULL,
+            purpose TEXT NOT NULL DEFAULT '',
+            trigger_kind TEXT NOT NULL DEFAULT 'session_prompt',
+            state TEXT NOT NULL,
+            requested_by TEXT NOT NULL DEFAULT 'user',
+            prompt_excerpt TEXT NOT NULL DEFAULT '',
+            root_worker_id TEXT,
+            visible_turn_id TEXT,
+            result_summary TEXT NOT NULL DEFAULT '',
+            last_error TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_jobs_session_id_created_at
+            ON jobs(session_id, created_at DESC, id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_jobs_parent_job_id_created_at
+            ON jobs(parent_job_id, created_at ASC, id ASC);
+
+        CREATE TABLE IF NOT EXISTS job_workers (
+            id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            parent_worker_id TEXT REFERENCES job_workers(id) ON DELETE SET NULL,
+            title TEXT NOT NULL,
+            lane TEXT NOT NULL DEFAULT 'utility',
+            state TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL DEFAULT '',
+            provider_base_url TEXT NOT NULL DEFAULT '',
+            provider_api_key TEXT NOT NULL DEFAULT '',
+            provider_session_id TEXT NOT NULL DEFAULT '',
+            working_dir TEXT NOT NULL,
+            read_roots_json TEXT NOT NULL DEFAULT '[]',
+            write_roots_json TEXT NOT NULL DEFAULT '[]',
+            max_steps INTEGER NOT NULL DEFAULT 12,
+            max_tool_calls INTEGER NOT NULL DEFAULT 24,
+            max_wall_clock_secs INTEGER NOT NULL DEFAULT 600,
+            step_count INTEGER NOT NULL DEFAULT 0,
+            tool_call_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_job_workers_job_id_created_at
+            ON job_workers(job_id, created_at ASC, id ASC);
+
+        CREATE TABLE IF NOT EXISTS tool_capability_grants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worker_id TEXT NOT NULL REFERENCES job_workers(id) ON DELETE CASCADE,
+            tool_id TEXT NOT NULL,
+            summary TEXT NOT NULL DEFAULT '',
+            approval_mode TEXT NOT NULL,
+            risk_level TEXT NOT NULL,
+            side_effect_level TEXT NOT NULL,
+            timeout_secs INTEGER NOT NULL DEFAULT 30,
+            max_output_bytes INTEGER NOT NULL DEFAULT 65536,
+            supports_streaming INTEGER NOT NULL DEFAULT 0,
+            concurrency_group TEXT NOT NULL DEFAULT '',
+            scope_kind TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_capability_grants_worker_tool
+            ON tool_capability_grants(worker_id, tool_id);
+
+        CREATE TABLE IF NOT EXISTS tool_calls (
+            id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            worker_id TEXT NOT NULL REFERENCES job_workers(id) ON DELETE CASCADE,
+            tool_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            summary TEXT NOT NULL DEFAULT '',
+            args_json TEXT NOT NULL,
+            result_json TEXT,
+            policy_decision_json TEXT,
+            artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+            error_class TEXT NOT NULL DEFAULT '',
+            error_detail TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            started_at INTEGER,
+            completed_at INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tool_calls_job_id_created_at
+            ON tool_calls(job_id, created_at ASC, id ASC);
+
+        CREATE INDEX IF NOT EXISTS idx_tool_calls_worker_id_created_at
+            ON tool_calls(worker_id, created_at ASC, id ASC);
+
+        CREATE TABLE IF NOT EXISTS approval_requests (
+            id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            worker_id TEXT NOT NULL REFERENCES job_workers(id) ON DELETE CASCADE,
+            tool_call_id TEXT NOT NULL REFERENCES tool_calls(id) ON DELETE CASCADE,
+            state TEXT NOT NULL,
+            risk_level TEXT NOT NULL,
+            summary TEXT NOT NULL DEFAULT '',
+            detail TEXT NOT NULL DEFAULT '',
+            diff_preview TEXT NOT NULL DEFAULT '',
+            policy_decision_json TEXT NOT NULL,
+            resolution_note TEXT NOT NULL DEFAULT '',
+            resolved_by TEXT NOT NULL DEFAULT '',
+            requested_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            resolved_at INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_approval_requests_job_id_requested_at
+            ON approval_requests(job_id, requested_at DESC, id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_approval_requests_state_requested_at
+            ON approval_requests(state, requested_at DESC, id DESC);
+
+        CREATE TABLE IF NOT EXISTS job_artifacts (
+            id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            worker_id TEXT REFERENCES job_workers(id) ON DELETE SET NULL,
+            tool_call_id TEXT REFERENCES tool_calls(id) ON DELETE SET NULL,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            path TEXT NOT NULL,
+            mime_type TEXT NOT NULL DEFAULT 'text/plain',
+            size_bytes INTEGER NOT NULL DEFAULT 0,
+            preview_text TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_job_artifacts_job_id_created_at
+            ON job_artifacts(job_id, created_at ASC, id ASC);
+
+        CREATE TABLE IF NOT EXISTS job_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            worker_id TEXT REFERENCES job_workers(id) ON DELETE SET NULL,
+            event_type TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT '',
+            summary TEXT NOT NULL DEFAULT '',
+            detail TEXT NOT NULL DEFAULT '',
+            data_json TEXT NOT NULL DEFAULT '{}',
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_job_events_job_id_created_at
+            ON job_events(job_id, created_at ASC, id ASC);
+
+        CREATE TABLE IF NOT EXISTS worker_checkpoints (
+            worker_id TEXT PRIMARY KEY REFERENCES job_workers(id) ON DELETE CASCADE,
+            checkpoint_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
 
         CREATE TABLE IF NOT EXISTS session_projects (
             session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -2335,6 +3182,598 @@ fn map_audit_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEvent> {
     })
 }
 
+fn list_jobs_for_session_with_connection(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<JobSummary>> {
+    ensure_session_exists(connection, session_id)?;
+    let mut statement = connection.prepare(
+        "
+        SELECT id
+        FROM jobs
+        WHERE session_id = ?1
+        ORDER BY created_at DESC, id DESC
+        ",
+    )?;
+    let rows = statement.query_map(params![session_id], |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load job ids")?
+        .into_iter()
+        .map(|job_id| load_job_summary(connection, &job_id))
+        .collect()
+}
+
+fn list_jobs_by_state_with_connection(
+    connection: &Connection,
+    states: &[&str],
+) -> Result<Vec<JobSummary>> {
+    if states.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = (0..states.len())
+        .map(|index| format!("?{}", index + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "
+        SELECT id
+        FROM jobs
+        WHERE state IN ({placeholders})
+        ORDER BY created_at ASC, id ASC
+        "
+    );
+    let params = rusqlite::params_from_iter(states.iter().copied());
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(params, |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load jobs by state")?
+        .into_iter()
+        .map(|job_id| load_job_summary(connection, &job_id))
+        .collect()
+}
+
+fn list_pending_approvals_with_connection(
+    connection: &Connection,
+) -> Result<Vec<ApprovalRequestSummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id
+        FROM approval_requests
+        WHERE state = 'pending'
+        ORDER BY requested_at DESC, id DESC
+        ",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load pending approval ids")?
+        .into_iter()
+        .map(|approval_id| load_approval_request_summary(connection, &approval_id))
+        .collect()
+}
+
+fn load_job_summary(connection: &Connection, job_id: &str) -> Result<JobSummary> {
+    let mut job = connection
+        .query_row(
+            "
+            SELECT
+                id,
+                session_id,
+                parent_job_id,
+                template_id,
+                title,
+                purpose,
+                trigger_kind,
+                state,
+                requested_by,
+                prompt_excerpt,
+                root_worker_id,
+                visible_turn_id,
+                result_summary,
+                last_error,
+                created_at,
+                updated_at
+            FROM jobs
+            WHERE id = ?1
+            ",
+            params![job_id],
+            map_job_summary_row,
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("job '{job_id}' was not found"))?;
+
+    job.worker_count = count_for_job(connection, "job_workers", job_id)?;
+    job.pending_approval_count = count_pending_approvals_for_job(connection, job_id)?;
+    job.artifact_count = count_for_job(connection, "job_artifacts", job_id)?;
+    Ok(job)
+}
+
+fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> {
+    Ok(JobSummary {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        parent_job_id: row.get(2)?,
+        template_id: row.get(3)?,
+        title: row.get(4)?,
+        purpose: row.get(5)?,
+        trigger_kind: row.get(6)?,
+        state: row.get(7)?,
+        requested_by: row.get(8)?,
+        prompt_excerpt: row.get(9)?,
+        root_worker_id: row.get(10)?,
+        visible_turn_id: row.get(11)?,
+        result_summary: row.get(12)?,
+        last_error: row.get(13)?,
+        worker_count: 0,
+        pending_approval_count: 0,
+        artifact_count: 0,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
+    })
+}
+
+fn count_for_job(connection: &Connection, table: &str, job_id: &str) -> Result<usize> {
+    connection
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE job_id = ?1"),
+            params![job_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count.max(0) as usize)
+        .context("failed to count job rows")
+}
+
+fn count_pending_approvals_for_job(connection: &Connection, job_id: &str) -> Result<usize> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM approval_requests WHERE job_id = ?1 AND state = 'pending'",
+            params![job_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count.max(0) as usize)
+        .context("failed to count pending approvals")
+}
+
+fn load_job_detail(connection: &Connection, job_id: &str) -> Result<JobDetail> {
+    let job = load_job_summary(connection, job_id)?;
+    let workers = load_workers_for_job(connection, job_id)?;
+    let child_jobs = load_child_jobs(connection, job_id)?;
+    let tool_calls = load_tool_calls_for_job(connection, job_id)?;
+    let approvals = load_approval_requests_for_job(connection, job_id)?;
+    let artifacts = load_artifacts_for_job(connection, job_id)?;
+    let events = load_job_events_for_job(connection, job_id)?;
+
+    Ok(JobDetail {
+        job,
+        workers,
+        child_jobs,
+        tool_calls,
+        approvals,
+        artifacts,
+        events,
+    })
+}
+
+fn load_child_jobs(connection: &Connection, parent_job_id: &str) -> Result<Vec<JobSummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id
+        FROM jobs
+        WHERE parent_job_id = ?1
+        ORDER BY created_at ASC, id ASC
+        ",
+    )?;
+    let rows = statement.query_map(params![parent_job_id], |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load child job ids")?
+        .into_iter()
+        .map(|job_id| load_job_summary(connection, &job_id))
+        .collect()
+}
+
+fn load_workers_for_job(connection: &Connection, job_id: &str) -> Result<Vec<WorkerSummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id
+        FROM job_workers
+        WHERE job_id = ?1
+        ORDER BY created_at ASC, id ASC
+        ",
+    )?;
+    let rows = statement.query_map(params![job_id], |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load worker ids")?
+        .into_iter()
+        .map(|worker_id| load_worker_summary(connection, &worker_id))
+        .collect()
+}
+
+fn load_worker_summary(connection: &Connection, worker_id: &str) -> Result<WorkerSummary> {
+    let mut worker = connection
+        .query_row(
+            "
+            SELECT
+                id,
+                job_id,
+                parent_worker_id,
+                title,
+                lane,
+                state,
+                provider,
+                model,
+                provider_base_url,
+                provider_api_key,
+                provider_session_id,
+                working_dir,
+                read_roots_json,
+                write_roots_json,
+                max_steps,
+                max_tool_calls,
+                max_wall_clock_secs,
+                step_count,
+                tool_call_count,
+                last_error,
+                created_at,
+                updated_at
+            FROM job_workers
+            WHERE id = ?1
+            ",
+            params![worker_id],
+            |row| {
+                Ok(WorkerSummary {
+                    id: row.get(0)?,
+                    job_id: row.get(1)?,
+                    parent_worker_id: row.get(2)?,
+                    title: row.get(3)?,
+                    lane: row.get(4)?,
+                    state: row.get(5)?,
+                    provider: row.get(6)?,
+                    model: row.get(7)?,
+                    provider_base_url: row.get(8)?,
+                    provider_api_key: row.get(9)?,
+                    provider_session_id: row.get(10)?,
+                    working_dir: row.get(11)?,
+                    read_roots: decode_string_list(row.get::<_, String>(12)?)?,
+                    write_roots: decode_string_list(row.get::<_, String>(13)?)?,
+                    max_steps: row.get::<_, i64>(14)?.max(0) as usize,
+                    max_tool_calls: row.get::<_, i64>(15)?.max(0) as usize,
+                    max_wall_clock_secs: row.get::<_, i64>(16)?.max(0) as u64,
+                    step_count: row.get::<_, i64>(17)?.max(0) as usize,
+                    tool_call_count: row.get::<_, i64>(18)?.max(0) as usize,
+                    last_error: row.get(19)?,
+                    capabilities: Vec::new(),
+                    created_at: row.get(20)?,
+                    updated_at: row.get(21)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("worker '{worker_id}' was not found"))?;
+    worker.capabilities = load_worker_capabilities(connection, worker_id)?;
+    Ok(worker)
+}
+
+fn load_worker_capabilities(
+    connection: &Connection,
+    worker_id: &str,
+) -> Result<Vec<ToolCapabilitySummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT
+            tool_id,
+            summary,
+            approval_mode,
+            risk_level,
+            side_effect_level,
+            timeout_secs,
+            max_output_bytes,
+            supports_streaming,
+            concurrency_group,
+            scope_kind
+        FROM tool_capability_grants
+        WHERE worker_id = ?1
+        ORDER BY tool_id ASC
+        ",
+    )?;
+    let rows = statement.query_map(params![worker_id], |row| {
+        Ok(ToolCapabilitySummary {
+            tool_id: row.get(0)?,
+            summary: row.get(1)?,
+            approval_mode: row.get(2)?,
+            risk_level: row.get(3)?,
+            side_effect_level: row.get(4)?,
+            timeout_secs: row.get::<_, i64>(5)?.max(0) as u64,
+            max_output_bytes: row.get::<_, i64>(6)?.max(0) as usize,
+            supports_streaming: row.get::<_, i64>(7)? != 0,
+            concurrency_group: row.get(8)?,
+            scope_kind: row.get(9)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load worker capabilities")
+}
+
+fn load_tool_calls_for_job(connection: &Connection, job_id: &str) -> Result<Vec<ToolCallSummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id
+        FROM tool_calls
+        WHERE job_id = ?1
+        ORDER BY created_at ASC, id ASC
+        ",
+    )?;
+    let rows = statement.query_map(params![job_id], |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load tool call ids")?
+        .into_iter()
+        .map(|call_id| load_tool_call_summary(connection, &call_id))
+        .collect()
+}
+
+fn load_tool_call_summary(connection: &Connection, tool_call_id: &str) -> Result<ToolCallSummary> {
+    connection
+        .query_row(
+            "
+            SELECT
+                id,
+                job_id,
+                worker_id,
+                tool_id,
+                status,
+                summary,
+                args_json,
+                result_json,
+                policy_decision_json,
+                artifact_ids_json,
+                error_class,
+                error_detail,
+                created_at,
+                started_at,
+                completed_at
+            FROM tool_calls
+            WHERE id = ?1
+            ",
+            params![tool_call_id],
+            |row| {
+                let result_json = row.get::<_, Option<String>>(7)?;
+                let policy_json = row.get::<_, Option<String>>(8)?;
+                Ok(ToolCallSummary {
+                    id: row.get(0)?,
+                    job_id: row.get(1)?,
+                    worker_id: row.get(2)?,
+                    tool_id: row.get(3)?,
+                    status: row.get(4)?,
+                    summary: row.get(5)?,
+                    args_json: decode_json_value(row.get::<_, String>(6)?)?,
+                    result_json: result_json.map(decode_json_value).transpose()?,
+                    policy_decision: policy_json.map(decode_policy_decision).transpose()?,
+                    artifact_ids: decode_string_list(row.get::<_, String>(9)?)?,
+                    error_class: row.get(10)?,
+                    error_detail: row.get(11)?,
+                    created_at: row.get(12)?,
+                    started_at: row.get(13)?,
+                    completed_at: row.get(14)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("tool call '{tool_call_id}' was not found"))
+}
+
+fn load_approval_requests_for_job(
+    connection: &Connection,
+    job_id: &str,
+) -> Result<Vec<ApprovalRequestSummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id
+        FROM approval_requests
+        WHERE job_id = ?1
+        ORDER BY requested_at DESC, id DESC
+        ",
+    )?;
+    let rows = statement.query_map(params![job_id], |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load approval ids")?
+        .into_iter()
+        .map(|approval_id| load_approval_request_summary(connection, &approval_id))
+        .collect()
+}
+
+fn load_approval_request_summary(
+    connection: &Connection,
+    approval_id: &str,
+) -> Result<ApprovalRequestSummary> {
+    connection
+        .query_row(
+            "
+            SELECT
+                id,
+                job_id,
+                worker_id,
+                tool_call_id,
+                state,
+                risk_level,
+                summary,
+                detail,
+                diff_preview,
+                policy_decision_json,
+                resolution_note,
+                resolved_by,
+                requested_at,
+                resolved_at
+            FROM approval_requests
+            WHERE id = ?1
+            ",
+            params![approval_id],
+            |row| {
+                Ok(ApprovalRequestSummary {
+                    id: row.get(0)?,
+                    job_id: row.get(1)?,
+                    worker_id: row.get(2)?,
+                    tool_call_id: row.get(3)?,
+                    state: row.get(4)?,
+                    risk_level: row.get(5)?,
+                    summary: row.get(6)?,
+                    detail: row.get(7)?,
+                    diff_preview: row.get(8)?,
+                    policy_decision: decode_policy_decision(row.get::<_, String>(9)?)?,
+                    resolution_note: row.get(10)?,
+                    resolved_by: row.get(11)?,
+                    requested_at: row.get(12)?,
+                    resolved_at: row.get(13)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("approval request '{approval_id}' was not found"))
+}
+
+fn load_artifacts_for_job(connection: &Connection, job_id: &str) -> Result<Vec<ArtifactSummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id
+        FROM job_artifacts
+        WHERE job_id = ?1
+        ORDER BY created_at ASC, id ASC
+        ",
+    )?;
+    let rows = statement.query_map(params![job_id], |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load artifact ids")?
+        .into_iter()
+        .map(|artifact_id| load_artifact_summary(connection, &artifact_id))
+        .collect()
+}
+
+fn load_artifact_summary(connection: &Connection, artifact_id: &str) -> Result<ArtifactSummary> {
+    connection
+        .query_row(
+            "
+            SELECT
+                id,
+                job_id,
+                worker_id,
+                tool_call_id,
+                kind,
+                title,
+                path,
+                mime_type,
+                size_bytes,
+                preview_text,
+                created_at
+            FROM job_artifacts
+            WHERE id = ?1
+            ",
+            params![artifact_id],
+            |row| {
+                Ok(ArtifactSummary {
+                    id: row.get(0)?,
+                    job_id: row.get(1)?,
+                    worker_id: row.get(2)?,
+                    tool_call_id: row.get(3)?,
+                    kind: row.get(4)?,
+                    title: row.get(5)?,
+                    path: row.get(6)?,
+                    mime_type: row.get(7)?,
+                    size_bytes: row.get::<_, i64>(8)?.max(0) as u64,
+                    preview_text: row.get(9)?,
+                    created_at: row.get(10)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("artifact '{artifact_id}' was not found"))
+}
+
+fn load_job_events_for_job(connection: &Connection, job_id: &str) -> Result<Vec<JobEvent>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id, job_id, worker_id, event_type, status, summary, detail, data_json, created_at
+        FROM job_events
+        WHERE job_id = ?1
+        ORDER BY created_at ASC, id ASC
+        ",
+    )?;
+    let rows = statement.query_map(params![job_id], map_job_event)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load job events")
+}
+
+fn load_job_event(connection: &Connection, event_id: i64) -> Result<JobEvent> {
+    connection
+        .query_row(
+            "
+            SELECT id, job_id, worker_id, event_type, status, summary, detail, data_json, created_at
+            FROM job_events
+            WHERE id = ?1
+            ",
+            params![event_id],
+            map_job_event,
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("job event '{event_id}' was not found"))
+}
+
+fn map_job_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobEvent> {
+    Ok(JobEvent {
+        id: row.get(0)?,
+        job_id: row.get(1)?,
+        worker_id: row.get(2)?,
+        event_type: row.get(3)?,
+        status: row.get(4)?,
+        summary: row.get(5)?,
+        detail: row.get(6)?,
+        data_json: decode_json_value(row.get::<_, String>(7)?)?,
+        created_at: row.get(8)?,
+    })
+}
+
+fn decode_string_list(value: String) -> rusqlite::Result<Vec<String>> {
+    serde_json::from_str(&value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            value.len(),
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+fn decode_json_value(value: String) -> rusqlite::Result<serde_json::Value> {
+    serde_json::from_str(&value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            value.len(),
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+fn decode_policy_decision(value: String) -> rusqlite::Result<PolicyDecisionSummary> {
+    serde_json::from_str(&value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            value.len(),
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+fn policy_decision_to_json(record: &PolicyDecisionRecord) -> Result<String> {
+    serde_json::to_string(&PolicyDecisionSummary {
+        decision: record.decision.clone(),
+        reason: record.reason.clone(),
+        matched_rule: record.matched_rule.clone(),
+        scope_kind: record.scope_kind.clone(),
+        risk_level: record.risk_level.clone(),
+    })
+    .context("failed to serialize policy decision")
+}
+
+fn policy_decision_summary_to_json(summary: &PolicyDecisionSummary) -> Result<String> {
+    serde_json::to_string(summary).context("failed to serialize policy decision summary")
+}
+
 fn ensure_session_exists(connection: &Connection, session_id: &str) -> Result<()> {
     let found = connection
         .query_row(
@@ -2348,6 +3787,46 @@ fn ensure_session_exists(connection: &Connection, session_id: &str) -> Result<()
         bail!("session '{session_id}' was not found");
     }
 
+    Ok(())
+}
+
+fn ensure_job_exists(connection: &Connection, job_id: &str) -> Result<()> {
+    let found = connection
+        .query_row("SELECT 1 FROM jobs WHERE id = ?1", params![job_id], |row| {
+            row.get::<_, i64>(0)
+        })
+        .optional()?;
+    if found.is_none() {
+        bail!("job '{job_id}' was not found");
+    }
+    Ok(())
+}
+
+fn ensure_worker_exists(connection: &Connection, worker_id: &str) -> Result<()> {
+    let found = connection
+        .query_row(
+            "SELECT 1 FROM job_workers WHERE id = ?1",
+            params![worker_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if found.is_none() {
+        bail!("worker '{worker_id}' was not found");
+    }
+    Ok(())
+}
+
+fn ensure_tool_call_exists(connection: &Connection, tool_call_id: &str) -> Result<()> {
+    let found = connection
+        .query_row(
+            "SELECT 1 FROM tool_calls WHERE id = ?1",
+            params![tool_call_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if found.is_none() {
+        bail!("tool call '{tool_call_id}' was not found");
+    }
     Ok(())
 }
 

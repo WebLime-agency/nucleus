@@ -76,6 +76,146 @@ export const sessionDetailSchema = z.object({
   turns: z.array(sessionTurnSchema)
 });
 
+export const policyDecisionSummarySchema = z.object({
+  decision: z.string(),
+  reason: z.string(),
+  matched_rule: z.string(),
+  scope_kind: z.string(),
+  risk_level: z.string()
+});
+
+export const toolCapabilitySummarySchema = z.object({
+  tool_id: z.string(),
+  summary: z.string(),
+  approval_mode: z.string(),
+  risk_level: z.string(),
+  side_effect_level: z.string(),
+  timeout_secs: z.number().int().nonnegative(),
+  max_output_bytes: z.number().int().nonnegative(),
+  supports_streaming: z.boolean(),
+  concurrency_group: z.string(),
+  scope_kind: z.string()
+});
+
+export const jobSummarySchema = z.object({
+  id: z.string(),
+  session_id: z.string().nullable(),
+  parent_job_id: z.string().nullable(),
+  template_id: z.string().nullable(),
+  title: z.string(),
+  purpose: z.string(),
+  trigger_kind: z.string(),
+  state: z.string(),
+  requested_by: z.string(),
+  prompt_excerpt: z.string(),
+  root_worker_id: z.string().nullable(),
+  visible_turn_id: z.string().nullable(),
+  result_summary: z.string(),
+  last_error: z.string(),
+  worker_count: z.number().int().nonnegative(),
+  pending_approval_count: z.number().int().nonnegative(),
+  artifact_count: z.number().int().nonnegative(),
+  created_at: z.number().int(),
+  updated_at: z.number().int()
+});
+
+export const workerSummarySchema = z.object({
+  id: z.string(),
+  job_id: z.string(),
+  parent_worker_id: z.string().nullable(),
+  title: z.string(),
+  lane: z.string(),
+  state: z.string(),
+  provider: z.string(),
+  model: z.string(),
+  provider_base_url: z.string(),
+  provider_api_key: z.string(),
+  provider_session_id: z.string(),
+  working_dir: z.string(),
+  read_roots: z.array(z.string()).default([]),
+  write_roots: z.array(z.string()).default([]),
+  max_steps: z.number().int().nonnegative(),
+  max_tool_calls: z.number().int().nonnegative(),
+  max_wall_clock_secs: z.number().int().nonnegative(),
+  step_count: z.number().int().nonnegative(),
+  tool_call_count: z.number().int().nonnegative(),
+  last_error: z.string(),
+  capabilities: z.array(toolCapabilitySummarySchema).default([]),
+  created_at: z.number().int(),
+  updated_at: z.number().int()
+});
+
+export const toolCallSummarySchema = z.object({
+  id: z.string(),
+  job_id: z.string(),
+  worker_id: z.string(),
+  tool_id: z.string(),
+  status: z.string(),
+  summary: z.string(),
+  args_json: z.unknown(),
+  result_json: z.unknown().nullable(),
+  policy_decision: policyDecisionSummarySchema.nullable(),
+  artifact_ids: z.array(z.string()).default([]),
+  error_class: z.string(),
+  error_detail: z.string(),
+  created_at: z.number().int(),
+  started_at: z.number().int().nullable(),
+  completed_at: z.number().int().nullable()
+});
+
+export const approvalRequestSummarySchema = z.object({
+  id: z.string(),
+  job_id: z.string(),
+  worker_id: z.string(),
+  tool_call_id: z.string(),
+  state: z.string(),
+  risk_level: z.string(),
+  summary: z.string(),
+  detail: z.string(),
+  diff_preview: z.string(),
+  policy_decision: policyDecisionSummarySchema,
+  resolution_note: z.string(),
+  resolved_by: z.string(),
+  requested_at: z.number().int(),
+  resolved_at: z.number().int().nullable()
+});
+
+export const artifactSummarySchema = z.object({
+  id: z.string(),
+  job_id: z.string(),
+  worker_id: z.string().nullable(),
+  tool_call_id: z.string().nullable(),
+  kind: z.string(),
+  title: z.string(),
+  path: z.string(),
+  mime_type: z.string(),
+  size_bytes: z.number().int().nonnegative(),
+  preview_text: z.string(),
+  created_at: z.number().int()
+});
+
+export const jobEventSchema = z.object({
+  id: z.number().int().nonnegative(),
+  job_id: z.string(),
+  worker_id: z.string().nullable(),
+  event_type: z.string(),
+  status: z.string(),
+  summary: z.string(),
+  detail: z.string(),
+  data_json: z.unknown(),
+  created_at: z.number().int()
+});
+
+export const jobDetailSchema = z.object({
+  job: jobSummarySchema,
+  workers: z.array(workerSummarySchema).default([]),
+  child_jobs: z.array(jobSummarySchema).default([]),
+  tool_calls: z.array(toolCallSummarySchema).default([]),
+  approvals: z.array(approvalRequestSummarySchema).default([]),
+  artifacts: z.array(artifactSummarySchema).default([]),
+  events: z.array(jobEventSchema).default([])
+});
+
 export const promptProgressUpdateSchema = z.object({
   session_id: z.string(),
   status: z.string(),
@@ -427,6 +567,38 @@ export const daemonEventSchema = z.discriminatedUnion('event', [
     data: sessionDetailSchema
   }),
   z.object({
+    event: z.literal('job.created'),
+    data: jobSummarySchema
+  }),
+  z.object({
+    event: z.literal('job.updated'),
+    data: jobSummarySchema
+  }),
+  z.object({
+    event: z.literal('worker.updated'),
+    data: workerSummarySchema
+  }),
+  z.object({
+    event: z.literal('approval.requested'),
+    data: approvalRequestSummarySchema
+  }),
+  z.object({
+    event: z.literal('approval.resolved'),
+    data: approvalRequestSummarySchema
+  }),
+  z.object({
+    event: z.literal('artifact.added'),
+    data: artifactSummarySchema
+  }),
+  z.object({
+    event: z.literal('job.completed'),
+    data: jobSummarySchema
+  }),
+  z.object({
+    event: z.literal('job.failed'),
+    data: jobSummarySchema
+  }),
+  z.object({
     event: z.literal('prompt.progress'),
     data: promptProgressUpdateSchema
   }),
@@ -460,6 +632,15 @@ export type SessionProjectSummary = z.infer<typeof sessionProjectSummarySchema>;
 export type SessionTurnImage = z.infer<typeof sessionTurnImageSchema>;
 export type SessionTurn = z.infer<typeof sessionTurnSchema>;
 export type SessionDetail = z.infer<typeof sessionDetailSchema>;
+export type PolicyDecisionSummary = z.infer<typeof policyDecisionSummarySchema>;
+export type ToolCapabilitySummary = z.infer<typeof toolCapabilitySummarySchema>;
+export type JobSummary = z.infer<typeof jobSummarySchema>;
+export type WorkerSummary = z.infer<typeof workerSummarySchema>;
+export type ToolCallSummary = z.infer<typeof toolCallSummarySchema>;
+export type ApprovalRequestSummary = z.infer<typeof approvalRequestSummarySchema>;
+export type ArtifactSummary = z.infer<typeof artifactSummarySchema>;
+export type JobEvent = z.infer<typeof jobEventSchema>;
+export type JobDetail = z.infer<typeof jobDetailSchema>;
 export type PromptProgressUpdate = z.infer<typeof promptProgressUpdateSchema>;
 export type ActionSummary = z.infer<typeof actionSummarySchema>;
 export type ActionRunResponse = z.infer<typeof actionRunResponseSchema>;
