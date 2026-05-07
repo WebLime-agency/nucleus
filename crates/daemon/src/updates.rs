@@ -173,7 +173,17 @@ pub struct UpdateManager {
 
 impl UpdateManager {
     pub fn new(instance: InstanceRuntime, store: Arc<StateStore>) -> Self {
-        let initial = initial_status(&instance, &store.read_update_state().unwrap_or_default());
+        let stored = store.read_update_state().unwrap_or_default();
+        let initial = initial_status(&instance, &stored);
+        let mut reconciled = stored_state_from_status(&initial);
+        if reconciled.release_manifest_url.is_none() {
+            reconciled.release_manifest_url = stored.release_manifest_url.clone();
+        }
+        if reconciled != stored
+            && let Err(error) = store.write_update_state(&reconciled)
+        {
+            tracing::warn!(error = %error, "failed to reconcile persisted update state");
+        }
         Self {
             instance,
             store,
@@ -869,6 +879,20 @@ fn initial_status(instance: &InstanceRuntime, stored: &StoredUpdateState) -> Upd
                 .unwrap_or_else(|| DEFAULT_RELEASE_CHANNEL.to_string()),
         )
     };
+    let current_ref = if instance.is_managed_release() {
+        instance
+            .install_root
+            .as_deref()
+            .and_then(|root| current_release_id(root).ok().flatten())
+    } else {
+        None
+    };
+    let restart_required = managed_restart_required_on_boot(
+        instance,
+        stored.restart_required,
+        current_ref.as_deref(),
+        stored.last_successful_target_release_id.as_deref(),
+    );
 
     UpdateStatus {
         install_kind: instance.install_kind.clone(),
@@ -877,14 +901,7 @@ fn initial_status(instance: &InstanceRuntime, stored: &StoredUpdateState) -> Upd
         repo_root: instance
             .is_dev_checkout()
             .then(|| display_path(&instance.repo_root)),
-        current_ref: if instance.is_managed_release() {
-            instance
-                .install_root
-                .as_deref()
-                .and_then(|root| current_release_id(root).ok().flatten())
-        } else {
-            None
-        },
+        current_ref,
         remote_name: instance
             .is_dev_checkout()
             .then(|| DEFAULT_REMOTE_NAME.to_string()),
@@ -900,7 +917,7 @@ fn initial_status(instance: &InstanceRuntime, stored: &StoredUpdateState) -> Upd
         latest_release_id: stored.last_successful_target_release_id.clone(),
         update_available: stored.update_available,
         dirty_worktree: false,
-        restart_required: stored.restart_required,
+        restart_required,
         last_successful_check_at: stored.last_successful_check_at,
         last_attempted_check_at: stored.last_attempted_check_at,
         last_attempt_result: stored.last_attempt_result.clone(),
@@ -913,9 +930,28 @@ fn initial_status(instance: &InstanceRuntime, stored: &StoredUpdateState) -> Upd
         },
         message: initial_message(
             instance,
-            stored.restart_required,
+            restart_required,
             stored.release_manifest_url.as_deref(),
         ),
+    }
+}
+
+fn managed_restart_required_on_boot(
+    instance: &InstanceRuntime,
+    restart_required: bool,
+    current_ref: Option<&str>,
+    staged_release_id: Option<&str>,
+) -> bool {
+    if !instance.is_managed_release() || !restart_required {
+        return restart_required;
+    }
+
+    match (
+        current_ref.and_then(non_empty),
+        staged_release_id.and_then(non_empty),
+    ) {
+        (Some(current_ref), Some(staged_release_id)) if current_ref == staged_release_id => false,
+        _ => true,
     }
 }
 
@@ -1196,7 +1232,6 @@ async fn inspect_managed_release(
         .as_deref()
         .map(|current| current != selected.release.release_id)
         .unwrap_or(true);
-
     Ok(UpdateStatus {
         install_kind: instance.install_kind.clone(),
         tracked_channel: Some(tracked_channel.clone()),
@@ -1749,7 +1784,7 @@ mod tests {
             managed_web_dist_dir: Some(current_release_web_dir(&install_root)),
             restart_mode: RestartMode::Unsupported,
         };
-        let manager = super::UpdateManager::new(instance, store.clone());
+        let manager = super::UpdateManager::new(instance.clone(), store.clone());
 
         let checked = manager.check().await;
         assert!(checked.status.update_available);
@@ -1794,6 +1829,16 @@ mod tests {
             persisted.last_successful_target_release_id.as_deref(),
             Some("rel_next")
         );
+
+        let restarted = super::UpdateManager::new(instance, store.clone());
+        let restarted_status = restarted.current().await;
+        assert_eq!(restarted_status.current_ref.as_deref(), Some("rel_next"));
+        assert!(!restarted_status.restart_required, "{:?}", restarted_status);
+
+        let reconciled = store
+            .read_update_state()
+            .expect("reconciled update state should read");
+        assert!(!reconciled.restart_required, "{:?}", reconciled);
 
         let _ = fs::remove_dir_all(root);
     }
