@@ -229,6 +229,7 @@ pub struct ArtifactSummary {
     pub job_id: String,
     pub worker_id: Option<String>,
     pub tool_call_id: Option<String>,
+    pub command_session_id: Option<String>,
     pub kind: String,
     pub title: String,
     pub path: String,
@@ -237,6 +238,34 @@ pub struct ArtifactSummary {
     #[serde(default)]
     pub preview_text: String,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommandSessionSummary {
+    pub id: String,
+    pub job_id: String,
+    pub worker_id: String,
+    pub tool_call_id: Option<String>,
+    pub mode: String,
+    pub title: String,
+    pub state: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub cwd: String,
+    #[serde(default)]
+    pub network_policy: String,
+    pub timeout_secs: u64,
+    pub output_limit_bytes: usize,
+    #[serde(default)]
+    pub last_error: String,
+    pub exit_code: Option<i32>,
+    pub stdout_artifact_id: Option<String>,
+    pub stderr_artifact_id: Option<String>,
+    pub started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -265,6 +294,8 @@ pub struct JobDetail {
     pub approvals: Vec<ApprovalRequestSummary>,
     #[serde(default)]
     pub artifacts: Vec<ArtifactSummary>,
+    #[serde(default)]
+    pub command_sessions: Vec<CommandSessionSummary>,
     #[serde(default)]
     pub events: Vec<JobEvent>,
 }
@@ -690,6 +721,8 @@ pub enum DaemonEvent {
     ApprovalResolved(ApprovalRequestSummary),
     #[serde(rename = "artifact.added")]
     ArtifactAdded(ArtifactSummary),
+    #[serde(rename = "command_session.updated")]
+    CommandSessionUpdated(CommandSessionSummary),
     #[serde(rename = "job.completed")]
     JobCompleted(JobSummary),
     #[serde(rename = "job.failed")]
