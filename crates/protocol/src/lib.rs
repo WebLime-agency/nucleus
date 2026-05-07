@@ -321,6 +321,11 @@ pub struct SessionPromptRequest {
     pub images: Vec<SessionTurnImage>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalResolutionRequest {
+    pub note: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectSummary {
     pub id: String,

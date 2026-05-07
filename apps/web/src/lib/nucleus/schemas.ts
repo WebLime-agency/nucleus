@@ -262,6 +262,10 @@ export const sessionPromptRequestSchema = z.object({
   message: 'A prompt or at least one image is required.'
 });
 
+export const approvalResolutionRequestSchema = z.object({
+  note: z.string().trim().optional()
+});
+
 export const actionParameterSchema = z.object({
   name: z.string(),
   label: z.string(),
@@ -642,6 +646,7 @@ export type ArtifactSummary = z.infer<typeof artifactSummarySchema>;
 export type JobEvent = z.infer<typeof jobEventSchema>;
 export type JobDetail = z.infer<typeof jobDetailSchema>;
 export type PromptProgressUpdate = z.infer<typeof promptProgressUpdateSchema>;
+export type ApprovalResolutionRequest = z.infer<typeof approvalResolutionRequestSchema>;
 export type ActionSummary = z.infer<typeof actionSummarySchema>;
 export type ActionRunResponse = z.infer<typeof actionRunResponseSchema>;
 export type AuditEvent = z.infer<typeof auditEventSchema>;
