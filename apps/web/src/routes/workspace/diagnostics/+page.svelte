@@ -100,7 +100,11 @@
       return;
     }
 
-    await goto(`/diagnostics?view=${next}`, { noScroll: true, keepFocus: true, replaceState: true });
+    await goto(`/workspace/diagnostics?view=${next}`, {
+      noScroll: true,
+      keepFocus: true,
+      replaceState: true
+    });
   }
 
   async function handleKill(pid: number) {

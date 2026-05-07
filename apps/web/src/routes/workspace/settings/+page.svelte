@@ -3,12 +3,14 @@
   import {
     Check,
     Download,
+    FolderTree,
     GitBranch,
     HardDrive,
     KeyRound,
     Link,
     Power,
     RefreshCcw,
+    Save,
     Settings2,
     Server,
     ShieldAlert
@@ -31,9 +33,11 @@
   import {
     applyUpdate,
     checkForUpdates,
+    fetchOverview,
     fetchSettings,
     restartDaemon,
-    updateUpdateConfig
+    updateUpdateConfig,
+    updateWorkspace
   } from '$lib/nucleus/client';
   import {
     compactPath,
@@ -42,21 +46,32 @@
     formatState
   } from '$lib/nucleus/format';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
-  import type { DaemonEvent, SettingsSummary } from '$lib/nucleus/schemas';
+  import type {
+    DaemonEvent,
+    RuntimeOverview,
+    SettingsSummary,
+    WorkspaceSummary
+  } from '$lib/nucleus/schemas';
 
   const releaseChannels = ['stable', 'beta', 'nightly'] as const;
 
   let settings = $state<SettingsSummary | null>(null);
+  let overview = $state<RuntimeOverview | null>(null);
   let loading = $state(true);
   let checking = $state(false);
   let applying = $state(false);
   let restarting = $state(false);
   let savingUpdateConfig = $state(false);
+  let savingWorkspace = $state(false);
   let error = $state<string | null>(null);
   let success = $state<string | null>(null);
   let streamStatus = $state<StreamStatus>('connecting');
   let trackedChannelInput = $state('stable');
   let trackedRefInput = $state('');
+  let workspaceRoot = $state('');
+
+  let workspace = $derived<WorkspaceSummary | null>(overview?.workspace ?? null);
+  let workspaceDirty = $derived(workspace ? workspaceRoot !== workspace.root_path : false);
 
   let update = $derived(settings?.update ?? null);
   let compatibility = $derived(evaluateCompatibility(settings?.compatibility ?? null));
@@ -182,6 +197,45 @@
     }
   }
 
+  function applyOverview(next: RuntimeOverview, force = false) {
+    overview = next;
+
+    if (force || !workspaceDirty) {
+      workspaceRoot = next.workspace.root_path;
+    }
+  }
+
+  async function loadOverview() {
+    try {
+      applyOverview(await fetchOverview(), true);
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to load workspace state.';
+    }
+  }
+
+  async function handleSaveWorkspace() {
+    if (!workspaceRoot.trim()) {
+      error = 'Workspace root is required.';
+      return;
+    }
+
+    savingWorkspace = true;
+    success = null;
+
+    try {
+      const nextWorkspace = await updateWorkspace({ root_path: workspaceRoot });
+      if (overview) {
+        applyOverview({ ...overview, workspace: nextWorkspace }, true);
+      }
+      error = null;
+      success = 'Workspace root updated.';
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to update the workspace root.';
+    } finally {
+      savingWorkspace = false;
+    }
+  }
+
   async function handleCheckForUpdates() {
     checking = true;
     success = null;
@@ -262,18 +316,22 @@
   }
 
   function applyStreamEvent(event: DaemonEvent) {
-    if (event.event !== 'update.updated' || !settings) {
+    if (event.event === 'overview.updated') {
+      applyOverview(event.data);
       return;
     }
 
-    applySettings({
-      ...settings,
-      update: event.data
-    });
+    if (event.event === 'update.updated' && settings) {
+      applySettings({
+        ...settings,
+        update: event.data
+      });
+    }
   }
 
   onMount(() => {
     void loadSettings();
+    void loadOverview();
 
     const disconnect = connectDaemonStream({
       onEvent: applyStreamEvent,
@@ -328,6 +386,61 @@
       {success}
     </div>
   {/if}
+
+  <Card>
+    <CardHeader>
+      <CardTitle>Workspace</CardTitle>
+      <CardDescription>
+        The workspace root is where the daemon discovers projects. Sessions still pick which
+        projects to attach when work starts.
+      </CardDescription>
+    </CardHeader>
+    <CardContent class="space-y-4">
+      <label class="block space-y-1">
+        <span class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Root Path</span>
+        <input
+          class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
+          bind:value={workspaceRoot}
+          placeholder="/home/eba/dev-projects"
+        />
+      </label>
+
+      <Button
+        onclick={handleSaveWorkspace}
+        disabled={savingWorkspace || !workspaceDirty || !workspaceRoot.trim()}
+      >
+        <Save class={savingWorkspace ? 'size-4 animate-spin' : 'size-4'} />
+        {savingWorkspace ? 'Saving' : 'Save Workspace Root'}
+      </Button>
+
+      <div class="space-y-3 pt-2">
+        <div class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">
+          Discovered Projects
+        </div>
+        {#if !workspace || workspace.projects.length === 0}
+          <div class="rounded-md border border-dashed border-zinc-800 px-4 py-6 text-sm text-zinc-500">
+            No projects discovered yet. Save a valid root and the daemon will populate them.
+          </div>
+        {:else}
+          {#each workspace.projects as project}
+            <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+              <div class="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+                <div class="space-y-1">
+                  <div class="flex items-center gap-2">
+                    <FolderTree class="size-4 text-zinc-500" />
+                    <div class="font-medium text-zinc-100">{project.title}</div>
+                    <Badge variant="secondary">Discovered</Badge>
+                  </div>
+                  <div class="text-sm text-zinc-400">{project.relative_path}</div>
+                  <div class="text-xs text-zinc-500">{compactPath(project.absolute_path)}</div>
+                </div>
+              </div>
+            </div>
+          {/each}
+        {/if}
+      </div>
+    </CardContent>
+  </Card>
 
   <section class="grid gap-4 xl:grid-cols-[0.95fr_1.05fr]">
     <Card>
