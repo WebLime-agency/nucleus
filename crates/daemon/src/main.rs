@@ -32,11 +32,12 @@ use nucleus_core::{AdapterKind, DEFAULT_DAEMON_ADDR, PRODUCT_NAME, product_banne
 use nucleus_protocol::{
     ActionParameter, ActionRunRequest, ActionRunResponse, ActionSummary, ApprovalRequestSummary,
     ApprovalResolutionRequest, AuditEvent, AuthSummary, CompatibilitySummary, ConnectionSummary,
-    CreateSessionRequest, DaemonEvent, HealthResponse, HostStatus, JobDetail, JobSummary,
-    ProcessKillRequest, ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate,
-    ProjectUpdateRequest, PromptProgressUpdate, RouterProfileSummary, RuntimeOverview,
-    RuntimeSummary, SessionDetail, SessionPromptRequest, SessionSummary, SettingsSummary,
-    StreamConnected, SystemStats, UpdateConfigRequest, UpdateSessionRequest, UpdateStatus,
+    CreatePlaybookRequest, CreateSessionRequest, DaemonEvent, HealthResponse, HostStatus,
+    JobDetail, JobSummary, PlaybookDetail, PlaybookSummary, ProcessKillRequest,
+    ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate, ProjectUpdateRequest,
+    PromptProgressUpdate, RouterProfileSummary, RuntimeOverview, RuntimeSummary, SessionDetail,
+    SessionPromptRequest, SessionSummary, SettingsSummary, StreamConnected, SystemStats,
+    UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
     WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceProfileWriteRequest, WorkspaceSummary,
     WorkspaceUpdateRequest,
 };
@@ -109,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
     agent::recover_interrupted_jobs(&state).await?;
     spawn_event_publisher(state.clone());
     spawn_update_monitor(state.clone());
+    agent::spawn_playbook_scheduler(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
@@ -169,6 +171,17 @@ fn app(state: AppState) -> Router {
         .route(
             "/approvals/{approval_id}/deny",
             axum::routing::post(deny_request),
+        )
+        .route("/playbooks", get(playbooks).post(create_playbook))
+        .route(
+            "/playbooks/{playbook_id}",
+            get(playbook_detail)
+                .patch(update_playbook)
+                .delete(delete_playbook),
+        )
+        .route(
+            "/playbooks/{playbook_id}/run",
+            axum::routing::post(run_playbook),
         )
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{session_id}/jobs", get(session_jobs))
@@ -441,6 +454,14 @@ async fn sync_projects(State(state): State<AppState>) -> Result<Json<WorkspaceSu
         },
     )
     .await;
+    if let Err(error) =
+        agent::dispatch_playbook_event(state.clone(), "workspace_projects_synced").await
+    {
+        warn!(
+            error = error.message.as_str(),
+            "failed to dispatch workspace_projects_synced playbooks"
+        );
+    }
     let _ = publish_overview_event(&state).await;
     Ok(Json(workspace))
 }
@@ -482,6 +503,50 @@ async fn list_sessions(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<SessionSummary>>, ApiError> {
     Ok(Json(state.store.list_sessions()?))
+}
+
+async fn playbooks(State(state): State<AppState>) -> Result<Json<Vec<PlaybookSummary>>, ApiError> {
+    Ok(Json(agent::list_playbooks(state).await?))
+}
+
+async fn playbook_detail(
+    State(state): State<AppState>,
+    Path(playbook_id): Path<String>,
+) -> Result<Json<PlaybookDetail>, ApiError> {
+    Ok(Json(agent::get_playbook(state, playbook_id).await?))
+}
+
+async fn create_playbook(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<PlaybookDetail>, ApiError> {
+    let payload = decode_json::<CreatePlaybookRequest>(&body)?;
+    Ok(Json(agent::create_playbook(state, payload).await?))
+}
+
+async fn update_playbook(
+    State(state): State<AppState>,
+    Path(playbook_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<PlaybookDetail>, ApiError> {
+    let payload = decode_json::<UpdatePlaybookRequest>(&body)?;
+    Ok(Json(
+        agent::update_playbook(state, playbook_id, payload).await?,
+    ))
+}
+
+async fn delete_playbook(
+    State(state): State<AppState>,
+    Path(playbook_id): Path<String>,
+) -> Result<Json<PlaybookDetail>, ApiError> {
+    Ok(Json(agent::delete_playbook(state, playbook_id).await?))
+}
+
+async fn run_playbook(
+    State(state): State<AppState>,
+    Path(playbook_id): Path<String>,
+) -> Result<Json<JobDetail>, ApiError> {
+    Ok(Json(agent::run_playbook(state, playbook_id).await?))
 }
 
 async fn actions() -> Json<Vec<ActionSummary>> {

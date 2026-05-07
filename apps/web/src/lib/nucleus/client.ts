@@ -8,9 +8,12 @@ import {
   apiErrorSchema,
   auditEventSchema,
   approvalResolutionRequestSchema,
+  createPlaybookRequestSchema,
   createSessionRequestSchema,
   jobDetailSchema,
   jobSummarySchema,
+  playbookDetailSchema,
+  playbookSummarySchema,
   processKillRequestSchema,
   processKillResponseSchema,
   processListResponseSchema,
@@ -25,6 +28,7 @@ import {
   updateConfigRequestSchema,
   systemStatsSchema,
   updateStatusSchema,
+  updatePlaybookRequestSchema,
   updateSessionRequestSchema,
   workspaceProfileSummarySchema,
   workspaceProfileWriteRequestSchema,
@@ -111,6 +115,83 @@ export async function fetchSessions(fetchImpl: FetchLike = fetch) {
       headers: { accept: 'application/json' }
     }),
     z.array(sessionSummarySchema)
+  );
+}
+
+export async function fetchPlaybooks(fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/playbooks', {
+      headers: { accept: 'application/json' }
+    }),
+    z.array(playbookSummarySchema)
+  );
+}
+
+export async function fetchPlaybookDetail(playbookId: string, fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/playbooks/${playbookId}`, {
+      headers: { accept: 'application/json' }
+    }),
+    playbookDetailSchema
+  );
+}
+
+export async function createPlaybook(
+  input: z.input<typeof createPlaybookRequestSchema>,
+  fetchImpl: FetchLike = fetch
+) {
+  const payload = createPlaybookRequestSchema.parse(input);
+
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/playbooks', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json'
+      },
+      body: JSON.stringify(payload)
+    }),
+    playbookDetailSchema
+  );
+}
+
+export async function updatePlaybook(
+  playbookId: string,
+  input: z.input<typeof updatePlaybookRequestSchema>,
+  fetchImpl: FetchLike = fetch
+) {
+  const payload = updatePlaybookRequestSchema.parse(input);
+
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/playbooks/${playbookId}`, {
+      method: 'PATCH',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json'
+      },
+      body: JSON.stringify(payload)
+    }),
+    playbookDetailSchema
+  );
+}
+
+export async function deletePlaybook(playbookId: string, fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/playbooks/${playbookId}`, {
+      method: 'DELETE',
+      headers: { accept: 'application/json' }
+    }),
+    playbookDetailSchema
+  );
+}
+
+export async function runPlaybook(playbookId: string, fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/playbooks/${playbookId}/run`, {
+      method: 'POST',
+      headers: { accept: 'application/json' }
+    }),
+    jobDetailSchema
   );
 }
 

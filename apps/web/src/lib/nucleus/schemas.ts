@@ -242,6 +242,37 @@ export const jobDetailSchema = z.object({
   events: z.array(jobEventSchema).default([])
 });
 
+export const playbookSummarySchema = z.object({
+  id: z.string(),
+  session_id: z.string(),
+  title: z.string(),
+  description: z.string(),
+  prompt_excerpt: z.string(),
+  enabled: z.boolean(),
+  policy_bundle: z.string(),
+  trigger_kind: z.string(),
+  schedule_interval_secs: z.number().int().nonnegative().nullable(),
+  event_kind: z.string().nullable(),
+  profile_id: z.string(),
+  profile_title: z.string(),
+  project_id: z.string(),
+  project_title: z.string(),
+  working_dir: z.string(),
+  job_count: z.number().int().nonnegative(),
+  last_job_id: z.string().nullable(),
+  last_job_state: z.string(),
+  last_run_at: z.number().int().nullable(),
+  created_at: z.number().int(),
+  updated_at: z.number().int()
+});
+
+export const playbookDetailSchema = z.object({
+  playbook: playbookSummarySchema,
+  session: sessionSummarySchema,
+  prompt: z.string(),
+  recent_jobs: z.array(jobSummarySchema).default([])
+});
+
 export const promptProgressUpdateSchema = z.object({
   session_id: z.string(),
   status: z.string(),
@@ -290,6 +321,32 @@ export const sessionPromptRequestSchema = z.object({
 
 export const approvalResolutionRequestSchema = z.object({
   note: z.string().trim().optional()
+});
+
+export const createPlaybookRequestSchema = z.object({
+  title: z.string().trim().min(1),
+  description: z.string().optional(),
+  prompt: z.string().trim().min(1),
+  profile_id: z.string().optional(),
+  project_id: z.string().optional(),
+  enabled: z.boolean().optional(),
+  policy_bundle: z.string().trim().min(1),
+  trigger_kind: z.string().trim().min(1),
+  schedule_interval_secs: z.number().int().positive().optional(),
+  event_kind: z.string().optional()
+});
+
+export const updatePlaybookRequestSchema = z.object({
+  title: z.string().optional(),
+  description: z.string().optional(),
+  prompt: z.string().optional(),
+  profile_id: z.string().optional(),
+  project_id: z.string().optional(),
+  enabled: z.boolean().optional(),
+  policy_bundle: z.string().optional(),
+  trigger_kind: z.string().optional(),
+  schedule_interval_secs: z.number().int().positive().nullable().optional(),
+  event_kind: z.string().nullable().optional()
 });
 
 export const actionParameterSchema = z.object({
@@ -676,8 +733,12 @@ export type ArtifactSummary = z.infer<typeof artifactSummarySchema>;
 export type CommandSessionSummary = z.infer<typeof commandSessionSummarySchema>;
 export type JobEvent = z.infer<typeof jobEventSchema>;
 export type JobDetail = z.infer<typeof jobDetailSchema>;
+export type PlaybookSummary = z.infer<typeof playbookSummarySchema>;
+export type PlaybookDetail = z.infer<typeof playbookDetailSchema>;
 export type PromptProgressUpdate = z.infer<typeof promptProgressUpdateSchema>;
 export type ApprovalResolutionRequest = z.infer<typeof approvalResolutionRequestSchema>;
+export type CreatePlaybookRequest = z.infer<typeof createPlaybookRequestSchema>;
+export type UpdatePlaybookRequest = z.infer<typeof updatePlaybookRequestSchema>;
 export type ActionSummary = z.infer<typeof actionSummarySchema>;
 export type ActionRunResponse = z.infer<typeof actionRunResponseSchema>;
 export type AuditEvent = z.infer<typeof auditEventSchema>;
