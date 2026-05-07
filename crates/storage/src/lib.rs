@@ -859,6 +859,11 @@ impl StateStore {
         list_pending_approvals_with_connection(&connection)
     }
 
+    pub fn get_approval_request(&self, approval_id: &str) -> Result<ApprovalRequestSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        load_approval_request_summary(&connection, approval_id)
+    }
+
     pub fn get_job(&self, job_id: &str) -> Result<JobDetail> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         load_job_detail(&connection, job_id)

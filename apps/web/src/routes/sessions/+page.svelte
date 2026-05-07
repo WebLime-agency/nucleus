@@ -24,8 +24,10 @@
   import { Badge } from '$lib/components/ui/badge';
   import { Button } from '$lib/components/ui/button';
   import {
+    approveRequest,
     cancelJob,
     deleteSession,
+    denyRequest,
     fetchActions,
     fetchAuditEvents,
     fetchJobDetail,
@@ -41,6 +43,8 @@
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
   import type {
     ActionSummary,
+    ApprovalRequestSummary,
+    ArtifactSummary,
     AuditEvent,
     DaemonEvent,
     JobDetail,
@@ -93,6 +97,7 @@
   let selectedJobId = $state('');
   let jobLoading = $state(false);
   let jobActioning = $state(false);
+  let approvalActioningId = $state<string | null>(null);
   let actionFormValues = $state<Record<string, Record<string, string>>>({});
   let detailPanelOpen = $state(false);
   let dragOver = $state(false);
@@ -121,6 +126,9 @@
   );
   let selectedJobSummary = $derived(
     jobSummaries.find((job) => job.id === selectedJobId) ?? jobSummaries[0] ?? null
+  );
+  let selectedJobHasPendingApprovals = $derived(
+    jobDetail?.approvals.some((approval) => approval.state === 'pending') ?? false
   );
   let attachedProjects = $derived(selectedSession?.projects ?? []);
   let selectedProject = $derived(attachedProjects.find((project) => project.is_primary) ?? null);
@@ -210,8 +218,10 @@
   function badgeVariantForJobState(
     state: string
   ): 'default' | 'secondary' | 'warning' | 'destructive' {
-    if (state === 'completed') return 'default';
-    if (state === 'paused' || state === 'running' || state === 'queued') return 'warning';
+    if (state === 'completed' || state === 'approved') return 'default';
+    if (state === 'paused' || state === 'running' || state === 'queued' || state === 'pending') {
+      return 'warning';
+    }
     if (state === 'canceled') return 'secondary';
     return 'destructive';
   }
@@ -220,8 +230,8 @@
     state: string
   ): 'default' | 'secondary' | 'warning' | 'destructive' {
     if (state === 'completed') return 'default';
-    if (state === 'running' || state === 'queued') return 'warning';
-    if (state === 'canceled') return 'secondary';
+    if (state === 'running' || state === 'queued' || state === 'pending_approval') return 'warning';
+    if (state === 'canceled' || state === 'denied') return 'secondary';
     return 'destructive';
   }
 
@@ -1109,6 +1119,44 @@
     }
   }
 
+  async function handleApproveRequest(approval: ApprovalRequestSummary) {
+    if (approvalActioningId || !selectedSessionId) {
+      return;
+    }
+
+    approvalActioningId = approval.id;
+
+    try {
+      syncJobDetail(await approveRequest(approval.id));
+      await loadSelectedSession(selectedSessionId, true);
+      await loadSessionJobs(selectedSessionId, true);
+      error = null;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to approve the pending tool mutation.';
+    } finally {
+      approvalActioningId = null;
+    }
+  }
+
+  async function handleDenyRequest(approval: ApprovalRequestSummary) {
+    if (approvalActioningId || !selectedSessionId) {
+      return;
+    }
+
+    approvalActioningId = approval.id;
+
+    try {
+      syncJobDetail(await denyRequest(approval.id));
+      await loadSelectedSession(selectedSessionId, true);
+      await loadSessionJobs(selectedSessionId, true);
+      error = null;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to deny the pending tool mutation.';
+    } finally {
+      approvalActioningId = null;
+    }
+  }
+
   function formatWorkerSummary(worker: WorkerSummary) {
     return `${formatState(worker.provider)}${worker.model ? ` / ${worker.model}` : ''}`;
   }
@@ -1119,6 +1167,22 @@
 
   function formatToolCallSummary(toolCall: ToolCallSummary) {
     return toolCall.summary || toolCall.tool_id;
+  }
+
+  function formatJsonPreview(value: unknown) {
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return String(value);
+    }
+  }
+
+  function formatApprovalSummary(approval: ApprovalRequestSummary) {
+    return approval.summary || approval.detail || approval.tool_call_id;
+  }
+
+  function formatArtifactSummary(artifact: ArtifactSummary) {
+    return artifact.title || artifact.kind;
   }
 
   function applyStreamEvent(event: DaemonEvent) {
@@ -1814,7 +1878,7 @@
                           </Button>
                         {/if}
 
-                        {#if jobDetail.job.state === 'paused'}
+                        {#if jobDetail.job.state === 'paused' && !selectedJobHasPendingApprovals}
                           <Button
                             variant="secondary"
                             size="sm"
@@ -1876,10 +1940,86 @@
                                   {#if toolCall.error_detail}
                                     <div class="mt-2 text-xs leading-5 text-red-200">{toolCall.error_detail}</div>
                                   {:else if toolCall.result_json}
-                                    <div class="mt-2 text-xs leading-5 text-zinc-500">
-                                      {JSON.stringify(toolCall.result_json)}
+                                    <pre class="mt-2 overflow-x-auto whitespace-pre-wrap rounded-lg bg-zinc-900 px-3 py-2 text-xs leading-5 text-zinc-500">{formatJsonPreview(toolCall.result_json)}</pre>
+                                  {/if}
+                                </div>
+                              {/each}
+                            {/if}
+                          </div>
+                        </div>
+
+                        <div>
+                          <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Approvals</div>
+                          <div class="mt-2 space-y-2">
+                            {#if jobDetail.approvals.length === 0}
+                              <div class="text-xs text-zinc-500">No approval requests were recorded for this job.</div>
+                            {:else}
+                              {#each [...jobDetail.approvals].reverse().slice(0, 6) as approval}
+                                <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2">
+                                  <div class="flex items-start justify-between gap-3">
+                                    <div class="min-w-0">
+                                      <div class="truncate text-sm text-zinc-100">{formatApprovalSummary(approval)}</div>
+                                      <div class="mt-1 text-xs leading-5 text-zinc-500">{approval.detail}</div>
+                                    </div>
+                                    <Badge variant={badgeVariantForJobState(approval.state)}>
+                                      {formatState(approval.state)}
+                                    </Badge>
+                                  </div>
+                                  {#if approval.diff_preview}
+                                    <pre class="mt-2 overflow-x-auto whitespace-pre-wrap rounded-lg bg-zinc-900 px-3 py-2 text-xs leading-5 text-zinc-500">{approval.diff_preview}</pre>
+                                  {/if}
+                                  {#if approval.resolution_note}
+                                    <div class="mt-2 text-xs leading-5 text-zinc-500">{approval.resolution_note}</div>
+                                  {/if}
+                                  {#if approval.state === 'pending'}
+                                    <div class="mt-3 flex flex-wrap gap-2">
+                                      <Button
+                                        variant="secondary"
+                                        size="sm"
+                                        disabled={approvalActioningId !== null}
+                                        onclick={() => {
+                                          void handleApproveRequest(approval);
+                                        }}
+                                      >
+                                        <span>{approvalActioningId === approval.id ? 'Approving' : 'Approve'}</span>
+                                      </Button>
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        disabled={approvalActioningId !== null}
+                                        onclick={() => {
+                                          void handleDenyRequest(approval);
+                                        }}
+                                      >
+                                        <span>{approvalActioningId === approval.id ? 'Resolving' : 'Deny'}</span>
+                                      </Button>
                                     </div>
                                   {/if}
+                                </div>
+                              {/each}
+                            {/if}
+                          </div>
+                        </div>
+
+                        <div>
+                          <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Artifacts</div>
+                          <div class="mt-2 space-y-2">
+                            {#if jobDetail.artifacts.length === 0}
+                              <div class="text-xs text-zinc-500">No artifacts were recorded for this job yet.</div>
+                            {:else}
+                              {#each [...jobDetail.artifacts].reverse().slice(0, 6) as artifact}
+                                <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2">
+                                  <div class="flex items-start justify-between gap-3">
+                                    <div class="min-w-0">
+                                      <div class="truncate text-sm text-zinc-100">{formatArtifactSummary(artifact)}</div>
+                                      <div class="mt-1 text-xs text-zinc-500">{artifact.kind} · {formatDateTime(artifact.created_at)}</div>
+                                    </div>
+                                    <div class="shrink-0 text-[11px] text-zinc-600">{artifact.size_bytes} bytes</div>
+                                  </div>
+                                  {#if artifact.preview_text}
+                                    <pre class="mt-2 overflow-x-auto whitespace-pre-wrap rounded-lg bg-zinc-900 px-3 py-2 text-xs leading-5 text-zinc-500">{artifact.preview_text}</pre>
+                                  {/if}
+                                  <div class="mt-2 text-[11px] text-zinc-600">{compactPath(artifact.path)}</div>
                                 </div>
                               {/each}
                             {/if}
