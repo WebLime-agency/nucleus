@@ -28,17 +28,21 @@ use axum::{
 };
 use futures_util::SinkExt;
 use host::{DEFAULT_PROCESS_LIMIT, HostEngine, ProcessSort, resolve_process_limit};
-use nucleus_core::{AdapterKind, DEFAULT_DAEMON_ADDR, PRODUCT_NAME, product_banner};
+use nucleus_core::{
+    AdapterKind, DEFAULT_DAEMON_ADDR, DEFAULT_OPENAI_COMPATIBLE_BASE_URL, PRODUCT_NAME,
+    product_banner,
+};
 use nucleus_protocol::{
     ActionParameter, ActionRunRequest, ActionRunResponse, ActionSummary, ApprovalRequestSummary,
     ApprovalResolutionRequest, AuditEvent, AuthSummary, CompatibilitySummary, ConnectionSummary,
     CreatePlaybookRequest, CreateSessionRequest, DaemonEvent, HealthResponse, HostStatus,
-    JobDetail, JobSummary, PlaybookDetail, PlaybookSummary, ProcessKillRequest,
-    ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate, ProjectUpdateRequest,
-    PromptProgressUpdate, RouterProfileSummary, RuntimeOverview, RuntimeSummary, SessionDetail,
-    SessionPromptRequest, SessionSummary, SettingsSummary, StreamConnected, SystemStats,
-    UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
-    WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceProfileWriteRequest, WorkspaceSummary,
+    JobDetail, JobSummary, McpServerSummary, NucleusToolDescriptor, PlaybookDetail,
+    PlaybookSummary, ProcessKillRequest, ProcessKillResponse, ProcessListResponse,
+    ProcessStreamUpdate, ProjectUpdateRequest, PromptProgressUpdate, RouterProfileSummary,
+    RuntimeOverview, RuntimeSummary, SessionDetail, SessionPromptRequest, SessionSummary,
+    SettingsSummary, SkillManifest, StreamConnected, SystemStats, UpdateConfigRequest,
+    UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus, WorkspaceModelConfig,
+    WorkspaceProfileSummary, WorkspaceProfileWriteRequest, WorkspaceSummary,
     WorkspaceUpdateRequest,
 };
 use nucleus_release::read_installed_release_metadata;
@@ -159,6 +163,13 @@ fn app(state: AppState) -> Router {
             axum::routing::patch(update_project),
         )
         .route("/router/profiles", get(router_profiles))
+        .route("/skills", get(list_skills).post(upsert_skill))
+        .route("/skills/{skill_id}", axum::routing::put(upsert_skill_by_id))
+        .route("/mcps", get(list_mcp_servers).post(upsert_mcp_server))
+        .route(
+            "/mcps/{server_id}",
+            axum::routing::put(upsert_mcp_server_by_id),
+        )
         .route("/actions", get(actions))
         .route("/actions/{action_id}", get(action_detail))
         .route("/actions/{action_id}/run", axum::routing::post(run_action))
@@ -499,6 +510,52 @@ async fn router_profiles(
     Ok(Json(load_router_profiles(&state, false).await?))
 }
 
+async fn list_skills(State(state): State<AppState>) -> Result<Json<Vec<SkillManifest>>, ApiError> {
+    Ok(Json(state.store.list_skill_manifests()?))
+}
+
+async fn upsert_skill(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<SkillManifest>, ApiError> {
+    let payload = sanitize_skill_manifest(decode_json::<SkillManifest>(&body)?)?;
+    Ok(Json(state.store.upsert_skill_manifest(&payload)?))
+}
+
+async fn upsert_skill_by_id(
+    State(state): State<AppState>,
+    Path(skill_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<SkillManifest>, ApiError> {
+    let mut payload = sanitize_skill_manifest(decode_json::<SkillManifest>(&body)?)?;
+    payload.id = sanitize_registry_id(&skill_id, "skill id")?;
+    Ok(Json(state.store.upsert_skill_manifest(&payload)?))
+}
+
+async fn list_mcp_servers(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<McpServerSummary>>, ApiError> {
+    Ok(Json(state.store.list_mcp_servers()?))
+}
+
+async fn upsert_mcp_server(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<McpServerSummary>, ApiError> {
+    let payload = sanitize_mcp_server(decode_json::<McpServerSummary>(&body)?)?;
+    Ok(Json(state.store.upsert_mcp_server(&payload)?))
+}
+
+async fn upsert_mcp_server_by_id(
+    State(state): State<AppState>,
+    Path(server_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<McpServerSummary>, ApiError> {
+    let mut payload = sanitize_mcp_server(decode_json::<McpServerSummary>(&body)?)?;
+    payload.id = sanitize_registry_id(&server_id, "MCP server id")?;
+    Ok(Json(state.store.upsert_mcp_server(&payload)?))
+}
+
 async fn list_sessions(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<SessionSummary>>, ApiError> {
@@ -600,7 +657,7 @@ async fn create_session(
         }
     }) {
         let profile = resolve_workspace_profile(&workspace, profile_id)?;
-        resolve_workspace_profile_target(&state, profile).await?
+        resolve_workspace_profile_target(&state, profile, "main").await?
     } else {
         let default_target = parse_target_selector(&workspace.main_target);
         resolve_session_target(
@@ -728,7 +785,7 @@ async fn update_session(
             .as_ref()
             .ok_or_else(|| ApiError::internal_message("workspace state was not available"))?;
         let profile = resolve_workspace_profile(workspace, profile_id)?;
-        Some(resolve_workspace_profile_target(&state, profile).await?)
+        Some(resolve_workspace_profile_target(&state, profile, "main").await?)
     } else if route_id.is_some_and(|value| !value.is_empty())
         || provider.is_some_and(|value| !value.is_empty())
     {
@@ -934,6 +991,7 @@ async fn prompt_session(
     let payload = decode_json::<SessionPromptRequest>(&body)?;
     let prompt = payload.prompt.trim();
     let execution_prompt = effective_prompt_text(prompt, payload.images.len());
+    let compiler_role = normalize_compiler_role(&payload.role)?;
 
     if prompt.is_empty() && payload.images.is_empty() {
         return Err(ApiError::bad_request(
@@ -957,8 +1015,15 @@ async fn prompt_session(
 
     if payload.images.is_empty() {
         return Ok(Json(
-            agent::start_text_prompt_job(state, session_id, payload, current, execution_prompt)
-                .await?,
+            agent::start_text_prompt_job(
+                state,
+                session_id,
+                payload,
+                current,
+                execution_prompt,
+                compiler_role,
+            )
+            .await?,
         ));
     }
 
@@ -1013,6 +1078,7 @@ async fn prompt_session(
         payload,
         current,
         execution_prompt,
+        compiler_role,
     );
 
     Ok(Json(state.store.get_session(&session_id)?))
@@ -1024,6 +1090,7 @@ fn spawn_prompt_job(
     payload: SessionPromptRequest,
     current: SessionDetail,
     execution_prompt: String,
+    compiler_role: String,
 ) {
     let prompt_excerpt = if payload.prompt.trim().is_empty() {
         format!("[{} image attachment(s)]", payload.images.len())
@@ -1038,6 +1105,7 @@ fn spawn_prompt_job(
             &payload,
             &current,
             &execution_prompt,
+            &compiler_role,
         )
         .await
         {
@@ -1060,6 +1128,7 @@ async fn process_prompt_job(
     payload: &SessionPromptRequest,
     current: &SessionDetail,
     execution_prompt: &str,
+    compiler_role: &str,
 ) -> Result<(), String> {
     let prompt_assembly = assemble_prompt_input(&state, &current.session, execution_prompt)
         .map_err(|error| error.message)?;
@@ -1083,9 +1152,14 @@ async fn process_prompt_job(
     )
     .await;
 
-    let targets = resolve_prompt_targets(&state, &current.session, !payload.images.is_empty())
-        .await
-        .map_err(|error| error.message)?;
+    let targets = resolve_prompt_targets(
+        &state,
+        &current.session,
+        !payload.images.is_empty(),
+        compiler_role,
+    )
+    .await
+    .map_err(|error| error.message)?;
     let target_count = targets.len();
     let _ = publish_prompt_progress_event(
         &state,
@@ -1166,6 +1240,7 @@ async fn process_prompt_job(
             &current.turns,
             &prompt_body,
             &payload.images,
+            compiler_role,
             &target,
             attempt,
             target_count,
@@ -1190,6 +1265,8 @@ async fn process_prompt_job(
                             route_title: Some(target.route_title.clone()),
                             provider_session_id: Some(provider_session_id),
                             model: Some(target.model.clone()),
+                            provider_base_url: Some(target.provider_base_url.clone()),
+                            provider_api_key: Some(target.provider_api_key.clone()),
                             last_error: Some(String::new()),
                             ..SessionPatch::default()
                         },
@@ -1360,6 +1437,7 @@ async fn run_prompt_attempt(
     history: &[nucleus_protocol::SessionTurn],
     prompt_body: &str,
     images: &[nucleus_protocol::SessionTurnImage],
+    compiler_role: &str,
     target: &PromptTarget,
     attempt: usize,
     attempt_count: usize,
@@ -1373,9 +1451,17 @@ async fn run_prompt_attempt(
     let history = history.to_vec();
     let prompt_body = prompt_body.to_string();
     let images = images.to_vec();
+    let compiler_role = compiler_role.to_string();
     let handle = tokio::spawn(async move {
         runtimes
-            .execute_prompt_stream(&execution, &history, &prompt_body, &images, events)
+            .execute_prompt_stream(
+                &execution,
+                &history,
+                &prompt_body,
+                &images,
+                &compiler_role,
+                events,
+            )
             .await
     });
 
@@ -2040,6 +2126,16 @@ fn resolve_provider(value: &str) -> Result<AdapterKind, ApiError> {
         .ok_or_else(|| ApiError::bad_request(format!("unsupported provider '{value}'")))
 }
 
+fn normalize_compiler_role(value: &str) -> Result<String, ApiError> {
+    match value.trim() {
+        "" | "main" => Ok("main".to_string()),
+        "utility" => Ok("utility".to_string()),
+        other => Err(ApiError::bad_request(format!(
+            "unsupported compiler role '{other}'"
+        ))),
+    }
+}
+
 fn sanitize_workspace_root(value: &str) -> Result<String, ApiError> {
     let path = value.trim();
 
@@ -2128,6 +2224,82 @@ fn sanitize_workspace_model_config(
     })
 }
 
+fn sanitize_skill_manifest(mut manifest: SkillManifest) -> Result<SkillManifest, ApiError> {
+    manifest.id = sanitize_registry_id(&manifest.id, "skill id")?;
+    manifest.title = required_trimmed(manifest.title, "skill title")?;
+    manifest.description = manifest.description.trim().to_string();
+    manifest.activation_mode = match manifest.activation_mode.trim() {
+        "always" | "auto" | "manual" => manifest.activation_mode.trim().to_string(),
+        _ => {
+            return Err(ApiError::bad_request(
+                "skill activation_mode must be always, auto, or manual",
+            ));
+        }
+    };
+    manifest.triggers = sanitize_string_list(manifest.triggers);
+    manifest.include_paths = sanitize_string_list(manifest.include_paths);
+    manifest.required_tools = sanitize_string_list(manifest.required_tools);
+    manifest.required_mcps = sanitize_string_list(manifest.required_mcps);
+    manifest.project_filters = sanitize_string_list(manifest.project_filters);
+    Ok(manifest)
+}
+
+fn sanitize_mcp_server(mut server: McpServerSummary) -> Result<McpServerSummary, ApiError> {
+    server.id = sanitize_registry_id(&server.id, "MCP server id")?;
+    server.title = required_trimmed(server.title, "MCP server title")?;
+    server.resources = sanitize_string_list(server.resources);
+    server.tools = server
+        .tools
+        .into_iter()
+        .map(sanitize_tool_descriptor)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(server)
+}
+
+fn sanitize_tool_descriptor(
+    mut tool: NucleusToolDescriptor,
+) -> Result<NucleusToolDescriptor, ApiError> {
+    tool.id = sanitize_registry_id(&tool.id, "tool id")?;
+    tool.title = required_trimmed(tool.title, "tool title")?;
+    tool.description = tool.description.trim().to_string();
+    tool.source = tool.source.trim().to_string();
+    Ok(tool)
+}
+
+fn required_trimmed(value: String, label: &str) -> Result<String, ApiError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ApiError::bad_request(format!("{label} is required")));
+    }
+    Ok(value.to_string())
+}
+
+fn sanitize_registry_id(value: &str, label: &str) -> Result<String, ApiError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ApiError::bad_request(format!("{label} is required")));
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        return Err(ApiError::bad_request(format!(
+            "{label} may only contain ASCII letters, numbers, '.', '_', or '-'",
+        )));
+    }
+    Ok(value.to_string())
+}
+
+fn sanitize_string_list(values: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .filter(|value| seen.insert(value.clone()))
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 struct SessionTargetSelection {
     profile_id: String,
@@ -2161,6 +2333,8 @@ struct WorkspaceTargetSelection {
 struct PromptTarget {
     provider: String,
     model: String,
+    provider_base_url: String,
+    provider_api_key: String,
     profile_id: String,
     profile_title: String,
     route_id: String,
@@ -2216,14 +2390,20 @@ fn resolve_workspace_profile<'a>(
 async fn resolve_workspace_profile_target(
     state: &AppState,
     profile: &WorkspaceProfileSummary,
+    compiler_role: &str,
 ) -> Result<SessionTargetSelection, ApiError> {
-    let provider = resolve_provider(&profile.main.adapter)?;
+    let compiler_role = normalize_compiler_role(compiler_role)?;
+    let config = match compiler_role.as_str() {
+        "utility" => &profile.utility,
+        _ => &profile.main,
+    };
+    let provider = resolve_provider(&config.adapter)?;
     ensure_prompting_runtime(state, provider.as_str(), false).await?;
 
-    let model = if profile.main.model.trim().is_empty() {
+    let model = if config.model.trim().is_empty() {
         provider.default_model().to_string()
     } else {
-        profile.main.model.trim().to_string()
+        config.model.trim().to_string()
     };
 
     Ok(SessionTargetSelection {
@@ -2233,8 +2413,8 @@ async fn resolve_workspace_profile_target(
         route_title: String::new(),
         provider: provider.as_str().to_string(),
         model,
-        provider_base_url: profile.main.base_url.trim().to_string(),
-        provider_api_key: profile.main.api_key.trim().to_string(),
+        provider_base_url: config.base_url.trim().to_string(),
+        provider_api_key: config.api_key.trim().to_string(),
     })
 }
 
@@ -2440,8 +2620,8 @@ async fn resolve_session_target(
             } else {
                 target.model
             },
-            provider_base_url: String::new(),
-            provider_api_key: String::new(),
+            provider_base_url: target.provider_base_url,
+            provider_api_key: target.provider_api_key,
         });
     }
 
@@ -2460,6 +2640,12 @@ async fn resolve_session_target(
 
     ensure_prompting_runtime(state, provider.as_str(), false).await?;
 
+    let provider_base_url = if provider == AdapterKind::OpenAiCompatible {
+        DEFAULT_OPENAI_COMPATIBLE_BASE_URL.to_string()
+    } else {
+        String::new()
+    };
+
     Ok(SessionTargetSelection {
         profile_id: String::new(),
         profile_title: String::new(),
@@ -2471,7 +2657,7 @@ async fn resolve_session_target(
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| provider.default_model().to_string()),
-        provider_base_url: String::new(),
+        provider_base_url,
         provider_api_key: String::new(),
     })
 }
@@ -2493,6 +2679,8 @@ async fn resolve_profile_targets(
         let item = PromptTarget {
             provider: target.provider.clone(),
             model: target.model.clone(),
+            provider_base_url: target.base_url.trim().to_string(),
+            provider_api_key: target.api_key.trim().to_string(),
             profile_id: String::new(),
             profile_title: String::new(),
             route_id: route.id.clone(),
@@ -2516,7 +2704,20 @@ async fn resolve_prompt_targets(
     state: &AppState,
     session: &SessionSummary,
     requires_image_support: bool,
+    compiler_role: &str,
 ) -> Result<Vec<PromptTarget>, ApiError> {
+    let compiler_role = normalize_compiler_role(compiler_role)?;
+    if compiler_role == "utility" {
+        let selection = resolve_utility_target_selection(state, session).await?;
+        if requires_image_support && !provider_supports_images(&selection.provider) {
+            return Err(ApiError::bad_request(format!(
+                "utility provider '{}' does not support image attachments in Nucleus yet",
+                selection.provider
+            )));
+        }
+        return Ok(vec![prompt_target_from_selection(selection)]);
+    }
+
     if !session.route_id.is_empty() {
         let route = load_router_profiles(state, false)
             .await?
@@ -2565,6 +2766,8 @@ async fn resolve_prompt_targets(
     Ok(vec![PromptTarget {
         provider: session.provider.clone(),
         model: session.model.clone(),
+        provider_base_url: session.provider_base_url.clone(),
+        provider_api_key: session.provider_api_key.clone(),
         profile_id: session.profile_id.clone(),
         profile_title: session.profile_title.clone(),
         route_id: String::new(),
@@ -2572,12 +2775,48 @@ async fn resolve_prompt_targets(
     }])
 }
 
+async fn resolve_utility_target_selection(
+    state: &AppState,
+    session: &SessionSummary,
+) -> Result<SessionTargetSelection, ApiError> {
+    if !session.profile_id.trim().is_empty() {
+        let workspace = state.store.workspace()?;
+        let profile = resolve_workspace_profile(&workspace, &session.profile_id)?;
+        return resolve_workspace_profile_target(state, profile, "utility").await;
+    }
+
+    let workspace = state.store.workspace()?;
+    let route_profiles = load_router_profiles(state, false).await?;
+    let utility_target = parse_target_selector(&workspace.utility_target);
+    resolve_session_target(
+        state,
+        &route_profiles,
+        utility_target.route_id.as_deref(),
+        utility_target.provider.as_deref(),
+        None,
+    )
+    .await
+}
+
+fn prompt_target_from_selection(selection: SessionTargetSelection) -> PromptTarget {
+    PromptTarget {
+        provider: selection.provider,
+        model: selection.model,
+        provider_base_url: selection.provider_base_url,
+        provider_api_key: selection.provider_api_key,
+        profile_id: selection.profile_id,
+        profile_title: selection.profile_title,
+        route_id: selection.route_id,
+        route_title: selection.route_title,
+    }
+}
+
 fn assemble_prompt_input(
     state: &AppState,
     session: &SessionSummary,
     prompt: &str,
 ) -> Result<PromptAssembly, ApiError> {
-    let sources = discover_prompt_sources(state, session)?;
+    let sources = discover_prompt_sources(state, session, prompt)?;
 
     if sources.is_empty() {
         return Ok(PromptAssembly {
@@ -2614,6 +2853,7 @@ fn assemble_prompt_input(
 fn discover_prompt_sources(
     state: &AppState,
     session: &SessionSummary,
+    prompt: &str,
 ) -> Result<Vec<PromptIncludeSource>, ApiError> {
     let workspace = state.store.workspace()?;
     let mut roots = Vec::new();
@@ -2622,7 +2862,7 @@ fn discover_prompt_sources(
         roots.push(("global", home_dir));
     }
 
-    let workspace_root = PathBuf::from(workspace.root_path);
+    let workspace_root = PathBuf::from(&workspace.root_path);
     roots.push(("workspace", workspace_root));
     roots.push(("session", PathBuf::from(&session.working_dir)));
 
@@ -2650,7 +2890,126 @@ fn discover_prompt_sources(
         }
     }
 
+    collect_skill_prompt_sources(
+        state,
+        &workspace,
+        session,
+        prompt,
+        &mut seen_files,
+        &mut sources,
+        &mut total_chars,
+    )?;
+
     Ok(sources)
+}
+
+fn collect_skill_prompt_sources(
+    state: &AppState,
+    workspace: &WorkspaceSummary,
+    session: &SessionSummary,
+    prompt: &str,
+    seen_files: &mut BTreeSet<PathBuf>,
+    sources: &mut Vec<PromptIncludeSource>,
+    total_chars: &mut usize,
+) -> Result<(), ApiError> {
+    if sources.len() >= MAX_PROMPT_INCLUDE_FILES || *total_chars >= MAX_PROMPT_INCLUDE_TOTAL_CHARS {
+        return Ok(());
+    }
+
+    let workspace_root = PathBuf::from(&workspace.root_path);
+    if !workspace_root.is_dir() {
+        return Ok(());
+    }
+    let workspace_root = fs::canonicalize(&workspace_root).map_err(|error| {
+        ApiError::internal_message(format!(
+            "failed to resolve workspace root '{}': {error}",
+            workspace.root_path
+        ))
+    })?;
+
+    for skill in state.store.list_skill_manifests()? {
+        if !skill_is_active_for_prompt(&skill, session, prompt) {
+            continue;
+        }
+
+        for include_path in &skill.include_paths {
+            let Some(path) = resolve_skill_include_path(&workspace_root, include_path) else {
+                continue;
+            };
+
+            push_prompt_source("skill", &path, seen_files, sources, total_chars)?;
+
+            if sources.len() >= MAX_PROMPT_INCLUDE_FILES
+                || *total_chars >= MAX_PROMPT_INCLUDE_TOTAL_CHARS
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn skill_is_active_for_prompt(
+    skill: &SkillManifest,
+    session: &SessionSummary,
+    prompt: &str,
+) -> bool {
+    if !skill.enabled || !skill_project_filter_matches(skill, session) {
+        return false;
+    }
+
+    match skill.activation_mode.as_str() {
+        "always" => true,
+        "auto" => {
+            let prompt = prompt.to_ascii_lowercase();
+            skill
+                .triggers
+                .iter()
+                .map(|trigger| trigger.trim().to_ascii_lowercase())
+                .filter(|trigger| !trigger.is_empty())
+                .any(|trigger| prompt.contains(&trigger))
+        }
+        _ => false,
+    }
+}
+
+fn skill_project_filter_matches(skill: &SkillManifest, session: &SessionSummary) -> bool {
+    if skill.project_filters.is_empty() {
+        return true;
+    }
+
+    session.projects.iter().any(|project| {
+        skill.project_filters.iter().any(|filter| {
+            let filter = filter.trim();
+            !filter.is_empty()
+                && (filter == project.id
+                    || filter == project.slug
+                    || filter == project.relative_path
+                    || filter == project.absolute_path
+                    || filter == project.title)
+        })
+    })
+}
+
+fn resolve_skill_include_path(workspace_root: &PathBuf, include_path: &str) -> Option<PathBuf> {
+    let include_path = include_path.trim();
+    if include_path.is_empty() {
+        return None;
+    }
+
+    let relative = PathBuf::from(include_path);
+    if relative.is_absolute() {
+        return None;
+    }
+
+    let path = workspace_root.join(relative);
+    let canonical = fs::canonicalize(path).ok()?;
+    if canonical.is_file() && canonical.starts_with(workspace_root) {
+        Some(canonical)
+    } else {
+        None
+    }
 }
 
 fn collect_prompt_sources_from_root(
@@ -2914,6 +3273,8 @@ fn build_prompt_execution_session(
     SessionSummary {
         provider: target.provider.clone(),
         model: target.model.clone(),
+        provider_base_url: target.provider_base_url.clone(),
+        provider_api_key: target.provider_api_key.clone(),
         provider_session_id,
         ..session.clone()
     }
@@ -3495,11 +3856,8 @@ mod tests {
     use std::{
         env, fs,
         path::PathBuf,
-        sync::Mutex,
         time::{SystemTime, UNIX_EPOCH},
     };
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn rejects_zero_audit_limit() {
@@ -3614,32 +3972,93 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn active_skills_contribute_workspace_include_files() {
+        let state_dir = test_state_dir("skill-includes");
+        let store = initialize_test_store(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let skill_dir = workspace_root.join("skills");
+        fs::create_dir_all(&skill_dir).expect("skill include directory should exist");
+        fs::write(
+            skill_dir.join("rust.md"),
+            "# Rust Skill\nPrefer small focused patches.\n",
+        )
+        .expect("skill include should write");
+        store
+            .upsert_skill_manifest(&SkillManifest {
+                id: "rust".to_string(),
+                title: "Rust".to_string(),
+                description: "Rust conventions".to_string(),
+                activation_mode: "auto".to_string(),
+                triggers: vec!["cargo".to_string()],
+                include_paths: vec!["skills/rust.md".to_string()],
+                required_tools: Vec::new(),
+                required_mcps: Vec::new(),
+                project_filters: Vec::new(),
+                enabled: true,
+            })
+            .expect("skill manifest should persist");
+
+        let (events, _) = broadcast::channel(4);
+        let state = AppState {
+            version: "test".to_string(),
+            store: store.clone(),
+            host: Arc::new(HostEngine::new()),
+            runtimes: Arc::new(RuntimeManager::default()),
+            updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            agent: Arc::new(agent::AgentRuntime::default()),
+            web_dist_dir: None,
+            tailscale_dns_name: None,
+            events,
+        };
+        let session = SessionSummary {
+            id: "session-skill".to_string(),
+            title: "Skill prompt".to_string(),
+            profile_id: String::new(),
+            profile_title: String::new(),
+            route_id: String::new(),
+            route_title: String::new(),
+            scope: "ad_hoc".to_string(),
+            project_id: String::new(),
+            project_title: String::new(),
+            project_path: String::new(),
+            provider: "openai_compatible".to_string(),
+            model: "gpt-5.4-mini".to_string(),
+            provider_base_url: "http://127.0.0.1:20128/v1".to_string(),
+            provider_api_key: String::new(),
+            working_dir: workspace_root.display().to_string(),
+            working_dir_kind: "workspace_scratch".to_string(),
+            project_count: 0,
+            projects: Vec::new(),
+            state: "active".to_string(),
+            provider_session_id: String::new(),
+            last_error: String::new(),
+            last_message_excerpt: String::new(),
+            turn_count: 0,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let assembly = assemble_prompt_input(&state, &session, "Run cargo test.")
+            .expect("skill includes should assemble");
+
+        assert!(assembly.prompt.contains("Prefer small focused patches."));
+        assert!(assembly.prompt.contains("[skill include:"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
     #[tokio::test]
-    async fn resolves_route_targets_from_cached_runtimes_when_creating_sessions() {
+    async fn route_targets_preserve_openai_transport_config_when_creating_sessions() {
         let state_dir = test_state_dir("session-target-cache");
         let store = initialize_test_store(&state_dir);
         let (events, _) = broadcast::channel(4);
-        let runtimes = Arc::new(RuntimeManager::default());
-        runtimes
-            .seed_cache_for_test(vec![RuntimeSummary {
-                id: "synthetic".to_string(),
-                summary: "Synthetic cached runtime".to_string(),
-                state: "ready".to_string(),
-                auth_state: "ready".to_string(),
-                version: "test".to_string(),
-                executable_path: String::new(),
-                default_model: "fast".to_string(),
-                note: String::new(),
-                supports_sessions: true,
-                supports_prompting: true,
-            }])
-            .await;
 
         let state = AppState {
             version: "test".to_string(),
             store: store.clone(),
             host: Arc::new(HostEngine::new()),
-            runtimes,
+            runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
@@ -3648,59 +4067,43 @@ mod tests {
         };
 
         let profiles = vec![RouterProfileSummary {
-            id: "synthetic-route".to_string(),
-            title: "Synthetic Route".to_string(),
-            summary: "Test route".to_string(),
+            id: "gateway-route".to_string(),
+            title: "Gateway Route".to_string(),
+            summary: "Test OpenAI-compatible route".to_string(),
             enabled: true,
             state: "ready".to_string(),
             targets: vec![nucleus_protocol::RouteTarget {
-                provider: "synthetic".to_string(),
-                model: "fast".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "route-model".to_string(),
+                base_url: "http://127.0.0.1:20128/v1".to_string(),
+                api_key: "nuctk_route".to_string(),
             }],
         }];
 
-        let result = resolve_session_target(&state, &profiles, Some("synthetic-route"), None, None)
+        let result = resolve_session_target(&state, &profiles, Some("gateway-route"), None, None)
             .await
-            .expect("cached runtime should satisfy route resolution");
+            .expect("OpenAI-compatible route should resolve");
 
-        assert_eq!(result.route_id, "synthetic-route");
-        assert_eq!(result.provider, "synthetic");
-        assert_eq!(result.model, "fast");
+        assert_eq!(result.route_id, "gateway-route");
+        assert_eq!(result.provider, "openai_compatible");
+        assert_eq!(result.model, "route-model");
+        assert_eq!(result.provider_base_url, "http://127.0.0.1:20128/v1");
+        assert_eq!(result.provider_api_key, "nuctk_route");
 
         let _ = fs::remove_dir_all(&state_dir);
     }
 
     #[tokio::test]
-    async fn creates_sessions_from_cached_default_provider_without_forcing_runtime_refresh() {
-        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
+    async fn creates_sessions_from_fresh_default_protocol_profile() {
         let state_dir = test_state_dir("create-session-cache");
         let store = initialize_test_store(&state_dir);
-        store
-            .update_workspace(None, None, Some("provider:claude"), None)
-            .expect("workspace target should update");
 
         let (events, _) = broadcast::channel(4);
-        let runtimes = Arc::new(RuntimeManager::default());
-        runtimes
-            .seed_cache_for_test(vec![RuntimeSummary {
-                id: "claude".to_string(),
-                summary: "Claude Code".to_string(),
-                state: "ready".to_string(),
-                auth_state: "ready".to_string(),
-                version: "test".to_string(),
-                executable_path: "/tmp/claude".to_string(),
-                default_model: "sonnet".to_string(),
-                note: String::new(),
-                supports_sessions: true,
-                supports_prompting: true,
-            }])
-            .await;
-
         let state = AppState {
             version: "test".to_string(),
             store: store.clone(),
             host: Arc::new(HostEngine::new()),
-            runtimes,
+            runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
@@ -3708,57 +4111,30 @@ mod tests {
             events,
         };
 
-        let original_path = env::var_os("PATH");
-        unsafe {
-            env::set_var("PATH", "");
-        }
-
-        let result = create_session(State(state), Bytes::from_static(b"{}")).await;
-
-        match original_path {
-            Some(value) => unsafe {
-                env::set_var("PATH", value);
-            },
-            None => unsafe {
-                env::remove_var("PATH");
-            },
-        }
-
-        let detail = result.expect("cached runtime should allow session creation");
-        assert_eq!(detail.0.session.provider, "claude");
-        assert_eq!(detail.0.session.model, "sonnet");
+        let detail = create_session(State(state), Bytes::from_static(b"{}"))
+            .await
+            .expect("fresh default profile should create a protocol session");
+        assert_eq!(detail.0.session.provider, "openai_compatible");
+        assert_eq!(detail.0.session.model, "gpt-5.4-mini");
+        assert_eq!(
+            detail.0.session.provider_base_url,
+            "http://127.0.0.1:20128/v1"
+        );
 
         let _ = fs::remove_dir_all(&state_dir);
     }
 
     #[tokio::test]
     async fn creates_sessions_from_default_workspace_profile() {
-        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
         let state_dir = test_state_dir("create-session-default-profile");
         let store = initialize_test_store(&state_dir);
 
         let (events, _) = broadcast::channel(4);
-        let runtimes = Arc::new(RuntimeManager::default());
-        runtimes
-            .seed_cache_for_test(vec![RuntimeSummary {
-                id: "claude".to_string(),
-                summary: "Claude Code".to_string(),
-                state: "ready".to_string(),
-                auth_state: "ready".to_string(),
-                version: "test".to_string(),
-                executable_path: "/tmp/claude".to_string(),
-                default_model: "sonnet".to_string(),
-                note: String::new(),
-                supports_sessions: true,
-                supports_prompting: true,
-            }])
-            .await;
-
         let state = AppState {
             version: "test".to_string(),
             store: store.clone(),
             host: Arc::new(HostEngine::new()),
-            runtimes,
+            runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
@@ -3766,27 +4142,13 @@ mod tests {
             events,
         };
 
-        let original_path = env::var_os("PATH");
-        unsafe {
-            env::set_var("PATH", "");
-        }
-
-        let result = create_session(State(state), Bytes::from_static(b"{}")).await;
-
-        match original_path {
-            Some(value) => unsafe {
-                env::set_var("PATH", value);
-            },
-            None => unsafe {
-                env::remove_var("PATH");
-            },
-        }
-
-        let detail = result.expect("default workspace profile should allow session creation");
+        let detail = create_session(State(state), Bytes::from_static(b"{}"))
+            .await
+            .expect("default workspace profile should allow session creation");
         assert_eq!(detail.0.session.profile_id, "default");
         assert_eq!(detail.0.session.profile_title, "Default");
-        assert_eq!(detail.0.session.provider, "claude");
-        assert_eq!(detail.0.session.model, "sonnet");
+        assert_eq!(detail.0.session.provider, "openai_compatible");
+        assert_eq!(detail.0.session.model, "gpt-5.4-mini");
 
         let _ = fs::remove_dir_all(&state_dir);
     }
@@ -3805,9 +4167,9 @@ mod tests {
                     api_key: "nuctk_test".to_string(),
                 },
                 utility: WorkspaceModelConfig {
-                    adapter: "claude".to_string(),
-                    model: "sonnet".to_string(),
-                    base_url: String::new(),
+                    adapter: "openai_compatible".to_string(),
+                    model: "gpt-4.1-mini".to_string(),
+                    base_url: "http://127.0.0.1:20129/v1".to_string(),
                     api_key: String::new(),
                 },
                 is_default: false,
@@ -3828,7 +4190,7 @@ mod tests {
         };
 
         let result = create_session(
-            State(state),
+            State(state.clone()),
             Bytes::from(
                 serde_json::to_vec(&CreateSessionRequest {
                     profile_id: Some("gateway".to_string()),
@@ -3855,36 +4217,31 @@ mod tests {
         );
         assert_eq!(result.0.session.provider_api_key, "nuctk_test");
 
+        let utility_targets = resolve_prompt_targets(&state, &result.0.session, false, "utility")
+            .await
+            .expect("utility role should resolve from the profile utility config");
+        assert_eq!(utility_targets.len(), 1);
+        assert_eq!(utility_targets[0].provider, "openai_compatible");
+        assert_eq!(utility_targets[0].model, "gpt-4.1-mini");
+        assert_eq!(
+            utility_targets[0].provider_base_url,
+            "http://127.0.0.1:20129/v1"
+        );
+
         let _ = fs::remove_dir_all(&state_dir);
     }
 
     #[tokio::test]
-    async fn resolves_direct_prompt_targets_from_cached_runtime_without_forcing_refresh() {
-        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
+    async fn resolves_direct_prompt_targets_without_cli_runtime_cache() {
         let state_dir = test_state_dir("prompt-target-direct-cache");
         let store = initialize_test_store(&state_dir);
         let (events, _) = broadcast::channel(4);
-        let runtimes = Arc::new(RuntimeManager::default());
-        runtimes
-            .seed_cache_for_test(vec![RuntimeSummary {
-                id: "claude".to_string(),
-                summary: "Claude Code".to_string(),
-                state: "ready".to_string(),
-                auth_state: "ready".to_string(),
-                version: "test".to_string(),
-                executable_path: "/tmp/claude".to_string(),
-                default_model: "sonnet".to_string(),
-                note: String::new(),
-                supports_sessions: true,
-                supports_prompting: true,
-            }])
-            .await;
 
         let state = AppState {
             version: "test".to_string(),
             store: store.clone(),
             host: Arc::new(HostEngine::new()),
-            runtimes,
+            runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
@@ -3903,9 +4260,9 @@ mod tests {
             project_id: String::new(),
             project_title: String::new(),
             project_path: String::new(),
-            provider: "claude".to_string(),
-            model: "sonnet".to_string(),
-            provider_base_url: String::new(),
+            provider: "openai_compatible".to_string(),
+            model: "direct-model".to_string(),
+            provider_base_url: "http://127.0.0.1:20128/v1".to_string(),
             provider_api_key: String::new(),
             working_dir: "/tmp".to_string(),
             working_dir_kind: "workspace_scratch".to_string(),
@@ -3920,57 +4277,29 @@ mod tests {
             updated_at: 0,
         };
 
-        let original_path = env::var_os("PATH");
-        unsafe {
-            env::set_var("PATH", "");
-        }
+        let result = resolve_prompt_targets(&state, &session, false, "main").await;
 
-        let result = resolve_prompt_targets(&state, &session, false).await;
-
-        match original_path {
-            Some(value) => unsafe {
-                env::set_var("PATH", value);
-            },
-            None => unsafe {
-                env::remove_var("PATH");
-            },
-        }
-
-        let targets = result.expect("cached runtime should satisfy direct prompt routing");
+        let targets =
+            result.expect("OpenAI-compatible runtime should satisfy direct prompt routing");
         assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].provider, "claude");
-        assert_eq!(targets[0].model, "sonnet");
+        assert_eq!(targets[0].provider, "openai_compatible");
+        assert_eq!(targets[0].model, "direct-model");
+        assert_eq!(targets[0].provider_base_url, "http://127.0.0.1:20128/v1");
 
         let _ = fs::remove_dir_all(&state_dir);
     }
 
     #[tokio::test]
-    async fn resolves_route_prompt_targets_from_cached_runtime_without_forcing_refresh() {
-        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
+    async fn resolves_route_prompt_targets_with_transport_config() {
         let state_dir = test_state_dir("prompt-target-route-cache");
         let store = initialize_test_store(&state_dir);
         let (events, _) = broadcast::channel(4);
-        let runtimes = Arc::new(RuntimeManager::default());
-        runtimes
-            .seed_cache_for_test(vec![RuntimeSummary {
-                id: "claude".to_string(),
-                summary: "Claude Code".to_string(),
-                state: "ready".to_string(),
-                auth_state: "ready".to_string(),
-                version: "test".to_string(),
-                executable_path: "/tmp/claude".to_string(),
-                default_model: "sonnet".to_string(),
-                note: String::new(),
-                supports_sessions: true,
-                supports_prompting: true,
-            }])
-            .await;
 
         let state = AppState {
             version: "test".to_string(),
             store: store.clone(),
             host: Arc::new(HostEngine::new()),
-            runtimes,
+            runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
@@ -3989,9 +4318,9 @@ mod tests {
             project_id: String::new(),
             project_title: String::new(),
             project_path: String::new(),
-            provider: "claude".to_string(),
-            model: "sonnet".to_string(),
-            provider_base_url: String::new(),
+            provider: "openai_compatible".to_string(),
+            model: "gpt-5.4-mini".to_string(),
+            provider_base_url: "http://127.0.0.1:20128/v1".to_string(),
             provider_api_key: String::new(),
             working_dir: "/tmp".to_string(),
             working_dir_kind: "workspace_scratch".to_string(),
@@ -4006,25 +4335,12 @@ mod tests {
             updated_at: 0,
         };
 
-        let original_path = env::var_os("PATH");
-        unsafe {
-            env::set_var("PATH", "");
-        }
+        let result = resolve_prompt_targets(&state, &session, false, "main").await;
 
-        let result = resolve_prompt_targets(&state, &session, false).await;
-
-        match original_path {
-            Some(value) => unsafe {
-                env::set_var("PATH", value);
-            },
-            None => unsafe {
-                env::remove_var("PATH");
-            },
-        }
-
-        let targets = result.expect("cached runtime should satisfy route prompt routing");
+        let targets = result.expect("OpenAI-compatible route should satisfy prompt routing");
         assert!(!targets.is_empty());
-        assert_eq!(targets[0].provider, "claude");
+        assert_eq!(targets[0].provider, "openai_compatible");
+        assert_eq!(targets[0].provider_base_url, "http://127.0.0.1:20128/v1");
 
         let _ = fs::remove_dir_all(&state_dir);
     }
