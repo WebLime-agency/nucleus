@@ -9,10 +9,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use nucleus_core::{AdapterKind, PRODUCT_SLUG};
 use nucleus_protocol::{
     ApprovalRequestSummary, ArtifactSummary, AuditEvent, CommandSessionSummary, JobDetail,
-    JobEvent, JobSummary, PolicyDecisionSummary, ProjectSummary, RouteTarget, RouterProfileSummary,
-    RuntimeSummary, SessionDetail, SessionProjectSummary, SessionSummary, SessionTurn,
-    SessionTurnImage, StorageSummary, ToolCallSummary, ToolCapabilitySummary, WorkerSummary,
-    WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceSummary,
+    JobEvent, JobSummary, PlaybookDetail, PlaybookSummary, PolicyDecisionSummary, ProjectSummary,
+    RouteTarget, RouterProfileSummary, RuntimeSummary, SessionDetail, SessionProjectSummary,
+    SessionSummary, SessionTurn, SessionTurnImage, StorageSummary, ToolCallSummary,
+    ToolCapabilitySummary, WorkerSummary, WorkspaceModelConfig, WorkspaceProfileSummary,
+    WorkspaceSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,7 @@ use uuid::Uuid;
 const LOCAL_AUTH_TOKEN_HASH_KEY: &str = "auth.local_token_hash";
 const LOCAL_AUTH_TOKEN_FILE_NAME: &str = "local-auth-token";
 const UPDATE_STATE_KEY: &str = "updates.state.v1";
+const PLAYBOOK_RECENT_JOB_LIMIT: usize = 12;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoragePlan {
@@ -251,6 +253,52 @@ pub struct JobArtifactPatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaybookRecord {
+    pub id: String,
+    pub session_id: String,
+    pub title: String,
+    pub description: String,
+    pub prompt: String,
+    pub enabled: bool,
+    pub policy_bundle: String,
+    pub trigger_kind: String,
+    pub schedule_interval_secs: Option<u64>,
+    pub event_kind: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlaybookPatch {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub prompt: Option<String>,
+    pub session_id: Option<String>,
+    pub enabled: Option<bool>,
+    pub policy_bundle: Option<String>,
+    pub trigger_kind: Option<String>,
+    pub schedule_interval_secs: Option<Option<u64>>,
+    pub event_kind: Option<Option<String>>,
+    pub updated_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct StoredPlaybook {
+    id: String,
+    session_id: String,
+    title: String,
+    description: String,
+    prompt: String,
+    enabled: bool,
+    policy_bundle: String,
+    trigger_kind: String,
+    schedule_interval_secs: Option<u64>,
+    event_kind: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSessionRecord {
     pub id: String,
     pub job_id: String,
@@ -430,6 +478,10 @@ impl StateStore {
 
     pub fn artifacts_dir_path(&self) -> PathBuf {
         self.plan.artifacts_dir.clone()
+    }
+
+    pub fn playbooks_dir_path(&self) -> PathBuf {
+        self.plan.playbooks_dir.clone()
     }
 
     pub fn local_auth_token_path(&self) -> String {
@@ -795,6 +847,94 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn list_playbooks(&self) -> Result<Vec<PlaybookSummary>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_playbooks_with_connection(&connection, &self.plan.playbooks_dir)
+    }
+
+    pub fn get_playbook(&self, playbook_id: &str) -> Result<PlaybookDetail> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        load_playbook_detail(&connection, &self.plan.playbooks_dir, playbook_id)
+    }
+
+    pub fn create_playbook(&self, record: PlaybookRecord) -> Result<PlaybookDetail> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        ensure_session_exists(&connection, &record.session_id)?;
+        let stored = StoredPlaybook {
+            id: record.id,
+            session_id: record.session_id,
+            title: record.title,
+            description: record.description,
+            prompt: record.prompt,
+            enabled: record.enabled,
+            policy_bundle: record.policy_bundle,
+            trigger_kind: record.trigger_kind,
+            schedule_interval_secs: record.schedule_interval_secs,
+            event_kind: record.event_kind,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        };
+        write_playbook_file(&self.plan.playbooks_dir, &stored)?;
+        playbook_detail_from_stored(&connection, &stored)
+    }
+
+    pub fn update_playbook(
+        &self,
+        playbook_id: &str,
+        patch: PlaybookPatch,
+    ) -> Result<PlaybookDetail> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let mut stored = read_playbook_file(&self.plan.playbooks_dir, playbook_id)?;
+        if let Some(session_id) = patch.session_id {
+            ensure_session_exists(&connection, &session_id)?;
+            stored.session_id = session_id;
+        }
+        if let Some(title) = patch.title {
+            stored.title = title;
+        }
+        if let Some(description) = patch.description {
+            stored.description = description;
+        }
+        if let Some(prompt) = patch.prompt {
+            stored.prompt = prompt;
+        }
+        if let Some(enabled) = patch.enabled {
+            stored.enabled = enabled;
+        }
+        if let Some(policy_bundle) = patch.policy_bundle {
+            stored.policy_bundle = policy_bundle;
+        }
+        if let Some(trigger_kind) = patch.trigger_kind {
+            stored.trigger_kind = trigger_kind;
+        }
+        if let Some(schedule_interval_secs) = patch.schedule_interval_secs {
+            stored.schedule_interval_secs = schedule_interval_secs;
+        }
+        if let Some(event_kind) = patch.event_kind {
+            stored.event_kind = event_kind;
+        }
+        if let Some(updated_at) = patch.updated_at {
+            stored.updated_at = updated_at;
+        }
+        write_playbook_file(&self.plan.playbooks_dir, &stored)?;
+        playbook_detail_from_stored(&connection, &stored)
+    }
+
+    pub fn delete_playbook(&self, playbook_id: &str) -> Result<PlaybookDetail> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let detail = load_playbook_detail(&connection, &self.plan.playbooks_dir, playbook_id)?;
+        let deleted = connection.execute(
+            "DELETE FROM sessions WHERE id = ?1",
+            params![detail.session.id],
+        )?;
+        if deleted == 0 {
+            bail!("session '{}' was not found", detail.session.id);
+        }
+        fs::remove_file(playbook_file_path(&self.plan.playbooks_dir, playbook_id))
+            .with_context(|| format!("failed to delete playbook '{}'", playbook_id))?;
+        Ok(detail)
+    }
+
     pub fn append_session_turn(
         &self,
         session_id: &str,
@@ -895,6 +1035,24 @@ impl StateStore {
     pub fn list_jobs_for_session(&self, session_id: &str) -> Result<Vec<JobSummary>> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         list_jobs_for_session_with_connection(&connection, session_id)
+    }
+
+    pub fn list_jobs_for_template(
+        &self,
+        template_id: &str,
+        limit: usize,
+    ) -> Result<Vec<JobSummary>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_jobs_for_template_with_connection(&connection, template_id, limit)
+    }
+
+    pub fn list_jobs_for_template_by_state(
+        &self,
+        template_id: &str,
+        states: &[&str],
+    ) -> Result<Vec<JobSummary>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_jobs_for_template_by_state_with_connection(&connection, template_id, states)
     }
 
     pub fn list_jobs_by_state(&self, states: &[&str]) -> Result<Vec<JobSummary>> {
@@ -2364,6 +2522,132 @@ fn table_columns(connection: &Connection, table: &str) -> Result<HashSet<String>
     Ok(columns.into_iter().collect())
 }
 
+fn playbook_file_path(playbooks_dir: &Path, playbook_id: &str) -> PathBuf {
+    playbooks_dir.join(format!("{playbook_id}.json"))
+}
+
+fn read_playbook_file(playbooks_dir: &Path, playbook_id: &str) -> Result<StoredPlaybook> {
+    let path = playbook_file_path(playbooks_dir, playbook_id);
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read playbook '{}'", path.display()))?;
+    serde_json::from_str::<StoredPlaybook>(&content)
+        .with_context(|| format!("failed to decode playbook '{}'", path.display()))
+}
+
+fn write_playbook_file(playbooks_dir: &Path, playbook: &StoredPlaybook) -> Result<()> {
+    fs::create_dir_all(playbooks_dir).with_context(|| {
+        format!(
+            "failed to create playbook directory '{}'",
+            playbooks_dir.display()
+        )
+    })?;
+    let path = playbook_file_path(playbooks_dir, &playbook.id);
+    let encoded =
+        serde_json::to_string_pretty(playbook).context("failed to encode playbook JSON")?;
+    let temp_path = path.with_extension("json.tmp");
+    fs::write(&temp_path, encoded.as_bytes())
+        .with_context(|| format!("failed to write playbook '{}'", temp_path.display()))?;
+    fs::rename(&temp_path, &path)
+        .with_context(|| format!("failed to move playbook '{}' into place", path.display()))?;
+    Ok(())
+}
+
+fn list_playbooks_with_connection(
+    connection: &Connection,
+    playbooks_dir: &Path,
+) -> Result<Vec<PlaybookSummary>> {
+    if !playbooks_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut paths = fs::read_dir(playbooks_dir)
+        .with_context(|| format!("failed to read '{}'", playbooks_dir.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    let mut playbooks = paths
+        .into_iter()
+        .map(|path| {
+            let content = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read playbook '{}'", path.display()))?;
+            let stored = serde_json::from_str::<StoredPlaybook>(&content)
+                .with_context(|| format!("failed to decode playbook '{}'", path.display()))?;
+            playbook_summary_from_stored(connection, &stored)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    playbooks.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| right.created_at.cmp(&left.created_at))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(playbooks)
+}
+
+fn load_playbook_detail(
+    connection: &Connection,
+    playbooks_dir: &Path,
+    playbook_id: &str,
+) -> Result<PlaybookDetail> {
+    let stored = read_playbook_file(playbooks_dir, playbook_id)?;
+    playbook_detail_from_stored(connection, &stored)
+}
+
+fn playbook_detail_from_stored(
+    connection: &Connection,
+    stored: &StoredPlaybook,
+) -> Result<PlaybookDetail> {
+    Ok(PlaybookDetail {
+        playbook: playbook_summary_from_stored(connection, stored)?,
+        session: load_session_summary(connection, &stored.session_id)?,
+        prompt: stored.prompt.clone(),
+        recent_jobs: list_jobs_for_template_with_connection(
+            connection,
+            &stored.id,
+            PLAYBOOK_RECENT_JOB_LIMIT,
+        )?,
+    })
+}
+
+fn playbook_summary_from_stored(
+    connection: &Connection,
+    stored: &StoredPlaybook,
+) -> Result<PlaybookSummary> {
+    let session = load_session_summary(connection, &stored.session_id)?;
+    let recent_jobs = list_jobs_for_template_with_connection(connection, &stored.id, 1)?;
+    let latest = recent_jobs.first();
+    Ok(PlaybookSummary {
+        id: stored.id.clone(),
+        session_id: stored.session_id.clone(),
+        title: stored.title.clone(),
+        description: stored.description.clone(),
+        prompt_excerpt: excerpt(&stored.prompt, 160),
+        enabled: stored.enabled,
+        policy_bundle: stored.policy_bundle.clone(),
+        trigger_kind: stored.trigger_kind.clone(),
+        schedule_interval_secs: stored.schedule_interval_secs,
+        event_kind: stored.event_kind.clone(),
+        profile_id: session.profile_id,
+        profile_title: session.profile_title,
+        project_id: session.project_id,
+        project_title: session.project_title,
+        working_dir: session.working_dir,
+        job_count: count_jobs_for_template(connection, &stored.id)?,
+        last_job_id: latest.map(|job| job.id.clone()),
+        last_job_state: latest.map(|job| job.state.clone()).unwrap_or_default(),
+        last_run_at: latest.map(|job| job.created_at),
+        created_at: stored.created_at,
+        updated_at: stored.updated_at,
+    })
+}
+
 fn load_workspace_summary(connection: &Connection) -> Result<WorkspaceSummary> {
     let default_profile_id = workspace_default_profile_id(connection)?;
     Ok(WorkspaceSummary {
@@ -3186,6 +3470,7 @@ fn list_sessions_with_connection(connection: &Connection) -> Result<Vec<SessionS
         "
         SELECT id
         FROM sessions
+        WHERE scope != 'automation'
         ORDER BY updated_at DESC, created_at DESC, id DESC
         LIMIT 50
         ",
@@ -3382,6 +3667,10 @@ fn load_session_projects(
 }
 
 fn session_scope_from_projects(projects: &[SessionProjectSummary], stored_scope: &str) -> String {
+    if stored_scope == "automation" {
+        return "automation".to_string();
+    }
+
     if projects.is_empty() {
         if stored_scope.trim().is_empty() {
             "ad_hoc".to_string()
@@ -3456,6 +3745,65 @@ fn list_jobs_for_session_with_connection(
     let rows = statement.query_map(params![session_id], |row| row.get::<_, String>(0))?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .context("failed to load job ids")?
+        .into_iter()
+        .map(|job_id| load_job_summary(connection, &job_id))
+        .collect()
+}
+
+fn list_jobs_for_template_with_connection(
+    connection: &Connection,
+    template_id: &str,
+    limit: usize,
+) -> Result<Vec<JobSummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id
+        FROM jobs
+        WHERE template_id = ?1 AND parent_job_id IS NULL
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?2
+        ",
+    )?;
+    let rows = statement.query_map(params![template_id, limit as i64], |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load playbook job ids")?
+        .into_iter()
+        .map(|job_id| load_job_summary(connection, &job_id))
+        .collect()
+}
+
+fn list_jobs_for_template_by_state_with_connection(
+    connection: &Connection,
+    template_id: &str,
+    states: &[&str],
+) -> Result<Vec<JobSummary>> {
+    if states.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = (0..states.len())
+        .map(|index| format!("?{}", index + 2))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "
+        SELECT id
+        FROM jobs
+        WHERE template_id = ?1 AND parent_job_id IS NULL AND state IN ({placeholders})
+        ORDER BY created_at DESC, id DESC
+        "
+    );
+    let params = std::iter::once(template_id)
+        .chain(states.iter().copied())
+        .collect::<Vec<_>>();
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(rusqlite::params_from_iter(params), |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load playbook jobs by state")?
         .into_iter()
         .map(|job_id| load_job_summary(connection, &job_id))
         .collect()
@@ -3544,6 +3892,17 @@ fn load_job_summary(connection: &Connection, job_id: &str) -> Result<JobSummary>
     job.pending_approval_count = count_pending_approvals_for_job(connection, job_id)?;
     job.artifact_count = count_for_job(connection, "job_artifacts", job_id)?;
     Ok(job)
+}
+
+fn count_jobs_for_template(connection: &Connection, template_id: &str) -> Result<usize> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM jobs WHERE template_id = ?1 AND parent_job_id IS NULL",
+            params![template_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count.max(0) as usize)
+        .context("failed to count playbook jobs")
 }
 
 fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> {
@@ -4806,6 +5165,214 @@ mod tests {
     }
 
     #[test]
+    fn excludes_automation_sessions_from_session_list() {
+        let state_dir = test_state_dir("automation-session-filter");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let visible_scratch = store
+            .scratch_dir_for_session("visible-session")
+            .expect("visible scratch dir should resolve");
+        let automation_scratch = store
+            .scratch_dir_for_session("automation-session")
+            .expect("automation scratch dir should resolve");
+
+        store
+            .create_session(test_session_record(
+                "visible-session",
+                "Visible session",
+                "ad_hoc",
+                visible_scratch,
+            ))
+            .expect("visible session should persist");
+        store
+            .create_session(test_session_record(
+                "automation-session",
+                "Automation session",
+                "automation",
+                automation_scratch,
+            ))
+            .expect("automation session should persist");
+
+        let sessions = store.list_sessions().expect("sessions should load");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "visible-session");
+        assert!(
+            sessions
+                .iter()
+                .all(|session| session.scope.as_str() != "automation")
+        );
+
+        let automation = store
+            .get_session("automation-session")
+            .expect("automation session should still be addressable");
+        assert_eq!(automation.session.scope, "automation");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn persists_playbooks_and_lists_jobs_by_template_state() {
+        let state_dir = test_state_dir("playbook-crud");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let working_dir = store
+            .scratch_dir_for_session("playbook-session")
+            .expect("playbook scratch dir should resolve");
+
+        store
+            .create_session(test_session_record(
+                "playbook-session",
+                "Playbook session",
+                "automation",
+                working_dir.clone(),
+            ))
+            .expect("playbook session should persist");
+
+        let created = store
+            .create_playbook(PlaybookRecord {
+                id: "playbook-1".to_string(),
+                session_id: "playbook-session".to_string(),
+                title: "Workspace Sync".to_string(),
+                description: "Refresh project metadata".to_string(),
+                prompt: "Inspect the workspace and summarize changes.".to_string(),
+                enabled: true,
+                policy_bundle: "command_runner".to_string(),
+                trigger_kind: "schedule".to_string(),
+                schedule_interval_secs: Some(900),
+                event_kind: None,
+                created_at: 100,
+                updated_at: 100,
+            })
+            .expect("playbook should persist");
+
+        assert_eq!(created.playbook.id, "playbook-1");
+        assert_eq!(created.playbook.job_count, 0);
+        assert_eq!(
+            store.playbooks_dir_path().join("playbook-1.json"),
+            playbook_file_path(&store.playbooks_dir_path(), "playbook-1")
+        );
+
+        let listed = store.list_playbooks().expect("playbooks should list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "playbook-1");
+        assert_eq!(listed[0].working_dir, working_dir);
+
+        let detail = store
+            .get_playbook("playbook-1")
+            .expect("playbook detail should load");
+        assert_eq!(
+            detail.prompt,
+            "Inspect the workspace and summarize changes."
+        );
+        assert_eq!(detail.session.scope, "automation");
+
+        let updated = store
+            .update_playbook(
+                "playbook-1",
+                PlaybookPatch {
+                    title: Some("Workspace sync and test".to_string()),
+                    prompt: Some("Run checks and summarize results.".to_string()),
+                    enabled: Some(false),
+                    trigger_kind: Some("event".to_string()),
+                    schedule_interval_secs: Some(None),
+                    event_kind: Some(Some("workspace_projects_synced".to_string())),
+                    updated_at: Some(200),
+                    ..PlaybookPatch::default()
+                },
+            )
+            .expect("playbook should update");
+        assert_eq!(updated.playbook.title, "Workspace sync and test");
+        assert_eq!(updated.playbook.enabled, false);
+        assert_eq!(updated.playbook.trigger_kind, "event");
+        assert_eq!(updated.playbook.schedule_interval_secs, None);
+        assert_eq!(
+            updated.playbook.event_kind.as_deref(),
+            Some("workspace_projects_synced")
+        );
+        assert_eq!(updated.prompt, "Run checks and summarize results.");
+
+        store
+            .create_job(JobRecord {
+                id: "playbook-job-b".to_string(),
+                session_id: Some("playbook-session".to_string()),
+                parent_job_id: None,
+                template_id: Some("playbook-1".to_string()),
+                title: "Playbook run".to_string(),
+                purpose: "automation".to_string(),
+                trigger_kind: "playbook_event".to_string(),
+                state: "running".to_string(),
+                requested_by: "system".to_string(),
+                prompt_excerpt: "summary".to_string(),
+            })
+            .expect("root playbook job should persist");
+        store
+            .create_job(JobRecord {
+                id: "playbook-job-a".to_string(),
+                session_id: Some("playbook-session".to_string()),
+                parent_job_id: None,
+                template_id: Some("playbook-1".to_string()),
+                title: "Playbook run complete".to_string(),
+                purpose: "automation".to_string(),
+                trigger_kind: "playbook_manual".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "summary".to_string(),
+            })
+            .expect("second root playbook job should persist");
+        store
+            .create_job(JobRecord {
+                id: "playbook-child".to_string(),
+                session_id: Some("playbook-session".to_string()),
+                parent_job_id: Some("playbook-job-a".to_string()),
+                template_id: Some("playbook-1".to_string()),
+                title: "Playbook child".to_string(),
+                purpose: "automation".to_string(),
+                trigger_kind: "child_job".to_string(),
+                state: "completed".to_string(),
+                requested_by: "agent".to_string(),
+                prompt_excerpt: "child".to_string(),
+            })
+            .expect("child job should persist");
+
+        let template_jobs = store
+            .list_jobs_for_template("playbook-1", 10)
+            .expect("template jobs should load");
+        assert_eq!(template_jobs.len(), 2);
+        assert!(
+            template_jobs
+                .iter()
+                .all(|job| job.parent_job_id.as_deref().is_none())
+        );
+
+        let running_jobs = store
+            .list_jobs_for_template_by_state("playbook-1", &["running"])
+            .expect("running playbook jobs should load");
+        assert_eq!(running_jobs.len(), 1);
+        assert_eq!(running_jobs[0].id, "playbook-job-b");
+
+        let with_jobs = store
+            .get_playbook("playbook-1")
+            .expect("playbook should reload with jobs");
+        assert_eq!(with_jobs.playbook.job_count, 2);
+        assert_eq!(with_jobs.recent_jobs.len(), 2);
+
+        let deleted = store
+            .delete_playbook("playbook-1")
+            .expect("playbook should delete");
+        assert_eq!(deleted.playbook.id, "playbook-1");
+        assert!(
+            store
+                .list_playbooks()
+                .expect("playbooks should reload")
+                .is_empty()
+        );
+        assert!(
+            store.get_session("playbook-session").is_err(),
+            "deleting a playbook should remove its hidden session"
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
     fn provisions_and_validates_local_auth_token() {
         let state_dir = test_state_dir("local-auth-token");
         let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
@@ -4914,5 +5481,32 @@ mod tests {
             .expect("time should be monotonic")
             .as_nanos();
         std::env::temp_dir().join(format!("nucleus-{label}-{}-{suffix}", std::process::id()))
+    }
+
+    fn test_session_record(
+        session_id: &str,
+        title: &str,
+        scope: &str,
+        working_dir: String,
+    ) -> SessionRecord {
+        SessionRecord {
+            id: session_id.to_string(),
+            title: title.to_string(),
+            profile_id: String::new(),
+            profile_title: String::new(),
+            route_id: String::new(),
+            route_title: String::new(),
+            scope: scope.to_string(),
+            project_id: String::new(),
+            project_title: String::new(),
+            project_path: String::new(),
+            project_ids: Vec::new(),
+            provider: "codex".to_string(),
+            model: "gpt-5.4".to_string(),
+            provider_base_url: String::new(),
+            provider_api_key: String::new(),
+            working_dir,
+            working_dir_kind: "workspace_scratch".to_string(),
+        }
     }
 }
