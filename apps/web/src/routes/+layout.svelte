@@ -3,15 +3,12 @@
   import { page } from '$app/state';
   import { onMount } from 'svelte';
   import {
-    Cpu,
     FolderRoot,
     FolderTree,
     Gauge,
     Menu,
-    MemoryStick,
     MessageSquarePlus,
     MessagesSquare,
-    Settings2,
     ServerCog,
     Workflow,
     X
@@ -51,10 +48,7 @@
     { href: '/', label: 'Overview', icon: Gauge },
     { href: '/sessions', label: 'Sessions', icon: MessagesSquare },
     { href: '/automations', label: 'Automations', icon: Workflow },
-    { href: '/workspace', label: 'Workspace', icon: FolderTree },
-    { href: '/diagnostics', label: 'Diagnostics', icon: Cpu },
-    { href: '/memory', label: 'Memory', icon: MemoryStick },
-    { href: '/settings', label: 'Settings', icon: Settings2 }
+    { href: '/workspace', label: 'Workspace', icon: FolderTree }
   ];
 
   let overview = $state<RuntimeOverview | null>(null);
@@ -512,7 +506,7 @@
       </div>
 
       <div class="sticky bottom-0 shrink-0 border-t border-zinc-900 bg-zinc-950/95 px-3 py-2.5 backdrop-blur">
-        <nav class="grid grid-cols-7 gap-2">
+        <nav class="grid grid-cols-4 gap-2">
           {#each navigation as item}
             <button
               type="button"
@@ -528,7 +522,7 @@
               onclick={() => openNavigation(item.href)}
             >
               <item.icon class="size-4" />
-              {#if item.href === '/settings' && (hasUpdateAvailable || restartRequired)}
+              {#if item.href === '/workspace' && (hasUpdateAvailable || restartRequired)}
                 <span
                   class={cn(
                     'absolute right-2 top-2 h-2 w-2 rounded-full',
@@ -708,7 +702,7 @@
       <Button
         size="sm"
         onclick={() => {
-          void openNavigation('/settings');
+          void openNavigation('/workspace/settings');
         }}
       >
         Open settings
