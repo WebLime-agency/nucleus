@@ -2,24 +2,29 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
+    process::Stdio,
+    sync::{Arc, Mutex as StdMutex},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use nucleus_protocol::{
-    ApprovalRequestSummary, ArtifactSummary, DaemonEvent, JobDetail, JobSummary,
-    PromptProgressUpdate, SessionDetail, SessionPromptRequest, SessionSummary, SessionTurn,
-    SessionTurnImage, WorkerSummary, WorkspaceProfileSummary, WorkspaceSummary,
+    ApprovalRequestSummary, ArtifactSummary, CommandSessionSummary, DaemonEvent, JobDetail,
+    JobSummary, PromptProgressUpdate, SessionDetail, SessionPromptRequest, SessionSummary,
+    SessionTurn, SessionTurnImage, WorkerSummary, WorkspaceProfileSummary, WorkspaceSummary,
 };
 use nucleus_storage::{
-    ApprovalRequestRecord, AuditEventRecord, JobArtifactRecord, JobEventRecord, JobPatch,
-    JobRecord, PolicyDecisionRecord, SessionPatch, ToolCallPatch, ToolCallRecord,
-    ToolCapabilityGrantRecord, WorkerPatch, WorkerRecord,
+    ApprovalRequestRecord, AuditEventRecord, CommandSessionPatch, CommandSessionRecord,
+    JobArtifactPatch, JobArtifactRecord, JobEventRecord, JobPatch, JobRecord, PolicyDecisionRecord,
+    SessionPatch, ToolCallPatch, ToolCallRecord, ToolCapabilityGrantRecord, WorkerPatch,
+    WorkerRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
-    sync::{Mutex, mpsc, watch},
+    sync::{Mutex, mpsc, oneshot, watch},
+    time::{Duration, timeout},
 };
 use tracing::warn;
 use uuid::Uuid;
@@ -39,11 +44,21 @@ const READ_FILE_CHAR_LIMIT: usize = 12_000;
 const LIST_LIMIT: usize = 120;
 const RG_LIMIT: usize = 80;
 const DIFF_PREVIEW_CHAR_LIMIT: usize = 12_000;
+const COMMAND_PREVIEW_CHAR_LIMIT: usize = 4_000;
+const COMMAND_DEFAULT_TIMEOUT_SECS: u64 = 300;
+const COMMAND_MAX_TIMEOUT_SECS: u64 = 1_800;
+const COMMAND_DEFAULT_OUTPUT_LIMIT_BYTES: usize = 131_072;
+const COMMAND_MAX_OUTPUT_LIMIT_BYTES: usize = 524_288;
+const COMMAND_DEFAULT_WAIT_FOR_OUTPUT_MS: u64 = 250;
+const COMMAND_MAX_WAIT_FOR_OUTPUT_MS: u64 = 2_000;
+const COMMAND_STATE_SETTLE_WAIT_MS: u64 = 50;
+const COMMAND_TRUNCATED_NOTE: &str = "[output truncated by the daemon budget]";
 
 #[derive(Default)]
 pub struct AgentRuntime {
     running_jobs: Mutex<BTreeSet<String>>,
     cancel_tokens: Mutex<BTreeMap<String, watch::Sender<bool>>>,
+    command_sessions: Mutex<BTreeMap<String, ActiveCommandSessionHandle>>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +88,7 @@ struct CheckpointMessage {
 struct PendingToolAction {
     tool_call_id: String,
     approval_id: Option<String>,
+    command_session_id: Option<String>,
     summary: String,
     tool: String,
     args: Value,
@@ -158,11 +174,134 @@ struct GitStagePatchArgs {
     pathspecs: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct CommandRunArgs {
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    cwd: Option<String>,
+    timeout_secs: Option<u64>,
+    output_limit_bytes: Option<usize>,
+    network_policy: Option<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CommandSessionOpenArgs {
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    cwd: Option<String>,
+    timeout_secs: Option<u64>,
+    output_limit_bytes: Option<usize>,
+    network_policy: Option<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    title: Option<String>,
+    wait_for_output_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CommandSessionWriteArgs {
+    session_id: String,
+    input: String,
+    append_newline: Option<bool>,
+    wait_for_output_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CommandSessionCloseArgs {
+    session_id: String,
+    wait_for_exit_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TestsRunArgs {
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    cwd: Option<String>,
+    timeout_secs: Option<u64>,
+    output_limit_bytes: Option<usize>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone)]
 struct MutationPreview {
     detail: String,
     diff_preview: String,
     artifact: Option<ArtifactDraft>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveCommandSessionHandle {
+    job_id: String,
+    control: mpsc::Sender<CommandControl>,
+    done: watch::Receiver<bool>,
+}
+
+#[derive(Debug)]
+enum CommandControl {
+    Snapshot {
+        wait_for_output_ms: u64,
+        reply: oneshot::Sender<Result<CommandInteractionResult, String>>,
+    },
+    Write {
+        input: String,
+        append_newline: bool,
+        wait_for_output_ms: u64,
+        reply: oneshot::Sender<Result<CommandInteractionResult, String>>,
+    },
+    Close {
+        wait_for_exit_secs: u64,
+        reply: oneshot::Sender<Result<CommandCloseResult, String>>,
+    },
+    Terminate {
+        reason: String,
+        final_state: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct CommandInteractionResult {
+    stdout_tail: String,
+    stderr_tail: String,
+    truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CommandCloseResult {
+    state: String,
+    exit_code: Option<i32>,
+    last_error: String,
+    stdout_tail: String,
+    stderr_tail: String,
+    truncated: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LiveCommandOutput {
+    stdout_tail: String,
+    stderr_tail: String,
+    stdout_bytes: u64,
+    stderr_bytes: u64,
+    total_captured_bytes: usize,
+    truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedCommandSpec {
+    mode: String,
+    title: String,
+    command: String,
+    args: Vec<String>,
+    cwd: PathBuf,
+    timeout_secs: u64,
+    output_limit_bytes: usize,
+    network_policy: String,
+    env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -352,6 +491,14 @@ pub async fn cancel_job(state: AppState, job_id: String) -> Result<JobDetail, Ap
             );
         }
     }
+    state
+        .agent
+        .terminate_job_command_sessions(
+            &job_id,
+            "The job was canceled before this command session finished.",
+            "canceled",
+        )
+        .await;
     if let Some(session_id) = detail.job.session_id.as_deref() {
         let _ = state.store.update_session(
             session_id,
@@ -488,6 +635,22 @@ pub async fn recover_interrupted_jobs(state: &AppState) -> Result<()> {
         });
         publish_job_updated(state, &state.store.get_job(&job.id)?.job).await;
     }
+    for command_session in state
+        .store
+        .list_command_sessions_by_state(&["starting", "running"])?
+    {
+        let _ = state.store.update_command_session(
+            &command_session.id,
+            CommandSessionPatch {
+                state: Some("orphaned".to_string()),
+                last_error: Some(
+                    "The daemon restarted before this command session completed.".to_string(),
+                ),
+                completed_at: Some(Some(unix_timestamp())),
+                ..CommandSessionPatch::default()
+            },
+        );
+    }
     Ok(())
 }
 
@@ -518,6 +681,62 @@ impl AgentRuntime {
     async fn finish_job(&self, job_id: &str) {
         self.running_jobs.lock().await.remove(job_id);
         self.cancel_tokens.lock().await.remove(job_id);
+    }
+
+    async fn register_command_session(
+        &self,
+        command_session_id: &str,
+        job_id: &str,
+        control: mpsc::Sender<CommandControl>,
+        done: watch::Receiver<bool>,
+    ) {
+        self.command_sessions.lock().await.insert(
+            command_session_id.to_string(),
+            ActiveCommandSessionHandle {
+                job_id: job_id.to_string(),
+                control,
+                done,
+            },
+        );
+    }
+
+    async fn get_command_session(
+        &self,
+        command_session_id: &str,
+    ) -> Option<ActiveCommandSessionHandle> {
+        self.command_sessions
+            .lock()
+            .await
+            .get(command_session_id)
+            .cloned()
+    }
+
+    async fn finish_command_session(&self, command_session_id: &str) {
+        self.command_sessions
+            .lock()
+            .await
+            .remove(command_session_id);
+    }
+
+    async fn terminate_job_command_sessions(&self, job_id: &str, reason: &str, final_state: &str) {
+        let handles = self
+            .command_sessions
+            .lock()
+            .await
+            .values()
+            .filter(|handle| handle.job_id == job_id)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            let _ = handle
+                .control
+                .send(CommandControl::Terminate {
+                    reason: reason.to_string(),
+                    final_state: final_state.to_string(),
+                })
+                .await;
+        }
     }
 }
 
@@ -607,6 +826,7 @@ async fn run_job_loop(
             &mut checkpoint,
             &mut step,
             &mut tool_calls,
+            cancel_rx,
         )
         .await?
         {
@@ -659,6 +879,14 @@ async fn run_job_loop(
                 summary,
                 final_answer,
             } => {
+                state
+                    .agent
+                    .terminate_job_command_sessions(
+                        job_id,
+                        "The job completed and closed any remaining daemon-owned command sessions.",
+                        "closed",
+                    )
+                    .await;
                 let final_turn_id = Uuid::new_v4().to_string();
                 state.store.append_session_turn(
                     &session_id,
@@ -755,6 +983,7 @@ async fn run_job_loop(
                     &mut checkpoint,
                     &mut step,
                     &mut tool_calls,
+                    cancel_rx,
                     summary,
                     tool,
                     args,
@@ -782,6 +1011,7 @@ async fn handle_pending_action(
     checkpoint: &mut WorkerCheckpoint,
     step: &mut usize,
     tool_calls: &mut usize,
+    cancel_rx: &mut watch::Receiver<bool>,
 ) -> Result<LoopDisposition> {
     let Some(pending) = checkpoint.pending_action.clone() else {
         return Ok(LoopDisposition::Continue);
@@ -885,8 +1115,65 @@ async fn handle_pending_action(
         }
     }
 
+    if let Some(command_session_id) = pending.command_session_id.as_deref() {
+        if let Ok(command_session) = state.store.get_command_session(command_session_id) {
+            if command_session.state == "orphaned" {
+                let snapshot = artifact_snapshot_from_summary(state, &command_session)?;
+                let result = command_session_result_json(&command_session, &snapshot);
+                checkpoint.pending_action = None;
+                checkpoint.next_prompt = Some(build_tool_result_prompt(
+                    &pending.tool,
+                    &pending.summary,
+                    &result,
+                ));
+                state.store.write_worker_checkpoint(
+                    &worker.id,
+                    &serde_json::to_value(&checkpoint)
+                        .context("failed to encode worker checkpoint")?,
+                )?;
+                state.store.update_tool_call(
+                    &pending.tool_call_id,
+                    ToolCallPatch {
+                        status: Some("completed".to_string()),
+                        result_json: Some(Some(result.clone())),
+                        completed_at: Some(Some(unix_timestamp())),
+                        ..ToolCallPatch::default()
+                    },
+                )?;
+                *step += 1;
+                *worker = state.store.update_worker(
+                    &worker.id,
+                    WorkerPatch {
+                        state: Some("running".to_string()),
+                        step_count: Some(*step),
+                        tool_call_count: Some(*tool_calls),
+                        last_error: Some(String::new()),
+                        ..WorkerPatch::default()
+                    },
+                )?;
+                let _ = state.store.append_job_event(JobEventRecord {
+                    job_id: job_id.to_string(),
+                    worker_id: Some(worker.id.clone()),
+                    event_type: "tool.completed".to_string(),
+                    status: "completed".to_string(),
+                    summary: format!("Recovered {}", pending.tool),
+                    detail: "The daemon resumed with the persisted command-session result after restart."
+                        .to_string(),
+                    data_json: json!({
+                        "tool_id": pending.tool,
+                        "tool_call_id": pending.tool_call_id,
+                        "command_session_id": command_session.id,
+                    }),
+                });
+                publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+                publish_worker_updated(state, worker).await;
+                return Ok(LoopDisposition::Continue);
+            }
+        }
+    }
+
     execute_pending_tool_action(
-        state, session, job_id, worker, checkpoint, step, tool_calls, pending,
+        state, session, job_id, worker, checkpoint, step, tool_calls, cancel_rx, pending,
     )
     .await?;
     Ok(LoopDisposition::Continue)
@@ -900,6 +1187,7 @@ async fn handle_tool_call_proposal(
     checkpoint: &mut WorkerCheckpoint,
     step: &mut usize,
     tool_calls: &mut usize,
+    cancel_rx: &mut watch::Receiver<bool>,
     summary: String,
     tool: String,
     args: Value,
@@ -930,7 +1218,7 @@ async fn handle_tool_call_proposal(
     })?;
 
     if requires_approval {
-        let preview = preview_mutating_tool(state, worker, &tool, &args)?;
+        let preview = preview_approval_tool(state, worker, &tool, &args)?;
         let artifact_ids = if let Some(draft) = preview.artifact {
             let artifact =
                 write_job_artifact(state, job_id, Some(&worker.id), Some(&tool_call_id), draft)?;
@@ -968,6 +1256,7 @@ async fn handle_tool_call_proposal(
         checkpoint.pending_action = Some(PendingToolAction {
             tool_call_id: tool_call_id.clone(),
             approval_id: Some(approval.id.clone()),
+            command_session_id: None,
             summary: summary.clone(),
             tool: tool.clone(),
             args,
@@ -1072,12 +1361,13 @@ async fn handle_tool_call_proposal(
     let pending = PendingToolAction {
         tool_call_id,
         approval_id: None,
+        command_session_id: None,
         summary,
         tool,
         args,
     };
     execute_pending_tool_action(
-        state, session, job_id, worker, checkpoint, step, tool_calls, pending,
+        state, session, job_id, worker, checkpoint, step, tool_calls, cancel_rx, pending,
     )
     .await?;
     Ok(LoopDisposition::Continue)
@@ -1378,6 +1668,7 @@ async fn execute_pending_tool_action(
     checkpoint: &mut WorkerCheckpoint,
     step: &mut usize,
     tool_calls: &mut usize,
+    cancel_rx: &mut watch::Receiver<bool>,
     pending: PendingToolAction,
 ) -> Result<Value> {
     let tool = pending.tool.clone();
@@ -1410,7 +1701,19 @@ async fn execute_pending_tool_action(
         },
     )?;
 
-    let tool_result = match execute_granted_tool(state, session, worker, &tool, args).await {
+    let tool_result = match execute_granted_tool(
+        state,
+        session,
+        job_id,
+        worker,
+        &pending.tool_call_id,
+        checkpoint,
+        cancel_rx,
+        &tool,
+        args,
+    )
+    .await
+    {
         Ok(result) => result,
         Err(error) => {
             let _ = state.store.update_tool_call(
@@ -1472,9 +1775,13 @@ async fn execute_pending_tool_action(
 }
 
 async fn execute_granted_tool(
-    _state: &AppState,
+    state: &AppState,
     session: &SessionDetail,
+    job_id: &str,
     worker: &WorkerSummary,
+    tool_call_id: &str,
+    checkpoint: &mut WorkerCheckpoint,
+    cancel_rx: &mut watch::Receiver<bool>,
     tool: &str,
     args: Value,
 ) -> Result<Value> {
@@ -1534,11 +1841,54 @@ async fn execute_granted_tool(
                 .context("invalid args for git.stage_patch")?;
             execute_git_stage_patch_tool(worker, args).await
         }
+        "command.run" => {
+            let args = serde_json::from_value::<CommandRunArgs>(args)
+                .context("invalid args for command.run")?;
+            execute_command_run_tool(
+                state,
+                job_id,
+                worker,
+                tool_call_id,
+                checkpoint,
+                cancel_rx,
+                args,
+            )
+            .await
+        }
+        "command.session.open" => {
+            let args = serde_json::from_value::<CommandSessionOpenArgs>(args)
+                .context("invalid args for command.session.open")?;
+            execute_command_session_open_tool(state, job_id, worker, tool_call_id, args).await
+        }
+        "command.session.write" => {
+            let args = serde_json::from_value::<CommandSessionWriteArgs>(args)
+                .context("invalid args for command.session.write")?;
+            execute_command_session_write_tool(state, job_id, worker, args).await
+        }
+        "command.session.close" => {
+            let args = serde_json::from_value::<CommandSessionCloseArgs>(args)
+                .context("invalid args for command.session.close")?;
+            execute_command_session_close_tool(state, job_id, worker, args).await
+        }
+        "tests.run" => {
+            let args = serde_json::from_value::<TestsRunArgs>(args)
+                .context("invalid args for tests.run")?;
+            execute_tests_run_tool(
+                state,
+                job_id,
+                worker,
+                tool_call_id,
+                checkpoint,
+                cancel_rx,
+                args,
+            )
+            .await
+        }
         other => bail!("unsupported tool '{}'", other),
     }
 }
 
-fn preview_mutating_tool(
+fn preview_approval_tool(
     _state: &AppState,
     worker: &WorkerSummary,
     tool: &str,
@@ -1570,7 +1920,27 @@ fn preview_mutating_tool(
                 .context("invalid args for git.stage_patch")?;
             preview_git_stage_patch(worker, args)
         }
-        other => bail!("'{}' is not a mutating tool", other),
+        "command.run" => {
+            let args = serde_json::from_value::<CommandRunArgs>(args.clone())
+                .context("invalid args for command.run")?;
+            preview_command_run(worker, args)
+        }
+        "command.session.open" => {
+            let args = serde_json::from_value::<CommandSessionOpenArgs>(args.clone())
+                .context("invalid args for command.session.open")?;
+            preview_command_session_open(worker, args)
+        }
+        "command.session.close" => {
+            let args = serde_json::from_value::<CommandSessionCloseArgs>(args.clone())
+                .context("invalid args for command.session.close")?;
+            preview_command_session_close(worker, args)
+        }
+        "tests.run" => {
+            let args = serde_json::from_value::<TestsRunArgs>(args.clone())
+                .context("invalid args for tests.run")?;
+            preview_tests_run(worker, args)
+        }
+        other => bail!("'{}' does not support approval previews", other),
     }
 }
 
@@ -2007,6 +2377,1429 @@ async fn execute_git_stage_patch_tool(
     }))
 }
 
+fn preview_command_run(worker: &WorkerSummary, args: CommandRunArgs) -> Result<MutationPreview> {
+    let spec = resolve_command_spec(
+        worker,
+        "oneshot",
+        None,
+        args.command,
+        args.args,
+        args.cwd,
+        args.timeout_secs,
+        args.output_limit_bytes,
+        args.network_policy,
+        args.env,
+        false,
+    )?;
+    let plan = render_command_plan(&spec, "Run a bounded daemon-owned command.");
+    Ok(MutationPreview {
+        detail: format!("Run {} in {}.", command_label(&spec), spec.cwd.display()),
+        diff_preview: excerpt(&plan, DIFF_PREVIEW_CHAR_LIMIT),
+        artifact: Some(text_artifact(
+            "command-plan",
+            format!("Command {}", command_label(&spec)),
+            "txt",
+            "text/plain",
+            plan,
+        )),
+    })
+}
+
+fn preview_command_session_open(
+    worker: &WorkerSummary,
+    args: CommandSessionOpenArgs,
+) -> Result<MutationPreview> {
+    let spec = resolve_command_spec(
+        worker,
+        "interactive",
+        args.title,
+        args.command,
+        args.args,
+        args.cwd,
+        args.timeout_secs,
+        args.output_limit_bytes,
+        args.network_policy,
+        args.env,
+        false,
+    )?;
+    let plan = render_command_plan(&spec, "Open a daemon-owned interactive command session.");
+    Ok(MutationPreview {
+        detail: format!("Open interactive session for {}.", command_label(&spec)),
+        diff_preview: excerpt(&plan, DIFF_PREVIEW_CHAR_LIMIT),
+        artifact: Some(text_artifact(
+            "command-plan",
+            format!("Session {}", command_label(&spec)),
+            "txt",
+            "text/plain",
+            plan,
+        )),
+    })
+}
+
+fn preview_command_session_close(
+    _worker: &WorkerSummary,
+    args: CommandSessionCloseArgs,
+) -> Result<MutationPreview> {
+    if args.session_id.trim().is_empty() {
+        bail!("command.session.close requires a session_id");
+    }
+    let description = format!("Close command session {}.", args.session_id.trim());
+    Ok(MutationPreview {
+        detail: description.clone(),
+        diff_preview: description.clone(),
+        artifact: Some(text_artifact(
+            "command-plan",
+            format!("Close {}", args.session_id.trim()),
+            "txt",
+            "text/plain",
+            description,
+        )),
+    })
+}
+
+fn preview_tests_run(worker: &WorkerSummary, args: TestsRunArgs) -> Result<MutationPreview> {
+    let spec = resolve_command_spec(
+        worker,
+        "tests",
+        Some("Daemon-owned test run".to_string()),
+        args.command,
+        args.args,
+        args.cwd,
+        args.timeout_secs,
+        args.output_limit_bytes,
+        Some("inherit".to_string()),
+        args.env,
+        true,
+    )?;
+    let plan = render_command_plan(&spec, "Run a bounded test or build command.");
+    Ok(MutationPreview {
+        detail: format!("Run tests/build command {}.", command_label(&spec)),
+        diff_preview: excerpt(&plan, DIFF_PREVIEW_CHAR_LIMIT),
+        artifact: Some(text_artifact(
+            "command-plan",
+            format!("Tests {}", command_label(&spec)),
+            "txt",
+            "text/plain",
+            plan,
+        )),
+    })
+}
+
+fn resolve_command_spec(
+    worker: &WorkerSummary,
+    mode: &str,
+    title: Option<String>,
+    command: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+    timeout_secs: Option<u64>,
+    output_limit_bytes: Option<usize>,
+    network_policy: Option<String>,
+    env: BTreeMap<String, String>,
+    restrict_to_test_commands: bool,
+) -> Result<ResolvedCommandSpec> {
+    let command = validate_command_value(worker, &command)?;
+    if restrict_to_test_commands && !is_supported_test_command(&command) {
+        bail!(
+            "tests.run only supports common test/build executables like cargo, npm, pnpm, yarn, bun, pytest, go, make, and just"
+        );
+    }
+    let cwd = resolve_command_cwd(worker, cwd.as_deref())?;
+    let timeout_secs = timeout_secs
+        .unwrap_or(COMMAND_DEFAULT_TIMEOUT_SECS)
+        .clamp(1, COMMAND_MAX_TIMEOUT_SECS);
+    let output_limit_bytes = output_limit_bytes
+        .unwrap_or(COMMAND_DEFAULT_OUTPUT_LIMIT_BYTES)
+        .clamp(1_024, COMMAND_MAX_OUTPUT_LIMIT_BYTES);
+    let network_policy = normalized_network_policy(network_policy)?;
+    let env = sanitize_command_env(env)?;
+    let title = title
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            if args.is_empty() {
+                command.clone()
+            } else {
+                format!("{} {}", command, args.join(" "))
+            }
+        });
+
+    Ok(ResolvedCommandSpec {
+        mode: mode.to_string(),
+        title,
+        command,
+        args,
+        cwd,
+        timeout_secs,
+        output_limit_bytes,
+        network_policy,
+        env,
+    })
+}
+
+fn validate_command_value(worker: &WorkerSummary, command: &str) -> Result<String> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        bail!("commands require a non-empty executable name");
+    }
+    if trimmed.contains('\n') || trimmed.contains('\r') {
+        bail!("commands must be passed as an executable plus args, not multiline shell text");
+    }
+    if trimmed.contains('/') {
+        let target = resolve_write_scoped_path(worker, trimmed, false)?;
+        return Ok(target.display().to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn resolve_command_cwd(worker: &WorkerSummary, cwd: Option<&str>) -> Result<PathBuf> {
+    let target = resolve_write_scoped_path(worker, cwd.unwrap_or("."), false)?;
+    if !target.is_dir() {
+        bail!("command cwd '{}' is not a directory", target.display());
+    }
+    Ok(target)
+}
+
+fn normalized_network_policy(network_policy: Option<String>) -> Result<String> {
+    let policy = network_policy
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "inherit".to_string());
+    if policy != "inherit" {
+        bail!("only network_policy='inherit' is supported by the current command runtime");
+    }
+    Ok(policy)
+}
+
+fn sanitize_command_env(env: BTreeMap<String, String>) -> Result<BTreeMap<String, String>> {
+    let mut sanitized = BTreeMap::new();
+    for (key, value) in env {
+        let trimmed_key = key.trim();
+        if trimmed_key.is_empty() {
+            bail!("environment variable names must not be empty");
+        }
+        if !is_allowed_command_env_key(trimmed_key) {
+            bail!(
+                "environment variable '{}' is not allowed for daemon command tools",
+                trimmed_key
+            );
+        }
+        if value.len() > 8_192 {
+            bail!(
+                "environment variable '{}' exceeds the size limit",
+                trimmed_key
+            );
+        }
+        sanitized.insert(trimmed_key.to_string(), value);
+    }
+    Ok(sanitized)
+}
+
+fn is_allowed_command_env_key(key: &str) -> bool {
+    matches!(
+        key,
+        "CI" | "FORCE_COLOR"
+            | "NO_COLOR"
+            | "TERM"
+            | "CARGO_TERM_COLOR"
+            | "CARGO_TERM_PROGRESS_WHEN"
+            | "RUST_LOG"
+            | "NODE_ENV"
+            | "NPM_CONFIG_COLOR"
+            | "PYTHONUNBUFFERED"
+    ) || key.starts_with("CARGO_")
+        || key.starts_with("RUST_")
+        || key.starts_with("NODE_")
+        || key.starts_with("NPM_CONFIG_")
+        || key.starts_with("PYTEST_")
+        || key.starts_with("GO")
+}
+
+fn is_supported_test_command(command: &str) -> bool {
+    let executable = Path::new(command)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(command);
+    matches!(
+        executable,
+        "cargo" | "npm" | "pnpm" | "yarn" | "bun" | "pytest" | "go" | "make" | "just"
+    )
+}
+
+fn render_command_plan(spec: &ResolvedCommandSpec, summary: &str) -> String {
+    let env_summary = if spec.env.is_empty() {
+        "No environment overrides.".to_string()
+    } else {
+        format!(
+            "Environment overrides:\n{}",
+            spec.env
+                .keys()
+                .map(|key| format!("- {key}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    format!(
+        "{}\n\nMode: {}\nCommand: {}\nWorking directory: {}\nTimeout: {}s\nOutput budget: {} bytes\nNetwork policy: {}\n{}",
+        summary,
+        spec.mode,
+        shell_quoted_command(spec),
+        spec.cwd.display(),
+        spec.timeout_secs,
+        spec.output_limit_bytes,
+        spec.network_policy,
+        env_summary
+    )
+}
+
+fn command_label(spec: &ResolvedCommandSpec) -> String {
+    shell_quoted_command(spec)
+}
+
+fn shell_quoted_command(spec: &ResolvedCommandSpec) -> String {
+    let mut parts = vec![spec.command.clone()];
+    parts.extend(spec.args.clone());
+    parts
+        .into_iter()
+        .map(|part| {
+            if part.contains(' ') {
+                format!("{part:?}")
+            } else {
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+async fn execute_command_run_tool(
+    state: &AppState,
+    job_id: &str,
+    worker: &WorkerSummary,
+    tool_call_id: &str,
+    checkpoint: &mut WorkerCheckpoint,
+    cancel_rx: &mut watch::Receiver<bool>,
+    args: CommandRunArgs,
+) -> Result<Value> {
+    let spec = resolve_command_spec(
+        worker,
+        "oneshot",
+        Some("Daemon-owned command".to_string()),
+        args.command,
+        args.args,
+        args.cwd,
+        args.timeout_secs,
+        args.output_limit_bytes,
+        args.network_policy,
+        args.env,
+        false,
+    )?;
+    run_bounded_command_tool(
+        state,
+        job_id,
+        worker,
+        tool_call_id,
+        checkpoint,
+        cancel_rx,
+        spec,
+    )
+    .await
+}
+
+async fn execute_tests_run_tool(
+    state: &AppState,
+    job_id: &str,
+    worker: &WorkerSummary,
+    tool_call_id: &str,
+    checkpoint: &mut WorkerCheckpoint,
+    cancel_rx: &mut watch::Receiver<bool>,
+    args: TestsRunArgs,
+) -> Result<Value> {
+    let spec = resolve_command_spec(
+        worker,
+        "tests",
+        Some("Daemon-owned test run".to_string()),
+        args.command,
+        args.args,
+        args.cwd,
+        args.timeout_secs,
+        args.output_limit_bytes,
+        Some("inherit".to_string()),
+        args.env,
+        true,
+    )?;
+    run_bounded_command_tool(
+        state,
+        job_id,
+        worker,
+        tool_call_id,
+        checkpoint,
+        cancel_rx,
+        spec,
+    )
+    .await
+}
+
+async fn run_bounded_command_tool(
+    state: &AppState,
+    job_id: &str,
+    worker: &WorkerSummary,
+    tool_call_id: &str,
+    checkpoint: &mut WorkerCheckpoint,
+    cancel_rx: &mut watch::Receiver<bool>,
+    spec: ResolvedCommandSpec,
+) -> Result<Value> {
+    let started = start_command_session(state, job_id, worker, tool_call_id, &spec, false).await?;
+    if let Some(pending) = checkpoint.pending_action.as_mut() {
+        pending.command_session_id = Some(started.id.clone());
+        state.store.write_worker_checkpoint(
+            &worker.id,
+            &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+        )?;
+    }
+    let completed =
+        wait_for_command_session_completion(state, &started.id, cancel_rx, "command.run").await?;
+    Ok(command_session_result_json(
+        &completed,
+        &artifact_snapshot_from_summary(state, &completed)?,
+    ))
+}
+
+async fn execute_command_session_open_tool(
+    state: &AppState,
+    job_id: &str,
+    worker: &WorkerSummary,
+    tool_call_id: &str,
+    args: CommandSessionOpenArgs,
+) -> Result<Value> {
+    let wait_for_output_ms = args
+        .wait_for_output_ms
+        .unwrap_or(COMMAND_DEFAULT_WAIT_FOR_OUTPUT_MS)
+        .clamp(0, COMMAND_MAX_WAIT_FOR_OUTPUT_MS);
+    let spec = resolve_command_spec(
+        worker,
+        "interactive",
+        args.title,
+        args.command,
+        args.args,
+        args.cwd,
+        args.timeout_secs,
+        args.output_limit_bytes,
+        args.network_policy,
+        args.env,
+        false,
+    )?;
+    let started = start_command_session(state, job_id, worker, tool_call_id, &spec, true).await?;
+    let snapshot = snapshot_command_session(state, &started.id, wait_for_output_ms).await?;
+    let latest = load_latest_command_session(state, &started.id).await?;
+    Ok(command_session_result_json(&latest, &snapshot))
+}
+
+async fn execute_command_session_write_tool(
+    state: &AppState,
+    job_id: &str,
+    worker: &WorkerSummary,
+    args: CommandSessionWriteArgs,
+) -> Result<Value> {
+    let summary = state.store.get_command_session(&args.session_id)?;
+    validate_command_session_scope(job_id, worker, &summary)?;
+    let wait_for_output_ms = args
+        .wait_for_output_ms
+        .unwrap_or(COMMAND_DEFAULT_WAIT_FOR_OUTPUT_MS)
+        .clamp(0, COMMAND_MAX_WAIT_FOR_OUTPUT_MS);
+    let Some(handle) = state.agent.get_command_session(&summary.id).await else {
+        bail!("command session '{}' is not running", summary.id);
+    };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .control
+        .send(CommandControl::Write {
+            input: args.input,
+            append_newline: args.append_newline.unwrap_or(true),
+            wait_for_output_ms,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| anyhow!("command session '{}' is no longer available", summary.id))?;
+    let snapshot = reply_rx
+        .await
+        .map_err(|_| anyhow!("command session '{}' did not reply", summary.id))?
+        .map_err(anyhow::Error::msg)?;
+    let latest = state.store.get_command_session(&summary.id)?;
+    Ok(command_session_result_json(&latest, &snapshot))
+}
+
+async fn execute_command_session_close_tool(
+    state: &AppState,
+    job_id: &str,
+    worker: &WorkerSummary,
+    args: CommandSessionCloseArgs,
+) -> Result<Value> {
+    let summary = state.store.get_command_session(&args.session_id)?;
+    validate_command_session_scope(job_id, worker, &summary)?;
+    let wait_for_exit_secs = args.wait_for_exit_secs.unwrap_or(5).clamp(1, 30);
+    let Some(handle) = state.agent.get_command_session(&summary.id).await else {
+        let snapshot = artifact_snapshot_from_summary(state, &summary)?;
+        return Ok(command_session_result_json(&summary, &snapshot));
+    };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .control
+        .send(CommandControl::Close {
+            wait_for_exit_secs,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| anyhow!("command session '{}' is no longer available", summary.id))?;
+    let close_result = reply_rx
+        .await
+        .map_err(|_| anyhow!("command session '{}' did not reply", summary.id))?
+        .map_err(anyhow::Error::msg)?;
+    let latest = state.store.get_command_session(&summary.id)?;
+    Ok(json!({
+        "id": latest.id,
+        "state": close_result.state,
+        "exit_code": close_result.exit_code,
+        "last_error": close_result.last_error,
+        "stdout_tail": close_result.stdout_tail,
+        "stderr_tail": close_result.stderr_tail,
+        "truncated": close_result.truncated,
+        "stdout_artifact_id": latest.stdout_artifact_id,
+        "stderr_artifact_id": latest.stderr_artifact_id,
+        "completed_at": latest.completed_at,
+    }))
+}
+
+async fn start_command_session(
+    state: &AppState,
+    job_id: &str,
+    worker: &WorkerSummary,
+    tool_call_id: &str,
+    spec: &ResolvedCommandSpec,
+    interactive: bool,
+) -> Result<CommandSessionSummary> {
+    let command_session_id = Uuid::new_v4().to_string();
+    let command_summary = spec.title.clone();
+    let log_dir = state
+        .store
+        .artifacts_dir_path()
+        .join(job_id)
+        .join("commands");
+    fs::create_dir_all(&log_dir)
+        .with_context(|| format!("failed to create '{}'", log_dir.display()))?;
+    let stdout_path = log_dir.join(format!("{command_session_id}-stdout.log"));
+    let stderr_path = log_dir.join(format!("{command_session_id}-stderr.log"));
+    fs::write(&stdout_path, b"")
+        .with_context(|| format!("failed to prepare '{}'", stdout_path.display()))?;
+    fs::write(&stderr_path, b"")
+        .with_context(|| format!("failed to prepare '{}'", stderr_path.display()))?;
+
+    state.store.create_command_session(CommandSessionRecord {
+        id: command_session_id.clone(),
+        job_id: job_id.to_string(),
+        worker_id: worker.id.clone(),
+        tool_call_id: Some(tool_call_id.to_string()),
+        mode: spec.mode.clone(),
+        title: spec.title.clone(),
+        state: "starting".to_string(),
+        command: spec.command.clone(),
+        args: spec.args.clone(),
+        cwd: spec.cwd.display().to_string(),
+        env_json: serde_json::to_value(&spec.env).context("failed to encode command env")?,
+        network_policy: spec.network_policy.clone(),
+        timeout_secs: spec.timeout_secs,
+        output_limit_bytes: spec.output_limit_bytes,
+        last_error: String::new(),
+        exit_code: None,
+        stdout_artifact_id: None,
+        stderr_artifact_id: None,
+        started_at: None,
+        completed_at: None,
+    })?;
+
+    let stdout_artifact = match create_command_log_artifact(
+        state,
+        job_id,
+        worker,
+        tool_call_id,
+        &command_session_id,
+        "stdout",
+        &spec.title,
+        &stdout_path,
+    ) {
+        Ok(artifact) => artifact,
+        Err(error) => {
+            fail_command_session_start(
+                state,
+                job_id,
+                &worker.id,
+                tool_call_id,
+                &command_session_id,
+                &command_summary,
+                &stderr_path,
+                None,
+                None,
+                &error,
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    let stderr_artifact = match create_command_log_artifact(
+        state,
+        job_id,
+        worker,
+        tool_call_id,
+        &command_session_id,
+        "stderr",
+        &spec.title,
+        &stderr_path,
+    ) {
+        Ok(artifact) => artifact,
+        Err(error) => {
+            fail_command_session_start(
+                state,
+                job_id,
+                &worker.id,
+                tool_call_id,
+                &command_session_id,
+                &command_summary,
+                &stderr_path,
+                Some(&stdout_artifact),
+                None,
+                &error,
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    let _ = state.store.update_tool_call(
+        tool_call_id,
+        ToolCallPatch {
+            artifact_ids: Some(vec![stdout_artifact.id.clone(), stderr_artifact.id.clone()]),
+            ..ToolCallPatch::default()
+        },
+    )?;
+
+    let mut command = Command::new(&spec.command);
+    command
+        .args(&spec.args)
+        .current_dir(&spec.cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(if interactive {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .kill_on_drop(true);
+    for (key, value) in &spec.env {
+        command.env(key, value);
+    }
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+
+    let mut child = match command
+        .spawn()
+        .with_context(|| format!("failed to start '{}'", spec.command))
+    {
+        Ok(child) => child,
+        Err(error) => {
+            fail_command_session_start(
+                state,
+                job_id,
+                &worker.id,
+                tool_call_id,
+                &command_session_id,
+                &command_summary,
+                &stderr_path,
+                Some(&stdout_artifact),
+                Some(&stderr_artifact),
+                &error,
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let error = anyhow!("failed to capture stdout for '{}'", spec.command);
+            let _ = terminate_command_process(&mut child).await;
+            let _ = child.wait().await;
+            fail_command_session_start(
+                state,
+                job_id,
+                &worker.id,
+                tool_call_id,
+                &command_session_id,
+                &command_summary,
+                &stderr_path,
+                Some(&stdout_artifact),
+                Some(&stderr_artifact),
+                &error,
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let error = anyhow!("failed to capture stderr for '{}'", spec.command);
+            let _ = terminate_command_process(&mut child).await;
+            let _ = child.wait().await;
+            fail_command_session_start(
+                state,
+                job_id,
+                &worker.id,
+                tool_call_id,
+                &command_session_id,
+                &command_summary,
+                &stderr_path,
+                Some(&stdout_artifact),
+                Some(&stderr_artifact),
+                &error,
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    let stdin = child.stdin.take();
+
+    let live_output = Arc::new(StdMutex::new(LiveCommandOutput::default()));
+    let stdout_task = tokio::spawn(drain_command_output(
+        stdout,
+        stdout_path,
+        true,
+        live_output.clone(),
+        spec.output_limit_bytes,
+    ));
+    let stderr_task = tokio::spawn(drain_command_output(
+        stderr,
+        stderr_path,
+        false,
+        live_output.clone(),
+        spec.output_limit_bytes,
+    ));
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let (done_tx, done_rx) = watch::channel(false);
+
+    let running = state.store.update_command_session(
+        &command_session_id,
+        CommandSessionPatch {
+            state: Some("running".to_string()),
+            stdout_artifact_id: Some(Some(stdout_artifact.id.clone())),
+            stderr_artifact_id: Some(Some(stderr_artifact.id.clone())),
+            started_at: Some(Some(unix_timestamp())),
+            ..CommandSessionPatch::default()
+        },
+    )?;
+
+    state
+        .agent
+        .register_command_session(&command_session_id, job_id, control_tx, done_rx.clone())
+        .await;
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: job_id.to_string(),
+        worker_id: Some(worker.id.clone()),
+        event_type: "command.session.started".to_string(),
+        status: "running".to_string(),
+        summary: format!("Started {}", spec.title),
+        detail: render_command_plan(spec, "Daemon-owned command session started."),
+        data_json: json!({
+            "command_session_id": command_session_id,
+            "tool_call_id": tool_call_id,
+            "mode": spec.mode,
+        }),
+    });
+    publish_artifact_added(state, &stdout_artifact).await;
+    publish_artifact_added(state, &stderr_artifact).await;
+    publish_command_session_updated(state, &running).await;
+    publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+
+    tokio::spawn(run_command_session_controller(
+        state.clone(),
+        worker.id.clone(),
+        running.clone(),
+        stdin,
+        child,
+        live_output,
+        stdout_task,
+        stderr_task,
+        control_rx,
+        done_tx,
+    ));
+
+    Ok(running)
+}
+
+async fn wait_for_command_session_completion(
+    state: &AppState,
+    command_session_id: &str,
+    cancel_rx: &mut watch::Receiver<bool>,
+    label: &str,
+) -> Result<CommandSessionSummary> {
+    let Some(handle) = state.agent.get_command_session(command_session_id).await else {
+        return state.store.get_command_session(command_session_id);
+    };
+    let mut done = handle.done.clone();
+
+    loop {
+        if *done.borrow() {
+            break;
+        }
+
+        tokio::select! {
+            changed = done.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+            }
+            changed = cancel_rx.changed() => {
+                if changed.is_ok() && *cancel_rx.borrow() {
+                    let _ = handle.control.send(CommandControl::Terminate {
+                        reason: format!("{label} was canceled by the daemon."),
+                        final_state: "canceled".to_string(),
+                    }).await;
+                }
+            }
+        }
+    }
+
+    state.store.get_command_session(command_session_id)
+}
+
+async fn load_latest_command_session(
+    state: &AppState,
+    command_session_id: &str,
+) -> Result<CommandSessionSummary> {
+    if let Some(handle) = state.agent.get_command_session(command_session_id).await {
+        let mut done = handle.done.clone();
+        if !*done.borrow() {
+            let _ = timeout(
+                Duration::from_millis(COMMAND_STATE_SETTLE_WAIT_MS),
+                done.changed(),
+            )
+            .await;
+        }
+    }
+
+    state.store.get_command_session(command_session_id)
+}
+
+async fn snapshot_command_session(
+    state: &AppState,
+    command_session_id: &str,
+    wait_for_output_ms: u64,
+) -> Result<CommandInteractionResult> {
+    let Some(handle) = state.agent.get_command_session(command_session_id).await else {
+        let summary = state.store.get_command_session(command_session_id)?;
+        return artifact_snapshot_from_summary(state, &summary);
+    };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .control
+        .send(CommandControl::Snapshot {
+            wait_for_output_ms,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "command session '{}' is no longer available",
+                command_session_id
+            )
+        })?;
+    reply_rx
+        .await
+        .map_err(|_| anyhow!("command session '{}' did not reply", command_session_id))?
+        .map_err(anyhow::Error::msg)
+}
+
+fn validate_command_session_scope(
+    job_id: &str,
+    worker: &WorkerSummary,
+    summary: &CommandSessionSummary,
+) -> Result<()> {
+    if summary.job_id != job_id {
+        bail!(
+            "command session '{}' does not belong to this job",
+            summary.id
+        );
+    }
+    if summary.worker_id != worker.id {
+        bail!(
+            "command session '{}' is not owned by this worker",
+            summary.id
+        );
+    }
+    Ok(())
+}
+
+fn command_session_result_json(
+    summary: &CommandSessionSummary,
+    snapshot: &CommandInteractionResult,
+) -> Value {
+    json!({
+        "id": summary.id,
+        "mode": summary.mode,
+        "title": summary.title,
+        "state": summary.state,
+        "command": summary.command,
+        "args": summary.args,
+        "cwd": summary.cwd,
+        "network_policy": summary.network_policy,
+        "timeout_secs": summary.timeout_secs,
+        "output_limit_bytes": summary.output_limit_bytes,
+        "last_error": summary.last_error,
+        "exit_code": summary.exit_code,
+        "stdout_tail": snapshot.stdout_tail,
+        "stderr_tail": snapshot.stderr_tail,
+        "truncated": snapshot.truncated,
+        "stdout_artifact_id": summary.stdout_artifact_id,
+        "stderr_artifact_id": summary.stderr_artifact_id,
+        "started_at": summary.started_at,
+        "completed_at": summary.completed_at,
+    })
+}
+
+fn create_command_log_artifact(
+    state: &AppState,
+    job_id: &str,
+    worker: &WorkerSummary,
+    tool_call_id: &str,
+    command_session_id: &str,
+    stream: &str,
+    title: &str,
+    path: &Path,
+) -> Result<ArtifactSummary> {
+    state.store.create_job_artifact(JobArtifactRecord {
+        id: Uuid::new_v4().to_string(),
+        job_id: job_id.to_string(),
+        worker_id: Some(worker.id.clone()),
+        tool_call_id: Some(tool_call_id.to_string()),
+        command_session_id: Some(command_session_id.to_string()),
+        kind: "command-log".to_string(),
+        title: format!("{title} {stream}"),
+        path: path.display().to_string(),
+        mime_type: "text/plain".to_string(),
+        size_bytes: 0,
+        preview_text: format!("Waiting for {stream} output."),
+    })
+}
+
+fn load_artifact_preview_from_summary(
+    state: &AppState,
+    artifact_id: Option<&str>,
+) -> Result<String> {
+    let Some(artifact_id) = artifact_id else {
+        return Ok(String::new());
+    };
+    Ok(state.store.get_job_artifact(artifact_id)?.preview_text)
+}
+
+fn artifact_snapshot_from_summary(
+    state: &AppState,
+    summary: &CommandSessionSummary,
+) -> Result<CommandInteractionResult> {
+    let stdout_tail =
+        load_artifact_preview_from_summary(state, summary.stdout_artifact_id.as_deref())?;
+    let stderr_tail =
+        load_artifact_preview_from_summary(state, summary.stderr_artifact_id.as_deref())?;
+    let truncated = stdout_tail.contains(COMMAND_TRUNCATED_NOTE)
+        || stderr_tail.contains(COMMAND_TRUNCATED_NOTE);
+    Ok(CommandInteractionResult {
+        stdout_tail,
+        stderr_tail,
+        truncated,
+    })
+}
+
+async fn fail_command_session_start(
+    state: &AppState,
+    job_id: &str,
+    worker_id: &str,
+    tool_call_id: &str,
+    command_session_id: &str,
+    title: &str,
+    stderr_path: &Path,
+    stdout_artifact: Option<&ArtifactSummary>,
+    stderr_artifact: Option<&ArtifactSummary>,
+    error: &anyhow::Error,
+) {
+    let note = format!("failed to start command session: {error}\n");
+    let _ = fs::write(stderr_path, note.as_bytes());
+
+    let artifact_ids = stdout_artifact
+        .into_iter()
+        .chain(stderr_artifact.into_iter())
+        .map(|artifact| artifact.id.clone())
+        .collect::<Vec<_>>();
+    if !artifact_ids.is_empty() {
+        let _ = state.store.update_tool_call(
+            tool_call_id,
+            ToolCallPatch {
+                artifact_ids: Some(artifact_ids),
+                ..ToolCallPatch::default()
+            },
+        );
+    }
+
+    if let Some(artifact) = stderr_artifact {
+        let _ = state.store.update_job_artifact(
+            &artifact.id,
+            JobArtifactPatch {
+                size_bytes: Some(note.len() as u64),
+                preview_text: Some(excerpt(&note, COMMAND_PREVIEW_CHAR_LIMIT)),
+                ..JobArtifactPatch::default()
+            },
+        );
+    }
+
+    if let Some(artifact) = stdout_artifact {
+        publish_artifact_added(state, artifact).await;
+    }
+    if let Some(artifact) = stderr_artifact {
+        publish_artifact_added(state, artifact).await;
+    }
+
+    if let Ok(summary) = state.store.update_command_session(
+        command_session_id,
+        CommandSessionPatch {
+            state: Some("failed".to_string()),
+            last_error: Some(error.to_string()),
+            stdout_artifact_id: Some(stdout_artifact.map(|artifact| artifact.id.clone())),
+            stderr_artifact_id: Some(stderr_artifact.map(|artifact| artifact.id.clone())),
+            completed_at: Some(Some(unix_timestamp())),
+            ..CommandSessionPatch::default()
+        },
+    ) {
+        let _ = state.store.append_job_event(JobEventRecord {
+            job_id: job_id.to_string(),
+            worker_id: Some(worker_id.to_string()),
+            event_type: "command.session.updated".to_string(),
+            status: "failed".to_string(),
+            summary: format!("Failed {title}"),
+            detail: excerpt(&note, 240),
+            data_json: json!({
+                "command_session_id": command_session_id,
+                "tool_call_id": tool_call_id,
+            }),
+        });
+        publish_command_session_updated(state, &summary).await;
+        if let Ok(detail) = state.store.get_job(job_id) {
+            publish_job_updated(state, &detail.job).await;
+        }
+    }
+}
+
+async fn terminate_command_process(child: &mut tokio::process::Child) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            let result = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+            if result == 0 {
+                return Ok(());
+            }
+
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            return Err(error);
+        }
+    }
+
+    child.kill().await
+}
+
+async fn run_command_session_controller(
+    state: AppState,
+    worker_id: String,
+    summary: CommandSessionSummary,
+    mut stdin: Option<tokio::process::ChildStdin>,
+    mut child: tokio::process::Child,
+    live_output: Arc<StdMutex<LiveCommandOutput>>,
+    stdout_task: tokio::task::JoinHandle<Result<()>>,
+    stderr_task: tokio::task::JoinHandle<Result<()>>,
+    mut control_rx: mpsc::Receiver<CommandControl>,
+    done_tx: watch::Sender<bool>,
+) {
+    let mut final_state = summary.state.clone();
+    let mut last_error = String::new();
+    let mut exit_code = None;
+    let mut close_reply: Option<oneshot::Sender<Result<CommandCloseResult, String>>> = None;
+    let timeout_window = tokio::time::sleep(Duration::from_secs(summary.timeout_secs));
+    tokio::pin!(timeout_window);
+
+    loop {
+        tokio::select! {
+            status = child.wait() => {
+                match status {
+                    Ok(status) => {
+                        exit_code = status.code();
+                        if final_state == "running" {
+                            if status.success() {
+                                final_state = "completed".to_string();
+                            } else {
+                                final_state = "failed".to_string();
+                                last_error = format_command_exit_error(status);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        final_state = "failed".to_string();
+                        last_error = error.to_string();
+                    }
+                }
+                break;
+            }
+            _ = &mut timeout_window => {
+                final_state = "timed_out".to_string();
+                last_error = format!(
+                    "command exceeded the {} second daemon timeout",
+                    summary.timeout_secs
+                );
+                let _ = terminate_command_process(&mut child).await;
+                if let Ok(status) = child.wait().await {
+                    exit_code = status.code();
+                }
+                break;
+            }
+            Some(control) = control_rx.recv() => {
+                match control {
+                    CommandControl::Snapshot { wait_for_output_ms, reply } => {
+                        if wait_for_output_ms > 0 {
+                            tokio::time::sleep(Duration::from_millis(wait_for_output_ms)).await;
+                        }
+                        let _ = reply.send(Ok(snapshot_live_command_output(&live_output)));
+                    }
+                    CommandControl::Write {
+                        input,
+                        append_newline,
+                        wait_for_output_ms,
+                        reply,
+                    } => {
+                        let result = async {
+                            let stdin = stdin
+                                .as_mut()
+                                .ok_or_else(|| "command session is not accepting input".to_string())?;
+                            stdin
+                                .write_all(input.as_bytes())
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            if append_newline {
+                                stdin.write_all(b"\n").await.map_err(|error| error.to_string())?;
+                            }
+                            stdin.flush().await.map_err(|error| error.to_string())?;
+                            if wait_for_output_ms > 0 {
+                                tokio::time::sleep(Duration::from_millis(wait_for_output_ms)).await;
+                            }
+                            Ok(snapshot_live_command_output(&live_output))
+                        }
+                        .await;
+                        let _ = reply.send(result);
+                    }
+                    CommandControl::Close {
+                        wait_for_exit_secs,
+                        reply,
+                    } => {
+                        stdin.take();
+                        final_state = "closed".to_string();
+                        close_reply = Some(reply);
+                        match timeout(Duration::from_secs(wait_for_exit_secs), child.wait()).await {
+                            Ok(Ok(status)) => {
+                                exit_code = status.code();
+                                if !status.success() {
+                                    last_error = format_command_exit_error(status);
+                                }
+                            }
+                            Ok(Err(error)) => {
+                                last_error = error.to_string();
+                            }
+                            Err(_) => {
+                                let _ = terminate_command_process(&mut child).await;
+                                match child.wait().await {
+                                    Ok(status) => {
+                                        exit_code = status.code();
+                                        if !status.success() {
+                                            last_error = format_command_exit_error(status);
+                                        }
+                                    }
+                                    Err(error) => {
+                                        last_error = error.to_string();
+                                    }
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    CommandControl::Terminate { reason, final_state: requested_state } => {
+                        stdin.take();
+                        final_state = requested_state;
+                        last_error = reason;
+                        let _ = terminate_command_process(&mut child).await;
+                        if let Ok(status) = child.wait().await {
+                            exit_code = status.code();
+                        }
+                        break;
+                    }
+                }
+            }
+            else => {
+                break;
+            }
+        }
+    }
+
+    let stdout_result = stdout_task.await;
+    let stderr_result = stderr_task.await;
+    if last_error.is_empty() {
+        match stdout_result {
+            Err(error) => last_error = format!("stdout task crashed: {error}"),
+            Ok(Err(error)) => last_error = error.to_string(),
+            Ok(Ok(())) => {}
+        }
+    }
+    if last_error.is_empty() {
+        match stderr_result {
+            Err(error) => last_error = format!("stderr task crashed: {error}"),
+            Ok(Err(error)) => last_error = error.to_string(),
+            Ok(Ok(())) => {}
+        }
+    }
+
+    let output = read_live_command_output(&live_output);
+    let _ = refresh_command_log_artifacts(&state, &summary, &output);
+    let final_summary = match state.store.update_command_session(
+        &summary.id,
+        CommandSessionPatch {
+            state: Some(final_state.clone()),
+            last_error: Some(last_error.clone()),
+            exit_code: Some(exit_code),
+            completed_at: Some(Some(unix_timestamp())),
+            ..CommandSessionPatch::default()
+        },
+    ) {
+        Ok(updated) => updated,
+        Err(error) => {
+            warn!(command_session_id = %summary.id, error = %error, "failed to finalize command session");
+            let _ = done_tx.send(true);
+            state.agent.finish_command_session(&summary.id).await;
+            return;
+        }
+    };
+
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: final_summary.job_id.clone(),
+        worker_id: Some(worker_id),
+        event_type: "command.session.updated".to_string(),
+        status: final_summary.state.clone(),
+        summary: format!(
+            "{} {}",
+            format_state_prefix(&final_summary.state),
+            final_summary.title
+        ),
+        detail: if final_summary.last_error.is_empty() {
+            shell_command_summary(&final_summary)
+        } else {
+            format!(
+                "{}\n{}",
+                shell_command_summary(&final_summary),
+                excerpt(&final_summary.last_error, 240)
+            )
+        },
+        data_json: json!({
+            "command_session_id": final_summary.id,
+            "mode": final_summary.mode,
+            "exit_code": final_summary.exit_code,
+        }),
+    });
+    publish_command_session_updated(&state, &final_summary).await;
+    if let Ok(detail) = state.store.get_job(&final_summary.job_id) {
+        publish_job_updated(&state, &detail.job).await;
+    }
+
+    if let Some(reply) = close_reply {
+        let _ = reply.send(Ok(CommandCloseResult {
+            state: final_summary.state.clone(),
+            exit_code: final_summary.exit_code,
+            last_error: final_summary.last_error.clone(),
+            stdout_tail: render_output_preview(&output.stdout_tail, output.truncated),
+            stderr_tail: render_output_preview(&output.stderr_tail, output.truncated),
+            truncated: output.truncated,
+        }));
+    }
+
+    let _ = done_tx.send(true);
+    state.agent.finish_command_session(&summary.id).await;
+}
+
+async fn drain_command_output<R>(
+    mut reader: R,
+    path: PathBuf,
+    is_stdout: bool,
+    live_output: Arc<StdMutex<LiveCommandOutput>>,
+    output_limit_bytes: usize,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut file = tokio::fs::File::create(&path)
+        .await
+        .with_context(|| format!("failed to open '{}'", path.display()))?;
+    let mut buffer = vec![0u8; 4096];
+
+    loop {
+        let bytes_read = reader
+            .read(&mut buffer)
+            .await
+            .with_context(|| format!("failed to read '{}'", path.display()))?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        let capture = {
+            let mut output = live_output
+                .lock()
+                .expect("live command output mutex poisoned");
+            let remaining = output_limit_bytes.saturating_sub(output.total_captured_bytes);
+            if remaining == 0 {
+                output.truncated = true;
+                Vec::new()
+            } else {
+                let take = remaining.min(bytes_read);
+                if take < bytes_read {
+                    output.truncated = true;
+                }
+                output.total_captured_bytes += take;
+                let text = String::from_utf8_lossy(&buffer[..take]).to_string();
+                if is_stdout {
+                    output.stdout_bytes += take as u64;
+                    append_tail(&mut output.stdout_tail, &text, COMMAND_PREVIEW_CHAR_LIMIT);
+                } else {
+                    output.stderr_bytes += take as u64;
+                    append_tail(&mut output.stderr_tail, &text, COMMAND_PREVIEW_CHAR_LIMIT);
+                }
+                buffer[..take].to_vec()
+            }
+        };
+
+        if !capture.is_empty() {
+            file.write_all(&capture)
+                .await
+                .with_context(|| format!("failed to write '{}'", path.display()))?;
+        }
+    }
+
+    file.flush()
+        .await
+        .with_context(|| format!("failed to flush '{}'", path.display()))?;
+    Ok(())
+}
+
+fn read_live_command_output(live_output: &Arc<StdMutex<LiveCommandOutput>>) -> LiveCommandOutput {
+    live_output
+        .lock()
+        .expect("live command output mutex poisoned")
+        .clone()
+}
+
+fn snapshot_live_command_output(
+    live_output: &Arc<StdMutex<LiveCommandOutput>>,
+) -> CommandInteractionResult {
+    let output = read_live_command_output(live_output);
+    CommandInteractionResult {
+        stdout_tail: render_output_preview(&output.stdout_tail, output.truncated),
+        stderr_tail: render_output_preview(&output.stderr_tail, output.truncated),
+        truncated: output.truncated,
+    }
+}
+
+fn refresh_command_log_artifacts(
+    state: &AppState,
+    summary: &CommandSessionSummary,
+    output: &LiveCommandOutput,
+) -> Result<()> {
+    if let Some(artifact_id) = summary.stdout_artifact_id.as_deref() {
+        let _ = state.store.update_job_artifact(
+            artifact_id,
+            JobArtifactPatch {
+                size_bytes: Some(output.stdout_bytes),
+                preview_text: Some(render_output_preview(&output.stdout_tail, output.truncated)),
+                ..JobArtifactPatch::default()
+            },
+        )?;
+    }
+    if let Some(artifact_id) = summary.stderr_artifact_id.as_deref() {
+        let _ = state.store.update_job_artifact(
+            artifact_id,
+            JobArtifactPatch {
+                size_bytes: Some(output.stderr_bytes),
+                preview_text: Some(render_output_preview(&output.stderr_tail, output.truncated)),
+                ..JobArtifactPatch::default()
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn render_output_preview(value: &str, truncated: bool) -> String {
+    let mut preview = excerpt(value, COMMAND_PREVIEW_CHAR_LIMIT);
+    if truncated {
+        if !preview.is_empty() {
+            preview.push_str("\n\n");
+        }
+        preview.push_str(COMMAND_TRUNCATED_NOTE);
+    }
+    preview
+}
+
+fn append_tail(target: &mut String, chunk: &str, limit: usize) {
+    target.push_str(chunk);
+    let overflow = target.chars().count().saturating_sub(limit);
+    if overflow == 0 {
+        return;
+    }
+    *target = target.chars().skip(overflow).collect();
+}
+
+fn format_command_exit_error(status: std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("command exited with status {code}"),
+        None => "command exited due to signal".to_string(),
+    }
+}
+
+fn shell_command_summary(summary: &CommandSessionSummary) -> String {
+    let spec = ResolvedCommandSpec {
+        mode: summary.mode.clone(),
+        title: summary.title.clone(),
+        command: summary.command.clone(),
+        args: summary.args.clone(),
+        cwd: PathBuf::from(&summary.cwd),
+        timeout_secs: summary.timeout_secs,
+        output_limit_bytes: summary.output_limit_bytes,
+        network_policy: summary.network_policy.clone(),
+        env: BTreeMap::new(),
+    };
+    shell_quoted_command(&spec)
+}
+
+fn format_state_prefix(state: &str) -> &'static str {
+    match state {
+        "completed" => "Completed",
+        "closed" => "Closed",
+        "canceled" => "Canceled",
+        "orphaned" => "Orphaned",
+        "failed" => "Failed",
+        _ => "Updated",
+    }
+}
+
 fn apply_patch_edits(content: &str, edits: &[PatchEditArgs]) -> Result<String> {
     let mut next = content.to_string();
     for edit in edits {
@@ -2146,6 +3939,7 @@ fn write_job_artifact(
         job_id: job_id.to_string(),
         worker_id: worker_id.map(ToOwned::to_owned),
         tool_call_id: tool_call_id.map(ToOwned::to_owned),
+        command_session_id: None,
         kind: draft.kind,
         title: draft.title,
         path: artifact_path.display().to_string(),
@@ -2207,23 +4001,61 @@ fn fallback_note(note: &str, default: &str) -> String {
 }
 
 fn policy_for_tool(tool: &str) -> PolicyDecisionRecord {
-    if is_mutating_tool(tool) {
+    if requires_approval_for_tool(tool) {
         PolicyDecisionRecord {
             decision: "require_approval".to_string(),
-            reason: "repo mutations require explicit operator approval".to_string(),
-            matched_rule: format!("approval:mutation:{tool}"),
-            scope_kind: "path".to_string(),
-            risk_level: "medium".to_string(),
+            reason: if is_mutating_tool(tool) {
+                "repo mutations require explicit operator approval".to_string()
+            } else {
+                "daemon-owned command launches require explicit operator approval".to_string()
+            },
+            matched_rule: if is_mutating_tool(tool) {
+                format!("approval:mutation:{tool}")
+            } else {
+                format!("approval:command:{tool}")
+            },
+            scope_kind: if is_mutating_tool(tool) {
+                "path"
+            } else {
+                "process"
+            }
+            .to_string(),
+            risk_level: if is_mutating_tool(tool) {
+                "medium".to_string()
+            } else {
+                "high".to_string()
+            },
         }
     } else {
         PolicyDecisionRecord {
             decision: "allow".to_string(),
-            reason: "read-only tool inside the session scope".to_string(),
-            matched_rule: format!("auto-readonly:{tool}"),
-            scope_kind: "path".to_string(),
-            risk_level: "low".to_string(),
+            reason: if is_command_follow_up_tool(tool) {
+                "continuing an already-approved daemon command session".to_string()
+            } else {
+                "read-only tool inside the session scope".to_string()
+            },
+            matched_rule: if is_command_follow_up_tool(tool) {
+                format!("auto-command-follow-up:{tool}")
+            } else {
+                format!("auto-readonly:{tool}")
+            },
+            scope_kind: if is_command_follow_up_tool(tool) {
+                "process"
+            } else {
+                "path"
+            }
+            .to_string(),
+            risk_level: if is_command_follow_up_tool(tool) {
+                "medium".to_string()
+            } else {
+                "low".to_string()
+            },
         }
     }
+}
+
+fn requires_approval_for_tool(tool: &str) -> bool {
+    is_mutating_tool(tool) || matches!(tool, "command.run" | "command.session.open" | "tests.run")
 }
 
 fn is_mutating_tool(tool: &str) -> bool {
@@ -2231,6 +4063,10 @@ fn is_mutating_tool(tool: &str) -> bool {
         tool,
         "fs.apply_patch" | "fs.write_text" | "fs.move" | "fs.mkdir" | "git.stage_patch"
     )
+}
+
+fn is_command_follow_up_tool(tool: &str) -> bool {
+    matches!(tool, "command.session.write" | "command.session.close")
 }
 
 fn resolve_write_scoped_path(
@@ -2308,6 +4144,14 @@ fn limit_text(value: String, max_chars: usize) -> String {
 
 async fn fail_job(state: &AppState, job_id: &str, error: &str) -> Result<()> {
     let detail = state.store.get_job(job_id)?;
+    state
+        .agent
+        .terminate_job_command_sessions(
+            job_id,
+            "The job failed and closed any remaining daemon-owned command sessions.",
+            "canceled",
+        )
+        .await;
     state.store.update_job(
         job_id,
         JobPatch {
@@ -2413,6 +4257,7 @@ fn worker_write_roots(session: &SessionSummary) -> Vec<String> {
 fn root_worker_capabilities() -> Vec<ToolCapabilityGrantRecord> {
     let mut capabilities = read_only_capabilities();
     capabilities.extend(mutating_capabilities());
+    capabilities.extend(execution_capabilities());
     capabilities
 }
 
@@ -2558,6 +4403,73 @@ fn mutating_capabilities() -> Vec<ToolCapabilityGrantRecord> {
     ]
 }
 
+fn execution_capabilities() -> Vec<ToolCapabilityGrantRecord> {
+    vec![
+        ToolCapabilityGrantRecord {
+            tool_id: "command.run".to_string(),
+            summary: "Run a bounded daemon-owned command and capture logs as artifacts."
+                .to_string(),
+            approval_mode: "explicit".to_string(),
+            risk_level: "high".to_string(),
+            side_effect_level: "process".to_string(),
+            timeout_secs: COMMAND_DEFAULT_TIMEOUT_SECS,
+            max_output_bytes: COMMAND_DEFAULT_OUTPUT_LIMIT_BYTES,
+            supports_streaming: false,
+            concurrency_group: "process".to_string(),
+            scope_kind: "process".to_string(),
+        },
+        ToolCapabilityGrantRecord {
+            tool_id: "command.session.open".to_string(),
+            summary: "Open a bounded interactive command session owned by the daemon.".to_string(),
+            approval_mode: "explicit".to_string(),
+            risk_level: "high".to_string(),
+            side_effect_level: "process".to_string(),
+            timeout_secs: COMMAND_DEFAULT_TIMEOUT_SECS,
+            max_output_bytes: COMMAND_DEFAULT_OUTPUT_LIMIT_BYTES,
+            supports_streaming: true,
+            concurrency_group: "process".to_string(),
+            scope_kind: "process".to_string(),
+        },
+        ToolCapabilityGrantRecord {
+            tool_id: "command.session.write".to_string(),
+            summary: "Send input to an approved daemon-owned command session.".to_string(),
+            approval_mode: "auto".to_string(),
+            risk_level: "medium".to_string(),
+            side_effect_level: "process".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: COMMAND_DEFAULT_OUTPUT_LIMIT_BYTES,
+            supports_streaming: true,
+            concurrency_group: "process".to_string(),
+            scope_kind: "process".to_string(),
+        },
+        ToolCapabilityGrantRecord {
+            tool_id: "command.session.close".to_string(),
+            summary: "Close an approved daemon-owned command session.".to_string(),
+            approval_mode: "auto".to_string(),
+            risk_level: "medium".to_string(),
+            side_effect_level: "process".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: COMMAND_DEFAULT_OUTPUT_LIMIT_BYTES,
+            supports_streaming: false,
+            concurrency_group: "process".to_string(),
+            scope_kind: "process".to_string(),
+        },
+        ToolCapabilityGrantRecord {
+            tool_id: "tests.run".to_string(),
+            summary: "Run a bounded test or build command and capture logs as artifacts."
+                .to_string(),
+            approval_mode: "explicit".to_string(),
+            risk_level: "high".to_string(),
+            side_effect_level: "process".to_string(),
+            timeout_secs: COMMAND_DEFAULT_TIMEOUT_SECS,
+            max_output_bytes: COMMAND_DEFAULT_OUTPUT_LIMIT_BYTES,
+            supports_streaming: false,
+            concurrency_group: "process".to_string(),
+            scope_kind: "process".to_string(),
+        },
+    ]
+}
+
 fn worker_system_prompt(worker: &WorkerSummary) -> String {
     let tool_help = worker
         .capabilities
@@ -2636,6 +4548,12 @@ async fn publish_artifact_added(state: &AppState, summary: &ArtifactSummary) {
         .send(DaemonEvent::ArtifactAdded(summary.clone()));
 }
 
+async fn publish_command_session_updated(state: &AppState, summary: &CommandSessionSummary) {
+    let _ = state
+        .events
+        .send(DaemonEvent::CommandSessionUpdated(summary.clone()));
+}
+
 async fn publish_prompt_status(
     state: &AppState,
     session: &SessionSummary,
@@ -2668,6 +4586,19 @@ async fn publish_prompt_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        host::HostEngine,
+        runtime::RuntimeManager,
+        updates::{InstanceRuntime, UpdateManager},
+    };
+    use nucleus_storage::{JobRecord, StateStore, ToolCallRecord, WorkerRecord};
+    use std::{
+        env, fs,
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    use tokio::sync::broadcast;
 
     #[test]
     fn apply_patch_edits_replaces_one_match() {
@@ -2708,6 +4639,258 @@ mod tests {
             policy_for_tool("fs.write_text").decision,
             "require_approval"
         );
+        assert_eq!(policy_for_tool("command.run").decision, "require_approval");
+        assert_eq!(
+            policy_for_tool("command.session.open").decision,
+            "require_approval"
+        );
+        assert_eq!(policy_for_tool("command.session.write").decision, "allow");
         assert_eq!(policy_for_tool("fs.read_text").decision, "allow");
+    }
+
+    #[tokio::test]
+    async fn command_session_open_returns_completed_state_for_quick_exit() {
+        let state_dir = test_state_dir("command-session-open-quick-exit");
+        let state = initialize_test_state(&state_dir);
+        let (job_id, worker, tool_call_id) = create_command_test_context(&state, "quick-exit");
+
+        let result = execute_command_session_open_tool(
+            &state,
+            &job_id,
+            &worker,
+            &tool_call_id,
+            CommandSessionOpenArgs {
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), "printf quick-exit".to_string()],
+                cwd: None,
+                timeout_secs: Some(5),
+                output_limit_bytes: Some(8_192),
+                network_policy: Some("inherit".to_string()),
+                env: BTreeMap::new(),
+                title: Some("Quick exit".to_string()),
+                wait_for_output_ms: Some(100),
+            },
+        )
+        .await
+        .expect("interactive command session should open");
+
+        assert_eq!(
+            result.get("state").and_then(Value::as_str),
+            Some("completed")
+        );
+        assert!(
+            result
+                .get("stdout_tail")
+                .and_then(Value::as_str)
+                .expect("stdout tail should exist")
+                .contains("quick-exit")
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn command_session_start_failures_leave_no_starting_records() {
+        let state_dir = test_state_dir("command-session-start-failure");
+        let state = initialize_test_state(&state_dir);
+        let (job_id, worker, tool_call_id) = create_command_test_context(&state, "start-failure");
+        let spec = resolve_command_spec(
+            &worker,
+            "oneshot",
+            Some("Broken command".to_string()),
+            "definitely-not-a-real-executable".to_string(),
+            Vec::new(),
+            None,
+            Some(5),
+            Some(8_192),
+            Some("inherit".to_string()),
+            BTreeMap::new(),
+            false,
+        )
+        .expect("spec should validate before spawn");
+
+        let error = start_command_session(&state, &job_id, &worker, &tool_call_id, &spec, false)
+            .await
+            .expect_err("missing executable should fail to start");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to start 'definitely-not-a-real-executable'")
+        );
+
+        let starting = state
+            .store
+            .list_command_sessions_by_state(&["starting"])
+            .expect("starting sessions should load");
+        assert!(starting.is_empty(), "no sessions should remain in starting");
+
+        let failed = state
+            .store
+            .list_command_sessions_by_state(&["failed"])
+            .expect("failed sessions should load");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].state, "failed");
+        assert!(failed[0].completed_at.is_some());
+        let stderr_artifact_id = failed[0]
+            .stderr_artifact_id
+            .as_deref()
+            .expect("stderr artifact should be recorded");
+        let stderr_artifact = state
+            .store
+            .get_job_artifact(stderr_artifact_id)
+            .expect("stderr artifact should load");
+        assert!(
+            stderr_artifact
+                .preview_text
+                .contains("failed to start command session")
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    fn initialize_test_state(state_dir: &Path) -> AppState {
+        let workspace_root = state_dir.join("workspace");
+        if let Some(default_root) = dirs::home_dir().map(|path| path.join("dev-projects")) {
+            fs::create_dir_all(default_root).expect("default workspace root should exist");
+        }
+        fs::create_dir_all(&workspace_root).expect("workspace root should exist");
+
+        let store =
+            Arc::new(StateStore::initialize_at(state_dir).expect("store should initialize"));
+        store
+            .update_workspace(
+                Some(
+                    workspace_root
+                        .to_str()
+                        .expect("workspace root should serialize as utf-8"),
+                ),
+                None,
+                None,
+                None,
+            )
+            .expect("workspace root should update");
+
+        let (events, _) = broadcast::channel(8);
+        AppState {
+            version: "test".to_string(),
+            store: store.clone(),
+            host: Arc::new(HostEngine::new()),
+            runtimes: Arc::new(RuntimeManager::default()),
+            updates: Arc::new(UpdateManager::new(test_instance_runtime(), store)),
+            agent: Arc::new(AgentRuntime::default()),
+            web_dist_dir: None,
+            tailscale_dns_name: None,
+            events,
+        }
+    }
+
+    fn create_command_test_context(
+        state: &AppState,
+        label: &str,
+    ) -> (String, WorkerSummary, String) {
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let working_dir = workspace_root.join(label);
+        fs::create_dir_all(&working_dir).expect("working dir should exist");
+
+        let job_id = format!("job-{label}");
+        state
+            .store
+            .create_job(JobRecord {
+                id: job_id.clone(),
+                session_id: None,
+                parent_job_id: None,
+                template_id: None,
+                title: format!("Job {label}"),
+                purpose: "test".to_string(),
+                trigger_kind: "manual".to_string(),
+                state: "running".to_string(),
+                requested_by: "test".to_string(),
+                prompt_excerpt: String::new(),
+            })
+            .expect("job should persist");
+
+        let worker = state
+            .store
+            .create_worker(WorkerRecord {
+                id: format!("worker-{label}"),
+                job_id: job_id.clone(),
+                parent_worker_id: None,
+                title: format!("Worker {label}"),
+                lane: "utility".to_string(),
+                state: "running".to_string(),
+                provider: "test".to_string(),
+                model: "test".to_string(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: working_dir.display().to_string(),
+                read_roots: vec![working_dir.display().to_string()],
+                write_roots: vec![working_dir.display().to_string()],
+                max_steps: 10,
+                max_tool_calls: 10,
+                max_wall_clock_secs: 30,
+            })
+            .expect("worker should persist");
+        state
+            .store
+            .replace_tool_capability_grants(&worker.id, &execution_capabilities())
+            .expect("worker capabilities should persist");
+        let worker = state
+            .store
+            .get_job(&job_id)
+            .expect("job should reload")
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.id == worker.id)
+            .expect("worker should reload with capabilities");
+
+        let tool_call_id = format!("tool-call-{label}");
+        state
+            .store
+            .create_tool_call(ToolCallRecord {
+                id: tool_call_id.clone(),
+                job_id: job_id.clone(),
+                worker_id: worker.id.clone(),
+                tool_id: "command.session.open".to_string(),
+                status: "pending".to_string(),
+                summary: "Open a command session".to_string(),
+                args_json: json!({}),
+                result_json: None,
+                policy_decision: None,
+                artifact_ids: Vec::new(),
+                error_class: String::new(),
+                error_detail: String::new(),
+                started_at: None,
+                completed_at: None,
+            })
+            .expect("tool call should persist");
+
+        (job_id, worker, tool_call_id)
+    }
+
+    fn test_instance_runtime() -> InstanceRuntime {
+        InstanceRuntime::for_test(
+            "Test",
+            env::current_dir().expect("cwd should resolve"),
+            "127.0.0.1:42241",
+            "managed_release",
+        )
+    }
+
+    fn test_state_dir(label: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "nucleus-agent-{label}-{}-{suffix}",
+            std::process::id()
+        ))
     }
 }
