@@ -20,6 +20,7 @@
   import { Badge } from '$lib/components/ui/badge';
   import { Button } from '$lib/components/ui/button';
   import { evaluateCompatibility } from '$lib/nucleus/compatibility';
+  import { markdownExcerpt } from '$lib/nucleus/markdown';
   import {
     clearAccessToken,
     isAuthError,
@@ -495,7 +496,7 @@
                       </div>
                       {#if session.last_message_excerpt}
                         <div class="mt-1 line-clamp-1 text-xs leading-5 text-zinc-400">
-                          {session.last_message_excerpt}
+                          {markdownExcerpt(session.last_message_excerpt)}
                         </div>
                       {/if}
                     </div>

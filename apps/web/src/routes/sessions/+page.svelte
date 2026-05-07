@@ -5,6 +5,8 @@
   import {
     Archive,
     Bot,
+    ChevronDown,
+    ChevronUp,
     FolderTree,
     ImagePlus,
     MessageSquare,
@@ -21,6 +23,7 @@
     XCircle
   } from 'lucide-svelte';
 
+  import MarkdownContent from '$lib/components/session/markdown-content.svelte';
   import { Badge } from '$lib/components/ui/badge';
   import { Button } from '$lib/components/ui/button';
   import {
@@ -104,6 +107,9 @@
   let dragOver = $state(false);
   let promptImages = $state<ComposerImage[]>([]);
   let promptProgress = $state<PromptProgressUpdate[]>([]);
+  let composerActivityExpanded = $state(false);
+  let activityJobDetail = $state<JobDetail | null>(null);
+  let activityJobRequestInFlight = $state('');
   let transcriptAnchor = $state('');
 
   let transcriptElement = $state<HTMLDivElement | null>(null);
@@ -188,6 +194,109 @@
     return 'Live';
   });
   let activePromptProgress = $derived(promptProgress[promptProgress.length - 1] ?? null);
+  let composerActivityJobSummary = $derived.by(
+    () => jobSummaries.find((job) => jobIsActive(job.state)) ?? jobSummaries[0] ?? null
+  );
+  let composerActivityJobId = $derived(composerActivityJobSummary?.id ?? '');
+  let composerActivityVisible = $derived(
+    Boolean(
+      selectedSession &&
+        (activePromptProgress ||
+          jobSummaries.length > 0 ||
+          selectedSession.state === 'running' ||
+          selectedSession.state === 'paused')
+    )
+  );
+  let composerActivityPendingApproval = $derived.by(() =>
+    latestPendingApproval(activityJobDetail?.approvals ?? [])
+  );
+  let composerActivityToolCall = $derived.by(() =>
+    latestToolCallByStatus(activityJobDetail?.tool_calls ?? [], [
+      'running',
+      'queued',
+      'pending_approval'
+    ])
+  );
+  let composerActivityCommandSession = $derived.by(() =>
+    latestByState(activityJobDetail?.command_sessions ?? [], ['running', 'starting'])
+  );
+  let composerActivityWorker = $derived.by(() =>
+    latestByState(activityJobDetail?.workers ?? [], ['running', 'queued', 'paused'])
+  );
+  let composerActivitySummary = $derived.by(() => {
+    if (activePromptProgress) {
+      return {
+        title: activePromptProgress.label || 'Working on your prompt',
+        detail: activePromptProgress.detail || 'The daemon is preparing the next turn.',
+        state: activePromptProgress.status
+      };
+    }
+
+    if (composerActivityPendingApproval) {
+      return {
+        title: formatApprovalSummary(composerActivityPendingApproval),
+        detail:
+          composerActivityPendingApproval.detail || 'The daemon is waiting for an approval response.',
+        state: composerActivityPendingApproval.state
+      };
+    }
+
+    if (composerActivityCommandSession) {
+      return {
+        title: formatCommandSessionSummary(composerActivityCommandSession),
+        detail: formatCommandInvocation(composerActivityCommandSession),
+        state: composerActivityCommandSession.state
+      };
+    }
+
+    if (composerActivityToolCall) {
+      return {
+        title: composerActivityToolCall.tool_id,
+        detail: formatToolCallSummary(composerActivityToolCall),
+        state: composerActivityToolCall.status
+      };
+    }
+
+    if (composerActivityWorker) {
+      return {
+        title: composerActivityWorker.title,
+        detail: formatWorkerSummary(composerActivityWorker),
+        state: composerActivityWorker.state
+      };
+    }
+
+    if (activityJobDetail) {
+      return {
+        title: activityJobDetail.job.title,
+        detail:
+          activityJobDetail.job.result_summary ||
+          activityJobDetail.job.prompt_excerpt ||
+          activityJobDetail.job.purpose,
+        state: activityJobDetail.job.state
+      };
+    }
+
+    if (composerActivityJobSummary) {
+      return {
+        title: composerActivityJobSummary.title,
+        detail:
+          composerActivityJobSummary.result_summary ||
+          composerActivityJobSummary.prompt_excerpt ||
+          composerActivityJobSummary.purpose,
+        state: composerActivityJobSummary.state
+      };
+    }
+
+    if (selectedSession?.state === 'running' || selectedSession?.state === 'paused') {
+      return {
+        title: 'Working on your prompt',
+        detail: 'The daemon is preparing the next turn.',
+        state: selectedSession.state
+      };
+    }
+
+    return null;
+  });
 
   function uniqueId() {
     try {
@@ -255,6 +364,34 @@
     return 'secondary';
   }
 
+  function jobIsActive(state: string) {
+    return state === 'running' || state === 'queued' || state === 'paused';
+  }
+
+  function lastItem<T>(items: T[]) {
+    return items.length > 0 ? items[items.length - 1] : null;
+  }
+
+  function latestByState<T extends { state: string }>(items: T[], states: string[]) {
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      if (states.includes(items[index].state)) {
+        return items[index];
+      }
+    }
+
+    return lastItem(items);
+  }
+
+  function latestToolCallByStatus(items: ToolCallSummary[], statuses: string[]) {
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      if (statuses.includes(items[index].status)) {
+        return items[index];
+      }
+    }
+
+    return lastItem(items);
+  }
+
   function turnRoleLabel(turn: SessionTurn) {
     if (turn.role === 'assistant') return 'Nucleus';
     if (turn.role === 'user') return 'You';
@@ -300,6 +437,41 @@
     if (status === 'completed') return 'default';
     if (status === 'failed') return 'destructive';
     if (status === 'retrying') return 'warning';
+    return 'secondary';
+  }
+
+  function badgeVariantForActivityState(
+    state: string
+  ): 'default' | 'secondary' | 'warning' | 'destructive' {
+    if (
+      state === 'queued' ||
+      state === 'running' ||
+      state === 'paused' ||
+      state === 'assembling' ||
+      state === 'routing' ||
+      state === 'calling' ||
+      state === 'thinking' ||
+      state === 'streaming' ||
+      state === 'retrying' ||
+      state === 'starting' ||
+      state === 'pending' ||
+      state === 'pending_approval'
+    ) {
+      return 'warning';
+    }
+
+    if (state === 'completed' || state === 'approved') {
+      return 'default';
+    }
+
+    if (state === 'canceled' || state === 'closed' || state === 'orphaned' || state === 'denied') {
+      return 'secondary';
+    }
+
+    if (state === 'failed' || state === 'error') {
+      return 'destructive';
+    }
+
     return 'secondary';
   }
 
@@ -352,6 +524,11 @@
     if (next) {
       selectedJobId = next.job.id;
       upsertJobSummary(next.job);
+      if (next.job.id === composerActivityJobId) {
+        activityJobDetail = next;
+      }
+    } else if (!composerActivityJobId) {
+      activityJobDetail = null;
     }
   }
 
@@ -724,12 +901,36 @@
     void scrollTranscriptToBottom();
   });
 
+  $effect(() => {
+    const jobId = composerActivityJobId;
+
+    if (!jobId) {
+      activityJobDetail = null;
+      activityJobRequestInFlight = '';
+      return;
+    }
+
+    if (jobDetail?.job.id === jobId) {
+      activityJobDetail = jobDetail;
+      return;
+    }
+
+    if (activityJobDetail?.job.id === jobId || activityJobRequestInFlight === jobId) {
+      return;
+    }
+
+    void loadActivityJob(jobId);
+  });
+
   async function loadSelectedSession(sessionId: string, silent = false) {
     if (!sessionId) {
       selectedSessionId = '';
       detail = null;
       jobSummaries = [];
       jobDetail = null;
+      activityJobDetail = null;
+      activityJobRequestInFlight = '';
+      composerActivityExpanded = false;
       selectedJobId = '';
       setSessionDrafts(null);
       return;
@@ -742,6 +943,9 @@
     if (previousId !== sessionId) {
       clearComposerState();
       promptProgress = [];
+      activityJobDetail = null;
+      activityJobRequestInFlight = '';
+      composerActivityExpanded = false;
     }
 
     if (!silent) {
@@ -799,6 +1003,8 @@
 
       if (nextJobs.length === 0) {
         jobDetail = null;
+        activityJobDetail = null;
+        activityJobRequestInFlight = '';
         selectedJobId = '';
         return;
       }
@@ -838,6 +1044,35 @@
       error = cause instanceof Error ? cause.message : 'Failed to load the selected job.';
     } finally {
       jobLoading = false;
+    }
+  }
+
+  async function loadActivityJob(jobId: string) {
+    if (!jobId) {
+      activityJobDetail = null;
+      activityJobRequestInFlight = '';
+      return;
+    }
+
+    if (activityJobRequestInFlight === jobId) {
+      return;
+    }
+
+    activityJobRequestInFlight = jobId;
+
+    try {
+      const next = await fetchJobDetail(jobId);
+      if (composerActivityJobId === jobId) {
+        activityJobDetail = next;
+      }
+    } catch {
+      if (composerActivityJobId === jobId) {
+        activityJobDetail = null;
+      }
+    } finally {
+      if (activityJobRequestInFlight === jobId) {
+        activityJobRequestInFlight = '';
+      }
     }
   }
 
@@ -1192,6 +1427,24 @@
     return commandSession.title || commandSession.command;
   }
 
+  function formatCommandInvocation(commandSession: CommandSessionSummary) {
+    if (commandSession.args.length === 0) {
+      return commandSession.command;
+    }
+
+    return `${commandSession.command} ${commandSession.args.join(' ')}`;
+  }
+
+  function latestPendingApproval(approvals: ApprovalRequestSummary[]) {
+    for (let index = approvals.length - 1; index >= 0; index -= 1) {
+      if (approvals[index].state === 'pending') {
+        return approvals[index];
+      }
+    }
+
+    return lastItem(approvals);
+  }
+
   function applyStreamEvent(event: DaemonEvent) {
     if (event.event === 'overview.updated') {
       syncOverview(event.data);
@@ -1238,6 +1491,9 @@
     ) {
       if (jobDetail?.job.id === event.data.job_id || selectedJobSummary?.id === event.data.job_id) {
         void loadJob(event.data.job_id, true);
+      }
+      if (composerActivityJobId === event.data.job_id) {
+        void loadActivityJob(event.data.job_id);
       }
       return;
     }
@@ -1422,63 +1678,18 @@
                         {/if}
 
                         {#if turn.content}
-                          <div class="break-words whitespace-pre-wrap text-sm leading-6">
-                            {turn.content}
-                          </div>
+                          {#if turn.role === 'assistant'}
+                            <MarkdownContent content={turn.content} class="break-words text-zinc-100" />
+                          {:else}
+                            <div class="break-words whitespace-pre-wrap text-sm leading-6">
+                              {turn.content}
+                            </div>
+                          {/if}
                         {/if}
                       </div>
                     </div>
                   </div>
                 {/each}
-
-                {#if selectedSession.state === 'running' || selectedSession.state === 'paused' || activePromptProgress}
-                  <div class="flex justify-start">
-                    <div class="flex max-w-3xl flex-col gap-2 items-start">
-                      <div class="flex items-center gap-2 text-xs text-zinc-500">
-                        <span>Nucleus</span>
-                        <span class="text-zinc-700">/</span>
-                        <span>{activePromptProgress ? formatPromptProgressStatus(activePromptProgress.status) : 'Working'}</span>
-                      </div>
-                      <div class="rounded-2xl border border-zinc-800 bg-zinc-900/85 px-4 py-3 shadow-sm">
-                        <div class="flex flex-wrap items-center gap-2">
-                          <div class="inline-flex h-7 w-7 items-center justify-center rounded-full border border-zinc-700 bg-zinc-950">
-                            <Bot class="size-3.5 text-zinc-300" />
-                          </div>
-                          <div class="text-sm font-medium text-zinc-100">
-                            {activePromptProgress?.label ?? 'Working on your prompt'}
-                          </div>
-                          <Badge
-                            variant={badgeVariantForPromptStatus(activePromptProgress?.status ?? 'queued')}
-                          >
-                            {formatPromptProgressStatus(activePromptProgress?.status ?? 'queued')}
-                          </Badge>
-                        </div>
-
-                        <div class="mt-2 text-sm leading-6 text-zinc-400">
-                          {activePromptProgress?.detail ?? 'The daemon is preparing the next turn.'}
-                        </div>
-
-                        {#if promptProgress.length > 1}
-                          <div class="mt-3 space-y-2 border-t border-zinc-800 pt-3">
-                            {#each promptProgress as step, index (index)}
-                              <div class="flex items-start justify-between gap-3 text-xs">
-                                <div class="min-w-0">
-                                  <div class="text-zinc-300">{step.label}</div>
-                                  {#if step.detail}
-                                    <div class="mt-0.5 text-zinc-500">{step.detail}</div>
-                                  {/if}
-                                </div>
-                                <div class="shrink-0 text-zinc-600">
-                                  {step.attempt_count > 0 ? `${step.attempt}/${step.attempt_count}` : ''}
-                                </div>
-                              </div>
-                            {/each}
-                          </div>
-                        {/if}
-                      </div>
-                    </div>
-                  </div>
-                {/if}
               </div>
             {:else}
               <div class="flex h-full min-h-[16rem] items-center justify-center sm:min-h-[22rem]">
@@ -1532,6 +1743,249 @@
               ondragleave={handleComposerDragLeave}
               ondrop={handleComposerDrop}
             >
+              {#if composerActivityVisible && composerActivitySummary}
+                <div class="mb-3 rounded-2xl border border-zinc-800 bg-zinc-950/70">
+                  <button
+                    type="button"
+                    class="flex w-full items-start gap-3 px-3 py-3 text-left"
+                    aria-expanded={composerActivityExpanded}
+                    onclick={() => {
+                      composerActivityExpanded = !composerActivityExpanded;
+                    }}
+                  >
+                    <div class="mt-0.5 inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-zinc-800 bg-zinc-900 text-zinc-300">
+                      <Workflow class="size-4" />
+                    </div>
+
+                    <div class="min-w-0 flex-1">
+                      <div class="flex flex-wrap items-center gap-2">
+                        <div class="text-[11px] font-medium uppercase tracking-[0.16em] text-zinc-500">
+                          Daemon Activity
+                        </div>
+                        <Badge variant={badgeVariantForActivityState(composerActivitySummary.state)}>
+                          {formatPromptProgressStatus(composerActivitySummary.state)}
+                        </Badge>
+                      </div>
+
+                      <div class="mt-1 text-sm font-medium text-zinc-100">
+                        {composerActivitySummary.title}
+                      </div>
+                      <div class="mt-1 text-xs leading-5 text-zinc-500">
+                        {composerActivitySummary.detail}
+                      </div>
+
+                      <div class="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-zinc-600">
+                        {#if composerActivityJobSummary}
+                          <span>{composerActivityJobSummary.worker_count} workers</span>
+                          <span>{composerActivityJobSummary.pending_approval_count} approvals</span>
+                          <span>{composerActivityJobSummary.artifact_count} artifacts</span>
+                        {/if}
+                        {#if composerActivityToolCall}
+                          <span>Latest tool · {composerActivityToolCall.tool_id}</span>
+                        {:else if composerActivityCommandSession}
+                          <span>Latest command · {formatCommandSessionSummary(composerActivityCommandSession)}</span>
+                        {:else if composerActivityWorker}
+                          <span>Worker · {composerActivityWorker.title}</span>
+                        {/if}
+                      </div>
+                    </div>
+
+                    <div class="shrink-0 pt-1 text-zinc-500">
+                      {#if composerActivityExpanded}
+                        <ChevronUp class="size-4" />
+                      {:else}
+                        <ChevronDown class="size-4" />
+                      {/if}
+                    </div>
+                  </button>
+
+                  {#if composerActivityExpanded}
+                    <div class="border-t border-zinc-800 px-3 pb-3 pt-3">
+                      <div class="max-h-80 space-y-4 overflow-y-auto pr-1">
+                        {#if promptProgress.length > 0}
+                          <div>
+                            <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Prompt Progress</div>
+                            <div class="mt-2 space-y-2">
+                              {#each promptProgress as step, index (index)}
+                                <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-2">
+                                  <div class="flex items-start justify-between gap-3">
+                                    <div class="min-w-0">
+                                      <div class="text-sm text-zinc-100">{step.label}</div>
+                                      {#if step.detail}
+                                        <div class="mt-1 text-xs leading-5 text-zinc-500">{step.detail}</div>
+                                      {/if}
+                                    </div>
+                                    <Badge variant={badgeVariantForPromptStatus(step.status)}>
+                                      {formatPromptProgressStatus(step.status)}
+                                    </Badge>
+                                  </div>
+                                </div>
+                              {/each}
+                            </div>
+                          </div>
+                        {/if}
+
+                        {#if activityJobDetail?.workers.length}
+                          <div>
+                            <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Workers</div>
+                            <div class="mt-2 space-y-2">
+                              {#each [...activityJobDetail.workers].slice(-3).reverse() as worker}
+                                <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-2">
+                                  <div class="flex items-start justify-between gap-3">
+                                    <div class="min-w-0">
+                                      <div class="truncate text-sm text-zinc-100">{worker.title}</div>
+                                      <div class="mt-1 text-xs text-zinc-500">
+                                        {formatWorkerSummary(worker)}
+                                      </div>
+                                    </div>
+                                    <Badge variant={badgeVariantForJobState(worker.state)}>
+                                      {formatState(worker.state)}
+                                    </Badge>
+                                  </div>
+                                </div>
+                              {/each}
+                            </div>
+                          </div>
+                        {/if}
+
+                        {#if activityJobDetail?.tool_calls.length}
+                          <div>
+                            <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Tool Calls</div>
+                            <div class="mt-2 space-y-2">
+                              {#each [...activityJobDetail.tool_calls].slice(-4).reverse() as toolCall}
+                                <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-2">
+                                  <div class="flex items-start justify-between gap-3">
+                                    <div class="min-w-0">
+                                      <div class="truncate text-sm text-zinc-100">{toolCall.tool_id}</div>
+                                      <div class="mt-1 text-xs text-zinc-500">
+                                        {formatToolCallSummary(toolCall)}
+                                      </div>
+                                    </div>
+                                    <Badge variant={badgeVariantForToolCall(toolCall.status)}>
+                                      {formatState(toolCall.status)}
+                                    </Badge>
+                                  </div>
+                                  {#if toolCall.error_detail}
+                                    <div class="mt-2 text-xs leading-5 text-red-200">{toolCall.error_detail}</div>
+                                  {/if}
+                                </div>
+                              {/each}
+                            </div>
+                          </div>
+                        {/if}
+
+                        {#if activityJobDetail?.approvals.length}
+                          <div>
+                            <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Approvals</div>
+                            <div class="mt-2 space-y-2">
+                              {#each [...activityJobDetail.approvals].slice(-3).reverse() as approval}
+                                <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-2">
+                                  <div class="flex items-start justify-between gap-3">
+                                    <div class="min-w-0">
+                                      <div class="truncate text-sm text-zinc-100">{formatApprovalSummary(approval)}</div>
+                                      <div class="mt-1 text-xs leading-5 text-zinc-500">{approval.detail}</div>
+                                    </div>
+                                    <Badge variant={badgeVariantForJobState(approval.state)}>
+                                      {formatState(approval.state)}
+                                    </Badge>
+                                  </div>
+                                  {#if approval.state === 'pending'}
+                                    <div class="mt-3 flex flex-wrap gap-2">
+                                      <Button
+                                        variant="secondary"
+                                        size="sm"
+                                        disabled={approvalActioningId !== null}
+                                        onclick={() => {
+                                          void handleApproveRequest(approval);
+                                        }}
+                                      >
+                                        <span>{approvalActioningId === approval.id ? 'Approving' : 'Approve'}</span>
+                                      </Button>
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        disabled={approvalActioningId !== null}
+                                        onclick={() => {
+                                          void handleDenyRequest(approval);
+                                        }}
+                                      >
+                                        <span>{approvalActioningId === approval.id ? 'Resolving' : 'Deny'}</span>
+                                      </Button>
+                                    </div>
+                                  {/if}
+                                </div>
+                              {/each}
+                            </div>
+                          </div>
+                        {/if}
+
+                        {#if activityJobDetail?.command_sessions.length}
+                          <div>
+                            <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Command Sessions</div>
+                            <div class="mt-2 space-y-2">
+                              {#each [...activityJobDetail.command_sessions].slice(-3).reverse() as commandSession}
+                                <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-2">
+                                  <div class="flex items-start justify-between gap-3">
+                                    <div class="min-w-0">
+                                      <div class="truncate text-sm text-zinc-100">{formatCommandSessionSummary(commandSession)}</div>
+                                      <div class="mt-1 text-xs leading-5 text-zinc-500">
+                                        {formatCommandInvocation(commandSession)}
+                                      </div>
+                                    </div>
+                                    <Badge variant={badgeVariantForToolCall(commandSession.state)}>
+                                      {formatState(commandSession.state)}
+                                    </Badge>
+                                  </div>
+                                </div>
+                              {/each}
+                            </div>
+                          </div>
+                        {/if}
+
+                        {#if activityJobDetail?.artifacts.length}
+                          <div>
+                            <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Artifacts</div>
+                            <div class="mt-2 space-y-2">
+                              {#each [...activityJobDetail.artifacts].slice(-2).reverse() as artifact}
+                                <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-2">
+                                  <div class="flex items-start justify-between gap-3">
+                                    <div class="min-w-0">
+                                      <div class="truncate text-sm text-zinc-100">{formatArtifactSummary(artifact)}</div>
+                                      <div class="mt-1 text-xs text-zinc-500">
+                                        {artifact.kind} · {formatDateTime(artifact.created_at)}
+                                      </div>
+                                    </div>
+                                    <div class="shrink-0 text-[11px] text-zinc-600">{artifact.size_bytes} bytes</div>
+                                  </div>
+                                  {#if artifact.preview_text}
+                                    <pre class="mt-2 overflow-x-auto whitespace-pre-wrap rounded-lg bg-zinc-950 px-3 py-2 text-xs leading-5 text-zinc-500">{artifact.preview_text}</pre>
+                                  {/if}
+                                </div>
+                              {/each}
+                            </div>
+                          </div>
+                        {/if}
+                      </div>
+
+                      {#if composerActivityJobSummary}
+                        <div class="mt-3 flex justify-end border-t border-zinc-800 pt-3">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onclick={() => {
+                              detailPanelOpen = true;
+                              void loadJob(composerActivityJobSummary.id, true);
+                            }}
+                          >
+                            Open Full Job History
+                          </Button>
+                        </div>
+                      {/if}
+                    </div>
+                  {/if}
+                </div>
+              {/if}
+
               <textarea
                 bind:value={promptText}
                 class="min-h-[6rem] w-full resize-none bg-transparent text-sm leading-6 text-zinc-100 outline-none placeholder:text-zinc-500 sm:min-h-[7.5rem]"
@@ -1807,7 +2261,7 @@
                 <div class="space-y-1">
                   <div class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Agent Jobs</div>
                   <div class="text-sm text-zinc-400">
-                    Hidden worker history stays here instead of spilling tool chatter into the transcript.
+                    The composer shows live daemon activity. Full hidden worker history stays here.
                   </div>
                 </div>
 
