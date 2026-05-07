@@ -3,7 +3,6 @@
   import {
     Bot,
     Cpu,
-    FolderTree,
     KeyRound,
     Link2,
     Plus,
@@ -25,10 +24,9 @@
     createWorkspaceProfile,
     deleteWorkspaceProfile,
     fetchOverview,
-    updateWorkspace,
     updateWorkspaceProfile
   } from '$lib/nucleus/client';
-  import { compactPath, formatCount, formatState } from '$lib/nucleus/format';
+  import { compactPath, formatState } from '$lib/nucleus/format';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
   import type {
     DaemonEvent,
@@ -63,13 +61,11 @@
   ];
 
   let overview = $state<RuntimeOverview | null>(null);
-  let workspaceRoot = $state('');
   let defaultProfileId = $state('');
   let selectedProfileId = $state('');
   let profileDrafts = $state<WorkspaceProfileSummary[]>([]);
   let loading = $state(true);
   let refreshing = $state(false);
-  let savingWorkspace = $state(false);
   let savingProfileId = $state<string | null>(null);
   let deletingProfileId = $state<string | null>(null);
   let creatingProfile = $state(false);
@@ -82,10 +78,6 @@
   let selectedProfile = $derived(
     profileDrafts.find((profile) => profile.id === selectedProfileId) ?? profileDrafts[0] ?? null
   );
-  let defaultProfileTitle = $derived(
-    profileDrafts.find((profile) => profile.id === defaultProfileId)?.title ?? 'Default'
-  );
-  let workspaceDirty = $derived(workspace ? workspaceRoot !== workspace.root_path : false);
   let hasDirtyProfiles = $derived.by(() =>
     workspace
       ? profileDrafts.some((profile) => profileIsDirty(profile, workspace))
@@ -112,7 +104,7 @@
   }
 
   function syncWorkspaceFields(nextWorkspace: WorkspaceSummary, force = false) {
-    if (!force && (workspaceDirty || hasDirtyProfiles)) {
+    if (!force && hasDirtyProfiles) {
       return;
     }
 
@@ -121,7 +113,6 @@
       ? selectedProfileId
       : (nextDrafts[0]?.id ?? '');
 
-    workspaceRoot = nextWorkspace.root_path;
     defaultProfileId = nextWorkspace.default_profile_id;
     profileDrafts = nextDrafts;
     selectedProfileId = nextSelectedProfileId;
@@ -216,31 +207,6 @@
     } finally {
       loading = false;
       refreshing = false;
-    }
-  }
-
-  async function handleSaveWorkspace() {
-    if (!workspaceRoot.trim()) {
-      error = 'Workspace root is required.';
-      return;
-    }
-
-    savingWorkspace = true;
-    success = null;
-
-    try {
-      const nextWorkspace = await updateWorkspace({
-        root_path: workspaceRoot
-      });
-
-      overview = overview ? { ...overview, workspace: nextWorkspace } : null;
-      syncWorkspaceFields(nextWorkspace, true);
-      success = 'Workspace root updated.';
-      error = null;
-    } catch (cause) {
-      error = cause instanceof Error ? cause.message : 'Failed to update workspace settings.';
-    } finally {
-      savingWorkspace = false;
     }
   }
 
@@ -393,17 +359,17 @@
 </script>
 
 <svelte:head>
-  <title>Nucleus - Workspace</title>
+  <title>Nucleus - Profiles</title>
 </svelte:head>
 
 <div class="space-y-8">
   <section class="space-y-3">
     <Badge variant={error ? 'destructive' : 'default'}>{statusLabel}</Badge>
     <div>
-      <h1 class="text-3xl font-semibold text-zinc-50">Workspace</h1>
+      <h1 class="text-3xl font-semibold text-zinc-50">Profiles</h1>
       <p class="mt-2 max-w-3xl text-sm leading-6 text-zinc-400">
-        Profile settings live in the daemon. Pick one profile, edit it, save it, and let sessions
-        inherit the result without redefining raw model settings in each chat.
+        Pick a profile, choose its main and utility models, save, and let new sessions inherit the
+        result. The runtime inventory below shows which adapters the daemon can actually drive.
       </p>
     </div>
   </section>
@@ -420,84 +386,39 @@
     </div>
   {/if}
 
-  <section class="grid gap-4 xl:grid-cols-[0.92fr_1.08fr]">
-    <Card>
-      <CardHeader>
-        <CardTitle>Workspace Settings</CardTitle>
-        <CardDescription>
-          Keep the workspace root here. Default profile is managed from the active profile editor.
-        </CardDescription>
-      </CardHeader>
-      <CardContent class="space-y-4">
-        <label class="block space-y-1">
-          <span class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Root Path</span>
-          <input
-            class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
-            bind:value={workspaceRoot}
-            placeholder="/home/eba/dev-projects"
-          />
-        </label>
-
-        <div class="grid gap-3 sm:grid-cols-3">
-          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
-            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Default</div>
-            <div class="mt-2 truncate text-sm font-semibold text-zinc-50">{defaultProfileTitle}</div>
-          </div>
-          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
-            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Profiles</div>
-            <div class="mt-2 text-2xl font-semibold text-zinc-50">
-              {formatCount(profileDrafts.length)}
+  <Card>
+    <CardHeader>
+      <CardTitle>Runtime Inventory</CardTitle>
+      <CardDescription>
+        These are the local runtimes the daemon can actually see. Profile settings only choose how
+        to use them.
+      </CardDescription>
+    </CardHeader>
+    <CardContent class="space-y-3">
+      {#each runtimes as runtime}
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-4">
+          <div class="flex items-start justify-between gap-3">
+            <div class="min-w-0 space-y-1">
+              <div class="flex items-center gap-2">
+                <Cpu class="size-4 text-zinc-500" />
+                <div class="font-medium text-zinc-100">{formatState(runtime.id)}</div>
+              </div>
+              <div class="text-sm text-zinc-400">{runtime.summary}</div>
+              {#if runtime.executable_path}
+                <div class="truncate text-xs text-zinc-500" title={runtime.executable_path}>
+                  {compactPath(runtime.executable_path)}
+                </div>
+              {/if}
+              {#if runtime.note}
+                <div class="text-xs text-zinc-500">{runtime.note}</div>
+              {/if}
             </div>
-          </div>
-          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
-            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Projects</div>
-            <div class="mt-2 text-2xl font-semibold text-zinc-50">
-              {formatCount(workspace?.projects.length ?? 0)}
-            </div>
+            <Badge variant={runtimeStateVariant(runtime.state)}>{formatState(runtime.state)}</Badge>
           </div>
         </div>
-
-        <Button onclick={handleSaveWorkspace} disabled={savingWorkspace || !workspaceDirty}>
-          <Save class={savingWorkspace ? 'size-4 animate-spin' : 'size-4'} />
-          {savingWorkspace ? 'Saving' : 'Save Workspace Root'}
-        </Button>
-      </CardContent>
-    </Card>
-
-    <Card>
-      <CardHeader>
-        <CardTitle>Runtime Inventory</CardTitle>
-        <CardDescription>
-          These are the local runtimes the daemon can actually see. Profile settings only choose how
-          to use them.
-        </CardDescription>
-      </CardHeader>
-      <CardContent class="space-y-3">
-        {#each runtimes as runtime}
-          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-4">
-            <div class="flex items-start justify-between gap-3">
-              <div class="min-w-0 space-y-1">
-                <div class="flex items-center gap-2">
-                  <Cpu class="size-4 text-zinc-500" />
-                  <div class="font-medium text-zinc-100">{formatState(runtime.id)}</div>
-                </div>
-                <div class="text-sm text-zinc-400">{runtime.summary}</div>
-                {#if runtime.executable_path}
-                  <div class="truncate text-xs text-zinc-500" title={runtime.executable_path}>
-                    {compactPath(runtime.executable_path)}
-                  </div>
-                {/if}
-                {#if runtime.note}
-                  <div class="text-xs text-zinc-500">{runtime.note}</div>
-                {/if}
-              </div>
-              <Badge variant={runtimeStateVariant(runtime.state)}>{formatState(runtime.state)}</Badge>
-            </div>
-          </div>
-        {/each}
-      </CardContent>
-    </Card>
-  </section>
+      {/each}
+    </CardContent>
+  </Card>
 
   <section class="grid gap-4 xl:grid-cols-[18rem_minmax(0,1fr)]">
     <Card>
@@ -731,41 +652,4 @@
       </CardContent>
     </Card>
   </section>
-
-  <Card>
-    <CardHeader>
-      <CardTitle>Discovered Projects</CardTitle>
-      <CardDescription>
-        Workspace directories are discovered from the root here. Sessions still choose which projects
-        to attach when work starts.
-      </CardDescription>
-    </CardHeader>
-    <CardContent class="space-y-3">
-      {#if !workspace || workspace.projects.length === 0}
-        <div class="rounded-md border border-dashed border-zinc-800 px-4 py-8 text-sm text-zinc-500">
-          No projects discovered yet. Save a valid root and the daemon will populate them.
-        </div>
-      {:else}
-        {#each workspace.projects as project}
-          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-4">
-            <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-              <div class="space-y-1">
-                <div class="flex items-center gap-2">
-                  <FolderTree class="size-4 text-zinc-500" />
-                  <div class="font-medium text-zinc-100">{project.title}</div>
-                  <Badge variant="secondary">Discovered</Badge>
-                </div>
-                <div class="text-sm text-zinc-400">{project.relative_path}</div>
-                <div class="text-xs text-zinc-500">{compactPath(project.absolute_path)}</div>
-              </div>
-
-              <div class="rounded-md border border-zinc-800 bg-zinc-950/60 px-3 py-2 text-xs text-zinc-500">
-                Attach from a session when needed
-              </div>
-            </div>
-          </div>
-        {/each}
-      {/if}
-    </CardContent>
-  </Card>
 </div>
