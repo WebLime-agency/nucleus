@@ -360,6 +360,7 @@ pub struct StoredUpdateState {
     pub tracked_channel: Option<String>,
     pub tracked_ref: Option<String>,
     pub release_manifest_url: Option<String>,
+    pub pending_restart_release_id: Option<String>,
     pub update_available: bool,
     pub last_successful_check_at: Option<i64>,
     pub last_successful_target_version: Option<String>,
@@ -5408,6 +5409,7 @@ mod tests {
                 tracked_channel: Some("stable".to_string()),
                 tracked_ref: Some("main".to_string()),
                 release_manifest_url: Some("file:///tmp/manifest-stable.json".to_string()),
+                pending_restart_release_id: Some("rel_pending".to_string()),
                 update_available: true,
                 last_successful_check_at: Some(123),
                 last_successful_target_version: Some("0.2.0".to_string()),
@@ -5429,6 +5431,10 @@ mod tests {
 
         assert_eq!(state.tracked_channel.as_deref(), Some("stable"));
         assert_eq!(state.tracked_ref.as_deref(), Some("main"));
+        assert_eq!(
+            state.pending_restart_release_id.as_deref(),
+            Some("rel_pending")
+        );
         assert!(state.update_available);
         assert_eq!(
             state.last_successful_target_version.as_deref(),
