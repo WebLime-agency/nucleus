@@ -2748,7 +2748,23 @@ fn normalize_worker_action_value(value: &Value) -> Option<WorkerAction> {
         return normalize_worker_tool_call_value(function_call);
     }
 
-    if object.contains_key("tool_name") || object.contains_key("name") {
+    if object
+        .get("action")
+        .or_else(|| object.get("kind"))
+        .and_then(Value::as_str)
+        .map(|value| value.trim().eq_ignore_ascii_case("tool_call"))
+        .unwrap_or(false)
+        && (object.contains_key("tool")
+            || object.contains_key("tool_name")
+            || object.contains_key("name"))
+    {
+        return normalize_worker_tool_call_value(value);
+    }
+
+    if object.contains_key("tool")
+        || object.contains_key("tool_name")
+        || object.contains_key("name")
+    {
         return normalize_worker_tool_call_value(value);
     }
 
@@ -2773,12 +2789,18 @@ fn normalize_worker_tool_call_value(value: &Value) -> Option<WorkerAction> {
         .cloned()
         .unwrap_or_else(|| {
             let mut inline_args = object.clone();
+            inline_args.remove("action");
+            inline_args.remove("kind");
             inline_args.remove("tool");
             inline_args.remove("tool_name");
             inline_args.remove("name");
             inline_args.remove("summary");
             inline_args.remove("reason");
-            Value::Object(inline_args)
+            if inline_args.len() == 1 && inline_args.contains_key("input") {
+                inline_args.remove("input").unwrap_or(Value::Null)
+            } else {
+                Value::Object(inline_args)
+            }
         });
     let args = decode_worker_tool_args(args)?;
     let summary = object
@@ -2806,7 +2828,9 @@ fn decode_worker_tool_args(args: Value) -> Option<Value> {
                 return Some(Value::Object(serde_json::Map::new()));
             }
 
-            serde_json::from_str::<Value>(trimmed).ok()
+            serde_json::from_str::<Value>(trimmed)
+                .ok()
+                .or_else(|| Some(Value::String(value)))
         }
         value => Some(value),
     }
@@ -2829,10 +2853,11 @@ fn normalize_worker_tool_name_and_args(raw_tool: &str, args: Value) -> Option<(S
 }
 
 fn normalize_shell_tool_args(args: Value) -> Option<Value> {
-    let object = args.as_object()?;
-
     let mut normalized = serde_json::Map::new();
-    let command_value = object.get("command")?;
+    let object = args.as_object();
+    let command_value = object
+        .and_then(|object| object.get("command").or_else(|| object.get("input")))
+        .unwrap_or(&args);
     if let Some(command) = command_value.as_str().map(str::trim) {
         if command.is_empty() {
             return None;
@@ -2866,21 +2891,23 @@ fn normalize_shell_tool_args(args: Value) -> Option<Value> {
         return None;
     }
 
-    for key in [
-        "cwd",
-        "workdir",
-        "working_dir",
-        "timeout_secs",
-        "output_limit_bytes",
-        "network_policy",
-        "env",
-    ] {
-        if let Some(value) = object.get(key) {
-            let normalized_key = match key {
-                "workdir" | "working_dir" => "cwd",
-                _ => key,
-            };
-            normalized.insert(normalized_key.to_string(), value.clone());
+    if let Some(object) = object {
+        for key in [
+            "cwd",
+            "workdir",
+            "working_dir",
+            "timeout_secs",
+            "output_limit_bytes",
+            "network_policy",
+            "env",
+        ] {
+            if let Some(value) = object.get(key) {
+                let normalized_key = match key {
+                    "workdir" | "working_dir" => "cwd",
+                    _ => key,
+                };
+                normalized.insert(normalized_key.to_string(), value.clone());
+            }
         }
     }
 
@@ -7185,6 +7212,54 @@ mod tests {
         assert_eq!(args["args"][0], "-lc");
         assert_eq!(args["args"][1], "rg -n \"uhm|UHM|Uhm\" .");
         assert_eq!(args["cwd"], "/home/eba/dev-projects/dga-clients");
+    }
+
+    #[test]
+    fn parses_provider_native_action_tool_input_shell_call_as_command_run() {
+        let action = parse_worker_action(
+            r#"{"action":"tool_call","tool":"shell","input":"cd /home/eba/dev-projects/dga-clients && pwd && ls -la"}"#,
+        )
+        .expect("provider-native action/tool/input shell call should normalize");
+
+        let WorkerAction::ToolCall {
+            summary,
+            tool,
+            args,
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(summary, "Run the requested Nucleus action.");
+        assert_eq!(tool, "command.run");
+        assert_eq!(args["command"], "sh");
+        assert_eq!(args["args"][0], "-lc");
+        assert_eq!(
+            args["args"][1],
+            "cd /home/eba/dev-projects/dga-clients && pwd && ls -la"
+        );
+    }
+
+    #[test]
+    fn preserves_provider_native_input_siblings_for_direct_tool_calls() {
+        let action = parse_worker_action(
+            r#"{"action":"tool_call","tool":"command.session.write","session_id":"session-1","input":"q\n"}"#,
+        )
+        .expect("provider-native direct tool call input siblings should normalize");
+
+        let WorkerAction::ToolCall {
+            summary,
+            tool,
+            args,
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(summary, "Run the requested Nucleus action.");
+        assert_eq!(tool, "command.session.write");
+        assert_eq!(args["session_id"], "session-1");
+        assert_eq!(args["input"], "q\n");
     }
 
     #[test]
