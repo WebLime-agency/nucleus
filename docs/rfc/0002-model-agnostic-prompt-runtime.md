@@ -37,6 +37,8 @@ Providers do not own prompt context, skills, MCPs, or tool semantics.
 - Skills are Nucleus-owned prompt/include behavior. Enabled `always` skills activate deterministically; enabled `auto` skills activate when a configured trigger appears in the user turn. Skill include paths are resolved under the workspace root.
 - MCP servers are Nucleus-owned registry metadata only. They are not advertised as executable tools until the Nucleus MCP execution loop exists.
 - The daemon-owned worker tool loop is the executable local tool path.
+- Worker model responses are parsed through a canonical Nucleus action boundary. Syntax failures, valid JSON with the wrong action shape, and unknown action names are distinct failure classes. Provider-shaped compatibility parsing is a bounded adapter path, not an open-ended source of new action semantics.
+- Worker step, action, and wall-clock budgets are safety rails, not task-length semantics. Workspace Settings owns the granular default run budget for new turns. Each session can inherit the workspace default or choose a preset such as focused, extended, marathon, or unbounded from the composer. Budget exhaustion should produce a visible checkpoint that can be continued instead of a dead-end failure.
 
 ## Non-Goals
 

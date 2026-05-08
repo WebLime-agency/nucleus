@@ -10,8 +10,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use nucleus_protocol::{
     ApprovalRequestSummary, ArtifactSummary, CommandSessionSummary, CreatePlaybookRequest,
     DaemonEvent, JobDetail, JobSummary, PlaybookDetail, PlaybookSummary, PromptProgressUpdate,
-    SessionDetail, SessionPromptRequest, SessionSummary, SessionTurn, SessionTurnImage,
-    UpdatePlaybookRequest, WorkerSummary, WorkspaceProfileSummary, WorkspaceSummary,
+    RunBudgetSummary, SessionDetail, SessionPromptRequest, SessionSummary, SessionTurn,
+    SessionTurnImage, UpdatePlaybookRequest, WorkerSummary, WorkspaceProfileSummary,
+    WorkspaceSummary,
 };
 use nucleus_storage::{
     ApprovalRequestRecord, AuditEventRecord, CommandSessionPatch, CommandSessionRecord,
@@ -38,14 +39,17 @@ use super::{
     unix_timestamp,
 };
 use crate::runtime::{PromptStreamEvent, ProviderTurnResult};
+use crate::worker_action::{ChildJobProposal, WorkerAction, parse_worker_action};
 
-const JOB_MAX_STEPS: usize = 10;
-const JOB_MAX_TOOL_CALLS: usize = 20;
-const JOB_MAX_WALL_CLOCK_SECS: u64 = 300;
+const DEFAULT_JOB_MAX_WALL_CLOCK_SECS: u64 = 7_200;
+const MAX_CONFIGURED_JOB_STEPS: usize = 1_000;
+const MAX_CONFIGURED_JOB_TOOL_CALLS: usize = 2_000;
+const MAX_CONFIGURED_JOB_WALL_CLOCK_SECS: u64 = 86_400;
 const JOB_MAX_CHILDREN_PER_FANOUT: usize = 3;
-const CHILD_JOB_MAX_STEPS: usize = 6;
-const CHILD_JOB_MAX_TOOL_CALLS: usize = 12;
+const DEFAULT_CHILD_JOB_MAX_STEPS: usize = 24;
+const DEFAULT_CHILD_JOB_MAX_TOOL_CALLS: usize = 48;
 const CHILD_JOB_POLL_INTERVAL_MS: u64 = 250;
+const SESSION_HISTORY_TURN_LIMIT: usize = 8;
 const TOOL_OUTPUT_CHAR_LIMIT: usize = 8_000;
 const READ_FILE_CHAR_LIMIT: usize = 12_000;
 const LIST_LIMIT: usize = 120;
@@ -65,6 +69,51 @@ const PLAYBOOK_SCHEDULER_INTERVAL_SECS: u64 = 30;
 const PLAYBOOK_MIN_INTERVAL_SECS: u64 = 60;
 const PLAYBOOK_MAX_INTERVAL_SECS: u64 = 86_400;
 const COMMAND_TRUNCATED_NOTE: &str = "[output truncated by the Nucleus budget]";
+
+fn configured_job_max_wall_clock_secs() -> u64 {
+    configured_u64_env(
+        "NUCLEUS_JOB_MAX_WALL_CLOCK_SECS",
+        DEFAULT_JOB_MAX_WALL_CLOCK_SECS,
+        60,
+        MAX_CONFIGURED_JOB_WALL_CLOCK_SECS,
+    )
+}
+
+fn configured_child_job_max_steps() -> usize {
+    configured_usize_env(
+        "NUCLEUS_CHILD_JOB_MAX_STEPS",
+        DEFAULT_CHILD_JOB_MAX_STEPS,
+        1,
+        MAX_CONFIGURED_JOB_STEPS,
+    )
+}
+
+fn configured_child_job_max_tool_calls() -> usize {
+    configured_usize_env(
+        "NUCLEUS_CHILD_JOB_MAX_TOOL_CALLS",
+        DEFAULT_CHILD_JOB_MAX_TOOL_CALLS,
+        1,
+        MAX_CONFIGURED_JOB_TOOL_CALLS,
+    )
+}
+
+fn configured_usize_env(name: &str, default: usize, min: usize, max: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= min)
+        .map(|value| value.min(max))
+        .unwrap_or(default)
+}
+
+fn configured_u64_env(name: &str, default: u64, min: u64, max: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value >= min)
+        .map(|value| value.min(max))
+        .unwrap_or(default)
+}
 
 #[derive(Default)]
 pub struct AgentRuntime {
@@ -113,32 +162,6 @@ struct PendingToolAction {
     summary: String,
     tool: String,
     args: Value,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum WorkerAction {
-    ToolCall {
-        summary: String,
-        tool: String,
-        #[serde(default)]
-        args: Value,
-    },
-    SpawnChildJobs {
-        summary: String,
-        jobs: Vec<ChildJobProposal>,
-    },
-    FinalAnswer {
-        summary: String,
-        final_answer: String,
-    },
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ChildJobProposal {
-    title: String,
-    prompt: String,
-    working_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -422,9 +445,9 @@ pub async fn start_prompt_job(
         working_dir: current.session.working_dir.clone(),
         read_roots: worker_read_roots(&current.session),
         write_roots: worker_write_roots(&current.session),
-        max_steps: JOB_MAX_STEPS,
-        max_tool_calls: JOB_MAX_TOOL_CALLS,
-        max_wall_clock_secs: JOB_MAX_WALL_CLOCK_SECS,
+        max_steps: current.session.run_budget.max_steps,
+        max_tool_calls: current.session.run_budget.max_tool_calls,
+        max_wall_clock_secs: current.session.run_budget.max_wall_clock_secs,
     })?;
     state.store.update_job(
         &job_id,
@@ -455,11 +478,11 @@ pub async fn start_prompt_job(
         session_id: session_id.clone(),
         prompt_text: execution_prompt.clone(),
         images: payload.images.clone(),
-        conversation: vec![CheckpointMessage {
-            role: "system".to_string(),
-            content: worker_system_prompt_with_mode(&worker, &current.session.execution_mode),
-            images: Vec::new(),
-        }],
+        conversation: initial_worker_conversation(
+            &worker,
+            &current.session.execution_mode,
+            &current.turns,
+        ),
         next_prompt: None,
         pending_action: None,
     };
@@ -1215,12 +1238,34 @@ async fn run_job_loop(
             return Ok(());
         }
 
-        if step >= worker.max_steps {
-            bail!("Utility Worker reached the maximum step budget");
+        if worker.max_steps > 0 && step >= worker.max_steps {
+            complete_job_with_budget_checkpoint(
+                state,
+                &session,
+                job_id,
+                &mut worker,
+                &checkpoint,
+                step,
+                tool_calls,
+                "step",
+            )
+            .await?;
+            return Ok(());
         }
 
-        if tool_calls >= worker.max_tool_calls {
-            bail!("Utility Worker reached the maximum action budget");
+        if worker.max_tool_calls > 0 && tool_calls >= worker.max_tool_calls {
+            complete_job_with_budget_checkpoint(
+                state,
+                &session,
+                job_id,
+                &mut worker,
+                &checkpoint,
+                step,
+                tool_calls,
+                "action",
+            )
+            .await?;
+            return Ok(());
         }
 
         if !checkpoint.images.is_empty() && !worker_supports_vision_with_tools(&worker) {
@@ -1252,6 +1297,7 @@ async fn run_job_loop(
         let prompt = checkpoint.next_prompt.take().unwrap_or_else(|| {
             build_initial_step_prompt(&session.session, &assembled_prompt.prompt, &worker)
         });
+        let prompt = add_budget_guidance(prompt, &worker, step, tool_calls);
         let prompt_images = if attach_initial_images {
             checkpoint.images.as_slice()
         } else {
@@ -2119,9 +2165,9 @@ async fn create_child_job(
         working_dir: working_dir.display().to_string(),
         read_roots,
         write_roots: Vec::new(),
-        max_steps: CHILD_JOB_MAX_STEPS,
-        max_tool_calls: CHILD_JOB_MAX_TOOL_CALLS,
-        max_wall_clock_secs: JOB_MAX_WALL_CLOCK_SECS,
+        max_steps: configured_child_job_max_steps(),
+        max_tool_calls: configured_child_job_max_tool_calls(),
+        max_wall_clock_secs: configured_job_max_wall_clock_secs(),
     })?;
     state.store.update_job(
         &child_job_id,
@@ -2368,6 +2414,86 @@ async fn complete_job_with_final_answer(
     Ok(())
 }
 
+async fn complete_job_with_budget_checkpoint(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &mut WorkerSummary,
+    checkpoint: &WorkerCheckpoint,
+    step_count: usize,
+    tool_call_count: usize,
+    budget_kind: &str,
+) -> Result<()> {
+    let summary = format!("Reached current {budget_kind} budget");
+    let final_answer = build_budget_checkpoint_answer(
+        session,
+        worker,
+        checkpoint,
+        step_count,
+        tool_call_count,
+        budget_kind,
+    );
+    complete_job_with_final_answer(
+        state,
+        session,
+        job_id,
+        worker,
+        step_count,
+        tool_call_count,
+        &summary,
+        &final_answer,
+    )
+    .await
+}
+
+fn build_budget_checkpoint_answer(
+    session: &SessionDetail,
+    worker: &WorkerSummary,
+    checkpoint: &WorkerCheckpoint,
+    step_count: usize,
+    tool_call_count: usize,
+    budget_kind: &str,
+) -> String {
+    let limit = match budget_kind {
+        "action" => worker.max_tool_calls,
+        _ => worker.max_steps,
+    };
+    let latest_checkpoint = checkpoint
+        .next_prompt
+        .as_deref()
+        .or_else(|| {
+            checkpoint
+                .conversation
+                .iter()
+                .rev()
+                .find(|message| message.role == "user")
+                .map(|message| message.content.as_str())
+        })
+        .map(|value| excerpt(value, 1_200))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "No checkpoint detail was available.".to_string());
+    let pending = checkpoint
+        .pending_action
+        .as_ref()
+        .map(|action| {
+            format!(
+                "\n\nPending action: {} ({})",
+                action.tool,
+                excerpt(&action.summary, 240)
+            )
+        })
+        .unwrap_or_default();
+    let project = if session.session.working_dir.is_empty() {
+        "the current workspace".to_string()
+    } else {
+        session.session.working_dir.clone()
+    };
+
+    format!(
+        "Nucleus reached the current {budget_kind} budget for this run ({step_count} steps, {tool_call_count} actions, limit {limit}) while working in {project}.\n\nLatest checkpoint:\n{latest_checkpoint}{pending}\n\nSend a follow-up such as \"continue from the checkpoint\" to give Nucleus a fresh run budget without losing the visible session context."
+    )
+}
+
 fn build_initial_step_prompt(
     session: &SessionSummary,
     prompt: &str,
@@ -2397,7 +2523,8 @@ Session title: {}\n\
 Visible provider: {} / {}\n\
 Utility Worker provider: {} / {}\n\
 Prompt-time context and user request:\n{}\n\
-Return one JSON action for the next step. If repo or workspace inspection is needed, return a tool_call. Only return final_answer when it is a complete user-facing response, never an action plan or a description of what should happen next.",
+Return one JSON action for the next step. If repo or workspace inspection is needed, return a tool_call. Only return final_answer when it is a complete user-facing response, never an action plan or a description of what should happen next.\n\
+If the current user request corrects, refines, or challenges the previous answer, treat it as a continuation of the unresolved task. Do not merely acknowledge or restate the correction; use the visible conversation history to continue troubleshooting or answer the corrected question.",
         session.title,
         project_context,
         session.provider,
@@ -2413,6 +2540,33 @@ Return one JSON action for the next step. If repo or workspace inspection is nee
             worker.model.as_str()
         },
         prompt
+    )
+}
+
+fn add_budget_guidance(
+    prompt: String,
+    worker: &WorkerSummary,
+    step_count: usize,
+    tool_call_count: usize,
+) -> String {
+    let final_step = worker.max_steps > 0 && worker.max_steps.saturating_sub(step_count) <= 1;
+    let final_action =
+        worker.max_tool_calls > 0 && worker.max_tool_calls.saturating_sub(tool_call_count) <= 1;
+
+    if !final_step && !final_action {
+        return prompt;
+    }
+
+    format!(
+        "{}\n\nBudget note: this run is at the edge of its current {}budget. Prefer final_answer now with a clear summary of completed work, latest evidence, remaining blocker, and exact continuation point. Only call another tool if that single action is decisive and worth checkpointing immediately afterward.",
+        prompt,
+        if final_step && final_action {
+            "step and action "
+        } else if final_step {
+            "step "
+        } else {
+            "action "
+        }
     )
 }
 
@@ -2500,7 +2654,6 @@ Return exactly one valid Nucleus worker action JSON object using kind=\"final_an
 
 fn should_attach_initial_worker_images(checkpoint: &WorkerCheckpoint) -> bool {
     !checkpoint.images.is_empty()
-        && checkpoint.conversation.len() == 1
         && checkpoint.next_prompt.is_none()
         && checkpoint.pending_action.is_none()
 }
@@ -2535,7 +2688,9 @@ async fn call_worker_model(
     let result = execute_worker_model_turn(state, worker, conversation, prompt, images).await?;
     let action = match parse_worker_action(&result.content) {
         Ok(action) => action,
-        Err(error) if worker.provider == "openai_compatible" => {
+        Err(error)
+            if worker.provider == "openai_compatible" && error.is_repairable_json_error() =>
+        {
             let mut repair_conversation = conversation.to_vec();
             repair_conversation.push(CheckpointMessage {
                 role: "user".to_string(),
@@ -2553,7 +2708,7 @@ async fn call_worker_model(
                     .await?;
             let action = parse_worker_action(&repaired.content).with_context(|| {
                 format!(
-                    "worker returned invalid JSON action after repair retry; original response: {}",
+                    "worker returned malformed JSON action after repair retry; original response: {}",
                     excerpt(&result.content, 220)
                 )
             })?;
@@ -2567,7 +2722,13 @@ async fn call_worker_model(
                 },
             });
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            return Err(anyhow!(
+                "{}; response excerpt: {}",
+                error,
+                excerpt(&result.content, 500)
+            ));
+        }
     };
 
     Ok(ModelResponse {
@@ -2620,9 +2781,9 @@ async fn execute_worker_model_turn(
         .map_err(|error| anyhow!("worker model task crashed: {error}"))?
 }
 
-fn build_worker_json_repair_prompt(raw_response: &str, error: &anyhow::Error) -> String {
+fn build_worker_json_repair_prompt(raw_response: &str, error: &dyn std::fmt::Display) -> String {
     format!(
-        "Your previous hidden-worker response was invalid: {}.\n\
+        "Your previous Utility Worker response could not be parsed as JSON: {}.\n\
 Convert the previous response into exactly one valid Nucleus worker action JSON object and nothing else.\n\
 If the previous response answered the user directly, use this shape:\n\
 {{\"kind\":\"final_answer\",\"summary\":\"brief reason the work is done\",\"final_answer\":\"user-facing answer\"}}\n\
@@ -2683,6 +2844,8 @@ fn build_execution_session(worker: &WorkerSummary) -> SessionSummary {
         scope: "job".to_string(),
         approval_mode: "ask".to_string(),
         execution_mode: "act".to_string(),
+        run_budget_mode: "standard".to_string(),
+        run_budget: RunBudgetSummary::default(),
         project_count: 0,
         projects: Vec::new(),
         state: worker.state.clone(),
@@ -2710,208 +2873,36 @@ fn checkpoint_history(messages: &[CheckpointMessage], session_id: &str) -> Vec<S
         .collect()
 }
 
-fn parse_worker_action(content: &str) -> Result<WorkerAction> {
-    let trimmed = content.trim();
-    if let Ok(parsed) = serde_json::from_str::<WorkerAction>(trimmed) {
-        return Ok(parsed);
-    }
+fn initial_worker_conversation(
+    worker: &WorkerSummary,
+    execution_mode: &str,
+    prior_turns: &[SessionTurn],
+) -> Vec<CheckpointMessage> {
+    let mut conversation = vec![CheckpointMessage {
+        role: "system".to_string(),
+        content: worker_system_prompt_with_mode(worker, execution_mode),
+        images: Vec::new(),
+    }];
 
-    let start = trimmed
-        .find('{')
-        .ok_or_else(|| anyhow!("worker returned no JSON object"))?;
-    let end = trimmed
-        .rfind('}')
-        .ok_or_else(|| anyhow!("worker returned no JSON object"))?;
-    let candidate = &trimmed[start..=end];
-    if let Ok(value) = serde_json::from_str::<Value>(candidate) {
-        if let Some(action) = normalize_worker_action_value(&value) {
-            return Ok(action);
-        }
-    }
+    let visible_turns = prior_turns
+        .iter()
+        .rev()
+        .filter(|turn| matches!(turn.role.as_str(), "user" | "assistant"))
+        .take(SESSION_HISTORY_TURN_LIMIT)
+        .collect::<Vec<_>>();
 
-    serde_json::from_str::<WorkerAction>(candidate).with_context(|| {
-        format!(
-            "worker returned invalid JSON action: {}",
-            excerpt(trimmed, 220)
-        )
-    })
-}
+    conversation.extend(
+        visible_turns
+            .into_iter()
+            .rev()
+            .map(|turn| CheckpointMessage {
+                role: turn.role.clone(),
+                content: turn.content.clone(),
+                images: turn.images.clone(),
+            }),
+    );
 
-fn normalize_worker_action_value(value: &Value) -> Option<WorkerAction> {
-    let object = value.as_object()?;
-
-    if let Some(tool_call) = object.get("tool_call") {
-        return normalize_worker_tool_call_value(tool_call);
-    }
-
-    if let Some(function_call) = object.get("function_call") {
-        return normalize_worker_tool_call_value(function_call);
-    }
-
-    if object
-        .get("action")
-        .or_else(|| object.get("kind"))
-        .and_then(Value::as_str)
-        .map(|value| value.trim().eq_ignore_ascii_case("tool_call"))
-        .unwrap_or(false)
-        && (object.contains_key("tool")
-            || object.contains_key("tool_name")
-            || object.contains_key("name"))
-    {
-        return normalize_worker_tool_call_value(value);
-    }
-
-    if object.contains_key("tool")
-        || object.contains_key("tool_name")
-        || object.contains_key("name")
-    {
-        return normalize_worker_tool_call_value(value);
-    }
-
-    None
-}
-
-fn normalize_worker_tool_call_value(value: &Value) -> Option<WorkerAction> {
-    let object = value.as_object()?;
-    let raw_tool = object
-        .get("tool")
-        .or_else(|| object.get("tool_name"))
-        .or_else(|| object.get("name"))
-        .and_then(Value::as_str)?
-        .trim();
-    if raw_tool.is_empty() {
-        return None;
-    }
-
-    let args = object
-        .get("args")
-        .or_else(|| object.get("arguments"))
-        .cloned()
-        .unwrap_or_else(|| {
-            let mut inline_args = object.clone();
-            inline_args.remove("action");
-            inline_args.remove("kind");
-            inline_args.remove("tool");
-            inline_args.remove("tool_name");
-            inline_args.remove("name");
-            inline_args.remove("summary");
-            inline_args.remove("reason");
-            if inline_args.len() == 1 && inline_args.contains_key("input") {
-                inline_args.remove("input").unwrap_or(Value::Null)
-            } else {
-                Value::Object(inline_args)
-            }
-        });
-    let args = decode_worker_tool_args(args)?;
-    let summary = object
-        .get("summary")
-        .or_else(|| object.get("reason"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("Run the requested Nucleus action.")
-        .to_string();
-
-    let (tool, args) = normalize_worker_tool_name_and_args(raw_tool, args)?;
-    Some(WorkerAction::ToolCall {
-        summary,
-        tool,
-        args,
-    })
-}
-
-fn decode_worker_tool_args(args: Value) -> Option<Value> {
-    match args {
-        Value::String(value) => {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                return Some(Value::Object(serde_json::Map::new()));
-            }
-
-            serde_json::from_str::<Value>(trimmed)
-                .ok()
-                .or_else(|| Some(Value::String(value)))
-        }
-        value => Some(value),
-    }
-}
-
-fn normalize_worker_tool_name_and_args(raw_tool: &str, args: Value) -> Option<(String, Value)> {
-    let normalized = raw_tool.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "shell" | "bash" | "terminal" | "command" | "run_command" => {
-            Some(("command.run".to_string(), normalize_shell_tool_args(args)?))
-        }
-        "read_file" | "fs.read" => Some(("fs.read_text".to_string(), args)),
-        "list_files" | "ls" => Some(("fs.list".to_string(), args)),
-        "search" | "grep" | "ripgrep" => Some(("rg.search".to_string(), args)),
-        "git_status" => Some(("git.status".to_string(), args)),
-        "git_diff" => Some(("git.diff".to_string(), args)),
-        tool if tool.contains('.') => Some((raw_tool.trim().to_string(), args)),
-        _ => None,
-    }
-}
-
-fn normalize_shell_tool_args(args: Value) -> Option<Value> {
-    let mut normalized = serde_json::Map::new();
-    let object = args.as_object();
-    let command_value = object
-        .and_then(|object| object.get("command").or_else(|| object.get("input")))
-        .unwrap_or(&args);
-    if let Some(command) = command_value.as_str().map(str::trim) {
-        if command.is_empty() {
-            return None;
-        }
-
-        normalized.insert("command".to_string(), Value::String("sh".to_string()));
-        normalized.insert(
-            "args".to_string(),
-            Value::Array(vec![
-                Value::String("-lc".to_string()),
-                Value::String(command.to_string()),
-            ]),
-        );
-    } else if let Some(parts) = command_value.as_array() {
-        let mut command_parts = parts
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::trim)
-            .filter(|part| !part.is_empty());
-        let command = command_parts.next()?;
-        normalized.insert("command".to_string(), Value::String(command.to_string()));
-        normalized.insert(
-            "args".to_string(),
-            Value::Array(
-                command_parts
-                    .map(|part| Value::String(part.to_string()))
-                    .collect(),
-            ),
-        );
-    } else {
-        return None;
-    }
-
-    if let Some(object) = object {
-        for key in [
-            "cwd",
-            "workdir",
-            "working_dir",
-            "timeout_secs",
-            "output_limit_bytes",
-            "network_policy",
-            "env",
-        ] {
-            if let Some(value) = object.get(key) {
-                let normalized_key = match key {
-                    "workdir" | "working_dir" => "cwd",
-                    _ => key,
-                };
-                normalized.insert(normalized_key.to_string(), value.clone());
-            }
-        }
-    }
-
-    Some(Value::Object(normalized))
+    conversation
 }
 
 #[derive(Debug)]
@@ -6065,6 +6056,7 @@ async fn create_playbook_session(
         working_dir_kind: projects.working_dir_kind,
         approval_mode: "ask".to_string(),
         execution_mode: "act".to_string(),
+        run_budget_mode: "inherit".to_string(),
     })?;
 
     Ok(state.store.get_session(session_id)?)
@@ -6312,7 +6304,7 @@ async fn queue_playbook_job(
         id: root_worker_id.clone(),
         job_id: job_id.clone(),
         parent_worker_id: None,
-        title: "Hidden automation worker".to_string(),
+        title: "Utility automation worker".to_string(),
         lane: "utility".to_string(),
         state: "queued".to_string(),
         provider: target.provider.clone(),
@@ -6323,9 +6315,9 @@ async fn queue_playbook_job(
         working_dir: playbook.session.working_dir.clone(),
         read_roots: worker_read_roots(&playbook.session),
         write_roots: worker_write_roots(&playbook.session),
-        max_steps: JOB_MAX_STEPS,
-        max_tool_calls: JOB_MAX_TOOL_CALLS,
-        max_wall_clock_secs: JOB_MAX_WALL_CLOCK_SECS,
+        max_steps: playbook.session.run_budget.max_steps,
+        max_tool_calls: playbook.session.run_budget.max_tool_calls,
+        max_wall_clock_secs: playbook.session.run_budget.max_wall_clock_secs,
     })?;
     state.store.update_job(
         &job_id,
@@ -6882,6 +6874,48 @@ mod tests {
     }
 
     #[test]
+    fn budget_guidance_is_added_on_final_available_step() {
+        let worker = test_worker_summary("root", 10, 20);
+        let prompt = add_budget_guidance("Return one action.".to_string(), &worker, 9, 2);
+
+        assert!(prompt.contains("Budget note"));
+        assert!(prompt.contains("Prefer final_answer now"));
+    }
+
+    #[test]
+    fn budget_guidance_is_not_added_with_room_remaining() {
+        let worker = test_worker_summary("root", 10, 20);
+        let prompt = add_budget_guidance("Return one action.".to_string(), &worker, 4, 2);
+
+        assert_eq!(prompt, "Return one action.");
+    }
+
+    #[test]
+    fn budget_checkpoint_answer_includes_latest_checkpoint() {
+        let worker = test_worker_summary("root", 10, 20);
+        let session = SessionDetail {
+            session: build_execution_session(&worker),
+            turns: Vec::new(),
+        };
+        let checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "do useful work".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: Some(
+                "Tool result: seed completed; sqlite3 command was missing.".to_string(),
+            ),
+            pending_action: None,
+        };
+
+        let answer = build_budget_checkpoint_answer(&session, &worker, &checkpoint, 10, 8, "step");
+
+        assert!(answer.contains("reached the current step budget"));
+        assert!(answer.contains("seed completed"));
+        assert!(answer.contains("continue from the checkpoint"));
+    }
+
+    #[test]
     fn playbook_trigger_validation_rejects_invalid_inputs() {
         let (trigger_kind, schedule_interval_secs, event_kind) =
             normalize_playbook_trigger("schedule", Some(300), None)
@@ -7215,6 +7249,72 @@ mod tests {
     }
 
     #[test]
+    fn parses_provider_native_inline_shell_command_string_as_command_run() {
+        let action = parse_worker_action(
+            r#"{"tool_call":{"tool":"shell","command":"cd /home/eba/dev-projects/dga-clients && for d in dga-stfr dga-uhm; do echo \"$d\"; done"}}"#,
+        )
+        .expect("inline provider-native shell command string should normalize");
+
+        let WorkerAction::ToolCall {
+            summary,
+            tool,
+            args,
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(summary, "Run the requested Nucleus action.");
+        assert_eq!(tool, "command.run");
+        assert_eq!(args["command"], "sh");
+        assert_eq!(args["args"][0], "-lc");
+        assert_eq!(
+            args["args"][1],
+            "cd /home/eba/dev-projects/dga-clients && for d in dga-stfr dga-uhm; do echo \"$d\"; done"
+        );
+    }
+
+    #[test]
+    fn parses_provider_native_shell_command_with_unescaped_find_parentheses() {
+        let action = parse_worker_action(
+            r#"{"tool_call":{"tool":"shell","arguments":{"command":["bash","-lc","find dga-uhm/src -maxdepth 3 \( -type f -o -type d \) | sort"]}}}"#,
+        )
+        .expect("shell command with invalid JSON shell escapes should normalize");
+
+        let WorkerAction::ToolCall { tool, args, .. } = action else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(tool, "command.run");
+        assert_eq!(args["command"], "bash");
+        assert_eq!(args["args"][0], "-lc");
+        assert_eq!(
+            args["args"][1],
+            r#"find dga-uhm/src -maxdepth 3 \( -type f -o -type d \) | sort"#
+        );
+    }
+
+    #[test]
+    fn parses_provider_native_shell_command_with_literal_newlines() {
+        let action = parse_worker_action(
+            "{\"tool_call\":{\"tool\":\"shell\",\"arguments\":{\"command\":[\"bash\",\"-lc\",\"printf '\n--- package.json ---\n' && cat dga-uhm/package.json\"]}}}",
+        )
+        .expect("shell command with literal newlines should normalize");
+
+        let WorkerAction::ToolCall { tool, args, .. } = action else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(tool, "command.run");
+        assert_eq!(args["command"], "bash");
+        assert_eq!(args["args"][0], "-lc");
+        assert_eq!(
+            args["args"][1],
+            "printf '\n--- package.json ---\n' && cat dga-uhm/package.json"
+        );
+    }
+
+    #[test]
     fn parses_provider_native_action_tool_input_shell_call_as_command_run() {
         let action = parse_worker_action(
             r#"{"action":"tool_call","tool":"shell","input":"cd /home/eba/dev-projects/dga-clients && pwd && ls -la"}"#,
@@ -7428,6 +7528,130 @@ mod tests {
         assert_eq!(history[1].images, vec![image]);
     }
 
+    #[test]
+    fn initial_worker_conversation_includes_recent_visible_session_history() {
+        let worker = WorkerSummary {
+            id: "root".to_string(),
+            job_id: "job".to_string(),
+            parent_worker_id: None,
+            title: "Root worker".to_string(),
+            lane: "main".to_string(),
+            state: "queued".to_string(),
+            provider: "openai_compatible".to_string(),
+            model: "cx/gpt-5.4".to_string(),
+            provider_base_url: "http://127.0.0.1:1234/v1".to_string(),
+            provider_api_key: "token".to_string(),
+            provider_session_id: String::new(),
+            working_dir: "/tmp".to_string(),
+            read_roots: vec!["/tmp".to_string()],
+            write_roots: vec!["/tmp".to_string()],
+            max_steps: 10,
+            max_tool_calls: 10,
+            max_wall_clock_secs: 30,
+            step_count: 0,
+            tool_call_count: 0,
+            last_error: String::new(),
+            capabilities: Vec::new(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let image = test_image("screenshot.png");
+        let prior_turns = vec![
+            SessionTurn {
+                id: "old-user".to_string(),
+                session_id: "session".to_string(),
+                role: "user".to_string(),
+                content: "why is uhm giving me a 404?".to_string(),
+                images: vec![image.clone()],
+                created_at: 1,
+            },
+            SessionTurn {
+                id: "old-assistant".to_string(),
+                session_id: "session".to_string(),
+                role: "assistant".to_string(),
+                content: "It is on /404.".to_string(),
+                images: Vec::new(),
+                created_at: 2,
+            },
+        ];
+
+        let conversation = initial_worker_conversation(&worker, "act", &prior_turns);
+
+        assert_eq!(conversation[0].role, "system");
+        assert_eq!(conversation[1].content, "why is uhm giving me a 404?");
+        assert_eq!(conversation[1].images, vec![image]);
+        assert_eq!(conversation[2].content, "It is on /404.");
+    }
+
+    #[test]
+    fn initial_step_prompt_treats_corrections_as_continuations() {
+        let session = SessionSummary {
+            id: "session".to_string(),
+            title: "Default session".to_string(),
+            profile_id: String::new(),
+            profile_title: String::new(),
+            route_id: String::new(),
+            route_title: String::new(),
+            project_id: "project".to_string(),
+            project_title: "Project".to_string(),
+            project_path: "/tmp/project".to_string(),
+            provider: "openai_compatible".to_string(),
+            model: "cx/gpt-5.4".to_string(),
+            provider_base_url: String::new(),
+            provider_api_key: String::new(),
+            working_dir: "/tmp/project".to_string(),
+            working_dir_kind: "project_root".to_string(),
+            scope: "project".to_string(),
+            approval_mode: "trusted".to_string(),
+            execution_mode: "act".to_string(),
+            run_budget_mode: "standard".to_string(),
+            run_budget: RunBudgetSummary::default(),
+            project_count: 0,
+            projects: Vec::new(),
+            state: "active".to_string(),
+            provider_session_id: String::new(),
+            last_error: String::new(),
+            last_message_excerpt: String::new(),
+            turn_count: 0,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let worker = WorkerSummary {
+            id: "root".to_string(),
+            job_id: "job".to_string(),
+            parent_worker_id: None,
+            title: "Root worker".to_string(),
+            lane: "main".to_string(),
+            state: "queued".to_string(),
+            provider: "openai_compatible".to_string(),
+            model: "cx/gpt-5.4".to_string(),
+            provider_base_url: "http://127.0.0.1:1234/v1".to_string(),
+            provider_api_key: "token".to_string(),
+            provider_session_id: String::new(),
+            working_dir: "/tmp/project".to_string(),
+            read_roots: vec!["/tmp/project".to_string()],
+            write_roots: vec!["/tmp/project".to_string()],
+            max_steps: 10,
+            max_tool_calls: 10,
+            max_wall_clock_secs: 30,
+            step_count: 0,
+            tool_call_count: 0,
+            last_error: String::new(),
+            capabilities: Vec::new(),
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let prompt = build_initial_step_prompt(
+            &session,
+            "That's the URL because it auto forwards there.",
+            &worker,
+        );
+
+        assert!(prompt.contains("corrects, refines, or challenges the previous answer"));
+        assert!(prompt.contains("Do not merely acknowledge or restate the correction"));
+    }
+
     #[tokio::test]
     async fn main_worker_prompt_resolves_current_route_target() {
         let state_dir = test_state_dir("main-worker-route-target");
@@ -7458,6 +7682,8 @@ mod tests {
             working_dir_kind: "workspace_scratch".to_string(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
+            run_budget_mode: "standard".to_string(),
+            run_budget: RunBudgetSummary::default(),
             project_count: 0,
             projects: Vec::new(),
             state: "active".to_string(),
@@ -7511,6 +7737,8 @@ mod tests {
             working_dir_kind: "workspace_scratch".to_string(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
+            run_budget_mode: "standard".to_string(),
+            run_budget: RunBudgetSummary::default(),
             project_count: 0,
             projects: Vec::new(),
             state: "active".to_string(),
@@ -7628,6 +7856,7 @@ mod tests {
                 working_dir_kind: "workspace_scratch".to_string(),
                 approval_mode: "ask".to_string(),
                 execution_mode: "act".to_string(),
+                run_budget_mode: "inherit".to_string(),
             })
             .expect("session should persist");
 
@@ -7808,6 +8037,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .expect("workspace root should update");
 
@@ -7920,6 +8150,34 @@ mod tests {
             display_name: display_name.to_string(),
             mime_type: "image/png".to_string(),
             data_url: "data:image/png;base64,iVBORw0KGgo=".to_string(),
+        }
+    }
+
+    fn test_worker_summary(id: &str, max_steps: usize, max_tool_calls: usize) -> WorkerSummary {
+        WorkerSummary {
+            id: id.to_string(),
+            job_id: format!("{id}-job"),
+            parent_worker_id: None,
+            title: "Root worker".to_string(),
+            lane: "utility".to_string(),
+            state: "running".to_string(),
+            provider: "openai_compatible".to_string(),
+            model: "test-model".to_string(),
+            provider_base_url: String::new(),
+            provider_api_key: String::new(),
+            provider_session_id: String::new(),
+            working_dir: "/tmp/nucleus-test".to_string(),
+            read_roots: vec!["/tmp/nucleus-test".to_string()],
+            write_roots: vec!["/tmp/nucleus-test".to_string()],
+            max_steps,
+            max_tool_calls,
+            max_wall_clock_secs: 300,
+            step_count: 0,
+            tool_call_count: 0,
+            last_error: String::new(),
+            capabilities: Vec::new(),
+            created_at: 0,
+            updated_at: 0,
         }
     }
 
