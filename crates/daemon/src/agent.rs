@@ -36,7 +36,7 @@ use super::{
     resolve_session_projects, resolve_workspace_profile, resolve_workspace_profile_target,
     try_record_audit_event, unix_timestamp,
 };
-use crate::runtime::PromptStreamEvent;
+use crate::runtime::{PromptStreamEvent, ProviderTurnResult};
 
 const JOB_MAX_STEPS: usize = 10;
 const JOB_MAX_TOOL_CALLS: usize = 20;
@@ -2168,6 +2168,55 @@ async fn call_worker_model(
     conversation: &[CheckpointMessage],
     prompt: &str,
 ) -> Result<ModelResponse> {
+    let result = execute_worker_model_turn(state, worker, conversation, prompt).await?;
+    let action = match parse_worker_action(&result.content) {
+        Ok(action) => action,
+        Err(error) if worker.provider == "openai_compatible" => {
+            let mut repair_conversation = conversation.to_vec();
+            repair_conversation.push(CheckpointMessage {
+                role: "user".to_string(),
+                content: prompt.to_string(),
+            });
+            repair_conversation.push(CheckpointMessage {
+                role: "assistant".to_string(),
+                content: result.content.clone(),
+            });
+            let repair_prompt = build_worker_json_repair_prompt(&result.content, &error);
+            let repaired =
+                execute_worker_model_turn(state, worker, &repair_conversation, &repair_prompt)
+                    .await?;
+            let action = parse_worker_action(&repaired.content).with_context(|| {
+                format!(
+                    "worker returned invalid JSON action after repair retry; original response: {}",
+                    excerpt(&result.content, 220)
+                )
+            })?;
+            return Ok(ModelResponse {
+                action,
+                raw: repaired.content,
+                provider_session_id: if repaired.provider_session_id.is_empty() {
+                    result.provider_session_id
+                } else {
+                    repaired.provider_session_id
+                },
+            });
+        }
+        Err(error) => return Err(error),
+    };
+
+    Ok(ModelResponse {
+        action,
+        raw: result.content,
+        provider_session_id: result.provider_session_id,
+    })
+}
+
+async fn execute_worker_model_turn(
+    state: &AppState,
+    worker: &WorkerSummary,
+    conversation: &[CheckpointMessage],
+    prompt: &str,
+) -> Result<ProviderTurnResult> {
     let (events, mut receiver) = mpsc::unbounded_channel();
     let execution = build_execution_session(worker);
     let history = checkpoint_history(conversation, &execution.id);
@@ -2198,16 +2247,21 @@ async fn call_worker_model(
         }
     }
 
-    let result = handle
+    handle
         .await
-        .map_err(|error| anyhow!("worker model task crashed: {error}"))??;
-    let action = parse_worker_action(&result.content)?;
+        .map_err(|error| anyhow!("worker model task crashed: {error}"))?
+}
 
-    Ok(ModelResponse {
-        action,
-        raw: result.content,
-        provider_session_id: result.provider_session_id,
-    })
+fn build_worker_json_repair_prompt(raw_response: &str, error: &anyhow::Error) -> String {
+    format!(
+        "Your previous hidden-worker response was invalid: {}.\n\
+Convert the previous response into exactly one valid Nucleus worker action JSON object and nothing else.\n\
+If the previous response answered the user directly, use this shape:\n\
+{{\"kind\":\"final_answer\",\"summary\":\"brief reason the work is done\",\"final_answer\":\"user-facing answer\"}}\n\
+Previous response:\n{}",
+        error,
+        excerpt(raw_response, 1_200)
+    )
 }
 
 fn build_worker_prompt_input(
@@ -5889,12 +5943,12 @@ fn execution_capabilities() -> Vec<ToolCapabilityGrantRecord> {
 fn worker_system_prompt(worker: &WorkerSummary) -> String {
     let is_root_worker = worker.parent_worker_id.is_none();
     let action_shapes = if is_root_worker {
-        "{{\"kind\":\"tool_call\",\"summary\":\"why this tool is next\",\"tool\":\"tool.id\",\"args\":{{...}}}}\n\
-{{\"kind\":\"spawn_child_jobs\",\"summary\":\"why parallel exploration helps\",\"jobs\":[{{\"title\":\"focused subtask\",\"prompt\":\"precise child prompt\",\"working_dir\":\"optional/path/inside/scope\"}}]}}\n\
-{{\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\"}}"
+        "{\"kind\":\"tool_call\",\"summary\":\"why this tool is next\",\"tool\":\"tool.id\",\"args\":{}}\n\
+{\"kind\":\"spawn_child_jobs\",\"summary\":\"why parallel exploration helps\",\"jobs\":[{\"title\":\"focused subtask\",\"prompt\":\"precise child prompt\",\"working_dir\":\"optional/path/inside/scope\"}]}\n\
+{\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\"}"
     } else {
-        "{{\"kind\":\"tool_call\",\"summary\":\"why this tool is next\",\"tool\":\"tool.id\",\"args\":{{...}}}}\n\
-{{\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\"}}"
+        "{\"kind\":\"tool_call\",\"summary\":\"why this tool is next\",\"tool\":\"tool.id\",\"args\":{}}\n\
+{\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\"}"
     };
     let tool_help = worker
         .capabilities
@@ -6298,6 +6352,11 @@ mod tests {
 
         assert!(root_prompt.contains("spawn_child_jobs"));
         assert!(!child_prompt.contains("spawn_child_jobs"));
+        assert!(root_prompt.contains("{\"kind\":\"final_answer\""));
+        assert!(
+            !root_prompt.contains("{{\"kind\""),
+            "worker prompt must show valid single-object JSON examples"
+        );
     }
 
     #[test]
