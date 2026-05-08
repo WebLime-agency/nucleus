@@ -8,7 +8,7 @@ Contributor checkouts can still run from source and use git-based updates, but i
 - `beta`
 - `nightly`
 
-Nucleus does not describe installed users as tracking `main` or `dev`. Maintainers publish artifacts from source refs into product channels, and installed daemons follow those channel manifests.
+Nucleus does not describe installed users as tracking `main` or `dev`. Maintainers publish artifacts from source refs into product channels, and installed Nucleus instances follow those channel manifests.
 
 ## Channel Manifests
 
@@ -36,7 +36,7 @@ That command:
 - verifies the artifact checksum
 - stages the release under the managed install root
 - activates it through the `current` symlink
-- writes daemon-owned update state
+- writes Nucleus-owned update state
 - installs a `systemd --user` service unless `--install-service false` is passed
 
 Default managed install root:
@@ -51,16 +51,16 @@ Important paths:
 current/                    active release symlink
 previous/                   previous release symlink after an update
 releases/<release_id>/      unpacked release payload
-current/bin/nucleus-daemon  daemon for the active release
+current/bin/nucleus-daemon  server binary for the active release
 current/bin/nucleus         operator CLI included in official channel artifacts
-current/web/                web bundle matching the active daemon release
+current/web/                web bundle matching the active Nucleus release
 ```
 
-The service unit points at `current/bin/nucleus-daemon` and `current/web`, so an update swaps both the daemon and the served web client together.
+The service unit points at `current/bin/nucleus-daemon` and `current/web`, so an update swaps both the Nucleus process and the served web client together.
 
 ## Switching Channels
 
-Use Settings to change the tracked release channel for an existing managed install. The daemon persists the tracked channel and update history in the state database.
+Use Settings to change the tracked release channel for an existing managed install. Nucleus persists the tracked channel and update history in the state database.
 
 For a fresh install on another channel:
 
@@ -73,19 +73,19 @@ nucleus release install --channel nightly --enable
 
 ## Updating
 
-The daemon owns update checks and apply state.
+Nucleus owns update checks and apply state.
 
 From Settings:
 
 1. Check for updates.
 2. Apply the update.
-3. Let the daemon restart itself when restart control is available.
+3. Let Nucleus restart itself when restart control is available.
 
 For managed releases, the apply path downloads the selected channel artifact, verifies checksum and size, stages the release, atomically moves `current`, records `previous`, and restarts onto `current/bin/nucleus-daemon`.
 
 ## Recovery
 
-If an update staged successfully but the new daemon does not come back:
+If an update staged successfully but the new Nucleus process does not come back:
 
 ```bash
 systemctl --user stop nucleus-daemon.service
@@ -96,9 +96,9 @@ mv -Tf .current-rollback current
 systemctl --user start nucleus-daemon.service
 ```
 
-Then open Settings and run another update check. The daemon will continue to report any latest error and restart requirement until a successful check or apply clears it.
+Then open Settings and run another update check. Nucleus will continue to report any latest error and restart requirement until a successful check or apply clears it.
 
-If the service itself is broken, run the active daemon directly to inspect the error:
+If the service itself is broken, run the active Nucleus binary directly to inspect the error:
 
 ```bash
 NUCLEUS_INSTALL_KIND=managed_release \

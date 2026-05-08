@@ -1,8 +1,8 @@
 # Nucleus
 
-Nucleus is a local AI control plane. The Rust daemon is the product core. It owns sessions, routing, machine operations, auth, persistence, and the HTTP/WebSocket contracts that every client uses.
+Nucleus is a local AI control plane. It owns sessions, routing, machine operations, auth, persistence, and the HTTP/WebSocket contracts that every client uses.
 
-The SvelteKit app in this repo is one client. Future native clients should talk to the same daemon contracts instead of reimplementing backend logic.
+The SvelteKit app in this repo is one client. Future native clients should talk to the same Nucleus contracts instead of reimplementing backend logic.
 
 Repo workflow lives in [docs/repo-workflow.md](docs/repo-workflow.md).
 
@@ -34,7 +34,7 @@ include/         committed prompt-time product context
 
 - bearer-token auth is enforced on `/api/*` and `/ws`
 - `GET /health` stays public
-- the daemon can serve the built web app directly from `apps/web/build`
+- Nucleus can serve the built web app directly from `apps/web/build`
 - REST handles bootstrap reads and mutations
 - WebSocket handles live telemetry, session updates, and prompt progress
 - structured operational truth lives in SQLite
@@ -98,7 +98,7 @@ What they do:
 
 Development still uses a split runtime:
 
-- daemon on `127.0.0.1:42240`
+- Nucleus server on `127.0.0.1:42240`
 - Vite dev server on `http://mini-server:5201`
 
 Rust:
@@ -131,7 +131,7 @@ source ~/.nvm/nvm.sh
 npm run build:web
 ```
 
-Then run the daemon with the built web output:
+Then run Nucleus with the built web output:
 
 ```bash
 NUCLEUS_BIND=0.0.0.0:5201 \
@@ -149,7 +149,7 @@ cargo run -p nucleus-cli --bin nucleus -- auth local-token
 
 ## Service Install
 
-On Linux, the CLI can install a `systemd --user` service that runs the daemon and serves the production web build:
+On Linux, the CLI can install a `systemd --user` service that runs Nucleus and serves the production web build:
 
 ```bash
 source ~/.nvm/nvm.sh
@@ -180,11 +180,11 @@ The default channel manifests are published as GitHub release assets:
 - `beta`: `https://github.com/WebLime-agency/nucleus/releases/download/nucleus-channel-beta/manifest-beta.json`
 - `nightly`: `https://github.com/WebLime-agency/nucleus/releases/download/nucleus-channel-nightly/manifest-nightly.json`
 
-The managed artifact includes the daemon, the operator CLI, and the matching embedded web bundle. See [docs/managed-release.md](docs/managed-release.md) for channel switching, update, publishing, and rollback details.
+The managed artifact includes the Nucleus server binary, the operator CLI, and the matching embedded web bundle. See [docs/managed-release.md](docs/managed-release.md) for channel switching, update, publishing, and rollback details.
 
 ## Tailscale
 
-Nucleus does not need a separate web server for tailnet access. Bind the daemon to a reachable address, then use the server URL and bearer token from another device.
+Nucleus does not need a separate web server for tailnet access. Bind Nucleus to a reachable address, then use the server URL and bearer token from another device.
 
 Typical direct tailnet URL:
 
@@ -196,7 +196,7 @@ When Tailscale MagicDNS is available, `nucleus setup server` also prints the ful
 
 ## Auth Model
 
-- the daemon auto-provisions a local bearer token on first start
+- Nucleus auto-provisions a local bearer token on first start
 - the token hash is stored in SQLite
 - the plaintext token is stored in the state directory outside the repo
 - the browser client stores the token locally and sends it on every API request and WebSocket connection
@@ -207,11 +207,11 @@ The repo already includes:
 
 - host telemetry
 - CPU, memory, and process control surfaces
-- daemon-owned sessions
+- Nucleus-owned sessions
 - router profiles and workspace defaults
 - background prompt jobs with live progress
 - include directory discovery for prompt assembly
-- daemon-managed update checks and apply flow for contributor git installs
+- Nucleus-managed update checks and apply flow for contributor git installs
 - managed-release install/update/restart flow for channel artifacts
 - stable, beta, and nightly channel publishing automation
 

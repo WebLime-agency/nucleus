@@ -67,7 +67,7 @@
     {
       value: 'full_agent',
       label: 'Full Agent',
-      summary: 'Read, mutate, and run bounded commands through the daemon.'
+      summary: 'Read, mutate, and run bounded commands through Nucleus.'
     }
   ];
 
@@ -78,7 +78,7 @@
   ];
 
   const eventOptions = [
-    { value: 'daemon_started', label: 'Daemon started' },
+    { value: 'daemon_started', label: 'Nucleus started' },
     { value: 'workspace_projects_synced', label: 'Workspace projects synced' }
   ];
 
@@ -288,7 +288,7 @@
         syncPlaybookDetail(null);
       }
     } catch (cause) {
-      error = cause instanceof Error ? cause.message : 'Failed to load daemon playbooks.';
+      error = cause instanceof Error ? cause.message : 'Failed to load Nucleus playbooks.';
     } finally {
       loading = false;
       refreshing = false;
@@ -303,7 +303,7 @@
     try {
       const detail = await createPlaybook({
         title: 'New playbook',
-        description: 'Daemon-owned background automation.',
+        description: 'Nucleus-owned background automation.',
         prompt: 'Inspect the workspace, decide the safest next step, and finish with a concise report.',
         profile_id: fallbackProfile?.id,
         project_id: workspaceProjects[0]?.id,
@@ -448,7 +448,7 @@
   <title>Nucleus - Automations</title>
   <meta
     name="description"
-    content="Daemon-owned playbooks, schedules, and event-triggered automation jobs in Nucleus."
+    content="Nucleus-owned playbooks, schedules, and event-triggered automation jobs."
   />
 </svelte:head>
 
@@ -459,7 +459,7 @@
       <div>
         <h1 class="text-3xl font-semibold text-zinc-50">Automations</h1>
         <p class="mt-2 max-w-3xl text-sm leading-6 text-zinc-400">
-          Saved playbooks run through the same daemon-owned worker engine as chat jobs, including
+          Saved playbooks run through the same Nucleus-owned Utility Worker engine as chat jobs, including
           approvals, audit, artifacts, and write-scope locking.
         </p>
       </div>
@@ -494,14 +494,14 @@
       <CardHeader>
         <CardTitle>Saved Playbooks</CardTitle>
         <CardDescription>
-          Hidden automation sessions stay out of the normal chat sidebar, but their jobs still use
-          the same daemon truth.
+          Utility automation sessions stay out of the normal chat sidebar, but their jobs still use
+          the same Nucleus truth.
         </CardDescription>
       </CardHeader>
       <CardContent class="space-y-3">
         {#if playbooks.length === 0}
           <div class="rounded-xl border border-dashed border-zinc-800 bg-zinc-950/60 px-4 py-5 text-sm text-zinc-500">
-            No playbooks yet. Create one to schedule or trigger daemon-owned work.
+            No playbooks yet. Create one to schedule or trigger Nucleus-owned work.
           </div>
         {:else}
           {#each playbooks as playbook}
@@ -676,7 +676,7 @@
             <div class="rounded-xl border border-zinc-800 bg-zinc-950/70 px-4 py-3 text-sm text-zinc-400">
               <div class="flex items-center gap-2 text-zinc-200">
                 <Workflow class="size-4" />
-                Hidden worker target
+                Utility Worker target
               </div>
               <div class="mt-2 text-xs leading-5 text-zinc-500">
                 Visible route: {playbookDetail.session.provider} / {playbookDetail.session.model}
@@ -745,7 +745,7 @@
             <CardHeader>
               <CardTitle>{selectedRecentJob ? selectedRecentJob.title : 'Job Detail'}</CardTitle>
               <CardDescription>
-                Timeline and outputs for the selected daemon-owned automation job.
+                Timeline and outputs for the selected Nucleus-owned automation job.
               </CardDescription>
             </CardHeader>
             <CardContent class="space-y-5">
