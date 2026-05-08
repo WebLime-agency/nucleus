@@ -64,6 +64,10 @@ pub struct SessionSummary {
     pub working_dir: String,
     pub working_dir_kind: String,
     pub scope: String,
+    #[serde(default = "default_session_approval_mode")]
+    pub approval_mode: String,
+    #[serde(default = "default_session_execution_mode")]
+    pub execution_mode: String,
     pub project_count: usize,
     pub projects: Vec<SessionProjectSummary>,
     pub state: String,
@@ -362,6 +366,8 @@ pub struct CreateSessionRequest {
     pub project_id: Option<String>,
     pub primary_project_id: Option<String>,
     pub project_ids: Option<Vec<String>>,
+    pub approval_mode: Option<String>,
+    pub execution_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -375,6 +381,16 @@ pub struct UpdateSessionRequest {
     pub project_id: Option<String>,
     pub primary_project_id: Option<String>,
     pub project_ids: Option<Vec<String>>,
+    pub approval_mode: Option<String>,
+    pub execution_mode: Option<String>,
+}
+
+fn default_session_approval_mode() -> String {
+    "ask".to_string()
+}
+
+fn default_session_execution_mode() -> String {
+    "act".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
