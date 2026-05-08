@@ -233,13 +233,18 @@ async fn execute_openai_compatible_prompt(
         .build()
         .context("failed to build OpenAI-compatible HTTP client")?;
 
+    let mut payload = json!({
+        "model": session.model,
+        "stream": true,
+        "messages": compiled_turn_openai_messages(compiled_turn),
+    });
+    if compiled_turn_requires_json_object(compiled_turn) {
+        payload["response_format"] = json!({ "type": "json_object" });
+    }
+
     let mut request = client
         .post(format!("{base_url}/chat/completions"))
-        .json(&json!({
-            "model": session.model,
-            "stream": true,
-            "messages": compiled_turn_openai_messages(compiled_turn),
-        }));
+        .json(&payload);
 
     if !session.provider_api_key.trim().is_empty() {
         request = request.header(
@@ -357,6 +362,15 @@ fn handle_openai_compatible_line(
     Ok(())
 }
 
+fn compiled_turn_requires_json_object(compiled_turn: &CompiledTurn) -> bool {
+    compiled_turn.history.iter().any(|turn| {
+        turn.role == "system"
+            && turn
+                .content
+                .contains("Return exactly one JSON object and nothing else.")
+    })
+}
+
 fn validate_working_directory(path: &str) -> Result<()> {
     let path = Path::new(path);
 
@@ -429,5 +443,35 @@ mod tests {
         assert_eq!(main.role, "main");
         assert_eq!(utility.role, "utility");
         assert_eq!(fallback.role, "main");
+    }
+
+    #[test]
+    fn openai_worker_turns_request_json_object_mode() {
+        let history = vec![SessionTurn {
+            id: "system".to_string(),
+            session_id: "job".to_string(),
+            role: "system".to_string(),
+            content: "Return exactly one JSON object and nothing else.".to_string(),
+            images: Vec::new(),
+            created_at: 0,
+        }];
+        let compiled = compiled_turn_from_prompt(&history, "Decide the next step.", &[], "main");
+
+        assert!(compiled_turn_requires_json_object(&compiled));
+    }
+
+    #[test]
+    fn openai_regular_turns_do_not_request_json_object_mode() {
+        let history = vec![SessionTurn {
+            id: "user".to_string(),
+            session_id: "session".to_string(),
+            role: "user".to_string(),
+            content: "Return exactly one JSON object and nothing else.".to_string(),
+            images: Vec::new(),
+            created_at: 0,
+        }];
+        let compiled = compiled_turn_from_prompt(&history, "Summarize.", &[], "main");
+
+        assert!(!compiled_turn_requires_json_object(&compiled));
     }
 }
