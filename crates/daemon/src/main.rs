@@ -2,6 +2,7 @@ mod agent;
 mod host;
 mod runtime;
 mod updates;
+mod worker_action;
 
 use std::{
     collections::BTreeSet,
@@ -36,13 +37,14 @@ use nucleus_protocol::{
     ActionParameter, ActionRunRequest, ActionRunResponse, ActionSummary, ApprovalRequestSummary,
     ApprovalResolutionRequest, AuditEvent, AuthSummary, CompatibilitySummary, ConnectionSummary,
     CreatePlaybookRequest, CreateSessionRequest, DaemonEvent, HealthResponse, HostStatus,
-    JobDetail, JobSummary, McpServerSummary, NucleusToolDescriptor, PlaybookDetail,
+    JobDetail, JobSummary, MAX_CONFIGURED_JOB_STEPS, MAX_CONFIGURED_JOB_TOOL_CALLS,
+    MAX_CONFIGURED_JOB_WALL_CLOCK_SECS, McpServerSummary, NucleusToolDescriptor, PlaybookDetail,
     PlaybookSummary, ProcessKillRequest, ProcessKillResponse, ProcessListResponse,
     ProcessStreamUpdate, ProjectUpdateRequest, PromptProgressUpdate, RouterProfileSummary,
-    RuntimeOverview, RuntimeSummary, SessionDetail, SessionPromptRequest, SessionSummary,
-    SettingsSummary, SkillManifest, StreamConnected, SystemStats, UpdateConfigRequest,
-    UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus, WorkspaceModelConfig,
-    WorkspaceProfileSummary, WorkspaceProfileWriteRequest, WorkspaceSummary,
+    RunBudgetSummary, RuntimeOverview, RuntimeSummary, SessionDetail, SessionPromptRequest,
+    SessionSummary, SettingsSummary, SkillManifest, StreamConnected, SystemStats,
+    UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
+    WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceProfileWriteRequest, WorkspaceSummary,
     WorkspaceUpdateRequest,
 };
 use nucleus_release::read_installed_release_metadata;
@@ -343,6 +345,10 @@ async fn update_workspace(
         Some(target) => Some(sanitize_workspace_target(&state, &route_profiles, target).await?),
         None => None,
     };
+    let run_budget = match payload.run_budget {
+        Some(value) => Some(normalize_workspace_run_budget(value)?),
+        None => None,
+    };
     let default_profile_id = payload
         .default_profile_id
         .as_deref()
@@ -354,6 +360,7 @@ async fn update_workspace(
         default_profile_id.as_deref(),
         main_target.as_deref(),
         utility_target.as_deref(),
+        run_budget.as_ref(),
     )?;
     let _ = try_record_audit_event(
         &state,
@@ -363,11 +370,14 @@ async fn update_workspace(
             status: "success".to_string(),
             summary: "Updated workspace settings.".to_string(),
             detail: format!(
-                "root_path={} default_profile_id={} main_target={} utility_target={}",
+                "root_path={} default_profile_id={} main_target={} utility_target={} run_budget_steps={} run_budget_actions={} run_budget_wall_clock_secs={}",
                 root_path.unwrap_or_else(|| workspace.root_path.clone()),
                 default_profile_id.unwrap_or_else(|| workspace.default_profile_id.clone()),
                 main_target.unwrap_or_else(|| workspace.main_target.clone()),
-                utility_target.unwrap_or_else(|| workspace.utility_target.clone())
+                utility_target.unwrap_or_else(|| workspace.utility_target.clone()),
+                workspace.run_budget.max_steps,
+                workspace.run_budget.max_tool_calls,
+                workspace.run_budget.max_wall_clock_secs
             ),
         },
     )
@@ -693,6 +703,7 @@ async fn create_session(
     let route_title = selection.route_title.clone();
     let approval_mode = normalize_session_approval_mode(payload.approval_mode.as_deref())?;
     let execution_mode = normalize_session_execution_mode(payload.execution_mode.as_deref())?;
+    let run_budget_mode = normalize_session_run_budget_mode(payload.run_budget_mode.as_deref())?;
 
     state.store.create_session(SessionRecord {
         id: session_id.clone(),
@@ -714,6 +725,7 @@ async fn create_session(
         working_dir_kind: projects.working_dir_kind.clone(),
         approval_mode,
         execution_mode,
+        run_budget_mode,
     })?;
 
     let detail = state.store.get_session(&session_id)?;
@@ -866,6 +878,10 @@ async fn update_session(
         },
         execution_mode: match payload.execution_mode {
             Some(value) => Some(normalize_session_execution_mode(Some(&value))?),
+            None => None,
+        },
+        run_budget_mode: match payload.run_budget_mode {
+            Some(value) => Some(normalize_session_run_budget_mode(Some(&value))?),
             None => None,
         },
         state: match payload.state {
@@ -2518,6 +2534,65 @@ fn normalize_session_execution_mode(value: Option<&str>) -> Result<String, ApiEr
     }
 }
 
+fn normalize_session_run_budget_mode(value: Option<&str>) -> Result<String, ApiError> {
+    let mode = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("inherit");
+    match mode {
+        "inherit" | "standard" | "extended" | "marathon" | "unbounded" => Ok(mode.to_string()),
+        other => Err(ApiError::bad_request(format!(
+            "unsupported session run budget mode '{other}'",
+        ))),
+    }
+}
+
+fn normalize_workspace_run_budget(
+    mut value: RunBudgetSummary,
+) -> Result<RunBudgetSummary, ApiError> {
+    value.mode = "standard".to_string();
+    value.max_steps = normalize_budget_usize(
+        "run_budget.max_steps",
+        value.max_steps,
+        MAX_CONFIGURED_JOB_STEPS,
+    )?;
+    value.max_tool_calls = normalize_budget_usize(
+        "run_budget.max_tool_calls",
+        value.max_tool_calls,
+        MAX_CONFIGURED_JOB_TOOL_CALLS,
+    )?;
+    value.max_wall_clock_secs = normalize_budget_u64(
+        "run_budget.max_wall_clock_secs",
+        value.max_wall_clock_secs,
+        MAX_CONFIGURED_JOB_WALL_CLOCK_SECS,
+    )?;
+    Ok(value)
+}
+
+fn normalize_budget_usize(name: &str, value: usize, max: usize) -> Result<usize, ApiError> {
+    if value == 0 {
+        return Err(ApiError::bad_request(format!("{name} must be at least 1")));
+    }
+    if value > max {
+        return Err(ApiError::bad_request(format!(
+            "{name} must be no more than {max}"
+        )));
+    }
+    Ok(value)
+}
+
+fn normalize_budget_u64(name: &str, value: u64, max: u64) -> Result<u64, ApiError> {
+    if value == 0 {
+        return Err(ApiError::bad_request(format!("{name} must be at least 1")));
+    }
+    if value > max {
+        return Err(ApiError::bad_request(format!(
+            "{name} must be no more than {max}"
+        )));
+    }
+    Ok(value)
+}
+
 fn default_session_title(provider: AdapterKind) -> String {
     match provider {
         AdapterKind::Claude => "Claude session".to_string(),
@@ -3130,6 +3205,8 @@ mod tests {
             working_dir_kind: "project_root".to_string(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
+            run_budget_mode: "standard".to_string(),
+            run_budget: RunBudgetSummary::default(),
             project_count: 1,
             projects: vec![nucleus_protocol::SessionProjectSummary {
                 id: "project-1".to_string(),
@@ -3263,6 +3340,8 @@ mod tests {
             working_dir_kind: "workspace_scratch".to_string(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
+            run_budget_mode: "standard".to_string(),
+            run_budget: RunBudgetSummary::default(),
             project_count: 0,
             projects: Vec::new(),
             state: "active".to_string(),
@@ -3438,6 +3517,7 @@ mod tests {
                     project_ids: None,
                     approval_mode: None,
                     execution_mode: None,
+                    run_budget_mode: None,
                 })
                 .expect("session payload should serialize"),
             ),
@@ -3507,6 +3587,8 @@ mod tests {
             working_dir_kind: "workspace_scratch".to_string(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
+            run_budget_mode: "standard".to_string(),
+            run_budget: RunBudgetSummary::default(),
             project_count: 0,
             projects: Vec::new(),
             state: "active".to_string(),
@@ -3573,6 +3655,8 @@ mod tests {
             working_dir_kind: "workspace_scratch".to_string(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
+            run_budget_mode: "standard".to_string(),
+            run_budget: RunBudgetSummary::default(),
             project_count: 0,
             projects: Vec::new(),
             state: "active".to_string(),
@@ -3622,6 +3706,7 @@ mod tests {
                         .to_str()
                         .expect("workspace root should serialize as utf-8"),
                 ),
+                None,
                 None,
                 None,
                 None,
