@@ -58,6 +58,8 @@ pub struct SessionRecord {
     pub provider_api_key: String,
     pub working_dir: String,
     pub working_dir_kind: String,
+    pub approval_mode: String,
+    pub execution_mode: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -78,6 +80,8 @@ pub struct SessionPatch {
     pub provider_api_key: Option<String>,
     pub working_dir: Option<String>,
     pub working_dir_kind: Option<String>,
+    pub approval_mode: Option<String>,
+    pub execution_mode: Option<String>,
     pub state: Option<String>,
     pub provider_session_id: Option<String>,
     pub last_error: Option<String>,
@@ -795,13 +799,15 @@ impl StateStore {
                 provider_api_key,
                 working_dir,
                 working_dir_kind,
+                approval_mode,
+                execution_mode,
                 state,
                 provider_session_id,
                 last_error,
                 last_message_excerpt,
                 turn_count
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'active', '', '', '', 0)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 'active', '', '', '', 0)
             ",
             params![
                 record.id,
@@ -820,6 +826,8 @@ impl StateStore {
                 record.provider_api_key,
                 record.working_dir,
                 record.working_dir_kind,
+                record.approval_mode,
+                record.execution_mode,
             ],
         )?;
 
@@ -851,6 +859,8 @@ impl StateStore {
         let next_provider_api_key = patch.provider_api_key.unwrap_or(current.provider_api_key);
         let next_working_dir = patch.working_dir.unwrap_or(current.working_dir);
         let next_working_dir_kind = patch.working_dir_kind.unwrap_or(current.working_dir_kind);
+        let next_approval_mode = patch.approval_mode.unwrap_or(current.approval_mode);
+        let next_execution_mode = patch.execution_mode.unwrap_or(current.execution_mode);
         let next_state = patch.state.unwrap_or(current.state);
         let next_provider_session_id = patch
             .provider_session_id
@@ -876,9 +886,11 @@ impl StateStore {
                 provider_api_key = ?14,
                 working_dir = ?15,
                 working_dir_kind = ?16,
-                state = ?17,
-                provider_session_id = ?18,
-                last_error = ?19,
+                approval_mode = ?17,
+                execution_mode = ?18,
+                state = ?19,
+                provider_session_id = ?20,
+                last_error = ?21,
                 updated_at = unixepoch()
             WHERE id = ?1
             ",
@@ -899,6 +911,8 @@ impl StateStore {
                 next_provider_api_key,
                 next_working_dir,
                 next_working_dir_kind,
+                next_approval_mode,
+                next_execution_mode,
                 next_state,
                 next_provider_session_id,
                 next_last_error,
@@ -1905,6 +1919,8 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             provider_api_key TEXT NOT NULL DEFAULT '',
             working_dir TEXT NOT NULL DEFAULT '',
             working_dir_kind TEXT NOT NULL DEFAULT 'workspace_scratch',
+            approval_mode TEXT NOT NULL DEFAULT 'ask',
+            execution_mode TEXT NOT NULL DEFAULT 'act',
             state TEXT NOT NULL,
             provider_session_id TEXT NOT NULL DEFAULT '',
             last_error TEXT NOT NULL DEFAULT '',
@@ -2272,6 +2288,18 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "sessions",
         "working_dir_kind",
         "TEXT NOT NULL DEFAULT 'workspace_scratch'",
+    )?;
+    ensure_column(
+        connection,
+        "sessions",
+        "approval_mode",
+        "TEXT NOT NULL DEFAULT 'ask'",
+    )?;
+    ensure_column(
+        connection,
+        "sessions",
+        "execution_mode",
+        "TEXT NOT NULL DEFAULT 'act'",
     )?;
     ensure_column(
         connection,
@@ -3805,6 +3833,8 @@ fn load_session_summary(connection: &Connection, session_id: &str) -> Result<Ses
                 provider_api_key,
                 working_dir,
                 working_dir_kind,
+                approval_mode,
+                execution_mode,
                 state,
                 provider_session_id,
                 last_error,
@@ -3854,15 +3884,17 @@ fn map_session_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionS
         provider_api_key: row.get(13)?,
         working_dir: row.get(14)?,
         working_dir_kind: row.get(15)?,
+        approval_mode: row.get(16)?,
+        execution_mode: row.get(17)?,
         project_count: 0,
         projects: Vec::new(),
-        state: row.get(16)?,
-        provider_session_id: row.get(17)?,
-        last_error: row.get(18)?,
-        last_message_excerpt: row.get(19)?,
-        turn_count: row.get(20)?,
-        created_at: row.get(21)?,
-        updated_at: row.get(22)?,
+        state: row.get(18)?,
+        provider_session_id: row.get(19)?,
+        last_error: row.get(20)?,
+        last_message_excerpt: row.get(21)?,
+        turn_count: row.get(22)?,
+        created_at: row.get(23)?,
+        updated_at: row.get(24)?,
     })
 }
 
@@ -5370,6 +5402,8 @@ mod tests {
                 provider_api_key: String::new(),
                 working_dir: scratch_dir,
                 working_dir_kind: "workspace_scratch".to_string(),
+                approval_mode: "ask".to_string(),
+                execution_mode: "act".to_string(),
             })
             .expect("session should persist");
         store
@@ -5428,6 +5462,8 @@ mod tests {
                 provider_api_key: String::new(),
                 working_dir: scratch_dir,
                 working_dir_kind: "workspace_scratch".to_string(),
+                approval_mode: "ask".to_string(),
+                execution_mode: "act".to_string(),
             })
             .expect("session should persist");
 
@@ -5818,6 +5854,8 @@ mod tests {
             provider_api_key: String::new(),
             working_dir,
             working_dir_kind: "workspace_scratch".to_string(),
+            approval_mode: "ask".to_string(),
+            execution_mode: "act".to_string(),
         }
     }
 }

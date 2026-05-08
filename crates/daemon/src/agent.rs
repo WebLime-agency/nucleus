@@ -52,6 +52,7 @@ const LIST_LIMIT: usize = 120;
 const RG_LIMIT: usize = 80;
 const DIFF_PREVIEW_CHAR_LIMIT: usize = 12_000;
 const COMMAND_PREVIEW_CHAR_LIMIT: usize = 4_000;
+const COMMAND_LABEL_CHAR_LIMIT: usize = 140;
 const COMMAND_DEFAULT_TIMEOUT_SECS: u64 = 300;
 const COMMAND_MAX_TIMEOUT_SECS: u64 = 1_800;
 const COMMAND_DEFAULT_OUTPUT_LIMIT_BYTES: usize = 131_072;
@@ -432,9 +433,14 @@ pub async fn start_prompt_job(
             ..JobPatch::default()
         },
     )?;
+    let root_capabilities = if current.session.execution_mode == "plan" {
+        Vec::new()
+    } else {
+        root_worker_capabilities()
+    };
     state
         .store
-        .replace_tool_capability_grants(&root_worker_id, &root_worker_capabilities())?;
+        .replace_tool_capability_grants(&root_worker_id, &root_capabilities)?;
     let worker = state
         .store
         .get_job(&job_id)?
@@ -451,7 +457,7 @@ pub async fn start_prompt_job(
         images: payload.images.clone(),
         conversation: vec![CheckpointMessage {
             role: "system".to_string(),
-            content: worker_system_prompt(&worker),
+            content: worker_system_prompt_with_mode(&worker, &current.session.execution_mode),
             images: Vec::new(),
         }],
         next_prompt: None,
@@ -1132,7 +1138,7 @@ async fn run_job_loop(
         .session_id
         .clone()
         .ok_or_else(|| anyhow!("job '{job_id}' is not attached to a session"))?;
-    let session = state.store.get_session(&session_id)?;
+    let mut session = state.store.get_session(&session_id)?;
     let worker_id = detail
         .job
         .root_worker_id
@@ -1193,6 +1199,7 @@ async fn run_job_loop(
             return Ok(());
         }
 
+        session = state.store.get_session(&session_id)?;
         if let LoopDisposition::Return = handle_pending_action(
             state,
             &session,
@@ -1292,8 +1299,24 @@ async fn run_job_loop(
             )?;
         }
 
+        session = state.store.get_session(&session_id)?;
         match response.action {
             WorkerAction::SpawnChildJobs { summary, jobs } => {
+                if session.session.execution_mode == "plan" {
+                    retry_plan_mode_action(
+                        state,
+                        job_id,
+                        &mut worker,
+                        &mut checkpoint,
+                        &mut step,
+                        tool_calls,
+                        &summary,
+                        &format!("spawn {} Utility Subworker job(s)", jobs.len()),
+                    )
+                    .await?;
+                    continue;
+                }
+
                 if let LoopDisposition::Return = handle_child_job_proposal(
                     state,
                     &session,
@@ -1366,6 +1389,21 @@ async fn run_job_loop(
                 tool,
                 args,
             } => {
+                if session.session.execution_mode == "plan" {
+                    retry_plan_mode_action(
+                        state,
+                        job_id,
+                        &mut worker,
+                        &mut checkpoint,
+                        &mut step,
+                        tool_calls,
+                        &summary,
+                        &format!("run {}", tool),
+                    )
+                    .await?;
+                    continue;
+                }
+
                 if let LoopDisposition::Return = handle_tool_call_proposal(
                     state,
                     &session,
@@ -1392,6 +1430,104 @@ async fn run_job_loop(
 enum LoopDisposition {
     Continue,
     Return,
+}
+
+async fn retry_plan_mode_action(
+    state: &AppState,
+    job_id: &str,
+    worker: &mut WorkerSummary,
+    checkpoint: &mut WorkerCheckpoint,
+    step: &mut usize,
+    tool_calls: usize,
+    summary: &str,
+    attempted_action: &str,
+) -> Result<()> {
+    checkpoint.next_prompt = Some(build_plan_mode_retry_prompt(summary, attempted_action));
+    state.store.write_worker_checkpoint(
+        &worker.id,
+        &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+    )?;
+    *step += 1;
+    *worker = state.store.update_worker(
+        &worker.id,
+        WorkerPatch {
+            state: Some("running".to_string()),
+            step_count: Some(*step),
+            tool_call_count: Some(tool_calls),
+            last_error: Some(String::new()),
+            ..WorkerPatch::default()
+        },
+    )?;
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: job_id.to_string(),
+        worker_id: Some(worker.id.clone()),
+        event_type: "worker.retry".to_string(),
+        status: "retrying".to_string(),
+        summary: "Rejected action while Plan mode is enabled.".to_string(),
+        detail: format!(
+            "Plan mode blocks Nucleus actions. Attempted action: {}. Summary: {}",
+            attempted_action,
+            excerpt(summary, 240)
+        ),
+        data_json: json!({
+            "reason": "plan_mode_action_rejected",
+            "attempted_action": attempted_action,
+        }),
+    });
+    publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+    publish_worker_updated(state, worker).await;
+    Ok(())
+}
+
+async fn reject_pending_action_for_plan_mode(
+    state: &AppState,
+    job_id: &str,
+    worker: &mut WorkerSummary,
+    checkpoint: &mut WorkerCheckpoint,
+    step: &mut usize,
+    tool_calls: usize,
+    pending: &PendingToolAction,
+) -> Result<()> {
+    checkpoint.pending_action = None;
+    if let Some(approval_id) = pending.approval_id.as_deref() {
+        if let Ok(approval) = state.store.get_approval_request(approval_id) {
+            if approval.state == "pending" {
+                let resolved = state.store.update_approval_request(
+                    approval_id,
+                    "denied",
+                    Some("Session switched to Plan mode before this action ran."),
+                    Some("system"),
+                    Some(unix_timestamp()),
+                )?;
+                publish_approval_resolved(state, &resolved).await;
+            }
+        }
+    }
+    if !pending.tool_call_id.is_empty() {
+        state.store.update_tool_call(
+            &pending.tool_call_id,
+            ToolCallPatch {
+                status: Some("denied".to_string()),
+                error_class: Some("plan_mode_action_rejected".to_string()),
+                error_detail: Some(
+                    "Session switched to Plan mode before this action ran.".to_string(),
+                ),
+                completed_at: Some(Some(unix_timestamp())),
+                ..ToolCallPatch::default()
+            },
+        )?;
+    }
+    retry_plan_mode_action(
+        state,
+        job_id,
+        worker,
+        checkpoint,
+        step,
+        tool_calls,
+        &pending.summary,
+        &format!("run {}", pending.tool),
+    )
+    .await
 }
 
 async fn handle_pending_action(
@@ -1467,42 +1603,80 @@ async fn handle_pending_action(
         return Ok(LoopDisposition::Continue);
     }
 
+    if session.session.execution_mode == "plan" {
+        reject_pending_action_for_plan_mode(
+            state,
+            job_id,
+            worker,
+            checkpoint,
+            step,
+            *tool_calls,
+            &pending,
+        )
+        .await?;
+        return Ok(LoopDisposition::Continue);
+    }
+
     if let Some(approval_id) = pending.approval_id.as_deref() {
         let approval = state.store.get_approval_request(approval_id)?;
         match approval.state.as_str() {
             "pending" => {
-                let pause_reason = format!("Waiting for approval to run {}.", pending.tool);
-                state.store.update_job(
-                    job_id,
-                    JobPatch {
-                        state: Some("paused".to_string()),
-                        last_error: Some(pause_reason.clone()),
-                        ..JobPatch::default()
-                    },
-                )?;
-                *worker = state.store.update_worker(
-                    &worker.id,
-                    WorkerPatch {
-                        state: Some("paused".to_string()),
-                        tool_call_count: Some(*tool_calls),
-                        last_error: Some(pause_reason.clone()),
-                        ..WorkerPatch::default()
-                    },
-                )?;
-                state.store.update_session(
-                    &session.session.id,
-                    SessionPatch {
-                        state: Some("paused".to_string()),
-                        last_error: Some(pause_reason),
-                        ..SessionPatch::default()
-                    },
-                )?;
-                if let Ok(updated) = state.store.get_session(&session.session.id) {
-                    let _ = publish_session_event(state, updated).await;
+                if session.session.approval_mode == "trusted" {
+                    let resolved = state.store.update_approval_request(
+                        approval_id,
+                        "approved",
+                        Some("Auto-approved because this session is set to Run Actions."),
+                        Some("system"),
+                        Some(unix_timestamp()),
+                    )?;
+                    let _ = state.store.append_job_event(JobEventRecord {
+                        job_id: job_id.to_string(),
+                        worker_id: Some(worker.id.clone()),
+                        event_type: "approval.resolved".to_string(),
+                        status: "approved".to_string(),
+                        summary: format!("Approved {}", approval.summary),
+                        detail: resolved.resolution_note.clone(),
+                        data_json: json!({
+                            "approval_id": resolved.id,
+                            "tool_call_id": resolved.tool_call_id,
+                            "resolved_by": resolved.resolved_by,
+                        }),
+                    });
+                    publish_approval_resolved(state, &resolved).await;
+                } else {
+                    let pause_reason = format!("Waiting for approval to run {}.", pending.tool);
+                    state.store.update_job(
+                        job_id,
+                        JobPatch {
+                            state: Some("paused".to_string()),
+                            last_error: Some(pause_reason.clone()),
+                            ..JobPatch::default()
+                        },
+                    )?;
+                    *worker = state.store.update_worker(
+                        &worker.id,
+                        WorkerPatch {
+                            state: Some("paused".to_string()),
+                            tool_call_count: Some(*tool_calls),
+                            last_error: Some(pause_reason.clone()),
+                            ..WorkerPatch::default()
+                        },
+                    )?;
+                    state.store.update_session(
+                        &session.session.id,
+                        SessionPatch {
+                            state: Some("paused".to_string()),
+                            last_error: Some(pause_reason),
+                            ..SessionPatch::default()
+                        },
+                    )?;
+                    if let Ok(updated) = state.store.get_session(&session.session.id) {
+                        let _ = publish_session_event(state, updated).await;
+                    }
+                    publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+                    publish_worker_updated(state, worker).await;
+                    return Ok(LoopDisposition::Return);
                 }
-                publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
-                publish_worker_updated(state, worker).await;
-                return Ok(LoopDisposition::Return);
             }
             "approved" => {}
             _ => {
@@ -1643,7 +1817,7 @@ async fn handle_tool_call_proposal(
     args: Value,
 ) -> Result<LoopDisposition> {
     *tool_calls += 1;
-    let policy = policy_for_tool(&tool);
+    let policy = policy_for_tool_with_mode(&tool, &session.session.approval_mode);
     let tool_call_id = Uuid::new_v4().to_string();
     let requires_approval = policy.decision == "require_approval";
     let mut tool_call = state.store.create_tool_call(ToolCallRecord {
@@ -2309,6 +2483,21 @@ Return exactly one valid Nucleus worker action JSON object.\n\
     )
 }
 
+fn build_plan_mode_retry_prompt(summary: &str, attempted_action: &str) -> String {
+    format!(
+        "Plan mode is enabled for this session, so Nucleus must not take actions.\n\
+Previous summary: {}\n\
+Attempted action: {}\n\
+Return exactly one valid Nucleus worker action JSON object using kind=\"final_answer\".\n\
+- Do not call tools.\n\
+- Do not spawn Utility Subworkers.\n\
+- Do not run commands, inspect files, edit files, or assume action results.\n\
+- The final_answer should be a concise user-facing plan, including assumptions or information you would need before acting.",
+        excerpt(summary, 320),
+        attempted_action
+    )
+}
+
 fn should_attach_initial_worker_images(checkpoint: &WorkerCheckpoint) -> bool {
     !checkpoint.images.is_empty()
         && checkpoint.conversation.len() == 1
@@ -2492,6 +2681,8 @@ fn build_execution_session(worker: &WorkerSummary) -> SessionSummary {
         working_dir: worker.working_dir.clone(),
         working_dir_kind: "project_root".to_string(),
         scope: "job".to_string(),
+        approval_mode: "ask".to_string(),
+        execution_mode: "act".to_string(),
         project_count: 0,
         projects: Vec::new(),
         state: worker.state.clone(),
@@ -2532,12 +2723,168 @@ fn parse_worker_action(content: &str) -> Result<WorkerAction> {
         .rfind('}')
         .ok_or_else(|| anyhow!("worker returned no JSON object"))?;
     let candidate = &trimmed[start..=end];
+    if let Ok(value) = serde_json::from_str::<Value>(candidate) {
+        if let Some(action) = normalize_worker_action_value(&value) {
+            return Ok(action);
+        }
+    }
+
     serde_json::from_str::<WorkerAction>(candidate).with_context(|| {
         format!(
             "worker returned invalid JSON action: {}",
             excerpt(trimmed, 220)
         )
     })
+}
+
+fn normalize_worker_action_value(value: &Value) -> Option<WorkerAction> {
+    let object = value.as_object()?;
+
+    if let Some(tool_call) = object.get("tool_call") {
+        return normalize_worker_tool_call_value(tool_call);
+    }
+
+    if let Some(function_call) = object.get("function_call") {
+        return normalize_worker_tool_call_value(function_call);
+    }
+
+    if object.contains_key("tool_name") || object.contains_key("name") {
+        return normalize_worker_tool_call_value(value);
+    }
+
+    None
+}
+
+fn normalize_worker_tool_call_value(value: &Value) -> Option<WorkerAction> {
+    let object = value.as_object()?;
+    let raw_tool = object
+        .get("tool")
+        .or_else(|| object.get("tool_name"))
+        .or_else(|| object.get("name"))
+        .and_then(Value::as_str)?
+        .trim();
+    if raw_tool.is_empty() {
+        return None;
+    }
+
+    let args = object
+        .get("args")
+        .or_else(|| object.get("arguments"))
+        .cloned()
+        .unwrap_or_else(|| {
+            let mut inline_args = object.clone();
+            inline_args.remove("tool");
+            inline_args.remove("tool_name");
+            inline_args.remove("name");
+            inline_args.remove("summary");
+            inline_args.remove("reason");
+            Value::Object(inline_args)
+        });
+    let args = decode_worker_tool_args(args)?;
+    let summary = object
+        .get("summary")
+        .or_else(|| object.get("reason"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Run the requested Nucleus action.")
+        .to_string();
+
+    let (tool, args) = normalize_worker_tool_name_and_args(raw_tool, args)?;
+    Some(WorkerAction::ToolCall {
+        summary,
+        tool,
+        args,
+    })
+}
+
+fn decode_worker_tool_args(args: Value) -> Option<Value> {
+    match args {
+        Value::String(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Some(Value::Object(serde_json::Map::new()));
+            }
+
+            serde_json::from_str::<Value>(trimmed).ok()
+        }
+        value => Some(value),
+    }
+}
+
+fn normalize_worker_tool_name_and_args(raw_tool: &str, args: Value) -> Option<(String, Value)> {
+    let normalized = raw_tool.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "shell" | "bash" | "terminal" | "command" | "run_command" => {
+            Some(("command.run".to_string(), normalize_shell_tool_args(args)?))
+        }
+        "read_file" | "fs.read" => Some(("fs.read_text".to_string(), args)),
+        "list_files" | "ls" => Some(("fs.list".to_string(), args)),
+        "search" | "grep" | "ripgrep" => Some(("rg.search".to_string(), args)),
+        "git_status" => Some(("git.status".to_string(), args)),
+        "git_diff" => Some(("git.diff".to_string(), args)),
+        tool if tool.contains('.') => Some((raw_tool.trim().to_string(), args)),
+        _ => None,
+    }
+}
+
+fn normalize_shell_tool_args(args: Value) -> Option<Value> {
+    let object = args.as_object()?;
+
+    let mut normalized = serde_json::Map::new();
+    let command_value = object.get("command")?;
+    if let Some(command) = command_value.as_str().map(str::trim) {
+        if command.is_empty() {
+            return None;
+        }
+
+        normalized.insert("command".to_string(), Value::String("sh".to_string()));
+        normalized.insert(
+            "args".to_string(),
+            Value::Array(vec![
+                Value::String("-lc".to_string()),
+                Value::String(command.to_string()),
+            ]),
+        );
+    } else if let Some(parts) = command_value.as_array() {
+        let mut command_parts = parts
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|part| !part.is_empty());
+        let command = command_parts.next()?;
+        normalized.insert("command".to_string(), Value::String(command.to_string()));
+        normalized.insert(
+            "args".to_string(),
+            Value::Array(
+                command_parts
+                    .map(|part| Value::String(part.to_string()))
+                    .collect(),
+            ),
+        );
+    } else {
+        return None;
+    }
+
+    for key in [
+        "cwd",
+        "workdir",
+        "working_dir",
+        "timeout_secs",
+        "output_limit_bytes",
+        "network_policy",
+        "env",
+    ] {
+        if let Some(value) = object.get(key) {
+            let normalized_key = match key {
+                "workdir" | "working_dir" => "cwd",
+                _ => key,
+            };
+            normalized.insert(normalized_key.to_string(), value.clone());
+        }
+    }
+
+    Some(Value::Object(normalized))
 }
 
 #[derive(Debug)]
@@ -3757,7 +4104,7 @@ fn render_command_plan(spec: &ResolvedCommandSpec, summary: &str) -> String {
 }
 
 fn command_label(spec: &ResolvedCommandSpec) -> String {
-    shell_quoted_command(spec)
+    excerpt(&shell_quoted_command(spec), COMMAND_LABEL_CHAR_LIMIT)
 }
 
 fn shell_quoted_command(spec: &ResolvedCommandSpec) -> String {
@@ -5173,7 +5520,31 @@ fn fallback_note(note: &str, default: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn policy_for_tool(tool: &str) -> PolicyDecisionRecord {
+    policy_for_tool_with_mode(tool, "ask")
+}
+
+fn policy_for_tool_with_mode(tool: &str, approval_mode: &str) -> PolicyDecisionRecord {
+    if approval_mode == "trusted" && requires_approval_for_tool(tool) {
+        return PolicyDecisionRecord {
+            decision: "allow".to_string(),
+            reason: "session allows Nucleus to run actions without per-step approval".to_string(),
+            matched_rule: format!("session-trusted-actions:{tool}"),
+            scope_kind: if is_mutating_tool(tool) {
+                "path"
+            } else {
+                "process"
+            }
+            .to_string(),
+            risk_level: if is_mutating_tool(tool) {
+                "medium".to_string()
+            } else {
+                "high".to_string()
+            },
+        };
+    }
+
     if requires_approval_for_tool(tool) {
         PolicyDecisionRecord {
             decision: "require_approval".to_string(),
@@ -5665,6 +6036,8 @@ async fn create_playbook_session(
         provider_api_key: target.provider_api_key,
         working_dir: projects.working_dir,
         working_dir_kind: projects.working_dir_kind,
+        approval_mode: "ask".to_string(),
+        execution_mode: "act".to_string(),
     })?;
 
     Ok(state.store.get_session(session_id)?)
@@ -6206,13 +6579,41 @@ fn execution_capabilities() -> Vec<ToolCapabilityGrantRecord> {
 }
 
 fn worker_system_prompt(worker: &WorkerSummary) -> String {
+    worker_system_prompt_with_mode(worker, "act")
+}
+
+fn worker_system_prompt_with_mode(worker: &WorkerSummary, execution_mode: &str) -> String {
+    if execution_mode == "plan" {
+        return format!(
+            "You are the Utility Nucleus {} worker for a Nucleus-owned job.\n\
+Return exactly one JSON object and nothing else.\n\
+Plan mode is enabled for this session.\n\
+Allowed response shape:\n\
+{{\"kind\":\"final_answer\",\"summary\":\"what the plan covers\",\"final_answer\":\"concise user-facing plan\"}}\n\
+Rules:\n\
+- Do not call tools.\n\
+- Do not spawn Utility Subworkers.\n\
+- Do not run commands, inspect files, edit files, or assume action results.\n\
+- You may reason from the user's prompt and existing visible context only.\n\
+- The visible chat will receive final_answer.\n\
+- Do not wrap JSON in markdown fences.\n\
+Available tools: disabled in Plan mode.\n\
+Worker lane: {}\n\
+Working directory: {}\n",
+            worker.lane, worker.lane, worker.working_dir
+        );
+    }
+
     let is_root_worker = worker.parent_worker_id.is_none();
     let action_shapes = if is_root_worker {
-        "{\"kind\":\"tool_call\",\"summary\":\"why this tool is next\",\"tool\":\"tool.id\",\"args\":{}}\n\
+        "{\"kind\":\"tool_call\",\"summary\":\"inspect the active project\",\"tool\":\"project.inspect\",\"args\":{}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"list likely project directories\",\"tool\":\"fs.list\",\"args\":{\"path\":\".\",\"recursive\":false,\"limit\":100}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"check running dev processes\",\"tool\":\"command.run\",\"args\":{\"command\":\"sh\",\"args\":[\"-lc\",\"ps -ef | grep -iE 'stfr|vite|next|webpack|dev server' | grep -v grep\"],\"cwd\":\".\",\"timeout_secs\":20}}\n\
 {\"kind\":\"spawn_child_jobs\",\"summary\":\"why parallel exploration helps\",\"jobs\":[{\"title\":\"focused subtask\",\"prompt\":\"precise child prompt\",\"working_dir\":\"optional/path/inside/scope\"}]}\n\
 {\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\"}"
     } else {
-        "{\"kind\":\"tool_call\",\"summary\":\"why this tool is next\",\"tool\":\"tool.id\",\"args\":{}}\n\
+        "{\"kind\":\"tool_call\",\"summary\":\"inspect the active project\",\"tool\":\"project.inspect\",\"args\":{}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"list likely project directories\",\"tool\":\"fs.list\",\"args\":{\"path\":\".\",\"recursive\":false,\"limit\":100}}\n\
 {\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\"}"
     };
     let tool_help = worker
@@ -6249,6 +6650,7 @@ Rules:\n\
 {}\
 - The visible chat will only receive final_answer, not your intermediate reasoning.\n\
 - Do not put plans, next-step instructions, or descriptions of future actions in final_answer.\n\
+- Do not use provider-native tool wrappers such as tool_call/tool_name/shell; use the exact Nucleus JSON shapes above.\n\
 - Do not wrap JSON in markdown fences.\n\
 Available tools:\n{}\n\
 Worker lane: {}\n\
@@ -6431,6 +6833,25 @@ mod tests {
         );
         assert_eq!(policy_for_tool("command.session.write").decision, "allow");
         assert_eq!(policy_for_tool("fs.read_text").decision, "allow");
+    }
+
+    #[test]
+    fn trusted_session_approval_mode_allows_action_tools() {
+        let command_policy = policy_for_tool_with_mode("command.run", "trusted");
+        assert_eq!(command_policy.decision, "allow");
+        assert_eq!(
+            command_policy.matched_rule,
+            "session-trusted-actions:command.run"
+        );
+        assert_eq!(command_policy.risk_level, "high");
+
+        let mutation_policy = policy_for_tool_with_mode("fs.write_text", "trusted");
+        assert_eq!(mutation_policy.decision, "allow");
+        assert_eq!(
+            mutation_policy.matched_rule,
+            "session-trusted-actions:fs.write_text"
+        );
+        assert_eq!(mutation_policy.risk_level, "medium");
     }
 
     #[test]
@@ -6627,6 +7048,60 @@ mod tests {
             root_prompt.contains("Do not put plans, next-step instructions"),
             "worker prompt should prevent internal plans from becoming visible answers"
         );
+        assert!(
+            root_prompt.contains("\"tool\":\"command.run\""),
+            "worker prompt should include concrete command.run action shape"
+        );
+        assert!(
+            root_prompt.contains("Do not use provider-native tool wrappers"),
+            "worker prompt should reject provider-native tool-call shapes"
+        );
+    }
+
+    #[test]
+    fn plan_mode_worker_prompt_disables_actions() {
+        let worker = WorkerSummary {
+            id: "root".to_string(),
+            job_id: "job".to_string(),
+            parent_worker_id: None,
+            title: "Root worker".to_string(),
+            lane: "utility".to_string(),
+            state: "queued".to_string(),
+            provider: "test".to_string(),
+            model: "test".to_string(),
+            provider_base_url: String::new(),
+            provider_api_key: String::new(),
+            provider_session_id: String::new(),
+            working_dir: "/tmp".to_string(),
+            read_roots: vec!["/tmp".to_string()],
+            write_roots: vec!["/tmp".to_string()],
+            max_steps: 10,
+            max_tool_calls: 10,
+            max_wall_clock_secs: 30,
+            step_count: 0,
+            tool_call_count: 0,
+            last_error: String::new(),
+            capabilities: Vec::new(),
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let prompt = worker_system_prompt_with_mode(&worker, "plan");
+        assert!(prompt.contains("Plan mode is enabled"));
+        assert!(prompt.contains("Do not call tools"));
+        assert!(prompt.contains("Available tools: disabled in Plan mode"));
+        assert!(prompt.contains("{\"kind\":\"final_answer\""));
+        assert!(!prompt.contains("\"kind\":\"tool_call\""));
+        assert!(!prompt.contains("spawn_child_jobs"));
+    }
+
+    #[test]
+    fn plan_mode_retry_prompt_requires_final_answer() {
+        let prompt = build_plan_mode_retry_prompt("inspect the repo", "run command.run");
+        assert!(prompt.contains("Plan mode is enabled"));
+        assert!(prompt.contains("kind=\"final_answer\""));
+        assert!(prompt.contains("Do not call tools"));
+        assert!(prompt.contains("run command.run"));
     }
 
     #[test]
@@ -6661,6 +7136,97 @@ mod tests {
         assert!(
             prompt.contains("Only return final_answer when the text directly answers the user")
         );
+    }
+
+    #[test]
+    fn parses_provider_native_shell_tool_call_as_command_run() {
+        let action = parse_worker_action(
+            r#"{"tool_call":{"tool_name":"shell","arguments":{"command":"pwd && ps -ef | grep -i stfr","cwd":"stfr","timeout_secs":20}}}"#,
+        )
+        .expect("provider-native shell call should normalize");
+
+        let WorkerAction::ToolCall {
+            summary,
+            tool,
+            args,
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(summary, "Run the requested Nucleus action.");
+        assert_eq!(tool, "command.run");
+        assert_eq!(args["command"], "sh");
+        assert_eq!(args["args"][0], "-lc");
+        assert_eq!(args["args"][1], "pwd && ps -ef | grep -i stfr");
+        assert_eq!(args["cwd"], "stfr");
+        assert_eq!(args["timeout_secs"], 20);
+    }
+
+    #[test]
+    fn parses_provider_native_inline_shell_argv_tool_call_as_command_run() {
+        let action = parse_worker_action(
+            r#"{"tool_call":{"tool":"shell","command":["bash","-lc","rg -n \"uhm|UHM|Uhm\" ."],"workdir":"/home/eba/dev-projects/dga-clients"}}"#,
+        )
+        .expect("inline provider-native shell argv call should normalize");
+
+        let WorkerAction::ToolCall {
+            summary,
+            tool,
+            args,
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(summary, "Run the requested Nucleus action.");
+        assert_eq!(tool, "command.run");
+        assert_eq!(args["command"], "bash");
+        assert_eq!(args["args"][0], "-lc");
+        assert_eq!(args["args"][1], "rg -n \"uhm|UHM|Uhm\" .");
+        assert_eq!(args["cwd"], "/home/eba/dev-projects/dga-clients");
+    }
+
+    #[test]
+    fn parses_provider_native_read_file_tool_call() {
+        let action = parse_worker_action(
+            r#"{"tool_call":{"name":"read_file","arguments":{"path":"package.json"},"summary":"read metadata"}}"#,
+        )
+        .expect("provider-native read file call should normalize");
+
+        let WorkerAction::ToolCall {
+            summary,
+            tool,
+            args,
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(summary, "read metadata");
+        assert_eq!(tool, "fs.read_text");
+        assert_eq!(args["path"], "package.json");
+    }
+
+    #[test]
+    fn parses_provider_native_stringified_arguments() {
+        let action = parse_worker_action(
+            r#"{"function_call":{"name":"read_file","arguments":"{\"path\":\"package.json\"}","summary":"read metadata"}}"#,
+        )
+        .expect("provider-native stringified arguments should normalize");
+
+        let WorkerAction::ToolCall {
+            summary,
+            tool,
+            args,
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(summary, "read metadata");
+        assert_eq!(tool, "fs.read_text");
+        assert_eq!(args["path"], "package.json");
     }
 
     #[test]
@@ -6815,6 +7381,8 @@ mod tests {
             provider_api_key: String::new(),
             working_dir: workspace_root.display().to_string(),
             working_dir_kind: "workspace_scratch".to_string(),
+            approval_mode: "ask".to_string(),
+            execution_mode: "act".to_string(),
             project_count: 0,
             projects: Vec::new(),
             state: "active".to_string(),
@@ -6866,6 +7434,8 @@ mod tests {
             provider_api_key: String::new(),
             working_dir: workspace_root.display().to_string(),
             working_dir_kind: "workspace_scratch".to_string(),
+            approval_mode: "ask".to_string(),
+            execution_mode: "act".to_string(),
             project_count: 0,
             projects: Vec::new(),
             state: "active".to_string(),
@@ -6981,6 +7551,8 @@ mod tests {
                 provider_api_key: String::new(),
                 working_dir: workspace_root.display().to_string(),
                 working_dir_kind: "workspace_scratch".to_string(),
+                approval_mode: "ask".to_string(),
+                execution_mode: "act".to_string(),
             })
             .expect("session should persist");
 

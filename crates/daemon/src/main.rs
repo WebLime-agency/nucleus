@@ -691,6 +691,8 @@ async fn create_session(
             }
         });
     let route_title = selection.route_title.clone();
+    let approval_mode = normalize_session_approval_mode(payload.approval_mode.as_deref())?;
+    let execution_mode = normalize_session_execution_mode(payload.execution_mode.as_deref())?;
 
     state.store.create_session(SessionRecord {
         id: session_id.clone(),
@@ -710,6 +712,8 @@ async fn create_session(
         provider_api_key: selection.provider_api_key,
         working_dir: projects.working_dir.clone(),
         working_dir_kind: projects.working_dir_kind.clone(),
+        approval_mode,
+        execution_mode,
     })?;
 
     let detail = state.store.get_session(&session_id)?;
@@ -724,11 +728,13 @@ async fn create_session(
                 detail.session.provider, detail.session.title
             ),
             detail: format!(
-                "provider={} model={} working_dir={} scope={} project_count={}",
+                "provider={} model={} working_dir={} scope={} approval_mode={} execution_mode={} project_count={}",
                 detail.session.provider,
                 detail.session.model,
                 detail.session.working_dir,
                 detail.session.scope,
+                detail.session.approval_mode,
+                detail.session.execution_mode,
                 detail.session.project_count
             ),
         },
@@ -854,6 +860,14 @@ async fn update_session(
         working_dir_kind: project_selection
             .as_ref()
             .map(|selection| selection.working_dir_kind.clone()),
+        approval_mode: match payload.approval_mode {
+            Some(value) => Some(normalize_session_approval_mode(Some(&value))?),
+            None => None,
+        },
+        execution_mode: match payload.execution_mode {
+            Some(value) => Some(normalize_session_execution_mode(Some(&value))?),
+            None => None,
+        },
         state: match payload.state {
             Some(value) => Some(normalize_session_state(&value)?),
             None => None,
@@ -876,12 +890,14 @@ async fn update_session(
             status: "success".to_string(),
             summary: describe_session_update(&before.session, &detail.session),
             detail: format!(
-                "provider={} model={} working_dir={} state={} scope={} project_count={}",
+                "provider={} model={} working_dir={} state={} scope={} approval_mode={} execution_mode={} project_count={}",
                 detail.session.provider,
                 detail.session.model,
                 detail.session.working_dir,
                 detail.session.state,
                 detail.session.scope,
+                detail.session.approval_mode,
+                detail.session.execution_mode,
                 detail.session.project_count
             ),
         },
@@ -2476,6 +2492,32 @@ fn normalize_session_state(value: &str) -> Result<String, ApiError> {
     }
 }
 
+fn normalize_session_approval_mode(value: Option<&str>) -> Result<String, ApiError> {
+    let mode = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("ask");
+    match mode {
+        "ask" | "trusted" => Ok(mode.to_string()),
+        other => Err(ApiError::bad_request(format!(
+            "unsupported session approval mode '{other}'",
+        ))),
+    }
+}
+
+fn normalize_session_execution_mode(value: Option<&str>) -> Result<String, ApiError> {
+    let mode = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("act");
+    match mode {
+        "act" | "plan" => Ok(mode.to_string()),
+        other => Err(ApiError::bad_request(format!(
+            "unsupported session execution mode '{other}'",
+        ))),
+    }
+}
+
 fn default_session_title(provider: AdapterKind) -> String {
     match provider {
         AdapterKind::Claude => "Claude session".to_string(),
@@ -2725,6 +2767,32 @@ fn describe_session_update(before: &SessionSummary, after: &SessionSummary) -> S
             "Updated {} session '{}' to {} attached projects with '{}' as the working directory.",
             after.provider, after.title, after.project_count, after.project_title
         );
+    }
+
+    if before.approval_mode != after.approval_mode {
+        return match after.approval_mode.as_str() {
+            "trusted" => format!(
+                "Allowed Nucleus to run actions without approval in {} session '{}'.",
+                after.provider, after.title
+            ),
+            _ => format!(
+                "Restored approval prompts in {} session '{}'.",
+                after.provider, after.title
+            ),
+        };
+    }
+
+    if before.execution_mode != after.execution_mode {
+        return match after.execution_mode.as_str() {
+            "plan" => format!(
+                "Enabled Plan mode in {} session '{}'.",
+                after.provider, after.title
+            ),
+            _ => format!(
+                "Enabled Action mode in {} session '{}'.",
+                after.provider, after.title
+            ),
+        };
     }
 
     if before.title != after.title {
@@ -3060,6 +3128,8 @@ mod tests {
             provider_api_key: String::new(),
             working_dir: "/home/eba/dev-projects/project-one".to_string(),
             working_dir_kind: "project_root".to_string(),
+            approval_mode: "ask".to_string(),
+            execution_mode: "act".to_string(),
             project_count: 1,
             projects: vec![nucleus_protocol::SessionProjectSummary {
                 id: "project-1".to_string(),
@@ -3191,6 +3261,8 @@ mod tests {
             provider_api_key: String::new(),
             working_dir: workspace_root.display().to_string(),
             working_dir_kind: "workspace_scratch".to_string(),
+            approval_mode: "ask".to_string(),
+            execution_mode: "act".to_string(),
             project_count: 0,
             projects: Vec::new(),
             state: "active".to_string(),
@@ -3364,6 +3436,8 @@ mod tests {
                     project_id: None,
                     primary_project_id: None,
                     project_ids: None,
+                    approval_mode: None,
+                    execution_mode: None,
                 })
                 .expect("session payload should serialize"),
             ),
@@ -3431,6 +3505,8 @@ mod tests {
             provider_api_key: String::new(),
             working_dir: "/tmp".to_string(),
             working_dir_kind: "workspace_scratch".to_string(),
+            approval_mode: "ask".to_string(),
+            execution_mode: "act".to_string(),
             project_count: 0,
             projects: Vec::new(),
             state: "active".to_string(),
@@ -3495,6 +3571,8 @@ mod tests {
             provider_api_key: String::new(),
             working_dir: "/tmp".to_string(),
             working_dir_kind: "workspace_scratch".to_string(),
+            approval_mode: "ask".to_string(),
+            execution_mode: "act".to_string(),
             project_count: 0,
             projects: Vec::new(),
             state: "active".to_string(),

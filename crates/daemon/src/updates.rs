@@ -204,7 +204,7 @@ impl UpdateManager {
     }
 
     pub fn auto_check_enabled(&self) -> bool {
-        self.instance.is_dev_checkout() || self.managed_release_manifest_url().is_some()
+        self.instance.is_managed_release() && self.managed_release_manifest_url().is_some()
     }
 
     pub async fn configure(
@@ -977,7 +977,7 @@ fn initial_message(
     }
 
     if instance.is_dev_checkout() {
-        return "Automatic update checks are ready for this checkout.".to_string();
+        return "Manual update checks are available for this checkout.".to_string();
     }
 
     "This managed release tracks a release channel and fetches verified release artifacts."
@@ -1670,6 +1670,18 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dev_checkouts_do_not_auto_check_updates() {
+        let state_dir = test_root("dev-auto-check-state");
+        let store =
+            Arc::new(StateStore::initialize_at(&state_dir).expect("store should initialize"));
+        let manager = super::UpdateManager::new(sample_instance(RestartMode::Unsupported), store);
+
+        assert!(!manager.auto_check_enabled());
+
+        let _ = fs::remove_dir_all(state_dir);
     }
 
     #[test]
