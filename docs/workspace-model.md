@@ -13,7 +13,7 @@ It owns:
 - router profiles
 - discovered projects
 
-Workspace settings belong to the daemon, not to a specific client.
+Workspace settings belong to Nucleus, not to a specific client.
 
 ## Project
 
@@ -36,7 +36,7 @@ A session may be:
 - ad hoc with no attached project
 - anchored to one project
 - attached to multiple projects
-- hidden automation-backed for daemon-owned playbooks and background runs
+- utility automation-backed for Nucleus-owned playbooks and background runs
 
 The working directory should come from the workspace and active-project model, not from arbitrary per-session free text.
 
@@ -48,7 +48,7 @@ The expected behavior is:
 
 ## Routing
 
-Routing belongs to the daemon.
+Routing belongs to Nucleus.
 
 The workspace owns:
 
@@ -56,13 +56,13 @@ The workspace owns:
 - a default utility model target
 - named profiles that package model and provider choices for common work modes
 
-Clients should present those choices cleanly, but the daemon remains the authority.
+Clients should present those choices cleanly, but Nucleus remains the authority.
 
 ## Prompt Context
 
 Prompt context should layer like this:
 
-1. daemon system instructions
+1. Nucleus system instructions
 2. committed public repo context
 3. local private operator context
 4. project-specific context

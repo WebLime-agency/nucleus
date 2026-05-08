@@ -369,7 +369,7 @@
       <h1 class="text-3xl font-semibold text-zinc-50">Profiles</h1>
       <p class="mt-2 max-w-3xl text-sm leading-6 text-zinc-400">
         Pick a profile, choose its main and utility models, save, and let new sessions inherit the
-        result. The runtime inventory below shows which adapters the daemon can actually drive.
+        result. The runtime inventory below shows which adapters Nucleus can actually drive.
       </p>
     </div>
   </section>
@@ -390,7 +390,7 @@
     <CardHeader>
       <CardTitle>Runtime Inventory</CardTitle>
       <CardDescription>
-        These are the local runtimes the daemon can actually see. Profile settings only choose how
+        These are the local runtimes Nucleus can actually see. Profile settings only choose how
         to use them.
       </CardDescription>
     </CardHeader>
@@ -486,7 +486,7 @@
             {/if}
           </div>
           <CardDescription>
-            Main model settings drive the session. Utility model settings stay daemon-side for prompt
+            Main model settings drive the session. Utility model settings stay inside Nucleus for prompt
             assembly, routing, and background work.
           </CardDescription>
         </div>

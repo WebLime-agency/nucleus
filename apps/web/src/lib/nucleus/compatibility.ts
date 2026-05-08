@@ -22,14 +22,14 @@ export function evaluateCompatibility(
   if (!summary) {
     return {
       level: 'degraded',
-      message: 'Compatibility metadata has not been received from the daemon yet.'
+      message: 'Compatibility metadata has not been received from Nucleus yet.'
     };
   }
 
   if (summary.surface_version !== CURRENT_CLIENT_SURFACE_VERSION) {
     return {
       level: 'blocked',
-      message: `This client expects surface ${CURRENT_CLIENT_SURFACE_VERSION}, but the daemon reports ${summary.surface_version}. Reconnect with a matching client build before relying on full support.`
+      message: `This client expects surface ${CURRENT_CLIENT_SURFACE_VERSION}, but Nucleus reports ${summary.surface_version}. Reconnect with a matching client build before relying on full support.`
     };
   }
 
@@ -39,7 +39,7 @@ export function evaluateCompatibility(
   ) {
     return {
       level: 'blocked',
-      message: `This client is ${CURRENT_CLIENT_VERSION}, but the daemon requires client ${summary.minimum_client_version} or newer. Update Nucleus before continuing.`
+      message: `This client is ${CURRENT_CLIENT_VERSION}, but Nucleus requires client ${summary.minimum_client_version} or newer. Update Nucleus before continuing.`
     };
   }
 
@@ -49,7 +49,7 @@ export function evaluateCompatibility(
   ) {
     return {
       level: 'blocked',
-      message: `This daemon is ${summary.server_version}, but this client flow requires server ${summary.minimum_server_version} or newer. Update Nucleus before continuing.`
+      message: `Nucleus is ${summary.server_version}, but this client flow requires server ${summary.minimum_server_version} or newer. Update Nucleus before continuing.`
     };
   }
 
@@ -60,7 +60,7 @@ export function evaluateCompatibility(
   if (missingCapabilities.length > 0) {
     return {
       level: 'degraded',
-      message: `The daemon did not advertise required capabilities: ${missingCapabilities.join(', ')}. Update and restart Nucleus before relying on update controls.`
+      message: `Nucleus did not advertise required capabilities: ${missingCapabilities.join(', ')}. Update and restart Nucleus before relying on update controls.`
     };
   }
 

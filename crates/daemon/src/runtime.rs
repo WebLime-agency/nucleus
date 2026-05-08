@@ -100,7 +100,7 @@ impl RuntimeManager {
                 session.provider
             ),
             AdapterKind::System => bail!(
-                "provider '{}' does not support daemon-managed prompting yet",
+                "provider '{}' does not support Nucleus-managed prompting yet",
                 session.provider
             ),
         }
@@ -149,7 +149,7 @@ fn probe_system_runtime(mut runtime: RuntimeSummary) -> RuntimeSummary {
     runtime.state = "ready".to_string();
     runtime.auth_state = "not_required".to_string();
     runtime.version = env!("CARGO_PKG_VERSION").to_string();
-    runtime.note = "Built into the Nucleus daemon.".to_string();
+    runtime.note = "Built into Nucleus.".to_string();
     runtime.supports_sessions = false;
     runtime.supports_prompting = false;
     runtime

@@ -59,7 +59,7 @@
       updatedAt = Date.now();
       error = null;
     } catch (cause) {
-      error = cause instanceof Error ? cause.message : 'Failed to reach the daemon.';
+      error = cause instanceof Error ? cause.message : 'Failed to reach Nucleus.';
     } finally {
       loading = false;
       refreshing = false;
@@ -140,7 +140,7 @@
   <title>Nucleus - Overview</title>
   <meta
     name="description"
-    content="Nucleus host operations overview with daemon-backed system telemetry, storage paths, and process controls."
+    content="Nucleus host operations overview with system telemetry, storage paths, and process controls."
   />
 </svelte:head>
 
@@ -151,8 +151,8 @@
       <div>
         <h1 class="text-3xl font-semibold text-zinc-50">Overview</h1>
         <p class="mt-2 max-w-3xl text-sm leading-6 text-zinc-400">
-          Rust owns the system data and process actions. This web client is only reading and steering
-          the daemon contract.
+          Nucleus owns the system data and process actions. This web client reads and steers that
+          local control plane.
         </p>
       </div>
     </div>
@@ -179,7 +179,7 @@
         {#if system}
           {system.cpu.cores.length} logical cores on {system.hostname}
         {:else}
-          Waiting for daemon metrics.
+          Waiting for Nucleus metrics.
         {/if}
       </CardContent>
     </Card>
@@ -193,7 +193,7 @@
         {#if system}
           {formatBytes(system.memory.used_bytes)} of {formatBytes(system.memory.total_bytes)}
         {:else}
-          Waiting for daemon metrics.
+          Waiting for Nucleus metrics.
         {/if}
       </CardContent>
     </Card>
@@ -207,7 +207,7 @@
         {#if processData}
           {formatCount(processData.meta.matching_processes)} owned by {processData.meta.current_user}
         {:else}
-          Waiting for daemon metrics.
+          Waiting for Nucleus metrics.
         {/if}
       </CardContent>
     </Card>
@@ -221,7 +221,7 @@
         {#if overview}
           {formatCount(overview.sessions.length)} tracked sessions
         {:else}
-          Waiting for daemon state.
+          Waiting for Nucleus state.
         {/if}
       </CardContent>
     </Card>
@@ -234,7 +234,7 @@
       <Card>
         <CardHeader>
           <CardTitle>Runtimes</CardTitle>
-          <CardDescription>Daemon-probed provider readiness and adapter inventory.</CardDescription>
+          <CardDescription>Nucleus-probed provider readiness and adapter inventory.</CardDescription>
         </CardHeader>
         <CardContent class="space-y-3">
           {#if overview && overview.runtimes.length > 0}
@@ -309,7 +309,7 @@
     title="Top processes"
     subtitle={processData
       ? `Showing ${formatCount(processData.processes.length)} of ${formatCount(processData.meta.matching_processes)} user-owned processes.`
-      : 'Waiting for daemon process data.'}
+      : 'Waiting for Nucleus process data.'}
     processes={processData?.processes ?? []}
     sort="memory"
     {killingPid}

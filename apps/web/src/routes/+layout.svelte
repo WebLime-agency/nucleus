@@ -201,7 +201,7 @@
         authMessage = cause.message;
         error = null;
       } else {
-        error = cause instanceof Error ? cause.message : 'Failed to reach the daemon.';
+        error = cause instanceof Error ? cause.message : 'Failed to reach Nucleus.';
       }
     } finally {
       loading = false;
@@ -663,7 +663,7 @@
     <div class="w-full max-w-md rounded-lg border border-zinc-800 bg-zinc-950 p-5 shadow-2xl">
       <div class="text-lg font-semibold text-zinc-50">Connect To Nucleus</div>
       <div class="mt-2 text-sm leading-6 text-zinc-400">
-        This server requires a bearer token before the daemon APIs and session stream become available.
+        This server requires a bearer token before the Nucleus APIs and session stream become available.
       </div>
 
       <div class="mt-4 space-y-2">

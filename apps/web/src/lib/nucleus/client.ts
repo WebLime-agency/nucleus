@@ -70,7 +70,7 @@ async function parseJson<T>(response: Response, schema: z.ZodType<T>): Promise<T
   const result = schema.safeParse(payload);
 
   if (!result.success) {
-    throw new Error('Daemon returned an invalid response payload.');
+    throw new Error('Nucleus returned an invalid response payload.');
   }
 
   return result.data;

@@ -286,7 +286,7 @@
       success = next.message;
     } catch (cause) {
       restarting = false;
-      error = cause instanceof Error ? cause.message : 'Failed to restart the daemon.';
+      error = cause instanceof Error ? cause.message : 'Failed to restart Nucleus.';
     }
   }
 
@@ -359,8 +359,8 @@
     <div>
       <h1 class="text-3xl font-semibold text-zinc-50">Settings</h1>
       <p class="mt-2 max-w-3xl text-sm leading-6 text-zinc-400">
-        Nucleus runs as a daemon-owned instance. This page shows the active install wiring, the
-        tracked update target, and the daemon-owned update history.
+        Nucleus runs as a managed local instance. This page shows the active install wiring, the
+        tracked update target, and Nucleus-owned update history.
       </p>
     </div>
   </section>
@@ -391,7 +391,7 @@
     <CardHeader>
       <CardTitle>Workspace</CardTitle>
       <CardDescription>
-        The workspace root is where the daemon discovers projects. Sessions still pick which
+        The workspace root is where Nucleus discovers projects. Sessions still pick which
         projects to attach when work starts.
       </CardDescription>
     </CardHeader>
@@ -419,7 +419,7 @@
         </div>
         {#if !workspace || workspace.projects.length === 0}
           <div class="rounded-md border border-dashed border-zinc-800 px-4 py-6 text-sm text-zinc-500">
-            No projects discovered yet. Save a valid root and the daemon will populate them.
+            No projects discovered yet. Save a valid root and Nucleus will populate them.
           </div>
         {:else}
           {#each workspace.projects as project}
@@ -447,7 +447,7 @@
       <CardHeader>
         <CardTitle>Instance</CardTitle>
         <CardDescription>
-          These values define which daemon, state tree, and install shape this UI is steering.
+          These values define which Nucleus instance, state tree, and install shape this UI is steering.
         </CardDescription>
       </CardHeader>
       <CardContent class="space-y-3">
@@ -462,7 +462,7 @@
           <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
             <div class="flex items-center gap-2 text-xs uppercase tracking-[0.16em] text-zinc-500">
               <Server class="size-3.5" />
-              <span>Daemon Bind</span>
+              <span>Server Bind</span>
             </div>
             <div class="mt-2 text-sm font-medium text-zinc-50">
               {settings?.instance.daemon_bind ?? 'Unavailable'}
@@ -516,7 +516,7 @@
       <CardHeader>
         <CardTitle>Updates</CardTitle>
         <CardDescription>
-          The daemon owns the tracked target, latest successful check, latest attempted check, and
+          Nucleus owns the tracked target, latest successful check, latest attempted check, and
           restart requirement for this install.
         </CardDescription>
       </CardHeader>
@@ -608,7 +608,7 @@
               </Button>
             </div>
             <div class="mt-3 text-xs leading-5 text-zinc-500">
-              Managed installs follow release channels, not git branches. The daemon stores the
+              Managed installs follow release channels, not git branches. Nucleus stores the
               tracked channel separately from the currently running release and reuses it across
               reconnects and restarts.
             </div>
@@ -627,7 +627,7 @@
               </Button>
             </div>
             <div class="mt-3 text-xs leading-5 text-zinc-500">
-              Contributor installs can track an explicit ref such as <code>main</code>. The daemon
+              Contributor installs can track an explicit ref such as <code>main</code>. Nucleus
               keeps this target separate from the live checkout so mismatch states stay visible.
             </div>
           {/if}
@@ -635,7 +635,7 @@
 
         {#if update?.restart_required}
           <div class="rounded-md border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-sm text-amber-100">
-            The install payload is newer than the running daemon. Restart the daemon after
+            The install payload is newer than the running Nucleus process. Restart Nucleus after
             resolving the issue.
           </div>
         {/if}
@@ -675,7 +675,7 @@
 
           <Button variant="secondary" onclick={handleRestartDaemon} disabled={!canRestart}>
             <Power class={restarting || update?.state === 'restarting' ? 'size-4 animate-pulse' : 'size-4'} />
-            {restarting || update?.state === 'restarting' ? 'Restarting' : 'Restart daemon'}
+            {restarting || update?.state === 'restarting' ? 'Restarting' : 'Restart Nucleus'}
           </Button>
         </div>
       </CardContent>
@@ -687,7 +687,7 @@
       <CardHeader>
         <CardTitle>Connection</CardTitle>
         <CardDescription>
-          These are the daemon-facing URLs for this instance and the current web delivery mode.
+          These are the Nucleus URLs for this instance and the current web delivery mode.
         </CardDescription>
       </CardHeader>
       <CardContent class="space-y-3">
@@ -743,7 +743,7 @@
       <CardHeader>
         <CardTitle>Access</CardTitle>
         <CardDescription>
-          The daemon owns bearer-token auth. The local token is stored outside the repository.
+          Nucleus owns bearer-token auth. The local token is stored outside the repository.
         </CardDescription>
       </CardHeader>
       <CardContent class="space-y-3">
@@ -769,7 +769,7 @@
     <CardHeader>
       <CardTitle>Compatibility</CardTitle>
       <CardDescription>
-        Clients should rely on explicit daemon compatibility metadata instead of inferring support
+        Clients should rely on explicit Nucleus compatibility metadata instead of inferring support
         from transport or decode failures.
       </CardDescription>
     </CardHeader>
@@ -790,7 +790,7 @@
           <div class="mt-2 text-sm font-medium text-zinc-50">{CURRENT_CLIENT_SURFACE_VERSION}</div>
         </div>
         <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
-          <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Daemon Surface</div>
+          <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Server Surface</div>
           <div class="mt-2 text-sm font-medium text-zinc-50">
             {settings?.compatibility.surface_version ?? 'Unavailable'}
           </div>
@@ -828,15 +828,15 @@
     <CardHeader>
       <CardTitle>Update Behavior</CardTitle>
       <CardDescription>
-        Nucleus keeps update truth in the daemon and serves the embedded web client that matches
-        the running daemon release.
+        Nucleus keeps update truth locally and serves the embedded web client that matches
+        the running release.
       </CardDescription>
     </CardHeader>
     <CardContent class="space-y-3 text-sm leading-6 text-zinc-400">
       <div class="flex items-start gap-3 rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
         <Check class="mt-0.5 size-4 shrink-0 text-lime-300/80" />
         <p>
-          Background checks update daemon-owned state and only raise an in-app toast when the latest
+          Background checks update Nucleus-owned state and only raise an in-app toast when the latest
           successful check found a newer target.
         </p>
       </div>

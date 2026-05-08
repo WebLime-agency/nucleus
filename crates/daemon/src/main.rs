@@ -10,7 +10,7 @@ use std::{
     path::PathBuf,
     process::Command as StdCommand,
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
@@ -49,11 +49,11 @@ use nucleus_release::read_installed_release_metadata;
 use nucleus_storage::{
     AuditEventRecord, ProjectPatch, SessionPatch, SessionRecord, StateStore, WorkspaceProfilePatch,
 };
-use runtime::{PromptStreamEvent, RuntimeManager};
+use runtime::RuntimeManager;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::{
-    sync::{broadcast, mpsc},
+    sync::broadcast,
     time::{self, MissedTickBehavior},
 };
 use tower_http::{
@@ -69,7 +69,6 @@ const STREAM_PROCESS_LIMIT: usize = DEFAULT_PROCESS_LIMIT;
 const STREAM_INTERVAL: Duration = Duration::from_secs(2);
 const DEFAULT_AUDIT_LIMIT: usize = 20;
 const MAX_AUDIT_LIMIT: usize = 100;
-const STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(90);
 const MAX_PROMPT_INCLUDE_FILES: usize = 24;
 const MAX_PROMPT_INCLUDE_FILE_CHARS: usize = 6_000;
 const MAX_PROMPT_INCLUDE_TOTAL_CHARS: usize = 24_000;
@@ -233,7 +232,7 @@ fn app(state: AppState) -> Router {
 }
 
 async fn root() -> &'static str {
-    "Nucleus daemon"
+    "Nucleus"
 }
 
 async fn require_api_auth(
@@ -1013,644 +1012,17 @@ async fn prompt_session(
         ));
     }
 
-    if payload.images.is_empty() {
-        return Ok(Json(
-            agent::start_text_prompt_job(
-                state,
-                session_id,
-                payload,
-                current,
-                execution_prompt,
-                compiler_role,
-            )
-            .await?,
-        ));
-    }
-
-    state.store.update_session(
-        &session_id,
-        SessionPatch {
-            state: Some("running".to_string()),
-            last_error: Some(String::new()),
-            ..SessionPatch::default()
-        },
-    )?;
-    state.store.append_session_turn(
-        &session_id,
-        &Uuid::new_v4().to_string(),
-        "user",
-        prompt,
-        &payload.images,
-    )?;
-    let started = state.store.get_session(&session_id)?;
-    let _ = publish_session_event(&state, started).await;
-    let _ = publish_prompt_progress_event(
-        &state,
-        PromptProgressUpdate {
-            session_id: session_id.clone(),
-            status: "queued".to_string(),
-            label: "Queued".to_string(),
-            detail: if payload.images.is_empty() {
-                "Prompt accepted by the daemon.".to_string()
-            } else {
-                format!(
-                    "Prompt accepted with {} image attachment(s).",
-                    payload.images.len()
-                )
-            },
-            provider: current.session.provider.clone(),
-            model: current.session.model.clone(),
-            profile_id: current.session.profile_id.clone(),
-            profile_title: current.session.profile_title.clone(),
-            route_id: current.session.route_id.clone(),
-            route_title: current.session.route_title.clone(),
-            attempt: 0,
-            attempt_count: 0,
-            created_at: unix_timestamp(),
-        },
-    )
-    .await;
-    let _ = publish_overview_event(&state).await;
-
-    spawn_prompt_job(
-        state.clone(),
-        session_id.clone(),
-        payload,
-        current,
-        execution_prompt,
-        compiler_role,
-    );
-
-    Ok(Json(state.store.get_session(&session_id)?))
-}
-
-fn spawn_prompt_job(
-    state: AppState,
-    session_id: String,
-    payload: SessionPromptRequest,
-    current: SessionDetail,
-    execution_prompt: String,
-    compiler_role: String,
-) {
-    let prompt_excerpt = if payload.prompt.trim().is_empty() {
-        format!("[{} image attachment(s)]", payload.images.len())
-    } else {
-        payload.prompt.trim().to_string()
-    };
-
-    tokio::spawn(async move {
-        if let Err(error) = process_prompt_job(
-            state.clone(),
-            &session_id,
-            &payload,
-            &current,
-            &execution_prompt,
-            &compiler_role,
-        )
-        .await
-        {
-            warn!(session_id = %session_id, error = %error, "prompt job failed");
-            finalize_prompt_job_failure(
-                &state,
-                &session_id,
-                &current.session,
-                &prompt_excerpt,
-                &error,
-            )
-            .await;
-        }
-    });
-}
-
-async fn process_prompt_job(
-    state: AppState,
-    session_id: &str,
-    payload: &SessionPromptRequest,
-    current: &SessionDetail,
-    execution_prompt: &str,
-    compiler_role: &str,
-) -> Result<(), String> {
-    let prompt_assembly = assemble_prompt_input(&state, &current.session, execution_prompt)
-        .map_err(|error| error.message)?;
-    let _ = publish_prompt_progress_event(
-        &state,
-        PromptProgressUpdate {
-            session_id: session_id.to_string(),
-            status: "assembling".to_string(),
-            label: "Built prompt context".to_string(),
-            detail: prompt_assembly.detail.clone(),
-            provider: current.session.provider.clone(),
-            model: current.session.model.clone(),
-            profile_id: current.session.profile_id.clone(),
-            profile_title: current.session.profile_title.clone(),
-            route_id: current.session.route_id.clone(),
-            route_title: current.session.route_title.clone(),
-            attempt: 0,
-            attempt_count: 0,
-            created_at: unix_timestamp(),
-        },
-    )
-    .await;
-
-    let targets = resolve_prompt_targets(
-        &state,
-        &current.session,
-        !payload.images.is_empty(),
-        compiler_role,
-    )
-    .await
-    .map_err(|error| error.message)?;
-    let target_count = targets.len();
-    let _ = publish_prompt_progress_event(
-        &state,
-        PromptProgressUpdate {
-            session_id: session_id.to_string(),
-            status: "routing".to_string(),
-            label: if current.session.route_id.is_empty() {
-                "Prepared provider".to_string()
-            } else {
-                "Resolved route targets".to_string()
-            },
-            detail: if current.session.route_id.is_empty() {
-                format!(
-                    "Using {} / {} directly.",
-                    current.session.provider, current.session.model
-                )
-            } else {
-                format!(
-                    "{} target(s) available on route '{}'.",
-                    target_count, current.session.route_title
-                )
-            },
-            provider: current.session.provider.clone(),
-            model: current.session.model.clone(),
-            profile_id: current.session.profile_id.clone(),
-            profile_title: current.session.profile_title.clone(),
-            route_id: current.session.route_id.clone(),
-            route_title: current.session.route_title.clone(),
-            attempt: 0,
-            attempt_count: target_count,
-            created_at: unix_timestamp(),
-        },
-    )
-    .await;
-
-    let mut stream_state = PromptStreamState::default();
-    let mut last_error = None;
-
-    for (index, target) in targets.into_iter().enumerate() {
-        let attempt = index + 1;
-        let execution = build_prompt_execution_session(&current.session, &target);
-        let prompt_body = if target.provider == current.session.provider {
-            prompt_assembly.prompt.clone()
-        } else {
-            build_reroute_prompt(
-                &current.turns,
-                &prompt_assembly.prompt,
-                payload.images.len(),
-            )
-        };
-        let _ = publish_prompt_progress_event(
-            &state,
-            PromptProgressUpdate {
-                session_id: session_id.to_string(),
-                status: "calling".to_string(),
-                label: format!("Calling {}", target.provider),
-                detail: format!(
-                    "Attempt {} of {} on {} / {}.",
-                    attempt, target_count, target.provider, target.model
-                ),
-                provider: target.provider.clone(),
-                model: target.model.clone(),
-                profile_id: target.profile_id.clone(),
-                profile_title: target.profile_title.clone(),
-                route_id: target.route_id.clone(),
-                route_title: target.route_title.clone(),
-                attempt,
-                attempt_count: target_count,
-                created_at: unix_timestamp(),
-            },
-        )
-        .await;
-
-        match run_prompt_attempt(
-            &state,
-            session_id,
-            &execution,
-            &current.turns,
-            &prompt_body,
-            &payload.images,
-            compiler_role,
-            &target,
-            attempt,
-            target_count,
-            &mut stream_state,
-        )
-        .await
-        {
-            Ok(result) => {
-                let provider_session_id = if result.provider_session_id.is_empty() {
-                    stream_state.provider_session_id.clone()
-                } else {
-                    result.provider_session_id.clone()
-                };
-                state
-                    .store
-                    .update_session(
-                        session_id,
-                        SessionPatch {
-                            provider: Some(target.provider.clone()),
-                            state: Some("active".to_string()),
-                            route_id: Some(target.route_id.clone()),
-                            route_title: Some(target.route_title.clone()),
-                            provider_session_id: Some(provider_session_id),
-                            model: Some(target.model.clone()),
-                            provider_base_url: Some(target.provider_base_url.clone()),
-                            provider_api_key: Some(target.provider_api_key.clone()),
-                            last_error: Some(String::new()),
-                            ..SessionPatch::default()
-                        },
-                    )
-                    .map_err(|error| error.to_string())?;
-                if current.session.provider != target.provider {
-                    let _ = try_record_audit_event(
-                        &state,
-                        AuditEventRecord {
-                            kind: "session.rerouted".to_string(),
-                            target: format!("session:{session_id}"),
-                            status: "success".to_string(),
-                            summary: format!(
-                                "Rerouted session '{}' from {} to {}.",
-                                current.session.title, current.session.provider, target.provider
-                            ),
-                            detail: format!("route_id={} model={}", target.route_id, target.model),
-                        },
-                    )
-                    .await;
-                }
-
-                let detail = state
-                    .store
-                    .get_session(session_id)
-                    .map_err(|error| error.to_string())?;
-                let _ = publish_session_event(&state, detail.clone()).await;
-                let _ = publish_prompt_progress_event(
-                    &state,
-                    PromptProgressUpdate {
-                        session_id: session_id.to_string(),
-                        status: "completed".to_string(),
-                        label: "Response received".to_string(),
-                        detail: format!("{} returned a response.", target.provider),
-                        provider: target.provider.clone(),
-                        model: target.model.clone(),
-                        profile_id: target.profile_id.clone(),
-                        profile_title: target.profile_title.clone(),
-                        route_id: target.route_id.clone(),
-                        route_title: target.route_title.clone(),
-                        attempt,
-                        attempt_count: target_count,
-                        created_at: unix_timestamp(),
-                    },
-                )
-                .await;
-                let _ = try_record_audit_event(
-                    &state,
-                    AuditEventRecord {
-                        kind: "session.prompted".to_string(),
-                        target: format!("session:{session_id}"),
-                        status: "success".to_string(),
-                        summary: format!(
-                            "Prompted {} session '{}'.",
-                            detail.session.provider, detail.session.title
-                        ),
-                        detail: format!(
-                            "model={} prompt={} turns={}",
-                            detail.session.model,
-                            excerpt(&payload.prompt, 160),
-                            detail.session.turn_count
-                        ),
-                    },
-                )
-                .await;
-                let _ = publish_overview_event(&state).await;
-                return Ok(());
-            }
-            Err(error) => {
-                let _ = publish_prompt_progress_event(
-                    &state,
-                    PromptProgressUpdate {
-                        session_id: session_id.to_string(),
-                        status: if attempt < target_count {
-                            "retrying".to_string()
-                        } else {
-                            "failed".to_string()
-                        },
-                        label: if attempt < target_count {
-                            format!("Retrying after {}", target.provider)
-                        } else {
-                            format!("{} failed", target.provider)
-                        },
-                        detail: excerpt(&error, 200),
-                        provider: target.provider.clone(),
-                        model: target.model.clone(),
-                        profile_id: target.profile_id.clone(),
-                        profile_title: target.profile_title.clone(),
-                        route_id: target.route_id.clone(),
-                        route_title: target.route_title.clone(),
-                        attempt,
-                        attempt_count: target_count,
-                        created_at: unix_timestamp(),
-                    },
-                )
-                .await;
-                last_error = Some(error);
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| "all prompt targets failed".to_string()))
-}
-
-async fn finalize_prompt_job_failure(
-    state: &AppState,
-    session_id: &str,
-    session: &SessionSummary,
-    prompt_excerpt: &str,
-    error: &str,
-) {
-    let _ = state.store.update_session(
-        session_id,
-        SessionPatch {
-            state: Some("error".to_string()),
-            last_error: Some(error.to_string()),
-            ..SessionPatch::default()
-        },
-    );
-    let _ = publish_prompt_progress_event(
-        state,
-        PromptProgressUpdate {
-            session_id: session_id.to_string(),
-            status: "failed".to_string(),
-            label: "Prompt failed".to_string(),
-            detail: excerpt(error, 200),
-            provider: session.provider.clone(),
-            model: session.model.clone(),
-            profile_id: session.profile_id.clone(),
-            profile_title: session.profile_title.clone(),
-            route_id: session.route_id.clone(),
-            route_title: session.route_title.clone(),
-            attempt: 0,
-            attempt_count: 0,
-            created_at: unix_timestamp(),
-        },
-    )
-    .await;
-    let _ = try_record_audit_event(
-        state,
-        AuditEventRecord {
-            kind: "session.prompt.failed".to_string(),
-            target: format!("session:{session_id}"),
-            status: "error".to_string(),
-            summary: format!(
-                "Prompt failed for {} session '{}'.",
-                session.provider, session.title
-            ),
-            detail: format!(
-                "prompt={} error={}",
-                excerpt(prompt_excerpt, 160),
-                excerpt(error, 240)
-            ),
-        },
-    )
-    .await;
-
-    if let Ok(detail) = state.store.get_session(session_id) {
-        let _ = publish_session_event(state, detail).await;
-    }
-    let _ = publish_overview_event(state).await;
-}
-
-async fn run_prompt_attempt(
-    state: &AppState,
-    session_id: &str,
-    execution: &SessionSummary,
-    history: &[nucleus_protocol::SessionTurn],
-    prompt_body: &str,
-    images: &[nucleus_protocol::SessionTurnImage],
-    compiler_role: &str,
-    target: &PromptTarget,
-    attempt: usize,
-    attempt_count: usize,
-    stream_state: &mut PromptStreamState,
-) -> Result<runtime::ProviderTurnResult, String> {
-    stream_state.reset_for_attempt();
-
-    let (events, mut receiver) = mpsc::unbounded_channel();
-    let runtimes = state.runtimes.clone();
-    let execution = execution.clone();
-    let history = history.to_vec();
-    let prompt_body = prompt_body.to_string();
-    let images = images.to_vec();
-    let compiler_role = compiler_role.to_string();
-    let handle = tokio::spawn(async move {
-        runtimes
-            .execute_prompt_stream(
-                &execution,
-                &history,
-                &prompt_body,
-                &images,
-                &compiler_role,
-                events,
-            )
-            .await
-    });
-
-    while let Some(event) = receiver.recv().await {
-        apply_prompt_stream_event(
+    Ok(Json(
+        agent::start_prompt_job(
             state,
             session_id,
-            target,
-            attempt,
-            attempt_count,
-            stream_state,
-            event,
+            payload,
+            current,
+            execution_prompt,
+            compiler_role,
         )
-        .await
-        .map_err(|error| error.message)?;
-    }
-
-    let result = handle
-        .await
-        .map_err(|error| format!("prompt worker crashed: {error}"))?
-        .map_err(|error| error.to_string())?;
-
-    if !result.provider_session_id.is_empty() {
-        stream_state.provider_session_id = result.provider_session_id.clone();
-    }
-
-    if stream_state.assistant_turn_id.is_none()
-        || stream_state.last_persisted_content != result.content
-    {
-        stream_state.assistant_content = result.content.clone();
-        persist_streaming_assistant(state, session_id, stream_state, true)
-            .await
-            .map_err(|error| error.message)?;
-    }
-
-    Ok(result)
-}
-
-async fn apply_prompt_stream_event(
-    state: &AppState,
-    session_id: &str,
-    target: &PromptTarget,
-    attempt: usize,
-    attempt_count: usize,
-    stream_state: &mut PromptStreamState,
-    event: PromptStreamEvent,
-) -> Result<(), ApiError> {
-    match event {
-        PromptStreamEvent::ProviderSessionReady {
-            provider_session_id,
-        } => {
-            stream_state.provider_session_id = provider_session_id;
-        }
-        PromptStreamEvent::ReasoningSnapshot { text } => {
-            let detail = excerpt(&text, 220);
-            if detail != stream_state.last_reasoning_excerpt {
-                stream_state.last_reasoning_excerpt = detail.clone();
-                let _ = publish_prompt_progress_event(
-                    state,
-                    PromptProgressUpdate {
-                        session_id: session_id.to_string(),
-                        status: "thinking".to_string(),
-                        label: format!("{} is thinking", target.provider),
-                        detail,
-                        provider: target.provider.clone(),
-                        model: target.model.clone(),
-                        profile_id: target.profile_id.clone(),
-                        profile_title: target.profile_title.clone(),
-                        route_id: target.route_id.clone(),
-                        route_title: target.route_title.clone(),
-                        attempt,
-                        attempt_count,
-                        created_at: unix_timestamp(),
-                    },
-                )
-                .await;
-            }
-        }
-        PromptStreamEvent::AssistantChunk { text } => {
-            if !stream_state.streaming_announced {
-                stream_state.streaming_announced = true;
-                let _ = publish_prompt_progress_event(
-                    state,
-                    PromptProgressUpdate {
-                        session_id: session_id.to_string(),
-                        status: "streaming".to_string(),
-                        label: format!("Streaming from {}", target.provider),
-                        detail: format!(
-                            "Receiving output from {} / {}.",
-                            target.provider, target.model
-                        ),
-                        provider: target.provider.clone(),
-                        model: target.model.clone(),
-                        profile_id: target.profile_id.clone(),
-                        profile_title: target.profile_title.clone(),
-                        route_id: target.route_id.clone(),
-                        route_title: target.route_title.clone(),
-                        attempt,
-                        attempt_count,
-                        created_at: unix_timestamp(),
-                    },
-                )
-                .await;
-            }
-
-            stream_state.assistant_content.push_str(&text);
-            persist_streaming_assistant(state, session_id, stream_state, false).await?;
-        }
-        PromptStreamEvent::AssistantSnapshot { text } => {
-            if !stream_state.streaming_announced {
-                stream_state.streaming_announced = true;
-                let _ = publish_prompt_progress_event(
-                    state,
-                    PromptProgressUpdate {
-                        session_id: session_id.to_string(),
-                        status: "streaming".to_string(),
-                        label: format!("Streaming from {}", target.provider),
-                        detail: format!(
-                            "Receiving output from {} / {}.",
-                            target.provider, target.model
-                        ),
-                        provider: target.provider.clone(),
-                        model: target.model.clone(),
-                        profile_id: target.profile_id.clone(),
-                        profile_title: target.profile_title.clone(),
-                        route_id: target.route_id.clone(),
-                        route_title: target.route_title.clone(),
-                        attempt,
-                        attempt_count,
-                        created_at: unix_timestamp(),
-                    },
-                )
-                .await;
-            }
-
-            stream_state.assistant_content = text;
-            persist_streaming_assistant(state, session_id, stream_state, true).await?;
-        }
-    }
-
-    Ok(())
-}
-
-async fn persist_streaming_assistant(
-    state: &AppState,
-    session_id: &str,
-    stream_state: &mut PromptStreamState,
-    force: bool,
-) -> Result<(), ApiError> {
-    if stream_state.assistant_content.is_empty() {
-        return Ok(());
-    }
-
-    if !force {
-        if stream_state.assistant_content == stream_state.last_persisted_content {
-            return Ok(());
-        }
-
-        if let Some(last_flush_at) = stream_state.last_flush_at {
-            if last_flush_at.elapsed() < STREAM_FLUSH_INTERVAL
-                && !stream_state.assistant_content.ends_with('\n')
-            {
-                return Ok(());
-            }
-        }
-    }
-
-    if let Some(turn_id) = stream_state.assistant_turn_id.as_deref() {
-        state.store.update_session_turn_content(
-            session_id,
-            turn_id,
-            &stream_state.assistant_content,
-        )?;
-    } else {
-        let turn = state.store.append_session_turn(
-            session_id,
-            &Uuid::new_v4().to_string(),
-            "assistant",
-            &stream_state.assistant_content,
-            &[],
-        )?;
-        stream_state.assistant_turn_id = Some(turn.id);
-    }
-
-    stream_state.last_persisted_content = stream_state.assistant_content.clone();
-    stream_state.last_flush_at = Some(Instant::now());
-    let detail = state.store.get_session(session_id)?;
-    let _ = publish_session_event(state, detail).await;
-    Ok(())
+        .await?,
+    ))
 }
 
 async fn host_status(State(state): State<AppState>) -> Json<nucleus_protocol::HostStatus> {
@@ -2313,6 +1685,14 @@ struct SessionTargetSelection {
 }
 
 #[derive(Debug, Clone)]
+struct PromptTarget {
+    provider: String,
+    model: String,
+    provider_base_url: String,
+    provider_api_key: String,
+}
+
+#[derive(Debug, Clone)]
 struct SessionProjectSelection {
     scope: String,
     primary_project_id: String,
@@ -2330,18 +1710,6 @@ struct WorkspaceTargetSelection {
 }
 
 #[derive(Debug, Clone)]
-struct PromptTarget {
-    provider: String,
-    model: String,
-    provider_base_url: String,
-    provider_api_key: String,
-    profile_id: String,
-    profile_title: String,
-    route_id: String,
-    route_title: String,
-}
-
-#[derive(Debug, Clone)]
 struct PromptIncludeSource {
     scope: &'static str,
     path: PathBuf,
@@ -2351,29 +1719,6 @@ struct PromptIncludeSource {
 #[derive(Debug, Clone)]
 struct PromptAssembly {
     prompt: String,
-    detail: String,
-}
-
-#[derive(Debug, Default)]
-struct PromptStreamState {
-    assistant_turn_id: Option<String>,
-    assistant_content: String,
-    last_persisted_content: String,
-    last_flush_at: Option<Instant>,
-    provider_session_id: String,
-    last_reasoning_excerpt: String,
-    streaming_announced: bool,
-}
-
-impl PromptStreamState {
-    fn reset_for_attempt(&mut self) {
-        self.assistant_content.clear();
-        self.last_persisted_content.clear();
-        self.last_flush_at = None;
-        self.provider_session_id.clear();
-        self.last_reasoning_excerpt.clear();
-        self.streaming_announced = false;
-    }
 }
 
 fn resolve_workspace_profile<'a>(
@@ -2633,7 +1978,7 @@ async fn resolve_session_target(
 
     if !provider.supports_sessions() {
         return Err(ApiError::bad_request(format!(
-            "provider '{}' cannot create daemon-managed sessions yet",
+            "provider '{}' cannot create Nucleus-managed sessions yet",
             provider.as_str()
         )));
     }
@@ -2681,10 +2026,6 @@ async fn resolve_profile_targets(
             model: target.model.clone(),
             provider_base_url: target.base_url.trim().to_string(),
             provider_api_key: target.api_key.trim().to_string(),
-            profile_id: String::new(),
-            profile_title: String::new(),
-            route_id: route.id.clone(),
-            route_title: route.title.clone(),
         };
 
         match runtime {
@@ -2700,117 +2041,6 @@ async fn resolve_profile_targets(
     Ok(ready)
 }
 
-async fn resolve_prompt_targets(
-    state: &AppState,
-    session: &SessionSummary,
-    requires_image_support: bool,
-    compiler_role: &str,
-) -> Result<Vec<PromptTarget>, ApiError> {
-    let compiler_role = normalize_compiler_role(compiler_role)?;
-    if compiler_role == "utility" {
-        let selection = resolve_utility_target_selection(state, session).await?;
-        if requires_image_support && !provider_supports_images(&selection.provider) {
-            return Err(ApiError::bad_request(format!(
-                "utility provider '{}' does not support image attachments in Nucleus yet",
-                selection.provider
-            )));
-        }
-        return Ok(vec![prompt_target_from_selection(selection)]);
-    }
-
-    if !session.route_id.is_empty() {
-        let route = load_router_profiles(state, false)
-            .await?
-            .into_iter()
-            .find(|profile| profile.id == session.route_id)
-            .ok_or_else(|| {
-                ApiError::bad_request(format!("unknown router profile '{}'", session.route_id))
-            })?;
-        let mut targets = resolve_profile_targets(state, &route, false).await?;
-
-        targets.sort_by_key(|target| {
-            let matches_active_target =
-                target.provider == session.provider && target.model == session.model;
-            let supports_images = provider_supports_images(&target.provider);
-
-            if requires_image_support {
-                (!supports_images, !matches_active_target)
-            } else {
-                (!matches_active_target, false)
-            }
-        });
-
-        if requires_image_support {
-            targets.retain(|target| provider_supports_images(&target.provider));
-        }
-
-        if requires_image_support && targets.is_empty() {
-            return Err(ApiError::bad_request(format!(
-                "router profile '{}' has no image-capable targets ready to accept this prompt",
-                route.title
-            )));
-        }
-
-        return Ok(targets);
-    }
-
-    if requires_image_support && !provider_supports_images(&session.provider) {
-        return Err(ApiError::bad_request(format!(
-            "provider '{}' does not support image attachments in Nucleus yet",
-            session.provider
-        )));
-    }
-
-    ensure_prompting_runtime(state, &session.provider, false).await?;
-
-    Ok(vec![PromptTarget {
-        provider: session.provider.clone(),
-        model: session.model.clone(),
-        provider_base_url: session.provider_base_url.clone(),
-        provider_api_key: session.provider_api_key.clone(),
-        profile_id: session.profile_id.clone(),
-        profile_title: session.profile_title.clone(),
-        route_id: String::new(),
-        route_title: String::new(),
-    }])
-}
-
-async fn resolve_utility_target_selection(
-    state: &AppState,
-    session: &SessionSummary,
-) -> Result<SessionTargetSelection, ApiError> {
-    if !session.profile_id.trim().is_empty() {
-        let workspace = state.store.workspace()?;
-        let profile = resolve_workspace_profile(&workspace, &session.profile_id)?;
-        return resolve_workspace_profile_target(state, profile, "utility").await;
-    }
-
-    let workspace = state.store.workspace()?;
-    let route_profiles = load_router_profiles(state, false).await?;
-    let utility_target = parse_target_selector(&workspace.utility_target);
-    resolve_session_target(
-        state,
-        &route_profiles,
-        utility_target.route_id.as_deref(),
-        utility_target.provider.as_deref(),
-        None,
-    )
-    .await
-}
-
-fn prompt_target_from_selection(selection: SessionTargetSelection) -> PromptTarget {
-    PromptTarget {
-        provider: selection.provider,
-        model: selection.model,
-        provider_base_url: selection.provider_base_url,
-        provider_api_key: selection.provider_api_key,
-        profile_id: selection.profile_id,
-        profile_title: selection.profile_title,
-        route_id: selection.route_id,
-        route_title: selection.route_title,
-    }
-}
-
 fn assemble_prompt_input(
     state: &AppState,
     session: &SessionSummary,
@@ -2821,32 +2051,11 @@ fn assemble_prompt_input(
     if sources.is_empty() {
         return Ok(PromptAssembly {
             prompt: prompt.to_string(),
-            detail: "No include context found. Using the raw prompt.".to_string(),
         });
-    }
-
-    let mut scopes = BTreeSet::new();
-    let mut listed_paths = Vec::new();
-    for source in &sources {
-        scopes.insert(source.scope);
-        if listed_paths.len() < 4 {
-            listed_paths.push(compact_prompt_source_path(&source.path));
-        }
     }
 
     Ok(PromptAssembly {
         prompt: render_prompt_with_sources(prompt, &sources),
-        detail: format!(
-            "Loaded {} include file(s) across {} scope(s): {}{}",
-            sources.len(),
-            scopes.len(),
-            listed_paths.join(", "),
-            if sources.len() > listed_paths.len() {
-                format!(" +{} more", sources.len() - listed_paths.len())
-            } else {
-                String::new()
-            }
-        ),
     })
 }
 
@@ -3234,13 +2443,6 @@ fn compact_prompt_source_path(path: &PathBuf) -> String {
     path_string
 }
 
-fn provider_supports_images(provider: &str) -> bool {
-    matches!(
-        AdapterKind::parse(provider),
-        Some(AdapterKind::Codex | AdapterKind::OpenAiCompatible)
-    )
-}
-
 fn effective_prompt_text(prompt: &str, image_count: usize) -> String {
     if !prompt.trim().is_empty() {
         return prompt.trim().to_string();
@@ -3257,50 +2459,6 @@ fn effective_prompt_text(prompt: &str, image_count: usize) -> String {
             "Review the {image_count} attached images and respond with the most useful analysis."
         )
     }
-}
-
-fn build_prompt_execution_session(
-    session: &SessionSummary,
-    target: &PromptTarget,
-) -> SessionSummary {
-    let provider_session_id =
-        if target.provider == session.provider && target.model == session.model {
-            session.provider_session_id.clone()
-        } else {
-            String::new()
-        };
-
-    SessionSummary {
-        provider: target.provider.clone(),
-        model: target.model.clone(),
-        provider_base_url: target.provider_base_url.clone(),
-        provider_api_key: target.provider_api_key.clone(),
-        provider_session_id,
-        ..session.clone()
-    }
-}
-
-fn build_reroute_prompt(
-    turns: &[nucleus_protocol::SessionTurn],
-    prompt: &str,
-    image_count: usize,
-) -> String {
-    let mut transcript =
-        String::from("Continue this session using the following transcript as context.\n\n");
-
-    for turn in turns.iter().rev().take(12).rev() {
-        transcript.push_str(&format!("{}:\n{}\n\n", turn.role, turn.content));
-    }
-
-    if image_count > 0 {
-        transcript.push_str(&format!(
-            "The next user turn also includes {image_count} attached image(s). Inspect them directly.\n\n"
-        ));
-    }
-
-    transcript.push_str("Next user turn:\n");
-    transcript.push_str(prompt);
-    transcript
 }
 
 fn normalize_session_state(value: &str) -> Result<String, ApiError> {
@@ -3336,9 +2494,8 @@ fn action_catalog() -> Vec<ActionSummary> {
             id: "system.process.terminate".to_string(),
             title: "Terminate process".to_string(),
             category: "system".to_string(),
-            summary:
-                "Send SIGTERM to a user-owned process by PID through the daemon safety checks."
-                    .to_string(),
+            summary: "Send SIGTERM to a user-owned process by PID through Nucleus safety checks."
+                .to_string(),
             risk: "caution".to_string(),
             requires_confirmation: true,
             parameters: vec![ActionParameter {
@@ -4217,14 +3374,16 @@ mod tests {
         );
         assert_eq!(result.0.session.provider_api_key, "nuctk_test");
 
-        let utility_targets = resolve_prompt_targets(&state, &result.0.session, false, "utility")
+        let workspace = state.store.workspace().expect("workspace should load");
+        let profile =
+            resolve_workspace_profile(&workspace, "gateway").expect("gateway profile should load");
+        let utility_target = resolve_workspace_profile_target(&state, profile, "utility")
             .await
             .expect("utility role should resolve from the profile utility config");
-        assert_eq!(utility_targets.len(), 1);
-        assert_eq!(utility_targets[0].provider, "openai_compatible");
-        assert_eq!(utility_targets[0].model, "gpt-4.1-mini");
+        assert_eq!(utility_target.provider, "openai_compatible");
+        assert_eq!(utility_target.model, "gpt-4.1-mini");
         assert_eq!(
-            utility_targets[0].provider_base_url,
+            utility_target.provider_base_url,
             "http://127.0.0.1:20129/v1"
         );
 
@@ -4277,14 +3436,20 @@ mod tests {
             updated_at: 0,
         };
 
-        let result = resolve_prompt_targets(&state, &session, false, "main").await;
+        let result = resolve_session_target(
+            &state,
+            &[],
+            None,
+            Some(&session.provider),
+            Some(&session.model),
+        )
+        .await;
 
-        let targets =
+        let target =
             result.expect("OpenAI-compatible runtime should satisfy direct prompt routing");
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].provider, "openai_compatible");
-        assert_eq!(targets[0].model, "direct-model");
-        assert_eq!(targets[0].provider_base_url, "http://127.0.0.1:20128/v1");
+        assert_eq!(target.provider, "openai_compatible");
+        assert_eq!(target.model, "direct-model");
+        assert_eq!(target.provider_base_url, "http://127.0.0.1:20128/v1");
 
         let _ = fs::remove_dir_all(&state_dir);
     }
@@ -4335,12 +3500,16 @@ mod tests {
             updated_at: 0,
         };
 
-        let result = resolve_prompt_targets(&state, &session, false, "main").await;
+        let route_profiles = load_router_profiles(&state, false)
+            .await
+            .expect("router profiles should load");
+        let result =
+            resolve_session_target(&state, &route_profiles, Some(&session.route_id), None, None)
+                .await;
 
-        let targets = result.expect("OpenAI-compatible route should satisfy prompt routing");
-        assert!(!targets.is_empty());
-        assert_eq!(targets[0].provider, "openai_compatible");
-        assert_eq!(targets[0].provider_base_url, "http://127.0.0.1:20128/v1");
+        let target = result.expect("OpenAI-compatible route should satisfy prompt routing");
+        assert_eq!(target.provider, "openai_compatible");
+        assert_eq!(target.provider_base_url, "http://127.0.0.1:20128/v1");
 
         let _ = fs::remove_dir_all(&state_dir);
     }

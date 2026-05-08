@@ -1,6 +1,6 @@
 # Product Direction
 
-Near-term Nucleus work focuses on making the daemon a stable daily driver for:
+Near-term Nucleus work focuses on making the product a stable daily driver for:
 
 - sessions
 - routing profiles

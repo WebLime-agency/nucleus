@@ -405,7 +405,7 @@ fn ensure_safe_kill_target(pid: u32, current_pid: u32) -> Result<(), ApiError> {
 
     if pid == current_pid {
         return Err(ApiError::bad_request(
-            "refusing to terminate the active Nucleus daemon process".to_string(),
+            "refusing to terminate the active Nucleus process".to_string(),
         ));
     }
 
