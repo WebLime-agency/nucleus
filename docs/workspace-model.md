@@ -15,6 +15,8 @@ It owns:
 
 Workspace settings belong to Nucleus, not to a specific client.
 
+The workspace also owns the default Utility Worker run budget: maximum steps, maximum actions, and wall-clock limit for a turn. Sessions inherit that default unless the user selects a session-level run budget preset.
+
 ## Project
 
 Projects are directories discovered under the workspace root.
@@ -55,6 +57,7 @@ The workspace owns:
 - a default main model target
 - a default utility model target
 - named profiles that package model and provider choices for common work modes
+- default Utility Worker run-budget limits
 
 Clients should present those choices cleanly, but Nucleus remains the authority.
 
