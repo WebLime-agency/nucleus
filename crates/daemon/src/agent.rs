@@ -32,9 +32,10 @@ use uuid::Uuid;
 
 use super::{
     ApiError, AppState, assemble_prompt_input, ensure_prompting_runtime, excerpt,
-    publish_overview_event, publish_prompt_progress_event, publish_session_event,
-    resolve_session_projects, resolve_workspace_profile, resolve_workspace_profile_target,
-    try_record_audit_event, unix_timestamp,
+    load_router_profiles, publish_overview_event, publish_prompt_progress_event,
+    publish_session_event, resolve_profile_targets, resolve_session_projects,
+    resolve_workspace_profile, resolve_workspace_profile_target, try_record_audit_event,
+    unix_timestamp,
 };
 use crate::runtime::{PromptStreamEvent, ProviderTurnResult};
 
@@ -5338,6 +5339,49 @@ async fn resolve_hidden_worker_target(
     needs_vision_tools: bool,
 ) -> Result<HiddenWorkerTarget, ApiError> {
     if compiler_role == "main" {
+        if !session.route_id.trim().is_empty() {
+            let route_profiles = load_router_profiles(state, false).await?;
+            let route = route_profiles
+                .iter()
+                .find(|profile| profile.id == session.route_id)
+                .ok_or_else(|| {
+                    ApiError::bad_request(format!("unknown router profile '{}'", session.route_id))
+                })?;
+
+            if !route.enabled {
+                return Err(ApiError::bad_request(format!(
+                    "router profile '{}' is disabled",
+                    route.title
+                )));
+            }
+
+            let targets = resolve_profile_targets(state, route, false)
+                .await?
+                .into_iter()
+                .map(|target| HiddenWorkerTargetCandidate {
+                    target: HiddenWorkerTarget {
+                        provider: target.provider,
+                        model: target.model,
+                        provider_base_url: target.provider_base_url,
+                        provider_api_key: target.provider_api_key,
+                    },
+                    runtime_ready: target.runtime_ready,
+                })
+                .collect::<Vec<_>>();
+            let mut target =
+                select_hidden_worker_target(targets, needs_vision_tools).ok_or_else(|| {
+                    ApiError::bad_request(format!(
+                        "router profile '{}' has no usable targets",
+                        route.title
+                    ))
+                })?;
+            if target.provider == session.provider && !session.model.trim().is_empty() {
+                target.model = session.model.clone();
+            }
+            ensure_hidden_worker_target_ready(state, &target, needs_vision_tools).await?;
+            return Ok(target);
+        }
+
         let target = HiddenWorkerTarget {
             provider: session.provider.clone(),
             model: session.model.clone(),
@@ -5370,6 +5414,31 @@ async fn resolve_hidden_worker_target(
     };
     ensure_hidden_worker_target_ready(state, &target, needs_vision_tools).await?;
     Ok(target)
+}
+
+#[derive(Clone)]
+struct HiddenWorkerTargetCandidate {
+    target: HiddenWorkerTarget,
+    runtime_ready: bool,
+}
+
+fn select_hidden_worker_target(
+    targets: Vec<HiddenWorkerTargetCandidate>,
+    needs_vision_tools: bool,
+) -> Option<HiddenWorkerTarget> {
+    if needs_vision_tools {
+        let ready_vision_target = targets
+            .iter()
+            .filter(|candidate| candidate.runtime_ready)
+            .map(|candidate| &candidate.target)
+            .find(|target| target_supports_vision_with_tools(target))
+            .cloned();
+        if let Some(target) = ready_vision_target {
+            return Some(target);
+        }
+    }
+
+    targets.into_iter().next().map(|candidate| candidate.target)
 }
 
 async fn ensure_hidden_worker_target_ready(
@@ -6593,6 +6662,168 @@ mod tests {
         assert!(!should_attach_initial_worker_images(&checkpoint));
         let history = checkpoint_history(&checkpoint.conversation, "job-image");
         assert_eq!(history[1].images, vec![image]);
+    }
+
+    #[tokio::test]
+    async fn main_worker_prompt_resolves_current_route_target() {
+        let state_dir = test_state_dir("main-worker-route-target");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let session = SessionSummary {
+            id: "session-route-target".to_string(),
+            title: "Route target".to_string(),
+            profile_id: String::new(),
+            profile_title: String::new(),
+            route_id: "balanced".to_string(),
+            route_title: "Balanced".to_string(),
+            scope: "ad_hoc".to_string(),
+            project_id: String::new(),
+            project_title: String::new(),
+            project_path: String::new(),
+            provider: "claude".to_string(),
+            model: "stale-session-model".to_string(),
+            provider_base_url: String::new(),
+            provider_api_key: String::new(),
+            working_dir: workspace_root.display().to_string(),
+            working_dir_kind: "workspace_scratch".to_string(),
+            project_count: 0,
+            projects: Vec::new(),
+            state: "active".to_string(),
+            provider_session_id: String::new(),
+            last_error: String::new(),
+            last_message_excerpt: String::new(),
+            turn_count: 0,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let target = resolve_hidden_worker_target(&state, &session, "main", false)
+            .await
+            .expect("main worker should resolve through the session route");
+
+        assert_eq!(target.provider, "openai_compatible");
+        assert_eq!(target.model, "gpt-5.4-mini");
+        assert_eq!(target.provider_base_url, "http://127.0.0.1:20128/v1");
+        assert_ne!(target.model, session.model);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn main_worker_prompt_preserves_route_session_model_override() {
+        let state_dir = test_state_dir("main-worker-route-model-override");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let session = SessionSummary {
+            id: "session-route-model-override".to_string(),
+            title: "Route model override".to_string(),
+            profile_id: String::new(),
+            profile_title: String::new(),
+            route_id: "balanced".to_string(),
+            route_title: "Balanced".to_string(),
+            scope: "ad_hoc".to_string(),
+            project_id: String::new(),
+            project_title: String::new(),
+            project_path: String::new(),
+            provider: "openai_compatible".to_string(),
+            model: "custom-route-model".to_string(),
+            provider_base_url: "http://127.0.0.1:20128/v1".to_string(),
+            provider_api_key: String::new(),
+            working_dir: workspace_root.display().to_string(),
+            working_dir_kind: "workspace_scratch".to_string(),
+            project_count: 0,
+            projects: Vec::new(),
+            state: "active".to_string(),
+            provider_session_id: String::new(),
+            last_error: String::new(),
+            last_message_excerpt: String::new(),
+            turn_count: 0,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let target = resolve_hidden_worker_target(&state, &session, "main", false)
+            .await
+            .expect("main worker should resolve through the session route");
+
+        assert_eq!(target.provider, "openai_compatible");
+        assert_eq!(target.model, "custom-route-model");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn image_main_worker_prefers_vision_capable_route_target() {
+        let targets = vec![
+            HiddenWorkerTargetCandidate {
+                target: HiddenWorkerTarget {
+                    provider: "claude".to_string(),
+                    model: "sonnet".to_string(),
+                    provider_base_url: String::new(),
+                    provider_api_key: String::new(),
+                },
+                runtime_ready: true,
+            },
+            HiddenWorkerTargetCandidate {
+                target: HiddenWorkerTarget {
+                    provider: "openai_compatible".to_string(),
+                    model: "gpt-5.4-mini".to_string(),
+                    provider_base_url: "http://127.0.0.1:20128/v1".to_string(),
+                    provider_api_key: "nuctk_test".to_string(),
+                },
+                runtime_ready: true,
+            },
+        ];
+
+        let text_target = select_hidden_worker_target(targets.clone(), false)
+            .expect("text prompt should select the first route target");
+        assert_eq!(text_target.provider, "claude");
+
+        let image_target = select_hidden_worker_target(targets, true)
+            .expect("image prompt should select a route target");
+        assert_eq!(image_target.provider, "openai_compatible");
+        assert_eq!(image_target.model, "gpt-5.4-mini");
+    }
+
+    #[test]
+    fn image_main_worker_does_not_prefer_pending_vision_target() {
+        let targets = vec![
+            HiddenWorkerTargetCandidate {
+                target: HiddenWorkerTarget {
+                    provider: "claude".to_string(),
+                    model: "sonnet".to_string(),
+                    provider_base_url: String::new(),
+                    provider_api_key: String::new(),
+                },
+                runtime_ready: true,
+            },
+            HiddenWorkerTargetCandidate {
+                target: HiddenWorkerTarget {
+                    provider: "openai_compatible".to_string(),
+                    model: "gpt-5.4-mini".to_string(),
+                    provider_base_url: "http://127.0.0.1:20128/v1".to_string(),
+                    provider_api_key: "nuctk_test".to_string(),
+                },
+                runtime_ready: false,
+            },
+        ];
+
+        let image_target = select_hidden_worker_target(targets, true)
+            .expect("image prompt should fall back to the ready route target");
+        assert_eq!(image_target.provider, "claude");
+        assert_eq!(image_target.model, "sonnet");
     }
 
     #[tokio::test]
