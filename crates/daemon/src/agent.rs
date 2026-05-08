@@ -5358,11 +5358,14 @@ async fn resolve_hidden_worker_target(
             let targets = resolve_profile_targets(state, route, false)
                 .await?
                 .into_iter()
-                .map(|target| HiddenWorkerTarget {
-                    provider: target.provider,
-                    model: target.model,
-                    provider_base_url: target.provider_base_url,
-                    provider_api_key: target.provider_api_key,
+                .map(|target| HiddenWorkerTargetCandidate {
+                    target: HiddenWorkerTarget {
+                        provider: target.provider,
+                        model: target.model,
+                        provider_base_url: target.provider_base_url,
+                        provider_api_key: target.provider_api_key,
+                    },
+                    runtime_ready: target.runtime_ready,
                 })
                 .collect::<Vec<_>>();
             let target =
@@ -5410,13 +5413,21 @@ async fn resolve_hidden_worker_target(
     Ok(target)
 }
 
+#[derive(Clone)]
+struct HiddenWorkerTargetCandidate {
+    target: HiddenWorkerTarget,
+    runtime_ready: bool,
+}
+
 fn select_hidden_worker_target(
-    targets: Vec<HiddenWorkerTarget>,
+    targets: Vec<HiddenWorkerTargetCandidate>,
     needs_vision_tools: bool,
 ) -> Option<HiddenWorkerTarget> {
     if needs_vision_tools {
         if let Some(target) = targets
             .iter()
+            .filter(|candidate| candidate.runtime_ready)
+            .map(|candidate| &candidate.target)
             .find(|target| target_supports_vision_with_tools(target))
             .cloned()
         {
@@ -5424,7 +5435,7 @@ fn select_hidden_worker_target(
         }
     }
 
-    targets.into_iter().next()
+    targets.into_iter().next().map(|candidate| candidate.target)
 }
 
 async fn ensure_hidden_worker_target_ready(
@@ -6704,17 +6715,23 @@ mod tests {
     #[test]
     fn image_main_worker_prefers_vision_capable_route_target() {
         let targets = vec![
-            HiddenWorkerTarget {
-                provider: "claude".to_string(),
-                model: "sonnet".to_string(),
-                provider_base_url: String::new(),
-                provider_api_key: String::new(),
+            HiddenWorkerTargetCandidate {
+                target: HiddenWorkerTarget {
+                    provider: "claude".to_string(),
+                    model: "sonnet".to_string(),
+                    provider_base_url: String::new(),
+                    provider_api_key: String::new(),
+                },
+                runtime_ready: true,
             },
-            HiddenWorkerTarget {
-                provider: "openai_compatible".to_string(),
-                model: "gpt-5.4-mini".to_string(),
-                provider_base_url: "http://127.0.0.1:20128/v1".to_string(),
-                provider_api_key: "nuctk_test".to_string(),
+            HiddenWorkerTargetCandidate {
+                target: HiddenWorkerTarget {
+                    provider: "openai_compatible".to_string(),
+                    model: "gpt-5.4-mini".to_string(),
+                    provider_base_url: "http://127.0.0.1:20128/v1".to_string(),
+                    provider_api_key: "nuctk_test".to_string(),
+                },
+                runtime_ready: true,
             },
         ];
 
@@ -6726,6 +6743,35 @@ mod tests {
             .expect("image prompt should select a route target");
         assert_eq!(image_target.provider, "openai_compatible");
         assert_eq!(image_target.model, "gpt-5.4-mini");
+    }
+
+    #[test]
+    fn image_main_worker_does_not_prefer_pending_vision_target() {
+        let targets = vec![
+            HiddenWorkerTargetCandidate {
+                target: HiddenWorkerTarget {
+                    provider: "claude".to_string(),
+                    model: "sonnet".to_string(),
+                    provider_base_url: String::new(),
+                    provider_api_key: String::new(),
+                },
+                runtime_ready: true,
+            },
+            HiddenWorkerTargetCandidate {
+                target: HiddenWorkerTarget {
+                    provider: "openai_compatible".to_string(),
+                    model: "gpt-5.4-mini".to_string(),
+                    provider_base_url: "http://127.0.0.1:20128/v1".to_string(),
+                    provider_api_key: "nuctk_test".to_string(),
+                },
+                runtime_ready: false,
+            },
+        ];
+
+        let image_target = select_hidden_worker_target(targets, true)
+            .expect("image prompt should fall back to the ready route target");
+        assert_eq!(image_target.provider, "claude");
+        assert_eq!(image_target.model, "sonnet");
     }
 
     #[tokio::test]
