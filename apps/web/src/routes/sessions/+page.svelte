@@ -113,6 +113,7 @@
   let transcriptAnchor = $state('');
 
   let transcriptElement = $state<HTMLDivElement | null>(null);
+  let composerTextareaElement = $state<HTMLTextAreaElement | null>(null);
   let fileInputElement = $state<HTMLInputElement | null>(null);
 
   let sessions = $derived(overview?.sessions ?? []);
@@ -227,7 +228,7 @@
     if (activePromptProgress) {
       return {
         title: activePromptProgress.label || 'Working on your prompt',
-        detail: activePromptProgress.detail || 'The daemon is preparing the next turn.',
+        detail: activePromptProgress.detail || 'Nucleus is preparing the next turn.',
         state: activePromptProgress.status
       };
     }
@@ -236,7 +237,7 @@
       return {
         title: formatApprovalSummary(composerActivityPendingApproval),
         detail:
-          composerActivityPendingApproval.detail || 'The daemon is waiting for an approval response.',
+          composerActivityPendingApproval.detail || 'Nucleus is waiting for an approval response.',
         state: composerActivityPendingApproval.state
       };
     }
@@ -290,7 +291,7 @@
     if (selectedSession?.state === 'running' || selectedSession?.state === 'paused') {
       return {
         title: 'Working on your prompt',
-        detail: 'The daemon is preparing the next turn.',
+        detail: 'Nucleus is preparing the next turn.',
         state: selectedSession.state
       };
     }
@@ -695,7 +696,7 @@
       {
         session_id: session.id,
         status: 'queued',
-        label: 'Sending to daemon',
+        label: 'Sending to Nucleus',
         detail: images.length
           ? `Passing prompt with ${images.length} image attachment(s).`
           : 'Passing prompt from the composer.',
@@ -794,6 +795,18 @@
 
   function triggerImagePicker() {
     fileInputElement?.click();
+  }
+
+  function resizeComposerTextarea() {
+    if (!composerTextareaElement) {
+      return;
+    }
+
+    composerTextareaElement.style.height = 'auto';
+    const nextHeight = Math.min(composerTextareaElement.scrollHeight, 168);
+    composerTextareaElement.style.height = `${nextHeight}px`;
+    composerTextareaElement.style.overflowY =
+      composerTextareaElement.scrollHeight > nextHeight ? 'auto' : 'hidden';
   }
 
   async function handleFileInputChange(event: Event) {
@@ -920,6 +933,11 @@
     }
 
     void loadActivityJob(jobId);
+  });
+
+  $effect(() => {
+    promptText;
+    void tick().then(resizeComposerTextarea);
   });
 
   async function loadSelectedSession(sessionId: string, silent = false) {
@@ -1370,7 +1388,7 @@
       await loadSessionJobs(selectedSessionId, true);
       error = null;
     } catch (cause) {
-      error = cause instanceof Error ? cause.message : 'Failed to approve the pending tool mutation.';
+      error = cause instanceof Error ? cause.message : 'Failed to approve the pending action.';
     } finally {
       approvalActioningId = null;
     }
@@ -1389,7 +1407,7 @@
       await loadSessionJobs(selectedSessionId, true);
       error = null;
     } catch (cause) {
-      error = cause instanceof Error ? cause.message : 'Failed to deny the pending tool mutation.';
+      error = cause instanceof Error ? cause.message : 'Failed to deny the pending action.';
     } finally {
       approvalActioningId = null;
     }
@@ -1540,7 +1558,7 @@
           <div class="inline-flex h-12 w-12 items-center justify-center rounded-full border border-zinc-800 bg-zinc-900/80">
             <RotateCcw class="size-5 animate-spin text-zinc-400" />
           </div>
-          <div class="mt-4 text-lg font-medium text-zinc-100">Connecting to the daemon</div>
+          <div class="mt-4 text-lg font-medium text-zinc-100">Connecting to Nucleus</div>
           <div class="mt-2 text-sm text-zinc-500">
             Nucleus is loading sessions, workspace state, and route readiness.
           </div>
@@ -1706,347 +1724,348 @@
             {/if}
           </div>
 
-          <div class="shrink-0 border-t border-zinc-900 bg-zinc-950/92 px-4 py-3 sm:px-6 sm:py-4">
-            {#if promptImages.length > 0}
-              <div class="mb-3 flex gap-3 overflow-x-auto pb-1">
-                {#each promptImages as image}
-                  <div class="relative w-28 shrink-0 overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900/85">
-                    <img
-                      src={image.data_url}
-                      alt={image.display_name}
-                      class="aspect-square w-full object-cover"
-                    />
-                    <button
-                      type="button"
-                      class="absolute right-2 top-2 inline-flex h-6 w-6 items-center justify-center rounded-full bg-black/75 text-zinc-100"
-                      aria-label={`Remove ${image.display_name}`}
-                      onclick={() => removeImage(image.id)}
-                    >
-                      <X class="size-3.5" />
-                    </button>
-                    <div class="truncate border-t border-zinc-800 px-2 py-2 text-[11px] text-zinc-400">
-                      {image.display_name}
+          <div class="shrink-0 border-t border-zinc-900 bg-zinc-950/92 px-3 py-3 sm:px-6">
+            {#if composerActivityVisible && composerActivitySummary}
+              <section
+                aria-label="Nucleus activity"
+                class={cn(
+                  'mb-2 overflow-hidden rounded-xl border border-zinc-800 bg-zinc-950/95 shadow-2xl shadow-black/25 transition-[max-height]',
+                  composerActivityExpanded ? 'max-h-[min(30rem,46vh)]' : 'max-h-20'
+                )}
+              >
+                <button
+                  type="button"
+                  class="flex w-full items-center gap-3 px-3 py-2.5 text-left"
+                  aria-expanded={composerActivityExpanded}
+                  onclick={() => {
+                    composerActivityExpanded = !composerActivityExpanded;
+                  }}
+                >
+                  <div class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-zinc-800 bg-zinc-900 text-zinc-300">
+                    <Workflow class="size-4" />
+                  </div>
+
+                  <div class="min-w-0 flex-1">
+                    <div class="flex min-w-0 items-center gap-2">
+                      <div class="truncate text-sm font-medium text-zinc-100">
+                        {composerActivitySummary.title}
+                      </div>
+                      <Badge variant={badgeVariantForActivityState(composerActivitySummary.state)}>
+                        {formatPromptProgressStatus(composerActivitySummary.state)}
+                      </Badge>
+                    </div>
+                    <div class="mt-0.5 truncate text-xs text-zinc-500">
+                      {composerActivitySummary.detail}
                     </div>
                   </div>
-                {/each}
-              </div>
+
+                  <div class="hidden shrink-0 flex-wrap justify-end gap-x-3 gap-y-1 text-[11px] text-zinc-600 md:flex">
+                    {#if composerActivityJobSummary}
+                      <span>{composerActivityJobSummary.worker_count} Utility Worker{composerActivityJobSummary.worker_count === 1 ? '' : 's'}</span>
+                      <span>{composerActivityJobSummary.pending_approval_count} approvals</span>
+                      <span>{composerActivityJobSummary.artifact_count} artifacts</span>
+                    {/if}
+                    {#if composerActivityToolCall}
+                      <span>Action · {composerActivityToolCall.tool_id}</span>
+                    {:else if composerActivityCommandSession}
+                      <span>Command · {formatCommandSessionSummary(composerActivityCommandSession)}</span>
+                    {:else if composerActivityWorker}
+                      <span>Utility Worker · {composerActivityWorker.title}</span>
+                    {/if}
+                  </div>
+
+                  <div class="shrink-0 text-zinc-500">
+                    {#if composerActivityExpanded}
+                      <ChevronDown class="size-4" />
+                    {:else}
+                      <ChevronUp class="size-4" />
+                    {/if}
+                  </div>
+                </button>
+
+                {#if composerActivityExpanded}
+                  <div class="border-t border-zinc-800 px-3 pb-3 pt-3">
+                    <div class="max-h-[min(24rem,38vh)] space-y-4 overflow-y-auto pr-1">
+                      {#if promptProgress.length > 0}
+                        <div>
+                          <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Prompt Progress</div>
+                          <div class="mt-2 space-y-2">
+                            {#each promptProgress as step, index (index)}
+                              <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-2">
+                                <div class="flex items-start justify-between gap-3">
+                                  <div class="min-w-0">
+                                    <div class="text-sm text-zinc-100">{step.label}</div>
+                                    {#if step.detail}
+                                      <div class="mt-1 text-xs leading-5 text-zinc-500">{step.detail}</div>
+                                    {/if}
+                                  </div>
+                                  <Badge variant={badgeVariantForPromptStatus(step.status)}>
+                                    {formatPromptProgressStatus(step.status)}
+                                  </Badge>
+                                </div>
+                              </div>
+                            {/each}
+                          </div>
+                        </div>
+                      {/if}
+
+                      {#if activityJobDetail?.workers.length}
+                        <div>
+                          <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Utility Workers</div>
+                          <div class="mt-2 space-y-2">
+                            {#each [...activityJobDetail.workers].slice(-3).reverse() as worker}
+                              <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-2">
+                                <div class="flex items-start justify-between gap-3">
+                                  <div class="min-w-0">
+                                    <div class="truncate text-sm text-zinc-100">{worker.title}</div>
+                                    <div class="mt-1 text-xs text-zinc-500">
+                                      {formatWorkerSummary(worker)}
+                                    </div>
+                                  </div>
+                                  <Badge variant={badgeVariantForJobState(worker.state)}>
+                                    {formatState(worker.state)}
+                                  </Badge>
+                                </div>
+                              </div>
+                            {/each}
+                          </div>
+                        </div>
+                      {/if}
+
+                      {#if activityJobDetail?.tool_calls.length}
+                        <div>
+                          <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Actions</div>
+                          <div class="mt-2 space-y-2">
+                            {#each [...activityJobDetail.tool_calls].slice(-4).reverse() as toolCall}
+                              <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-2">
+                                <div class="flex items-start justify-between gap-3">
+                                  <div class="min-w-0">
+                                    <div class="truncate text-sm text-zinc-100">{toolCall.tool_id}</div>
+                                    <div class="mt-1 text-xs text-zinc-500">
+                                      {formatToolCallSummary(toolCall)}
+                                    </div>
+                                  </div>
+                                  <Badge variant={badgeVariantForToolCall(toolCall.status)}>
+                                    {formatState(toolCall.status)}
+                                  </Badge>
+                                </div>
+                                {#if toolCall.error_detail}
+                                  <div class="mt-2 text-xs leading-5 text-red-200">{toolCall.error_detail}</div>
+                                {/if}
+                              </div>
+                            {/each}
+                          </div>
+                        </div>
+                      {/if}
+
+                      {#if activityJobDetail?.approvals.length}
+                        <div>
+                          <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Approvals</div>
+                          <div class="mt-2 space-y-2">
+                            {#each [...activityJobDetail.approvals].slice(-3).reverse() as approval}
+                              <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-2">
+                                <div class="flex items-start justify-between gap-3">
+                                  <div class="min-w-0">
+                                    <div class="truncate text-sm text-zinc-100">{formatApprovalSummary(approval)}</div>
+                                    <div class="mt-1 text-xs leading-5 text-zinc-500">{approval.detail}</div>
+                                  </div>
+                                  <Badge variant={badgeVariantForJobState(approval.state)}>
+                                    {formatState(approval.state)}
+                                  </Badge>
+                                </div>
+                                {#if approval.state === 'pending'}
+                                  <div class="mt-3 flex flex-wrap gap-2">
+                                    <Button
+                                      variant="secondary"
+                                      size="sm"
+                                      disabled={approvalActioningId !== null}
+                                      onclick={() => {
+                                        void handleApproveRequest(approval);
+                                      }}
+                                    >
+                                      <span>{approvalActioningId === approval.id ? 'Approving' : 'Approve'}</span>
+                                    </Button>
+                                    <Button
+                                      variant="outline"
+                                      size="sm"
+                                      disabled={approvalActioningId !== null}
+                                      onclick={() => {
+                                        void handleDenyRequest(approval);
+                                      }}
+                                    >
+                                      <span>{approvalActioningId === approval.id ? 'Resolving' : 'Deny'}</span>
+                                    </Button>
+                                  </div>
+                                {/if}
+                              </div>
+                            {/each}
+                          </div>
+                        </div>
+                      {/if}
+
+                      {#if activityJobDetail?.command_sessions.length}
+                        <div>
+                          <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Command Sessions</div>
+                          <div class="mt-2 space-y-2">
+                            {#each [...activityJobDetail.command_sessions].slice(-3).reverse() as commandSession}
+                              <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-2">
+                                <div class="flex items-start justify-between gap-3">
+                                  <div class="min-w-0">
+                                    <div class="truncate text-sm text-zinc-100">{formatCommandSessionSummary(commandSession)}</div>
+                                    <div class="mt-1 text-xs leading-5 text-zinc-500">
+                                      {formatCommandInvocation(commandSession)}
+                                    </div>
+                                  </div>
+                                  <Badge variant={badgeVariantForToolCall(commandSession.state)}>
+                                    {formatState(commandSession.state)}
+                                  </Badge>
+                                </div>
+                              </div>
+                            {/each}
+                          </div>
+                        </div>
+                      {/if}
+
+                      {#if activityJobDetail?.artifacts.length}
+                        <div>
+                          <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Artifacts</div>
+                          <div class="mt-2 space-y-2">
+                            {#each [...activityJobDetail.artifacts].slice(-2).reverse() as artifact}
+                              <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-2">
+                                <div class="flex items-start justify-between gap-3">
+                                  <div class="min-w-0">
+                                    <div class="truncate text-sm text-zinc-100">{formatArtifactSummary(artifact)}</div>
+                                    <div class="mt-1 text-xs text-zinc-500">
+                                      {artifact.kind} · {formatDateTime(artifact.created_at)}
+                                    </div>
+                                  </div>
+                                  <div class="shrink-0 text-[11px] text-zinc-600">{artifact.size_bytes} bytes</div>
+                                </div>
+                                {#if artifact.preview_text}
+                                  <pre class="mt-2 overflow-x-auto whitespace-pre-wrap rounded-lg bg-zinc-950 px-3 py-2 text-xs leading-5 text-zinc-500">{artifact.preview_text}</pre>
+                                {/if}
+                              </div>
+                            {/each}
+                          </div>
+                        </div>
+                      {/if}
+                    </div>
+
+                    {#if composerActivityJobSummary}
+                      <div class="mt-3 flex justify-end border-t border-zinc-800 pt-3">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onclick={() => {
+                            detailPanelOpen = true;
+                            void loadJob(composerActivityJobSummary.id, true);
+                          }}
+                        >
+                          Open Full Job History
+                        </Button>
+                      </div>
+                    {/if}
+                  </div>
+                {/if}
+              </section>
             {/if}
 
             <div
               role="group"
               aria-label="Session composer"
               class={cn(
-                'rounded-2xl border bg-zinc-900/80 p-3 transition-colors',
+                'rounded-xl border bg-zinc-900/85 p-2 transition-colors',
                 dragOver ? 'border-lime-300/50 bg-lime-300/8' : 'border-zinc-800'
               )}
               ondragover={handleComposerDragOver}
               ondragleave={handleComposerDragLeave}
               ondrop={handleComposerDrop}
             >
-              {#if composerActivityVisible && composerActivitySummary}
-                <div class="mb-3 rounded-2xl border border-zinc-800 bg-zinc-950/70">
-                  <button
-                    type="button"
-                    class="flex w-full items-start gap-3 px-3 py-3 text-left"
-                    aria-expanded={composerActivityExpanded}
-                    onclick={() => {
-                      composerActivityExpanded = !composerActivityExpanded;
-                    }}
-                  >
-                    <div class="mt-0.5 inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-zinc-800 bg-zinc-900 text-zinc-300">
-                      <Workflow class="size-4" />
+              {#if promptImages.length > 0}
+                <div class="mb-2 flex gap-2 overflow-x-auto pb-1">
+                  {#each promptImages as image}
+                    <div class="relative flex h-12 min-w-0 max-w-40 shrink-0 items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-950/75 p-1 pr-8">
+                      <img
+                        src={image.data_url}
+                        alt={image.display_name}
+                        class="h-10 w-10 shrink-0 rounded-md object-cover"
+                      />
+                      <div class="min-w-0 truncate text-[11px] text-zinc-400">{image.display_name}</div>
+                      <button
+                        type="button"
+                        class="absolute right-1.5 top-1.5 inline-flex h-5 w-5 items-center justify-center rounded-full bg-black/75 text-zinc-100"
+                        aria-label={`Remove ${image.display_name}`}
+                        onclick={() => removeImage(image.id)}
+                      >
+                        <X class="size-3" />
+                      </button>
                     </div>
-
-                    <div class="min-w-0 flex-1">
-                      <div class="flex flex-wrap items-center gap-2">
-                        <div class="text-[11px] font-medium uppercase tracking-[0.16em] text-zinc-500">
-                          Daemon Activity
-                        </div>
-                        <Badge variant={badgeVariantForActivityState(composerActivitySummary.state)}>
-                          {formatPromptProgressStatus(composerActivitySummary.state)}
-                        </Badge>
-                      </div>
-
-                      <div class="mt-1 text-sm font-medium text-zinc-100">
-                        {composerActivitySummary.title}
-                      </div>
-                      <div class="mt-1 text-xs leading-5 text-zinc-500">
-                        {composerActivitySummary.detail}
-                      </div>
-
-                      <div class="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-zinc-600">
-                        {#if composerActivityJobSummary}
-                          <span>{composerActivityJobSummary.worker_count} workers</span>
-                          <span>{composerActivityJobSummary.pending_approval_count} approvals</span>
-                          <span>{composerActivityJobSummary.artifact_count} artifacts</span>
-                        {/if}
-                        {#if composerActivityToolCall}
-                          <span>Latest tool · {composerActivityToolCall.tool_id}</span>
-                        {:else if composerActivityCommandSession}
-                          <span>Latest command · {formatCommandSessionSummary(composerActivityCommandSession)}</span>
-                        {:else if composerActivityWorker}
-                          <span>Worker · {composerActivityWorker.title}</span>
-                        {/if}
-                      </div>
-                    </div>
-
-                    <div class="shrink-0 pt-1 text-zinc-500">
-                      {#if composerActivityExpanded}
-                        <ChevronUp class="size-4" />
-                      {:else}
-                        <ChevronDown class="size-4" />
-                      {/if}
-                    </div>
-                  </button>
-
-                  {#if composerActivityExpanded}
-                    <div class="border-t border-zinc-800 px-3 pb-3 pt-3">
-                      <div class="max-h-80 space-y-4 overflow-y-auto pr-1">
-                        {#if promptProgress.length > 0}
-                          <div>
-                            <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Prompt Progress</div>
-                            <div class="mt-2 space-y-2">
-                              {#each promptProgress as step, index (index)}
-                                <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-2">
-                                  <div class="flex items-start justify-between gap-3">
-                                    <div class="min-w-0">
-                                      <div class="text-sm text-zinc-100">{step.label}</div>
-                                      {#if step.detail}
-                                        <div class="mt-1 text-xs leading-5 text-zinc-500">{step.detail}</div>
-                                      {/if}
-                                    </div>
-                                    <Badge variant={badgeVariantForPromptStatus(step.status)}>
-                                      {formatPromptProgressStatus(step.status)}
-                                    </Badge>
-                                  </div>
-                                </div>
-                              {/each}
-                            </div>
-                          </div>
-                        {/if}
-
-                        {#if activityJobDetail?.workers.length}
-                          <div>
-                            <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Workers</div>
-                            <div class="mt-2 space-y-2">
-                              {#each [...activityJobDetail.workers].slice(-3).reverse() as worker}
-                                <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-2">
-                                  <div class="flex items-start justify-between gap-3">
-                                    <div class="min-w-0">
-                                      <div class="truncate text-sm text-zinc-100">{worker.title}</div>
-                                      <div class="mt-1 text-xs text-zinc-500">
-                                        {formatWorkerSummary(worker)}
-                                      </div>
-                                    </div>
-                                    <Badge variant={badgeVariantForJobState(worker.state)}>
-                                      {formatState(worker.state)}
-                                    </Badge>
-                                  </div>
-                                </div>
-                              {/each}
-                            </div>
-                          </div>
-                        {/if}
-
-                        {#if activityJobDetail?.tool_calls.length}
-                          <div>
-                            <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Tool Calls</div>
-                            <div class="mt-2 space-y-2">
-                              {#each [...activityJobDetail.tool_calls].slice(-4).reverse() as toolCall}
-                                <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-2">
-                                  <div class="flex items-start justify-between gap-3">
-                                    <div class="min-w-0">
-                                      <div class="truncate text-sm text-zinc-100">{toolCall.tool_id}</div>
-                                      <div class="mt-1 text-xs text-zinc-500">
-                                        {formatToolCallSummary(toolCall)}
-                                      </div>
-                                    </div>
-                                    <Badge variant={badgeVariantForToolCall(toolCall.status)}>
-                                      {formatState(toolCall.status)}
-                                    </Badge>
-                                  </div>
-                                  {#if toolCall.error_detail}
-                                    <div class="mt-2 text-xs leading-5 text-red-200">{toolCall.error_detail}</div>
-                                  {/if}
-                                </div>
-                              {/each}
-                            </div>
-                          </div>
-                        {/if}
-
-                        {#if activityJobDetail?.approvals.length}
-                          <div>
-                            <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Approvals</div>
-                            <div class="mt-2 space-y-2">
-                              {#each [...activityJobDetail.approvals].slice(-3).reverse() as approval}
-                                <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-2">
-                                  <div class="flex items-start justify-between gap-3">
-                                    <div class="min-w-0">
-                                      <div class="truncate text-sm text-zinc-100">{formatApprovalSummary(approval)}</div>
-                                      <div class="mt-1 text-xs leading-5 text-zinc-500">{approval.detail}</div>
-                                    </div>
-                                    <Badge variant={badgeVariantForJobState(approval.state)}>
-                                      {formatState(approval.state)}
-                                    </Badge>
-                                  </div>
-                                  {#if approval.state === 'pending'}
-                                    <div class="mt-3 flex flex-wrap gap-2">
-                                      <Button
-                                        variant="secondary"
-                                        size="sm"
-                                        disabled={approvalActioningId !== null}
-                                        onclick={() => {
-                                          void handleApproveRequest(approval);
-                                        }}
-                                      >
-                                        <span>{approvalActioningId === approval.id ? 'Approving' : 'Approve'}</span>
-                                      </Button>
-                                      <Button
-                                        variant="outline"
-                                        size="sm"
-                                        disabled={approvalActioningId !== null}
-                                        onclick={() => {
-                                          void handleDenyRequest(approval);
-                                        }}
-                                      >
-                                        <span>{approvalActioningId === approval.id ? 'Resolving' : 'Deny'}</span>
-                                      </Button>
-                                    </div>
-                                  {/if}
-                                </div>
-                              {/each}
-                            </div>
-                          </div>
-                        {/if}
-
-                        {#if activityJobDetail?.command_sessions.length}
-                          <div>
-                            <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Command Sessions</div>
-                            <div class="mt-2 space-y-2">
-                              {#each [...activityJobDetail.command_sessions].slice(-3).reverse() as commandSession}
-                                <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-2">
-                                  <div class="flex items-start justify-between gap-3">
-                                    <div class="min-w-0">
-                                      <div class="truncate text-sm text-zinc-100">{formatCommandSessionSummary(commandSession)}</div>
-                                      <div class="mt-1 text-xs leading-5 text-zinc-500">
-                                        {formatCommandInvocation(commandSession)}
-                                      </div>
-                                    </div>
-                                    <Badge variant={badgeVariantForToolCall(commandSession.state)}>
-                                      {formatState(commandSession.state)}
-                                    </Badge>
-                                  </div>
-                                </div>
-                              {/each}
-                            </div>
-                          </div>
-                        {/if}
-
-                        {#if activityJobDetail?.artifacts.length}
-                          <div>
-                            <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Artifacts</div>
-                            <div class="mt-2 space-y-2">
-                              {#each [...activityJobDetail.artifacts].slice(-2).reverse() as artifact}
-                                <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-2">
-                                  <div class="flex items-start justify-between gap-3">
-                                    <div class="min-w-0">
-                                      <div class="truncate text-sm text-zinc-100">{formatArtifactSummary(artifact)}</div>
-                                      <div class="mt-1 text-xs text-zinc-500">
-                                        {artifact.kind} · {formatDateTime(artifact.created_at)}
-                                      </div>
-                                    </div>
-                                    <div class="shrink-0 text-[11px] text-zinc-600">{artifact.size_bytes} bytes</div>
-                                  </div>
-                                  {#if artifact.preview_text}
-                                    <pre class="mt-2 overflow-x-auto whitespace-pre-wrap rounded-lg bg-zinc-950 px-3 py-2 text-xs leading-5 text-zinc-500">{artifact.preview_text}</pre>
-                                  {/if}
-                                </div>
-                              {/each}
-                            </div>
-                          </div>
-                        {/if}
-                      </div>
-
-                      {#if composerActivityJobSummary}
-                        <div class="mt-3 flex justify-end border-t border-zinc-800 pt-3">
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onclick={() => {
-                              detailPanelOpen = true;
-                              void loadJob(composerActivityJobSummary.id, true);
-                            }}
-                          >
-                            Open Full Job History
-                          </Button>
-                        </div>
-                      {/if}
-                    </div>
-                  {/if}
+                  {/each}
                 </div>
               {/if}
 
-              <textarea
-                bind:value={promptText}
-                class="min-h-[6rem] w-full resize-none bg-transparent text-sm leading-6 text-zinc-100 outline-none placeholder:text-zinc-500 sm:min-h-[7.5rem]"
-                placeholder="Send a message..."
-                spellcheck={false}
-                disabled={
-                  sending ||
-                  selectedSession.state === 'archived' ||
-                  selectedSession.state === 'paused'
-                }
-                onkeydown={handleComposerKeydown}
-                onpaste={handleComposerPaste}
-              ></textarea>
+              <div class="flex items-end gap-2">
+                <input
+                  bind:this={fileInputElement}
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  class="hidden"
+                  onchange={handleFileInputChange}
+                />
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Attach image"
+                  title={composerHint}
+                  disabled={
+                    !sessionSupportsImages ||
+                    sending ||
+                    selectedSession.state === 'archived' ||
+                    selectedSession.state === 'running' ||
+                    selectedSession.state === 'paused'
+                  }
+                  onclick={triggerImagePicker}
+                >
+                  <ImagePlus class="size-4" />
+                </Button>
 
-              <div class="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-zinc-800 pt-3">
-                <div class="min-w-0">
-                  <div class="text-xs text-zinc-400">{composerHint}</div>
-                  <div class="mt-1 text-[11px] text-zinc-600">
-                    Enter sends. Shift+Enter adds a new line.
-                  </div>
-                </div>
+                <textarea
+                  bind:this={composerTextareaElement}
+                  bind:value={promptText}
+                  rows="1"
+                  class="max-h-[10.5rem] min-h-10 flex-1 resize-none bg-transparent px-1 py-2 text-sm leading-5 text-zinc-100 outline-none placeholder:text-zinc-500"
+                  placeholder="Send a message..."
+                  spellcheck={false}
+                  aria-describedby="composer-hint"
+                  disabled={
+                    sending ||
+                    selectedSession.state === 'archived' ||
+                    selectedSession.state === 'paused'
+                  }
+                  onkeydown={handleComposerKeydown}
+                  onpaste={handleComposerPaste}
+                ></textarea>
 
-                <div class="flex items-center gap-2">
-                  <input
-                    bind:this={fileInputElement}
-                    type="file"
-                    accept="image/*"
-                    multiple
-                    class="hidden"
-                    onchange={handleFileInputChange}
-                  />
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    aria-label="Attach image"
-                    disabled={
-                      !sessionSupportsImages ||
-                      sending ||
-                      selectedSession.state === 'archived' ||
-                      selectedSession.state === 'running' ||
-                      selectedSession.state === 'paused'
-                    }
-                    onclick={triggerImagePicker}
-                  >
-                    <ImagePlus class="size-4" />
-                  </Button>
-                  <Button
-                    variant="default"
-                    disabled={
-                      !promptReady ||
-                      sending ||
-                      selectedSession.state === 'archived' ||
-                      selectedSession.state === 'running' ||
-                      selectedSession.state === 'paused'
-                    }
-                    onclick={handlePromptSubmit}
-                  >
-                    <Send class={cn('size-4', sending && 'animate-pulse')} />
-                    <span>{sending ? 'Handing Off' : 'Send'}</span>
-                  </Button>
-                </div>
+                <Button
+                  variant="default"
+                  size="icon"
+                  aria-label={sending ? 'Sending prompt' : 'Send prompt'}
+                  disabled={
+                    !promptReady ||
+                    sending ||
+                    selectedSession.state === 'archived' ||
+                    selectedSession.state === 'running' ||
+                    selectedSession.state === 'paused'
+                  }
+                  onclick={handlePromptSubmit}
+                >
+                  <Send class={cn('size-4', sending && 'animate-pulse')} />
+                </Button>
+              </div>
+
+              <div id="composer-hint" class="sr-only">
+                {composerHint} Press Enter to send. Press Shift and Enter to add a new line.
               </div>
             </div>
           </div>
@@ -2261,17 +2280,17 @@
                 <div class="space-y-1">
                   <div class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Agent Jobs</div>
                   <div class="text-sm text-zinc-400">
-                    The composer shows live daemon activity. Full hidden worker history stays here.
+                    The activity drawer shows live Nucleus activity. Full Utility Worker history stays here.
                   </div>
                 </div>
 
                 {#if jobLoading && jobSummaries.length === 0}
                   <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-4 text-sm text-zinc-500">
-                    Loading daemon-owned job history...
+                    Loading Nucleus job history...
                   </div>
                 {:else if jobSummaries.length === 0}
                   <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-4 text-sm text-zinc-500">
-                    No hidden worker jobs have been recorded for this session yet.
+                    No Utility Worker jobs have been recorded for this session yet.
                   </div>
                 {:else}
                   <div class="space-y-3">
@@ -2298,7 +2317,7 @@
                           </Badge>
                         </div>
                         <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-zinc-600">
-                          <span>{job.worker_count} workers</span>
+                          <span>{job.worker_count} Utility Worker{job.worker_count === 1 ? '' : 's'}</span>
                           <span>{job.pending_approval_count} approvals</span>
                           <span>{job.artifact_count} artifacts</span>
                           <span>{formatDateTime(job.updated_at)}</span>
@@ -2355,10 +2374,10 @@
 
                       <div class="mt-4 space-y-3 border-t border-zinc-800 pt-4">
                         <div>
-                          <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Child Jobs</div>
+                          <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Subtasks</div>
                           <div class="mt-2 space-y-2">
                             {#if jobDetail.child_jobs.length === 0}
-                              <div class="text-xs text-zinc-500">No child jobs were recorded for this job.</div>
+                              <div class="text-xs text-zinc-500">No subtasks were recorded for this job.</div>
                             {:else}
                               {#each jobDetail.child_jobs as childJob}
                                 <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2">
@@ -2377,7 +2396,7 @@
                                     </Badge>
                                   </div>
                                   <div class="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-zinc-600">
-                                    <span>{childJob.worker_count} worker{childJob.worker_count === 1 ? '' : 's'}</span>
+                                    <span>{childJob.worker_count} Utility Worker{childJob.worker_count === 1 ? '' : 's'}</span>
                                     <span>{childJob.artifact_count} artifact{childJob.artifact_count === 1 ? '' : 's'}</span>
                                     {#if childJob.updated_at}
                                       <span>Updated {formatDateTime(childJob.updated_at)}</span>
@@ -2393,7 +2412,7 @@
                         </div>
 
                         <div>
-                          <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Workers</div>
+                          <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Utility Workers</div>
                           <div class="mt-2 space-y-2">
                             {#each jobDetail.workers as worker}
                               <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2">
@@ -2410,7 +2429,7 @@
                                 </div>
                                 <div class="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-zinc-600">
                                   <span>{worker.step_count}/{worker.max_steps} steps</span>
-                                  <span>{worker.tool_call_count}/{worker.max_tool_calls} tool calls</span>
+                                  <span>{worker.tool_call_count}/{worker.max_tool_calls} actions</span>
                                   <span>{compactPath(worker.working_dir)}</span>
                                 </div>
                               </div>
@@ -2419,10 +2438,10 @@
                         </div>
 
                         <div>
-                          <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Tool Calls</div>
+                          <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Actions</div>
                           <div class="mt-2 space-y-2">
                             {#if jobDetail.tool_calls.length === 0}
-                              <div class="text-xs text-zinc-500">No tool calls were recorded for this job yet.</div>
+                              <div class="text-xs text-zinc-500">No actions were recorded for this job yet.</div>
                             {:else}
                               {#each [...jobDetail.tool_calls].reverse().slice(0, 6) as toolCall}
                                 <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2">
@@ -2505,7 +2524,7 @@
                           <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Command Sessions</div>
                           <div class="mt-2 space-y-2">
                             {#if jobDetail.command_sessions.length === 0}
-                              <div class="text-xs text-zinc-500">No daemon-owned command sessions were recorded for this job.</div>
+                              <div class="text-xs text-zinc-500">No command sessions were recorded for this job.</div>
                             {:else}
                               {#each [...jobDetail.command_sessions].reverse().slice(0, 6) as commandSession}
                                 <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2">
@@ -2684,7 +2703,7 @@
                 <div class="space-y-1">
                   <div class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Recent Activity</div>
                   <div class="text-sm text-zinc-400">
-                    Audit history stays live from the daemon stream, without taking over the session page.
+                    Audit history stays live from the Nucleus stream, without taking over the session page.
                   </div>
                 </div>
 

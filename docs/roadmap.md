@@ -8,7 +8,7 @@ The near-term goal is to make Nucleus a credible daily driver for local AI work.
 
 That means finishing and stabilizing:
 
-- daemon-owned sessions
+- Nucleus-owned sessions
 - workspace and project activation
 - router profiles and model settings
 - machine telemetry and process control
@@ -27,7 +27,7 @@ V1 should replace the current fragmented local setup for:
 - routing and model selection
 - approvals and operator steering
 
-The daemon should already be the product brain by that point. The web UI should be a strong first client, not a second backend.
+Nucleus should already be the product brain by that point. The web UI should be a strong first client, not a second backend.
 
 ## Later
 
