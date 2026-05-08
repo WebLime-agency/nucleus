@@ -15,7 +15,7 @@
 <Card>
   <CardHeader>
     <CardTitle>Disk Usage</CardTitle>
-    <CardDescription>Active local mounts surfaced by the Rust daemon.</CardDescription>
+    <CardDescription>Active local mounts surfaced by Nucleus.</CardDescription>
   </CardHeader>
   <CardContent>
     {#if disks.length === 0}

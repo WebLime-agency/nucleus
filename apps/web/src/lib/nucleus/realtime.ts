@@ -74,14 +74,14 @@ export function connectDaemonStream(options: StreamOptions) {
       try {
         payload = JSON.parse(message.data);
       } catch {
-        options.onError?.('Daemon stream sent invalid JSON.');
+        options.onError?.('Nucleus stream sent invalid JSON.');
         return;
       }
 
       const parsed = daemonEventSchema.safeParse(payload);
 
       if (!parsed.success) {
-        options.onError?.('Daemon stream sent an invalid event payload.');
+        options.onError?.('Nucleus stream sent an invalid event payload.');
         return;
       }
 

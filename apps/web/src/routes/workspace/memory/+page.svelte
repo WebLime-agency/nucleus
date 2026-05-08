@@ -97,7 +97,7 @@
         </CardDescription>
       </CardHeader>
       <CardContent class="text-sm leading-6 text-zinc-400">
-        The daemon already owns the storage roots. The next pass is exposing user-editable memory
+        Nucleus already owns the storage roots. The next pass is exposing user-editable memory
         entries the way Agent0 surfaces durable context.
       </CardContent>
     </Card>
@@ -146,7 +146,7 @@
         Next Phase
       </CardTitle>
       <CardDescription>
-        The UI layer is ready for real memory controls once the daemon model is finalized.
+        The UI layer is ready for real memory controls once the Nucleus memory model is finalized.
       </CardDescription>
     </CardHeader>
     <CardContent class="text-sm leading-6 text-zinc-400">

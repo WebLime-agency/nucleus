@@ -366,7 +366,7 @@
     title={view === 'cpu' ? 'Top CPU processes' : 'Top memory processes'}
     subtitle={processData
       ? `Showing ${formatCount(processData.processes.length)} of ${formatCount(processData.meta.matching_processes)} processes for ${processData.meta.current_user}.`
-      : 'Waiting for daemon process data.'}
+      : 'Waiting for Nucleus process data.'}
     processes={processData?.processes ?? []}
     sort={view}
     {killingPid}

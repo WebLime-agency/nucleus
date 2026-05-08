@@ -413,7 +413,7 @@ impl UpdateManager {
             RestartMode::Systemd { unit } => restart_systemd_unit(unit).await,
             RestartMode::SelfReexec => relaunch_current_daemon(&self.instance).await,
             RestartMode::Unsupported => {
-                anyhow::bail!("This install does not support daemon restarts from the UI.")
+                anyhow::bail!("This install does not support Nucleus restarts from Settings.")
             }
         }
     }
