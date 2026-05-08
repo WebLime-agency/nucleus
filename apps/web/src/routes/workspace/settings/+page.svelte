@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import {
     Check,
+    Clock3,
     Download,
     FolderTree,
     GitBranch,
@@ -69,9 +70,23 @@
   let trackedChannelInput = $state('stable');
   let trackedRefInput = $state('');
   let workspaceRoot = $state('');
+  let runBudgetMaxSteps = $state(80);
+  let runBudgetMaxActions = $state(160);
+  let runBudgetMaxWallClockHours = $state(2);
 
   let workspace = $derived<WorkspaceSummary | null>(overview?.workspace ?? null);
   let workspaceDirty = $derived(workspace ? workspaceRoot !== workspace.root_path : false);
+  let runBudgetDirty = $derived.by(() => {
+    if (!workspace) {
+      return false;
+    }
+
+    return (
+      runBudgetMaxSteps !== workspace.run_budget.max_steps ||
+      runBudgetMaxActions !== workspace.run_budget.max_tool_calls ||
+      Math.round(runBudgetMaxWallClockHours * 3600) !== workspace.run_budget.max_wall_clock_secs
+    );
+  });
 
   let update = $derived(settings?.update ?? null);
   let compatibility = $derived(evaluateCompatibility(settings?.compatibility ?? null));
@@ -203,6 +218,18 @@
     if (force || !workspaceDirty) {
       workspaceRoot = next.workspace.root_path;
     }
+    if (force || !runBudgetDirty) {
+      applyWorkspaceBudgetInputs(next.workspace);
+    }
+  }
+
+  function applyWorkspaceBudgetInputs(next: WorkspaceSummary) {
+    runBudgetMaxSteps = next.run_budget.max_steps;
+    runBudgetMaxActions = next.run_budget.max_tool_calls;
+    runBudgetMaxWallClockHours = Math.max(
+      1,
+      Math.round((next.run_budget.max_wall_clock_secs / 3600) * 10) / 10
+    );
   }
 
   async function loadOverview() {
@@ -231,6 +258,36 @@
       success = 'Workspace root updated.';
     } catch (cause) {
       error = cause instanceof Error ? cause.message : 'Failed to update the workspace root.';
+    } finally {
+      savingWorkspace = false;
+    }
+  }
+
+  async function handleSaveRunBudget() {
+    if (runBudgetMaxSteps < 1 || runBudgetMaxActions < 1 || runBudgetMaxWallClockHours <= 0) {
+      error = 'Run budget values must be greater than zero.';
+      return;
+    }
+
+    savingWorkspace = true;
+    success = null;
+
+    try {
+      const nextWorkspace = await updateWorkspace({
+        run_budget: {
+          mode: 'standard',
+          max_steps: runBudgetMaxSteps,
+          max_tool_calls: runBudgetMaxActions,
+          max_wall_clock_secs: Math.round(runBudgetMaxWallClockHours * 3600)
+        }
+      });
+      if (overview) {
+        applyOverview({ ...overview, workspace: nextWorkspace }, true);
+      }
+      error = null;
+      success = 'Default run budget updated.';
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to update the default run budget.';
     } finally {
       savingWorkspace = false;
     }
@@ -438,6 +495,91 @@
             </div>
           {/each}
         {/if}
+      </div>
+    </CardContent>
+  </Card>
+
+  <Card>
+    <CardHeader>
+      <CardTitle>Run Budget</CardTitle>
+      <CardDescription>
+        Default Utility Worker limits for new session turns. Sessions can inherit these defaults
+        or choose a different run budget from the composer.
+      </CardDescription>
+    </CardHeader>
+    <CardContent class="space-y-4">
+      <div class="grid gap-3 md:grid-cols-3">
+        <label class="block space-y-1">
+          <span class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Steps</span>
+          <input
+            type="number"
+            min="1"
+            max="1000"
+            class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
+            bind:value={runBudgetMaxSteps}
+            aria-label="Default maximum steps"
+          />
+        </label>
+
+        <label class="block space-y-1">
+          <span class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Actions</span>
+          <input
+            type="number"
+            min="1"
+            max="2000"
+            class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
+            bind:value={runBudgetMaxActions}
+            aria-label="Default maximum actions"
+          />
+        </label>
+
+        <label class="block space-y-1">
+          <span class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Hours</span>
+          <input
+            type="number"
+            min="0.1"
+            max="24"
+            step="0.5"
+            class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
+            bind:value={runBudgetMaxWallClockHours}
+            aria-label="Default maximum run time in hours"
+          />
+        </label>
+      </div>
+
+      <div class="flex flex-wrap items-center gap-3">
+        <Button
+          onclick={handleSaveRunBudget}
+          disabled={
+            savingWorkspace ||
+            !runBudgetDirty ||
+            runBudgetMaxSteps < 1 ||
+            runBudgetMaxActions < 1 ||
+            runBudgetMaxWallClockHours <= 0
+          }
+        >
+          <Clock3 class={savingWorkspace ? 'size-4 animate-spin' : 'size-4'} />
+          {savingWorkspace ? 'Saving' : 'Save Run Budget'}
+        </Button>
+        <div class="text-xs leading-5 text-zinc-500">
+          Use <span class="text-zinc-300">Unbounded</span> at the session level only for trusted
+          local work where long-running autonomy is expected.
+        </div>
+      </div>
+
+      <div class="grid gap-2 text-xs leading-5 text-zinc-500 md:grid-cols-2">
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2">
+          <span class="text-zinc-300">Focused</span>: 80 steps, 160 actions, 2 hours.
+        </div>
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2">
+          <span class="text-zinc-300">Extended</span>: 200 steps, 400 actions, 4 hours.
+        </div>
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2">
+          <span class="text-zinc-300">Marathon</span>: 600 steps, 1200 actions, 8 hours.
+        </div>
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2">
+          <span class="text-zinc-300">Unbounded</span>: no step, action, or time cap.
+        </div>
       </div>
     </CardContent>
   </Card>
