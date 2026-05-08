@@ -62,7 +62,7 @@ const WRITE_LOCK_POLL_INTERVAL_MS: u64 = 250;
 const PLAYBOOK_SCHEDULER_INTERVAL_SECS: u64 = 30;
 const PLAYBOOK_MIN_INTERVAL_SECS: u64 = 60;
 const PLAYBOOK_MAX_INTERVAL_SECS: u64 = 86_400;
-const COMMAND_TRUNCATED_NOTE: &str = "[output truncated by the daemon budget]";
+const COMMAND_TRUNCATED_NOTE: &str = "[output truncated by the Nucleus budget]";
 
 #[derive(Default)]
 pub struct AgentRuntime {
@@ -84,6 +84,8 @@ struct HiddenWorkerTarget {
 struct WorkerCheckpoint {
     session_id: String,
     prompt_text: String,
+    #[serde(default)]
+    images: Vec<SessionTurnImage>,
     conversation: Vec<CheckpointMessage>,
     next_prompt: Option<String>,
     pending_action: Option<PendingToolAction>,
@@ -93,6 +95,8 @@ struct WorkerCheckpoint {
 struct CheckpointMessage {
     role: String,
     content: String,
+    #[serde(default)]
+    images: Vec<SessionTurnImage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,7 +353,7 @@ struct ArtifactDraft {
     preview_text: String,
 }
 
-pub async fn start_text_prompt_job(
+pub async fn start_prompt_job(
     state: AppState,
     session_id: String,
     payload: SessionPromptRequest,
@@ -364,9 +368,13 @@ pub async fn start_text_prompt_job(
     }
 
     let prompt_excerpt = excerpt(&execution_prompt, 160);
+    let visible_prompt = payload.prompt.trim().to_string();
     let job_id = Uuid::new_v4().to_string();
     let root_worker_id = Uuid::new_v4().to_string();
-    let target = resolve_hidden_worker_target(&state, &current.session, &compiler_role).await?;
+    let needs_vision_tools = !payload.images.is_empty();
+    let target =
+        resolve_hidden_worker_target(&state, &current.session, &compiler_role, needs_vision_tools)
+            .await?;
 
     state.store.update_session(
         &session_id,
@@ -380,7 +388,7 @@ pub async fn start_text_prompt_job(
         &session_id,
         &Uuid::new_v4().to_string(),
         "user",
-        execution_prompt.as_str(),
+        visible_prompt.as_str(),
         &payload.images,
     )?;
 
@@ -401,7 +409,7 @@ pub async fn start_text_prompt_job(
         id: root_worker_id.clone(),
         job_id: job_id.clone(),
         parent_worker_id: None,
-        title: format!("Hidden {compiler_role} worker"),
+        title: format!("Utility {compiler_role} worker"),
         lane: compiler_role.clone(),
         state: "queued".to_string(),
         provider: target.provider.clone(),
@@ -432,14 +440,18 @@ pub async fn start_text_prompt_job(
         .workers
         .into_iter()
         .find(|item| item.id == root_worker_id)
-        .ok_or_else(|| ApiError::internal_message("failed to reload hidden worker capabilities"))?;
+        .ok_or_else(|| {
+            ApiError::internal_message("failed to reload Utility Worker capabilities")
+        })?;
 
     let checkpoint = WorkerCheckpoint {
         session_id: session_id.clone(),
         prompt_text: execution_prompt.clone(),
+        images: payload.images.clone(),
         conversation: vec![CheckpointMessage {
             role: "system".to_string(),
             content: worker_system_prompt(&worker),
+            images: Vec::new(),
         }],
         next_prompt: None,
         pending_action: None,
@@ -457,8 +469,12 @@ pub async fn start_text_prompt_job(
         &current.session,
         &worker,
         "queued",
-        "Queued hidden worker",
-        "The daemon accepted the prompt and created a hidden utility worker.",
+        "Queued Utility Worker",
+        if payload.images.is_empty() {
+            "Nucleus accepted the prompt and created a Utility Worker."
+        } else {
+            "Nucleus accepted the prompt with scoped image attachment(s) and created a Utility Worker."
+        },
     )
     .await;
     let _ = publish_overview_event(&state).await;
@@ -470,7 +486,7 @@ pub async fn start_text_prompt_job(
             target: format!("job:{job_id}"),
             status: "success".to_string(),
             summary: format!(
-                "Queued hidden worker job for session '{}'.",
+                "Queued Utility Worker job for session '{}'.",
                 current.session.title
             ),
             detail: format!(
@@ -563,8 +579,8 @@ pub async fn cancel_job(state: AppState, job_id: String) -> Result<JobDetail, Ap
             worker_id: None,
             event_type: "job.canceled".to_string(),
             status: "canceled".to_string(),
-            summary: "Canceled hidden worker job.".to_string(),
-            detail: "The daemon stopped the job before it finished.".to_string(),
+            summary: "Canceled Utility Worker job.".to_string(),
+            detail: "Nucleus stopped the job before it finished.".to_string(),
             data_json: json!({}),
         });
         publish_job_updated(&state, &state.store.get_job(child_job_id)?.job).await;
@@ -596,7 +612,7 @@ pub async fn resume_job(state: AppState, job_id: String) -> Result<JobDetail, Ap
     let detail = state.store.get_job(&job_id)?;
     if detail.job.state != "paused" {
         return Err(ApiError::bad_request(
-            "only paused hidden worker jobs can be resumed",
+            "only paused Utility Worker jobs can be resumed",
         ));
     }
 
@@ -883,7 +899,7 @@ pub async fn recover_interrupted_jobs(state: &AppState) -> Result<()> {
             &job.id,
             JobPatch {
                 state: Some("paused".to_string()),
-                last_error: Some("The daemon restarted before this job completed.".to_string()),
+                last_error: Some("Nucleus restarted before this job completed.".to_string()),
                 ..JobPatch::default()
             },
         );
@@ -894,7 +910,7 @@ pub async fn recover_interrupted_jobs(state: &AppState) -> Result<()> {
                 WorkerPatch {
                     state: Some("paused".to_string()),
                     last_error: Some(
-                        "The daemon restarted before this worker completed.".to_string(),
+                        "Nucleus restarted before this Utility Worker completed.".to_string(),
                     ),
                     ..WorkerPatch::default()
                 },
@@ -905,7 +921,7 @@ pub async fn recover_interrupted_jobs(state: &AppState) -> Result<()> {
                 session_id,
                 SessionPatch {
                     state: Some("paused".to_string()),
-                    last_error: Some("Resume or cancel the paused hidden worker job.".to_string()),
+                    last_error: Some("Resume or cancel the paused Utility Worker job.".to_string()),
                     ..SessionPatch::default()
                 },
             );
@@ -915,10 +931,9 @@ pub async fn recover_interrupted_jobs(state: &AppState) -> Result<()> {
             worker_id: None,
             event_type: "job.paused".to_string(),
             status: "paused".to_string(),
-            summary: "Paused a hidden worker job after daemon restart.".to_string(),
-            detail:
-                "The daemon recovered persisted job state and is waiting for an explicit resume."
-                    .to_string(),
+            summary: "Paused a Utility Worker job after Nucleus restart.".to_string(),
+            detail: "Nucleus recovered persisted job state and is waiting for an explicit resume."
+                .to_string(),
             data_json: json!({ "reason": "daemon_restart" }),
         });
         publish_job_updated(state, &state.store.get_job(&job.id)?.job).await;
@@ -932,7 +947,7 @@ pub async fn recover_interrupted_jobs(state: &AppState) -> Result<()> {
             CommandSessionPatch {
                 state: Some("orphaned".to_string()),
                 last_error: Some(
-                    "The daemon restarted before this command session completed.".to_string(),
+                    "Nucleus restarted before this command session completed.".to_string(),
                 ),
                 completed_at: Some(Some(unix_timestamp())),
                 ..CommandSessionPatch::default()
@@ -1154,8 +1169,8 @@ async fn run_job_loop(
         &session.session,
         &worker,
         "running",
-        "Hidden worker running",
-        "The daemon is planning the next repo-inspection step.",
+        "Utility Worker running",
+        "Nucleus is planning the next repo-inspection step.",
     )
     .await;
 
@@ -1193,16 +1208,47 @@ async fn run_job_loop(
         }
 
         if step >= worker.max_steps {
-            bail!("hidden worker reached the maximum step budget");
+            bail!("Utility Worker reached the maximum step budget");
         }
 
         if tool_calls >= worker.max_tool_calls {
-            bail!("hidden worker reached the maximum tool-call budget");
+            bail!("Utility Worker reached the maximum action budget");
         }
 
+        if !checkpoint.images.is_empty() && !worker_supports_vision_with_tools(&worker) {
+            let detail = unsupported_vision_with_tools_detail(&worker, checkpoint.images.len());
+            publish_prompt_status(
+                state,
+                &session.session,
+                &worker,
+                "degraded",
+                "Vision unavailable for Utility Worker",
+                &detail,
+            )
+            .await;
+            complete_job_with_final_answer(
+                state,
+                &session,
+                job_id,
+                &mut worker,
+                step,
+                tool_calls,
+                "Vision with tools is unsupported for the selected runtime.",
+                &detail,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let attach_initial_images = should_attach_initial_worker_images(&checkpoint);
         let prompt = checkpoint.next_prompt.take().unwrap_or_else(|| {
             build_initial_step_prompt(&session.session, &assembled_prompt.prompt, &worker)
         });
+        let prompt_images = if attach_initial_images {
+            checkpoint.images.as_slice()
+        } else {
+            &[]
+        };
 
         publish_prompt_status(
             state,
@@ -1210,18 +1256,30 @@ async fn run_job_loop(
             &worker,
             "thinking",
             "Planning the next step",
-            "The hidden worker is deciding whether to inspect the repo or answer directly.",
+            "The Utility Worker is deciding whether to inspect the repo or answer directly.",
         )
         .await;
 
-        let response = call_worker_model(state, &worker, &checkpoint.conversation, &prompt).await?;
+        let response = call_worker_model(
+            state,
+            &worker,
+            &checkpoint.conversation,
+            &prompt,
+            prompt_images,
+        )
+        .await?;
         checkpoint.conversation.push(CheckpointMessage {
             role: "user".to_string(),
             content: prompt.clone(),
+            images: prompt_images.to_vec(),
         });
+        if attach_initial_images {
+            checkpoint.images.clear();
+        }
         checkpoint.conversation.push(CheckpointMessage {
             role: "assistant".to_string(),
             content: response.raw.clone(),
+            images: Vec::new(),
         });
         if !response.provider_session_id.is_empty() {
             worker = state.store.update_worker(
@@ -1513,8 +1571,9 @@ async fn handle_pending_action(
                     event_type: "tool.completed".to_string(),
                     status: "completed".to_string(),
                     summary: format!("Recovered {}", pending.tool),
-                    detail: "The daemon resumed with the persisted command-session result after restart."
-                        .to_string(),
+                    detail:
+                        "Nucleus resumed with the persisted command-session result after restart."
+                            .to_string(),
                     data_json: json!({
                         "tool_id": pending.tool,
                         "tool_call_id": pending.tool_call_id,
@@ -1722,7 +1781,7 @@ async fn handle_child_job_proposal(
     jobs: Vec<ChildJobProposal>,
 ) -> Result<LoopDisposition> {
     if worker.parent_worker_id.is_some() {
-        bail!("only the root hidden worker may spawn child jobs");
+        bail!("only the root Utility Worker may spawn subtasks");
     }
     if jobs.is_empty() {
         bail!("spawn_child_jobs requires at least one child job");
@@ -1782,7 +1841,7 @@ async fn handle_child_job_proposal(
         &session.session,
         worker,
         "running",
-        "Spawning child workers",
+        "Spawning Utility Subworkers",
         &summary,
     )
     .await;
@@ -1872,7 +1931,7 @@ async fn create_child_job(
         .find(|item| item.id == child_worker_id)
         .ok_or_else(|| {
             anyhow!(
-                "child worker '{}' was not found after creation",
+                "Utility Subworker '{}' was not found after creation",
                 child_worker_id
             )
         })?;
@@ -1880,16 +1939,19 @@ async fn create_child_job(
     let checkpoint = WorkerCheckpoint {
         session_id: session.session.id.clone(),
         prompt_text: prompt.to_string(),
+        images: Vec::new(),
         conversation: vec![CheckpointMessage {
             role: "system".to_string(),
             content: worker_system_prompt(&child_worker),
+            images: Vec::new(),
         }],
         next_prompt: None,
         pending_action: None,
     };
     state.store.write_worker_checkpoint(
         &child_worker.id,
-        &serde_json::to_value(checkpoint).context("failed to encode child worker checkpoint")?,
+        &serde_json::to_value(checkpoint)
+            .context("failed to encode Utility Subworker checkpoint")?,
     )?;
 
     publish_job_created(state, &child_job).await;
@@ -1979,7 +2041,7 @@ async fn complete_job_with_final_answer(
         .agent
         .terminate_job_command_sessions(
             job_id,
-            "The job completed and closed any remaining daemon-owned command sessions.",
+            "The job completed and closed any remaining Nucleus-owned command sessions.",
             "closed",
         )
         .await;
@@ -2057,7 +2119,7 @@ async fn complete_job_with_final_answer(
             target: format!("job:{job_id}"),
             status: "success".to_string(),
             summary: format!(
-                "Completed hidden worker job for session '{}'.",
+                "Completed Utility Worker job for session '{}'.",
                 session.session.title
             ),
             detail: format!(
@@ -2077,8 +2139,8 @@ async fn complete_job_with_final_answer(
             &session.session,
             worker,
             "completed",
-            "Hidden worker completed",
-            "The daemon persisted a clean assistant turn from the worker result.",
+            "Utility Worker completed",
+            "Nucleus persisted a clean assistant turn from the Utility Worker result.",
         )
         .await;
     } else {
@@ -2119,11 +2181,11 @@ fn build_initial_step_prompt(
         )
     };
     format!(
-        "You are handling a daemon-owned session prompt.\n\
+        "You are handling a Nucleus-owned session prompt.\n\
 Session title: {}\n\
 {}\n\
 Visible provider: {} / {}\n\
-Hidden worker provider: {} / {}\n\
+Utility Worker provider: {} / {}\n\
 Prompt-time context and user request:\n{}\n\
 Decide the next single step.",
         session.title,
@@ -2156,9 +2218,36 @@ Decide the next single step. If the work is done, return final_answer.",
 
 fn build_tool_denied_prompt(tool: &str, summary: &str, reason: &str) -> String {
     format!(
-        "The daemon did not allow {}.\nReason for the proposed call: {}\nResolution detail: {}\n\
+        "Nucleus did not allow {}.\nReason for the proposed action: {}\nResolution detail: {}\n\
 Choose the next best single step. If the work can still be completed without this mutation, return final_answer.",
         tool, summary, reason
+    )
+}
+
+fn should_attach_initial_worker_images(checkpoint: &WorkerCheckpoint) -> bool {
+    !checkpoint.images.is_empty()
+        && checkpoint.conversation.len() == 1
+        && checkpoint.next_prompt.is_none()
+        && checkpoint.pending_action.is_none()
+}
+
+fn worker_supports_vision_with_tools(worker: &WorkerSummary) -> bool {
+    provider_supports_vision_with_tools(&worker.provider)
+}
+
+fn target_supports_vision_with_tools(target: &HiddenWorkerTarget) -> bool {
+    provider_supports_vision_with_tools(&target.provider)
+}
+
+fn provider_supports_vision_with_tools(provider: &str) -> bool {
+    provider == "openai_compatible"
+}
+
+fn unsupported_vision_with_tools_detail(worker: &WorkerSummary, image_count: usize) -> String {
+    let plural = if image_count == 1 { "" } else { "s" };
+    format!(
+        "Nucleus stored the attached image{plural} on this turn, but the selected Utility Worker runtime '{} / {}' cannot inspect image attachments while preserving the Nucleus-owned action path. Image understanding with actions currently requires an OpenAI-compatible Utility Worker model.",
+        worker.provider, worker.model
     )
 }
 
@@ -2167,8 +2256,9 @@ async fn call_worker_model(
     worker: &WorkerSummary,
     conversation: &[CheckpointMessage],
     prompt: &str,
+    images: &[SessionTurnImage],
 ) -> Result<ModelResponse> {
-    let result = execute_worker_model_turn(state, worker, conversation, prompt).await?;
+    let result = execute_worker_model_turn(state, worker, conversation, prompt, images).await?;
     let action = match parse_worker_action(&result.content) {
         Ok(action) => action,
         Err(error) if worker.provider == "openai_compatible" => {
@@ -2176,14 +2266,16 @@ async fn call_worker_model(
             repair_conversation.push(CheckpointMessage {
                 role: "user".to_string(),
                 content: prompt.to_string(),
+                images: Vec::new(),
             });
             repair_conversation.push(CheckpointMessage {
                 role: "assistant".to_string(),
                 content: result.content.clone(),
+                images: Vec::new(),
             });
             let repair_prompt = build_worker_json_repair_prompt(&result.content, &error);
             let repaired =
-                execute_worker_model_turn(state, worker, &repair_conversation, &repair_prompt)
+                execute_worker_model_turn(state, worker, &repair_conversation, &repair_prompt, &[])
                     .await?;
             let action = parse_worker_action(&repaired.content).with_context(|| {
                 format!(
@@ -2216,6 +2308,7 @@ async fn execute_worker_model_turn(
     worker: &WorkerSummary,
     conversation: &[CheckpointMessage],
     prompt: &str,
+    images: &[SessionTurnImage],
 ) -> Result<ProviderTurnResult> {
     let (events, mut receiver) = mpsc::unbounded_channel();
     let execution = build_execution_session(worker);
@@ -2224,13 +2317,14 @@ async fn execute_worker_model_turn(
     let runtimes = state.runtimes.clone();
     let execution_clone = execution.clone();
     let history_clone = history.clone();
+    let images = images.to_vec();
     let handle = tokio::spawn(async move {
         runtimes
             .execute_prompt_stream(
                 &execution_clone,
                 &history_clone,
                 &prompt_body,
-                &[],
+                &images,
                 "utility",
                 events,
             )
@@ -2334,7 +2428,7 @@ fn checkpoint_history(messages: &[CheckpointMessage], session_id: &str) -> Vec<S
             session_id: session_id.to_string(),
             role: message.role.clone(),
             content: message.content.clone(),
-            images: Vec::<SessionTurnImage>::new(),
+            images: message.images.clone(),
             created_at: index as i64,
         })
         .collect()
@@ -2448,9 +2542,9 @@ async fn resolve_approval_request(
             target: format!("approval:{}", resolved.id),
             status: resolved.state.clone(),
             summary: if approved {
-                "Approved a daemon-owned tool mutation.".to_string()
+                "Approved a Nucleus-owned action.".to_string()
             } else {
-                "Denied a daemon-owned tool mutation.".to_string()
+                "Denied a Nucleus-owned action.".to_string()
             },
             detail: format!(
                 "job_id={} worker_id={} tool_call_id={} note={}",
@@ -3316,7 +3410,7 @@ fn preview_command_run(worker: &WorkerSummary, args: CommandRunArgs) -> Result<M
         args.env,
         false,
     )?;
-    let plan = render_command_plan(&spec, "Run a bounded daemon-owned command.");
+    let plan = render_command_plan(&spec, "Run a bounded Nucleus-owned command.");
     Ok(MutationPreview {
         detail: format!("Run {} in {}.", command_label(&spec), spec.cwd.display()),
         diff_preview: excerpt(&plan, DIFF_PREVIEW_CHAR_LIMIT),
@@ -3347,7 +3441,7 @@ fn preview_command_session_open(
         args.env,
         false,
     )?;
-    let plan = render_command_plan(&spec, "Open a daemon-owned interactive command session.");
+    let plan = render_command_plan(&spec, "Open a Nucleus-owned interactive command session.");
     Ok(MutationPreview {
         detail: format!("Open interactive session for {}.", command_label(&spec)),
         diff_preview: excerpt(&plan, DIFF_PREVIEW_CHAR_LIMIT),
@@ -3386,7 +3480,7 @@ fn preview_tests_run(worker: &WorkerSummary, args: TestsRunArgs) -> Result<Mutat
     let spec = resolve_command_spec(
         worker,
         "tests",
-        Some("Daemon-owned test run".to_string()),
+        Some("Nucleus-owned test run".to_string()),
         args.command,
         args.args,
         args.cwd,
@@ -3505,7 +3599,7 @@ fn sanitize_command_env(env: BTreeMap<String, String>) -> Result<BTreeMap<String
         }
         if !is_allowed_command_env_key(trimmed_key) {
             bail!(
-                "environment variable '{}' is not allowed for daemon command tools",
+                "environment variable '{}' is not allowed for Nucleus command actions",
                 trimmed_key
             );
         }
@@ -3609,7 +3703,7 @@ async fn execute_command_run_tool(
     let spec = resolve_command_spec(
         worker,
         "oneshot",
-        Some("Daemon-owned command".to_string()),
+        Some("Nucleus-owned command".to_string()),
         args.command,
         args.args,
         args.cwd,
@@ -3643,7 +3737,7 @@ async fn execute_tests_run_tool(
     let spec = resolve_command_spec(
         worker,
         "tests",
-        Some("Daemon-owned test run".to_string()),
+        Some("Nucleus-owned test run".to_string()),
         args.command,
         args.args,
         args.cwd,
@@ -4044,7 +4138,7 @@ async fn start_command_session(
         event_type: "command.session.started".to_string(),
         status: "running".to_string(),
         summary: format!("Started {}", spec.title),
-        detail: render_command_plan(spec, "Daemon-owned command session started."),
+        detail: render_command_plan(spec, "Nucleus-owned command session started."),
         data_json: json!({
             "command_session_id": command_session_id,
             "tool_call_id": tool_call_id,
@@ -4097,7 +4191,7 @@ async fn wait_for_command_session_completion(
             changed = cancel_rx.changed() => {
                 if changed.is_ok() && *cancel_rx.borrow() {
                     let _ = handle.control.send(CommandControl::Terminate {
-                        reason: format!("{label} was canceled by the daemon."),
+                        reason: format!("{label} was canceled by Nucleus."),
                         final_state: "canceled".to_string(),
                     }).await;
                 }
@@ -4393,7 +4487,7 @@ async fn run_command_session_controller(
             _ = &mut timeout_window => {
                 final_state = "timed_out".to_string();
                 last_error = format!(
-                    "command exceeded the {} second daemon timeout",
+                    "command exceeded the {} second Nucleus timeout",
                     summary.timeout_secs
                 );
                 let _ = terminate_command_process(&mut child).await;
@@ -5001,7 +5095,7 @@ fn policy_for_tool(tool: &str) -> PolicyDecisionRecord {
             reason: if is_mutating_tool(tool) {
                 "repo mutations require explicit operator approval".to_string()
             } else {
-                "daemon-owned command launches require explicit operator approval".to_string()
+                "Nucleus-owned command launches require explicit operator approval".to_string()
             },
             matched_rule: if is_mutating_tool(tool) {
                 format!("approval:mutation:{tool}")
@@ -5024,7 +5118,7 @@ fn policy_for_tool(tool: &str) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
             decision: "allow".to_string(),
             reason: if is_command_follow_up_tool(tool) {
-                "continuing an already-approved daemon command session".to_string()
+                "continuing an already-approved Nucleus command session".to_string()
             } else {
                 "read-only tool inside the session scope".to_string()
             },
@@ -5070,7 +5164,7 @@ fn requires_write_lock(tool: &str) -> bool {
 fn lock_reason_for_tool(tool: &str, summary: &str) -> String {
     let detail = summary.trim();
     if detail.is_empty() {
-        format!("daemon-owned {tool}")
+        format!("Nucleus-owned {tool}")
     } else {
         format!("{tool}: {detail}")
     }
@@ -5183,7 +5277,7 @@ async fn fail_job(state: &AppState, job_id: &str, error: &str) -> Result<()> {
         .agent
         .terminate_job_command_sessions(
             job_id,
-            "The job failed and closed any remaining daemon-owned command sessions.",
+            "The job failed and closed any remaining Nucleus-owned command sessions.",
             "canceled",
         )
         .await;
@@ -5225,7 +5319,7 @@ async fn fail_job(state: &AppState, job_id: &str, error: &str) -> Result<()> {
         worker_id: detail.job.root_worker_id.clone(),
         event_type: "job.failed".to_string(),
         status: "failed".to_string(),
-        summary: "Hidden worker job failed.".to_string(),
+        summary: "Utility Worker job failed.".to_string(),
         detail: excerpt(error, 320),
         data_json: json!({ "error": error }),
     });
@@ -5241,37 +5335,53 @@ async fn resolve_hidden_worker_target(
     state: &AppState,
     session: &SessionSummary,
     compiler_role: &str,
+    needs_vision_tools: bool,
 ) -> Result<HiddenWorkerTarget, ApiError> {
     if compiler_role == "main" {
-        ensure_prompting_runtime(state, &session.provider, false).await?;
-        return Ok(HiddenWorkerTarget {
+        let target = HiddenWorkerTarget {
             provider: session.provider.clone(),
             model: session.model.clone(),
             provider_base_url: session.provider_base_url.clone(),
             provider_api_key: session.provider_api_key.clone(),
-        });
+        };
+        ensure_hidden_worker_target_ready(state, &target, needs_vision_tools).await?;
+        return Ok(target);
     }
 
     let workspace = state.store.workspace()?;
     let profile = resolve_hidden_worker_profile(&workspace, session);
 
     if let Some(profile) = profile {
-        ensure_prompting_runtime(state, &profile.utility.adapter, false).await?;
-        return Ok(HiddenWorkerTarget {
+        let target = HiddenWorkerTarget {
             provider: profile.utility.adapter.clone(),
             model: profile.utility.model.clone(),
             provider_base_url: profile.utility.base_url.clone(),
             provider_api_key: profile.utility.api_key.clone(),
-        });
+        };
+        ensure_hidden_worker_target_ready(state, &target, needs_vision_tools).await?;
+        return Ok(target);
     }
 
-    ensure_prompting_runtime(state, &session.provider, false).await?;
-    Ok(HiddenWorkerTarget {
+    let target = HiddenWorkerTarget {
         provider: session.provider.clone(),
         model: session.model.clone(),
         provider_base_url: session.provider_base_url.clone(),
         provider_api_key: session.provider_api_key.clone(),
-    })
+    };
+    ensure_hidden_worker_target_ready(state, &target, needs_vision_tools).await?;
+    Ok(target)
+}
+
+async fn ensure_hidden_worker_target_ready(
+    state: &AppState,
+    target: &HiddenWorkerTarget,
+    needs_vision_tools: bool,
+) -> Result<(), ApiError> {
+    if needs_vision_tools && !target_supports_vision_with_tools(target) {
+        return Ok(());
+    }
+
+    ensure_prompting_runtime(state, &target.provider, false).await
 }
 
 fn resolve_hidden_worker_profile<'a>(
@@ -5610,7 +5720,7 @@ async fn queue_playbook_job(
     let prompt_excerpt = excerpt(&playbook.prompt, 160);
     let job_id = Uuid::new_v4().to_string();
     let root_worker_id = Uuid::new_v4().to_string();
-    let target = resolve_hidden_worker_target(state, &playbook.session, "utility").await?;
+    let target = resolve_hidden_worker_target(state, &playbook.session, "utility", false).await?;
 
     state.store.update_session(
         &session_id,
@@ -5686,9 +5796,11 @@ async fn queue_playbook_job(
     let checkpoint = WorkerCheckpoint {
         session_id: session_id.clone(),
         prompt_text: playbook.prompt.clone(),
+        images: Vec::new(),
         conversation: vec![CheckpointMessage {
             role: "system".to_string(),
             content: worker_system_prompt(&worker),
+            images: Vec::new(),
         }],
         next_prompt: None,
         pending_action: None,
@@ -5877,7 +5989,7 @@ fn execution_capabilities() -> Vec<ToolCapabilityGrantRecord> {
     vec![
         ToolCapabilityGrantRecord {
             tool_id: "command.run".to_string(),
-            summary: "Run a bounded daemon-owned command and capture logs as artifacts."
+            summary: "Run a bounded Nucleus-owned command and capture logs as artifacts."
                 .to_string(),
             approval_mode: "explicit".to_string(),
             risk_level: "high".to_string(),
@@ -5890,7 +6002,7 @@ fn execution_capabilities() -> Vec<ToolCapabilityGrantRecord> {
         },
         ToolCapabilityGrantRecord {
             tool_id: "command.session.open".to_string(),
-            summary: "Open a bounded interactive command session owned by the daemon.".to_string(),
+            summary: "Open a bounded interactive command session owned by Nucleus.".to_string(),
             approval_mode: "explicit".to_string(),
             risk_level: "high".to_string(),
             side_effect_level: "process".to_string(),
@@ -5902,7 +6014,7 @@ fn execution_capabilities() -> Vec<ToolCapabilityGrantRecord> {
         },
         ToolCapabilityGrantRecord {
             tool_id: "command.session.write".to_string(),
-            summary: "Send input to an approved daemon-owned command session.".to_string(),
+            summary: "Send input to an approved Nucleus-owned command session.".to_string(),
             approval_mode: "auto".to_string(),
             risk_level: "medium".to_string(),
             side_effect_level: "process".to_string(),
@@ -5914,7 +6026,7 @@ fn execution_capabilities() -> Vec<ToolCapabilityGrantRecord> {
         },
         ToolCapabilityGrantRecord {
             tool_id: "command.session.close".to_string(),
-            summary: "Close an approved daemon-owned command session.".to_string(),
+            summary: "Close an approved Nucleus-owned command session.".to_string(),
             approval_mode: "auto".to_string(),
             risk_level: "medium".to_string(),
             side_effect_level: "process".to_string(),
@@ -5972,7 +6084,7 @@ fn worker_system_prompt(worker: &WorkerSummary) -> String {
     };
 
     format!(
-        "You are the hidden Nucleus {} worker for a daemon-owned job.\n\
+        "You are the Utility Nucleus {} worker for a Nucleus-owned job.\n\
 Return exactly one JSON object and nothing else.\n\
 Allowed response shapes:\n\
 {}\n\
@@ -6110,12 +6222,12 @@ mod tests {
         runtime::RuntimeManager,
         updates::{InstanceRuntime, UpdateManager},
     };
-    use nucleus_storage::{JobRecord, StateStore, ToolCallRecord, WorkerRecord};
+    use nucleus_storage::{JobRecord, SessionRecord, StateStore, ToolCallRecord, WorkerRecord};
     use std::{
         env, fs,
         path::{Path, PathBuf},
         sync::Arc,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
     use tokio::sync::broadcast;
 
@@ -6390,10 +6502,12 @@ mod tests {
             CheckpointMessage {
                 role: "system".to_string(),
                 content: "Return exactly one JSON object and nothing else.".to_string(),
+                images: Vec::new(),
             },
             CheckpointMessage {
                 role: "assistant".to_string(),
                 content: "{\"kind\":\"tool_call\"}".to_string(),
+                images: Vec::new(),
             },
         ];
 
@@ -6443,11 +6557,135 @@ mod tests {
         let conversation = vec![CheckpointMessage {
             role: "system".to_string(),
             content: "Return exactly one JSON object and nothing else.".to_string(),
+            images: Vec::new(),
         }];
 
         let prompt = build_worker_prompt_input(&worker, &conversation, "You there?");
 
         assert_eq!(prompt, "You there?");
+    }
+
+    #[test]
+    fn scoped_worker_images_are_attached_only_to_initial_model_turn() {
+        let image = test_image("diagram.png");
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: "session-image".to_string(),
+            prompt_text: "Describe this image.".to_string(),
+            images: vec![image.clone()],
+            conversation: vec![CheckpointMessage {
+                role: "system".to_string(),
+                content: "Return exactly one JSON object and nothing else.".to_string(),
+                images: Vec::new(),
+            }],
+            next_prompt: None,
+            pending_action: None,
+        };
+
+        assert!(should_attach_initial_worker_images(&checkpoint));
+
+        checkpoint.conversation.push(CheckpointMessage {
+            role: "user".to_string(),
+            content: "Describe this image.".to_string(),
+            images: checkpoint.images.clone(),
+        });
+        checkpoint.images.clear();
+
+        assert!(!should_attach_initial_worker_images(&checkpoint));
+        let history = checkpoint_history(&checkpoint.conversation, "job-image");
+        assert_eq!(history[1].images, vec![image]);
+    }
+
+    #[tokio::test]
+    async fn image_prompt_uses_worker_job_and_degrades_without_vision_tool_support() {
+        let state_dir = test_state_dir("image-prompt-degrade");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let session_id = "session-image-degrade".to_string();
+        state
+            .store
+            .create_session(SessionRecord {
+                id: session_id.clone(),
+                title: "Image degradation".to_string(),
+                profile_id: String::new(),
+                profile_title: String::new(),
+                route_id: String::new(),
+                route_title: String::new(),
+                scope: "ad_hoc".to_string(),
+                project_id: String::new(),
+                project_title: String::new(),
+                project_path: String::new(),
+                project_ids: Vec::new(),
+                provider: "claude".to_string(),
+                model: "sonnet".to_string(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                working_dir: workspace_root.display().to_string(),
+                working_dir_kind: "workspace_scratch".to_string(),
+            })
+            .expect("session should persist");
+
+        let payload = SessionPromptRequest {
+            prompt: "What is in this image?".to_string(),
+            images: vec![test_image("photo.png")],
+            role: "main".to_string(),
+        };
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            payload,
+            current,
+            "What is in this image?".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("image prompt should queue a worker job");
+
+        let detail = wait_for_session_state(&state, &session_id, "active").await;
+        let jobs = state
+            .store
+            .list_jobs_for_session(&session_id)
+            .expect("session jobs should load");
+        assert_eq!(jobs.len(), 1);
+        let job = state.store.get_job(&jobs[0].id).expect("job should load");
+        assert_eq!(job.job.state, "completed");
+        assert_eq!(job.workers.len(), 1);
+        assert_eq!(job.workers[0].provider, "claude");
+        assert!(
+            job.job.root_worker_id.is_some(),
+            "image prompt should still create the Nucleus-owned root worker"
+        );
+
+        let user_turn = detail
+            .turns
+            .iter()
+            .find(|turn| turn.role == "user")
+            .expect("visible user turn should persist");
+        assert_eq!(user_turn.content, "What is in this image?");
+        assert_eq!(user_turn.images.len(), 1);
+
+        let assistant_turn = detail
+            .turns
+            .iter()
+            .find(|turn| turn.role == "assistant")
+            .expect("degraded assistant turn should persist");
+        assert!(
+            assistant_turn.content.contains("Nucleus-owned action path"),
+            "assistant response should explicitly explain the degradation: {}",
+            assistant_turn.content
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
     }
 
     #[tokio::test]
@@ -6674,6 +6912,33 @@ mod tests {
             .expect("tool call should persist");
 
         (job_id, worker, tool_call_id)
+    }
+
+    fn test_image(display_name: &str) -> SessionTurnImage {
+        SessionTurnImage {
+            display_name: display_name.to_string(),
+            mime_type: "image/png".to_string(),
+            data_url: "data:image/png;base64,iVBORw0KGgo=".to_string(),
+        }
+    }
+
+    async fn wait_for_session_state(
+        state: &AppState,
+        session_id: &str,
+        expected_state: &str,
+    ) -> SessionDetail {
+        for _ in 0..100 {
+            let detail = state
+                .store
+                .get_session(session_id)
+                .expect("session should load while polling");
+            if detail.session.state == expected_state {
+                return detail;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        panic!("session '{session_id}' did not reach state '{expected_state}'");
     }
 
     fn test_instance_runtime() -> InstanceRuntime {
