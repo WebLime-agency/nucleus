@@ -26,6 +26,7 @@
   import MarkdownContent from '$lib/components/session/markdown-content.svelte';
   import { Badge } from '$lib/components/ui/badge';
   import { Button } from '$lib/components/ui/button';
+  import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
   import {
     approveRequest,
     cancelJob,
@@ -75,6 +76,10 @@
     size_bytes: number;
   };
 
+  type SessionComposerMode = 'plan' | 'ask' | 'trusted';
+
+  const COMPOSER_MODES: SessionComposerMode[] = ['plan', 'ask', 'trusted'];
+
   let overview = $state<RuntimeOverview | null>(null);
   let actions = $state<ActionSummary[]>([]);
   let auditEvents = $state<AuditEvent[]>([]);
@@ -96,6 +101,8 @@
   let promptText = $state('');
   let draftTitle = $state('');
   let draftProfileId = $state('');
+  let draftApprovalMode = $state<'ask' | 'trusted'>('ask');
+  let draftExecutionMode = $state<'act' | 'plan'>('act');
   let jobSummaries = $state<JobSummary[]>([]);
   let jobDetail = $state<JobDetail | null>(null);
   let selectedJobId = $state('');
@@ -108,6 +115,7 @@
   let promptImages = $state<ComposerImage[]>([]);
   let promptProgress = $state<PromptProgressUpdate[]>([]);
   let composerActivityExpanded = $state(false);
+  let composerModeMenuOpen = $state(false);
   let activityJobDetail = $state<JobDetail | null>(null);
   let activityJobRequestInFlight = $state('');
   let transcriptAnchor = $state('');
@@ -147,7 +155,10 @@
   );
   let sessionSettingsDirty = $derived(
     selectedSession
-      ? draftTitle !== selectedSession.title || draftProfileId !== selectedSession.profile_id
+      ? draftTitle !== selectedSession.title ||
+          draftProfileId !== selectedSession.profile_id ||
+          draftApprovalMode !== normalizeApprovalMode(selectedSession.approval_mode) ||
+          draftExecutionMode !== normalizeExecutionMode(selectedSession.execution_mode)
       : false
   );
   let promptReady = $derived(promptText.trim().length > 0 || promptImages.length > 0);
@@ -234,10 +245,15 @@
     }
 
     if (composerActivityPendingApproval) {
+      const toolCall = toolCallForApproval(
+        composerActivityPendingApproval,
+        activityJobDetail?.tool_calls ?? []
+      );
       return {
-        title: formatApprovalSummary(composerActivityPendingApproval),
-        detail:
-          composerActivityPendingApproval.detail || 'Nucleus is waiting for an approval response.',
+        title: `Approval required: ${toolCall ? formatActionLabel(toolCall.tool_id) : formatApprovalSummary(composerActivityPendingApproval)}`,
+        detail: toolCall
+          ? formatToolCallApprovalDetail(toolCall)
+          : formatApprovalDetail(composerActivityPendingApproval),
         state: composerActivityPendingApproval.state
       };
     }
@@ -252,7 +268,7 @@
 
     if (composerActivityToolCall) {
       return {
-        title: composerActivityToolCall.tool_id,
+        title: formatActionLabel(composerActivityToolCall.tool_id),
         detail: formatToolCallSummary(composerActivityToolCall),
         state: composerActivityToolCall.status
       };
@@ -507,6 +523,9 @@
   function setSessionDrafts(session: SessionSummary | null) {
     draftTitle = session?.title ?? '';
     draftProfileId = session?.profile_id ?? '';
+    draftApprovalMode = normalizeApprovalMode(session?.approval_mode);
+    draftExecutionMode = normalizeExecutionMode(session?.execution_mode);
+    composerModeMenuOpen = false;
   }
 
   function upsertJobSummary(next: JobSummary) {
@@ -1111,7 +1130,9 @@
     try {
       const next = await updateSession(selectedSession.id, {
         title: draftTitle,
-        profile_id: draftProfileId || undefined
+        profile_id: draftProfileId || undefined,
+        approval_mode: draftApprovalMode,
+        execution_mode: draftExecutionMode
       });
 
       syncSession(next);
@@ -1119,6 +1140,47 @@
       error = null;
     } catch (cause) {
       error = cause instanceof Error ? cause.message : 'Failed to save the session details.';
+    } finally {
+      savingSession = false;
+    }
+  }
+
+  async function handleSelectComposerMode(mode: SessionComposerMode) {
+    if (!selectedSession || savingSession) {
+      return;
+    }
+
+    const currentMode = sessionComposerMode(selectedSession);
+    if (mode === currentMode) {
+      composerModeMenuOpen = false;
+      return;
+    }
+
+    const nextApprovalMode = mode === 'trusted' ? 'trusted' : 'ask';
+    const nextExecutionMode = mode === 'plan' ? 'plan' : 'act';
+    savingSession = true;
+    composerModeMenuOpen = false;
+    deleteConfirmId = null;
+    actionConfirmId = null;
+
+    try {
+      const next = await updateSession(selectedSession.id, {
+        approval_mode: nextApprovalMode,
+        execution_mode: nextExecutionMode
+      });
+
+      syncSession(next);
+      draftApprovalMode = normalizeApprovalMode(next.session.approval_mode);
+      draftExecutionMode = normalizeExecutionMode(next.session.execution_mode);
+      actionResultMessage =
+        mode === 'plan'
+          ? 'Plan mode enabled for this session.'
+          : mode === 'trusted'
+            ? 'Nucleus can run actions in this session.'
+            : 'Nucleus will ask before commands and edits.';
+      error = null;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to update session mode.';
     } finally {
       savingSession = false;
     }
@@ -1423,6 +1485,165 @@
 
   function formatToolCallSummary(toolCall: ToolCallSummary) {
     return toolCall.summary || toolCall.tool_id;
+  }
+
+  function normalizeApprovalMode(value: string | undefined): 'ask' | 'trusted' {
+    return value === 'trusted' ? 'trusted' : 'ask';
+  }
+
+  function normalizeExecutionMode(value: string | undefined): 'act' | 'plan' {
+    return value === 'plan' ? 'plan' : 'act';
+  }
+
+  function setDraftComposerMode(mode: SessionComposerMode) {
+    draftApprovalMode = mode === 'trusted' ? 'trusted' : 'ask';
+    draftExecutionMode = mode === 'plan' ? 'plan' : 'act';
+  }
+
+  function handleDraftComposerModeChange(event: Event) {
+    setDraftComposerMode((event.currentTarget as HTMLSelectElement).value as SessionComposerMode);
+  }
+
+  function sessionComposerMode(session: SessionSummary): SessionComposerMode {
+    if (normalizeExecutionMode(session.execution_mode) === 'plan') {
+      return 'plan';
+    }
+
+    return normalizeApprovalMode(session.approval_mode) === 'trusted' ? 'trusted' : 'ask';
+  }
+
+  function draftComposerMode(): SessionComposerMode {
+    if (draftExecutionMode === 'plan') {
+      return 'plan';
+    }
+
+    return draftApprovalMode === 'trusted' ? 'trusted' : 'ask';
+  }
+
+  function composerModeLabel(mode: SessionComposerMode) {
+    if (mode === 'plan') return 'Plan';
+    if (mode === 'trusted') return 'Run Actions';
+    return 'Ask First';
+  }
+
+  function composerModeDescription(mode: SessionComposerMode) {
+    if (mode === 'plan') return 'No actions, only a plan.';
+    if (mode === 'trusted') return 'Run actions without approval prompts.';
+    return 'Ask before commands and edits.';
+  }
+
+  function composerModeTriggerClass(mode: SessionComposerMode) {
+    return cn(
+      'inline-flex h-9 items-center justify-center gap-2 rounded-md px-2.5 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 disabled:pointer-events-none disabled:opacity-50 sm:px-3',
+      mode === 'ask'
+        ? 'text-zinc-300 hover:bg-zinc-900 hover:text-zinc-50 focus-visible:ring-zinc-700'
+        : 'bg-zinc-900 text-zinc-100 hover:bg-zinc-800 focus-visible:ring-zinc-700'
+    );
+  }
+
+  function formatActionLabel(toolId: string) {
+    if (toolId === 'command.run') return 'Run command';
+    if (toolId === 'command.session.open') return 'Open command session';
+    if (toolId === 'command.session.write') return 'Send command input';
+    if (toolId === 'command.session.close') return 'Close command session';
+    if (toolId === 'fs.read_text') return 'Read file';
+    if (toolId === 'fs.write_text') return 'Write file';
+    if (toolId === 'fs.patch') return 'Edit file';
+    if (toolId === 'fs.list') return 'List files';
+    if (toolId === 'rg.search') return 'Search files';
+    if (toolId === 'project.inspect') return 'Inspect project';
+    if (toolId === 'git.status') return 'Check git status';
+    if (toolId === 'git.diff') return 'Review git diff';
+    if (toolId === 'git.stage_patch') return 'Stage changes';
+    if (toolId === 'tests.run') return 'Run checks';
+    return toolId;
+  }
+
+  function compactText(value: string, maxChars = 180) {
+    const collapsed = value.replace(/\s+/g, ' ').trim();
+    if (collapsed.length <= maxChars) {
+      return collapsed;
+    }
+
+    return `${collapsed.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
+  }
+
+  function toolCallForApproval(
+    approval: ApprovalRequestSummary,
+    toolCalls: ToolCallSummary[]
+  ): ToolCallSummary | null {
+    return toolCalls.find((toolCall) => toolCall.id === approval.tool_call_id) ?? null;
+  }
+
+  function objectValue(value: unknown): Record<string, unknown> {
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  }
+
+  function stringValue(value: unknown) {
+    return typeof value === 'string' ? value : '';
+  }
+
+  function formatArgs(args: unknown) {
+    if (!Array.isArray(args)) {
+      return '';
+    }
+
+    return args
+      .filter((item): item is string => typeof item === 'string')
+      .map((item) => (/\s/.test(item) ? JSON.stringify(item) : item))
+      .join(' ');
+  }
+
+  function formatToolCallApprovalDetail(toolCall: ToolCallSummary) {
+    const args = objectValue(toolCall.args_json);
+
+    if (toolCall.tool_id === 'command.run') {
+      const command = stringValue(args.command);
+      const commandArgs = formatArgs(args.args);
+      const cwd = stringValue(args.cwd);
+      const commandLine = compactText([command, commandArgs].filter(Boolean).join(' '), 140);
+      return cwd ? `${commandLine} in ${compactPath(cwd)}` : commandLine;
+    }
+
+    if (toolCall.tool_id === 'fs.read_text' || toolCall.tool_id === 'fs.write_text') {
+      const path = stringValue(args.path);
+      return path ? compactPath(path) : formatToolCallSummary(toolCall);
+    }
+
+    if (toolCall.tool_id === 'fs.list') {
+      const path = stringValue(args.path);
+      return path ? `List ${compactPath(path)}` : formatToolCallSummary(toolCall);
+    }
+
+    if (toolCall.tool_id === 'rg.search') {
+      const pattern = stringValue(args.pattern);
+      const path = stringValue(args.path);
+      return compactText([pattern && `Search "${pattern}"`, path && `in ${compactPath(path)}`].filter(Boolean).join(' '));
+    }
+
+    return formatToolCallSummary(toolCall);
+  }
+
+  function formatApprovalTitle(
+    approval: ApprovalRequestSummary,
+    toolCalls: ToolCallSummary[]
+  ) {
+    const toolCall = toolCallForApproval(approval, toolCalls);
+    return toolCall ? formatActionLabel(toolCall.tool_id) : formatApprovalSummary(approval);
+  }
+
+  function formatApprovalDetail(
+    approval: ApprovalRequestSummary,
+    toolCalls: ToolCallSummary[] = []
+  ) {
+    const toolCall = toolCallForApproval(approval, toolCalls);
+    if (toolCall) {
+      return formatToolCallApprovalDetail(toolCall);
+    }
+
+    return compactText(approval.detail || 'Nucleus is waiting for an approval response.');
   }
 
   function formatJsonPreview(value: unknown) {
@@ -1733,55 +1954,82 @@
                   composerActivityExpanded ? 'max-h-[min(30rem,46vh)]' : 'max-h-20'
                 )}
               >
-                <button
-                  type="button"
-                  class="flex w-full items-center gap-3 px-3 py-2.5 text-left"
-                  aria-expanded={composerActivityExpanded}
-                  onclick={() => {
-                    composerActivityExpanded = !composerActivityExpanded;
-                  }}
-                >
-                  <div class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-zinc-800 bg-zinc-900 text-zinc-300">
-                    <Workflow class="size-4" />
-                  </div>
+                <div class="flex flex-col gap-2 px-3 py-2.5 sm:flex-row sm:items-center">
+                  <button
+                    type="button"
+                    class="flex min-w-0 flex-1 items-center gap-3 text-left"
+                    aria-expanded={composerActivityExpanded}
+                    onclick={() => {
+                      composerActivityExpanded = !composerActivityExpanded;
+                    }}
+                  >
+                    <div class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-zinc-800 bg-zinc-900 text-zinc-300">
+                      <Workflow class="size-4" />
+                    </div>
 
-                  <div class="min-w-0 flex-1">
-                    <div class="flex min-w-0 items-center gap-2">
-                      <div class="truncate text-sm font-medium text-zinc-100">
-                        {composerActivitySummary.title}
+                    <div class="min-w-0 flex-1">
+                      <div class="flex min-w-0 items-center gap-2">
+                        <div class="truncate text-sm font-medium text-zinc-100">
+                          {composerActivitySummary.title}
+                        </div>
+                        <Badge variant={badgeVariantForActivityState(composerActivitySummary.state)}>
+                          {formatPromptProgressStatus(composerActivitySummary.state)}
+                        </Badge>
                       </div>
-                      <Badge variant={badgeVariantForActivityState(composerActivitySummary.state)}>
-                        {formatPromptProgressStatus(composerActivitySummary.state)}
-                      </Badge>
+                      <div class="mt-0.5 truncate text-xs text-zinc-500">
+                        {composerActivitySummary.detail}
+                      </div>
                     </div>
-                    <div class="mt-0.5 truncate text-xs text-zinc-500">
-                      {composerActivitySummary.detail}
+
+                    <div class="hidden shrink-0 flex-wrap justify-end gap-x-3 gap-y-1 text-[11px] text-zinc-600 md:flex">
+                      {#if composerActivityJobSummary}
+                        <span>{composerActivityJobSummary.worker_count} Utility Worker{composerActivityJobSummary.worker_count === 1 ? '' : 's'}</span>
+                        <span>{composerActivityJobSummary.pending_approval_count} approvals</span>
+                        <span>{composerActivityJobSummary.artifact_count} artifacts</span>
+                      {/if}
+                      {#if composerActivityToolCall}
+                        <span>Action · {formatActionLabel(composerActivityToolCall.tool_id)}</span>
+                      {:else if composerActivityCommandSession}
+                        <span>Command · {formatCommandSessionSummary(composerActivityCommandSession)}</span>
+                      {:else if composerActivityWorker}
+                        <span>Utility Worker · {composerActivityWorker.title}</span>
+                      {/if}
                     </div>
-                  </div>
 
-                  <div class="hidden shrink-0 flex-wrap justify-end gap-x-3 gap-y-1 text-[11px] text-zinc-600 md:flex">
-                    {#if composerActivityJobSummary}
-                      <span>{composerActivityJobSummary.worker_count} Utility Worker{composerActivityJobSummary.worker_count === 1 ? '' : 's'}</span>
-                      <span>{composerActivityJobSummary.pending_approval_count} approvals</span>
-                      <span>{composerActivityJobSummary.artifact_count} artifacts</span>
-                    {/if}
-                    {#if composerActivityToolCall}
-                      <span>Action · {composerActivityToolCall.tool_id}</span>
-                    {:else if composerActivityCommandSession}
-                      <span>Command · {formatCommandSessionSummary(composerActivityCommandSession)}</span>
-                    {:else if composerActivityWorker}
-                      <span>Utility Worker · {composerActivityWorker.title}</span>
-                    {/if}
-                  </div>
+                    <div class="shrink-0 text-zinc-500">
+                      {#if composerActivityExpanded}
+                        <ChevronDown class="size-4" />
+                      {:else}
+                        <ChevronUp class="size-4" />
+                      {/if}
+                    </div>
+                  </button>
 
-                  <div class="shrink-0 text-zinc-500">
-                    {#if composerActivityExpanded}
-                      <ChevronDown class="size-4" />
-                    {:else}
-                      <ChevronUp class="size-4" />
-                    {/if}
-                  </div>
-                </button>
+                  {#if composerActivityPendingApproval?.state === 'pending'}
+                    <div class="flex shrink-0 gap-2 pl-11 sm:pl-0">
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        disabled={approvalActioningId !== null}
+                        onclick={() => {
+                          void handleApproveRequest(composerActivityPendingApproval);
+                        }}
+                      >
+                        <span>{approvalActioningId === composerActivityPendingApproval.id ? 'Approving' : 'Approve'}</span>
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={approvalActioningId !== null}
+                        onclick={() => {
+                          void handleDenyRequest(composerActivityPendingApproval);
+                        }}
+                      >
+                        <span>{approvalActioningId === composerActivityPendingApproval.id ? 'Resolving' : 'Deny'}</span>
+                      </Button>
+                    </div>
+                  {/if}
+                </div>
 
                 {#if composerActivityExpanded}
                   <div class="border-t border-zinc-800 px-3 pb-3 pt-3">
@@ -1840,7 +2088,7 @@
                               <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-2">
                                 <div class="flex items-start justify-between gap-3">
                                   <div class="min-w-0">
-                                    <div class="truncate text-sm text-zinc-100">{toolCall.tool_id}</div>
+                                    <div class="truncate text-sm text-zinc-100">{formatActionLabel(toolCall.tool_id)}</div>
                                     <div class="mt-1 text-xs text-zinc-500">
                                       {formatToolCallSummary(toolCall)}
                                     </div>
@@ -1866,8 +2114,8 @@
                               <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-2">
                                 <div class="flex items-start justify-between gap-3">
                                   <div class="min-w-0">
-                                    <div class="truncate text-sm text-zinc-100">{formatApprovalSummary(approval)}</div>
-                                    <div class="mt-1 text-xs leading-5 text-zinc-500">{approval.detail}</div>
+                                    <div class="truncate text-sm text-zinc-100">{formatApprovalTitle(approval, activityJobDetail?.tool_calls ?? [])}</div>
+                                    <div class="mt-1 text-xs leading-5 text-zinc-500">{formatApprovalDetail(approval, activityJobDetail?.tool_calls ?? [])}</div>
                                   </div>
                                   <Badge variant={badgeVariantForJobState(approval.state)}>
                                     {formatState(approval.state)}
@@ -2016,6 +2264,7 @@
                 <Button
                   variant="ghost"
                   size="icon"
+                  class="h-9 w-9"
                   aria-label="Attach image"
                   title={composerHint}
                   disabled={
@@ -2029,6 +2278,53 @@
                 >
                   <ImagePlus class="size-4" />
                 </Button>
+
+                <DropdownMenu.Root bind:open={composerModeMenuOpen}>
+                  <DropdownMenu.Trigger
+                    class={composerModeTriggerClass(sessionComposerMode(selectedSession))}
+                    aria-label={`Session mode: ${composerModeLabel(sessionComposerMode(selectedSession))}`}
+                    title={composerModeDescription(sessionComposerMode(selectedSession))}
+                    disabled={savingSession || selectedSession.state === 'archived'}
+                  >
+                    {#if sessionComposerMode(selectedSession) === 'plan'}
+                      <MessageSquare class="size-4" />
+                    {:else}
+                      <Wrench class="size-4" />
+                    {/if}
+                    <span class="hidden sm:inline">{composerModeLabel(sessionComposerMode(selectedSession))}</span>
+                    <ChevronUp class="size-3.5 text-zinc-500" />
+                  </DropdownMenu.Trigger>
+                  <DropdownMenu.Content side="top" align="start" sideOffset={8} class="w-64 max-w-[calc(100vw-2rem)]">
+                    <DropdownMenu.RadioGroup
+                      value={sessionComposerMode(selectedSession)}
+                      onValueChange={(value) => {
+                        if (value === 'plan' || value === 'ask' || value === 'trusted') {
+                          void handleSelectComposerMode(value);
+                        }
+                      }}
+                    >
+                      {#each COMPOSER_MODES as mode}
+                        <DropdownMenu.RadioItem value={mode} class="items-start gap-3 py-2 pl-2 pr-8">
+                          <div class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center text-zinc-400">
+                            {#if mode === 'plan'}
+                              <MessageSquare class="size-4" />
+                            {:else}
+                              <Wrench class="size-4" />
+                            {/if}
+                          </div>
+                          <div class="min-w-0">
+                            <div class="text-sm font-medium text-zinc-100">
+                              {composerModeLabel(mode)}
+                            </div>
+                            <div class="mt-0.5 text-xs leading-5 text-zinc-500">
+                              {composerModeDescription(mode)}
+                            </div>
+                          </div>
+                        </DropdownMenu.RadioItem>
+                      {/each}
+                    </DropdownMenu.RadioGroup>
+                  </DropdownMenu.Content>
+                </DropdownMenu.Root>
 
                 <textarea
                   bind:this={composerTextareaElement}
@@ -2132,6 +2428,22 @@
                   </select>
                 </label>
 
+                <label class="block space-y-2">
+                  <span class="text-xs text-zinc-500">Session Mode</span>
+                  <select
+                    value={draftComposerMode()}
+                    class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
+                    onchange={handleDraftComposerModeChange}
+                  >
+                    {#each COMPOSER_MODES as mode}
+                      <option value={mode}>{composerModeLabel(mode)} - {composerModeDescription(mode)}</option>
+                    {/each}
+                  </select>
+                  <span class="block text-xs leading-5 text-zinc-500">
+                    Choose whether Nucleus plans only, asks before actions, or runs actions without approval prompts.
+                  </span>
+                </label>
+
                 <div class="grid gap-3 sm:grid-cols-2">
                   <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
                     <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Provider</div>
@@ -2176,6 +2488,16 @@
                   <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Provider Thread</div>
                   <div class="mt-2 break-all text-sm text-zinc-100">
                     {selectedSession.provider_session_id || 'Waiting for first successful turn'}
+                  </div>
+                </div>
+
+                <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
+                  <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Session Mode</div>
+                  <div class="mt-2 text-sm text-zinc-100">
+                    {composerModeLabel(sessionComposerMode(selectedSession))}
+                  </div>
+                  <div class="mt-1 text-xs text-zinc-500">
+                    {composerModeDescription(sessionComposerMode(selectedSession))}
                   </div>
                 </div>
 
@@ -2447,7 +2769,7 @@
                                 <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2">
                                   <div class="flex items-center justify-between gap-3">
                                     <div class="min-w-0">
-                                      <div class="truncate text-sm text-zinc-100">{toolCall.tool_id}</div>
+                                      <div class="truncate text-sm text-zinc-100">{formatActionLabel(toolCall.tool_id)}</div>
                                       <div class="mt-1 text-xs text-zinc-500">
                                         {formatToolCallSummary(toolCall)}
                                       </div>
@@ -2477,8 +2799,8 @@
                                 <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2">
                                   <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
-                                      <div class="truncate text-sm text-zinc-100">{formatApprovalSummary(approval)}</div>
-                                      <div class="mt-1 text-xs leading-5 text-zinc-500">{approval.detail}</div>
+                                      <div class="truncate text-sm text-zinc-100">{formatApprovalTitle(approval, jobDetail.tool_calls)}</div>
+                                      <div class="mt-1 text-xs leading-5 text-zinc-500">{formatApprovalDetail(approval, jobDetail.tool_calls)}</div>
                                     </div>
                                     <Badge variant={badgeVariantForJobState(approval.state)}>
                                       {formatState(approval.state)}

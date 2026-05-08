@@ -44,6 +44,8 @@ export const sessionSummarySchema = z.object({
   provider_api_key: z.string(),
   working_dir: z.string(),
   working_dir_kind: z.string(),
+  approval_mode: z.string().default('ask'),
+  execution_mode: z.string().default('act'),
   scope: z.string(),
   project_count: z.number().int().nonnegative(),
   projects: z.array(sessionProjectSummarySchema),
@@ -297,7 +299,9 @@ export const createSessionRequestSchema = z.object({
   model: z.string().trim().optional(),
   project_id: z.string().trim().optional(),
   primary_project_id: z.string().trim().optional(),
-  project_ids: z.array(z.string().trim()).optional()
+  project_ids: z.array(z.string().trim()).optional(),
+  approval_mode: z.enum(['ask', 'trusted']).optional(),
+  execution_mode: z.enum(['act', 'plan']).optional()
 });
 
 export const updateSessionRequestSchema = z.object({
@@ -309,7 +313,9 @@ export const updateSessionRequestSchema = z.object({
   state: z.string().trim().optional(),
   project_id: z.string().trim().optional(),
   primary_project_id: z.string().trim().optional(),
-  project_ids: z.array(z.string().trim()).optional()
+  project_ids: z.array(z.string().trim()).optional(),
+  approval_mode: z.enum(['ask', 'trusted']).optional(),
+  execution_mode: z.enum(['act', 'plan']).optional()
 });
 
 export const sessionPromptRequestSchema = z.object({
