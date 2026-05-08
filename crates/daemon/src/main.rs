@@ -1690,6 +1690,7 @@ struct PromptTarget {
     model: String,
     provider_base_url: String,
     provider_api_key: String,
+    runtime_ready: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2021,18 +2022,23 @@ async fn resolve_profile_targets(
             .iter()
             .find(|runtime| runtime.id == target.provider);
 
-        let item = PromptTarget {
-            provider: target.provider.clone(),
-            model: target.model.clone(),
-            provider_base_url: target.base_url.trim().to_string(),
-            provider_api_key: target.api_key.trim().to_string(),
-        };
-
         match runtime {
             Some(runtime) if runtime.supports_prompting && runtime.state == "ready" => {
-                ready.push(item)
+                ready.push(PromptTarget {
+                    provider: target.provider.clone(),
+                    model: target.model.clone(),
+                    provider_base_url: target.base_url.trim().to_string(),
+                    provider_api_key: target.api_key.trim().to_string(),
+                    runtime_ready: true,
+                })
             }
-            Some(runtime) if runtime.supports_prompting => pending.push(item),
+            Some(runtime) if runtime.supports_prompting => pending.push(PromptTarget {
+                provider: target.provider.clone(),
+                model: target.model.clone(),
+                provider_base_url: target.base_url.trim().to_string(),
+                provider_api_key: target.api_key.trim().to_string(),
+                runtime_ready: false,
+            }),
             _ => {}
         }
     }
