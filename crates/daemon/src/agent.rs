@@ -2532,12 +2532,118 @@ fn parse_worker_action(content: &str) -> Result<WorkerAction> {
         .rfind('}')
         .ok_or_else(|| anyhow!("worker returned no JSON object"))?;
     let candidate = &trimmed[start..=end];
+    if let Ok(value) = serde_json::from_str::<Value>(candidate) {
+        if let Some(action) = normalize_worker_action_value(&value) {
+            return Ok(action);
+        }
+    }
+
     serde_json::from_str::<WorkerAction>(candidate).with_context(|| {
         format!(
             "worker returned invalid JSON action: {}",
             excerpt(trimmed, 220)
         )
     })
+}
+
+fn normalize_worker_action_value(value: &Value) -> Option<WorkerAction> {
+    let object = value.as_object()?;
+
+    if let Some(tool_call) = object.get("tool_call") {
+        return normalize_worker_tool_call_value(tool_call);
+    }
+
+    if let Some(function_call) = object.get("function_call") {
+        return normalize_worker_tool_call_value(function_call);
+    }
+
+    if object.contains_key("tool_name") || object.contains_key("name") {
+        return normalize_worker_tool_call_value(value);
+    }
+
+    None
+}
+
+fn normalize_worker_tool_call_value(value: &Value) -> Option<WorkerAction> {
+    let object = value.as_object()?;
+    let raw_tool = object
+        .get("tool")
+        .or_else(|| object.get("tool_name"))
+        .or_else(|| object.get("name"))
+        .and_then(Value::as_str)?
+        .trim();
+    if raw_tool.is_empty() {
+        return None;
+    }
+
+    let args = object
+        .get("args")
+        .or_else(|| object.get("arguments"))
+        .cloned()
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    let summary = object
+        .get("summary")
+        .or_else(|| object.get("reason"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Run the requested Nucleus action.")
+        .to_string();
+
+    let (tool, args) = normalize_worker_tool_name_and_args(raw_tool, args)?;
+    Some(WorkerAction::ToolCall {
+        summary,
+        tool,
+        args,
+    })
+}
+
+fn normalize_worker_tool_name_and_args(raw_tool: &str, args: Value) -> Option<(String, Value)> {
+    let normalized = raw_tool.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "shell" | "bash" | "terminal" | "command" | "run_command" => {
+            Some(("command.run".to_string(), normalize_shell_tool_args(args)?))
+        }
+        "read_file" | "fs.read" => Some(("fs.read_text".to_string(), args)),
+        "list_files" | "ls" => Some(("fs.list".to_string(), args)),
+        "search" | "grep" | "ripgrep" => Some(("rg.search".to_string(), args)),
+        "git_status" => Some(("git.status".to_string(), args)),
+        "git_diff" => Some(("git.diff".to_string(), args)),
+        tool if tool.contains('.') => Some((raw_tool.trim().to_string(), args)),
+        _ => None,
+    }
+}
+
+fn normalize_shell_tool_args(args: Value) -> Option<Value> {
+    let object = args.as_object()?;
+    let command = object.get("command")?.as_str()?.trim();
+    if command.is_empty() {
+        return None;
+    }
+
+    let mut normalized = serde_json::Map::new();
+    normalized.insert("command".to_string(), Value::String("sh".to_string()));
+    normalized.insert(
+        "args".to_string(),
+        Value::Array(vec![
+            Value::String("-lc".to_string()),
+            Value::String(command.to_string()),
+        ]),
+    );
+
+    for key in [
+        "cwd",
+        "timeout_secs",
+        "output_limit_bytes",
+        "network_policy",
+        "env",
+    ] {
+        if let Some(value) = object.get(key) {
+            normalized.insert(key.to_string(), value.clone());
+        }
+    }
+
+    Some(Value::Object(normalized))
 }
 
 #[derive(Debug)]
@@ -6208,11 +6314,14 @@ fn execution_capabilities() -> Vec<ToolCapabilityGrantRecord> {
 fn worker_system_prompt(worker: &WorkerSummary) -> String {
     let is_root_worker = worker.parent_worker_id.is_none();
     let action_shapes = if is_root_worker {
-        "{\"kind\":\"tool_call\",\"summary\":\"why this tool is next\",\"tool\":\"tool.id\",\"args\":{}}\n\
+        "{\"kind\":\"tool_call\",\"summary\":\"inspect the active project\",\"tool\":\"project.inspect\",\"args\":{}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"list likely project directories\",\"tool\":\"fs.list\",\"args\":{\"path\":\".\",\"recursive\":false,\"limit\":100}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"check running dev processes\",\"tool\":\"command.run\",\"args\":{\"command\":\"sh\",\"args\":[\"-lc\",\"ps -ef | grep -iE 'stfr|vite|next|webpack|dev server' | grep -v grep\"],\"cwd\":\".\",\"timeout_secs\":20}}\n\
 {\"kind\":\"spawn_child_jobs\",\"summary\":\"why parallel exploration helps\",\"jobs\":[{\"title\":\"focused subtask\",\"prompt\":\"precise child prompt\",\"working_dir\":\"optional/path/inside/scope\"}]}\n\
 {\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\"}"
     } else {
-        "{\"kind\":\"tool_call\",\"summary\":\"why this tool is next\",\"tool\":\"tool.id\",\"args\":{}}\n\
+        "{\"kind\":\"tool_call\",\"summary\":\"inspect the active project\",\"tool\":\"project.inspect\",\"args\":{}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"list likely project directories\",\"tool\":\"fs.list\",\"args\":{\"path\":\".\",\"recursive\":false,\"limit\":100}}\n\
 {\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\"}"
     };
     let tool_help = worker
@@ -6249,6 +6358,7 @@ Rules:\n\
 {}\
 - The visible chat will only receive final_answer, not your intermediate reasoning.\n\
 - Do not put plans, next-step instructions, or descriptions of future actions in final_answer.\n\
+- Do not use provider-native tool wrappers such as tool_call/tool_name/shell; use the exact Nucleus JSON shapes above.\n\
 - Do not wrap JSON in markdown fences.\n\
 Available tools:\n{}\n\
 Worker lane: {}\n\
@@ -6627,6 +6737,14 @@ mod tests {
             root_prompt.contains("Do not put plans, next-step instructions"),
             "worker prompt should prevent internal plans from becoming visible answers"
         );
+        assert!(
+            root_prompt.contains("\"tool\":\"command.run\""),
+            "worker prompt should include concrete command.run action shape"
+        );
+        assert!(
+            root_prompt.contains("Do not use provider-native tool wrappers"),
+            "worker prompt should reject provider-native tool-call shapes"
+        );
     }
 
     #[test]
@@ -6661,6 +6779,52 @@ mod tests {
         assert!(
             prompt.contains("Only return final_answer when the text directly answers the user")
         );
+    }
+
+    #[test]
+    fn parses_provider_native_shell_tool_call_as_command_run() {
+        let action = parse_worker_action(
+            r#"{"tool_call":{"tool_name":"shell","arguments":{"command":"pwd && ps -ef | grep -i stfr","cwd":"stfr","timeout_secs":20}}}"#,
+        )
+        .expect("provider-native shell call should normalize");
+
+        let WorkerAction::ToolCall {
+            summary,
+            tool,
+            args,
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(summary, "Run the requested Nucleus action.");
+        assert_eq!(tool, "command.run");
+        assert_eq!(args["command"], "sh");
+        assert_eq!(args["args"][0], "-lc");
+        assert_eq!(args["args"][1], "pwd && ps -ef | grep -i stfr");
+        assert_eq!(args["cwd"], "stfr");
+        assert_eq!(args["timeout_secs"], 20);
+    }
+
+    #[test]
+    fn parses_provider_native_read_file_tool_call() {
+        let action = parse_worker_action(
+            r#"{"tool_call":{"name":"read_file","arguments":{"path":"package.json"},"summary":"read metadata"}}"#,
+        )
+        .expect("provider-native read file call should normalize");
+
+        let WorkerAction::ToolCall {
+            summary,
+            tool,
+            args,
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(summary, "read metadata");
+        assert_eq!(tool, "fs.read_text");
+        assert_eq!(args["path"], "package.json");
     }
 
     #[test]
