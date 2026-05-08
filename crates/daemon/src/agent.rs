@@ -1313,6 +1313,41 @@ async fn run_job_loop(
                 summary,
                 final_answer,
             } => {
+                if should_retry_internal_action_item_final_answer(&final_answer, tool_calls) {
+                    checkpoint.next_prompt = Some(build_internal_action_item_retry_prompt(
+                        &summary,
+                        &final_answer,
+                    ));
+                    state.store.write_worker_checkpoint(
+                        &worker.id,
+                        &serde_json::to_value(&checkpoint)
+                            .context("failed to encode worker checkpoint")?,
+                    )?;
+                    step += 1;
+                    worker = state.store.update_worker(
+                        &worker.id,
+                        WorkerPatch {
+                            state: Some("running".to_string()),
+                            step_count: Some(step),
+                            tool_call_count: Some(tool_calls),
+                            last_error: Some(String::new()),
+                            ..WorkerPatch::default()
+                        },
+                    )?;
+                    let _ = state.store.append_job_event(JobEventRecord {
+                        job_id: job_id.to_string(),
+                        worker_id: Some(worker.id.clone()),
+                        event_type: "worker.retry".to_string(),
+                        status: "retrying".to_string(),
+                        summary: "Rejected internal action item as final answer.".to_string(),
+                        detail: excerpt(&final_answer, 320),
+                        data_json: json!({ "reason": "internal_action_item_final_answer" }),
+                    });
+                    publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+                    publish_worker_updated(state, &worker).await;
+                    continue;
+                }
+
                 complete_job_with_final_answer(
                     state,
                     &session,
@@ -1965,7 +2000,7 @@ async fn create_child_job(
 fn build_child_job_results_prompt(summary: &str, results: &[Value]) -> String {
     format!(
         "Child job results are ready.\nReason for the fan-out: {}\nStructured results:\n{}\n\
-Decide the next single step. If the work is done, return final_answer.",
+Return one JSON action for the next step. If the work is done, return final_answer with a complete user-facing answer.",
         summary,
         serde_json::to_string_pretty(results)
             .unwrap_or_else(|_| Value::Array(results.to_vec()).to_string())
@@ -2188,7 +2223,7 @@ Session title: {}\n\
 Visible provider: {} / {}\n\
 Utility Worker provider: {} / {}\n\
 Prompt-time context and user request:\n{}\n\
-Decide the next single step.",
+Return one JSON action for the next step. If repo or workspace inspection is needed, return a tool_call. Only return final_answer when it is a complete user-facing response, never an action plan or a description of what should happen next.",
         session.title,
         project_context,
         session.provider,
@@ -2210,7 +2245,7 @@ Decide the next single step.",
 fn build_tool_result_prompt(tool: &str, summary: &str, result: &Value) -> String {
     format!(
         "Tool result for {}.\nReason for the call: {}\nStructured result:\n{}\n\
-Decide the next single step. If the work is done, return final_answer.",
+Return one JSON action for the next step. If the work is done, return final_answer with a complete user-facing answer.",
         tool,
         summary,
         format_tool_result(result)
@@ -2220,8 +2255,57 @@ Decide the next single step. If the work is done, return final_answer.",
 fn build_tool_denied_prompt(tool: &str, summary: &str, reason: &str) -> String {
     format!(
         "Nucleus did not allow {}.\nReason for the proposed action: {}\nResolution detail: {}\n\
-Choose the next best single step. If the work can still be completed without this mutation, return final_answer.",
+Return one JSON action for the next step. If the work can still be completed without this mutation, return final_answer with a complete user-facing answer.",
         tool, summary, reason
+    )
+}
+
+fn should_retry_internal_action_item_final_answer(
+    final_answer: &str,
+    tool_call_count: usize,
+) -> bool {
+    if tool_call_count > 0 {
+        return false;
+    }
+
+    let normalized = normalize_action_item_text(final_answer);
+    if normalized.is_empty() {
+        return false;
+    }
+
+    normalized.starts_with("next single step")
+        || normalized.starts_with("single step")
+        || normalized.starts_with("next step")
+        || normalized.starts_with("check whether ")
+        || normalized.starts_with("inspect ")
+        || normalized.starts_with("confirm ")
+        || normalized.starts_with("find the ")
+        || normalized.starts_with("look for ")
+}
+
+fn normalize_action_item_text(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches(|character: char| {
+            character == '-' || character == '*' || character == ':' || character.is_whitespace()
+        })
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn build_internal_action_item_retry_prompt(summary: &str, final_answer: &str) -> String {
+    format!(
+        "Your previous final_answer was an internal action item, not a user-facing answer.\n\
+Previous summary: {}\n\
+Previous final_answer: {}\n\
+Return exactly one valid Nucleus worker action JSON object.\n\
+- If you need repo, workspace, file, git, search, or process information, return a tool_call instead of describing the action.\n\
+- Prefer auto-approved read actions such as project.inspect, fs.list, fs.read_text, rg.search, git.status, and git.diff when they can answer the request.\n\
+- Only return final_answer when the text directly answers the user.",
+        excerpt(summary, 320),
+        excerpt(final_answer, 1_200)
     )
 }
 
@@ -6158,12 +6242,13 @@ Return exactly one JSON object and nothing else.\n\
 Allowed response shapes:\n\
 {}\n\
 Rules:\n\
-- Prefer the smallest useful next step.\n\
+- Choose and execute the smallest useful next action.\n\
 - Use tools only when they materially improve the answer.\n\
 - Never invent tool output.\n\
 - Stay inside the granted repo scope.\n\
 {}\
 - The visible chat will only receive final_answer, not your intermediate reasoning.\n\
+- Do not put plans, next-step instructions, or descriptions of future actions in final_answer.\n\
 - Do not wrap JSON in markdown fences.\n\
 Available tools:\n{}\n\
 Worker lane: {}\n\
@@ -6537,6 +6622,44 @@ mod tests {
         assert!(
             !root_prompt.contains("{{\"kind\""),
             "worker prompt must show valid single-object JSON examples"
+        );
+        assert!(
+            root_prompt.contains("Do not put plans, next-step instructions"),
+            "worker prompt should prevent internal plans from becoming visible answers"
+        );
+    }
+
+    #[test]
+    fn internal_action_item_final_answers_retry_before_any_tool_call() {
+        assert!(should_retry_internal_action_item_final_answer(
+            "Next single step: inspect the workspace to find the `stfr` project.",
+            0
+        ));
+        assert!(should_retry_internal_action_item_final_answer(
+            "Check whether the STFR server process is currently running.",
+            0
+        ));
+        assert!(!should_retry_internal_action_item_final_answer(
+            "I found the STFR project in `/home/eba/dev-projects/dga-clients/stfr`.",
+            0
+        ));
+        assert!(
+            !should_retry_internal_action_item_final_answer("Next step: inspect the workspace.", 1),
+            "after an action has run, concise follow-up guidance can be a valid answer"
+        );
+    }
+
+    #[test]
+    fn internal_action_item_retry_prompt_requires_an_action_or_real_answer() {
+        let prompt = build_internal_action_item_retry_prompt(
+            "Provided the next single step requested by the user",
+            "Next single step: inspect the workspace.",
+        );
+
+        assert!(prompt.contains("not a user-facing answer"));
+        assert!(prompt.contains("return a tool_call"));
+        assert!(
+            prompt.contains("Only return final_answer when the text directly answers the user")
         );
     }
 
