@@ -302,10 +302,20 @@ jobs:
             [ -n "${asset_name}" ] || continue
             asset_id="$(gh release view "${CHANNEL_TAG}" --json assets --jq ".assets[] | select(.name == \"${asset_name}\") | .id" || true)"
             if [ -n "${asset_id}" ]; then
-              gh api \
+              delete_status=0
+              delete_output="$(gh api \
                 --method DELETE \
                 -H "Accept: application/vnd.github+json" \
-                "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
+                "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" 2>&1)" || delete_status=$?
+
+              if [ "${delete_status}" -ne 0 ]; then
+                if printf '%s\n' "${delete_output}" | grep -q "HTTP 404"; then
+                  echo "::warning::Pruned release asset was already absent: ${asset_name}"
+                else
+                  printf '%s\n' "${delete_output}"
+                  exit "${delete_status}"
+                fi
+              fi
             fi
           done <<EOF
           ${PRUNED_ASSETS}
