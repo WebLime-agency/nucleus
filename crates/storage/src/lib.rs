@@ -10,12 +10,13 @@ use nucleus_core::{
     AdapterKind, DEFAULT_OPENAI_COMPATIBLE_BASE_URL, DEFAULT_OPENAI_COMPATIBLE_MODEL, PRODUCT_SLUG,
 };
 use nucleus_protocol::{
-    ApprovalRequestSummary, ArtifactSummary, AuditEvent, CommandSessionSummary, JobDetail,
+    ApprovalRequestSummary, ArtifactSummary, AuditEvent, CommandSessionSummary,
+    DEFAULT_JOB_MAX_STEPS, DEFAULT_JOB_MAX_TOOL_CALLS, DEFAULT_JOB_MAX_WALL_CLOCK_SECS, JobDetail,
     JobEvent, JobSummary, McpServerSummary, PlaybookDetail, PlaybookSummary, PolicyDecisionSummary,
-    ProjectSummary, RouteTarget, RouterProfileSummary, RuntimeSummary, SessionDetail,
-    SessionProjectSummary, SessionSummary, SessionTurn, SessionTurnImage, SkillManifest,
-    StorageSummary, ToolCallSummary, ToolCapabilitySummary, WorkerSummary, WorkspaceModelConfig,
-    WorkspaceProfileSummary, WorkspaceSummary,
+    ProjectSummary, RouteTarget, RouterProfileSummary, RunBudgetSummary, RuntimeSummary,
+    SessionDetail, SessionProjectSummary, SessionSummary, SessionTurn, SessionTurnImage,
+    SkillManifest, StorageSummary, ToolCallSummary, ToolCapabilitySummary, WorkerSummary,
+    WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -60,6 +61,7 @@ pub struct SessionRecord {
     pub working_dir_kind: String,
     pub approval_mode: String,
     pub execution_mode: String,
+    pub run_budget_mode: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -82,6 +84,7 @@ pub struct SessionPatch {
     pub working_dir_kind: Option<String>,
     pub approval_mode: Option<String>,
     pub execution_mode: Option<String>,
+    pub run_budget_mode: Option<String>,
     pub state: Option<String>,
     pub provider_session_id: Option<String>,
     pub last_error: Option<String>,
@@ -585,6 +588,7 @@ impl StateStore {
         default_profile_id: Option<&str>,
         main_target: Option<&str>,
         utility_target: Option<&str>,
+        run_budget: Option<&RunBudgetSummary>,
     ) -> Result<WorkspaceSummary> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         if let Some(root_path) = root_path {
@@ -598,6 +602,9 @@ impl StateStore {
         }
         if let Some(utility_target) = utility_target {
             set_workspace_utility_target(&connection, utility_target)?;
+        }
+        if let Some(run_budget) = run_budget {
+            set_workspace_run_budget(&connection, run_budget)?;
         }
         sync_projects_with_connection(&connection)?;
         load_workspace_summary(&connection)
@@ -801,13 +808,14 @@ impl StateStore {
                 working_dir_kind,
                 approval_mode,
                 execution_mode,
+                run_budget_mode,
                 state,
                 provider_session_id,
                 last_error,
                 last_message_excerpt,
                 turn_count
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 'active', '', '', '', 0)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 'active', '', '', '', 0)
             ",
             params![
                 record.id,
@@ -828,6 +836,7 @@ impl StateStore {
                 record.working_dir_kind,
                 record.approval_mode,
                 record.execution_mode,
+                record.run_budget_mode,
             ],
         )?;
 
@@ -861,6 +870,7 @@ impl StateStore {
         let next_working_dir_kind = patch.working_dir_kind.unwrap_or(current.working_dir_kind);
         let next_approval_mode = patch.approval_mode.unwrap_or(current.approval_mode);
         let next_execution_mode = patch.execution_mode.unwrap_or(current.execution_mode);
+        let next_run_budget_mode = patch.run_budget_mode.unwrap_or(current.run_budget_mode);
         let next_state = patch.state.unwrap_or(current.state);
         let next_provider_session_id = patch
             .provider_session_id
@@ -888,9 +898,10 @@ impl StateStore {
                 working_dir_kind = ?16,
                 approval_mode = ?17,
                 execution_mode = ?18,
-                state = ?19,
-                provider_session_id = ?20,
-                last_error = ?21,
+                run_budget_mode = ?19,
+                state = ?20,
+                provider_session_id = ?21,
+                last_error = ?22,
                 updated_at = unixepoch()
             WHERE id = ?1
             ",
@@ -913,6 +924,7 @@ impl StateStore {
                 next_working_dir_kind,
                 next_approval_mode,
                 next_execution_mode,
+                next_run_budget_mode,
                 next_state,
                 next_provider_session_id,
                 next_last_error,
@@ -1921,6 +1933,7 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             working_dir_kind TEXT NOT NULL DEFAULT 'workspace_scratch',
             approval_mode TEXT NOT NULL DEFAULT 'ask',
             execution_mode TEXT NOT NULL DEFAULT 'act',
+            run_budget_mode TEXT NOT NULL DEFAULT 'inherit',
             state TEXT NOT NULL,
             provider_session_id TEXT NOT NULL DEFAULT '',
             last_error TEXT NOT NULL DEFAULT '',
@@ -2304,6 +2317,12 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
     ensure_column(
         connection,
         "sessions",
+        "run_budget_mode",
+        "TEXT NOT NULL DEFAULT 'inherit'",
+    )?;
+    ensure_column(
+        connection,
+        "sessions",
         "provider_session_id",
         "TEXT NOT NULL DEFAULT ''",
     )?;
@@ -2483,6 +2502,30 @@ fn seed_workspace_settings(connection: &Connection) -> Result<()> {
         ON CONFLICT(key) DO NOTHING
         ",
         [],
+    )?;
+    connection.execute(
+        "
+        INSERT INTO app_settings (key, value)
+        VALUES ('workspace_run_budget_max_steps', ?1)
+        ON CONFLICT(key) DO NOTHING
+        ",
+        params![DEFAULT_JOB_MAX_STEPS.to_string()],
+    )?;
+    connection.execute(
+        "
+        INSERT INTO app_settings (key, value)
+        VALUES ('workspace_run_budget_max_tool_calls', ?1)
+        ON CONFLICT(key) DO NOTHING
+        ",
+        params![DEFAULT_JOB_MAX_TOOL_CALLS.to_string()],
+    )?;
+    connection.execute(
+        "
+        INSERT INTO app_settings (key, value)
+        VALUES ('workspace_run_budget_max_wall_clock_secs', ?1)
+        ON CONFLICT(key) DO NOTHING
+        ",
+        params![DEFAULT_JOB_MAX_WALL_CLOCK_SECS.to_string()],
     )?;
 
     Ok(())
@@ -2860,6 +2903,7 @@ fn load_workspace_summary(connection: &Connection) -> Result<WorkspaceSummary> {
         default_profile_id: default_profile_id.clone(),
         main_target: workspace_main_target(connection)?,
         utility_target: workspace_utility_target(connection)?,
+        run_budget: workspace_run_budget(connection)?,
         profiles: list_workspace_profiles_with_connection(connection, &default_profile_id)?,
         projects: list_projects_with_connection(connection)?,
     })
@@ -2926,6 +2970,79 @@ fn workspace_utility_target(connection: &Connection) -> Result<String> {
 
 fn set_workspace_utility_target(connection: &Connection, target: &str) -> Result<()> {
     set_setting_value(connection, "workspace_utility_target", target)
+}
+
+fn workspace_run_budget(connection: &Connection) -> Result<RunBudgetSummary> {
+    Ok(RunBudgetSummary {
+        mode: "standard".to_string(),
+        max_steps: setting_usize_or_default(
+            connection,
+            "workspace_run_budget_max_steps",
+            DEFAULT_JOB_MAX_STEPS,
+        )?,
+        max_tool_calls: setting_usize_or_default(
+            connection,
+            "workspace_run_budget_max_tool_calls",
+            DEFAULT_JOB_MAX_TOOL_CALLS,
+        )?,
+        max_wall_clock_secs: setting_u64_or_default(
+            connection,
+            "workspace_run_budget_max_wall_clock_secs",
+            DEFAULT_JOB_MAX_WALL_CLOCK_SECS,
+        )?,
+    })
+}
+
+fn set_workspace_run_budget(connection: &Connection, run_budget: &RunBudgetSummary) -> Result<()> {
+    set_setting_value(
+        connection,
+        "workspace_run_budget_max_steps",
+        &run_budget.max_steps.to_string(),
+    )?;
+    set_setting_value(
+        connection,
+        "workspace_run_budget_max_tool_calls",
+        &run_budget.max_tool_calls.to_string(),
+    )?;
+    set_setting_value(
+        connection,
+        "workspace_run_budget_max_wall_clock_secs",
+        &run_budget.max_wall_clock_secs.to_string(),
+    )
+}
+
+fn session_run_budget(connection: &Connection, mode: &str) -> Result<RunBudgetSummary> {
+    let workspace = workspace_run_budget(connection)?;
+    let mode = mode.trim();
+    let mut budget = match mode {
+        "" | "inherit" => workspace,
+        "standard" => RunBudgetSummary::default(),
+        "extended" => RunBudgetSummary {
+            mode: "extended".to_string(),
+            max_steps: 200,
+            max_tool_calls: 400,
+            max_wall_clock_secs: 14_400,
+        },
+        "marathon" => RunBudgetSummary {
+            mode: "marathon".to_string(),
+            max_steps: 600,
+            max_tool_calls: 1_200,
+            max_wall_clock_secs: 28_800,
+        },
+        "unbounded" => RunBudgetSummary {
+            mode: "unbounded".to_string(),
+            max_steps: 0,
+            max_tool_calls: 0,
+            max_wall_clock_secs: 0,
+        },
+        _ => workspace,
+    };
+    budget.mode = if mode.is_empty() {
+        "inherit".to_string()
+    } else {
+        mode.to_string()
+    };
+    Ok(budget)
 }
 
 fn list_workspace_profile_ids(connection: &Connection) -> Result<Vec<String>> {
@@ -3193,6 +3310,18 @@ fn setting_value_optional(connection: &Connection, key: &str) -> Result<Option<S
         )
         .optional()
         .context("failed to load setting")
+}
+
+fn setting_usize_or_default(connection: &Connection, key: &str, default: usize) -> Result<usize> {
+    Ok(setting_value_optional(connection, key)?
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default))
+}
+
+fn setting_u64_or_default(connection: &Connection, key: &str, default: u64) -> Result<u64> {
+    Ok(setting_value_optional(connection, key)?
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default))
 }
 
 fn set_setting_value(connection: &Connection, key: &str, value: &str) -> Result<()> {
@@ -3835,6 +3964,7 @@ fn load_session_summary(connection: &Connection, session_id: &str) -> Result<Ses
                 working_dir_kind,
                 approval_mode,
                 execution_mode,
+                run_budget_mode,
                 state,
                 provider_session_id,
                 last_error,
@@ -3854,6 +3984,7 @@ fn load_session_summary(connection: &Connection, session_id: &str) -> Result<Ses
     session.projects = load_session_projects(connection, session_id)?;
     session.project_count = session.projects.len();
     session.scope = session_scope_from_projects(&session.projects, &session.scope);
+    session.run_budget = session_run_budget(connection, &session.run_budget_mode)?;
 
     if session.project_id.is_empty() {
         if let Some(primary) = session.projects.iter().find(|project| project.is_primary) {
@@ -3886,15 +4017,17 @@ fn map_session_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionS
         working_dir_kind: row.get(15)?,
         approval_mode: row.get(16)?,
         execution_mode: row.get(17)?,
+        run_budget_mode: row.get(18)?,
+        run_budget: RunBudgetSummary::default(),
         project_count: 0,
         projects: Vec::new(),
-        state: row.get(18)?,
-        provider_session_id: row.get(19)?,
-        last_error: row.get(20)?,
-        last_message_excerpt: row.get(21)?,
-        turn_count: row.get(22)?,
-        created_at: row.get(23)?,
-        updated_at: row.get(24)?,
+        state: row.get(19)?,
+        provider_session_id: row.get(20)?,
+        last_error: row.get(21)?,
+        last_message_excerpt: row.get(22)?,
+        turn_count: row.get(23)?,
+        created_at: row.get(24)?,
+        updated_at: row.get(25)?,
     })
 }
 
@@ -5192,6 +5325,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .expect("workspace root should update");
         let project_id = workspace
@@ -5227,6 +5361,7 @@ mod tests {
                         .to_str()
                         .expect("workspace root should be utf-8"),
                 ),
+                None,
                 None,
                 None,
                 None,
@@ -5307,6 +5442,7 @@ mod tests {
                         .to_str()
                         .expect("workspace root should be utf-8"),
                 ),
+                None,
                 None,
                 None,
                 None,
@@ -5404,6 +5540,7 @@ mod tests {
                 working_dir_kind: "workspace_scratch".to_string(),
                 approval_mode: "ask".to_string(),
                 execution_mode: "act".to_string(),
+                run_budget_mode: "inherit".to_string(),
             })
             .expect("session should persist");
         store
@@ -5431,6 +5568,61 @@ mod tests {
             "Hi there"
         );
         assert_eq!(session.session.last_message_excerpt, "Hi there");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn session_run_budget_inherits_workspace_defaults_and_can_override() {
+        let state_dir = test_state_dir("session-run-budget");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let workspace_budget = RunBudgetSummary {
+            mode: "standard".to_string(),
+            max_steps: 120,
+            max_tool_calls: 240,
+            max_wall_clock_secs: 10_800,
+        };
+        store
+            .update_workspace(None, None, None, None, Some(&workspace_budget))
+            .expect("workspace run budget should update");
+        let scratch_dir = store
+            .scratch_dir_for_session("budget-session")
+            .expect("scratch dir should resolve");
+        store
+            .create_session(test_session_record(
+                "budget-session",
+                "Budget session",
+                "ad_hoc",
+                scratch_dir,
+            ))
+            .expect("session should persist");
+
+        let inherited = store
+            .get_session("budget-session")
+            .expect("session should reload")
+            .session;
+        assert_eq!(inherited.run_budget_mode, "inherit");
+        assert_eq!(inherited.run_budget.max_steps, 120);
+        assert_eq!(inherited.run_budget.max_tool_calls, 240);
+        assert_eq!(inherited.run_budget.max_wall_clock_secs, 10_800);
+
+        store
+            .update_session(
+                "budget-session",
+                SessionPatch {
+                    run_budget_mode: Some("unbounded".to_string()),
+                    ..SessionPatch::default()
+                },
+            )
+            .expect("session budget should update");
+        let unbounded = store
+            .get_session("budget-session")
+            .expect("session should reload")
+            .session;
+        assert_eq!(unbounded.run_budget_mode, "unbounded");
+        assert_eq!(unbounded.run_budget.max_steps, 0);
+        assert_eq!(unbounded.run_budget.max_tool_calls, 0);
+        assert_eq!(unbounded.run_budget.max_wall_clock_secs, 0);
 
         let _ = fs::remove_dir_all(&state_dir);
     }
@@ -5464,6 +5656,7 @@ mod tests {
                 working_dir_kind: "workspace_scratch".to_string(),
                 approval_mode: "ask".to_string(),
                 execution_mode: "act".to_string(),
+                run_budget_mode: "inherit".to_string(),
             })
             .expect("session should persist");
 
@@ -5856,6 +6049,7 @@ mod tests {
             working_dir_kind: "workspace_scratch".to_string(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
+            run_budget_mode: "inherit".to_string(),
         }
     }
 }

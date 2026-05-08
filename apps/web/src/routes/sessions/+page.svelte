@@ -7,6 +7,7 @@
     Bot,
     ChevronDown,
     ChevronUp,
+    Clock3,
     FolderTree,
     ImagePlus,
     MessageSquare,
@@ -77,8 +78,16 @@
   };
 
   type SessionComposerMode = 'plan' | 'ask' | 'trusted';
+  type SessionRunBudgetMode = 'inherit' | 'standard' | 'extended' | 'marathon' | 'unbounded';
 
   const COMPOSER_MODES: SessionComposerMode[] = ['plan', 'ask', 'trusted'];
+  const RUN_BUDGET_MODES: SessionRunBudgetMode[] = [
+    'inherit',
+    'standard',
+    'extended',
+    'marathon',
+    'unbounded'
+  ];
 
   let overview = $state<RuntimeOverview | null>(null);
   let actions = $state<ActionSummary[]>([]);
@@ -103,6 +112,7 @@
   let draftProfileId = $state('');
   let draftApprovalMode = $state<'ask' | 'trusted'>('ask');
   let draftExecutionMode = $state<'act' | 'plan'>('act');
+  let draftRunBudgetMode = $state<SessionRunBudgetMode>('inherit');
   let jobSummaries = $state<JobSummary[]>([]);
   let jobDetail = $state<JobDetail | null>(null);
   let selectedJobId = $state('');
@@ -116,6 +126,7 @@
   let promptProgress = $state<PromptProgressUpdate[]>([]);
   let composerActivityExpanded = $state(false);
   let composerModeMenuOpen = $state(false);
+  let runBudgetMenuOpen = $state(false);
   let activityJobDetail = $state<JobDetail | null>(null);
   let activityJobRequestInFlight = $state('');
   let transcriptAnchor = $state('');
@@ -158,7 +169,8 @@
       ? draftTitle !== selectedSession.title ||
           draftProfileId !== selectedSession.profile_id ||
           draftApprovalMode !== normalizeApprovalMode(selectedSession.approval_mode) ||
-          draftExecutionMode !== normalizeExecutionMode(selectedSession.execution_mode)
+          draftExecutionMode !== normalizeExecutionMode(selectedSession.execution_mode) ||
+          draftRunBudgetMode !== normalizeRunBudgetMode(selectedSession.run_budget_mode)
       : false
   );
   let promptReady = $derived(promptText.trim().length > 0 || promptImages.length > 0);
@@ -525,7 +537,9 @@
     draftProfileId = session?.profile_id ?? '';
     draftApprovalMode = normalizeApprovalMode(session?.approval_mode);
     draftExecutionMode = normalizeExecutionMode(session?.execution_mode);
+    draftRunBudgetMode = normalizeRunBudgetMode(session?.run_budget_mode);
     composerModeMenuOpen = false;
+    runBudgetMenuOpen = false;
   }
 
   function upsertJobSummary(next: JobSummary) {
@@ -1132,7 +1146,8 @@
         title: draftTitle,
         profile_id: draftProfileId || undefined,
         approval_mode: draftApprovalMode,
-        execution_mode: draftExecutionMode
+        execution_mode: draftExecutionMode,
+        run_budget_mode: draftRunBudgetMode
       });
 
       syncSession(next);
@@ -1181,6 +1196,38 @@
       error = null;
     } catch (cause) {
       error = cause instanceof Error ? cause.message : 'Failed to update session mode.';
+    } finally {
+      savingSession = false;
+    }
+  }
+
+  async function handleSelectRunBudgetMode(mode: SessionRunBudgetMode) {
+    if (!selectedSession || savingSession) {
+      return;
+    }
+
+    const currentMode = normalizeRunBudgetMode(selectedSession.run_budget_mode);
+    if (mode === currentMode) {
+      runBudgetMenuOpen = false;
+      return;
+    }
+
+    savingSession = true;
+    runBudgetMenuOpen = false;
+    deleteConfirmId = null;
+    actionConfirmId = null;
+
+    try {
+      const next = await updateSession(selectedSession.id, {
+        run_budget_mode: mode
+      });
+
+      syncSession(next);
+      draftRunBudgetMode = normalizeRunBudgetMode(next.session.run_budget_mode);
+      actionResultMessage = `Run budget set to ${runBudgetModeLabel(mode)}.`;
+      error = null;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to update the run budget.';
     } finally {
       savingSession = false;
     }
@@ -1495,6 +1542,19 @@
     return value === 'plan' ? 'plan' : 'act';
   }
 
+  function normalizeRunBudgetMode(value: string | undefined): SessionRunBudgetMode {
+    if (
+      value === 'standard' ||
+      value === 'extended' ||
+      value === 'marathon' ||
+      value === 'unbounded'
+    ) {
+      return value;
+    }
+
+    return 'inherit';
+  }
+
   function setDraftComposerMode(mode: SessionComposerMode) {
     draftApprovalMode = mode === 'trusted' ? 'trusted' : 'ask';
     draftExecutionMode = mode === 'plan' ? 'plan' : 'act';
@@ -1530,6 +1590,57 @@
     if (mode === 'plan') return 'No actions, only a plan.';
     if (mode === 'trusted') return 'Run actions without approval prompts.';
     return 'Ask before commands and edits.';
+  }
+
+  function runBudgetModeLabel(mode: SessionRunBudgetMode) {
+    if (mode === 'inherit') return 'Default';
+    if (mode === 'standard') return 'Focused';
+    if (mode === 'extended') return 'Extended';
+    if (mode === 'marathon') return 'Marathon';
+    return 'Unbounded';
+  }
+
+  function runBudgetModeDescription(mode: SessionRunBudgetMode) {
+    if (mode === 'inherit') return `Use workspace defaults: ${formatBudgetLimits(workspace?.run_budget)}`;
+    if (mode === 'standard') return '80 steps · 160 actions · 2h';
+    if (mode === 'extended') return '200 steps · 400 actions · 4h';
+    if (mode === 'marathon') return '600 steps · 1200 actions · 8h';
+    return 'No step, action, or time cap.';
+  }
+
+  function runBudgetModeHelp(mode: SessionRunBudgetMode) {
+    if (mode === 'inherit') return 'Matches the workspace default configured in Settings.';
+    if (mode === 'standard') return 'For normal multi-step chat, debugging, and small edits.';
+    if (mode === 'extended') return 'For longer coding or research tasks.';
+    if (mode === 'marathon') return 'For several hours of trusted local work.';
+    return 'For trusted sessions where Nucleus should keep going until stopped or blocked.';
+  }
+
+  function formatBudgetLimits(
+    budget: { max_steps: number; max_tool_calls: number; max_wall_clock_secs: number } | null | undefined
+  ) {
+    if (!budget) {
+      return 'workspace default';
+    }
+
+    if (
+      budget.max_steps === 0 &&
+      budget.max_tool_calls === 0 &&
+      budget.max_wall_clock_secs === 0
+    ) {
+      return 'no run cap';
+    }
+
+    const hours = Math.round((budget.max_wall_clock_secs / 3600) * 10) / 10;
+    return `${budget.max_steps} steps · ${budget.max_tool_calls} actions · ${hours}h`;
+  }
+
+  function formatRunBudget(session: SessionSummary) {
+    if (normalizeRunBudgetMode(session.run_budget_mode) === 'unbounded') {
+      return 'No run cap';
+    }
+
+    return formatBudgetLimits(session.run_budget);
   }
 
   function composerModeTriggerClass(mode: SessionComposerMode) {
@@ -2326,6 +2437,54 @@
                   </DropdownMenu.Content>
                 </DropdownMenu.Root>
 
+                <DropdownMenu.Root bind:open={runBudgetMenuOpen}>
+                  <DropdownMenu.Trigger
+                    class="inline-flex h-9 items-center justify-center gap-2 rounded-md px-2.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-900 hover:text-zinc-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-700 disabled:pointer-events-none disabled:opacity-50 sm:px-3"
+                    aria-label={`Run budget: ${runBudgetModeLabel(normalizeRunBudgetMode(selectedSession.run_budget_mode))}`}
+                    title={formatRunBudget(selectedSession)}
+                    disabled={savingSession || selectedSession.state === 'archived'}
+                  >
+                    <Clock3 class="size-4" />
+                    <span class="hidden sm:inline">{runBudgetModeLabel(normalizeRunBudgetMode(selectedSession.run_budget_mode))}</span>
+                    <ChevronUp class="size-3.5 text-zinc-500" />
+                  </DropdownMenu.Trigger>
+                  <DropdownMenu.Content side="top" align="start" sideOffset={8} class="w-72 max-w-[calc(100vw-2rem)]">
+                    <DropdownMenu.RadioGroup
+                      value={normalizeRunBudgetMode(selectedSession.run_budget_mode)}
+                      onValueChange={(value) => {
+                        if (
+                          value === 'inherit' ||
+                          value === 'standard' ||
+                          value === 'extended' ||
+                          value === 'marathon' ||
+                          value === 'unbounded'
+                        ) {
+                          void handleSelectRunBudgetMode(value);
+                        }
+                      }}
+                    >
+                      {#each RUN_BUDGET_MODES as mode}
+                        <DropdownMenu.RadioItem value={mode} class="items-start gap-3 py-2 pl-2 pr-8">
+                          <div class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center text-zinc-400">
+                            <Clock3 class="size-4" />
+                          </div>
+                          <div class="min-w-0">
+                            <div class="text-sm font-medium text-zinc-100">
+                              {runBudgetModeLabel(mode)}
+                            </div>
+                            <div class="mt-0.5 text-xs leading-5 text-zinc-500">
+                              {runBudgetModeDescription(mode)}
+                            </div>
+                            <div class="mt-0.5 text-xs leading-5 text-zinc-600">
+                              {runBudgetModeHelp(mode)}
+                            </div>
+                          </div>
+                        </DropdownMenu.RadioItem>
+                      {/each}
+                    </DropdownMenu.RadioGroup>
+                  </DropdownMenu.Content>
+                </DropdownMenu.Root>
+
                 <textarea
                   bind:this={composerTextareaElement}
                   bind:value={promptText}
@@ -2444,6 +2603,21 @@
                   </span>
                 </label>
 
+                <label class="block space-y-2">
+                  <span class="text-xs text-zinc-500">Run Budget</span>
+                  <select
+                    bind:value={draftRunBudgetMode}
+                    class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
+                  >
+                    {#each RUN_BUDGET_MODES as mode}
+                      <option value={mode}>{runBudgetModeLabel(mode)} - {runBudgetModeDescription(mode)}</option>
+                    {/each}
+                  </select>
+                  <span class="block text-xs leading-5 text-zinc-500">
+                    {runBudgetModeHelp(draftRunBudgetMode)}
+                  </span>
+                </label>
+
                 <div class="grid gap-3 sm:grid-cols-2">
                   <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
                     <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Provider</div>
@@ -2498,6 +2672,16 @@
                   </div>
                   <div class="mt-1 text-xs text-zinc-500">
                     {composerModeDescription(sessionComposerMode(selectedSession))}
+                  </div>
+                </div>
+
+                <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
+                  <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Run Budget</div>
+                  <div class="mt-2 text-sm text-zinc-100">
+                    {runBudgetModeLabel(normalizeRunBudgetMode(selectedSession.run_budget_mode))}
+                  </div>
+                  <div class="mt-1 text-xs text-zinc-500">
+                    {formatRunBudget(selectedSession)}
                   </div>
                 </div>
 

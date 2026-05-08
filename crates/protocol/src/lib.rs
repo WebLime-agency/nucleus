@@ -1,6 +1,34 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub const DEFAULT_JOB_MAX_STEPS: usize = 80;
+pub const DEFAULT_JOB_MAX_TOOL_CALLS: usize = 160;
+pub const DEFAULT_JOB_MAX_WALL_CLOCK_SECS: u64 = 7_200;
+pub const DEFAULT_CHILD_JOB_MAX_STEPS: usize = 24;
+pub const DEFAULT_CHILD_JOB_MAX_TOOL_CALLS: usize = 48;
+pub const MAX_CONFIGURED_JOB_STEPS: usize = 1_000;
+pub const MAX_CONFIGURED_JOB_TOOL_CALLS: usize = 2_000;
+pub const MAX_CONFIGURED_JOB_WALL_CLOCK_SECS: u64 = 86_400;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunBudgetSummary {
+    pub mode: String,
+    pub max_steps: usize,
+    pub max_tool_calls: usize,
+    pub max_wall_clock_secs: u64,
+}
+
+impl Default for RunBudgetSummary {
+    fn default() -> Self {
+        Self {
+            mode: "standard".to_string(),
+            max_steps: DEFAULT_JOB_MAX_STEPS,
+            max_tool_calls: DEFAULT_JOB_MAX_TOOL_CALLS,
+            max_wall_clock_secs: DEFAULT_JOB_MAX_WALL_CLOCK_SECS,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HealthResponse {
     pub status: String,
@@ -68,6 +96,10 @@ pub struct SessionSummary {
     pub approval_mode: String,
     #[serde(default = "default_session_execution_mode")]
     pub execution_mode: String,
+    #[serde(default = "default_session_run_budget_mode")]
+    pub run_budget_mode: String,
+    #[serde(default)]
+    pub run_budget: RunBudgetSummary,
     pub project_count: usize,
     pub projects: Vec<SessionProjectSummary>,
     pub state: String,
@@ -368,6 +400,7 @@ pub struct CreateSessionRequest {
     pub project_ids: Option<Vec<String>>,
     pub approval_mode: Option<String>,
     pub execution_mode: Option<String>,
+    pub run_budget_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -383,6 +416,7 @@ pub struct UpdateSessionRequest {
     pub project_ids: Option<Vec<String>>,
     pub approval_mode: Option<String>,
     pub execution_mode: Option<String>,
+    pub run_budget_mode: Option<String>,
 }
 
 fn default_session_approval_mode() -> String {
@@ -391,6 +425,10 @@ fn default_session_approval_mode() -> String {
 
 fn default_session_execution_mode() -> String {
     "act".to_string()
+}
+
+fn default_session_run_budget_mode() -> String {
+    "inherit".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -548,6 +586,8 @@ pub struct WorkspaceSummary {
     pub default_profile_id: String,
     pub main_target: String,
     pub utility_target: String,
+    #[serde(default)]
+    pub run_budget: RunBudgetSummary,
     pub profiles: Vec<WorkspaceProfileSummary>,
     pub projects: Vec<ProjectSummary>,
 }
@@ -558,6 +598,7 @@ pub struct WorkspaceUpdateRequest {
     pub default_profile_id: Option<String>,
     pub main_target: Option<String>,
     pub utility_target: Option<String>,
+    pub run_budget: Option<RunBudgetSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

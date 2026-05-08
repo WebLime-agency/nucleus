@@ -28,6 +28,13 @@ export const sessionProjectSummarySchema = z.object({
   is_primary: z.boolean()
 });
 
+export const runBudgetSummarySchema = z.object({
+  mode: z.string().default('standard'),
+  max_steps: z.number().int().nonnegative(),
+  max_tool_calls: z.number().int().nonnegative(),
+  max_wall_clock_secs: z.number().int().nonnegative()
+});
+
 export const sessionSummarySchema = z.object({
   id: z.string(),
   title: z.string(),
@@ -46,6 +53,13 @@ export const sessionSummarySchema = z.object({
   working_dir_kind: z.string(),
   approval_mode: z.string().default('ask'),
   execution_mode: z.string().default('act'),
+  run_budget_mode: z.string().default('inherit'),
+  run_budget: runBudgetSummarySchema.default({
+    mode: 'standard',
+    max_steps: 80,
+    max_tool_calls: 160,
+    max_wall_clock_secs: 7200
+  }),
   scope: z.string(),
   project_count: z.number().int().nonnegative(),
   projects: z.array(sessionProjectSummarySchema),
@@ -301,7 +315,8 @@ export const createSessionRequestSchema = z.object({
   primary_project_id: z.string().trim().optional(),
   project_ids: z.array(z.string().trim()).optional(),
   approval_mode: z.enum(['ask', 'trusted']).optional(),
-  execution_mode: z.enum(['act', 'plan']).optional()
+  execution_mode: z.enum(['act', 'plan']).optional(),
+  run_budget_mode: z.enum(['inherit', 'standard', 'extended', 'marathon', 'unbounded']).optional()
 });
 
 export const updateSessionRequestSchema = z.object({
@@ -315,7 +330,8 @@ export const updateSessionRequestSchema = z.object({
   primary_project_id: z.string().trim().optional(),
   project_ids: z.array(z.string().trim()).optional(),
   approval_mode: z.enum(['ask', 'trusted']).optional(),
-  execution_mode: z.enum(['act', 'plan']).optional()
+  execution_mode: z.enum(['act', 'plan']).optional(),
+  run_budget_mode: z.enum(['inherit', 'standard', 'extended', 'marathon', 'unbounded']).optional()
 });
 
 export const sessionPromptRequestSchema = z.object({
@@ -426,6 +442,7 @@ export const workspaceSummarySchema = z.object({
   default_profile_id: z.string(),
   main_target: z.string(),
   utility_target: z.string(),
+  run_budget: runBudgetSummarySchema,
   profiles: z.array(workspaceProfileSummarySchema),
   projects: z.array(projectSummarySchema)
 });
@@ -434,7 +451,8 @@ export const workspaceUpdateRequestSchema = z.object({
   root_path: z.string().trim().min(1).optional(),
   default_profile_id: z.string().trim().min(1).optional(),
   main_target: z.string().trim().min(1).optional(),
-  utility_target: z.string().trim().min(1).optional()
+  utility_target: z.string().trim().min(1).optional(),
+  run_budget: runBudgetSummarySchema.optional()
 });
 
 export const projectUpdateRequestSchema = z.object({
