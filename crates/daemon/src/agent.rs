@@ -5368,13 +5368,16 @@ async fn resolve_hidden_worker_target(
                     runtime_ready: target.runtime_ready,
                 })
                 .collect::<Vec<_>>();
-            let target =
+            let mut target =
                 select_hidden_worker_target(targets, needs_vision_tools).ok_or_else(|| {
                     ApiError::bad_request(format!(
                         "router profile '{}' has no usable targets",
                         route.title
                     ))
                 })?;
+            if target.provider == session.provider && !session.model.trim().is_empty() {
+                target.model = session.model.clone();
+            }
             ensure_hidden_worker_target_ready(state, &target, needs_vision_tools).await?;
             return Ok(target);
         }
@@ -5424,13 +5427,13 @@ fn select_hidden_worker_target(
     needs_vision_tools: bool,
 ) -> Option<HiddenWorkerTarget> {
     if needs_vision_tools {
-        if let Some(target) = targets
+        let ready_vision_target = targets
             .iter()
             .filter(|candidate| candidate.runtime_ready)
             .map(|candidate| &candidate.target)
             .find(|target| target_supports_vision_with_tools(target))
-            .cloned()
-        {
+            .cloned();
+        if let Some(target) = ready_vision_target {
             return Some(target);
         }
     }
@@ -6708,6 +6711,55 @@ mod tests {
         assert_eq!(target.model, "gpt-5.4-mini");
         assert_eq!(target.provider_base_url, "http://127.0.0.1:20128/v1");
         assert_ne!(target.model, session.model);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn main_worker_prompt_preserves_route_session_model_override() {
+        let state_dir = test_state_dir("main-worker-route-model-override");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let session = SessionSummary {
+            id: "session-route-model-override".to_string(),
+            title: "Route model override".to_string(),
+            profile_id: String::new(),
+            profile_title: String::new(),
+            route_id: "balanced".to_string(),
+            route_title: "Balanced".to_string(),
+            scope: "ad_hoc".to_string(),
+            project_id: String::new(),
+            project_title: String::new(),
+            project_path: String::new(),
+            provider: "openai_compatible".to_string(),
+            model: "custom-route-model".to_string(),
+            provider_base_url: "http://127.0.0.1:20128/v1".to_string(),
+            provider_api_key: String::new(),
+            working_dir: workspace_root.display().to_string(),
+            working_dir_kind: "workspace_scratch".to_string(),
+            project_count: 0,
+            projects: Vec::new(),
+            state: "active".to_string(),
+            provider_session_id: String::new(),
+            last_error: String::new(),
+            last_message_excerpt: String::new(),
+            turn_count: 0,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let target = resolve_hidden_worker_target(&state, &session, "main", false)
+            .await
+            .expect("main worker should resolve through the session route");
+
+        assert_eq!(target.provider, "openai_compatible");
+        assert_eq!(target.model, "custom-route-model");
 
         let _ = fs::remove_dir_all(&state_dir);
     }
