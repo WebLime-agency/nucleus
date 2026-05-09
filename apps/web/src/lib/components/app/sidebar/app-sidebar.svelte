@@ -143,7 +143,6 @@
         </DropdownMenu.Root>
 
         <Button
-          variant="outline"
           size="icon"
           class="h-9 w-9"
           disabled={creating || compatibilityBlocked}
