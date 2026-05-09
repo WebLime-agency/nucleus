@@ -1,7 +1,6 @@
 <script lang="ts">
   import { cn } from '$lib/utils';
   import { Button } from '$lib/components/ui/button';
-  import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
   import type {
     ProjectSummary,
     RuntimeOverview,
@@ -9,8 +8,9 @@
     SessionSummary
   } from '$lib/nucleus/schemas';
   import type { StreamStatus } from '$lib/nucleus/realtime';
-  import { MessageSquarePlus, MoreVertical, X } from '@lucide/svelte';
+  import { MessageSquarePlus, X } from '@lucide/svelte';
   import SidebarFooter from './sidebar-footer.svelte';
+  import SidebarProjectList from './sidebar-project-list.svelte';
   import SidebarSessionList from './sidebar-session-list.svelte';
 
   type NavItem = {
@@ -78,6 +78,12 @@
   let selectedCreateProject = $derived(
     projects.find((project) => project.id === createProjectId) ?? null
   );
+  let projectListOpen = $state(false);
+
+  function handleSelectProject(projectId: string) {
+    onSelectCreateProject(projectId);
+    projectListOpen = false;
+  }
 </script>
 
 {#if open}
@@ -99,61 +105,26 @@
     <div class="flex items-center justify-between gap-2">
       <div class="min-w-0 flex-1">
         <div class="truncate text-sm font-semibold text-zinc-100">Nucleus</div>
-        <div
+        <button
+          type="button"
           class={cn(
-            'mt-0.5 truncate text-[11px]',
-            selectedCreateProject ? 'font-medium text-lime-300' : 'text-zinc-600'
+            'mt-0.5 block max-w-full truncate text-left text-[11px] transition-colors hover:text-zinc-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-700 disabled:pointer-events-none disabled:opacity-50',
+            selectedCreateProject ? 'font-medium text-lime-300' : 'text-zinc-600',
+            projectListOpen && 'text-zinc-200'
           )}
+          aria-expanded={projectListOpen}
+          aria-label="Choose project for new session"
+          title="Choose project for new session"
+          disabled={creating || compatibilityBlocked}
+          onclick={() => {
+            projectListOpen = !projectListOpen;
+          }}
         >
           {selectedCreateProject ? selectedCreateProject.title : 'Workspace scratch'}
-        </div>
+        </button>
       </div>
 
       <div class="flex shrink-0 items-center gap-1">
-        <DropdownMenu.Root>
-          <DropdownMenu.Trigger
-            class="inline-flex h-9 w-9 items-center justify-center rounded-md text-zinc-300 transition-colors hover:bg-zinc-900 hover:text-zinc-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-700 disabled:pointer-events-none disabled:opacity-50"
-            disabled={creating || compatibilityBlocked}
-            aria-label="Choose project for new session"
-            title="Choose project for new session"
-          >
-            <MoreVertical class="size-4" />
-          </DropdownMenu.Trigger>
-          <DropdownMenu.Content
-            side="bottom"
-            align="end"
-            alignOffset={52}
-            sideOffset={16}
-            portalProps={{ disabled: true }}
-            class="ml-3 max-h-[min(24rem,calc(100vh-5rem))] w-[15rem] max-w-[calc(100vw-1rem)]"
-          >
-            <DropdownMenu.Label>New session context</DropdownMenu.Label>
-            <DropdownMenu.RadioGroup
-              value={createProjectId}
-              onValueChange={(value) => {
-                onSelectCreateProject(value);
-              }}
-            >
-              <DropdownMenu.RadioItem value="" class="min-w-0 items-start gap-3 py-2 pl-2 pr-8">
-                <div class="min-w-0 flex-1">
-                  <div class="text-sm font-medium text-zinc-100">Workspace scratch</div>
-                  <div class="mt-0.5 text-xs leading-5 text-zinc-500">
-                    Start without an attached project.
-                  </div>
-                </div>
-              </DropdownMenu.RadioItem>
-              {#each projects as project}
-                <DropdownMenu.RadioItem value={project.id} class="min-w-0 items-start gap-3 py-2 pl-2 pr-8">
-                  <div class="min-w-0 flex-1">
-                    <div class="truncate text-sm font-medium text-zinc-100">{project.title}</div>
-                    <div class="mt-0.5 truncate text-xs text-zinc-500">{project.relative_path}</div>
-                  </div>
-                </DropdownMenu.RadioItem>
-              {/each}
-            </DropdownMenu.RadioGroup>
-          </DropdownMenu.Content>
-        </DropdownMenu.Root>
-
         <Button
           size="icon"
           class="h-9 w-9"
@@ -175,21 +146,29 @@
   <div class="flex min-h-0 flex-1 flex-col">
     <div class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
       <div class="px-3 pt-3 text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-600">
-        Sessions
+        {projectListOpen ? 'Projects' : 'Sessions'}
       </div>
-      <SidebarSessionList
-        sessions={sessions.map((session: SessionSummary) => ({
-          id: session.id,
-          title: session.title,
-          projectLabel: projectLabel(session.project_count, session.project_title),
-          turnCount: session.turn_count,
-          excerpt: session.last_message_excerpt ? markdownExcerpt(session.last_message_excerpt) : null,
-          stateLabel: formatState(session.state),
-          stateVariant: badgeVariantForSession(session.state)
-        }))}
-        activeSessionId={activeSidebarSessionId}
-        onOpen={(sessionId) => openNavigation(`/?session=${sessionId}`)}
-      />
+      {#if projectListOpen}
+        <SidebarProjectList
+          {projects}
+          selectedProjectId={createProjectId}
+          onSelect={handleSelectProject}
+        />
+      {:else}
+        <SidebarSessionList
+          sessions={sessions.map((session: SessionSummary) => ({
+            id: session.id,
+            title: session.title,
+            projectLabel: projectLabel(session.project_count, session.project_title),
+            turnCount: session.turn_count,
+            excerpt: session.last_message_excerpt ? markdownExcerpt(session.last_message_excerpt) : null,
+            stateLabel: formatState(session.state),
+            stateVariant: badgeVariantForSession(session.state)
+          }))}
+          activeSessionId={activeSidebarSessionId}
+          onOpen={(sessionId) => openNavigation(`/?session=${sessionId}`)}
+        />
+      {/if}
     </div>
 
     <SidebarFooter
