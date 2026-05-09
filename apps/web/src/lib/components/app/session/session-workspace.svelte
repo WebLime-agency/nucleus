@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { browser } from '$app/environment';
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
   import { onMount, tick } from 'svelte';
@@ -139,7 +140,9 @@
   let routerProfiles = $derived(overview?.router_profiles ?? []);
   let workspace = $derived(overview?.workspace ?? null);
   let workspaceProjects = $derived(workspace?.projects ?? []);
-  let requestedSessionId = $derived(page.url.searchParams.get('session') ?? '');
+  let requestedSessionId = $derived.by(() =>
+    browser ? page.url.searchParams.get('session') ?? '' : ''
+  );
   let selectedSession = $derived(
     detail?.session ?? sessions.find((session) => session.id === selectedSessionId) ?? null
   );
@@ -1358,7 +1361,7 @@
 
       const fallbackId = overview?.sessions.find((session) => session.id !== deletedId)?.id ?? '';
 
-      await goto(fallbackId ? `/sessions?session=${fallbackId}` : '/sessions', {
+      await goto(fallbackId ? `/?session=${fallbackId}` : '/', {
         noScroll: true,
         replaceState: true
       });
@@ -1437,7 +1440,7 @@
   }
 
   async function openSession(sessionId: string) {
-    await goto(`/sessions?session=${sessionId}`, { noScroll: true });
+    await goto(`/?session=${sessionId}`, { noScroll: true });
   }
 
   async function handleCancelJob() {
@@ -2056,7 +2059,7 @@
             {/if}
           </div>
 
-          <div class="shrink-0 border-t border-zinc-900 bg-zinc-950/92 px-3 py-3 sm:px-6">
+          <div class="shrink-0 bg-zinc-950/92 px-3 py-3 sm:px-6">
             {#if composerActivityVisible && composerActivitySummary}
               <section
                 aria-label="Nucleus activity"
@@ -2709,7 +2712,7 @@
                 </div>
               </section>
 
-              <section class="space-y-4 border-t border-zinc-900 pt-6">
+              <section class="space-y-4 pt-6">
                 <div class="space-y-1">
                   <div class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Projects</div>
                   <div class="text-sm text-zinc-400">
@@ -2782,7 +2785,7 @@
                 </div>
               </section>
 
-              <section class="space-y-4 border-t border-zinc-900 pt-6">
+              <section class="space-y-4 pt-6">
                 <div class="space-y-1">
                   <div class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Agent Jobs</div>
                   <div class="text-sm text-zinc-400">
@@ -3127,7 +3130,7 @@
                 {/if}
               </section>
 
-              <section class="space-y-4 border-t border-zinc-900 pt-6">
+              <section class="space-y-4 pt-6">
                 <div class="space-y-1">
                   <div class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Actions</div>
                   <div class="text-sm text-zinc-400">
@@ -3205,7 +3208,7 @@
                 </div>
               </section>
 
-              <section class="space-y-4 border-t border-zinc-900 pt-6">
+              <section class="space-y-4 pt-6">
                 <div class="space-y-1">
                   <div class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Recent Activity</div>
                   <div class="text-sm text-zinc-400">
