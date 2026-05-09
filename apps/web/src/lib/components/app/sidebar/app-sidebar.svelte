@@ -1,7 +1,7 @@
 <script lang="ts">
   import { cn } from '$lib/utils';
   import { Button } from '$lib/components/ui/button';
-  import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
+  import { fly } from 'svelte/transition';
   import type {
     ProjectSummary,
     RuntimeOverview,
@@ -11,6 +11,7 @@
   import type { StreamStatus } from '$lib/nucleus/realtime';
   import { MessageSquarePlus, MoreVertical, X } from '@lucide/svelte';
   import SidebarFooter from './sidebar-footer.svelte';
+  import SidebarProjectPicker from './sidebar-project-picker.svelte';
   import SidebarSessionList from './sidebar-session-list.svelte';
 
   type NavItem = {
@@ -78,6 +79,12 @@
   let selectedCreateProject = $derived(
     projects.find((project) => project.id === createProjectId) ?? null
   );
+  let projectPickerOpen = $state(false);
+
+  function handleSelectProject(projectId: string) {
+    onSelectCreateProject(projectId);
+    projectPickerOpen = false;
+  }
 </script>
 
 {#if open}
@@ -105,47 +112,20 @@
       </div>
 
       <div class="flex shrink-0 items-center gap-1">
-        <DropdownMenu.Root>
-          <DropdownMenu.Trigger
-            class="inline-flex h-9 w-9 items-center justify-center rounded-md text-zinc-300 transition-colors hover:bg-zinc-900 hover:text-zinc-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-700 disabled:pointer-events-none disabled:opacity-50"
-            disabled={creating || compatibilityBlocked}
-            aria-label="Choose project for new session"
-            title="Choose project for new session"
-          >
-            <MoreVertical class="size-4" />
-          </DropdownMenu.Trigger>
-          <DropdownMenu.Content
-            side="bottom"
-            align="end"
-            sideOffset={8}
-            class="max-h-[min(24rem,calc(100vh-5rem))] w-[15rem] max-w-[calc(100vw-1rem)]"
-          >
-            <DropdownMenu.Label>New session context</DropdownMenu.Label>
-            <DropdownMenu.RadioGroup
-              value={createProjectId}
-              onValueChange={(value) => {
-                onSelectCreateProject(value);
-              }}
-            >
-              <DropdownMenu.RadioItem value="" class="min-w-0 items-start gap-3 py-2 pl-2 pr-8">
-                <div class="min-w-0 flex-1">
-                  <div class="text-sm font-medium text-zinc-100">Workspace scratch</div>
-                  <div class="mt-0.5 text-xs leading-5 text-zinc-500">
-                    Start without an attached project.
-                  </div>
-                </div>
-              </DropdownMenu.RadioItem>
-              {#each projects as project}
-                <DropdownMenu.RadioItem value={project.id} class="min-w-0 items-start gap-3 py-2 pl-2 pr-8">
-                  <div class="min-w-0 flex-1">
-                    <div class="truncate text-sm font-medium text-zinc-100">{project.title}</div>
-                    <div class="mt-0.5 truncate text-xs text-zinc-500">{project.relative_path}</div>
-                  </div>
-                </DropdownMenu.RadioItem>
-              {/each}
-            </DropdownMenu.RadioGroup>
-          </DropdownMenu.Content>
-        </DropdownMenu.Root>
+        <Button
+          variant="ghost"
+          size="icon"
+          class="h-9 w-9"
+          disabled={creating || compatibilityBlocked}
+          aria-label={projectPickerOpen ? 'Show sessions' : 'Choose project for new session'}
+          title={projectPickerOpen ? 'Show sessions' : 'Choose project for new session'}
+          aria-pressed={projectPickerOpen}
+          onclick={() => {
+            projectPickerOpen = !projectPickerOpen;
+          }}
+        >
+          <MoreVertical class="size-4" />
+        </Button>
 
         <Button
           size="icon"
@@ -167,22 +147,52 @@
 
   <div class="flex min-h-0 flex-1 flex-col">
     <div class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
-      <div class="px-3 pt-3 text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-600">
-        Sessions
+      <div class="flex items-center justify-between gap-2 px-3 pt-3">
+        <div class="min-w-0 truncate text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-600">
+          {projectPickerOpen ? 'New Session Context' : 'Sessions'}
+        </div>
+        {#if projectPickerOpen}
+          <Button
+            variant="ghost"
+            size="sm"
+            class="h-7 px-2"
+            onclick={() => {
+              projectPickerOpen = false;
+            }}
+          >
+            Sessions
+          </Button>
+        {/if}
       </div>
-      <SidebarSessionList
-        sessions={sessions.map((session: SessionSummary) => ({
-          id: session.id,
-          title: session.title,
-          projectLabel: projectLabel(session.project_count, session.project_title),
-          turnCount: session.turn_count,
-          excerpt: session.last_message_excerpt ? markdownExcerpt(session.last_message_excerpt) : null,
-          stateLabel: formatState(session.state),
-          stateVariant: badgeVariantForSession(session.state)
-        }))}
-        activeSessionId={activeSidebarSessionId}
-        onOpen={(sessionId) => openNavigation(`/?session=${sessionId}`)}
-      />
+
+      {#key projectPickerOpen}
+        <div
+          in:fly={{ x: projectPickerOpen ? 12 : -12, duration: 140 }}
+          out:fly={{ x: projectPickerOpen ? -12 : 12, duration: 100 }}
+        >
+          {#if projectPickerOpen}
+            <SidebarProjectPicker
+              {projects}
+              selectedProjectId={createProjectId}
+              onSelect={handleSelectProject}
+            />
+          {:else}
+            <SidebarSessionList
+              sessions={sessions.map((session: SessionSummary) => ({
+                id: session.id,
+                title: session.title,
+                projectLabel: projectLabel(session.project_count, session.project_title),
+                turnCount: session.turn_count,
+                excerpt: session.last_message_excerpt ? markdownExcerpt(session.last_message_excerpt) : null,
+                stateLabel: formatState(session.state),
+                stateVariant: badgeVariantForSession(session.state)
+              }))}
+              activeSessionId={activeSidebarSessionId}
+              onOpen={(sessionId) => openNavigation(`/?session=${sessionId}`)}
+            />
+          {/if}
+        </div>
+      {/key}
     </div>
 
     <SidebarFooter
