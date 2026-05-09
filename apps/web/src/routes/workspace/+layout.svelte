@@ -25,7 +25,7 @@
 
 <div class="flex flex-col gap-5 lg:flex-row lg:items-start lg:gap-6">
   <nav
-    class="-mx-4 flex shrink-0 gap-2 overflow-x-auto border-b border-zinc-900 px-4 pb-3 sm:-mx-6 sm:px-6 lg:mx-0 lg:w-44 lg:flex-col lg:gap-1 lg:overflow-visible lg:border-b-0 lg:border-r lg:border-zinc-900 lg:px-0 lg:pb-0 lg:pr-4"
+    class="-mx-4 flex shrink-0 gap-2 overflow-x-auto border-b border-zinc-900 px-4 pb-3 sm:-mx-6 sm:px-6 lg:sticky lg:top-0 lg:mx-0 lg:max-h-screen lg:w-44 lg:flex-col lg:gap-1 lg:self-start lg:overflow-y-auto lg:overflow-x-visible lg:border-b-0 lg:border-r lg:border-zinc-900 lg:px-0 lg:pb-0 lg:pr-4"
     aria-label="Workspace navigation"
   >
     {#each tabs as tab}
