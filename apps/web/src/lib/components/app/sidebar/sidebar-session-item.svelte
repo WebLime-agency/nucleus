@@ -30,16 +30,16 @@
 <button
   type="button"
   class={cn(
-    'w-full rounded-lg border px-3 py-3 text-left transition-colors',
+    'w-full min-w-0 overflow-hidden rounded-lg border px-3 py-3 text-left transition-colors',
     active ? 'border-lime-300/30 bg-lime-300/10' : 'border-zinc-900 bg-zinc-950 hover:bg-zinc-900'
   )}
   {onclick}
 >
   <div class="flex items-start justify-between gap-3">
-    <div class="min-w-0">
+    <div class="min-w-0 flex-1">
       <div class="truncate text-sm font-medium text-zinc-100">{title}</div>
-      <div class="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-zinc-500">
-        <span>{projectLabel}</span>
+      <div class="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-zinc-500">
+        <span class="min-w-0 max-w-full truncate">{projectLabel}</span>
         <span>{turnCount} turns</span>
       </div>
       {#if excerpt}
