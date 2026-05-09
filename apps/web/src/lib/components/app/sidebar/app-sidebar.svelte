@@ -122,9 +122,10 @@
           <DropdownMenu.Content
             side="bottom"
             align="end"
-            sideOffset={8}
+            alignOffset={52}
+            sideOffset={16}
             portalProps={{ disabled: true }}
-            class="max-h-[min(24rem,calc(100vh-5rem))] w-[15rem] max-w-[calc(100vw-1rem)]"
+            class="ml-3 max-h-[min(24rem,calc(100vh-5rem))] w-[15rem] max-w-[calc(100vw-1rem)]"
           >
             <DropdownMenu.Label>New session context</DropdownMenu.Label>
             <DropdownMenu.RadioGroup
