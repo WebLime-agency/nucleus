@@ -29,9 +29,14 @@
   import { Badge } from '$lib/components/ui/badge';
   import { Button } from '$lib/components/ui/button';
   import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
+  import { Input } from '$lib/components/ui/input';
+  import { Label } from '$lib/components/ui/label';
+  import { Select } from '$lib/components/ui/select';
+  import { Textarea } from '$lib/components/ui/textarea';
   import {
     approveRequest,
     cancelJob,
+    createSession,
     deleteSession,
     denyRequest,
     fetchActions,
@@ -225,15 +230,6 @@
     () => jobSummaries.find((job) => jobIsActive(job.state)) ?? jobSummaries[0] ?? null
   );
   let composerActivityJobId = $derived(composerActivityJobSummary?.id ?? '');
-  let composerActivityVisible = $derived(
-    Boolean(
-      selectedSession &&
-        (activePromptProgress ||
-          jobSummaries.length > 0 ||
-          selectedSession.state === 'running' ||
-          selectedSession.state === 'paused')
-    )
-  );
   let composerActivityPendingApproval = $derived.by(() =>
     latestPendingApproval(activityJobDetail?.approvals ?? [])
   );
@@ -328,6 +324,21 @@
     }
 
     return null;
+  });
+  let composerActivityDisplay = $derived.by(() => {
+    if (composerActivitySummary) {
+      return composerActivitySummary;
+    }
+
+    if (!selectedSession) {
+      return null;
+    }
+
+    return {
+      title: 'Utility Worker activity',
+      detail: 'No active background work for this session.',
+      state: 'idle'
+    };
   });
 
   function uniqueId() {
@@ -1263,22 +1274,32 @@
   }
 
   async function handlePromptSubmit() {
-    if (
-      !selectedSession ||
-      !promptReady ||
-      selectedSession.state === 'running' ||
-      selectedSession.state === 'paused'
-    ) {
+    if (!promptReady || selectedSession?.state === 'running' || selectedSession?.state === 'paused') {
       return;
     }
-
-    const submittedSession = selectedSession;
-    const submittedPrompt = promptText;
-    const submittedImages = [...promptImages];
 
     sending = true;
     deleteConfirmId = null;
     actionConfirmId = null;
+
+    let submittedSession = selectedSession;
+
+    if (!submittedSession) {
+      try {
+        const next = await createSession({});
+        syncSession(next);
+        submittedSession = next.session;
+        await goto(`/?session=${next.session.id}`, { noScroll: true, replaceState: true });
+      } catch (cause) {
+        error = cause instanceof Error ? cause.message : 'Failed to create the session.';
+        sending = false;
+        return;
+      }
+    }
+
+    const submittedPrompt = promptText;
+    const submittedImages = [...promptImages];
+
     beginOptimisticPrompt(submittedSession, submittedPrompt, submittedImages);
     clearComposerState();
     window.setTimeout(() => {
@@ -1585,14 +1606,14 @@
 
   function composerModeLabel(mode: SessionComposerMode) {
     if (mode === 'plan') return 'Plan';
-    if (mode === 'trusted') return 'Run Actions';
+    if (mode === 'trusted') return 'Auto-Run';
     return 'Ask First';
   }
 
   function composerModeDescription(mode: SessionComposerMode) {
-    if (mode === 'plan') return 'No actions, only a plan.';
-    if (mode === 'trusted') return 'Run actions without approval prompts.';
-    return 'Ask before commands and edits.';
+    if (mode === 'plan') return 'Draft a plan without taking actions.';
+    if (mode === 'trusted') return 'Run trusted actions without approval prompts.';
+    return 'Ask before commands, edits, and other actions.';
   }
 
   function runBudgetModeLabel(mode: SessionRunBudgetMode) {
@@ -1885,7 +1906,7 @@
   });
 </script>
 
-<div class="flex h-full min-h-0 min-w-0 flex-1 overflow-hidden">
+<div class="flex min-h-0 min-w-0 flex-1 self-stretch overflow-hidden">
   <div class="flex min-h-0 min-w-0 flex-1 overflow-hidden border-y border-zinc-900 bg-zinc-950/70 lg:border-x">
     {#if loading && sessions.length === 0}
       <div class="flex flex-1 items-center justify-center px-8">
@@ -1900,19 +1921,78 @@
         </div>
       </div>
     {:else if !selectedSession}
-      <div class="flex flex-1 items-center justify-center px-8">
-        <div class="max-w-lg text-center">
-          <div class="inline-flex h-14 w-14 items-center justify-center rounded-full border border-zinc-800 bg-zinc-900/80">
-            <MessageSquare class="size-6 text-zinc-400" />
+      <div class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+        <div class="flex min-h-0 flex-1 items-center justify-center px-8">
+          <div class="max-w-lg text-center">
+            <div class="inline-flex h-14 w-14 items-center justify-center rounded-full border border-zinc-800 bg-zinc-900/80">
+              <MessageSquare class="size-6 text-zinc-400" />
+            </div>
+            <div class="mt-4 text-lg font-medium text-zinc-100">Start a session</div>
+            <div class="mt-2 text-sm leading-6 text-zinc-500">
+              Send a prompt below or choose an existing session from the sidebar.
+            </div>
+            <div class="mt-4 inline-flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-900/80 px-3 py-1.5 text-xs text-zinc-400">
+              <span>{statusLabel}</span>
+              <span class="text-zinc-700">/</span>
+              <span>{sessions.length} sessions</span>
+            </div>
           </div>
-          <div class="mt-4 text-lg font-medium text-zinc-100">Select or start a session</div>
-          <div class="mt-2 text-sm leading-6 text-zinc-500">
-            Session history stays in the sidebar. Open one there and the full work surface stays here.
-          </div>
-          <div class="mt-4 inline-flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-900/80 px-3 py-1.5 text-xs text-zinc-400">
-            <span>{statusLabel}</span>
-            <span class="text-zinc-700">/</span>
-            <span>{sessions.length} sessions</span>
+        </div>
+
+        <div class="shrink-0 border-t border-zinc-900 bg-zinc-950/95 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 sm:px-6">
+          <section
+            aria-label="Nucleus activity"
+            class="mb-3 overflow-hidden rounded-lg border border-zinc-800 bg-zinc-950/95 shadow-2xl shadow-black/25"
+          >
+            <div class="flex items-center gap-3 px-3 py-2.5">
+              <div class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-zinc-800 bg-zinc-900 text-zinc-300">
+                <Workflow class="size-4" />
+              </div>
+              <div class="min-w-0 flex-1">
+                <div class="flex min-w-0 items-center gap-2">
+                  <div class="truncate text-sm font-medium text-zinc-100">Utility Worker activity</div>
+                  <Badge variant="secondary">Idle</Badge>
+                </div>
+                <div class="mt-0.5 truncate text-xs text-zinc-500">
+                  Work details will appear here after the first prompt starts.
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <div
+            role="group"
+            aria-label="Session composer"
+            class="rounded-lg border border-zinc-800 bg-zinc-900/85 p-2"
+          >
+            <div class="flex items-end gap-2">
+              <Textarea
+                bind:ref={composerTextareaElement}
+                bind:value={promptText}
+                rows={1}
+                class="max-h-[10.5rem] min-h-10 flex-1 resize-none border-0 bg-transparent px-1 py-2 text-sm leading-5 text-zinc-100 focus:border-transparent focus-visible:ring-0"
+                placeholder="Send a message..."
+                spellcheck={false}
+                aria-describedby="starter-composer-hint"
+                disabled={sending}
+                onkeydown={handleComposerKeydown}
+                onpaste={handleComposerPaste}
+              ></Textarea>
+
+              <Button
+                variant="default"
+                size="icon"
+                aria-label={sending ? 'Starting session' : 'Start session'}
+                disabled={!promptReady || sending}
+                onclick={handlePromptSubmit}
+              >
+                <Send class={cn('size-4', sending && 'animate-pulse')} />
+              </Button>
+            </div>
+
+            <div id="starter-composer-hint" class="sr-only">
+              Press Enter to send. Press Shift and Enter to add a new line.
+            </div>
           </div>
         </div>
       </div>
@@ -1972,7 +2052,7 @@
               </span>
               <span class="inline-flex items-center gap-1.5">
                 <FolderTree class="size-3.5" />
-                <span>{selectedProjectTitle}</span>
+                <span class="min-w-0 max-w-56 truncate">{selectedProjectTitle}</span>
               </span>
               <span>{selectedSession.turn_count} turns</span>
               <span>{formatDateTime(selectedSession.updated_at)}</span>
@@ -2059,12 +2139,12 @@
             {/if}
           </div>
 
-          <div class="shrink-0 bg-zinc-950/92 px-3 py-3 sm:px-6">
-            {#if composerActivityVisible && composerActivitySummary}
+          <div class="shrink-0 border-t border-zinc-900 bg-zinc-950/95 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 sm:px-6">
+            {#if composerActivityDisplay}
               <section
                 aria-label="Nucleus activity"
                 class={cn(
-                  'mb-2 overflow-hidden rounded-xl border border-zinc-800 bg-zinc-950/95 shadow-2xl shadow-black/25 transition-[max-height]',
+                  'mb-3 overflow-hidden rounded-lg border border-zinc-800 bg-zinc-950/95 shadow-2xl shadow-black/25 transition-[max-height]',
                   composerActivityExpanded ? 'max-h-[min(30rem,46vh)]' : 'max-h-20'
                 )}
               >
@@ -2084,14 +2164,14 @@
                     <div class="min-w-0 flex-1">
                       <div class="flex min-w-0 items-center gap-2">
                         <div class="truncate text-sm font-medium text-zinc-100">
-                          {composerActivitySummary.title}
+                          {composerActivityDisplay.title}
                         </div>
-                        <Badge variant={badgeVariantForActivityState(composerActivitySummary.state)}>
-                          {formatPromptProgressStatus(composerActivitySummary.state)}
+                        <Badge variant={badgeVariantForActivityState(composerActivityDisplay.state)}>
+                          {formatPromptProgressStatus(composerActivityDisplay.state)}
                         </Badge>
                       </div>
                       <div class="mt-0.5 truncate text-xs text-zinc-500">
-                        {composerActivitySummary.detail}
+                        {composerActivityDisplay.detail}
                       </div>
                     </div>
 
@@ -2148,6 +2228,12 @@
                 {#if composerActivityExpanded}
                   <div class="border-t border-zinc-800 px-3 pb-3 pt-3">
                     <div class="max-h-[min(24rem,38vh)] space-y-4 overflow-y-auto pr-1">
+                      {#if promptProgress.length === 0 && !activityJobDetail}
+                        <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3 text-sm text-zinc-500">
+                          Utility Worker activity will appear here when Nucleus starts work for this session.
+                        </div>
+                      {/if}
+
                       {#if promptProgress.length > 0}
                         <div>
                           <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Prompt Progress</div>
@@ -2336,7 +2422,7 @@
               role="group"
               aria-label="Session composer"
               class={cn(
-                'rounded-xl border bg-zinc-900/85 p-2 transition-colors',
+                'rounded-lg border bg-zinc-900/85 p-2 transition-colors',
                 dragOver ? 'border-lime-300/50 bg-lime-300/8' : 'border-zinc-800'
               )}
               ondragover={handleComposerDragOver}
@@ -2488,11 +2574,11 @@
                   </DropdownMenu.Content>
                 </DropdownMenu.Root>
 
-                <textarea
-                  bind:this={composerTextareaElement}
+                <Textarea
+                  bind:ref={composerTextareaElement}
                   bind:value={promptText}
-                  rows="1"
-                  class="max-h-[10.5rem] min-h-10 flex-1 resize-none bg-transparent px-1 py-2 text-sm leading-5 text-zinc-100 outline-none placeholder:text-zinc-500"
+                  rows={1}
+                  class="max-h-[10.5rem] min-h-10 flex-1 resize-none border-0 bg-transparent px-1 py-2 text-sm leading-5 text-zinc-100 focus:border-transparent focus-visible:ring-0"
                   placeholder="Send a message..."
                   spellcheck={false}
                   aria-describedby="composer-hint"
@@ -2503,7 +2589,7 @@
                   }
                   onkeydown={handleComposerKeydown}
                   onpaste={handleComposerPaste}
-                ></textarea>
+                ></Textarea>
 
                 <Button
                   variant="default"
@@ -2539,7 +2625,7 @@
             }}
           ></button>
 
-          <aside class="fixed inset-y-0 right-0 z-20 flex w-full max-w-md flex-col overflow-y-auto border-l border-zinc-900 bg-zinc-950 lg:static lg:z-auto">
+          <aside class="fixed inset-y-0 right-0 z-20 flex w-full min-w-0 max-w-md flex-col overflow-y-auto overflow-x-hidden border-l border-zinc-900 bg-zinc-950 lg:static lg:z-auto lg:w-96 lg:max-w-96 lg:shrink-0">
             <div class="flex items-center justify-between border-b border-zinc-900 px-5 py-4">
               <div>
                 <div class="text-sm font-medium text-zinc-100">Session Details</div>
@@ -2557,8 +2643,8 @@
               </Button>
             </div>
 
-            <div class="space-y-6 px-5 py-5">
-              <section class="space-y-4">
+            <div class="min-w-0 space-y-6 px-5 py-5">
+              <section class="min-w-0 space-y-4">
                 <div class="space-y-1">
                   <div class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Session</div>
                   <div class="text-sm text-zinc-400">
@@ -2566,20 +2652,20 @@
                   </div>
                 </div>
 
-                <label class="block space-y-2">
-                  <span class="text-xs text-zinc-500">Title</span>
-                  <input
+                <div class="block space-y-2">
+                  <Label for="session-title" class="normal-case tracking-normal">Title</Label>
+                  <Input
+                    id="session-title"
                     bind:value={draftTitle}
-                    class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
                     placeholder="Session title"
                   />
-                </label>
+                </div>
 
-                <label class="block space-y-2">
-                  <span class="text-xs text-zinc-500">Profile</span>
-                  <select
+                <div class="block space-y-2">
+                  <Label for="session-profile" class="normal-case tracking-normal">Profile</Label>
+                  <Select
+                    id="session-profile"
                     bind:value={draftProfileId}
-                    class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
                   >
                     {#if selectedSession.profile_id === ''}
                       <option value="">Legacy or direct target</option>
@@ -2587,39 +2673,39 @@
                     {#each workspaceProfiles as profile}
                       <option value={profile.id}>{profile.title}</option>
                     {/each}
-                  </select>
-                </label>
+                  </Select>
+                </div>
 
-                <label class="block space-y-2">
-                  <span class="text-xs text-zinc-500">Session Mode</span>
-                  <select
+                <div class="block space-y-2">
+                  <Label for="session-mode" class="normal-case tracking-normal">Session Mode</Label>
+                  <Select
+                    id="session-mode"
                     value={draftComposerMode()}
-                    class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
                     onchange={handleDraftComposerModeChange}
                   >
                     {#each COMPOSER_MODES as mode}
                       <option value={mode}>{composerModeLabel(mode)} - {composerModeDescription(mode)}</option>
                     {/each}
-                  </select>
+                  </Select>
                   <span class="block text-xs leading-5 text-zinc-500">
-                    Choose whether Nucleus plans only, asks before actions, or runs actions without approval prompts.
+                    Choose whether Nucleus plans first, asks before actions, or auto-runs trusted actions.
                   </span>
-                </label>
+                </div>
 
-                <label class="block space-y-2">
-                  <span class="text-xs text-zinc-500">Run Budget</span>
-                  <select
+                <div class="block space-y-2">
+                  <Label for="session-run-budget" class="normal-case tracking-normal">Run Budget</Label>
+                  <Select
+                    id="session-run-budget"
                     bind:value={draftRunBudgetMode}
-                    class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
                   >
                     {#each RUN_BUDGET_MODES as mode}
                       <option value={mode}>{runBudgetModeLabel(mode)} - {runBudgetModeDescription(mode)}</option>
                     {/each}
-                  </select>
+                  </Select>
                   <span class="block text-xs leading-5 text-zinc-500">
                     {runBudgetModeHelp(draftRunBudgetMode)}
                   </span>
-                </label>
+                </div>
 
                 <div class="grid gap-3 sm:grid-cols-2">
                   <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
@@ -2712,7 +2798,7 @@
                 </div>
               </section>
 
-              <section class="space-y-4 pt-6">
+              <section class="min-w-0 space-y-4 pt-6">
                 <div class="space-y-1">
                   <div class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Projects</div>
                   <div class="text-sm text-zinc-400">
@@ -2720,9 +2806,9 @@
                   </div>
                 </div>
 
-                <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
+                <div class="min-w-0 rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
                   <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Primary Context</div>
-                  <div class="mt-2 text-sm text-zinc-100">{selectedProjectTitle}</div>
+                  <div class="mt-2 truncate text-sm text-zinc-100">{selectedProjectTitle}</div>
                   {#if attachedProjects.length === 0}
                     <div class="mt-1 text-xs text-zinc-500">
                       This session is currently running from workspace scratch.
@@ -2730,11 +2816,11 @@
                   {/if}
                 </div>
 
-                <div class="space-y-3">
+                <div class="min-w-0 space-y-3">
                   {#each workspaceProjects as project}
-                    <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
+                    <div class="min-w-0 rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
                       <div class="flex items-start justify-between gap-3">
-                        <div class="min-w-0">
+                        <div class="min-w-0 flex-1">
                           <div class="truncate text-sm font-medium text-zinc-100">{project.title}</div>
                           <div class="mt-1 truncate text-xs text-zinc-500">
                             {compactPath(project.absolute_path)}
@@ -2787,7 +2873,7 @@
 
               <section class="space-y-4 pt-6">
                 <div class="space-y-1">
-                  <div class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Agent Jobs</div>
+                  <div class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Utility Worker Jobs</div>
                   <div class="text-sm text-zinc-400">
                     The activity drawer shows live Nucleus activity. Full Utility Worker history stays here.
                   </div>
@@ -3159,10 +3245,16 @@
                       {#if action.parameters.length > 0}
                         <div class="mt-3 space-y-3">
                           {#each action.parameters as parameter}
-                            <label class="block space-y-1">
-                              <span class="text-xs text-zinc-500">{parameter.label}</span>
-                              <input
-                                class="h-9 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
+                            <div class="block space-y-1">
+                              <Label
+                                for={`action-${action.id}-${parameter.name}`}
+                                class="normal-case tracking-normal"
+                              >
+                                {parameter.label}
+                              </Label>
+                              <Input
+                                id={`action-${action.id}-${parameter.name}`}
+                                class="h-9"
                                 value={actionFormValues[action.id]?.[parameter.name] ?? ''}
                                 placeholder={parameter.default_value || parameter.description}
                                 oninput={(event) =>
@@ -3175,7 +3267,7 @@
                               {#if parameter.description}
                                 <div class="text-[11px] text-zinc-600">{parameter.description}</div>
                               {/if}
-                            </label>
+                            </div>
                           {/each}
                         </div>
                       {/if}
