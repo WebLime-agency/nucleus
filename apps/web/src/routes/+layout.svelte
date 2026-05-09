@@ -47,7 +47,7 @@
   let { children } = $props();
 
   const navigation = [
-    { href: '/', label: 'Overview', icon: Gauge },
+    { href: '/', label: 'Chat', icon: Gauge },
     { href: '/workspace', label: 'Workspace', icon: FolderTree }
   ];
 
@@ -115,7 +115,7 @@
   let requestedSessionId = $derived.by(() =>
     browser ? page.url.searchParams.get('session') ?? '' : ''
   );
-  let usesFullHeightContent = $derived(pathname === '/' && Boolean(requestedSessionId));
+  let usesFullHeightContent = $derived(pathname === '/');
   let activeSidebarSessionId = $derived(requestedSessionId || sessions[0]?.id || '');
   let compatibility = $derived(
     evaluateCompatibility(daemonCompatibility ?? settings?.compatibility ?? null)

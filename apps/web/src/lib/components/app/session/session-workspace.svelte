@@ -1889,7 +1889,7 @@
   });
 </script>
 
-<div class="flex h-full min-h-0 min-w-0 flex-1 overflow-hidden">
+<div class="flex min-h-0 min-w-0 flex-1 self-stretch overflow-hidden">
   <div class="flex min-h-0 min-w-0 flex-1 overflow-hidden border-y border-zinc-900 bg-zinc-950/70 lg:border-x">
     {#if loading && sessions.length === 0}
       <div class="flex flex-1 items-center justify-center px-8">
@@ -2063,7 +2063,7 @@
             {/if}
           </div>
 
-          <div class="shrink-0 border-t border-zinc-900 bg-zinc-950/95 px-3 py-3 sm:px-6">
+          <div class="shrink-0 border-t border-zinc-900 bg-zinc-950/95 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 sm:px-6">
             {#if composerActivityVisible && composerActivitySummary}
               <section
                 aria-label="Nucleus activity"
