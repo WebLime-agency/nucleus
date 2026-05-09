@@ -4,12 +4,12 @@
   import { page } from '$app/state';
   import { onMount } from 'svelte';
   import {
-    CalendarClock,
     FolderTree,
     Gauge,
     MessageSquare,
     Menu,
-    MessageSquarePlus
+    MessageSquarePlus,
+    Workflow
   } from 'lucide-svelte';
 
   import { Badge } from '$lib/components/ui/badge';
@@ -45,7 +45,7 @@
   const navigation = [
     { href: '/', label: 'Chat', icon: MessageSquare },
     { href: '/dashboard', label: 'Dashboard', icon: Gauge },
-    { href: '/automations', label: 'Automations', icon: CalendarClock },
+    { href: '/automations', label: 'Automations', icon: Workflow },
     { href: '/workspace', label: 'Workspace', icon: FolderTree }
   ];
 

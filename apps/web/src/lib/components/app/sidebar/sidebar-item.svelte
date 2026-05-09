@@ -40,11 +40,13 @@
   {#if Icon}
     <Icon class="size-4 shrink-0" />
   {/if}
-  <span class={cn('min-w-0 truncate', compact && 'text-[11px]')}>{label}</span>
+  {#if !compact}
+    <span class="min-w-0 truncate">{label}</span>
+  {/if}
   {#if badge}
     <span
       class={cn(
-        'ml-auto h-2 w-2 shrink-0 rounded-full',
+        compact ? 'absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full' : 'ml-auto h-2 w-2 shrink-0 rounded-full',
         badge === 'amber' ? 'bg-amber-300' : 'bg-lime-300'
       )}
     ></span>

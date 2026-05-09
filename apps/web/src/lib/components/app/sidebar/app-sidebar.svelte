@@ -9,7 +9,7 @@
     SessionSummary
   } from '$lib/nucleus/schemas';
   import type { StreamStatus } from '$lib/nucleus/realtime';
-  import { MessageSquarePlus, MoreHorizontal, X } from '@lucide/svelte';
+  import { MessageSquarePlus, MoreVertical, X } from '@lucide/svelte';
   import SidebarFooter from './sidebar-footer.svelte';
   import SidebarSessionList from './sidebar-session-list.svelte';
 
@@ -105,26 +105,14 @@
       </div>
 
       <div class="flex shrink-0 items-center gap-1">
-        <Button
-          variant="outline"
-          size="icon"
-          class="h-9 w-9"
-          disabled={creating || compatibilityBlocked}
-          title={createSessionTitle}
-          aria-label={createSessionTitle || 'New session'}
-          onclick={handleCreateSession}
-        >
-          <MessageSquarePlus class={creating ? 'size-4 animate-spin' : 'size-4'} />
-        </Button>
-
         <DropdownMenu.Root>
           <DropdownMenu.Trigger
-            class="inline-flex h-9 w-9 items-center justify-center rounded-md border border-zinc-800 bg-transparent text-zinc-200 transition-colors hover:bg-zinc-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-700 disabled:pointer-events-none disabled:opacity-50"
+            class="inline-flex h-9 w-9 items-center justify-center rounded-md text-zinc-300 transition-colors hover:bg-zinc-900 hover:text-zinc-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-700 disabled:pointer-events-none disabled:opacity-50"
             disabled={creating || compatibilityBlocked}
             aria-label="Choose project for new session"
             title="Choose project for new session"
           >
-            <MoreHorizontal class="size-4" />
+            <MoreVertical class="size-4" />
           </DropdownMenu.Trigger>
           <DropdownMenu.Content side="bottom" align="end" sideOffset={8} class="w-72">
             <DropdownMenu.Label>New session context</DropdownMenu.Label>
@@ -153,6 +141,18 @@
             </DropdownMenu.RadioGroup>
           </DropdownMenu.Content>
         </DropdownMenu.Root>
+
+        <Button
+          variant="outline"
+          size="icon"
+          class="h-9 w-9"
+          disabled={creating || compatibilityBlocked}
+          title={createSessionTitle}
+          aria-label={createSessionTitle || 'New session'}
+          onclick={handleCreateSession}
+        >
+          <MessageSquarePlus class={creating ? 'size-4 animate-spin' : 'size-4'} />
+        </Button>
 
         <Button variant="ghost" size="icon" class="h-9 w-9 lg:hidden" aria-label="Close sidebar" onclick={closeSidebar}>
           <X class="size-4" />
