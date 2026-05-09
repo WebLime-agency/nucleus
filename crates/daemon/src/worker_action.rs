@@ -168,6 +168,16 @@ fn normalize_worker_action_value(
         return normalize_worker_final_answer_value(object).map(Some);
     }
 
+    if object
+        .get("action")
+        .or_else(|| object.get("kind"))
+        .and_then(Value::as_str)
+        .map(|value| value.trim().eq_ignore_ascii_case("final_answer"))
+        .unwrap_or(false)
+    {
+        return normalize_worker_final_answer_value(object).map(Some);
+    }
+
     if let Some(tool_call) = object.get("tool_call") {
         return normalize_worker_tool_call_value(tool_call).map(Some);
     }
@@ -204,6 +214,7 @@ fn normalize_worker_final_answer_value(
 ) -> Result<WorkerAction, WorkerActionParseError> {
     let final_answer = object
         .get("final_answer")
+        .or_else(|| object.get("content"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -301,6 +312,10 @@ fn normalize_worker_tool_name_and_args(
         "read_file" | "fs.read" => Ok(("fs.read_text".to_string(), args)),
         "list_files" | "ls" => Ok(("fs.list".to_string(), args)),
         "search" | "grep" | "ripgrep" => Ok(("rg.search".to_string(), args)),
+        "inspect_repo" | "inspect_project" | "repo_inspect" | "project_inspect" => Ok((
+            "project.inspect".to_string(),
+            Value::Object(serde_json::Map::new()),
+        )),
         "git_status" => Ok(("git.status".to_string(), args)),
         "git_diff" => Ok(("git.diff".to_string(), args)),
         tool if tool.contains('.') && is_supported_nucleus_tool(tool) => {
@@ -489,5 +504,45 @@ mod tests {
             final_answer,
             "The homepage is redirecting because the CMS entry is missing."
         );
+    }
+
+    #[test]
+    fn accepts_action_final_answer_content_as_bounded_compatibility() {
+        let action = parse_worker_action(
+            r#"{"action":"final_answer","content":"Yes—I’m here. How can I help?"}"#,
+        )
+        .expect("action/content final answer should normalize");
+
+        let WorkerAction::FinalAnswer {
+            summary,
+            final_answer,
+        } = action
+        else {
+            panic!("expected final answer");
+        };
+
+        assert_eq!(summary, "The work is done.");
+        assert_eq!(final_answer, "Yes—I’m here. How can I help?");
+    }
+
+    #[test]
+    fn accepts_inspect_repo_as_project_inspect_compatibility() {
+        let action = parse_worker_action(
+            r#"{"tool_call":{"name":"inspect_repo","arguments":{"cwd":"/tmp/project","targets":["apps/web/src/lib/components"]}}}"#,
+        )
+        .expect("inspect_repo should normalize to project.inspect");
+
+        let WorkerAction::ToolCall {
+            summary,
+            tool,
+            args,
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(summary, "Run the requested Nucleus action.");
+        assert_eq!(tool, "project.inspect");
+        assert!(args.as_object().is_some_and(|object| object.is_empty()));
     }
 }

@@ -6,6 +6,7 @@ Near-term Nucleus work focuses on making the product a stable daily driver for:
 - routing profiles
 - machine telemetry and process control
 - prompt assembly and durable context layering
+- Utility Worker reliability across text, image, follow-up, and long-running turns
 - auth, managed-release update, and restart flows
 
 Public installs follow managed release channels (`stable`, `beta`, `nightly`). Contributor source checkouts remain the only git-based self-update mode.

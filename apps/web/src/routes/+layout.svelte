@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { browser } from '$app/environment';
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
   import { onMount } from 'svelte';
@@ -15,6 +16,7 @@
   } from 'lucide-svelte';
 
   import { Badge } from '$lib/components/ui/badge';
+  import AppSidebar from '$lib/components/app/sidebar/app-sidebar.svelte';
   import { Button } from '$lib/components/ui/button';
   import { evaluateCompatibility } from '$lib/nucleus/compatibility';
   import { markdownExcerpt } from '$lib/nucleus/markdown';
@@ -46,8 +48,6 @@
 
   const navigation = [
     { href: '/', label: 'Overview', icon: Gauge },
-    { href: '/sessions', label: 'Sessions', icon: MessagesSquare },
-    { href: '/automations', label: 'Automations', icon: Workflow },
     { href: '/workspace', label: 'Workspace', icon: FolderTree }
   ];
 
@@ -109,14 +109,14 @@
   let activeNavItem = $derived(
     navigation.find((item) => isNavActive(item.href, pathname)) ?? navigation[0]
   );
-  let usesFullHeightContent = $derived(pathname === '/sessions');
+  let usesFullHeightContent = $derived(false);
   let sessionsWithProjects = $derived(
     overview?.sessions.filter((session) => session.project_count > 0).length ?? 0
   );
-  let requestedSessionId = $derived(page.url.searchParams.get('session') ?? '');
-  let activeSidebarSessionId = $derived(
-    pathname === '/sessions' ? requestedSessionId || sessions[0]?.id || '' : ''
+  let requestedSessionId = $derived.by(() =>
+    browser ? page.url.searchParams.get('session') ?? '' : ''
   );
+  let activeSidebarSessionId = $derived(requestedSessionId || sessions[0]?.id || '');
   let compatibility = $derived(
     evaluateCompatibility(daemonCompatibility ?? settings?.compatibility ?? null)
   );
@@ -251,7 +251,7 @@
       prependSession(detail.session);
       error = null;
       sidebarOpen = false;
-      await goto(`/sessions?session=${detail.session.id}`, { noScroll: true });
+      await goto(`/?session=${detail.session.id}`, { noScroll: true });
     } catch (cause) {
       error = cause instanceof Error ? cause.message : 'Failed to create the session.';
     } finally {
@@ -261,7 +261,7 @@
 
   async function openSession(sessionId: string) {
     sidebarOpen = false;
-    await goto(`/sessions?session=${sessionId}`, { noScroll: true });
+    await goto(`/?session=${sessionId}`, { noScroll: true });
   }
 
   async function openNavigation(href: string) {
@@ -391,183 +391,34 @@
 </script>
 
 <div class="flex h-dvh min-h-0 flex-col overflow-hidden bg-zinc-950 text-zinc-100 lg:grid lg:grid-cols-[16.5rem_minmax(0,1fr)]">
-  {#if sidebarOpen}
-    <button
-      type="button"
-      class="fixed inset-0 z-30 bg-black/60 lg:hidden"
-      aria-label="Close sidebar"
-      onclick={() => {
-        sidebarOpen = false;
-      }}
-    ></button>
-  {/if}
+  <AppSidebar
+  open={sidebarOpen}
+  {pathname}
+  {navigation}
+  {overview}
+  {activeSidebarSessionId}
+  {creating}
+  {compatibilityBlocked}
+  {createSessionTitle}
+  {sessionsWithProjects}
+  {hasUpdateAvailable}
+  {restartRequired}
+  updateTrackLabel={updateTrackLabel}
+  updateLastAttemptResult={updateStatus?.last_attempt_result ?? null}
+  {formatCount}
+  {compactPath}
+  {projectLabel}
+  {markdownExcerpt}
+  {formatState}
+  {badgeVariantForSession}
+  {isNavActive}
+  {openNavigation}
+  {handleCreateSession}
+  closeSidebar={() => {
+    sidebarOpen = false;
+  }}
+/>
 
-  <aside
-    class={cn(
-      'fixed inset-y-0 left-0 z-40 flex h-screen w-[17rem] max-w-[86vw] flex-col overflow-hidden border-r border-zinc-900 bg-zinc-950 transition-transform lg:static lg:z-auto lg:w-auto lg:max-w-none lg:translate-x-0',
-      sidebarOpen ? 'translate-x-0' : '-translate-x-full'
-    )}
-  >
-    <div class="flex min-h-0 flex-1 flex-col">
-      <div class="border-b border-zinc-900 px-3 py-3">
-        <div class="flex items-center justify-between gap-3">
-          <div class="flex min-w-0 items-center gap-3">
-            <div class="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-zinc-800 bg-zinc-950">
-              <ServerCog class="size-4.5 text-lime-300/80" />
-            </div>
-            <div class="truncate text-base font-semibold text-zinc-50">{instanceName}</div>
-          </div>
-
-          <div class="flex items-center gap-2">
-            <Button
-              variant="ghost"
-              size="icon"
-              class="h-10 w-10 lg:hidden"
-              aria-label="Close sidebar"
-              title="Close sidebar"
-              onclick={() => {
-                sidebarOpen = false;
-              }}
-            >
-              <X class="size-4" />
-            </Button>
-          </div>
-        </div>
-      </div>
-
-      <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
-        <div class="border-b border-zinc-900 px-3 py-2.5">
-          <div class="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-3">
-            <div class="flex items-center gap-2 text-sm font-medium text-zinc-100">
-              <MessagesSquare class="size-4 text-zinc-500" />
-              <span>Sessions</span>
-            </div>
-
-            <div class="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
-              <select
-                class="h-10 min-w-0 rounded-md border border-zinc-800 bg-zinc-950 px-2.5 text-xs text-zinc-300 outline-none focus:border-zinc-700"
-                bind:value={createProjectId}
-                aria-label="Project for new session"
-                title="Project for new session"
-              >
-                <option value="">{createSessionContextLabel()}</option>
-                {#each discoveredProjects as project}
-                  <option value={project.id}>{project.title}</option>
-                {/each}
-              </select>
-              <Button
-                size="icon"
-                variant="outline"
-                class="h-10 w-10 shrink-0"
-                onclick={handleCreateSession}
-                disabled={creating || compatibilityBlocked}
-                aria-label={createSessionTitle}
-                title={createSessionTitle}
-              >
-                <MessageSquarePlus class={creating ? 'size-4 animate-spin' : 'size-4'} />
-              </Button>
-            </div>
-          </div>
-        </div>
-
-        <div class="min-h-0 flex-1 overflow-y-auto px-2.5 py-2.5">
-          {#if sessions.length === 0}
-            <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-3 text-sm text-zinc-500">
-              No sessions yet.
-            </div>
-          {:else}
-            <div class="space-y-2">
-              {#each sessions as session}
-                <button
-                  type="button"
-                  class={cn(
-                    'w-full rounded-md border px-3 py-2 text-left transition-colors',
-                    activeSidebarSessionId === session.id
-                      ? 'border-lime-300/40 bg-lime-300/8'
-                      : 'border-zinc-800 bg-zinc-950/40 hover:bg-zinc-900/80'
-                  )}
-                  title={session.title}
-                  onclick={() => openSession(session.id)}
-                >
-                  <div class="flex items-start justify-between gap-3">
-                    <div class="min-w-0">
-                      <div class="truncate text-sm font-medium text-zinc-100">{session.title}</div>
-                      <div class="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-zinc-500">
-                        <span>{projectLabel(session.project_count, session.project_title)}</span>
-                        <span>{session.turn_count} turns</span>
-                      </div>
-                      {#if session.last_message_excerpt}
-                        <div class="mt-1 line-clamp-1 text-xs leading-5 text-zinc-400">
-                          {markdownExcerpt(session.last_message_excerpt)}
-                        </div>
-                      {/if}
-                    </div>
-                    <Badge variant={badgeVariantForSession(session.state)} class="shrink-0">
-                      {formatState(session.state)}
-                    </Badge>
-                  </div>
-                </button>
-              {/each}
-            </div>
-          {/if}
-        </div>
-      </div>
-
-      <div class="sticky bottom-0 shrink-0 border-t border-zinc-900 bg-zinc-950/95 px-3 py-2.5 backdrop-blur">
-        <nav class="grid grid-cols-4 gap-2">
-          {#each navigation as item}
-            {@const navActive = isNavActive(item.href, pathname)}
-            <button
-              type="button"
-              aria-current={navActive ? 'page' : undefined}
-              aria-label={item.label}
-              title={item.label}
-              class={cn(
-                'relative inline-flex h-10 items-center justify-center rounded-md border transition-colors',
-                navActive
-                  ? 'border-lime-300/30 bg-lime-300/10 text-lime-100'
-                  : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:bg-zinc-900 hover:text-zinc-100'
-              )}
-              onclick={() => openNavigation(item.href)}
-            >
-              <item.icon class="size-4" />
-              {#if item.href === '/workspace' && (hasUpdateAvailable || restartRequired)}
-                <span
-                  class={cn(
-                    'absolute right-2 top-2 h-2 w-2 rounded-full',
-                    restartRequired ? 'bg-amber-300' : 'bg-lime-300'
-                  )}
-                ></span>
-              {/if}
-            </button>
-          {/each}
-        </nav>
-
-        <div class="mt-3 flex items-center gap-2 text-xs text-zinc-500">
-          <FolderRoot class="size-3.5 text-zinc-600" />
-          <span>{workspace ? formatCount(workspace.projects.length) : '0'} projects</span>
-          {#if workspace}
-            <span>-</span>
-            <span>{formatCount(sessionsWithProjects)} attached</span>
-          {/if}
-        </div>
-        {#if workspace}
-          <div class="mt-1 truncate text-[11px] text-zinc-600" title={workspace.root_path}>
-            {compactPath(workspace.root_path)}
-          </div>
-        {/if}
-        {#if restartRequired}
-          <div class="mt-2 text-[11px] text-amber-300/80">Restart required to load the latest update.</div>
-        {:else if hasUpdateAvailable}
-          <div class="mt-2 text-[11px] text-lime-300/80">
-            {updateStatus?.last_attempt_result === 'success'
-              ? `Update available on ${updateTrackLabel || 'the tracked target'}.`
-              : 'Last known update available.'}
-          </div>
-        {/if}
-      </div>
-    </div>
-  </aside>
 
   <main
     class={cn(
