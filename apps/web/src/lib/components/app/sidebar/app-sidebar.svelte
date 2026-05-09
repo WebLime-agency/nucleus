@@ -91,13 +91,13 @@
 
 <aside
   class={cn(
-    'fixed inset-y-0 left-0 z-40 flex min-h-0 w-80 max-w-[85vw] flex-col overflow-hidden border-r border-zinc-900 bg-zinc-950 transition-transform lg:static lg:z-auto lg:h-dvh lg:w-full lg:max-w-full lg:translate-x-0',
+    'fixed inset-y-0 left-0 z-40 flex min-h-0 w-80 min-w-0 max-w-[85vw] flex-col overflow-hidden border-r border-zinc-900 bg-zinc-950 transition-transform lg:static lg:z-auto lg:h-dvh lg:w-[16.5rem] lg:max-w-[16.5rem] lg:translate-x-0',
     open ? 'translate-x-0' : '-translate-x-full'
   )}
 >
   <div class="border-b border-zinc-900 px-3 py-3">
     <div class="flex items-center justify-between gap-2">
-      <div class="min-w-0">
+      <div class="min-w-0 flex-1">
         <div class="truncate text-sm font-semibold text-zinc-100">Nucleus</div>
         <div class="mt-0.5 hidden truncate text-[11px] text-zinc-600 lg:block">
           {selectedCreateProject ? selectedCreateProject.title : 'Workspace scratch'}
@@ -114,7 +114,12 @@
           >
             <MoreVertical class="size-4" />
           </DropdownMenu.Trigger>
-          <DropdownMenu.Content side="bottom" align="end" sideOffset={8} class="w-72 max-w-[calc(100vw-1rem)]">
+          <DropdownMenu.Content
+            side="bottom"
+            align="end"
+            sideOffset={8}
+            class="max-h-[min(24rem,calc(100vh-5rem))] w-[15rem] max-w-[calc(100vw-1rem)]"
+          >
             <DropdownMenu.Label>New session context</DropdownMenu.Label>
             <DropdownMenu.RadioGroup
               value={createProjectId}

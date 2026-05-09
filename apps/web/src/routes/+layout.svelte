@@ -374,7 +374,7 @@
   });
 </script>
 
-<div class="flex h-dvh min-h-0 flex-col overflow-hidden bg-zinc-950 text-zinc-100 lg:grid lg:grid-cols-[16.5rem_minmax(0,1fr)]">
+<div class="flex h-dvh min-h-0 flex-col overflow-hidden bg-zinc-950 text-zinc-100 lg:grid lg:grid-cols-[minmax(0,16.5rem)_minmax(0,1fr)]">
   <AppSidebar
     open={sidebarOpen}
     {pathname}

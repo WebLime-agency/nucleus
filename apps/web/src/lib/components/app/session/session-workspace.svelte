@@ -2052,7 +2052,7 @@
               </span>
               <span class="inline-flex items-center gap-1.5">
                 <FolderTree class="size-3.5" />
-                <span>{selectedProjectTitle}</span>
+                <span class="min-w-0 max-w-56 truncate">{selectedProjectTitle}</span>
               </span>
               <span>{selectedSession.turn_count} turns</span>
               <span>{formatDateTime(selectedSession.updated_at)}</span>
@@ -2625,7 +2625,7 @@
             }}
           ></button>
 
-          <aside class="fixed inset-y-0 right-0 z-20 flex w-full max-w-md flex-col overflow-y-auto border-l border-zinc-900 bg-zinc-950 lg:static lg:z-auto">
+          <aside class="fixed inset-y-0 right-0 z-20 flex w-full min-w-0 max-w-md flex-col overflow-y-auto overflow-x-hidden border-l border-zinc-900 bg-zinc-950 lg:static lg:z-auto lg:w-96 lg:max-w-96 lg:shrink-0">
             <div class="flex items-center justify-between border-b border-zinc-900 px-5 py-4">
               <div>
                 <div class="text-sm font-medium text-zinc-100">Session Details</div>
@@ -2643,8 +2643,8 @@
               </Button>
             </div>
 
-            <div class="space-y-6 px-5 py-5">
-              <section class="space-y-4">
+            <div class="min-w-0 space-y-6 px-5 py-5">
+              <section class="min-w-0 space-y-4">
                 <div class="space-y-1">
                   <div class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Session</div>
                   <div class="text-sm text-zinc-400">
@@ -2798,7 +2798,7 @@
                 </div>
               </section>
 
-              <section class="space-y-4 pt-6">
+              <section class="min-w-0 space-y-4 pt-6">
                 <div class="space-y-1">
                   <div class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Projects</div>
                   <div class="text-sm text-zinc-400">
@@ -2806,7 +2806,7 @@
                   </div>
                 </div>
 
-                <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
+                <div class="min-w-0 rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
                   <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Primary Context</div>
                   <div class="mt-2 truncate text-sm text-zinc-100">{selectedProjectTitle}</div>
                   {#if attachedProjects.length === 0}
@@ -2816,7 +2816,7 @@
                   {/if}
                 </div>
 
-                <div class="space-y-3">
+                <div class="min-w-0 space-y-3">
                   {#each workspaceProjects as project}
                     <div class="min-w-0 rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
                       <div class="flex items-start justify-between gap-3">
