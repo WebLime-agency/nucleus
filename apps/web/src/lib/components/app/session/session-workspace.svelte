@@ -1997,9 +1997,9 @@
         </div>
       </div>
     {:else}
-      <div class="relative flex min-h-0 min-w-0 flex-1 overflow-hidden">
+      <div class="relative flex min-h-0 min-w-0 flex-1 overflow-hidden lg:overflow-hidden">
         <div class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-          <header class="shrink-0 border-b border-zinc-900 bg-zinc-950/90 px-4 py-3 sm:px-6 sm:py-4">
+          <header class="sticky top-0 z-20 shrink-0 border-b border-zinc-900 bg-zinc-950/90 px-4 py-3 backdrop-blur supports-[backdrop-filter]:bg-zinc-950/75 sm:px-6 sm:py-4">
             <div class="flex items-start gap-3">
               <div class="min-w-0 flex-1">
                 <div class="flex min-w-0 flex-wrap items-center gap-2">
@@ -2060,7 +2060,7 @@
           </header>
 
           {#if error || actionResultMessage || selectedSession.last_error}
-            <div class="shrink-0 border-b border-zinc-900 bg-zinc-950/75 px-4 py-3 sm:px-6">
+            <div class="sticky top-[89px] z-10 shrink-0 border-b border-zinc-900 bg-zinc-950/75 px-4 py-3 backdrop-blur supports-[backdrop-filter]:bg-zinc-950/65 sm:top-[105px] sm:px-6">
               {#if error}
                 <div class="rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-2 text-sm text-red-200">
                   {error}
@@ -2081,7 +2081,7 @@
             </div>
           {/if}
 
-          <div bind:this={transcriptElement} class="min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-6 sm:py-6">
+          <div bind:this={transcriptElement} class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4 pb-40 sm:px-6 sm:py-6 sm:pb-44">
             {#if detail?.turns.length}
               <div class="space-y-6">
                 {#each detail.turns as turn (turn.id)}
