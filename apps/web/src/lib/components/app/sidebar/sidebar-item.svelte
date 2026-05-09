@@ -8,9 +8,18 @@
     icon?: any;
     onclick?: () => void;
     badge?: 'lime' | 'amber' | null;
+    compact?: boolean;
   };
 
-  let { label, active = false, title = label, icon, onclick, badge = null }: Props = $props();
+  let {
+    label,
+    active = false,
+    title = label,
+    icon,
+    onclick,
+    badge = null,
+    compact = false
+  }: Props = $props();
   let Icon = $derived(icon);
 </script>
 
@@ -20,7 +29,8 @@
   aria-label={label}
   title={title}
   class={cn(
-    'relative inline-flex h-9 w-full items-center justify-start gap-2 rounded-md border px-2.5 text-sm transition-colors',
+    'relative inline-flex h-9 w-full items-center rounded-md border text-sm transition-colors',
+    compact ? 'justify-center gap-1.5 px-2' : 'justify-start gap-2 px-2.5',
     active
       ? 'border-lime-300/30 bg-lime-300/10 text-lime-100'
       : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:bg-zinc-900 hover:text-zinc-100'
@@ -30,7 +40,7 @@
   {#if Icon}
     <Icon class="size-4 shrink-0" />
   {/if}
-  <span class="min-w-0 truncate">{label}</span>
+  <span class={cn('min-w-0 truncate', compact && 'text-[11px]')}>{label}</span>
   {#if badge}
     <span
       class={cn(

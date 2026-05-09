@@ -37,9 +37,6 @@
     restartRequired?: boolean;
     updateTrackLabel?: string;
     updateLastAttemptResult?: string | null;
-    sessionsWithProjects?: number;
-    formatCount: (value: number) => string;
-    compactPath: (value: string) => string;
     projectLabel: (projectCount: number, projectTitle: string) => string;
     markdownExcerpt: (value: string) => string;
     formatState: (value: string) => string;
@@ -66,9 +63,6 @@
     restartRequired = false,
     updateTrackLabel = '',
     updateLastAttemptResult = null,
-    sessionsWithProjects = 0,
-    formatCount,
-    compactPath,
     projectLabel,
     markdownExcerpt,
     formatState,
@@ -80,7 +74,6 @@
     closeSidebar
   }: Props = $props();
 
-  let workspace = $derived(overview?.workspace ?? null);
   let sessions = $derived(overview?.sessions ?? []);
   let selectedCreateProject = $derived(
     projects.find((project) => project.id === createProjectId) ?? null
@@ -98,7 +91,7 @@
 
 <aside
   class={cn(
-    'fixed inset-y-0 left-0 z-40 flex w-80 max-w-[85vw] flex-col border-r border-zinc-900 bg-zinc-950 transition-transform lg:static lg:z-auto lg:w-auto lg:max-w-none lg:translate-x-0',
+    'fixed inset-y-0 left-0 z-40 flex min-h-0 w-80 max-w-[85vw] flex-col overflow-hidden border-r border-zinc-900 bg-zinc-950 transition-transform lg:static lg:z-auto lg:h-dvh lg:w-auto lg:max-w-none lg:translate-x-0',
     open ? 'translate-x-0' : '-translate-x-full'
   )}
 >
@@ -197,10 +190,6 @@
       {restartRequired}
       {updateTrackLabel}
       {updateLastAttemptResult}
-      {workspace}
-      {sessionsWithProjects}
-      {formatCount}
-      {compactPath}
     />
   </div>
 </aside>

@@ -5,16 +5,11 @@
   import { onMount } from 'svelte';
   import {
     CalendarClock,
-    FolderRoot,
     FolderTree,
     Gauge,
     MessageSquare,
     Menu,
-    MessageSquarePlus,
-    MessagesSquare,
-    ServerCog,
-    Workflow,
-    X
+    MessageSquarePlus
   } from 'lucide-svelte';
 
   import { Badge } from '$lib/components/ui/badge';
@@ -30,7 +25,6 @@
   } from '$lib/nucleus/auth';
   import { createSession, fetchOverview, fetchSettings } from '$lib/nucleus/client';
   import {
-    compactPath,
     formatCount,
     formatLatestTargetLabel,
     formatState
@@ -80,16 +74,9 @@
       'Default'
   );
   let sessions = $derived(overview?.sessions ?? []);
-  let instanceName = $derived(settings?.instance.name ?? 'Nucleus');
   let updateStatus = $derived(settings?.update ?? null);
   let hasUpdateAvailable = $derived(updateStatus?.update_available ?? false);
   let restartRequired = $derived(updateStatus?.restart_required ?? false);
-  let updateTargetId = $derived(
-    updateStatus?.latest_release_id ??
-      updateStatus?.latest_version ??
-      updateStatus?.latest_commit ??
-      ''
-  );
   let updateTrackLabel = $derived.by(() => {
     if (!updateStatus) {
       return '';
@@ -112,9 +99,6 @@
   }
   let activeNavItem = $derived(
     navigation.find((item) => isNavActive(item.href, pathname)) ?? navigation[0]
-  );
-  let sessionsWithProjects = $derived(
-    overview?.sessions.filter((session) => session.project_count > 0).length ?? 0
   );
   let requestedSessionId = $derived.by(() =>
     browser ? page.url.searchParams.get('session') ?? '' : ''
@@ -168,10 +152,6 @@
 
   function sessionContextLabel() {
     return 'Workspace scratch';
-  }
-
-  function createSessionContextLabel() {
-    return 'Scratch';
   }
 
   function projectLabel(projectCount: number, projectTitle: string) {
@@ -406,13 +386,10 @@
     {createSessionTitle}
     createProjectId={createProjectId}
     projects={discoveredProjects}
-    {sessionsWithProjects}
     {hasUpdateAvailable}
     {restartRequired}
     updateTrackLabel={updateTrackLabel}
     updateLastAttemptResult={updateStatus?.last_attempt_result ?? null}
-    {formatCount}
-    {compactPath}
     {projectLabel}
     {markdownExcerpt}
     {formatState}

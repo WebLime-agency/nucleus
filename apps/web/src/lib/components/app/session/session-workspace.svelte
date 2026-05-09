@@ -36,6 +36,7 @@
   import {
     approveRequest,
     cancelJob,
+    createSession,
     deleteSession,
     denyRequest,
     fetchActions,
@@ -1273,22 +1274,32 @@
   }
 
   async function handlePromptSubmit() {
-    if (
-      !selectedSession ||
-      !promptReady ||
-      selectedSession.state === 'running' ||
-      selectedSession.state === 'paused'
-    ) {
+    if (!promptReady || selectedSession?.state === 'running' || selectedSession?.state === 'paused') {
       return;
     }
-
-    const submittedSession = selectedSession;
-    const submittedPrompt = promptText;
-    const submittedImages = [...promptImages];
 
     sending = true;
     deleteConfirmId = null;
     actionConfirmId = null;
+
+    let submittedSession = selectedSession;
+
+    if (!submittedSession) {
+      try {
+        const next = await createSession({});
+        syncSession(next);
+        submittedSession = next.session;
+        await goto(`/?session=${next.session.id}`, { noScroll: true, replaceState: true });
+      } catch (cause) {
+        error = cause instanceof Error ? cause.message : 'Failed to create the session.';
+        sending = false;
+        return;
+      }
+    }
+
+    const submittedPrompt = promptText;
+    const submittedImages = [...promptImages];
+
     beginOptimisticPrompt(submittedSession, submittedPrompt, submittedImages);
     clearComposerState();
     window.setTimeout(() => {
@@ -1910,19 +1921,78 @@
         </div>
       </div>
     {:else if !selectedSession}
-      <div class="flex flex-1 items-center justify-center px-8">
-        <div class="max-w-lg text-center">
-          <div class="inline-flex h-14 w-14 items-center justify-center rounded-full border border-zinc-800 bg-zinc-900/80">
-            <MessageSquare class="size-6 text-zinc-400" />
+      <div class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+        <div class="flex min-h-0 flex-1 items-center justify-center px-8">
+          <div class="max-w-lg text-center">
+            <div class="inline-flex h-14 w-14 items-center justify-center rounded-full border border-zinc-800 bg-zinc-900/80">
+              <MessageSquare class="size-6 text-zinc-400" />
+            </div>
+            <div class="mt-4 text-lg font-medium text-zinc-100">Start a session</div>
+            <div class="mt-2 text-sm leading-6 text-zinc-500">
+              Send a prompt below or choose an existing session from the sidebar.
+            </div>
+            <div class="mt-4 inline-flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-900/80 px-3 py-1.5 text-xs text-zinc-400">
+              <span>{statusLabel}</span>
+              <span class="text-zinc-700">/</span>
+              <span>{sessions.length} sessions</span>
+            </div>
           </div>
-          <div class="mt-4 text-lg font-medium text-zinc-100">Select or start a session</div>
-          <div class="mt-2 text-sm leading-6 text-zinc-500">
-            Session history stays in the sidebar. Open one there and the full work surface stays here.
-          </div>
-          <div class="mt-4 inline-flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-900/80 px-3 py-1.5 text-xs text-zinc-400">
-            <span>{statusLabel}</span>
-            <span class="text-zinc-700">/</span>
-            <span>{sessions.length} sessions</span>
+        </div>
+
+        <div class="shrink-0 border-t border-zinc-900 bg-zinc-950/95 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 sm:px-6">
+          <section
+            aria-label="Nucleus activity"
+            class="mb-3 overflow-hidden rounded-lg border border-zinc-800 bg-zinc-950/95 shadow-2xl shadow-black/25"
+          >
+            <div class="flex items-center gap-3 px-3 py-2.5">
+              <div class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-zinc-800 bg-zinc-900 text-zinc-300">
+                <Workflow class="size-4" />
+              </div>
+              <div class="min-w-0 flex-1">
+                <div class="flex min-w-0 items-center gap-2">
+                  <div class="truncate text-sm font-medium text-zinc-100">Utility Worker activity</div>
+                  <Badge variant="secondary">Idle</Badge>
+                </div>
+                <div class="mt-0.5 truncate text-xs text-zinc-500">
+                  Work details will appear here after the first prompt starts.
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <div
+            role="group"
+            aria-label="Session composer"
+            class="rounded-lg border border-zinc-800 bg-zinc-900/85 p-2"
+          >
+            <div class="flex items-end gap-2">
+              <Textarea
+                bind:ref={composerTextareaElement}
+                bind:value={promptText}
+                rows={1}
+                class="max-h-[10.5rem] min-h-10 flex-1 resize-none border-0 bg-transparent px-1 py-2 text-sm leading-5 text-zinc-100 focus:border-transparent focus-visible:ring-0"
+                placeholder="Send a message..."
+                spellcheck={false}
+                aria-describedby="starter-composer-hint"
+                disabled={sending}
+                onkeydown={handleComposerKeydown}
+                onpaste={handleComposerPaste}
+              ></Textarea>
+
+              <Button
+                variant="default"
+                size="icon"
+                aria-label={sending ? 'Starting session' : 'Start session'}
+                disabled={!promptReady || sending}
+                onclick={handlePromptSubmit}
+              >
+                <Send class={cn('size-4', sending && 'animate-pulse')} />
+              </Button>
+            </div>
+
+            <div id="starter-composer-hint" class="sr-only">
+              Press Enter to send. Press Shift and Enter to add a new line.
+            </div>
           </div>
         </div>
       </div>
