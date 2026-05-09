@@ -2,7 +2,7 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
   import { onMount } from 'svelte';
-  import { Cpu, MemoryStick, RefreshCw, ShieldCheck } from 'lucide-svelte';
+  import { Cpu, MemoryStick, ShieldCheck } from 'lucide-svelte';
 
   import { Badge } from '$lib/components/ui/badge';
   import { Button } from '$lib/components/ui/button';
@@ -182,15 +182,15 @@
 
 <div class="space-y-8">
   <section class="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-    <div class="space-y-3">
-      <Badge variant={error ? 'destructive' : 'default'}>{statusLabel}</Badge>
-      <div>
+    <div>
+      <div class="flex flex-wrap items-center gap-3">
         <h1 class="text-3xl font-semibold text-zinc-50">Diagnostics</h1>
-        <p class="mt-2 max-w-3xl text-sm leading-6 text-zinc-400">
-          Host CPU and RAM now live together so the memory surface can shift toward long-term agent
-          memory instead of machine telemetry.
-        </p>
+        <Badge variant={error ? 'destructive' : 'default'}>{statusLabel}</Badge>
       </div>
+      <p class="mt-2 max-w-3xl text-sm leading-6 text-zinc-400">
+        Host CPU and RAM now live together so the memory surface can shift toward long-term agent
+        memory instead of machine telemetry.
+      </p>
     </div>
 
     <div class="flex flex-wrap items-center gap-2">
@@ -220,11 +220,6 @@
           RAM
         </button>
       </div>
-
-      <Button variant="outline" onclick={refreshNow} disabled={refreshing}>
-        <RefreshCw class={refreshing ? 'size-4 animate-spin' : 'size-4'} />
-        {refreshing ? 'Refreshing' : 'Refresh'}
-      </Button>
     </div>
   </section>
 

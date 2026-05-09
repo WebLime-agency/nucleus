@@ -74,7 +74,6 @@
   let streamStatus = $state<StreamStatus>('connecting');
 
   let workspace = $derived(overview?.workspace ?? null);
-  let runtimes = $derived(overview?.runtimes ?? []);
   let selectedProfile = $derived(
     profileDrafts.find((profile) => profile.id === selectedProfileId) ?? profileDrafts[0] ?? null
   );
@@ -86,14 +85,6 @@
   let selectedProfileDirty = $derived(
     workspace && selectedProfile ? profileIsDirty(selectedProfile, workspace) : false
   );
-  let statusLabel = $derived.by(() => {
-    if (loading) return 'Connecting';
-    if (refreshing) return 'Refreshing';
-    if (streamStatus === 'reconnecting') return 'Reconnecting';
-    if (streamStatus === 'connecting') return 'Connecting';
-    if (error) return 'Degraded';
-    return 'Live';
-  });
 
   function cloneProfile(profile: WorkspaceProfileSummary): WorkspaceProfileSummary {
     return {
@@ -137,15 +128,6 @@
       profileSignature(profile, defaultProfileId) !==
       profileSignature(source, currentWorkspace.default_profile_id)
     );
-  }
-
-  function runtimeStateVariant(
-    state: string
-  ): 'default' | 'secondary' | 'warning' | 'destructive' {
-    if (state === 'ready') return 'default';
-    if (state === 'degraded' || state === 'auth_required') return 'warning';
-    if (state === 'planned') return 'secondary';
-    return 'destructive';
   }
 
   function helperForAdapter(adapter: string) {
@@ -364,7 +346,6 @@
 
 <div class="space-y-8">
   <section class="space-y-3">
-    <Badge variant={error ? 'destructive' : 'default'}>{statusLabel}</Badge>
     <div>
       <h1 class="text-3xl font-semibold text-zinc-50">Profiles</h1>
       <p class="mt-2 max-w-3xl text-sm leading-6 text-zinc-400">
@@ -385,40 +366,6 @@
       {success}
     </div>
   {/if}
-
-  <Card>
-    <CardHeader>
-      <CardTitle>Runtime Inventory</CardTitle>
-      <CardDescription>
-        These are the local runtimes Nucleus can actually see. Profile settings only choose how
-        to use them.
-      </CardDescription>
-    </CardHeader>
-    <CardContent class="space-y-3">
-      {#each runtimes as runtime}
-        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-4">
-          <div class="flex items-start justify-between gap-3">
-            <div class="min-w-0 space-y-1">
-              <div class="flex items-center gap-2">
-                <Cpu class="size-4 text-zinc-500" />
-                <div class="font-medium text-zinc-100">{formatState(runtime.id)}</div>
-              </div>
-              <div class="text-sm text-zinc-400">{runtime.summary}</div>
-              {#if runtime.executable_path}
-                <div class="truncate text-xs text-zinc-500" title={runtime.executable_path}>
-                  {compactPath(runtime.executable_path)}
-                </div>
-              {/if}
-              {#if runtime.note}
-                <div class="text-xs text-zinc-500">{runtime.note}</div>
-              {/if}
-            </div>
-            <Badge variant={runtimeStateVariant(runtime.state)}>{formatState(runtime.state)}</Badge>
-          </div>
-        </div>
-      {/each}
-    </CardContent>
-  </Card>
 
   <section class="grid gap-4 xl:grid-cols-[18rem_minmax(0,1fr)]">
     <Card>
