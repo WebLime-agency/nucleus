@@ -82,6 +82,14 @@
     sessions.find((session: SessionSummary) => session.id === activeSidebarSessionId) ?? null
   );
   let headerContext = $derived.by(() => {
+    if (selectedCreateProject || createProjectId === '') {
+      return {
+        label: selectedCreateProject ? selectedCreateProject.title : 'Workspace scratch',
+        hasProject: Boolean(selectedCreateProject),
+        projectId: createProjectId
+      };
+    }
+
     if (activeSession) {
       return {
         label: projectLabel(activeSession.project_count, activeSession.project_title),
@@ -91,9 +99,9 @@
     }
 
     return {
-      label: selectedCreateProject ? selectedCreateProject.title : 'Workspace scratch',
-      hasProject: Boolean(selectedCreateProject),
-      projectId: createProjectId
+      label: 'Workspace scratch',
+      hasProject: false,
+      projectId: ''
     };
   });
   let projectListOpen = $state(false);
@@ -169,7 +177,7 @@
       {#if projectListOpen}
         <SidebarProjectList
           {projects}
-          selectedProjectId={headerContext.projectId}
+          selectedProjectId={createProjectId}
           onSelect={handleSelectProject}
         />
       {:else}
