@@ -4,15 +4,12 @@
   import { page } from '$app/state';
   import { onMount } from 'svelte';
   import {
-    FolderRoot,
     FolderTree,
     Gauge,
+    MessageSquare,
     Menu,
     MessageSquarePlus,
-    MessagesSquare,
-    ServerCog,
-    Workflow,
-    X
+    Workflow
   } from 'lucide-svelte';
 
   import { Badge } from '$lib/components/ui/badge';
@@ -28,7 +25,6 @@
   } from '$lib/nucleus/auth';
   import { createSession, fetchOverview, fetchSettings } from '$lib/nucleus/client';
   import {
-    compactPath,
     formatCount,
     formatLatestTargetLabel,
     formatState
@@ -47,7 +43,9 @@
   let { children } = $props();
 
   const navigation = [
-    { href: '/', label: 'Overview', icon: Gauge },
+    { href: '/', label: 'Chat', icon: MessageSquare },
+    { href: '/dashboard', label: 'Dashboard', icon: Gauge },
+    { href: '/automations', label: 'Automations', icon: Workflow },
     { href: '/workspace', label: 'Workspace', icon: FolderTree }
   ];
 
@@ -76,16 +74,9 @@
       'Default'
   );
   let sessions = $derived(overview?.sessions ?? []);
-  let instanceName = $derived(settings?.instance.name ?? 'Nucleus');
   let updateStatus = $derived(settings?.update ?? null);
   let hasUpdateAvailable = $derived(updateStatus?.update_available ?? false);
   let restartRequired = $derived(updateStatus?.restart_required ?? false);
-  let updateTargetId = $derived(
-    updateStatus?.latest_release_id ??
-      updateStatus?.latest_version ??
-      updateStatus?.latest_commit ??
-      ''
-  );
   let updateTrackLabel = $derived.by(() => {
     if (!updateStatus) {
       return '';
@@ -109,13 +100,10 @@
   let activeNavItem = $derived(
     navigation.find((item) => isNavActive(item.href, pathname)) ?? navigation[0]
   );
-  let usesFullHeightContent = $derived(false);
-  let sessionsWithProjects = $derived(
-    overview?.sessions.filter((session) => session.project_count > 0).length ?? 0
-  );
   let requestedSessionId = $derived.by(() =>
     browser ? page.url.searchParams.get('session') ?? '' : ''
   );
+  let usesFullHeightContent = $derived(pathname === '/');
   let activeSidebarSessionId = $derived(requestedSessionId || sessions[0]?.id || '');
   let compatibility = $derived(
     evaluateCompatibility(daemonCompatibility ?? settings?.compatibility ?? null)
@@ -164,10 +152,6 @@
 
   function sessionContextLabel() {
     return 'Workspace scratch';
-  }
-
-  function createSessionContextLabel() {
-    return 'Scratch';
   }
 
   function projectLabel(projectCount: number, projectTitle: string) {
@@ -390,34 +374,36 @@
   });
 </script>
 
-<div class="flex h-dvh min-h-0 flex-col overflow-hidden bg-zinc-950 text-zinc-100 lg:grid lg:grid-cols-[16.5rem_minmax(0,1fr)]">
+<div class="flex h-dvh min-h-0 flex-col overflow-hidden bg-zinc-950 text-zinc-100 lg:grid lg:grid-cols-[minmax(0,16.5rem)_minmax(0,1fr)]">
   <AppSidebar
-  open={sidebarOpen}
-  {pathname}
-  {navigation}
-  {overview}
-  {activeSidebarSessionId}
-  {creating}
-  {compatibilityBlocked}
-  {createSessionTitle}
-  {sessionsWithProjects}
-  {hasUpdateAvailable}
-  {restartRequired}
-  updateTrackLabel={updateTrackLabel}
-  updateLastAttemptResult={updateStatus?.last_attempt_result ?? null}
-  {formatCount}
-  {compactPath}
-  {projectLabel}
-  {markdownExcerpt}
-  {formatState}
-  {badgeVariantForSession}
-  {isNavActive}
-  {openNavigation}
-  {handleCreateSession}
-  closeSidebar={() => {
-    sidebarOpen = false;
-  }}
-/>
+    open={sidebarOpen}
+    {pathname}
+    {navigation}
+    {overview}
+    {activeSidebarSessionId}
+    {creating}
+    {compatibilityBlocked}
+    {createSessionTitle}
+    createProjectId={createProjectId}
+    projects={discoveredProjects}
+    {hasUpdateAvailable}
+    {restartRequired}
+    updateTrackLabel={updateTrackLabel}
+    updateLastAttemptResult={updateStatus?.last_attempt_result ?? null}
+    {projectLabel}
+    {markdownExcerpt}
+    {formatState}
+    {badgeVariantForSession}
+    {isNavActive}
+    {openNavigation}
+    {handleCreateSession}
+    onSelectCreateProject={(projectId) => {
+      createProjectId = projectId;
+    }}
+    closeSidebar={() => {
+      sidebarOpen = false;
+    }}
+  />
 
 
   <main
