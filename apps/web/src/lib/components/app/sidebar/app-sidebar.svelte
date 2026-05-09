@@ -123,6 +123,7 @@
             side="bottom"
             align="end"
             sideOffset={8}
+            portalProps={{ disabled: true }}
             class="max-h-[min(24rem,calc(100vh-5rem))] w-[15rem] max-w-[calc(100vw-1rem)]"
           >
             <DropdownMenu.Label>New session context</DropdownMenu.Label>
