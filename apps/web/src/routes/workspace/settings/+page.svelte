@@ -93,19 +93,17 @@
 
   let update = $derived(settings?.update ?? null);
   let compatibility = $derived(evaluateCompatibility(settings?.compatibility ?? null));
-  let compatibilityWarning = $derived(compatibility.message);
   let statusLabel = $derived.by(() => {
-    if (loading) return 'Connecting';
-    if (checking) return 'Checking';
-    if (applying) return 'Updating';
-    if (restarting || update?.state === 'restarting') return 'Restarting';
-    if (streamStatus === 'reconnecting') return 'Reconnecting';
+    if (error) return 'Error';
+    if (restarting || settings?.update?.state === 'restarting') return 'Restarting';
+    if (checking) return 'Checking for updates';
+    if (applying) return 'Applying update';
+    if (streamStatus === 'connected') return 'Connected';
     if (streamStatus === 'connecting') return 'Connecting';
-    if (compatibility.level === 'blocked') return 'Incompatible';
-    if (compatibility.level === 'degraded') return 'Degraded';
-    if (error) return 'Degraded';
-    return 'Live';
+    if (streamStatus === 'reconnecting') return 'Reconnecting';
+    return 'Offline';
   });
+  let compatibilityWarning = $derived(compatibility.message);
   let isDevCheckout = $derived(update?.install_kind === 'dev_checkout');
   let trackedTargetLabel = $derived.by(() => {
     if (!update) {
