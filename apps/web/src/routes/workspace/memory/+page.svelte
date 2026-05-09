@@ -2,7 +2,6 @@
   import { onMount } from 'svelte';
   import { BookOpenText, Brain, Database, FileClock } from 'lucide-svelte';
 
-  import { Badge } from '$lib/components/ui/badge';
   import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '$lib/components/ui/card';
   import { fetchOverview } from '$lib/nucleus/client';
   import { compactPath } from '$lib/nucleus/format';
@@ -15,13 +14,6 @@
   let streamStatus = $state<StreamStatus>('connecting');
 
   let storage = $derived(overview?.storage ?? null);
-  let statusLabel = $derived.by(() => {
-    if (loading) return 'Connecting';
-    if (streamStatus === 'reconnecting') return 'Reconnecting';
-    if (streamStatus === 'connecting') return 'Connecting';
-    if (error) return 'Degraded';
-    return 'Live';
-  });
 
   async function loadAll() {
     try {
@@ -69,7 +61,6 @@
 
 <div class="space-y-8">
   <section class="space-y-3">
-    <Badge variant={error ? 'destructive' : 'default'}>{statusLabel}</Badge>
     <div>
       <h1 class="text-3xl font-semibold text-zinc-50">Memory</h1>
       <p class="mt-2 max-w-3xl text-sm leading-6 text-zinc-400">
