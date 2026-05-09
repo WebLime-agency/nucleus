@@ -83,13 +83,18 @@
 
 <aside
   class={cn(
-    'fixed inset-y-0 left-0 z-40 flex w-80 max-w-[85vw] flex-col border-r border-zinc-900 bg-zinc-950 transition-transform lg:static lg:z-auto lg:max-w-none lg:translate-x-0',
+    'fixed inset-y-0 left-0 z-40 flex w-80 max-w-[85vw] flex-col border-r border-zinc-900 bg-zinc-950 transition-transform lg:static lg:z-auto lg:w-auto lg:max-w-none lg:translate-x-0',
     open ? 'translate-x-0' : '-translate-x-full'
   )}
 >
-  <div class="flex items-center justify-between border-b border-zinc-900 px-3 py-3 lg:hidden">
-    <div class="text-sm font-semibold text-zinc-100">Nucleus</div>
-    <Button variant="ghost" size="icon" aria-label="Close sidebar" onclick={closeSidebar}>
+  <div class="flex items-center justify-between border-b border-zinc-900 px-3 py-3">
+    <div>
+      <div class="text-sm font-semibold text-zinc-100">Nucleus</div>
+      <div class="mt-0.5 hidden text-[11px] text-zinc-600 lg:block">
+        Local AI control plane
+      </div>
+    </div>
+    <Button variant="ghost" size="icon" class="lg:hidden" aria-label="Close sidebar" onclick={closeSidebar}>
       <X class="size-4" />
     </Button>
   </div>
@@ -108,6 +113,9 @@
     </div>
 
     <div class="min-h-0 flex-1 overflow-y-auto">
+      <div class="px-3 pt-3 text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-600">
+        Sessions
+      </div>
       <SidebarSessionList
         sessions={sessions.map((session: SessionSummary) => ({
           id: session.id,

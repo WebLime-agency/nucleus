@@ -41,7 +41,10 @@
 </script>
 
 <div class="sticky bottom-0 shrink-0 border-t border-zinc-900 bg-zinc-950/95 px-3 py-2.5 backdrop-blur">
-  <nav class="grid grid-cols-4 gap-2">
+  <div class="mb-2 text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-600">
+    Navigation
+  </div>
+  <nav class="grid gap-1.5">
     {#each navigation as item}
       <SidebarItem
         label={item.label}

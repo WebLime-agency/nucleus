@@ -26,6 +26,9 @@
     CardHeader,
     CardTitle
   } from '$lib/components/ui/card';
+  import { Input } from '$lib/components/ui/input';
+  import { Label } from '$lib/components/ui/label';
+  import { Select } from '$lib/components/ui/select';
   import {
     CURRENT_CLIENT_VERSION,
     CURRENT_CLIENT_SURFACE_VERSION,
@@ -453,14 +456,14 @@
       </CardDescription>
     </CardHeader>
     <CardContent class="space-y-4">
-      <label class="block space-y-1">
-        <span class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Root Path</span>
-        <input
-          class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
+      <div class="block space-y-1">
+        <Label for="workspace-root">Root Path</Label>
+        <Input
+          id="workspace-root"
           bind:value={workspaceRoot}
           placeholder="/home/eba/dev-projects"
         />
-      </label>
+      </div>
 
       <Button
         onclick={handleSaveWorkspace}
@@ -509,42 +512,45 @@
     </CardHeader>
     <CardContent class="space-y-4">
       <div class="grid gap-3 md:grid-cols-3">
-        <label class="block space-y-1">
-          <span class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Steps</span>
-          <input
+        <div class="block space-y-1">
+          <Label for="run-budget-steps">Conversation steps</Label>
+          <Input
+            id="run-budget-steps"
             type="number"
             min="1"
             max="1000"
-            class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
             bind:value={runBudgetMaxSteps}
             aria-label="Default maximum steps"
           />
-        </label>
+          <span class="block text-xs leading-5 text-zinc-500">How many reasoning or work steps a Utility Worker can take.</span>
+        </div>
 
-        <label class="block space-y-1">
-          <span class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Actions</span>
-          <input
+        <div class="block space-y-1">
+          <Label for="run-budget-actions">Actions</Label>
+          <Input
+            id="run-budget-actions"
             type="number"
             min="1"
             max="2000"
-            class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
             bind:value={runBudgetMaxActions}
             aria-label="Default maximum actions"
           />
-        </label>
+          <span class="block text-xs leading-5 text-zinc-500">Commands, file edits, searches, and other concrete actions.</span>
+        </div>
 
-        <label class="block space-y-1">
-          <span class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Hours</span>
-          <input
+        <div class="block space-y-1">
+          <Label for="run-budget-hours">Time limit</Label>
+          <Input
+            id="run-budget-hours"
             type="number"
             min="0.1"
             max="24"
             step="0.5"
-            class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
             bind:value={runBudgetMaxWallClockHours}
             aria-label="Default maximum run time in hours"
           />
-        </label>
+          <span class="block text-xs leading-5 text-zinc-500">Maximum elapsed time before the turn stops.</span>
+        </div>
       </div>
 
       <div class="flex flex-wrap items-center gap-3">
@@ -569,16 +575,20 @@
 
       <div class="grid gap-2 text-xs leading-5 text-zinc-500 md:grid-cols-2">
         <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2">
-          <span class="text-zinc-300">Focused</span>: 80 steps, 160 actions, 2 hours.
+          <span class="text-zinc-300">Focused</span>: everyday chat, small fixes, and quick checks.
+          <span class="block text-zinc-600">80 steps, 160 actions, 2 hours.</span>
         </div>
         <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2">
-          <span class="text-zinc-300">Extended</span>: 200 steps, 400 actions, 4 hours.
+          <span class="text-zinc-300">Extended</span>: longer coding or research tasks.
+          <span class="block text-zinc-600">200 steps, 400 actions, 4 hours.</span>
         </div>
         <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2">
-          <span class="text-zinc-300">Marathon</span>: 600 steps, 1200 actions, 8 hours.
+          <span class="text-zinc-300">Marathon</span>: several hours of supervised local work.
+          <span class="block text-zinc-600">600 steps, 1200 actions, 8 hours.</span>
         </div>
         <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2">
-          <span class="text-zinc-300">Unbounded</span>: no step, action, or time cap.
+          <span class="text-zinc-300">Unbounded</span>: trusted work that should keep going until stopped.
+          <span class="block text-zinc-600">No step, action, or time cap.</span>
         </div>
       </div>
     </CardContent>
@@ -736,15 +746,15 @@
 
           {#if update?.install_kind === 'managed_release'}
             <div class="mt-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto]">
-              <select
-                class="h-11 rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
+              <Select
+                class="h-11"
                 bind:value={trackedChannelInput}
                 aria-label="Tracked release channel"
               >
                 {#each releaseChannels as channel}
                   <option value={channel}>{channel}</option>
                 {/each}
-              </select>
+              </Select>
               <Button onclick={handleSaveUpdateConfig} disabled={!canSaveUpdateConfig}>
                 {savingUpdateConfig ? 'Saving' : 'Save target'}
               </Button>
@@ -756,8 +766,8 @@
             </div>
           {:else}
             <div class="mt-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto]">
-              <input
-                class="h-11 rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
+              <Input
+                class="h-11"
                 bind:value={trackedRefInput}
                 placeholder="main"
                 spellcheck="false"

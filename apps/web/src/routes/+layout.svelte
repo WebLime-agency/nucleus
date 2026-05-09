@@ -109,13 +109,13 @@
   let activeNavItem = $derived(
     navigation.find((item) => isNavActive(item.href, pathname)) ?? navigation[0]
   );
-  let usesFullHeightContent = $derived(false);
   let sessionsWithProjects = $derived(
     overview?.sessions.filter((session) => session.project_count > 0).length ?? 0
   );
   let requestedSessionId = $derived.by(() =>
     browser ? page.url.searchParams.get('session') ?? '' : ''
   );
+  let usesFullHeightContent = $derived(pathname === '/' && Boolean(requestedSessionId));
   let activeSidebarSessionId = $derived(requestedSessionId || sessions[0]?.id || '');
   let compatibility = $derived(
     evaluateCompatibility(daemonCompatibility ?? settings?.compatibility ?? null)
@@ -392,32 +392,32 @@
 
 <div class="flex h-dvh min-h-0 flex-col overflow-hidden bg-zinc-950 text-zinc-100 lg:grid lg:grid-cols-[16.5rem_minmax(0,1fr)]">
   <AppSidebar
-  open={sidebarOpen}
-  {pathname}
-  {navigation}
-  {overview}
-  {activeSidebarSessionId}
-  {creating}
-  {compatibilityBlocked}
-  {createSessionTitle}
-  {sessionsWithProjects}
-  {hasUpdateAvailable}
-  {restartRequired}
-  updateTrackLabel={updateTrackLabel}
-  updateLastAttemptResult={updateStatus?.last_attempt_result ?? null}
-  {formatCount}
-  {compactPath}
-  {projectLabel}
-  {markdownExcerpt}
-  {formatState}
-  {badgeVariantForSession}
-  {isNavActive}
-  {openNavigation}
-  {handleCreateSession}
-  closeSidebar={() => {
-    sidebarOpen = false;
-  }}
-/>
+    open={sidebarOpen}
+    {pathname}
+    {navigation}
+    {overview}
+    {activeSidebarSessionId}
+    {creating}
+    {compatibilityBlocked}
+    {createSessionTitle}
+    {sessionsWithProjects}
+    {hasUpdateAvailable}
+    {restartRequired}
+    updateTrackLabel={updateTrackLabel}
+    updateLastAttemptResult={updateStatus?.last_attempt_result ?? null}
+    {formatCount}
+    {compactPath}
+    {projectLabel}
+    {markdownExcerpt}
+    {formatState}
+    {badgeVariantForSession}
+    {isNavActive}
+    {openNavigation}
+    {handleCreateSession}
+    closeSidebar={() => {
+      sidebarOpen = false;
+    }}
+  />
 
 
   <main

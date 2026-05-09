@@ -29,6 +29,10 @@
   import { Badge } from '$lib/components/ui/badge';
   import { Button } from '$lib/components/ui/button';
   import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
+  import { Input } from '$lib/components/ui/input';
+  import { Label } from '$lib/components/ui/label';
+  import { Select } from '$lib/components/ui/select';
+  import { Textarea } from '$lib/components/ui/textarea';
   import {
     approveRequest,
     cancelJob,
@@ -1585,14 +1589,14 @@
 
   function composerModeLabel(mode: SessionComposerMode) {
     if (mode === 'plan') return 'Plan';
-    if (mode === 'trusted') return 'Run Actions';
+    if (mode === 'trusted') return 'Auto-Run';
     return 'Ask First';
   }
 
   function composerModeDescription(mode: SessionComposerMode) {
-    if (mode === 'plan') return 'No actions, only a plan.';
-    if (mode === 'trusted') return 'Run actions without approval prompts.';
-    return 'Ask before commands and edits.';
+    if (mode === 'plan') return 'Draft a plan without taking actions.';
+    if (mode === 'trusted') return 'Run trusted actions without approval prompts.';
+    return 'Ask before commands, edits, and other actions.';
   }
 
   function runBudgetModeLabel(mode: SessionRunBudgetMode) {
@@ -2059,12 +2063,12 @@
             {/if}
           </div>
 
-          <div class="shrink-0 bg-zinc-950/92 px-3 py-3 sm:px-6">
+          <div class="shrink-0 border-t border-zinc-900 bg-zinc-950/95 px-3 py-3 sm:px-6">
             {#if composerActivityVisible && composerActivitySummary}
               <section
                 aria-label="Nucleus activity"
                 class={cn(
-                  'mb-2 overflow-hidden rounded-xl border border-zinc-800 bg-zinc-950/95 shadow-2xl shadow-black/25 transition-[max-height]',
+                  'mb-3 overflow-hidden rounded-lg border border-zinc-800 bg-zinc-950/95 shadow-2xl shadow-black/25 transition-[max-height]',
                   composerActivityExpanded ? 'max-h-[min(30rem,46vh)]' : 'max-h-20'
                 )}
               >
@@ -2336,7 +2340,7 @@
               role="group"
               aria-label="Session composer"
               class={cn(
-                'rounded-xl border bg-zinc-900/85 p-2 transition-colors',
+                'rounded-lg border bg-zinc-900/85 p-2 transition-colors',
                 dragOver ? 'border-lime-300/50 bg-lime-300/8' : 'border-zinc-800'
               )}
               ondragover={handleComposerDragOver}
@@ -2488,11 +2492,11 @@
                   </DropdownMenu.Content>
                 </DropdownMenu.Root>
 
-                <textarea
-                  bind:this={composerTextareaElement}
+                <Textarea
+                  bind:ref={composerTextareaElement}
                   bind:value={promptText}
-                  rows="1"
-                  class="max-h-[10.5rem] min-h-10 flex-1 resize-none bg-transparent px-1 py-2 text-sm leading-5 text-zinc-100 outline-none placeholder:text-zinc-500"
+                  rows={1}
+                  class="max-h-[10.5rem] min-h-10 flex-1 resize-none border-0 bg-transparent px-1 py-2 text-sm leading-5 text-zinc-100 focus:border-transparent focus-visible:ring-0"
                   placeholder="Send a message..."
                   spellcheck={false}
                   aria-describedby="composer-hint"
@@ -2503,7 +2507,7 @@
                   }
                   onkeydown={handleComposerKeydown}
                   onpaste={handleComposerPaste}
-                ></textarea>
+                ></Textarea>
 
                 <Button
                   variant="default"
@@ -2566,20 +2570,20 @@
                   </div>
                 </div>
 
-                <label class="block space-y-2">
-                  <span class="text-xs text-zinc-500">Title</span>
-                  <input
+                <div class="block space-y-2">
+                  <Label for="session-title" class="normal-case tracking-normal">Title</Label>
+                  <Input
+                    id="session-title"
                     bind:value={draftTitle}
-                    class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
                     placeholder="Session title"
                   />
-                </label>
+                </div>
 
-                <label class="block space-y-2">
-                  <span class="text-xs text-zinc-500">Profile</span>
-                  <select
+                <div class="block space-y-2">
+                  <Label for="session-profile" class="normal-case tracking-normal">Profile</Label>
+                  <Select
+                    id="session-profile"
                     bind:value={draftProfileId}
-                    class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
                   >
                     {#if selectedSession.profile_id === ''}
                       <option value="">Legacy or direct target</option>
@@ -2587,39 +2591,39 @@
                     {#each workspaceProfiles as profile}
                       <option value={profile.id}>{profile.title}</option>
                     {/each}
-                  </select>
-                </label>
+                  </Select>
+                </div>
 
-                <label class="block space-y-2">
-                  <span class="text-xs text-zinc-500">Session Mode</span>
-                  <select
+                <div class="block space-y-2">
+                  <Label for="session-mode" class="normal-case tracking-normal">Session Mode</Label>
+                  <Select
+                    id="session-mode"
                     value={draftComposerMode()}
-                    class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
                     onchange={handleDraftComposerModeChange}
                   >
                     {#each COMPOSER_MODES as mode}
                       <option value={mode}>{composerModeLabel(mode)} - {composerModeDescription(mode)}</option>
                     {/each}
-                  </select>
+                  </Select>
                   <span class="block text-xs leading-5 text-zinc-500">
-                    Choose whether Nucleus plans only, asks before actions, or runs actions without approval prompts.
+                    Choose whether Nucleus plans first, asks before actions, or auto-runs trusted actions.
                   </span>
-                </label>
+                </div>
 
-                <label class="block space-y-2">
-                  <span class="text-xs text-zinc-500">Run Budget</span>
-                  <select
+                <div class="block space-y-2">
+                  <Label for="session-run-budget" class="normal-case tracking-normal">Run Budget</Label>
+                  <Select
+                    id="session-run-budget"
                     bind:value={draftRunBudgetMode}
-                    class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
                   >
                     {#each RUN_BUDGET_MODES as mode}
                       <option value={mode}>{runBudgetModeLabel(mode)} - {runBudgetModeDescription(mode)}</option>
                     {/each}
-                  </select>
+                  </Select>
                   <span class="block text-xs leading-5 text-zinc-500">
                     {runBudgetModeHelp(draftRunBudgetMode)}
                   </span>
-                </label>
+                </div>
 
                 <div class="grid gap-3 sm:grid-cols-2">
                   <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
@@ -2787,7 +2791,7 @@
 
               <section class="space-y-4 pt-6">
                 <div class="space-y-1">
-                  <div class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Agent Jobs</div>
+                  <div class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Utility Worker Jobs</div>
                   <div class="text-sm text-zinc-400">
                     The activity drawer shows live Nucleus activity. Full Utility Worker history stays here.
                   </div>
@@ -3159,10 +3163,16 @@
                       {#if action.parameters.length > 0}
                         <div class="mt-3 space-y-3">
                           {#each action.parameters as parameter}
-                            <label class="block space-y-1">
-                              <span class="text-xs text-zinc-500">{parameter.label}</span>
-                              <input
-                                class="h-9 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none focus:border-zinc-700"
+                            <div class="block space-y-1">
+                              <Label
+                                for={`action-${action.id}-${parameter.name}`}
+                                class="normal-case tracking-normal"
+                              >
+                                {parameter.label}
+                              </Label>
+                              <Input
+                                id={`action-${action.id}-${parameter.name}`}
+                                class="h-9"
                                 value={actionFormValues[action.id]?.[parameter.name] ?? ''}
                                 placeholder={parameter.default_value || parameter.description}
                                 oninput={(event) =>
@@ -3175,7 +3185,7 @@
                               {#if parameter.description}
                                 <div class="text-[11px] text-zinc-600">{parameter.description}</div>
                               {/if}
-                            </label>
+                            </div>
                           {/each}
                         </div>
                       {/if}
