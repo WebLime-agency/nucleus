@@ -91,7 +91,7 @@
 
 <aside
   class={cn(
-    'fixed inset-y-0 left-0 z-40 flex min-h-0 w-80 max-w-[85vw] flex-col overflow-hidden border-r border-zinc-900 bg-zinc-950 transition-transform lg:static lg:z-auto lg:h-dvh lg:w-auto lg:max-w-none lg:translate-x-0',
+    'fixed inset-y-0 left-0 z-40 flex min-h-0 w-80 max-w-[85vw] flex-col overflow-hidden border-r border-zinc-900 bg-zinc-950 transition-transform lg:static lg:z-auto lg:h-dvh lg:w-full lg:max-w-full lg:translate-x-0',
     open ? 'translate-x-0' : '-translate-x-full'
   )}
 >
@@ -114,7 +114,7 @@
           >
             <MoreVertical class="size-4" />
           </DropdownMenu.Trigger>
-          <DropdownMenu.Content side="bottom" align="end" sideOffset={8} class="w-72">
+          <DropdownMenu.Content side="bottom" align="end" sideOffset={8} class="w-72 max-w-[calc(100vw-1rem)]">
             <DropdownMenu.Label>New session context</DropdownMenu.Label>
             <DropdownMenu.RadioGroup
               value={createProjectId}
@@ -122,8 +122,8 @@
                 onSelectCreateProject(value);
               }}
             >
-              <DropdownMenu.RadioItem value="" class="items-start gap-3 py-2 pl-2 pr-8">
-                <div class="min-w-0">
+              <DropdownMenu.RadioItem value="" class="min-w-0 items-start gap-3 py-2 pl-2 pr-8">
+                <div class="min-w-0 flex-1">
                   <div class="text-sm font-medium text-zinc-100">Workspace scratch</div>
                   <div class="mt-0.5 text-xs leading-5 text-zinc-500">
                     Start without an attached project.
@@ -131,8 +131,8 @@
                 </div>
               </DropdownMenu.RadioItem>
               {#each projects as project}
-                <DropdownMenu.RadioItem value={project.id} class="items-start gap-3 py-2 pl-2 pr-8">
-                  <div class="min-w-0">
+                <DropdownMenu.RadioItem value={project.id} class="min-w-0 items-start gap-3 py-2 pl-2 pr-8">
+                  <div class="min-w-0 flex-1">
                     <div class="truncate text-sm font-medium text-zinc-100">{project.title}</div>
                     <div class="mt-0.5 truncate text-xs text-zinc-500">{project.relative_path}</div>
                   </div>
@@ -161,7 +161,7 @@
   </div>
 
   <div class="flex min-h-0 flex-1 flex-col">
-    <div class="min-h-0 flex-1 overflow-y-auto">
+    <div class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
       <div class="px-3 pt-3 text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-600">
         Sessions
       </div>

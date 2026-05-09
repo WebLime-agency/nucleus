@@ -2808,7 +2808,7 @@
 
                 <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
                   <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Primary Context</div>
-                  <div class="mt-2 text-sm text-zinc-100">{selectedProjectTitle}</div>
+                  <div class="mt-2 truncate text-sm text-zinc-100">{selectedProjectTitle}</div>
                   {#if attachedProjects.length === 0}
                     <div class="mt-1 text-xs text-zinc-500">
                       This session is currently running from workspace scratch.
@@ -2818,9 +2818,9 @@
 
                 <div class="space-y-3">
                   {#each workspaceProjects as project}
-                    <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
+                    <div class="min-w-0 rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
                       <div class="flex items-start justify-between gap-3">
-                        <div class="min-w-0">
+                        <div class="min-w-0 flex-1">
                           <div class="truncate text-sm font-medium text-zinc-100">{project.title}</div>
                           <div class="mt-1 truncate text-xs text-zinc-500">
                             {compactPath(project.absolute_path)}

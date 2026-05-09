@@ -483,16 +483,16 @@
           </div>
         {:else}
           {#each workspace.projects as project}
-            <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+            <div class="min-w-0 rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
               <div class="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
-                <div class="space-y-1">
-                  <div class="flex items-center gap-2">
+                <div class="min-w-0 space-y-1">
+                  <div class="flex min-w-0 items-center gap-2">
                     <FolderTree class="size-4 text-zinc-500" />
-                    <div class="font-medium text-zinc-100">{project.title}</div>
+                    <div class="min-w-0 truncate font-medium text-zinc-100">{project.title}</div>
                     <Badge variant="secondary">Discovered</Badge>
                   </div>
-                  <div class="text-sm text-zinc-400">{project.relative_path}</div>
-                  <div class="text-xs text-zinc-500">{compactPath(project.absolute_path)}</div>
+                  <div class="truncate text-sm text-zinc-400">{project.relative_path}</div>
+                  <div class="truncate text-xs text-zinc-500">{compactPath(project.absolute_path)}</div>
                 </div>
               </div>
             </div>
