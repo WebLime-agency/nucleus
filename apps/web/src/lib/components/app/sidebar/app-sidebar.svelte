@@ -78,6 +78,24 @@
   let selectedCreateProject = $derived(
     projects.find((project) => project.id === createProjectId) ?? null
   );
+  let activeSession = $derived(
+    sessions.find((session: SessionSummary) => session.id === activeSidebarSessionId) ?? null
+  );
+  let headerContext = $derived.by(() => {
+    if (activeSession) {
+      return {
+        label: projectLabel(activeSession.project_count, activeSession.project_title),
+        hasProject: activeSession.project_count > 0,
+        projectId: activeSession.project_count > 0 ? activeSession.project_id : ''
+      };
+    }
+
+    return {
+      label: selectedCreateProject ? selectedCreateProject.title : 'Workspace scratch',
+      hasProject: Boolean(selectedCreateProject),
+      projectId: createProjectId
+    };
+  });
   let projectListOpen = $state(false);
 
   function handleSelectProject(projectId: string) {
@@ -109,7 +127,7 @@
           type="button"
           class={cn(
             'mt-0.5 block max-w-full truncate text-left text-[11px] transition-colors hover:text-zinc-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-700 disabled:pointer-events-none disabled:opacity-50',
-            selectedCreateProject ? 'font-medium text-lime-300' : 'text-zinc-600',
+            headerContext.hasProject ? 'font-medium text-lime-300' : 'text-zinc-600',
             projectListOpen && 'text-zinc-200'
           )}
           aria-expanded={projectListOpen}
@@ -120,7 +138,7 @@
             projectListOpen = !projectListOpen;
           }}
         >
-          {selectedCreateProject ? selectedCreateProject.title : 'Workspace scratch'}
+          {headerContext.label}
         </button>
       </div>
 
@@ -151,7 +169,7 @@
       {#if projectListOpen}
         <SidebarProjectList
           {projects}
-          selectedProjectId={createProjectId}
+          selectedProjectId={headerContext.projectId}
           onSelect={handleSelectProject}
         />
       {:else}
