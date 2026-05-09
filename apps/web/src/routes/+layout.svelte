@@ -4,9 +4,11 @@
   import { page } from '$app/state';
   import { onMount } from 'svelte';
   import {
+    CalendarClock,
     FolderRoot,
     FolderTree,
     Gauge,
+    MessageSquare,
     Menu,
     MessageSquarePlus,
     MessagesSquare,
@@ -47,7 +49,9 @@
   let { children } = $props();
 
   const navigation = [
-    { href: '/', label: 'Chat', icon: Gauge },
+    { href: '/', label: 'Chat', icon: MessageSquare },
+    { href: '/dashboard', label: 'Dashboard', icon: Gauge },
+    { href: '/automations', label: 'Automations', icon: CalendarClock },
     { href: '/workspace', label: 'Workspace', icon: FolderTree }
   ];
 
@@ -400,6 +404,8 @@
     {creating}
     {compatibilityBlocked}
     {createSessionTitle}
+    createProjectId={createProjectId}
+    projects={discoveredProjects}
     {sessionsWithProjects}
     {hasUpdateAvailable}
     {restartRequired}
@@ -414,6 +420,9 @@
     {isNavActive}
     {openNavigation}
     {handleCreateSession}
+    onSelectCreateProject={(projectId) => {
+      createProjectId = projectId;
+    }}
     closeSidebar={() => {
       sidebarOpen = false;
     }}

@@ -1,9 +1,15 @@
 <script lang="ts">
   import { cn } from '$lib/utils';
   import { Button } from '$lib/components/ui/button';
-  import type { RuntimeOverview, SettingsSummary, SessionSummary } from '$lib/nucleus/schemas';
+  import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
+  import type {
+    ProjectSummary,
+    RuntimeOverview,
+    SettingsSummary,
+    SessionSummary
+  } from '$lib/nucleus/schemas';
   import type { StreamStatus } from '$lib/nucleus/realtime';
-  import { MessageSquarePlus, X } from '@lucide/svelte';
+  import { MessageSquarePlus, MoreHorizontal, X } from '@lucide/svelte';
   import SidebarFooter from './sidebar-footer.svelte';
   import SidebarSessionList from './sidebar-session-list.svelte';
 
@@ -25,6 +31,8 @@
     creating?: boolean;
     compatibilityBlocked?: boolean;
     createSessionTitle?: string;
+    createProjectId?: string;
+    projects?: ProjectSummary[];
     hasUpdateAvailable?: boolean;
     restartRequired?: boolean;
     updateTrackLabel?: string;
@@ -39,6 +47,7 @@
     isNavActive: (href: string, currentPath: string) => boolean;
     openNavigation: (href: string) => void | Promise<void>;
     handleCreateSession: () => void | Promise<void>;
+    onSelectCreateProject?: (projectId: string) => void;
     closeSidebar: () => void;
   };
 
@@ -51,6 +60,8 @@
     creating = false,
     compatibilityBlocked = false,
     createSessionTitle = '',
+    createProjectId = '',
+    projects = [],
     hasUpdateAvailable = false,
     restartRequired = false,
     updateTrackLabel = '',
@@ -65,11 +76,15 @@
     isNavActive,
     openNavigation,
     handleCreateSession,
+    onSelectCreateProject = () => {},
     closeSidebar
   }: Props = $props();
 
   let workspace = $derived(overview?.workspace ?? null);
   let sessions = $derived(overview?.sessions ?? []);
+  let selectedCreateProject = $derived(
+    projects.find((project) => project.id === createProjectId) ?? null
+  );
 </script>
 
 {#if open}
@@ -87,31 +102,73 @@
     open ? 'translate-x-0' : '-translate-x-full'
   )}
 >
-  <div class="flex items-center justify-between border-b border-zinc-900 px-3 py-3">
-    <div>
-      <div class="text-sm font-semibold text-zinc-100">Nucleus</div>
-      <div class="mt-0.5 hidden text-[11px] text-zinc-600 lg:block">
-        Local AI control plane
+  <div class="border-b border-zinc-900 px-3 py-3">
+    <div class="flex items-center justify-between gap-2">
+      <div class="min-w-0">
+        <div class="truncate text-sm font-semibold text-zinc-100">Nucleus</div>
+        <div class="mt-0.5 hidden truncate text-[11px] text-zinc-600 lg:block">
+          {selectedCreateProject ? selectedCreateProject.title : 'Workspace scratch'}
+        </div>
+      </div>
+
+      <div class="flex shrink-0 items-center gap-1">
+        <Button
+          variant="outline"
+          size="icon"
+          class="h-9 w-9"
+          disabled={creating || compatibilityBlocked}
+          title={createSessionTitle}
+          aria-label={createSessionTitle || 'New session'}
+          onclick={handleCreateSession}
+        >
+          <MessageSquarePlus class={creating ? 'size-4 animate-spin' : 'size-4'} />
+        </Button>
+
+        <DropdownMenu.Root>
+          <DropdownMenu.Trigger
+            class="inline-flex h-9 w-9 items-center justify-center rounded-md border border-zinc-800 bg-transparent text-zinc-200 transition-colors hover:bg-zinc-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-700 disabled:pointer-events-none disabled:opacity-50"
+            disabled={creating || compatibilityBlocked}
+            aria-label="Choose project for new session"
+            title="Choose project for new session"
+          >
+            <MoreHorizontal class="size-4" />
+          </DropdownMenu.Trigger>
+          <DropdownMenu.Content side="bottom" align="end" sideOffset={8} class="w-72">
+            <DropdownMenu.Label>New session context</DropdownMenu.Label>
+            <DropdownMenu.RadioGroup
+              value={createProjectId}
+              onValueChange={(value) => {
+                onSelectCreateProject(value);
+              }}
+            >
+              <DropdownMenu.RadioItem value="" class="items-start gap-3 py-2 pl-2 pr-8">
+                <div class="min-w-0">
+                  <div class="text-sm font-medium text-zinc-100">Workspace scratch</div>
+                  <div class="mt-0.5 text-xs leading-5 text-zinc-500">
+                    Start without an attached project.
+                  </div>
+                </div>
+              </DropdownMenu.RadioItem>
+              {#each projects as project}
+                <DropdownMenu.RadioItem value={project.id} class="items-start gap-3 py-2 pl-2 pr-8">
+                  <div class="min-w-0">
+                    <div class="truncate text-sm font-medium text-zinc-100">{project.title}</div>
+                    <div class="mt-0.5 truncate text-xs text-zinc-500">{project.relative_path}</div>
+                  </div>
+                </DropdownMenu.RadioItem>
+              {/each}
+            </DropdownMenu.RadioGroup>
+          </DropdownMenu.Content>
+        </DropdownMenu.Root>
+
+        <Button variant="ghost" size="icon" class="h-9 w-9 lg:hidden" aria-label="Close sidebar" onclick={closeSidebar}>
+          <X class="size-4" />
+        </Button>
       </div>
     </div>
-    <Button variant="ghost" size="icon" class="lg:hidden" aria-label="Close sidebar" onclick={closeSidebar}>
-      <X class="size-4" />
-    </Button>
   </div>
 
   <div class="flex min-h-0 flex-1 flex-col">
-    <div class="border-b border-zinc-900 px-3 py-3">
-      <Button
-        class="w-full justify-start gap-2"
-        disabled={creating || compatibilityBlocked}
-        title={createSessionTitle}
-        onclick={handleCreateSession}
-      >
-        <MessageSquarePlus class={creating ? 'size-4 animate-spin' : 'size-4'} />
-        <span>New session</span>
-      </Button>
-    </div>
-
     <div class="min-h-0 flex-1 overflow-y-auto">
       <div class="px-3 pt-3 text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-600">
         Sessions

@@ -229,15 +229,6 @@
     () => jobSummaries.find((job) => jobIsActive(job.state)) ?? jobSummaries[0] ?? null
   );
   let composerActivityJobId = $derived(composerActivityJobSummary?.id ?? '');
-  let composerActivityVisible = $derived(
-    Boolean(
-      selectedSession &&
-        (activePromptProgress ||
-          jobSummaries.length > 0 ||
-          selectedSession.state === 'running' ||
-          selectedSession.state === 'paused')
-    )
-  );
   let composerActivityPendingApproval = $derived.by(() =>
     latestPendingApproval(activityJobDetail?.approvals ?? [])
   );
@@ -332,6 +323,21 @@
     }
 
     return null;
+  });
+  let composerActivityDisplay = $derived.by(() => {
+    if (composerActivitySummary) {
+      return composerActivitySummary;
+    }
+
+    if (!selectedSession) {
+      return null;
+    }
+
+    return {
+      title: 'Utility Worker activity',
+      detail: 'No active background work for this session.',
+      state: 'idle'
+    };
   });
 
   function uniqueId() {
@@ -2064,7 +2070,7 @@
           </div>
 
           <div class="shrink-0 border-t border-zinc-900 bg-zinc-950/95 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 sm:px-6">
-            {#if composerActivityVisible && composerActivitySummary}
+            {#if composerActivityDisplay}
               <section
                 aria-label="Nucleus activity"
                 class={cn(
@@ -2088,14 +2094,14 @@
                     <div class="min-w-0 flex-1">
                       <div class="flex min-w-0 items-center gap-2">
                         <div class="truncate text-sm font-medium text-zinc-100">
-                          {composerActivitySummary.title}
+                          {composerActivityDisplay.title}
                         </div>
-                        <Badge variant={badgeVariantForActivityState(composerActivitySummary.state)}>
-                          {formatPromptProgressStatus(composerActivitySummary.state)}
+                        <Badge variant={badgeVariantForActivityState(composerActivityDisplay.state)}>
+                          {formatPromptProgressStatus(composerActivityDisplay.state)}
                         </Badge>
                       </div>
                       <div class="mt-0.5 truncate text-xs text-zinc-500">
-                        {composerActivitySummary.detail}
+                        {composerActivityDisplay.detail}
                       </div>
                     </div>
 
@@ -2152,6 +2158,12 @@
                 {#if composerActivityExpanded}
                   <div class="border-t border-zinc-800 px-3 pb-3 pt-3">
                     <div class="max-h-[min(24rem,38vh)] space-y-4 overflow-y-auto pr-1">
+                      {#if promptProgress.length === 0 && !activityJobDetail}
+                        <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3 text-sm text-zinc-500">
+                          Utility Worker activity will appear here when Nucleus starts work for this session.
+                        </div>
+                      {/if}
+
                       {#if promptProgress.length > 0}
                         <div>
                           <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Prompt Progress</div>
