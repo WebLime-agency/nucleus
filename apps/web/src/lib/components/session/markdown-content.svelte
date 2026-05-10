@@ -13,13 +13,26 @@
   let rendered = $derived(renderMarkdown(content));
 </script>
 
-<div class={cn('message-markdown text-sm leading-6', className)}>
+<div class={cn('message-markdown min-w-0 max-w-full overflow-x-hidden text-sm leading-6', className)}>
   {@html rendered}
 </div>
 
 <style>
   .message-markdown :global(* + *) {
     margin-top: 0.75rem;
+  }
+
+
+  .message-markdown {
+    min-width: 0;
+    max-width: 100%;
+    overflow-x: hidden;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  .message-markdown :global(*) {
+    max-width: 100%;
   }
 
   .message-markdown :global(p),
