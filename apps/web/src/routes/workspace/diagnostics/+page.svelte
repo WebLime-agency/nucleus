@@ -4,8 +4,14 @@
   import { onMount } from 'svelte';
   import { Cpu, MemoryStick, ShieldCheck } from 'lucide-svelte';
 
-  import { Badge } from '$lib/components/ui/badge';
-  import { Button } from '$lib/components/ui/button';
+    import {
+  WorkspaceEmptyState,
+  WorkspaceMeterPanel,
+  WorkspacePageHeader,
+  WorkspaceSegmentedControl,
+  WorkspaceStatCard
+} from '$lib/components/app/workspace';
+import { Button } from '$lib/components/ui/button';
   import { Card, CardContent, CardHeader, CardTitle } from '$lib/components/ui/card';
   import ProcessTable from '$lib/components/dashboard/process-table.svelte';
   import { fetchProcesses, fetchSystemStats, killProcess } from '$lib/nucleus/client';
@@ -181,80 +187,43 @@
 </svelte:head>
 
 <div class="space-y-8">
-  <section class="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-    <div>
-      <div class="flex flex-wrap items-center gap-3">
-        <h1 class="text-3xl font-semibold text-zinc-50">Diagnostics</h1>
-        <Badge variant={error ? 'destructive' : 'default'}>{statusLabel}</Badge>
-      </div>
-      <p class="mt-2 max-w-3xl text-sm leading-6 text-zinc-400">
-        Host CPU and RAM now live together so the memory surface can shift toward long-term agent
-        memory instead of machine telemetry.
-      </p>
-    </div>
+  <WorkspacePageHeader
+    title="Diagnostics"
+    description="Host CPU and RAM now live together so the memory surface can shift toward long-term agent memory instead of machine telemetry."
+    badge={statusLabel}
+    badgeVariant={error ? 'destructive' : 'default'}
+  >
+    {#snippet actions()}
+      <WorkspaceSegmentedControl
+        items={[
+          { value: 'cpu', label: 'CPU', icon: Cpu },
+          { value: 'memory', label: 'RAM', icon: MemoryStick }
+        ]}
+        value={view}
+        onChange={(next) => switchView(next as DiagnosticsView)}
+      />
 
-    <div class="flex flex-wrap items-center gap-2">
-      <div class="inline-flex rounded-lg border border-zinc-800 bg-zinc-950/70 p-1">
-        <button
-          type="button"
-          class={`inline-flex h-9 items-center gap-2 rounded-md px-3 text-sm transition-colors ${
-            view === 'cpu'
-              ? 'bg-zinc-100 text-zinc-950'
-              : 'text-zinc-400 hover:bg-zinc-900 hover:text-zinc-100'
-          }`}
-          onclick={() => switchView('cpu')}
-        >
-          <Cpu class="size-4" />
-          CPU
-        </button>
-        <button
-          type="button"
-          class={`inline-flex h-9 items-center gap-2 rounded-md px-3 text-sm transition-colors ${
-            view === 'memory'
-              ? 'bg-zinc-100 text-zinc-950'
-              : 'text-zinc-400 hover:bg-zinc-900 hover:text-zinc-100'
-          }`}
-          onclick={() => switchView('memory')}
-        >
-          <MemoryStick class="size-4" />
-          RAM
-        </button>
-      </div>
-    </div>
-  </section>
-
-  {#if error}
-    <div class="rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">
-      {error}
-    </div>
-  {/if}
+      <Button variant="outline" onclick={refreshNow} disabled={refreshing}>
+        {refreshing ? 'Refreshing…' : 'Refresh'}
+      </Button>
+    {/snippet}
+  </WorkspacePageHeader>
 
   {#if view === 'cpu'}
     <section class="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-      <Card>
-        <CardHeader>
-          <CardTitle>{system ? formatPercent(system.cpu.load_percent) : '--'}</CardTitle>
-        </CardHeader>
-        <CardContent class="text-sm text-zinc-400">Overall CPU load</CardContent>
-      </Card>
-      <Card>
-        <CardHeader>
-          <CardTitle>{system ? formatCount(system.cpu.cores.length) : '--'}</CardTitle>
-        </CardHeader>
-        <CardContent class="text-sm text-zinc-400">Logical cores</CardContent>
-      </Card>
-      <Card>
-        <CardHeader>
-          <CardTitle>{formatPercent(hottestCore)}</CardTitle>
-        </CardHeader>
-        <CardContent class="text-sm text-zinc-400">Busiest core</CardContent>
-      </Card>
-      <Card>
-        <CardHeader>
-          <CardTitle>{averageFrequency > 0 ? `${formatCount(averageFrequency)} MHz` : '--'}</CardTitle>
-        </CardHeader>
-        <CardContent class="text-sm text-zinc-400">Average frequency</CardContent>
-      </Card>
+      <WorkspaceStatCard
+        value={system ? formatPercent(system.cpu.load_percent) : '--'}
+        label="Overall CPU load"
+      />
+      <WorkspaceStatCard
+        value={system ? formatCount(system.cpu.cores.length) : '--'}
+        label="Logical cores"
+      />
+      <WorkspaceStatCard value={formatPercent(hottestCore)} label="Busiest core" />
+      <WorkspaceStatCard
+        value={averageFrequency > 0 ? `${formatCount(averageFrequency)} MHz` : '--'}
+        label="Average frequency"
+      />
     </section>
 
     <Card>
@@ -284,38 +253,28 @@
             {/each}
           </div>
         {:else}
-          <div class="rounded-md border border-dashed border-zinc-800 px-4 py-8 text-sm text-zinc-500">
-            Waiting for CPU telemetry.
-          </div>
+          <WorkspaceEmptyState message="Waiting for CPU telemetry." />
         {/if}
       </CardContent>
     </Card>
   {:else}
     <section class="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-      <Card>
-        <CardHeader>
-          <CardTitle>{system ? formatBytes(system.memory.used_bytes) : '--'}</CardTitle>
-        </CardHeader>
-        <CardContent class="text-sm text-zinc-400">Used memory</CardContent>
-      </Card>
-      <Card>
-        <CardHeader>
-          <CardTitle>{system ? formatBytes(system.memory.available_bytes) : '--'}</CardTitle>
-        </CardHeader>
-        <CardContent class="text-sm text-zinc-400">Available memory</CardContent>
-      </Card>
-      <Card>
-        <CardHeader>
-          <CardTitle>{system ? formatBytes(system.memory.free_bytes) : '--'}</CardTitle>
-        </CardHeader>
-        <CardContent class="text-sm text-zinc-400">Free memory</CardContent>
-      </Card>
-      <Card>
-        <CardHeader>
-          <CardTitle>{system ? formatPercent(system.memory.used_percent) : '--'}</CardTitle>
-        </CardHeader>
-        <CardContent class="text-sm text-zinc-400">Overall memory pressure</CardContent>
-      </Card>
+      <WorkspaceStatCard
+        value={system ? formatBytes(system.memory.used_bytes) : '--'}
+        label="Used memory"
+      />
+      <WorkspaceStatCard
+        value={system ? formatBytes(system.memory.available_bytes) : '--'}
+        label="Available memory"
+      />
+      <WorkspaceStatCard
+        value={system ? formatBytes(system.memory.free_bytes) : '--'}
+        label="Free memory"
+      />
+      <WorkspaceStatCard
+        value={system ? formatPercent(system.memory.used_percent) : '--'}
+        label="Overall memory pressure"
+      />
     </section>
 
     <Card>
@@ -324,34 +283,25 @@
       </CardHeader>
       <CardContent>
         {#if system}
-          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-4">
-            <div class="mb-3 flex items-center justify-between gap-3">
-              <div class="inline-flex items-center gap-2 text-zinc-200">
-                <MemoryStick class="size-4 text-zinc-500" />
-                In use
-              </div>
-              <div class="font-mono text-xs text-zinc-400">
-                {formatBytes(system.memory.used_bytes)} / {formatBytes(system.memory.total_bytes)}
-              </div>
-            </div>
-            <div class="h-3 rounded-full bg-zinc-900">
-              <div
-                class="h-3 rounded-full bg-cyan-300/80 transition-all"
-                style={`width: ${clampPercent(system.memory.used_percent)}%`}
-              ></div>
-            </div>
-            <div class="mt-3 flex items-center justify-between gap-3 text-xs text-zinc-500">
-              <span>{formatBytes(system.memory.available_bytes)} available</span>
+          <WorkspaceMeterPanel
+            title="In use"
+            detail={`${formatBytes(system.memory.used_bytes)} / ${formatBytes(system.memory.total_bytes)}`}
+            value={clampPercent(system.memory.used_percent)}
+            tone="cyan"
+          >
+            {#snippet icon()}
+              <MemoryStick class="size-4 text-zinc-500" />
+            {/snippet}
+            {#snippet footer()}
+              <span>{formatBytes(system!.memory.available_bytes)} available</span>
               <span class="inline-flex items-center gap-1">
                 <ShieldCheck class="size-3.5 text-lime-300/80" />
-                {formatCount(system.process_count)} total processes
+                {formatCount(system!.process_count)} total processes
               </span>
-            </div>
-          </div>
+            {/snippet}
+          </WorkspaceMeterPanel>
         {:else}
-          <div class="rounded-md border border-dashed border-zinc-800 px-4 py-8 text-sm text-zinc-500">
-            Waiting for memory telemetry.
-          </div>
+          <WorkspaceEmptyState message="Waiting for memory telemetry." />
         {/if}
       </CardContent>
     </Card>

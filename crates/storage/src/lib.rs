@@ -12,11 +12,11 @@ use nucleus_core::{
 use nucleus_protocol::{
     ApprovalRequestSummary, ArtifactSummary, AuditEvent, CommandSessionSummary,
     DEFAULT_JOB_MAX_STEPS, DEFAULT_JOB_MAX_TOOL_CALLS, DEFAULT_JOB_MAX_WALL_CLOCK_SECS, JobDetail,
-    JobEvent, JobSummary, McpServerSummary, PlaybookDetail, PlaybookSummary, PolicyDecisionSummary,
-    ProjectSummary, RouteTarget, RouterProfileSummary, RunBudgetSummary, RuntimeSummary,
-    SessionDetail, SessionProjectSummary, SessionSummary, SessionTurn, SessionTurnImage,
-    SkillManifest, StorageSummary, ToolCallSummary, ToolCapabilitySummary, WorkerSummary,
-    WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceSummary,
+    JobEvent, JobSummary, McpServerRecord, McpServerSummary, PlaybookDetail, PlaybookSummary,
+    PolicyDecisionSummary, ProjectSummary, RouteTarget, RouterProfileSummary, RunBudgetSummary,
+    RuntimeSummary, SessionDetail, SessionProjectSummary, SessionSummary, SessionTurn,
+    SessionTurnImage, SkillManifest, StorageSummary, ToolCallSummary, ToolCapabilitySummary,
+    WorkerSummary, WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -342,6 +342,45 @@ pub struct CommandSessionPatch {
     pub stderr_artifact_id: Option<Option<String>>,
     pub started_at: Option<Option<i64>>,
     pub completed_at: Option<Option<i64>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerPatch {
+    pub title: Option<String>,
+    pub transport: Option<String>,
+    pub command: Option<String>,
+    pub args: Option<Vec<String>>,
+    pub env_json: Option<serde_json::Value>,
+    pub enabled: Option<bool>,
+    pub sync_status: Option<String>,
+    pub last_error: Option<String>,
+    pub last_synced_at: Option<Option<i64>>,
+    pub updated_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpToolPatch {
+    pub description: Option<String>,
+    pub input_schema: Option<serde_json::Value>,
+    pub source: Option<String>,
+    pub discovered_at: Option<i64>,
+    pub updated_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillPackagePatch {
+    pub name: Option<String>,
+    pub version: Option<String>,
+    pub manifest_json: Option<serde_json::Value>,
+    pub instructions: Option<String>,
+    pub updated_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillInstallationPatch {
+    pub enabled: Option<bool>,
+    pub pinned_version: Option<Option<String>>,
+    pub updated_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -699,28 +738,182 @@ impl StateStore {
         list_mcp_servers_with_connection(&connection)
     }
 
+    pub fn list_mcp_server_records(&self) -> Result<Vec<McpServerRecord>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_mcp_server_records_with_connection(&connection)
+    }
+
     pub fn upsert_mcp_server(&self, server: &McpServerSummary) -> Result<McpServerSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let existing = match load_mcp_server_record(&connection, &server.id) {
+            Ok(record) => Some(record),
+            Err(error) if error.to_string().contains("was not found") => None,
+            Err(error) => return Err(error),
+        };
+        let record = McpServerRecord {
+            id: server.id.clone(),
+            workspace_id: existing
+                .as_ref()
+                .map(|value| value.workspace_id.clone())
+                .unwrap_or_else(|| "workspace".to_string()),
+            title: server.title.clone(),
+            transport: existing
+                .as_ref()
+                .map(|value| value.transport.clone())
+                .unwrap_or_else(|| "stdio".to_string()),
+            command: existing
+                .as_ref()
+                .map(|value| value.command.clone())
+                .unwrap_or_default(),
+            args: existing
+                .as_ref()
+                .map(|value| value.args.clone())
+                .unwrap_or_default(),
+            env_json: existing
+                .as_ref()
+                .map(|value| value.env_json.clone())
+                .unwrap_or_else(|| json!({})),
+            enabled: server.enabled,
+            sync_status: existing
+                .as_ref()
+                .map(|value| value.sync_status.clone())
+                .unwrap_or_else(|| "pending".to_string()),
+            last_error: existing
+                .as_ref()
+                .map(|value| value.last_error.clone())
+                .unwrap_or_default(),
+            last_synced_at: existing.as_ref().and_then(|value| value.last_synced_at),
+            created_at: existing.as_ref().map(|value| value.created_at).unwrap_or(0),
+            updated_at: existing.as_ref().map(|value| value.updated_at).unwrap_or(0),
+        };
+        upsert_mcp_server_record_with_summary(&connection, &record, server)
+    }
+
+    pub fn upsert_mcp_server_record(
+        &self,
+        record: &McpServerRecord,
+        tools: &[nucleus_protocol::NucleusToolDescriptor],
+        resources: &[String],
+    ) -> Result<McpServerRecord> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        upsert_mcp_server_record_only(&connection, record, tools, resources)?;
+        load_mcp_server_record(&connection, &record.id)
+    }
+
+    pub fn list_mcp_tools(&self) -> Result<Vec<nucleus_protocol::McpToolRecord>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_mcp_tools_with_connection(&connection)
+    }
+
+    pub fn upsert_mcp_tool(
+        &self,
+        tool: &nucleus_protocol::McpToolRecord,
+    ) -> Result<nucleus_protocol::McpToolRecord> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         connection.execute(
             "
-            INSERT INTO mcp_servers (id, title, enabled, tools_json, resources_json)
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            INSERT INTO mcp_tools (
+                id, server_id, name, description, input_schema_json, source, discovered_at, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             ON CONFLICT(id) DO UPDATE SET
-                title = excluded.title,
-                enabled = excluded.enabled,
-                tools_json = excluded.tools_json,
-                resources_json = excluded.resources_json,
-                updated_at = unixepoch()
+                server_id = excluded.server_id,
+                name = excluded.name,
+                description = excluded.description,
+                input_schema_json = excluded.input_schema_json,
+                source = excluded.source,
+                discovered_at = excluded.discovered_at,
+                updated_at = excluded.updated_at
             ",
             params![
-                server.id,
-                server.title,
-                server.enabled as i64,
-                serde_json::to_string(&server.tools)?,
-                serde_json::to_string(&server.resources)?,
+                tool.id,
+                tool.server_id,
+                tool.name,
+                tool.description,
+                serde_json::to_string(&tool.input_schema)?,
+                tool.source,
+                tool.discovered_at,
+                tool.created_at,
+                tool.updated_at,
             ],
         )?;
-        load_mcp_server(&connection, &server.id)
+        load_mcp_tool(&connection, &tool.id)
+    }
+
+    pub fn list_skill_packages(&self) -> Result<Vec<nucleus_protocol::SkillPackageRecord>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_skill_packages_with_connection(&connection)
+    }
+
+    pub fn upsert_skill_package(
+        &self,
+        package: &nucleus_protocol::SkillPackageRecord,
+    ) -> Result<nucleus_protocol::SkillPackageRecord> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        connection.execute(
+            "
+            INSERT INTO skill_packages (
+                id, name, version, manifest_json, instructions, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                version = excluded.version,
+                manifest_json = excluded.manifest_json,
+                instructions = excluded.instructions,
+                updated_at = excluded.updated_at
+            ",
+            params![
+                package.id,
+                package.name,
+                package.version,
+                serde_json::to_string(&package.manifest_json)?,
+                package.instructions,
+                package.created_at,
+                package.updated_at,
+            ],
+        )?;
+        load_skill_package(&connection, &package.id)
+    }
+
+    pub fn list_skill_installations(
+        &self,
+    ) -> Result<Vec<nucleus_protocol::SkillInstallationRecord>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_skill_installations_with_connection(&connection)
+    }
+
+    pub fn upsert_skill_installation(
+        &self,
+        installation: &nucleus_protocol::SkillInstallationRecord,
+    ) -> Result<nucleus_protocol::SkillInstallationRecord> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        connection.execute(
+            "
+            INSERT INTO skill_installations (
+                id, package_id, scope_kind, scope_id, enabled, pinned_version, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ON CONFLICT(id) DO UPDATE SET
+                package_id = excluded.package_id,
+                scope_kind = excluded.scope_kind,
+                scope_id = excluded.scope_id,
+                enabled = excluded.enabled,
+                pinned_version = excluded.pinned_version,
+                updated_at = excluded.updated_at
+            ",
+            params![
+                installation.id,
+                installation.package_id,
+                installation.scope_kind,
+                installation.scope_id,
+                installation.enabled,
+                installation.pinned_version,
+                installation.created_at,
+                installation.updated_at,
+            ],
+        )?;
+        load_skill_installation(&connection, &installation.id)
     }
 
     pub fn sync_projects(&self) -> Result<WorkspaceSummary> {
@@ -2044,13 +2237,61 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
 
         CREATE TABLE IF NOT EXISTS mcp_servers (
             id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL DEFAULT 'workspace',
             title TEXT NOT NULL,
+            transport TEXT NOT NULL DEFAULT 'stdio',
+            command TEXT NOT NULL DEFAULT '',
+            args_json TEXT NOT NULL DEFAULT '[]',
+            env_json TEXT NOT NULL DEFAULT '{}',
             enabled INTEGER NOT NULL DEFAULT 1,
+            sync_status TEXT NOT NULL DEFAULT 'pending',
+            last_error TEXT NOT NULL DEFAULT '',
+            last_synced_at INTEGER,
             tools_json TEXT NOT NULL DEFAULT '[]',
             resources_json TEXT NOT NULL DEFAULT '[]',
             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
+
+        CREATE TABLE IF NOT EXISTS mcp_tools (
+            id TEXT PRIMARY KEY,
+            server_id TEXT NOT NULL REFERENCES mcp_servers(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            input_schema_json TEXT NOT NULL DEFAULT '{}',
+            source TEXT NOT NULL DEFAULT '',
+            discovered_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mcp_tools_server_id_name
+            ON mcp_tools(server_id, name);
+
+
+        CREATE TABLE IF NOT EXISTS skill_packages (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            version TEXT NOT NULL DEFAULT '',
+            manifest_json TEXT NOT NULL DEFAULT '{}',
+            instructions TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+
+        CREATE TABLE IF NOT EXISTS skill_installations (
+            id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL REFERENCES skill_packages(id) ON DELETE CASCADE,
+            scope_kind TEXT NOT NULL DEFAULT '',
+            scope_id TEXT NOT NULL DEFAULT '',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            pinned_version TEXT,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_skill_installations_package_scope
+            ON skill_installations(package_id, scope_kind, scope_id);
 
         CREATE TABLE IF NOT EXISTS tool_calls (
             id TEXT PRIMARY KEY,
@@ -2228,6 +2469,50 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         );
         ",
     )?;
+
+    ensure_column(
+        connection,
+        "mcp_servers",
+        "workspace_id",
+        "TEXT NOT NULL DEFAULT 'workspace'",
+    )?;
+    ensure_column(
+        connection,
+        "mcp_servers",
+        "transport",
+        "TEXT NOT NULL DEFAULT 'stdio'",
+    )?;
+    ensure_column(
+        connection,
+        "mcp_servers",
+        "command",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "mcp_servers",
+        "args_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column(
+        connection,
+        "mcp_servers",
+        "env_json",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )?;
+    ensure_column(
+        connection,
+        "mcp_servers",
+        "sync_status",
+        "TEXT NOT NULL DEFAULT 'pending'",
+    )?;
+    ensure_column(
+        connection,
+        "mcp_servers",
+        "last_error",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(connection, "mcp_servers", "last_synced_at", "INTEGER")?;
 
     ensure_column(
         connection,
@@ -3872,6 +4157,25 @@ fn list_mcp_servers_with_connection(connection: &Connection) -> Result<Vec<McpSe
         .collect()
 }
 
+fn list_mcp_server_records_with_connection(
+    connection: &Connection,
+) -> Result<Vec<McpServerRecord>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id
+        FROM mcp_servers
+        ORDER BY enabled DESC, title COLLATE NOCASE, id
+        ",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let ids = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load MCP server record ids")?;
+    ids.into_iter()
+        .map(|id| load_mcp_server_record(connection, &id))
+        .collect()
+}
+
 fn load_mcp_server(connection: &Connection, id: &str) -> Result<McpServerSummary> {
     connection
         .query_row(
@@ -3882,6 +4186,23 @@ fn load_mcp_server(connection: &Connection, id: &str) -> Result<McpServerSummary
             ",
             params![id],
             map_mcp_server,
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("MCP server '{id}' was not found"))
+}
+
+fn load_mcp_server_record(connection: &Connection, id: &str) -> Result<McpServerRecord> {
+    connection
+        .query_row(
+            "
+            SELECT
+                id, workspace_id, title, transport, command, args_json, env_json, enabled,
+                sync_status, last_error, last_synced_at, created_at, updated_at
+            FROM mcp_servers
+            WHERE id = ?1
+            ",
+            params![id],
+            map_mcp_server_record,
         )
         .optional()?
         .ok_or_else(|| anyhow!("MCP server '{id}' was not found"))
@@ -3903,6 +4224,182 @@ fn map_mcp_server(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpServerSummary>
         enabled: row.get::<_, i64>(2)? != 0,
         tools,
         resources,
+    })
+}
+
+fn map_mcp_server_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpServerRecord> {
+    Ok(McpServerRecord {
+        id: row.get(0)?,
+        workspace_id: row.get(1)?,
+        title: row.get(2)?,
+        transport: row.get(3)?,
+        command: row.get(4)?,
+        args: decode_string_list(row.get::<_, String>(5)?)?,
+        env_json: decode_json_value(row.get::<_, String>(6)?)?,
+        enabled: row.get::<_, i64>(7)? != 0,
+        sync_status: row.get(8)?,
+        last_error: row.get(9)?,
+        last_synced_at: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+    })
+}
+
+fn upsert_mcp_server_record_only(
+    connection: &Connection,
+    record: &McpServerRecord,
+    tools: &[nucleus_protocol::NucleusToolDescriptor],
+    resources: &[String],
+) -> Result<()> {
+    connection.execute(
+        "
+        INSERT INTO mcp_servers (
+            id, workspace_id, title, transport, command, args_json, env_json, enabled,
+            sync_status, last_error, last_synced_at, tools_json, resources_json, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+            COALESCE(NULLIF(?14, 0), unixepoch()),
+            COALESCE(NULLIF(?15, 0), unixepoch()))
+        ON CONFLICT(id) DO UPDATE SET
+            workspace_id = excluded.workspace_id,
+            title = excluded.title,
+            transport = excluded.transport,
+            command = excluded.command,
+            args_json = excluded.args_json,
+            env_json = excluded.env_json,
+            enabled = excluded.enabled,
+            sync_status = excluded.sync_status,
+            last_error = excluded.last_error,
+            last_synced_at = excluded.last_synced_at,
+            tools_json = excluded.tools_json,
+            resources_json = excluded.resources_json,
+            updated_at = COALESCE(NULLIF(excluded.updated_at, 0), unixepoch())
+        ",
+        params![
+            record.id,
+            record.workspace_id,
+            record.title,
+            record.transport,
+            record.command,
+            serde_json::to_string(&record.args)?,
+            serde_json::to_string(&record.env_json)?,
+            record.enabled as i64,
+            record.sync_status,
+            record.last_error,
+            record.last_synced_at,
+            serde_json::to_string(tools)?,
+            serde_json::to_string(resources)?,
+            record.created_at,
+            record.updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_mcp_server_record_with_summary(
+    connection: &Connection,
+    record: &McpServerRecord,
+    summary: &McpServerSummary,
+) -> Result<McpServerSummary> {
+    upsert_mcp_server_record_only(connection, record, &summary.tools, &summary.resources)?;
+    load_mcp_server(connection, &record.id)
+}
+
+fn list_mcp_tools_with_connection(
+    connection: &Connection,
+) -> Result<Vec<nucleus_protocol::McpToolRecord>> {
+    let mut statement =
+        connection.prepare("SELECT id FROM mcp_tools ORDER BY server_id ASC, name ASC, id ASC")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let ids = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    ids.into_iter()
+        .map(|id| load_mcp_tool(connection, &id))
+        .collect()
+}
+
+fn load_mcp_tool(connection: &Connection, id: &str) -> Result<nucleus_protocol::McpToolRecord> {
+    connection.query_row("SELECT id, server_id, name, description, input_schema_json, source, discovered_at, created_at, updated_at FROM mcp_tools WHERE id = ?1", params![id], map_mcp_tool).optional()?.ok_or_else(|| anyhow!("mcp tool {id} was not found"))
+}
+
+fn map_mcp_tool(row: &rusqlite::Row<'_>) -> rusqlite::Result<nucleus_protocol::McpToolRecord> {
+    Ok(nucleus_protocol::McpToolRecord {
+        id: row.get(0)?,
+        server_id: row.get(1)?,
+        name: row.get(2)?,
+        description: row.get(3)?,
+        input_schema: decode_json_value(row.get(4)?)?,
+        source: row.get(5)?,
+        discovered_at: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+fn list_skill_packages_with_connection(
+    connection: &Connection,
+) -> Result<Vec<nucleus_protocol::SkillPackageRecord>> {
+    let mut statement = connection
+        .prepare("SELECT id FROM skill_packages ORDER BY name ASC, version ASC, id ASC")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let ids = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    ids.into_iter()
+        .map(|id| load_skill_package(connection, &id))
+        .collect()
+}
+
+fn load_skill_package(
+    connection: &Connection,
+    id: &str,
+) -> Result<nucleus_protocol::SkillPackageRecord> {
+    connection.query_row("SELECT id, name, version, manifest_json, instructions, created_at, updated_at FROM skill_packages WHERE id = ?1", params![id], map_skill_package).optional()?.ok_or_else(|| anyhow!("skill package {id} was not found"))
+}
+
+fn map_skill_package(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<nucleus_protocol::SkillPackageRecord> {
+    Ok(nucleus_protocol::SkillPackageRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        version: row.get(2)?,
+        manifest_json: decode_json_value(row.get(3)?)?,
+        instructions: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+fn list_skill_installations_with_connection(
+    connection: &Connection,
+) -> Result<Vec<nucleus_protocol::SkillInstallationRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT id FROM skill_installations ORDER BY scope_kind ASC, scope_id ASC, id ASC",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let ids = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    ids.into_iter()
+        .map(|id| load_skill_installation(connection, &id))
+        .collect()
+}
+
+fn load_skill_installation(
+    connection: &Connection,
+    id: &str,
+) -> Result<nucleus_protocol::SkillInstallationRecord> {
+    connection.query_row("SELECT id, package_id, scope_kind, scope_id, enabled, pinned_version, created_at, updated_at FROM skill_installations WHERE id = ?1", params![id], map_skill_installation).optional()?.ok_or_else(|| anyhow!("skill installation {id} was not found"))
+}
+
+fn map_skill_installation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<nucleus_protocol::SkillInstallationRecord> {
+    Ok(nucleus_protocol::SkillInstallationRecord {
+        id: row.get(0)?,
+        package_id: row.get(1)?,
+        scope_kind: row.get(2)?,
+        scope_id: row.get(3)?,
+        enabled: row.get::<_, i64>(4)? != 0,
+        pinned_version: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
     })
 }
 
@@ -6051,5 +6548,132 @@ mod tests {
             execution_mode: "act".to_string(),
             run_budget_mode: "inherit".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod skills_mcp_phase2_tests {
+    use super::*;
+    use nucleus_protocol::{McpServerSummary, NucleusToolDescriptor, SkillManifest};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn persists_skills_and_mcp_resources_across_reinitialization() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let state_dir = std::env::temp_dir().join(format!(
+            "nucleus-skills-mcp-persistence-{}-{suffix}",
+            std::process::id()
+        ));
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+
+        let manifest = SkillManifest {
+            id: "skill.manifest.docs".to_string(),
+            title: "Docs Skill".to_string(),
+            description: "Helps with docs".to_string(),
+            activation_mode: "manual".to_string(),
+            triggers: vec!["docs".to_string()],
+            include_paths: vec!["docs/**".to_string()],
+            required_tools: vec!["shell".to_string()],
+            required_mcps: vec!["mcp.docs".to_string()],
+            project_filters: vec!["nucleus".to_string()],
+            enabled: true,
+        };
+        store
+            .upsert_skill_manifest(&manifest)
+            .expect("skill manifest should persist");
+
+        let server = McpServerSummary {
+            id: "mcp.docs".to_string(),
+            title: "Docs MCP".to_string(),
+            enabled: true,
+            tools: vec![NucleusToolDescriptor {
+                id: "docs.search".to_string(),
+                title: "Docs Search".to_string(),
+                description: "Search docs".to_string(),
+                input_schema: serde_json::json!({"type":"object"}),
+                source: "mcp.docs".to_string(),
+            }],
+            resources: vec!["docs://index".to_string()],
+        };
+        store
+            .upsert_mcp_server(&server)
+            .expect("mcp server should persist");
+
+        let tool = nucleus_protocol::McpToolRecord {
+            id: "mcp-tool-1".to_string(),
+            server_id: server.id.clone(),
+            name: "searchDocs".to_string(),
+            description: "Searches docs".to_string(),
+            input_schema: serde_json::json!({"type":"object","properties":{"query":{"type":"string"}}}),
+            source: "mcp.docs".to_string(),
+            discovered_at: 1,
+            created_at: 2,
+            updated_at: 3,
+        };
+        store
+            .upsert_mcp_tool(&tool)
+            .expect("mcp tool should persist");
+
+        let package = nucleus_protocol::SkillPackageRecord {
+            id: "skill-pkg-1".to_string(),
+            name: "Docs Skill Package".to_string(),
+            version: "0.1.0".to_string(),
+            manifest_json: serde_json::json!({"manifest_id": manifest.id}),
+            instructions: "Use docs skill".to_string(),
+            created_at: 4,
+            updated_at: 5,
+        };
+        store
+            .upsert_skill_package(&package)
+            .expect("skill package should persist");
+
+        let installation = nucleus_protocol::SkillInstallationRecord {
+            id: "skill-install-1".to_string(),
+            package_id: package.id.clone(),
+            scope_kind: "workspace".to_string(),
+            scope_id: "workspace".to_string(),
+            enabled: true,
+            pinned_version: Some("0.1.0".to_string()),
+            created_at: 6,
+            updated_at: 7,
+        };
+        store
+            .upsert_skill_installation(&installation)
+            .expect("skill installation should persist");
+
+        drop(store);
+
+        let store = StateStore::initialize_at(&state_dir).expect("store should reinitialize");
+        assert_eq!(
+            store
+                .list_skill_manifests()
+                .expect("skill manifests should load"),
+            vec![manifest]
+        );
+        assert_eq!(
+            store.list_mcp_servers().expect("mcp servers should load"),
+            vec![server]
+        );
+        assert_eq!(
+            store.list_mcp_tools().expect("mcp tools should load"),
+            vec![tool]
+        );
+        assert_eq!(
+            store
+                .list_skill_packages()
+                .expect("skill packages should load"),
+            vec![package]
+        );
+        assert_eq!(
+            store
+                .list_skill_installations()
+                .expect("skill installations should load"),
+            vec![installation]
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
     }
 }

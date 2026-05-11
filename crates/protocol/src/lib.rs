@@ -532,6 +532,81 @@ pub struct McpServerSummary {
     pub resources: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerRecord {
+    pub id: String,
+    pub workspace_id: String,
+    pub title: String,
+    pub transport: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub env_json: Value,
+    pub enabled: bool,
+    pub sync_status: String,
+    #[serde(default)]
+    pub last_error: String,
+    pub last_synced_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpToolRecord {
+    pub id: String,
+    pub server_id: String,
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+    #[serde(default)]
+    pub source: String,
+    pub discovered_at: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillPackageRecord {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub manifest_json: Value,
+    pub instructions: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillInstallationRecord {
+    pub id: String,
+    pub package_id: String,
+    pub scope_kind: String,
+    pub scope_id: String,
+    pub enabled: bool,
+    pub pinned_version: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillPackageUpsertRequest {
+    pub id: Option<String>,
+    pub name: String,
+    pub version: String,
+    pub manifest_json: Value,
+    pub instructions: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillInstallationUpsertRequest {
+    pub id: Option<String>,
+    pub package_id: String,
+    pub scope_kind: String,
+    pub scope_id: String,
+    pub enabled: Option<bool>,
+    pub pinned_version: Option<String>,
+}
+
 fn default_compiler_role() -> String {
     "main".to_string()
 }

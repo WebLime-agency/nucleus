@@ -18,7 +18,12 @@
   } from 'lucide-svelte';
 
   import { Badge } from '$lib/components/ui/badge';
-  import { Button } from '$lib/components/ui/button';
+  import {
+  WorkspaceInfoTile,
+  WorkspaceNoteGrid,
+  WorkspacePageHeader
+} from '$lib/components/app/workspace';
+import { Button } from '$lib/components/ui/button';
   import {
     Card,
     CardContent,
@@ -571,24 +576,14 @@
         </div>
       </div>
 
-      <div class="grid gap-2 text-xs leading-5 text-zinc-500 md:grid-cols-2">
-        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2">
-          <span class="text-zinc-300">Focused</span>: everyday chat, small fixes, and quick checks.
-          <span class="block text-zinc-600">80 steps, 160 actions, 2 hours.</span>
-        </div>
-        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2">
-          <span class="text-zinc-300">Extended</span>: longer coding or research tasks.
-          <span class="block text-zinc-600">200 steps, 400 actions, 4 hours.</span>
-        </div>
-        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2">
-          <span class="text-zinc-300">Marathon</span>: several hours of supervised local work.
-          <span class="block text-zinc-600">600 steps, 1200 actions, 8 hours.</span>
-        </div>
-        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2">
-          <span class="text-zinc-300">Unbounded</span>: trusted work that should keep going until stopped.
-          <span class="block text-zinc-600">No step, action, or time cap.</span>
-        </div>
-      </div>
+      <WorkspaceNoteGrid
+        items={[
+          { title: 'Focused', detail: 'everyday chat, small fixes, and quick checks. 80 steps, 160 actions, 2 hours.' },
+          { title: 'Extended', detail: 'longer coding or research tasks. 200 steps, 400 actions, 4 hours.' },
+          { title: 'Marathon', detail: 'several hours of supervised local work. 600 steps, 1200 actions, 8 hours.' },
+          { title: 'Unbounded', detail: 'trusted work that should keep going until stopped. No step, action, or time cap.' }
+        ]}
+      />
     </CardContent>
   </Card>
 
@@ -602,40 +597,22 @@
       </CardHeader>
       <CardContent class="space-y-3">
         <div class="grid gap-3 sm:grid-cols-2">
-          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
-            <div class="flex items-center gap-2 text-xs uppercase tracking-[0.16em] text-zinc-500">
-              <Settings2 class="size-3.5" />
-              <span>Name</span>
-            </div>
-            <div class="mt-2 text-sm font-medium text-zinc-50">{settings?.instance.name ?? 'Nucleus'}</div>
-          </div>
-          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
-            <div class="flex items-center gap-2 text-xs uppercase tracking-[0.16em] text-zinc-500">
-              <Server class="size-3.5" />
-              <span>Server Bind</span>
-            </div>
-            <div class="mt-2 text-sm font-medium text-zinc-50">
-              {settings?.instance.daemon_bind ?? 'Unavailable'}
-            </div>
-          </div>
-          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
-            <div class="flex items-center gap-2 text-xs uppercase tracking-[0.16em] text-zinc-500">
-              <Power class="size-3.5" />
-              <span>Restart Control</span>
-            </div>
-            <div class="mt-2 text-sm font-medium text-zinc-50">
-              {settings ? restartModeLabel(settings.instance.restart_mode) : 'Unavailable'}
-            </div>
-          </div>
-          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
-            <div class="flex items-center gap-2 text-xs uppercase tracking-[0.16em] text-zinc-500">
-              <GitBranch class="size-3.5" />
-              <span>Install Kind</span>
-            </div>
-            <div class="mt-2 text-sm font-medium text-zinc-50">
-              {settings ? installKindLabel(settings.instance.install_kind) : 'Unavailable'}
-            </div>
-          </div>
+          <WorkspaceInfoTile label="Name" value={settings?.instance.name ?? 'Nucleus'} icon={Settings2} />
+          <WorkspaceInfoTile
+            label="Server Bind"
+            value={settings?.instance.daemon_bind ?? 'Unavailable'}
+            icon={Server}
+          />
+          <WorkspaceInfoTile
+            label="Restart Control"
+            value={settings ? restartModeLabel(settings.instance.restart_mode) : 'Unavailable'}
+            icon={Power}
+          />
+          <WorkspaceInfoTile
+            label="Install Kind"
+            value={settings ? installKindLabel(settings.instance.install_kind) : 'Unavailable'}
+            icon={GitBranch}
+          />
         </div>
 
         <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
