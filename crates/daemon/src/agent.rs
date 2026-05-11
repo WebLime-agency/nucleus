@@ -1012,16 +1012,25 @@ pub async fn recover_interrupted_jobs(state: &AppState) -> Result<()> {
         .list_command_sessions_by_state(&["starting", "running"])?
     {
         if let Some(tool_call_id) = command_session.tool_call_id.as_deref() {
-            let _ = state.store.update_tool_call(
-                tool_call_id,
-                ToolCallPatch {
-                    status: Some("failed".to_string()),
-                    error_class: Some("daemon_restart".to_string()),
-                    error_detail: Some(restart_error.to_string()),
-                    completed_at: Some(Some(unix_timestamp())),
-                    ..ToolCallPatch::default()
-                },
-            );
+            if let Ok(detail) = state.store.get_job(&command_session.job_id) {
+                if detail
+                    .tool_calls
+                    .iter()
+                    .find(|tool_call| tool_call.id == tool_call_id)
+                    .is_some_and(|tool_call| is_non_terminal_tool_call_status(&tool_call.status))
+                {
+                    let _ = state.store.update_tool_call(
+                        tool_call_id,
+                        ToolCallPatch {
+                            status: Some("failed".to_string()),
+                            error_class: Some("daemon_restart".to_string()),
+                            error_detail: Some(restart_error.to_string()),
+                            completed_at: Some(Some(unix_timestamp())),
+                            ..ToolCallPatch::default()
+                        },
+                    );
+                }
+            }
         }
         let _ = state.store.update_command_session(
             &command_session.id,
@@ -1034,6 +1043,10 @@ pub async fn recover_interrupted_jobs(state: &AppState) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn is_non_terminal_tool_call_status(status: &str) -> bool {
+    matches!(status, "queued" | "starting" | "running")
 }
 
 fn spawn_job_task(state: AppState, job_id: String) {
@@ -7301,6 +7314,17 @@ async fn publish_prompt_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_restart_recovery_only_rewrites_non_terminal_tool_calls() {
+        for status in ["queued", "starting", "running"] {
+            assert!(is_non_terminal_tool_call_status(status));
+        }
+
+        for status in ["completed", "failed", "canceled", "denied"] {
+            assert!(!is_non_terminal_tool_call_status(status));
+        }
+    }
     use crate::{
         host::HostEngine,
         runtime::RuntimeManager,
