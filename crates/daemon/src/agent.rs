@@ -961,6 +961,7 @@ pub async fn dispatch_playbook_event(state: AppState, event_kind: &str) -> Resul
 }
 
 pub async fn recover_interrupted_jobs(state: &AppState) -> Result<()> {
+    let restart_error = "Nucleus restarted before this command session completed.";
     let jobs = state.store.list_jobs_by_state(&["queued", "running"])?;
     for job in jobs {
         let _ = state.store.update_job(
@@ -1010,13 +1011,23 @@ pub async fn recover_interrupted_jobs(state: &AppState) -> Result<()> {
         .store
         .list_command_sessions_by_state(&["starting", "running"])?
     {
+        if let Some(tool_call_id) = command_session.tool_call_id.as_deref() {
+            let _ = state.store.update_tool_call(
+                tool_call_id,
+                ToolCallPatch {
+                    status: Some("failed".to_string()),
+                    error_class: Some("daemon_restart".to_string()),
+                    error_detail: Some(restart_error.to_string()),
+                    completed_at: Some(Some(unix_timestamp())),
+                    ..ToolCallPatch::default()
+                },
+            );
+        }
         let _ = state.store.update_command_session(
             &command_session.id,
             CommandSessionPatch {
                 state: Some("orphaned".to_string()),
-                last_error: Some(
-                    "Nucleus restarted before this command session completed.".to_string(),
-                ),
+                last_error: Some(restart_error.to_string()),
                 completed_at: Some(Some(unix_timestamp())),
                 ..CommandSessionPatch::default()
             },
@@ -1261,6 +1272,12 @@ async fn run_job_loop(
         }
 
         session = state.store.get_session(&session_id)?;
+        if matches!(
+            state.store.get_job(job_id)?.job.state.as_str(),
+            "completed" | "failed" | "canceled"
+        ) {
+            return Ok(());
+        }
         if let LoopDisposition::Return = handle_pending_action(
             state,
             &session,
@@ -3475,6 +3492,34 @@ async fn execute_pending_tool_action(
     };
 
     state.agent.release_write_lock(&pending.tool_call_id);
+
+    if *cancel_rx.borrow()
+        || matches!(
+            state.store.get_job(job_id)?.job.state.as_str(),
+            "completed" | "failed" | "canceled"
+        )
+    {
+        let _ = state.store.update_tool_call(
+            &pending.tool_call_id,
+            ToolCallPatch {
+                status: Some("canceled".to_string()),
+                result_json: Some(Some(tool_result.clone())),
+                error_class: Some("job_canceled".to_string()),
+                error_detail: Some(
+                    "The job was canceled before this tool result could continue the worker loop."
+                        .to_string(),
+                ),
+                completed_at: Some(Some(unix_timestamp())),
+                ..ToolCallPatch::default()
+            },
+        );
+        checkpoint.pending_action = None;
+        let _ = state.store.write_worker_checkpoint(
+            &worker.id,
+            &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+        );
+        return Ok(LoopDisposition::Return);
+    }
 
     state.store.update_tool_call(
         &pending.tool_call_id,
