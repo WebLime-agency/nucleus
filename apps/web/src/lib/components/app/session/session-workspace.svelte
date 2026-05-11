@@ -2423,7 +2423,7 @@
             {#if selectedSession.state === 'paused' || selectedSession.state === 'error'}
               <section
                 class={cn(
-                  'rounded-xl border px-4 py-3 text-sm',
+                  'mb-3 rounded-xl border px-4 py-3 text-sm',
                   selectedSession.state === 'paused'
                     ? 'border-amber-500/30 bg-amber-500/10 text-amber-100'
                     : 'border-red-500/30 bg-red-500/10 text-red-100'
