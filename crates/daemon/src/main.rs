@@ -35,14 +35,16 @@ use nucleus_core::{
 };
 use nucleus_protocol::{
     ActionParameter, ActionRunRequest, ActionRunResponse, ActionSummary, ApprovalRequestSummary,
-    ApprovalResolutionRequest, AuditEvent, AuthSummary, CompatibilitySummary, ConnectionSummary,
-    CreatePlaybookRequest, CreateSessionRequest, DaemonEvent, HealthResponse, HostStatus,
-    JobDetail, JobSummary, MAX_CONFIGURED_JOB_STEPS, MAX_CONFIGURED_JOB_TOOL_CALLS,
-    MAX_CONFIGURED_JOB_WALL_CLOCK_SECS, McpServerSummary, NucleusToolDescriptor, PlaybookDetail,
-    PlaybookSummary, ProcessKillRequest, ProcessKillResponse, ProcessListResponse,
-    ProcessStreamUpdate, ProjectUpdateRequest, PromptProgressUpdate, RouterProfileSummary,
-    RunBudgetSummary, RuntimeOverview, RuntimeSummary, SessionDetail, SessionPromptRequest,
-    SessionSummary, SettingsSummary, SkillManifest, StreamConnected, SystemStats,
+    ApprovalResolutionRequest, AuditEvent, AuthSummary, CompatibilitySummary, CompiledPromptLayer,
+    CompiledTurn, ConnectionSummary, CreatePlaybookRequest, CreateSessionRequest, DaemonEvent,
+    HealthResponse, HostStatus, JobDetail, JobSummary, MAX_CONFIGURED_JOB_STEPS,
+    MAX_CONFIGURED_JOB_TOOL_CALLS, MAX_CONFIGURED_JOB_WALL_CLOCK_SECS, McpServerRecord,
+    McpServerSummary, McpToolRecord, NucleusToolDescriptor, PlaybookDetail, PlaybookSummary,
+    ProcessKillRequest, ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate,
+    ProjectUpdateRequest, PromptProgressUpdate, RouterProfileSummary, RunBudgetSummary,
+    RuntimeOverview, RuntimeSummary, SessionDetail, SessionPromptRequest, SessionSummary,
+    SettingsSummary, SkillInstallationRecord, SkillInstallationUpsertRequest, SkillManifest,
+    SkillPackageRecord, SkillPackageUpsertRequest, StreamConnected, SystemStats,
     UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
     WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceProfileWriteRequest, WorkspaceSummary,
     WorkspaceUpdateRequest,
@@ -55,6 +57,8 @@ use runtime::RuntimeManager;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::Command,
     sync::broadcast,
     time::{self, MissedTickBehavior},
 };
@@ -166,10 +170,30 @@ fn app(state: AppState) -> Router {
         .route("/router/profiles", get(router_profiles))
         .route("/skills", get(list_skills).post(upsert_skill))
         .route("/skills/{skill_id}", axum::routing::put(upsert_skill_by_id))
+        .route(
+            "/skill-packages",
+            get(list_skill_packages).post(upsert_skill_package),
+        )
+        .route(
+            "/skill-packages/{package_id}",
+            axum::routing::put(upsert_skill_package_by_id),
+        )
+        .route(
+            "/skill-installations",
+            get(list_skill_installations).post(upsert_skill_installation),
+        )
+        .route(
+            "/skill-installations/{installation_id}",
+            axum::routing::put(upsert_skill_installation_by_id),
+        )
         .route("/mcps", get(list_mcp_servers).post(upsert_mcp_server))
         .route(
             "/mcps/{server_id}",
             axum::routing::put(upsert_mcp_server_by_id),
+        )
+        .route(
+            "/mcps/{server_id}/discover",
+            axum::routing::post(discover_mcp_server_tools),
         )
         .route("/actions", get(actions))
         .route("/actions/{action_id}", get(action_detail))
@@ -541,6 +565,56 @@ async fn upsert_skill_by_id(
     Ok(Json(state.store.upsert_skill_manifest(&payload)?))
 }
 
+async fn list_skill_packages(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<SkillPackageRecord>>, ApiError> {
+    Ok(Json(state.store.list_skill_packages()?))
+}
+
+async fn upsert_skill_package(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<SkillPackageRecord>, ApiError> {
+    let payload = decode_json::<SkillPackageUpsertRequest>(&body)?;
+    let package = build_skill_package_record(payload, None)?;
+    Ok(Json(state.store.upsert_skill_package(&package)?))
+}
+
+async fn upsert_skill_package_by_id(
+    State(state): State<AppState>,
+    Path(package_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<SkillPackageRecord>, ApiError> {
+    let payload = decode_json::<SkillPackageUpsertRequest>(&body)?;
+    let package = build_skill_package_record(payload, Some(package_id))?;
+    Ok(Json(state.store.upsert_skill_package(&package)?))
+}
+
+async fn list_skill_installations(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<SkillInstallationRecord>>, ApiError> {
+    Ok(Json(state.store.list_skill_installations()?))
+}
+
+async fn upsert_skill_installation(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<SkillInstallationRecord>, ApiError> {
+    let payload = decode_json::<SkillInstallationUpsertRequest>(&body)?;
+    let installation = build_skill_installation_record(&state, payload, None)?;
+    Ok(Json(state.store.upsert_skill_installation(&installation)?))
+}
+
+async fn upsert_skill_installation_by_id(
+    State(state): State<AppState>,
+    Path(installation_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<SkillInstallationRecord>, ApiError> {
+    let payload = decode_json::<SkillInstallationUpsertRequest>(&body)?;
+    let installation = build_skill_installation_record(&state, payload, Some(installation_id))?;
+    Ok(Json(state.store.upsert_skill_installation(&installation)?))
+}
+
 async fn list_mcp_servers(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<McpServerSummary>>, ApiError> {
@@ -563,6 +637,259 @@ async fn upsert_mcp_server_by_id(
     let mut payload = sanitize_mcp_server(decode_json::<McpServerSummary>(&body)?)?;
     payload.id = sanitize_registry_id(&server_id, "MCP server id")?;
     Ok(Json(state.store.upsert_mcp_server(&payload)?))
+}
+
+async fn discover_mcp_server_tools(
+    State(state): State<AppState>,
+    Path(server_id): Path<String>,
+) -> Result<Json<McpServerSummary>, ApiError> {
+    let server_id = sanitize_registry_id(&server_id, "MCP server id")?;
+    let record = state
+        .store
+        .list_mcp_server_records()
+        .map_err(ApiError::from)?
+        .into_iter()
+        .find(|server| server.id == server_id)
+        .ok_or_else(|| ApiError::not_found(format!("MCP server '{server_id}' was not found")))?;
+
+    let result = discover_mcp_stdio_server(&record).await;
+    match result {
+        Ok(discovered) => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time should be monotonic")
+                .as_secs() as i64;
+            let updated_record = McpServerRecord {
+                sync_status: "ready".to_string(),
+                last_error: String::new(),
+                last_synced_at: Some(now),
+                updated_at: now,
+                ..record.clone()
+            };
+            let summary = McpServerSummary {
+                id: record.id.clone(),
+                title: record.title.clone(),
+                enabled: record.enabled,
+                tools: discovered.tools.clone(),
+                resources: discovered.resources.clone(),
+            };
+            state
+                .store
+                .upsert_mcp_server_record(&updated_record, &summary.tools, &summary.resources)
+                .map_err(ApiError::from)?;
+            for tool in &discovered.tool_records {
+                state.store.upsert_mcp_tool(tool).map_err(ApiError::from)?;
+            }
+            Ok(Json(
+                state
+                    .store
+                    .list_mcp_servers()
+                    .map_err(ApiError::from)?
+                    .into_iter()
+                    .find(|server| server.id == record.id)
+                    .expect("discovered MCP server should be present"),
+            ))
+        }
+        Err(error) => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time should be monotonic")
+                .as_secs() as i64;
+            let message = error.to_string();
+            let updated_record = McpServerRecord {
+                sync_status: "error".to_string(),
+                last_error: message.clone(),
+                last_synced_at: Some(now),
+                updated_at: now,
+                ..record.clone()
+            };
+            state
+                .store
+                .upsert_mcp_server_record(&updated_record, &[], &[])
+                .map_err(ApiError::from)?;
+            Err(ApiError::bad_request(message))
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DiscoveredMcpCatalog {
+    tools: Vec<NucleusToolDescriptor>,
+    resources: Vec<String>,
+    tool_records: Vec<McpToolRecord>,
+}
+
+async fn discover_mcp_stdio_server(
+    record: &McpServerRecord,
+) -> anyhow::Result<DiscoveredMcpCatalog> {
+    if record.transport != "stdio" {
+        anyhow::bail!("unsupported MCP transport '{}'", record.transport);
+    }
+    if record.command.trim().is_empty() {
+        anyhow::bail!("MCP stdio command is required");
+    }
+
+    let mut command = Command::new(&record.command);
+    command.args(&record.args);
+    for (key, value) in record.env_json.as_object().cloned().unwrap_or_default() {
+        let value = match value {
+            Value::String(text) => text,
+            other => other.to_string(),
+        };
+        command.env(key, value);
+    }
+    command.stdin(std::process::Stdio::piped());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::null());
+
+    let mut child = command
+        .spawn()
+        .context("failed to start MCP stdio server")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("MCP stdio server did not expose stdin")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("MCP stdio server did not expose stdout")?;
+    let mut reader = BufReader::new(stdout).lines();
+
+    stdin
+        .write_all(
+            serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "nucleus", "version": env!("CARGO_PKG_VERSION")}
+                }
+            }))?
+            .as_bytes(),
+        )
+        .await?;
+    stdin
+        .write_all(
+            b"
+",
+        )
+        .await?;
+
+    stdin
+        .write_all(
+            serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {}
+            }))?
+            .as_bytes(),
+        )
+        .await?;
+    stdin
+        .write_all(
+            b"
+",
+        )
+        .await?;
+
+    stdin
+        .write_all(
+            serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {}
+            }))?
+            .as_bytes(),
+        )
+        .await?;
+    stdin
+        .write_all(
+            b"
+",
+        )
+        .await?;
+    stdin.flush().await?;
+
+    let mut tool_list: Option<Value> = None;
+    for _ in 0..16 {
+        let Some(line) = reader.next_line().await? else {
+            break;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(&line).context("failed to parse MCP response")?;
+        if value.get("id") == Some(&json!(2)) {
+            tool_list = value.get("result").cloned();
+            break;
+        }
+    }
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+
+    let result = tool_list.context("MCP server did not return a tools/list result")?;
+    let tools_value = result
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_secs() as i64;
+    let mut tools = Vec::new();
+    let mut tool_records = Vec::new();
+    for item in tools_value {
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if name.is_empty() {
+            continue;
+        }
+        let description = item
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let input_schema = item
+            .get("inputSchema")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let source = record.id.clone();
+        let tool_id = format!("{}.{}", record.id, name);
+        tools.push(NucleusToolDescriptor {
+            id: tool_id.clone(),
+            title: name.to_string(),
+            description: description.clone(),
+            input_schema: input_schema.clone(),
+            source: source.clone(),
+        });
+        tool_records.push(McpToolRecord {
+            id: tool_id,
+            server_id: record.id.clone(),
+            name: name.to_string(),
+            description,
+            input_schema,
+            source,
+            discovered_at: now,
+            created_at: now,
+            updated_at: now,
+        });
+    }
+
+    Ok(DiscoveredMcpCatalog {
+        tools,
+        resources: Vec::new(),
+        tool_records,
+    })
 }
 
 async fn list_sessions(
@@ -1660,6 +1987,76 @@ fn sanitize_mcp_server(mut server: McpServerSummary) -> Result<McpServerSummary,
     Ok(server)
 }
 
+fn build_skill_package_record(
+    payload: SkillPackageUpsertRequest,
+    path_id: Option<String>,
+) -> Result<SkillPackageRecord, ApiError> {
+    let id = path_id
+        .or(payload.id)
+        .ok_or_else(|| ApiError::bad_request("skill package id is required"))?;
+    let id = sanitize_registry_id(&id, "skill package id")?;
+    let name = required_trimmed(payload.name, "skill package name")?;
+    let version = required_trimmed(payload.version, "skill package version")?;
+    let instructions = required_trimmed(payload.instructions, "skill package instructions")?;
+    let now = unix_timestamp();
+    Ok(SkillPackageRecord {
+        id,
+        name,
+        version,
+        manifest_json: payload.manifest_json,
+        instructions,
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+fn build_skill_installation_record(
+    state: &AppState,
+    payload: SkillInstallationUpsertRequest,
+    path_id: Option<String>,
+) -> Result<SkillInstallationRecord, ApiError> {
+    let id = path_id
+        .or(payload.id)
+        .ok_or_else(|| ApiError::bad_request("skill installation id is required"))?;
+    let id = sanitize_registry_id(&id, "skill installation id")?;
+    let package_id = sanitize_registry_id(&payload.package_id, "skill package id")?;
+    let package_ids = state
+        .store
+        .list_skill_packages()?
+        .into_iter()
+        .map(|pkg| pkg.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    if !package_ids.contains(&package_id) {
+        return Err(ApiError::bad_request(format!(
+            "skill package '{package_id}' was not found"
+        )));
+    }
+    let scope_kind = required_trimmed(payload.scope_kind, "skill installation scope_kind")?;
+    let scope_id = required_trimmed(payload.scope_id, "skill installation scope_id")?;
+    match scope_kind.as_str() {
+        "workspace" | "project" | "session" => {}
+        _ => {
+            return Err(ApiError::bad_request(
+                "skill installation scope_kind must be workspace, project, or session",
+            ));
+        }
+    }
+    let now = unix_timestamp();
+    Ok(SkillInstallationRecord {
+        id,
+        package_id,
+        scope_kind,
+        scope_id,
+        enabled: payload.enabled.unwrap_or(true),
+        pinned_version: payload
+            .pinned_version
+            .map(|v: String| v.trim().to_string())
+            .filter(|v: &String| !v.is_empty()),
+        created_at: now,
+        updated_at: now,
+    })
+}
+
 fn sanitize_tool_descriptor(
     mut tool: NucleusToolDescriptor,
 ) -> Result<NucleusToolDescriptor, ApiError> {
@@ -2257,6 +2654,131 @@ fn resolve_skill_include_path(workspace_root: &PathBuf, include_path: &str) -> O
     } else {
         None
     }
+}
+
+fn compile_session_turn(
+    state: &AppState,
+    session: &SessionSummary,
+    history: &[nucleus_protocol::SessionTurn],
+    prompt: &str,
+    images: &[nucleus_protocol::SessionTurnImage],
+    compiler_role: &str,
+) -> Result<CompiledTurn, ApiError> {
+    let prompt_sources = discover_prompt_sources(state, session, prompt)?;
+    let skill_layers = collect_compiled_skill_layers(state, session, prompt)?;
+    let mut mcp_catalog = state.store.list_mcp_servers()?;
+    mcp_catalog.retain(|server| server.enabled);
+    mcp_catalog.sort_by(|a, b| a.id.cmp(&b.id));
+    let tool_catalog = mcp_catalog
+        .iter()
+        .flat_map(|server| server.tools.clone())
+        .collect::<Vec<_>>();
+
+    let mut compiled = runtime::compiled_turn_from_prompt(
+        history,
+        prompt,
+        images,
+        compiler_role,
+        &skill_layers,
+        &tool_catalog,
+        &mcp_catalog,
+    );
+    compiled.debug_summary.include_count = prompt_sources.len();
+    compiled.debug_summary.layer_count = compiled.skill_layers.len();
+    compiled.debug_summary.summary = format!(
+        "Compiled {} history turns for {} provider-neutral prompt with {} prompt includes, {} skill layers, {} MCP servers, and {} tools.",
+        compiled.history.len(),
+        compiled.role,
+        compiled.debug_summary.include_count,
+        compiled.debug_summary.skill_count,
+        compiled.debug_summary.mcp_server_count,
+        compiled.debug_summary.tool_count,
+    );
+    Ok(compiled)
+}
+
+fn collect_compiled_skill_layers(
+    state: &AppState,
+    session: &SessionSummary,
+    prompt: &str,
+) -> Result<Vec<CompiledPromptLayer>, ApiError> {
+    let workspace = state.store.workspace()?;
+    let workspace_root = PathBuf::from(&workspace.root_path);
+    if !workspace_root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let workspace_root = fs::canonicalize(&workspace_root).map_err(|error| {
+        ApiError::internal_message(format!(
+            "failed to resolve workspace root '{}': {error}",
+            workspace.root_path
+        ))
+    })?;
+
+    let mut layers = Vec::new();
+    let mut installed_skill_ids = std::collections::BTreeSet::new();
+    let packages = state.store.list_skill_packages()?;
+    let package_map = packages
+        .into_iter()
+        .map(|pkg| (pkg.id.clone(), pkg))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for installation in state.store.list_skill_installations()? {
+        if !installation.enabled {
+            continue;
+        }
+        let Some(package) = package_map.get(&installation.package_id) else {
+            continue;
+        };
+        let applies = match installation.scope_kind.as_str() {
+            "workspace" => installation.scope_id == "workspace",
+            "project" => session
+                .projects
+                .iter()
+                .any(|project| project.id == installation.scope_id),
+            "session" => session.id == installation.scope_id,
+            _ => false,
+        };
+        if !applies {
+            continue;
+        }
+        if let Some(pinned) = installation.pinned_version.as_deref() {
+            if package.version != pinned {
+                continue;
+            }
+        }
+        if let Some(manifest_id) = package
+            .manifest_json
+            .get("manifest_id")
+            .and_then(|v| v.as_str())
+        {
+            installed_skill_ids.insert(manifest_id.to_string());
+        }
+    }
+    for skill in state.store.list_skill_manifests()? {
+        if !installed_skill_ids.is_empty() && !installed_skill_ids.contains(&skill.id) {
+            continue;
+        }
+        if !skill_is_active_for_prompt(&skill, session, prompt) {
+            continue;
+        }
+        for include_path in &skill.include_paths {
+            let Some(path) = resolve_skill_include_path(&workspace_root, include_path) else {
+                continue;
+            };
+            let Ok(content) = fs::read_to_string(&path) else {
+                continue;
+            };
+            layers.push(CompiledPromptLayer {
+                id: format!("skill:{}:{}", skill.id, include_path),
+                kind: "skill".to_string(),
+                scope: "workspace".to_string(),
+                title: skill.title.clone(),
+                source_path: path.display().to_string(),
+                content,
+            });
+        }
+    }
+    layers.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(layers)
 }
 
 fn collect_prompt_sources_from_root(
@@ -3283,6 +3805,127 @@ mod tests {
     }
 
     #[test]
+    fn compile_session_turn_populates_skill_layers_and_mcp_catalog() {
+        let state_dir = test_state_dir("phase4-compiled-turn");
+        let store = initialize_test_store(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let skill_dir = workspace_root.join("skills");
+        fs::create_dir_all(&skill_dir).expect("skill include directory should exist");
+        fs::write(
+            skill_dir.join("rust.md"),
+            "# Rust Skill\nPrefer small focused patches.\n",
+        )
+        .expect("skill include should write");
+        store
+            .upsert_skill_manifest(&SkillManifest {
+                id: "rust".to_string(),
+                title: "Rust".to_string(),
+                description: "Rust conventions".to_string(),
+                activation_mode: "auto".to_string(),
+                triggers: vec!["cargo".to_string()],
+                include_paths: vec!["skills/rust.md".to_string()],
+                required_tools: Vec::new(),
+                required_mcps: vec!["mcp.docs".to_string()],
+                project_filters: Vec::new(),
+                enabled: true,
+            })
+            .expect("skill manifest should persist");
+        store
+            .upsert_mcp_server(&McpServerSummary {
+                id: "mcp.docs".to_string(),
+                title: "Docs MCP".to_string(),
+                enabled: true,
+                tools: vec![NucleusToolDescriptor {
+                    id: "mcp.docs.searchDocs".to_string(),
+                    title: "searchDocs".to_string(),
+                    description: "Search docs".to_string(),
+                    input_schema: json!({"type":"object"}),
+                    source: "mcp.docs".to_string(),
+                }],
+                resources: Vec::new(),
+            })
+            .expect("mcp server should persist");
+
+        store
+            .update_workspace(
+                Some(&workspace_root.display().to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("workspace root should update");
+
+        let (events, _) = broadcast::channel(4);
+        let state = AppState {
+            version: "test".to_string(),
+            store: store.clone(),
+            host: Arc::new(HostEngine::new()),
+            runtimes: Arc::new(RuntimeManager::default()),
+            updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            agent: Arc::new(agent::AgentRuntime::default()),
+            web_dist_dir: None,
+            tailscale_dns_name: None,
+            events,
+        };
+
+        let session = SessionSummary {
+            id: "session-1".to_string(),
+            title: "Phase 4".to_string(),
+            profile_id: String::new(),
+            profile_title: String::new(),
+            route_id: String::new(),
+            route_title: String::new(),
+            project_id: String::new(),
+            project_title: String::new(),
+            project_path: workspace_root.display().to_string(),
+            provider: "openai_compatible".to_string(),
+            model: "gpt-5.4-mini".to_string(),
+            provider_base_url: "http://127.0.0.1:20128/v1".to_string(),
+            provider_api_key: String::new(),
+            working_dir: workspace_root.display().to_string(),
+            working_dir_kind: "workspace".to_string(),
+            scope: "workspace".to_string(),
+            approval_mode: "ask".to_string(),
+            execution_mode: "act".to_string(),
+            run_budget_mode: "inherit".to_string(),
+            run_budget: RunBudgetSummary::default(),
+            project_count: 0,
+            projects: Vec::new(),
+            state: "active".to_string(),
+            provider_session_id: String::new(),
+            last_error: String::new(),
+            last_message_excerpt: String::new(),
+            turn_count: 0,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let compiled =
+            compile_session_turn(&state, &session, &[], "Please run cargo test", &[], "main")
+                .expect("compiled turn should build");
+
+        assert_eq!(compiled.skill_layers.len(), 1);
+        assert_eq!(compiled.skill_layers[0].title, "Rust");
+        assert!(
+            compiled.skill_layers[0]
+                .content
+                .contains("small focused patches")
+        );
+        assert_eq!(compiled.mcp_catalog.len(), 1);
+        assert_eq!(compiled.mcp_catalog[0].id, "mcp.docs");
+        assert_eq!(compiled.tool_catalog.len(), 1);
+        assert_eq!(compiled.tool_catalog[0].id, "mcp.docs.searchDocs");
+        assert_eq!(compiled.debug_summary.skill_count, 1);
+        assert_eq!(compiled.debug_summary.mcp_server_count, 1);
+        assert_eq!(compiled.debug_summary.tool_count, 1);
+        assert!(compiled.capabilities.needs_mcp);
+        assert!(compiled.capabilities.needs_tools);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
     fn active_skills_contribute_workspace_include_files() {
         let state_dir = test_state_dir("skill-includes");
         let store = initialize_test_store(&state_dir);
@@ -3713,6 +4356,136 @@ mod tests {
             )
             .expect("workspace root should update");
         store
+    }
+
+    #[tokio::test]
+    async fn discovers_stdio_mcp_tools_and_persists_sync_state() {
+        let state_dir = test_state_dir("mcp-discover-success");
+        let store = initialize_test_store(&state_dir);
+        let (events, _) = broadcast::channel(4);
+        let state = AppState {
+            version: "test".to_string(),
+            store: store.clone(),
+            host: Arc::new(HostEngine::new()),
+            runtimes: Arc::new(RuntimeManager::default()),
+            updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            agent: Arc::new(agent::AgentRuntime::default()),
+            web_dist_dir: None,
+            tailscale_dns_name: None,
+            events,
+        };
+
+        let script_path = state_dir.join("fake-mcp.py");
+        fs::write(&script_path, r#"
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get('method') == 'initialize' and 'id' in msg:
+        sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':msg['id'],'result':{'protocolVersion':'2024-11-05','capabilities':{},'serverInfo':{'name':'fake','version':'1.0'}}}) + '\n')
+        sys.stdout.flush()
+    elif msg.get('method') == 'tools/list' and 'id' in msg:
+        sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':msg['id'],'result':{'tools':[{'name':'searchDocs','description':'Search docs','inputSchema':{'type':'object','properties':{'query':{'type':'string'}}}}]}}) + '\n')
+        sys.stdout.flush()
+        break
+"#.trim_start()).expect("fake mcp script should write");
+
+        let record = McpServerRecord {
+            id: "mcp.docs".to_string(),
+            workspace_id: "workspace".to_string(),
+            title: "Docs MCP".to_string(),
+            transport: "stdio".to_string(),
+            command: "python3".to_string(),
+            args: vec![script_path.to_string_lossy().to_string()],
+            env_json: json!({}),
+            enabled: true,
+            sync_status: "pending".to_string(),
+            last_error: String::new(),
+            last_synced_at: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        store
+            .upsert_mcp_server_record(&record, &[], &[])
+            .expect("mcp record should persist");
+
+        let summary = discover_mcp_server_tools(State(state.clone()), Path("mcp.docs".to_string()))
+            .await
+            .expect("discovery should succeed")
+            .0;
+        assert_eq!(summary.id, "mcp.docs");
+        assert_eq!(summary.tools.len(), 1);
+        assert_eq!(summary.tools[0].id, "mcp.docs.searchDocs");
+
+        let tools = store.list_mcp_tools().expect("mcp tools should load");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "searchDocs");
+
+        let records = store
+            .list_mcp_server_records()
+            .expect("mcp server records should load");
+        let record = records
+            .into_iter()
+            .find(|row| row.id == "mcp.docs")
+            .expect("record should exist");
+        assert_eq!(record.sync_status, "ready");
+        assert!(record.last_error.is_empty());
+        assert!(record.last_synced_at.is_some());
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn records_stdio_mcp_discovery_failures() {
+        let state_dir = test_state_dir("mcp-discover-failure");
+        let store = initialize_test_store(&state_dir);
+        let (events, _) = broadcast::channel(4);
+        let state = AppState {
+            version: "test".to_string(),
+            store: store.clone(),
+            host: Arc::new(HostEngine::new()),
+            runtimes: Arc::new(RuntimeManager::default()),
+            updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            agent: Arc::new(agent::AgentRuntime::default()),
+            web_dist_dir: None,
+            tailscale_dns_name: None,
+            events,
+        };
+
+        let record = McpServerRecord {
+            id: "mcp.broken".to_string(),
+            workspace_id: "workspace".to_string(),
+            title: "Broken MCP".to_string(),
+            transport: "stdio".to_string(),
+            command: String::new(),
+            args: Vec::new(),
+            env_json: json!({}),
+            enabled: true,
+            sync_status: "pending".to_string(),
+            last_error: String::new(),
+            last_synced_at: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        store
+            .upsert_mcp_server_record(&record, &[], &[])
+            .expect("mcp record should persist");
+
+        let error = discover_mcp_server_tools(State(state.clone()), Path("mcp.broken".to_string()))
+            .await
+            .expect_err("discovery should fail");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+
+        let records = store
+            .list_mcp_server_records()
+            .expect("mcp server records should load");
+        let record = records
+            .into_iter()
+            .find(|row| row.id == "mcp.broken")
+            .expect("record should exist");
+        assert_eq!(record.sync_status, "error");
+        assert!(record.last_error.contains("command is required"));
+
+        let _ = fs::remove_dir_all(&state_dir);
     }
 
     fn test_instance_runtime() -> InstanceRuntime {

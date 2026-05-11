@@ -2,7 +2,8 @@
   import { onMount } from 'svelte';
   import { BookOpenText, Brain, Database, FileClock } from 'lucide-svelte';
 
-  import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '$lib/components/ui/card';
+  import { WorkspaceEmptyState, WorkspacePageHeader } from '$lib/components/app/workspace';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '$lib/components/ui/card';
   import { fetchOverview } from '$lib/nucleus/client';
   import { compactPath } from '$lib/nucleus/format';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
