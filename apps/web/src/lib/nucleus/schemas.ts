@@ -492,6 +492,44 @@ export const skillManifestSchema = z.object({
   enabled: z.boolean()
 });
 
+export const skillPackageRecordSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  version: z.string(),
+  manifest_json: z.unknown(),
+  instructions: z.string(),
+  created_at: z.number().int(),
+  updated_at: z.number().int()
+});
+
+export const skillPackageUpsertRequestSchema = z.object({
+  id: z.string().optional(),
+  name: z.string(),
+  version: z.string(),
+  manifest_json: z.unknown(),
+  instructions: z.string()
+});
+
+export const skillInstallationRecordSchema = z.object({
+  id: z.string(),
+  package_id: z.string(),
+  scope_kind: z.string(),
+  scope_id: z.string(),
+  enabled: z.boolean(),
+  pinned_version: z.string().nullable().optional(),
+  created_at: z.number().int(),
+  updated_at: z.number().int()
+});
+
+export const skillInstallationUpsertRequestSchema = z.object({
+  id: z.string().optional(),
+  package_id: z.string(),
+  scope_kind: z.string(),
+  scope_id: z.string(),
+  enabled: z.boolean().optional(),
+  pinned_version: z.string().nullable().optional()
+});
+
 export const mcpServerSummarySchema = z.object({
   id: z.string(),
   title: z.string(),
@@ -806,6 +844,10 @@ export type RouterProfileSummary = z.infer<typeof routerProfileSummarySchema>;
 export type RouteTarget = z.infer<typeof routeTargetSchema>;
 export type NucleusToolDescriptor = z.infer<typeof nucleusToolDescriptorSchema>;
 export type SkillManifest = z.infer<typeof skillManifestSchema>;
+export type SkillPackageRecord = z.infer<typeof skillPackageRecordSchema>;
+export type SkillPackageUpsertRequest = z.infer<typeof skillPackageUpsertRequestSchema>;
+export type SkillInstallationRecord = z.infer<typeof skillInstallationRecordSchema>;
+export type SkillInstallationUpsertRequest = z.infer<typeof skillInstallationUpsertRequestSchema>;
 export type McpServerSummary = z.infer<typeof mcpServerSummarySchema>;
 export type SystemStats = z.infer<typeof systemStatsSchema>;
 export type ProcessListResponse = z.infer<typeof processListResponseSchema>;

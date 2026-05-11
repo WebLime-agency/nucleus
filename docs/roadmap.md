@@ -44,3 +44,5 @@ Later phases can expand into:
 Only stable, broadly true direction belongs here.
 
 Fast-moving experiments, local notes, and operator-specific judgment should stay in `.nucleus/include/` until they are mature enough to promote into the public repo.
+
+Current implementation plans that are expected to land quickly can live directly under `docs/`, for example `docs/skills-mcp-plan.md`.
