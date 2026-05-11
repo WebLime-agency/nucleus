@@ -26,7 +26,11 @@ import {
   sessionPromptRequestSchema,
   sessionSummarySchema,
   settingsSummarySchema,
+  skillInstallationRecordSchema,
+  skillInstallationUpsertRequestSchema,
   skillManifestSchema,
+  skillPackageRecordSchema,
+  skillPackageUpsertRequestSchema,
   updateConfigRequestSchema,
   systemStatsSchema,
   updateStatusSchema,
@@ -389,12 +393,78 @@ export async function upsertSkill(
   );
 }
 
+export async function fetchSkillPackages(fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/skill-packages', {
+      headers: { accept: 'application/json' }
+    }),
+    z.array(skillPackageRecordSchema)
+  );
+}
+
+export async function upsertSkillPackage(
+  input: z.input<typeof skillPackageUpsertRequestSchema>,
+  fetchImpl: FetchLike = fetch
+) {
+  const payload = skillPackageUpsertRequestSchema.parse(input);
+
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/skill-packages', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json'
+      },
+      body: JSON.stringify(payload)
+    }),
+    skillPackageRecordSchema
+  );
+}
+
+export async function fetchSkillInstallations(fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/skill-installations', {
+      headers: { accept: 'application/json' }
+    }),
+    z.array(skillInstallationRecordSchema)
+  );
+}
+
+export async function upsertSkillInstallation(
+  input: z.input<typeof skillInstallationUpsertRequestSchema>,
+  fetchImpl: FetchLike = fetch
+) {
+  const payload = skillInstallationUpsertRequestSchema.parse(input);
+
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/skill-installations', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json'
+      },
+      body: JSON.stringify(payload)
+    }),
+    skillInstallationRecordSchema
+  );
+}
+
 export async function fetchMcpServers(fetchImpl: FetchLike = fetch) {
   return parseJson(
     await daemonFetch(fetchImpl, '/api/mcps', {
       headers: { accept: 'application/json' }
     }),
     z.array(mcpServerSummarySchema)
+  );
+}
+
+export async function discoverMcpServer(serverId: string, fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/mcps/${encodeURIComponent(serverId)}/discover`, {
+      method: 'POST',
+      headers: { accept: 'application/json' }
+    }),
+    mcpServerSummarySchema
   );
 }
 

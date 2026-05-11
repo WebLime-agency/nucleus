@@ -84,7 +84,15 @@ pub fn parse_worker_action(content: &str) -> Result<WorkerAction, WorkerActionPa
         .ok_or(WorkerActionParseError::NoJsonObject)?;
     let candidate = &trimmed[start..=end];
 
-    let value = parse_worker_action_value(candidate)?;
+    let value = match parse_worker_action_value(candidate) {
+        Ok(value) => value,
+        Err(error) => {
+            if let Some(action) = recover_provider_shell_action(candidate)? {
+                return validate_worker_action(action);
+            }
+            return Err(error);
+        }
+    };
     if let Some(action) = normalize_worker_action_value(&value)? {
         return validate_worker_action(action);
     }
@@ -98,6 +106,121 @@ pub fn parse_worker_action(content: &str) -> Result<WorkerAction, WorkerActionPa
             detail: excerpt(&error.to_string(), 220),
         }),
     }
+}
+
+fn recover_provider_shell_action(
+    candidate: &str,
+) -> Result<Option<WorkerAction>, WorkerActionParseError> {
+    let lower = candidate.to_ascii_lowercase();
+    if !lower.contains("tool_call") || !lower.contains("shell") || !lower.contains("command") {
+        return Ok(None);
+    }
+
+    let Some(command) = extract_jsonish_string_field(candidate, "command", false) else {
+        return Ok(None);
+    };
+    let command = command.trim();
+    if command.is_empty() {
+        return Ok(None);
+    }
+
+    let mut args = serde_json::Map::new();
+    args.insert("command".to_string(), Value::String(command.to_string()));
+    if let Some(cwd) = extract_jsonish_string_field(candidate, "cwd", true)
+        .or_else(|| extract_jsonish_string_field(candidate, "workdir", true))
+        .or_else(|| extract_jsonish_string_field(candidate, "working_dir", true))
+    {
+        let cwd = cwd.trim();
+        if !cwd.is_empty() {
+            args.insert("cwd".to_string(), Value::String(cwd.to_string()));
+        }
+    }
+
+    normalize_worker_tool_name_and_args("shell", Value::Object(args)).map(|(tool, args)| {
+        Some(WorkerAction::ToolCall {
+            summary: "Run the requested Nucleus action.".to_string(),
+            tool,
+            args,
+        })
+    })
+}
+
+fn extract_jsonish_string_field(
+    candidate: &str,
+    field: &str,
+    allow_comma_end: bool,
+) -> Option<String> {
+    let quoted_field = format!("\"{field}\"");
+    let field_start = candidate.find(&quoted_field)?;
+    let after_field = &candidate[field_start + quoted_field.len()..];
+    let colon_offset = after_field.find(':')?;
+    let after_colon = after_field[colon_offset + 1..].trim_start();
+    let value_start_in_after_colon = after_field[colon_offset + 1..].len() - after_colon.len();
+    if !after_colon.starts_with('"') {
+        return None;
+    }
+    let absolute_value_start =
+        field_start + quoted_field.len() + colon_offset + 1 + value_start_in_after_colon + 1;
+    let rest = &candidate[absolute_value_start..];
+
+    let end = find_jsonish_string_end(rest, allow_comma_end).unwrap_or(rest.len());
+    Some(unescape_jsonish_string(&rest[..end]))
+}
+
+fn find_jsonish_string_end(value: &str, allow_comma_end: bool) -> Option<usize> {
+    let bytes = value.as_bytes();
+    let mut escaped = false;
+    let mut fallback = None;
+
+    for (index, byte) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match *byte {
+            b'\\' => escaped = true,
+            b'"' => {
+                fallback = Some(index);
+                let tail = value[index + 1..].trim_start();
+                if tail.starts_with('}')
+                    || (allow_comma_end && tail.starts_with(','))
+                    || tail.starts_with("]}")
+                    || tail.starts_with("}}")
+                    || tail.starts_with("}]}")
+                {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fallback
+}
+
+fn unescape_jsonish_string(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+
+        match chars.next() {
+            Some('n') => output.push('\n'),
+            Some('r') => output.push('\r'),
+            Some('t') => output.push('\t'),
+            Some('"') => output.push('"'),
+            Some('\\') => output.push('\\'),
+            Some(other) => {
+                output.push('\\');
+                output.push(other);
+            }
+            None => output.push('\\'),
+        }
+    }
+    output
 }
 
 fn validate_worker_action(action: WorkerAction) -> Result<WorkerAction, WorkerActionParseError> {
@@ -392,6 +515,10 @@ fn normalize_shell_tool_args(args: Value) -> Result<Value, WorkerActionParseErro
 }
 
 fn is_supported_nucleus_tool(tool: &str) -> bool {
+    if tool.starts_with("mcp.") {
+        return true;
+    }
+
     matches!(
         tool,
         "project.inspect"
@@ -544,5 +671,32 @@ mod tests {
         assert_eq!(summary, "Run the requested Nucleus action.");
         assert_eq!(tool, "project.inspect");
         assert!(args.as_object().is_some_and(|object| object.is_empty()));
+    }
+
+    #[test]
+    fn recovers_provider_shell_action_with_raw_multiline_command() {
+        let action = parse_worker_action(
+            "{\"tool_call\":{\"tool\":\"shell\",\"args\":{\"command\":\"cd /tmp && python3 - <<'PY'\nfrom pathlib import Path\ntext = p.read_text()\ntext = text.replace(\n\"old\",\n\"new\"\n)\nPY\"}}}",
+        )
+        .expect("provider-native shell command should be recovered");
+
+        let WorkerAction::ToolCall {
+            summary,
+            tool,
+            args,
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(summary, "Run the requested Nucleus action.");
+        assert_eq!(tool, "command.run");
+        assert_eq!(args["command"], "sh");
+        assert_eq!(args["args"][0], "-lc");
+        assert!(
+            args["args"][1]
+                .as_str()
+                .is_some_and(|command| command.contains("text.replace") && command.contains("PY"))
+        );
     }
 }

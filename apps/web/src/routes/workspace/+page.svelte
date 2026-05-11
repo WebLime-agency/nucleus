@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { WorkspacePageHeader } from '$lib/components/app/workspace';
   import { onMount } from 'svelte';
   import {
     Bot,

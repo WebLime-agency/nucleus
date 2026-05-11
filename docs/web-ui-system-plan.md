@@ -171,7 +171,24 @@ Expected outputs:
 - agreed folder structure
 - initial backlog of missing primitives and app-level compositions
 
+Current status:
+
+- complete enough to proceed with implementation phases
+- the plan should remain temporary and be removed once the rollout is finished and replaced by a shorter durable architecture doc
+
 ## Phase 1: sidebar
+
+Status: complete
+
+Phase 1 review summary:
+
+- shared app-level sidebar components are in place under `apps/web/src/lib/components/app/sidebar/*`
+- the main app sidebar is composed from shared sidebar components rather than route-local markup
+- core sidebar row states are standardized through the shared sidebar item patterns
+- project and session navigation lists have shared app-level implementations
+- `ui/scroll-area` is implemented and adopted for workspace shell navigation scrolling
+- the remaining question about extracting another reusable sidebar section/group shell was reviewed and is not currently needed
+- the current shared sidebar surfaces are consistent enough to treat Phase 1 as complete
 
 Purpose:
 
@@ -192,21 +209,26 @@ Scope:
 - sidebar scrolling behavior and spacing conventions
 - badges or status indicators used inside navigation rows where needed
 
-Shared components likely needed:
+Shared components used for this phase:
 
-- `app/sidebar-nav`
-- `app/sidebar-nav-item`
-- `app/sidebar-section`
-- `ui/separator`
-- `ui/scroll-area`
-- `app/status-badge` or equivalent if nav rows need shared status treatment
+- `app/sidebar/*` shared sidebar compositions are in place
+- `ui/scroll-area` is implemented and adopted in the workspace shell
+- no additional `app/sidebar-section` extraction is currently needed
+- no separate shared status badge was required for Phase 1
 
 Definition of done for Phase 1:
 
-- there is one canonical sidebar pattern for Nucleus web
-- sidebar rows are built from shared components rather than route-local styling
-- spacing, states, and icon treatment are consistent
-- the sidebar no longer feels like a one-off surface compared with the rest of the app
+- [x] there is one canonical sidebar pattern for Nucleus web
+- [x] sidebar rows are built from shared components rather than route-local styling
+- [x] spacing, states, and icon treatment are consistent
+- [x] the sidebar no longer feels like a one-off surface compared with the rest of the app
+
+Phase 1 closeout notes:
+
+- the app sidebar is already composed through shared `app/sidebar/*` components
+- the workspace shell now uses shared `ui/scroll-area` primitives instead of one-off scroll handling
+- the remaining Phase 1 question about extracting another sidebar section shell was reviewed and is not currently necessary
+- Phase 2 can proceed from the current shared shell without additional Phase 1 structural work
 
 ## Phase 2: workspace
 
@@ -234,7 +256,22 @@ Likely surfaces:
 - diagnostics
 - settings and other workspace configuration pages
 
-Shared components likely needed:
+Shared components now in place for Phase 2:
+
+- `app/workspace/workspace-page-header.svelte`
+- `app/workspace/workspace-segmented-control.svelte`
+- `app/workspace/workspace-stat-card.svelte`
+- `app/workspace/workspace-empty-state.svelte`
+- `app/workspace/workspace-meter-panel.svelte`
+- `app/workspace/workspace-info-tile.svelte`
+- `app/workspace/workspace-note-grid.svelte`
+
+Status update:
+
+- Phase 2 workspace extraction is now implemented across the current workspace surfaces.
+- Diagnostics now uses shared page-header, segmented-control, stat-card, empty-state, and meter-panel building blocks.
+- Workspace home and memory now use the shared workspace page-header pattern.
+- Settings now uses shared workspace page-header, info-tile, and note-grid patterns for repeated layout blocks.
 
 - `app/page-header`
 - `app/section-card`
@@ -251,6 +288,16 @@ Definition of done for Phase 2:
 
 ## Phase 3: chat canvas
 
+Status: complete enough to treat the shared session canvas as the canonical implementation
+
+Phase 3 audit summary:
+
+- the root route already renders a shared session surface through `apps/web/src/routes/+page.svelte`
+- the primary chat/session experience is consolidated in `apps/web/src/lib/components/app/session/session-workspace.svelte`
+- the session canvas already centralizes composer behavior, transcript rendering, activity state, approvals, job detail loading, and session-level settings and draft handling
+- the product is no longer relying on a route-local one-off chat canvas for the main session experience
+- the main gap found in the audit was documentation drift rather than missing chat-canvas migration work
+
 Purpose:
 
 - standardize the main daily-driver work surface after navigation and workspace foundations are in place
@@ -261,29 +308,32 @@ Why third:
 - it benefits from shared spacing, surfaces, and feedback patterns
 - earlier phases reduce the risk of reinventing shell and state patterns inside the chat area
 
-Scope:
+Scope covered by the current implementation:
 
-- message list chrome around content
-- chat composer shell and actions
-- tool/action result blocks
-- empty, loading, and error states
-- scroll-area and spacing conventions for the session canvas
-- session-level actions or menus that should use shared components
+- message list chrome around content is handled inside the shared session workspace
+- the composer shell, textarea sizing, image attachments, and action controls are centralized in the shared session workspace
+- approval handling, worker and action activity summaries, and job detail loading are centralized there as well
+- empty, loading, degraded, and reconnecting states are represented through shared session-level state handling rather than scattered route-local logic
+- transcript anchoring and auto-scroll behavior are managed in one canonical session surface
+- session-level actions and draft settings are part of the shared session workspace flow
 
-Shared components likely needed:
+Shared components and primitives confirmed during the audit:
 
-- `app/chat-shell` or equivalent feature-level compositions
-- `app/empty-state` if not already introduced
-- `ui/textarea`
-- `ui/tooltip`
-- `ui/dialog` and `ui/sheet` where chat actions need them
-- `ui/tabs` if chat-adjacent views rely on tabbing patterns
+- `app/session/session-workspace.svelte` is the canonical app-level chat/session composition
+- Phase 2 shared workspace primitives remain in use where workspace-style layouts are needed outside the chat canvas
+- the current session surface already uses shared UI primitives for common controls instead of a standalone route-local buildout
 
 Definition of done for Phase 3:
 
-- the chat canvas uses the shared system for controls and feedback states
-- message-adjacent chrome and composer controls are visually consistent with the rest of the app
-- route-local styling is reduced in the main session surface
+- [x] the chat canvas uses a shared app-level session surface
+- [x] composer and session-level controls are centralized rather than duplicated in routes
+- [x] activity, approval, and feedback states are managed in the shared session canvas
+- [x] route-local styling is reduced in the main session surface
+
+Phase 3 closeout notes:
+
+- the implementation is concentrated in a large `session-workspace.svelte` file, so future work should focus on refinement and extraction rather than treating Phase 3 as unstarted
+- if maintainability starts to suffer, the next cleanup should split the session workspace into smaller shared subcomponents, but that is follow-up work rather than a blocker for Phase 3 completion
 
 ## Phase 4: rest of the web UI
 
@@ -331,6 +381,14 @@ The following primitives should be considered first because they unlock the migr
 - `badge`
 - `card`
 - `dropdown-menu`
+
+Status from phases 1-3 audit:
+
+- `scroll-area` is implemented and adopted
+- sidebar shared app compositions are in place
+- workspace shared app compositions are in place
+- the main session/chat surface is already consolidated at the app level
+- the remaining backlog should now be prioritized mainly against Phase 4 needs rather than earlier migration assumptions
 
 ### Form support
 

@@ -9,10 +9,10 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use nucleus_protocol::{
     ApprovalRequestSummary, ArtifactSummary, CommandSessionSummary, CreatePlaybookRequest,
-    DaemonEvent, JobDetail, JobSummary, PlaybookDetail, PlaybookSummary, PromptProgressUpdate,
-    RunBudgetSummary, SessionDetail, SessionPromptRequest, SessionSummary, SessionTurn,
-    SessionTurnImage, UpdatePlaybookRequest, WorkerSummary, WorkspaceProfileSummary,
-    WorkspaceSummary,
+    DaemonEvent, JobDetail, JobSummary, McpServerRecord, McpToolRecord, PlaybookDetail,
+    PlaybookSummary, PromptProgressUpdate, RunBudgetSummary, SessionDetail, SessionPromptRequest,
+    SessionSummary, SessionTurn, SessionTurnImage, UpdatePlaybookRequest, WorkerSummary,
+    WorkspaceProfileSummary, WorkspaceSummary,
 };
 use nucleus_storage::{
     ApprovalRequestRecord, AuditEventRecord, CommandSessionPatch, CommandSessionRecord,
@@ -23,7 +23,7 @@ use nucleus_storage::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
     sync::{Mutex, mpsc, oneshot, watch},
     time::{Duration, timeout},
@@ -283,6 +283,12 @@ struct TestsRunArgs {
     env: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct McpToolCallArgs {
+    #[serde(default)]
+    params: Value,
+}
+
 #[derive(Debug, Clone)]
 struct MutationPreview {
     detail: String,
@@ -459,7 +465,9 @@ pub async fn start_prompt_job(
     let root_capabilities = if current.session.execution_mode == "plan" {
         Vec::new()
     } else {
-        root_worker_capabilities()
+        let mut capabilities = root_worker_capabilities();
+        capabilities.extend(mcp_tool_capabilities(&state));
+        capabilities
     };
     state
         .store
@@ -473,6 +481,15 @@ pub async fn start_prompt_job(
         .ok_or_else(|| {
             ApiError::internal_message("failed to reload Utility Worker capabilities")
         })?;
+
+    let _compiled_turn = crate::compile_session_turn(
+        &state,
+        &current.session,
+        &current.turns,
+        &payload.prompt,
+        &payload.images,
+        &compiler_role,
+    )?;
 
     let checkpoint = WorkerCheckpoint {
         session_id: session_id.clone(),
@@ -2708,8 +2725,9 @@ async fn call_worker_model(
                     .await?;
             let action = parse_worker_action(&repaired.content).with_context(|| {
                 format!(
-                    "worker returned malformed JSON action after repair retry; original response: {}",
-                    excerpt(&result.content, 220)
+                    "worker returned malformed JSON action after repair retry; original response: {}; repaired response: {}",
+                    excerpt(&result.content, 220),
+                    excerpt(&repaired.content, 220)
                 )
             })?;
             return Ok(ModelResponse {
@@ -3353,6 +3371,11 @@ async fn execute_granted_tool(
             )
             .await
         }
+        other if other.starts_with("mcp.") => {
+            let args = serde_json::from_value::<McpToolCallArgs>(args.clone())
+                .unwrap_or(McpToolCallArgs { params: args });
+            execute_mcp_tool_call(state, other, args.params).await
+        }
         other => bail!("unsupported tool '{}'", other),
     }
 }
@@ -3409,6 +3432,14 @@ fn preview_approval_tool(
                 .context("invalid args for tests.run")?;
             preview_tests_run(worker, args)
         }
+        other if other.starts_with("mcp.") => Ok(MutationPreview {
+            detail: format!(
+                "Invoke MCP tool {} through the Nucleus action bridge.",
+                other
+            ),
+            diff_preview: String::new(),
+            artifact: None,
+        }),
         other => bail!("'{}' does not support approval previews", other),
     }
 }
@@ -4207,6 +4238,134 @@ async fn execute_tests_run_tool(
         spec,
     )
     .await
+}
+
+async fn execute_mcp_tool_call(state: &AppState, tool_id: &str, params: Value) -> Result<Value> {
+    let tool = state
+        .store
+        .list_mcp_tools()?
+        .into_iter()
+        .find(|tool| tool.id == tool_id)
+        .ok_or_else(|| anyhow!("MCP tool '{}' was not found", tool_id))?;
+    let server = state
+        .store
+        .list_mcp_server_records()?
+        .into_iter()
+        .find(|server| server.id == tool.server_id)
+        .ok_or_else(|| anyhow!("MCP server '{}' was not found", tool.server_id))?;
+    if !server.enabled {
+        bail!("MCP server '{}' is disabled", server.id);
+    }
+    invoke_mcp_stdio_tool(&server, &tool, params).await
+}
+
+async fn invoke_mcp_stdio_tool(
+    server: &McpServerRecord,
+    tool: &McpToolRecord,
+    params: Value,
+) -> Result<Value> {
+    if server.transport != "stdio" {
+        bail!("unsupported MCP transport '{}'", server.transport);
+    }
+    if server.command.trim().is_empty() {
+        bail!("MCP stdio command is required");
+    }
+
+    let mut command = Command::new(&server.command);
+    command.args(&server.args);
+    for (key, value) in server.env_json.as_object().cloned().unwrap_or_default() {
+        let value = match value {
+            Value::String(text) => text,
+            other => other.to_string(),
+        };
+        command.env(key, value);
+    }
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::null());
+
+    let mut child = command
+        .spawn()
+        .context("failed to start MCP stdio server")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("MCP stdio server did not expose stdin")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("MCP stdio server did not expose stdout")?;
+    let mut reader = BufReader::new(stdout).lines();
+
+    write_mcp_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "nucleus", "version": env!("CARGO_PKG_VERSION")}
+            }
+        }),
+    )
+    .await?;
+    write_mcp_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}),
+    )
+    .await?;
+    write_mcp_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": tool.name, "arguments": params}
+        }),
+    )
+    .await?;
+    stdin.flush().await?;
+
+    let result = timeout(Duration::from_secs(30), read_mcp_response(&mut reader, 2)).await??;
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    Ok(result)
+}
+
+async fn write_mcp_message(stdin: &mut tokio::process::ChildStdin, value: Value) -> Result<()> {
+    stdin
+        .write_all(serde_json::to_string(&value)?.as_bytes())
+        .await?;
+    stdin.write_all(b"\n").await?;
+    Ok(())
+}
+
+async fn read_mcp_response<R>(reader: &mut tokio::io::Lines<R>, id: i64) -> Result<Value>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    for _ in 0..64 {
+        let Some(line) = reader.next_line().await? else {
+            break;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(&line).context("failed to parse MCP response")?;
+        if value.get("id") != Some(&json!(id)) {
+            continue;
+        }
+        if let Some(error) = value.get("error") {
+            bail!("MCP tool call failed: {}", error);
+        }
+        return value
+            .get("result")
+            .cloned()
+            .context("MCP response did not include a result");
+    }
+    bail!("MCP server did not return a tools/call result")
 }
 
 async fn run_bounded_command_tool(
@@ -6597,6 +6756,44 @@ fn execution_capabilities() -> Vec<ToolCapabilityGrantRecord> {
     ]
 }
 
+fn mcp_tool_capabilities(state: &AppState) -> Vec<ToolCapabilityGrantRecord> {
+    let Ok(servers) = state.store.list_mcp_servers() else {
+        return Vec::new();
+    };
+    let enabled_servers = servers
+        .into_iter()
+        .filter(|server| server.enabled)
+        .map(|server| server.id)
+        .collect::<BTreeSet<_>>();
+    if enabled_servers.is_empty() {
+        return Vec::new();
+    }
+
+    state
+        .store
+        .list_mcp_tools()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|tool| enabled_servers.contains(&tool.server_id))
+        .map(|tool| ToolCapabilityGrantRecord {
+            tool_id: tool.id,
+            summary: if tool.description.trim().is_empty() {
+                format!("Invoke MCP tool {} via Nucleus.", tool.name)
+            } else {
+                tool.description
+            },
+            approval_mode: "explicit".to_string(),
+            risk_level: "medium".to_string(),
+            side_effect_level: "external".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: 32_768,
+            supports_streaming: false,
+            concurrency_group: "mcp".to_string(),
+            scope_kind: "mcp".to_string(),
+        })
+        .collect()
+}
+
 fn worker_system_prompt(worker: &WorkerSummary) -> String {
     worker_system_prompt_with_mode(worker, "act")
 }
@@ -8014,6 +8211,83 @@ mod tests {
                 .preview_text
                 .contains("failed to start command session")
         );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn invokes_stdio_mcp_tool_through_nucleus_action_bridge() {
+        let state_dir = test_state_dir("mcp-tool-call");
+        let state = initialize_test_state(&state_dir);
+
+        let script_path = state_dir.join("fake-mcp-call.py");
+        fs::write(
+            &script_path,
+            r#"
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get('method') == 'initialize' and 'id' in msg:
+        sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':msg['id'],'result':{'protocolVersion':'2024-11-05','capabilities':{},'serverInfo':{'name':'fake','version':'1.0'}}}) + '\n')
+        sys.stdout.flush()
+    elif msg.get('method') == 'tools/call' and 'id' in msg:
+        args = msg.get('params', {}).get('arguments', {})
+        query = args.get('query', '')
+        sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':msg['id'],'result':{'content':[{'type':'text','text':'result:' + query}]}}) + '\n')
+        sys.stdout.flush()
+        break
+"#
+            .trim_start(),
+        )
+        .expect("fake mcp script should write");
+
+        state
+            .store
+            .upsert_mcp_server_record(
+                &McpServerRecord {
+                    id: "mcp.docs".to_string(),
+                    workspace_id: "workspace".to_string(),
+                    title: "Docs MCP".to_string(),
+                    transport: "stdio".to_string(),
+                    command: "python3".to_string(),
+                    args: vec![script_path.to_string_lossy().to_string()],
+                    env_json: json!({}),
+                    enabled: true,
+                    sync_status: "ready".to_string(),
+                    last_error: String::new(),
+                    last_synced_at: Some(1),
+                    created_at: 1,
+                    updated_at: 1,
+                },
+                &[],
+                &[],
+            )
+            .expect("mcp server should persist");
+        state
+            .store
+            .upsert_mcp_tool(&McpToolRecord {
+                id: "mcp.docs.searchDocs".to_string(),
+                server_id: "mcp.docs".to_string(),
+                name: "searchDocs".to_string(),
+                description: "Search docs".to_string(),
+                input_schema: json!({"type":"object"}),
+                source: "mcp.docs".to_string(),
+                discovered_at: 1,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("mcp tool should persist");
+
+        let capabilities = mcp_tool_capabilities(&state);
+        assert_eq!(capabilities.len(), 1);
+        assert_eq!(capabilities[0].tool_id, "mcp.docs.searchDocs");
+
+        let result =
+            execute_mcp_tool_call(&state, "mcp.docs.searchDocs", json!({"query":"nucleus"}))
+                .await
+                .expect("mcp tool call should succeed");
+
+        assert_eq!(result["content"][0]["text"], "result:nucleus");
 
         let _ = fs::remove_dir_all(&state_dir);
     }

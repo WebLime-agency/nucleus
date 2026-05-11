@@ -9,7 +9,8 @@ use futures_util::StreamExt;
 use nucleus_core::{AdapterKind, compiled_turn_openai_messages};
 use nucleus_protocol::{
     CompiledConversationTurn, CompiledPromptLayer, CompiledTurn, CompiledTurnCapabilities,
-    CompiledTurnDebugSummary, RuntimeSummary, SessionSummary, SessionTurn, SessionTurnImage,
+    CompiledTurnDebugSummary, McpServerSummary, NucleusToolDescriptor, RuntimeSummary,
+    SessionSummary, SessionTurn, SessionTurnImage,
 };
 use reqwest::header::AUTHORIZATION;
 use serde::Deserialize;
@@ -77,7 +78,8 @@ impl RuntimeManager {
         compiler_role: &str,
         events: mpsc::UnboundedSender<PromptStreamEvent>,
     ) -> Result<ProviderTurnResult> {
-        let compiled_turn = compiled_turn_from_prompt(history, prompt, images, compiler_role);
+        let compiled_turn =
+            compiled_turn_from_prompt(history, prompt, images, compiler_role, &[], &[], &[]);
         self.execute_compiled_turn_stream(session, Arc::new(compiled_turn), events)
             .await
     }
@@ -155,16 +157,29 @@ fn probe_system_runtime(mut runtime: RuntimeSummary) -> RuntimeSummary {
     runtime
 }
 
-fn compiled_turn_from_prompt(
+pub(crate) fn compiled_turn_from_prompt(
     history: &[SessionTurn],
     prompt: &str,
     images: &[SessionTurnImage],
     compiler_role: &str,
+    skill_layers: &[CompiledPromptLayer],
+    tool_catalog: &[NucleusToolDescriptor],
+    mcp_catalog: &[McpServerSummary],
 ) -> CompiledTurn {
     let role = match compiler_role.trim() {
         "utility" => "utility",
         _ => "main",
     };
+
+    let compiled_history = history
+        .iter()
+        .filter(|turn| matches!(turn.role.as_str(), "user" | "assistant" | "system"))
+        .map(|turn| CompiledConversationTurn {
+            role: turn.role.clone(),
+            content: turn.content.clone(),
+            images: turn.images.clone(),
+        })
+        .collect::<Vec<_>>();
 
     CompiledTurn {
         id: uuid::Uuid::new_v4().to_string(),
@@ -179,18 +194,10 @@ fn compiled_turn_from_prompt(
             content: "Nucleus owns prompt assembly, project context, skills, tools, and turn execution semantics. Provider-native project memory, skills, and MCP configuration are not authoritative for this turn.".to_string(),
         }],
         project_layers: Vec::new(),
-        skill_layers: Vec::new(),
-        tool_catalog: Vec::new(),
-        mcp_catalog: Vec::new(),
-        history: history
-            .iter()
-            .filter(|turn| matches!(turn.role.as_str(), "user" | "assistant" | "system"))
-            .map(|turn| CompiledConversationTurn {
-                role: turn.role.clone(),
-                content: turn.content.clone(),
-                images: turn.images.clone(),
-            })
-            .collect(),
+        skill_layers: skill_layers.to_vec(),
+        tool_catalog: tool_catalog.to_vec(),
+        mcp_catalog: mcp_catalog.to_vec(),
+        history: compiled_history.clone(),
         user_turn: CompiledConversationTurn {
             role: "user".to_string(),
             content: prompt.to_string(),
@@ -198,16 +205,19 @@ fn compiled_turn_from_prompt(
         },
         capabilities: CompiledTurnCapabilities {
             needs_images: !images.is_empty(),
-            needs_tools: false,
-            needs_mcp: false,
+            needs_tools: !tool_catalog.is_empty(),
+            needs_mcp: !mcp_catalog.is_empty(),
         },
         debug_summary: CompiledTurnDebugSummary {
             include_count: 0,
-            skill_count: 0,
-            mcp_server_count: 0,
-            tool_count: 0,
-            layer_count: 1,
-            summary: "Compiled transient runtime prompt wrapper.".to_string(),
+            skill_count: skill_layers.len(),
+            mcp_server_count: mcp_catalog.len(),
+            tool_count: tool_catalog.len(),
+            layer_count: skill_layers.len(),
+            summary: format!(
+                "Compiled {} history turns for {} provider-neutral prompt with {} skill layers, {} MCP servers, and {} tools.",
+                compiled_history.len(), role, skill_layers.len(), mcp_catalog.len(), tool_catalog.len()
+            ),
         },
     }
 }
@@ -436,9 +446,10 @@ mod tests {
 
     #[test]
     fn compiled_turn_preserves_requested_compiler_role() {
-        let main = compiled_turn_from_prompt(&[], "Summarize.", &[], "main");
-        let utility = compiled_turn_from_prompt(&[], "Summarize.", &[], "utility");
-        let fallback = compiled_turn_from_prompt(&[], "Summarize.", &[], "unexpected");
+        let main = compiled_turn_from_prompt(&[], "Summarize.", &[], "main", &[], &[], &[]);
+        let utility = compiled_turn_from_prompt(&[], "Summarize.", &[], "utility", &[], &[], &[]);
+        let fallback =
+            compiled_turn_from_prompt(&[], "Summarize.", &[], "unexpected", &[], &[], &[]);
 
         assert_eq!(main.role, "main");
         assert_eq!(utility.role, "utility");
@@ -455,7 +466,15 @@ mod tests {
             images: Vec::new(),
             created_at: 0,
         }];
-        let compiled = compiled_turn_from_prompt(&history, "Decide the next step.", &[], "main");
+        let compiled = compiled_turn_from_prompt(
+            &history,
+            "Decide the next step.",
+            &[],
+            "main",
+            &[],
+            &[],
+            &[],
+        );
 
         assert!(compiled_turn_requires_json_object(&compiled));
     }
@@ -470,7 +489,8 @@ mod tests {
             images: Vec::new(),
             created_at: 0,
         }];
-        let compiled = compiled_turn_from_prompt(&history, "Summarize.", &[], "main");
+        let compiled =
+            compiled_turn_from_prompt(&history, "Summarize.", &[], "main", &[], &[], &[]);
 
         assert!(!compiled_turn_requires_json_object(&compiled));
     }
