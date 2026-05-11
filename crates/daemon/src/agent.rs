@@ -1400,37 +1400,43 @@ async fn run_job_loop(
                 final_answer,
             } => {
                 if should_retry_internal_action_item_final_answer(&final_answer, tool_calls) {
-                    checkpoint.next_prompt = Some(build_internal_action_item_retry_prompt(
-                        &summary,
+                    retry_worker_final_answer(
+                        state,
+                        job_id,
+                        &mut worker,
+                        &mut checkpoint,
+                        &mut step,
+                        tool_calls,
+                        "Rejected internal action item as final answer.",
+                        "internal_action_item_final_answer",
+                        &build_internal_action_item_retry_prompt(&summary, &final_answer),
                         &final_answer,
-                    ));
-                    state.store.write_worker_checkpoint(
-                        &worker.id,
-                        &serde_json::to_value(&checkpoint)
-                            .context("failed to encode worker checkpoint")?,
-                    )?;
-                    step += 1;
-                    worker = state.store.update_worker(
-                        &worker.id,
-                        WorkerPatch {
-                            state: Some("running".to_string()),
-                            step_count: Some(step),
-                            tool_call_count: Some(tool_calls),
-                            last_error: Some(String::new()),
-                            ..WorkerPatch::default()
-                        },
-                    )?;
-                    let _ = state.store.append_job_event(JobEventRecord {
-                        job_id: job_id.to_string(),
-                        worker_id: Some(worker.id.clone()),
-                        event_type: "worker.retry".to_string(),
-                        status: "retrying".to_string(),
-                        summary: "Rejected internal action item as final answer.".to_string(),
-                        detail: excerpt(&final_answer, 320),
-                        data_json: json!({ "reason": "internal_action_item_final_answer" }),
-                    });
-                    publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
-                    publish_worker_updated(state, &worker).await;
+                    )
+                    .await?;
+                    continue;
+                }
+
+                if should_retry_incomplete_progress_final_answer(
+                    &summary,
+                    &final_answer,
+                    &session.session.execution_mode,
+                    &worker,
+                    step,
+                    tool_calls,
+                ) {
+                    retry_worker_final_answer(
+                        state,
+                        job_id,
+                        &mut worker,
+                        &mut checkpoint,
+                        &mut step,
+                        tool_calls,
+                        "Rejected incomplete progress report as final answer.",
+                        "incomplete_progress_final_answer",
+                        &build_incomplete_progress_retry_prompt(&summary, &final_answer),
+                        &final_answer,
+                    )
+                    .await?;
                     continue;
                 }
 
@@ -1446,6 +1452,36 @@ async fn run_job_loop(
                 )
                 .await?;
                 return Ok(());
+            }
+            WorkerAction::ProgressUpdate { summary, detail } => {
+                if session.session.execution_mode == "plan" {
+                    retry_plan_mode_action(
+                        state,
+                        job_id,
+                        &mut worker,
+                        &mut checkpoint,
+                        &mut step,
+                        tool_calls,
+                        &summary,
+                        "record a progress checkpoint",
+                    )
+                    .await?;
+                    continue;
+                }
+
+                record_worker_progress_update(
+                    state,
+                    &session,
+                    job_id,
+                    &mut worker,
+                    &mut checkpoint,
+                    &mut step,
+                    tool_calls,
+                    &summary,
+                    &detail,
+                )
+                .await?;
+                continue;
             }
             WorkerAction::ToolCall {
                 summary,
@@ -2121,6 +2157,98 @@ async fn handle_child_job_proposal(
     Ok(LoopDisposition::Continue)
 }
 
+async fn retry_worker_final_answer(
+    state: &AppState,
+    job_id: &str,
+    worker: &mut WorkerSummary,
+    checkpoint: &mut WorkerCheckpoint,
+    step: &mut usize,
+    tool_calls: usize,
+    event_summary: &str,
+    reason: &str,
+    retry_prompt: &str,
+    rejected_final_answer: &str,
+) -> Result<()> {
+    checkpoint.next_prompt = Some(retry_prompt.to_string());
+    state.store.write_worker_checkpoint(
+        &worker.id,
+        &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+    )?;
+    *step += 1;
+    *worker = state.store.update_worker(
+        &worker.id,
+        WorkerPatch {
+            state: Some("running".to_string()),
+            step_count: Some(*step),
+            tool_call_count: Some(tool_calls),
+            last_error: Some(String::new()),
+            ..WorkerPatch::default()
+        },
+    )?;
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: job_id.to_string(),
+        worker_id: Some(worker.id.clone()),
+        event_type: "worker.retry".to_string(),
+        status: "retrying".to_string(),
+        summary: event_summary.to_string(),
+        detail: excerpt(rejected_final_answer, 320),
+        data_json: json!({ "reason": reason }),
+    });
+    publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+    publish_worker_updated(state, worker).await;
+    Ok(())
+}
+
+async fn record_worker_progress_update(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &mut WorkerSummary,
+    checkpoint: &mut WorkerCheckpoint,
+    step: &mut usize,
+    tool_calls: usize,
+    summary: &str,
+    detail: &str,
+) -> Result<()> {
+    checkpoint.next_prompt = Some(build_progress_update_continuation_prompt(summary, detail));
+    state.store.write_worker_checkpoint(
+        &worker.id,
+        &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+    )?;
+    *step += 1;
+    *worker = state.store.update_worker(
+        &worker.id,
+        WorkerPatch {
+            state: Some("running".to_string()),
+            step_count: Some(*step),
+            tool_call_count: Some(tool_calls),
+            last_error: Some(String::new()),
+            ..WorkerPatch::default()
+        },
+    )?;
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: job_id.to_string(),
+        worker_id: Some(worker.id.clone()),
+        event_type: "worker.progress".to_string(),
+        status: "running".to_string(),
+        summary: summary.to_string(),
+        detail: excerpt(detail, 1_200),
+        data_json: json!({ "terminal": false }),
+    });
+    publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+    publish_worker_updated(state, worker).await;
+    publish_prompt_status(
+        state,
+        &session.session,
+        worker,
+        "running",
+        summary,
+        &excerpt(detail, 320),
+    )
+    .await;
+    Ok(())
+}
+
 async fn create_child_job(
     state: &AppState,
     session: &SessionDetail,
@@ -2540,7 +2668,7 @@ Session title: {}\n\
 Visible provider: {} / {}\n\
 Utility Worker provider: {} / {}\n\
 Prompt-time context and user request:\n{}\n\
-Return one JSON action for the next step. If repo or workspace inspection is needed, return a tool_call. Only return final_answer when it is a complete user-facing response, never an action plan or a description of what should happen next.\n\
+Return one JSON action for the next step. If repo or workspace inspection is needed, return a tool_call. If you need to persist a non-terminal checkpoint, return progress_update. Only return final_answer when it is a complete terminal response, never an action plan, progress update, or a description of what should happen next.\n\
 If the current user request corrects, refines, or challenges the previous answer, treat it as a continuation of the unresolved task. Do not merely acknowledge or restate the correction; use the visible conversation history to continue troubleshooting or answer the corrected question.",
         session.title,
         project_context,
@@ -2590,7 +2718,7 @@ fn add_budget_guidance(
 fn build_tool_result_prompt(tool: &str, summary: &str, result: &Value) -> String {
     format!(
         "Tool result for {}.\nReason for the call: {}\nStructured result:\n{}\n\
-Return one JSON action for the next step. If the work is done, return final_answer with a complete user-facing answer.",
+Return one JSON action for the next step. If the work is done, return final_answer with a complete user-facing answer. If the work is not done but a durable checkpoint is useful, return progress_update and continue afterward.",
         tool,
         summary,
         format_tool_result(result)
@@ -2628,6 +2756,90 @@ fn should_retry_internal_action_item_final_answer(
         || normalized.starts_with("look for ")
 }
 
+fn should_retry_incomplete_progress_final_answer(
+    summary: &str,
+    final_answer: &str,
+    execution_mode: &str,
+    worker: &WorkerSummary,
+    step_count: usize,
+    tool_call_count: usize,
+) -> bool {
+    if execution_mode == "plan" || !has_remaining_worker_budget(worker, step_count, tool_call_count)
+    {
+        return false;
+    }
+
+    let text = normalize_action_item_text(&format!("{}\n{}", summary, final_answer));
+    if text.is_empty() || contains_blocked_or_waiting_language(&text) {
+        return false;
+    }
+
+    contains_incomplete_work_language(&text)
+}
+
+fn has_remaining_worker_budget(
+    worker: &WorkerSummary,
+    step_count: usize,
+    tool_call_count: usize,
+) -> bool {
+    let has_step_budget = worker.max_steps == 0 || step_count.saturating_add(1) < worker.max_steps;
+    let has_action_budget =
+        worker.max_tool_calls == 0 || tool_call_count.saturating_add(1) < worker.max_tool_calls;
+    has_step_budget && has_action_budget
+}
+
+fn contains_incomplete_work_language(text: &str) -> bool {
+    [
+        "not complete",
+        "not completed",
+        "not done",
+        "not finished",
+        "isn't complete",
+        "isnt complete",
+        "isn't done",
+        "isnt done",
+        "still not complete",
+        "still incomplete",
+        "still needs",
+        "remaining work",
+        "work remains",
+        "left to do",
+        "todo remains",
+        "follow-up needed",
+        "more remains",
+        "need to continue",
+        "needs further",
+        "remaining refactor",
+        "remaining refactors",
+        "remaining task",
+        "remaining tasks",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn contains_blocked_or_waiting_language(text: &str) -> bool {
+    [
+        "blocked by",
+        "blocked on",
+        "cannot continue",
+        "can't continue",
+        "cant continue",
+        "need your approval",
+        "requires your approval",
+        "waiting for approval",
+        "waiting for you",
+        "need you to",
+        "requires user",
+        "permission denied",
+        "access denied",
+        "budget exhausted",
+        "reached the current",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
 fn normalize_action_item_text(value: &str) -> String {
     value
         .trim()
@@ -2651,6 +2863,35 @@ Return exactly one valid Nucleus worker action JSON object.\n\
 - Only return final_answer when the text directly answers the user.",
         excerpt(summary, 320),
         excerpt(final_answer, 1_200)
+    )
+}
+
+fn build_incomplete_progress_retry_prompt(summary: &str, final_answer: &str) -> String {
+    format!(
+        "Your previous final_answer said the requested work is incomplete, so it was a progress report rather than a completion answer.\n\
+Previous summary: {}\n\
+Previous final_answer: {}\n\
+Return exactly one valid Nucleus worker action JSON object.\n\
+- Do not final_answer progress updates, partial completion notes, or lists of remaining work.\n\
+- Continue with the next smallest useful tool_call unless you are genuinely blocked or the run budget is exhausted.\n\
+- Only return final_answer when the user's requested phase/task is fully complete and validated, or when you clearly cannot continue without user input.",
+        excerpt(summary, 320),
+        excerpt(final_answer, 1_200)
+    )
+}
+
+fn build_progress_update_continuation_prompt(summary: &str, detail: &str) -> String {
+    format!(
+        "Nucleus recorded your previous response as a non-terminal progress checkpoint.\n\
+Checkpoint summary: {}\n\
+Checkpoint detail: {}\n\
+Return exactly one valid Nucleus worker action JSON object for the next step.\n\
+- Continue working from this checkpoint.\n\
+- Prefer a tool_call for the next concrete repo, file, command, test, or verification action.\n\
+- You may use progress_update again only for a durable checkpoint; it does not complete the job.\n\
+- Use final_answer only when the requested task is complete and validated, or when you are genuinely blocked.",
+        excerpt(summary, 320),
+        excerpt(detail, 1_200)
     )
 }
 
@@ -6826,10 +7067,12 @@ Working directory: {}\n",
 {\"kind\":\"tool_call\",\"summary\":\"list likely project directories\",\"tool\":\"fs.list\",\"args\":{\"path\":\".\",\"recursive\":false,\"limit\":100}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"check running dev processes\",\"tool\":\"command.run\",\"args\":{\"command\":\"sh\",\"args\":[\"-lc\",\"ps -ef | grep -iE 'stfr|vite|next|webpack|dev server' | grep -v grep\"],\"cwd\":\".\",\"timeout_secs\":20}}\n\
 {\"kind\":\"spawn_child_jobs\",\"summary\":\"why parallel exploration helps\",\"jobs\":[{\"title\":\"focused subtask\",\"prompt\":\"precise child prompt\",\"working_dir\":\"optional/path/inside/scope\"}]}\n\
+{\"kind\":\"progress_update\",\"summary\":\"durable checkpoint, not done\",\"detail\":\"completed evidence and exact continuation point\"}\n\
 {\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\"}"
     } else {
         "{\"kind\":\"tool_call\",\"summary\":\"inspect the active project\",\"tool\":\"project.inspect\",\"args\":{}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"list likely project directories\",\"tool\":\"fs.list\",\"args\":{\"path\":\".\",\"recursive\":false,\"limit\":100}}\n\
+{\"kind\":\"progress_update\",\"summary\":\"durable checkpoint, not done\",\"detail\":\"completed evidence and exact continuation point\"}\n\
 {\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\"}"
     };
     let tool_help = worker
@@ -6865,7 +7108,10 @@ Rules:\n\
 - Stay inside the granted repo scope.\n\
 {}\
 - The visible chat will only receive final_answer, not your intermediate reasoning.\n\
-- Do not put plans, next-step instructions, or descriptions of future actions in final_answer.\n\
+- progress_update records a non-terminal checkpoint for Nucleus; it does not complete the job.\n\
+- Do not put plans, next-step instructions, progress updates, partial completion notes, or descriptions of future actions in final_answer.\n\
+- If the requested work is incomplete and you are not blocked or out of budget, continue with a tool_call instead of returning final_answer.\n\
+- Use final_answer only as the terminal completion action when the requested task is complete and validated, or when you are genuinely blocked.\n\
 - Do not use provider-native tool wrappers such as tool_call/tool_name/shell; use the exact Nucleus JSON shapes above.\n\
 - Do not wrap JSON in markdown fences.\n\
 Available tools:\n{}\n\
@@ -7306,6 +7552,8 @@ mod tests {
             root_prompt.contains("Do not put plans, next-step instructions"),
             "worker prompt should prevent internal plans from becoming visible answers"
         );
+        assert!(root_prompt.contains("{\"kind\":\"progress_update\""));
+        assert!(root_prompt.contains("progress_update records a non-terminal checkpoint"));
         assert!(
             root_prompt.contains("\"tool\":\"command.run\""),
             "worker prompt should include concrete command.run action shape"
@@ -7380,6 +7628,84 @@ mod tests {
             !should_retry_internal_action_item_final_answer("Next step: inspect the workspace.", 1),
             "after an action has run, concise follow-up guidance can be a valid answer"
         );
+    }
+
+    #[test]
+    fn incomplete_progress_final_answers_retry_when_budget_remains() {
+        let worker = test_worker_summary("retry-incomplete", 100, 100);
+
+        assert!(should_retry_incomplete_progress_final_answer(
+            "Phase 4 is not complete yet",
+            "Done and tested: composer extraction. Remaining work: sidebar refactor and docs.",
+            "act",
+            &worker,
+            24,
+            23,
+        ));
+        assert!(should_retry_incomplete_progress_final_answer(
+            "Progress validated",
+            "Phase 4 is not finished; remaining refactors are still required.",
+            "act",
+            &worker,
+            24,
+            23,
+        ));
+    }
+
+    #[test]
+    fn incomplete_progress_final_answers_do_not_retry_when_blocked_plan_or_out_of_budget() {
+        let worker = test_worker_summary("no-retry-incomplete", 25, 25);
+
+        assert!(!should_retry_incomplete_progress_final_answer(
+            "Phase 4 is not complete yet",
+            "Remaining work exists, but I am blocked by a missing credential.",
+            "act",
+            &worker,
+            20,
+            20,
+        ));
+        assert!(!should_retry_incomplete_progress_final_answer(
+            "Phase 4 is not complete yet",
+            "Remaining work: implement the sidebar.",
+            "plan",
+            &worker,
+            20,
+            20,
+        ));
+        assert!(!should_retry_incomplete_progress_final_answer(
+            "Phase 4 is not complete yet",
+            "Remaining work: implement the sidebar.",
+            "act",
+            &worker,
+            24,
+            24,
+        ));
+    }
+
+    #[test]
+    fn incomplete_progress_retry_prompt_requires_continuation() {
+        let prompt = build_incomplete_progress_retry_prompt(
+            "Phase 4 is not complete yet",
+            "Remaining work: split the detail sidebar.",
+        );
+
+        assert!(prompt.contains("progress report rather than a completion answer"));
+        assert!(prompt.contains("Continue with the next smallest useful tool_call"));
+        assert!(prompt.contains(
+            "Only return final_answer when the user's requested phase/task is fully complete"
+        ));
+    }
+
+    #[test]
+    fn progress_update_continuation_prompt_keeps_job_running() {
+        let prompt = build_progress_update_continuation_prompt(
+            "checkpoint saved",
+            "Composer extraction is complete; continue with sidebar extraction.",
+        );
+
+        assert!(prompt.contains("non-terminal progress checkpoint"));
+        assert!(prompt.contains("Continue working from this checkpoint"));
+        assert!(prompt.contains("Use final_answer only when the requested task is complete"));
     }
 
     #[test]

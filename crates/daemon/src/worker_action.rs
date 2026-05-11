@@ -16,6 +16,10 @@ pub enum WorkerAction {
         summary: String,
         jobs: Vec<ChildJobProposal>,
     },
+    ProgressUpdate {
+        summary: String,
+        detail: String,
+    },
     FinalAnswer {
         summary: String,
         final_answer: String,
@@ -287,6 +291,23 @@ fn normalize_worker_action_value(
         .as_object()
         .ok_or(WorkerActionParseError::InvalidActionShape)?;
 
+    if object.contains_key("progress_update") || object.contains_key("progress") {
+        return normalize_worker_progress_update_value(object).map(Some);
+    }
+
+    if object
+        .get("action")
+        .or_else(|| object.get("kind"))
+        .and_then(Value::as_str)
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            value == "progress_update" || value == "checkpoint"
+        })
+        .unwrap_or(false)
+    {
+        return normalize_worker_progress_update_value(object).map(Some);
+    }
+
     if object.contains_key("final_answer") {
         return normalize_worker_final_answer_value(object).map(Some);
     }
@@ -330,6 +351,30 @@ fn normalize_worker_action_value(
     }
 
     Ok(None)
+}
+
+fn normalize_worker_progress_update_value(
+    object: &serde_json::Map<String, Value>,
+) -> Result<WorkerAction, WorkerActionParseError> {
+    let detail = object
+        .get("detail")
+        .or_else(|| object.get("progress_update"))
+        .or_else(|| object.get("progress"))
+        .or_else(|| object.get("content"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(WorkerActionParseError::InvalidActionShape)?
+        .to_string();
+    let summary = object
+        .get("summary")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Recorded a non-terminal progress checkpoint.")
+        .to_string();
+
+    Ok(WorkerAction::ProgressUpdate { summary, detail })
 }
 
 fn normalize_worker_final_answer_value(
@@ -650,6 +695,42 @@ mod tests {
 
         assert_eq!(summary, "The work is done.");
         assert_eq!(final_answer, "Yes—I’m here. How can I help?");
+    }
+
+    #[test]
+    fn parses_progress_update_as_non_terminal_action() {
+        let action = parse_worker_action(
+            r#"{"kind":"progress_update","summary":"checkpoint saved","detail":"Composer extraction is complete; sidebar extraction remains."}"#,
+        )
+        .expect("progress_update should parse");
+
+        let WorkerAction::ProgressUpdate { summary, detail } = action else {
+            panic!("expected progress update");
+        };
+
+        assert_eq!(summary, "checkpoint saved");
+        assert_eq!(
+            detail,
+            "Composer extraction is complete; sidebar extraction remains."
+        );
+    }
+
+    #[test]
+    fn accepts_checkpoint_progress_compatibility() {
+        let action = parse_worker_action(
+            r#"{"action":"checkpoint","content":"Validated current slice; continue with job history."}"#,
+        )
+        .expect("checkpoint/content progress should normalize");
+
+        let WorkerAction::ProgressUpdate { summary, detail } = action else {
+            panic!("expected progress update");
+        };
+
+        assert_eq!(summary, "Recorded a non-terminal progress checkpoint.");
+        assert_eq!(
+            detail,
+            "Validated current slice; continue with job history."
+        );
     }
 
     #[test]
