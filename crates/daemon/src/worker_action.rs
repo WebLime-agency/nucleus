@@ -356,11 +356,23 @@ fn normalize_worker_action_value(
 fn normalize_worker_progress_update_value(
     object: &serde_json::Map<String, Value>,
 ) -> Result<WorkerAction, WorkerActionParseError> {
+    let nested = object
+        .get("progress_update")
+        .or_else(|| object.get("progress"))
+        .and_then(Value::as_object);
     let detail = object
         .get("detail")
-        .or_else(|| object.get("progress_update"))
-        .or_else(|| object.get("progress"))
         .or_else(|| object.get("content"))
+        .or_else(|| object.get("message"))
+        .or_else(|| nested.and_then(|value| value.get("detail")))
+        .or_else(|| nested.and_then(|value| value.get("message")))
+        .or_else(|| nested.and_then(|value| value.get("content")))
+        .or_else(|| {
+            object
+                .get("progress_update")
+                .filter(|value| value.is_string())
+        })
+        .or_else(|| object.get("progress").filter(|value| value.is_string()))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -368,6 +380,8 @@ fn normalize_worker_progress_update_value(
         .to_string();
     let summary = object
         .get("summary")
+        .or_else(|| nested.and_then(|value| value.get("summary")))
+        .or_else(|| nested.and_then(|value| value.get("status")))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -730,6 +744,24 @@ mod tests {
         assert_eq!(
             detail,
             "Validated current slice; continue with job history."
+        );
+    }
+
+    #[test]
+    fn accepts_object_progress_update_compatibility() {
+        let action = parse_worker_action(
+            r#"{"progress_update":{"status":"in_progress","summary":"checkpoint saved","message":"Phase 4 is not complete yet; continue with the next slice."}}"#,
+        )
+        .expect("object progress_update should normalize");
+
+        let WorkerAction::ProgressUpdate { summary, detail } = action else {
+            panic!("expected progress update");
+        };
+
+        assert_eq!(summary, "checkpoint saved");
+        assert_eq!(
+            detail,
+            "Phase 4 is not complete yet; continue with the next slice."
         );
     }
 
