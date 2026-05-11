@@ -376,8 +376,9 @@ fn normalize_worker_progress_update_value(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or(WorkerActionParseError::InvalidActionShape)?
-        .to_string();
+        .map(ToString::to_string)
+        .or_else(|| nested.map(format_progress_update_object))
+        .ok_or(WorkerActionParseError::InvalidActionShape)?;
     let summary = object
         .get("summary")
         .or_else(|| nested.and_then(|value| value.get("summary")))
@@ -389,6 +390,47 @@ fn normalize_worker_progress_update_value(
         .to_string();
 
     Ok(WorkerAction::ProgressUpdate { summary, detail })
+}
+
+fn format_progress_update_object(object: &serde_json::Map<String, Value>) -> String {
+    let mut lines = Vec::new();
+    for key in [
+        "status",
+        "summary",
+        "validated",
+        "changed_files",
+        "remaining",
+        "next",
+    ] {
+        if let Some(value) = object.get(key) {
+            lines.push(format!("{}: {}", key, format_progress_value(value)));
+        }
+    }
+
+    for (key, value) in object {
+        if [
+            "status",
+            "summary",
+            "validated",
+            "changed_files",
+            "remaining",
+            "next",
+        ]
+        .contains(&key.as_str())
+        {
+            continue;
+        }
+        lines.push(format!("{}: {}", key, format_progress_value(value)));
+    }
+
+    lines.join("\n")
+}
+
+fn format_progress_value(value: &Value) -> String {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_else(|_| value.to_string()))
 }
 
 fn normalize_worker_final_answer_value(
@@ -763,6 +805,23 @@ mod tests {
             detail,
             "Phase 4 is not complete yet; continue with the next slice."
         );
+    }
+
+    #[test]
+    fn accepts_structured_progress_update_without_message() {
+        let action = parse_worker_action(
+            r#"{"progress_update":{"status":"partial_success","summary":"Validated another Phase 4 slice.","validated":["npm run check:web","npm run build:web"],"changed_files":["apps/web/src/lib/components/app/workspace/workspace-storage-path-card.svelte"],"next":"Continue with the session workspace decomposition."}}"#,
+        )
+        .expect("structured progress_update should normalize");
+
+        let WorkerAction::ProgressUpdate { summary, detail } = action else {
+            panic!("expected progress update");
+        };
+
+        assert_eq!(summary, "Validated another Phase 4 slice.");
+        assert!(detail.contains("status: partial_success"));
+        assert!(detail.contains("validated:"));
+        assert!(detail.contains("Continue with the session workspace decomposition."));
     }
 
     #[test]
