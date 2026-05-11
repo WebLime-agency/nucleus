@@ -657,22 +657,32 @@ pub async fn cancel_job(state: AppState, job_id: String) -> Result<JobDetail, Ap
 
 pub async fn resume_job(state: AppState, job_id: String) -> Result<JobDetail, ApiError> {
     let detail = state.store.get_job(&job_id)?;
-    if detail.job.state != "paused" {
+    if detail.job.state != "paused" && detail.job.state != "failed" {
         return Err(ApiError::bad_request(
-            "only paused Utility Worker jobs can be resumed",
+            "only paused or checkpointed failed Utility Worker jobs can be resumed",
+        ));
+    }
+    if detail.job.state == "failed" && !job_has_worker_checkpoint(&state, &detail)? {
+        return Err(ApiError::bad_request(
+            "failed Utility Worker job has no checkpoint to resume from",
         ));
     }
 
     let subtree = collect_job_subtree_ids(&state, &job_id)?;
     for child_job_id in subtree.iter().rev() {
         let child_detail = state.store.get_job(child_job_id)?;
-        if child_detail.job.state != "paused" {
+        if child_detail.job.state != "paused" && child_detail.job.state != "failed" {
+            continue;
+        }
+        if child_detail.job.state == "failed" && !job_has_worker_checkpoint(&state, &child_detail)?
+        {
             continue;
         }
         state.store.update_job(
             child_job_id,
             JobPatch {
                 state: Some("queued".to_string()),
+                last_error: Some(String::new()),
                 ..JobPatch::default()
             },
         )?;
@@ -681,6 +691,7 @@ pub async fn resume_job(state: AppState, job_id: String) -> Result<JobDetail, Ap
                 &worker.id,
                 WorkerPatch {
                     state: Some("queued".to_string()),
+                    last_error: Some(String::new()),
                     ..WorkerPatch::default()
                 },
             );
@@ -707,6 +718,16 @@ pub async fn resume_job(state: AppState, job_id: String) -> Result<JobDetail, Ap
         }
     }
     Ok(state.store.get_job(&job_id)?)
+}
+
+fn job_has_worker_checkpoint(state: &AppState, detail: &JobDetail) -> Result<bool> {
+    for worker in &detail.workers {
+        if state.store.read_worker_checkpoint(&worker.id)?.is_some() {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 pub async fn list_pending_approvals(

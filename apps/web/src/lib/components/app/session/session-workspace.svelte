@@ -1464,15 +1464,16 @@
     await goto(`/?session=${sessionId}`, { noScroll: true });
   }
 
-  async function handleCancelJob() {
-    if (!jobDetail || jobActioning) {
+  async function handleCancelJob(jobId?: string) {
+    const targetJobId = jobId ?? jobDetail?.job.id ?? '';
+    if (!targetJobId || jobActioning) {
       return;
     }
 
     jobActioning = true;
 
     try {
-      const next = await cancelJob(jobDetail.job.id);
+      const next = await cancelJob(targetJobId);
       syncJobDetail(next);
       if (selectedSessionId) {
         await loadSelectedSession(selectedSessionId, true);
@@ -1486,15 +1487,16 @@
     }
   }
 
-  async function handleResumeJob() {
-    if (!jobDetail || jobActioning) {
+  async function handleResumeJob(jobId?: string) {
+    const targetJobId = jobId ?? jobDetail?.job.id ?? '';
+    if (!targetJobId || jobActioning) {
       return;
     }
 
     jobActioning = true;
 
     try {
-      const next = await resumeJob(jobDetail.job.id);
+      const next = await resumeJob(targetJobId);
       syncJobDetail(next);
       if (selectedSessionId) {
         await loadSelectedSession(selectedSessionId, true);
@@ -2418,6 +2420,64 @@
               </section>
             {/if}
 
+            {#if selectedSession.state === 'paused' || selectedSession.state === 'error'}
+              <section
+                class={cn(
+                  'rounded-xl border px-4 py-3 text-sm',
+                  selectedSession.state === 'paused'
+                    ? 'border-amber-500/30 bg-amber-500/10 text-amber-100'
+                    : 'border-red-500/30 bg-red-500/10 text-red-100'
+                )}
+              >
+                <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div class="min-w-0">
+                    <div class="font-medium">
+                      {selectedSession.state === 'paused' ? 'This session is paused.' : 'This session has a recoverable job error.'}
+                    </div>
+                    <div class="mt-1 text-xs leading-5 opacity-75">
+                      {selectedSession.state === 'paused'
+                        ? 'Resume or cancel the paused Utility Worker job before sending another prompt.'
+                        : 'Retry the checkpointed Utility Worker job or cancel it before continuing this session.'}
+                    </div>
+                  </div>
+                  <div class="flex shrink-0 flex-wrap gap-2">
+                    {#if composerActivityJobSummary?.state === 'paused' || composerActivityJobSummary?.state === 'failed'}
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        disabled={jobActioning}
+                        onclick={() => handleResumeJob(composerActivityJobSummary?.id)}
+                      >
+                        <RotateCcw class={cn('size-4', jobActioning && 'animate-spin')} />
+                        <span>{jobActioning ? 'Retrying' : composerActivityJobSummary?.state === 'failed' ? 'Retry Job' : 'Resume Job'}</span>
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={jobActioning}
+                        onclick={() => handleCancelJob(composerActivityJobSummary?.id)}
+                      >
+                        <XCircle class="size-4" />
+                        <span>Cancel Job</span>
+                      </Button>
+                    {/if}
+                    {#if composerActivityJobSummary}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onclick={() => {
+                          detailPanelOpen = true;
+                          void loadJob(composerActivityJobSummary.id, true);
+                        }}
+                      >
+                        Open Job Details
+                      </Button>
+                    {/if}
+                  </div>
+                </div>
+              </section>
+            {/if}
+
             <div
               role="group"
               aria-label="Session composer"
@@ -2947,22 +3007,22 @@
                             variant="outline"
                             size="sm"
                             disabled={jobActioning}
-                            onclick={handleCancelJob}
+                            onclick={() => handleCancelJob()}
                           >
                             <XCircle class="size-4" />
                             <span>{jobActioning ? 'Stopping' : 'Cancel Job'}</span>
                           </Button>
                         {/if}
 
-                        {#if jobDetail.job.state === 'paused' && !selectedJobHasPendingApprovals}
+                        {#if (jobDetail.job.state === 'paused' || jobDetail.job.state === 'failed') && !selectedJobHasPendingApprovals}
                           <Button
                             variant="secondary"
                             size="sm"
                             disabled={jobActioning}
-                            onclick={handleResumeJob}
+                            onclick={() => handleResumeJob()}
                           >
                             <RotateCcw class={cn('size-4', jobActioning && 'animate-spin')} />
-                            <span>{jobActioning ? 'Resuming' : 'Resume Job'}</span>
+                            <span>{jobActioning ? 'Retrying' : jobDetail.job.state === 'failed' ? 'Retry Job' : 'Resume Job'}</span>
                           </Button>
                         {/if}
                       </div>
