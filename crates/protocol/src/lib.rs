@@ -497,6 +497,8 @@ pub struct SkillManifest {
     pub id: String,
     pub title: String,
     pub description: String,
+    #[serde(default)]
+    pub instructions: String,
     pub activation_mode: String,
     #[serde(default)]
     pub triggers: Vec<String>,
