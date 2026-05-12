@@ -2863,23 +2863,23 @@ fn assemble_prompt_input(
     session: &SessionSummary,
     prompt: &str,
 ) -> Result<PromptAssembly, ApiError> {
-    let sources = discover_prompt_sources(state, session, prompt)?;
+    let sources = discover_prompt_sources(state, session)?;
+    let skill_layers = collect_compiled_skill_layers(state, session, prompt)?.layers;
 
-    if sources.is_empty() {
+    if sources.is_empty() && skill_layers.is_empty() {
         return Ok(PromptAssembly {
             prompt: prompt.to_string(),
         });
     }
 
     Ok(PromptAssembly {
-        prompt: render_prompt_with_sources(prompt, &sources),
+        prompt: render_prompt_with_sources_and_skill_layers(prompt, &sources, &skill_layers),
     })
 }
 
 fn discover_prompt_sources(
     state: &AppState,
     session: &SessionSummary,
-    prompt: &str,
 ) -> Result<Vec<PromptIncludeSource>, ApiError> {
     let workspace = state.store.workspace()?;
     let mut roots = Vec::new();
@@ -2916,16 +2916,6 @@ fn discover_prompt_sources(
         }
     }
 
-    collect_skill_prompt_sources(
-        state,
-        &workspace,
-        session,
-        prompt,
-        &mut seen_files,
-        &mut sources,
-        &mut total_chars,
-    )?;
-
     Ok(sources)
 }
 
@@ -2941,50 +2931,6 @@ struct InstalledSkillPackage {
     name: String,
     instructions: String,
     manifest_json: Value,
-}
-
-fn collect_skill_prompt_sources(
-    state: &AppState,
-    workspace: &WorkspaceSummary,
-    session: &SessionSummary,
-    prompt: &str,
-    seen_files: &mut BTreeSet<PathBuf>,
-    sources: &mut Vec<PromptIncludeSource>,
-    total_chars: &mut usize,
-) -> Result<(), ApiError> {
-    if sources.len() >= MAX_PROMPT_INCLUDE_FILES || *total_chars >= MAX_PROMPT_INCLUDE_TOTAL_CHARS {
-        return Ok(());
-    }
-
-    let workspace_root = canonical_workspace_root(workspace)?;
-    let installed = installed_skill_packages_by_skill_id(state, session)?;
-
-    for skill in state.store.list_skill_manifests()? {
-        let packages = installed.get(&skill.id).cloned().unwrap_or_default();
-        if packages.is_empty() {
-            continue;
-        }
-        if skill_activation_match(&skill, &packages, prompt).is_none() {
-            continue;
-        }
-
-        for include_path in &skill.include_paths {
-            let Some(path) = resolve_skill_include_path(&workspace_root, &skill.id, include_path)
-            else {
-                continue;
-            };
-
-            push_prompt_source("skill", &path, seen_files, sources, total_chars)?;
-
-            if sources.len() >= MAX_PROMPT_INCLUDE_FILES
-                || *total_chars >= MAX_PROMPT_INCLUDE_TOTAL_CHARS
-            {
-                return Ok(());
-            }
-        }
-    }
-
-    Ok(())
 }
 
 fn canonical_workspace_root(workspace: &WorkspaceSummary) -> Result<PathBuf, ApiError> {
@@ -3243,7 +3189,7 @@ fn compile_session_turn(
     images: &[nucleus_protocol::SessionTurnImage],
     compiler_role: &str,
 ) -> Result<CompiledTurn, ApiError> {
-    let prompt_sources = discover_prompt_sources(state, session, prompt)?;
+    let prompt_sources = discover_prompt_sources(state, session)?;
     let skill_collection = collect_compiled_skill_layers(state, session, prompt)?;
     let skill_layers = skill_collection.layers;
     let mut mcp_catalog = state.store.list_mcp_servers()?;
@@ -3587,6 +3533,14 @@ fn push_prompt_source(
 }
 
 fn render_prompt_with_sources(prompt: &str, sources: &[PromptIncludeSource]) -> String {
+    render_prompt_with_sources_and_skill_layers(prompt, sources, &[])
+}
+
+fn render_prompt_with_sources_and_skill_layers(
+    prompt: &str,
+    sources: &[PromptIncludeSource],
+    skill_layers: &[CompiledPromptLayer],
+) -> String {
     let mut rendered = String::from(
         "Session context for this turn. Treat these files as always-on instructions and local knowledge.\n",
     );
@@ -3598,6 +3552,18 @@ fn render_prompt_with_sources(prompt: &str, sources: &[PromptIncludeSource]) -> 
         rendered.push_str(&compact_prompt_source_path(&source.path));
         rendered.push_str("]\n");
         rendered.push_str(&source.content);
+        rendered.push('\n');
+    }
+
+    for layer in skill_layers {
+        rendered.push_str("\n[skill layer: ");
+        rendered.push_str(&layer.title);
+        if !layer.source_path.is_empty() {
+            rendered.push_str(" — ");
+            rendered.push_str(&layer.source_path);
+        }
+        rendered.push_str("]\n");
+        rendered.push_str(&layer.content);
         rendered.push('\n');
     }
 
@@ -4635,7 +4601,7 @@ mod tests {
             .expect("skill includes should assemble");
 
         assert!(assembly.prompt.contains("Prefer small focused patches."));
-        assert!(assembly.prompt.contains("[skill include:"));
+        assert!(assembly.prompt.contains("[skill layer: Rust"));
 
         let _ = fs::remove_dir_all(&state_dir);
     }
