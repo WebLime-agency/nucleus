@@ -298,6 +298,7 @@ fn normalize_worker_action_value(
     if object
         .get("action")
         .or_else(|| object.get("kind"))
+        .or_else(|| object.get("type"))
         .and_then(Value::as_str)
         .map(|value| {
             let value = value.trim().to_ascii_lowercase();
@@ -315,6 +316,7 @@ fn normalize_worker_action_value(
     if object
         .get("action")
         .or_else(|| object.get("kind"))
+        .or_else(|| object.get("type"))
         .and_then(Value::as_str)
         .map(|value| value.trim().eq_ignore_ascii_case("final_answer"))
         .unwrap_or(false)
@@ -333,6 +335,7 @@ fn normalize_worker_action_value(
     if object
         .get("action")
         .or_else(|| object.get("kind"))
+        .or_else(|| object.get("type"))
         .and_then(Value::as_str)
         .map(|value| value.trim().eq_ignore_ascii_case("tool_call"))
         .unwrap_or(false)
@@ -773,6 +776,20 @@ mod tests {
 
         assert_eq!(summary, "The work is done.");
         assert_eq!(final_answer, "Yes — I can help with EmDash.");
+    }
+
+    #[test]
+    fn accepts_type_final_answer_content_as_bounded_compatibility() {
+        let action = parse_worker_action(
+            r#"{"type":"final_answer","content":"Yes—I can assist with EmDash."}"#,
+        )
+        .expect("type/content final answer should normalize");
+
+        let WorkerAction::FinalAnswer { final_answer, .. } = action else {
+            panic!("expected final answer");
+        };
+
+        assert_eq!(final_answer, "Yes—I can assist with EmDash.");
     }
 
     #[test]
