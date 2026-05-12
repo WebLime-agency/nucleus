@@ -60,6 +60,17 @@ pub struct SessionRecord {
     pub provider_api_key: String,
     pub working_dir: String,
     pub working_dir_kind: String,
+    pub workspace_mode: String,
+    pub source_project_path: String,
+    pub git_root: String,
+    pub worktree_path: String,
+    pub git_branch: String,
+    pub git_base_ref: String,
+    pub git_head: String,
+    pub git_dirty: bool,
+    pub git_untracked_count: usize,
+    pub git_remote_tracking_branch: String,
+    pub workspace_warnings: Vec<String>,
     pub approval_mode: String,
     pub execution_mode: String,
     pub run_budget_mode: String,
@@ -83,6 +94,17 @@ pub struct SessionPatch {
     pub provider_api_key: Option<String>,
     pub working_dir: Option<String>,
     pub working_dir_kind: Option<String>,
+    pub workspace_mode: Option<String>,
+    pub source_project_path: Option<String>,
+    pub git_root: Option<String>,
+    pub worktree_path: Option<String>,
+    pub git_branch: Option<String>,
+    pub git_base_ref: Option<String>,
+    pub git_head: Option<String>,
+    pub git_dirty: Option<bool>,
+    pub git_untracked_count: Option<usize>,
+    pub git_remote_tracking_branch: Option<String>,
+    pub workspace_warnings: Option<Vec<String>>,
     pub approval_mode: Option<String>,
     pub execution_mode: Option<String>,
     pub run_budget_mode: Option<String>,
@@ -320,6 +342,11 @@ pub struct CommandSessionRecord {
     pub command: String,
     pub args: Vec<String>,
     pub cwd: String,
+    pub session_id: String,
+    pub project_id: String,
+    pub worktree_path: String,
+    pub branch: String,
+    pub port: Option<u16>,
     pub env_json: serde_json::Value,
     pub network_policy: String,
     pub timeout_secs: u64,
@@ -1150,6 +1177,7 @@ impl StateStore {
                 provider_api_key,
                 working_dir,
                 working_dir_kind,
+                workspace_mode, source_project_path, git_root, worktree_path, git_branch, git_base_ref, git_head, git_dirty, git_untracked_count, git_remote_tracking_branch, workspace_warnings_json,
                 approval_mode,
                 execution_mode,
                 run_budget_mode,
@@ -1159,7 +1187,7 @@ impl StateStore {
                 last_message_excerpt,
                 turn_count
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 'active', '', '', '', 0)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, 'active', '', '', '', 0)
             ",
             params![
                 record.id,
@@ -1178,6 +1206,17 @@ impl StateStore {
                 record.provider_api_key,
                 record.working_dir,
                 record.working_dir_kind,
+                record.workspace_mode,
+                record.source_project_path,
+                record.git_root,
+                record.worktree_path,
+                record.git_branch,
+                record.git_base_ref,
+                record.git_head,
+                record.git_dirty,
+                record.git_untracked_count,
+                record.git_remote_tracking_branch,
+                serde_json::to_string(&record.workspace_warnings).unwrap_or_else(|_| "[]".to_string()),
                 record.approval_mode,
                 record.execution_mode,
                 record.run_budget_mode,
@@ -1212,6 +1251,25 @@ impl StateStore {
         let next_provider_api_key = patch.provider_api_key.unwrap_or(current.provider_api_key);
         let next_working_dir = patch.working_dir.unwrap_or(current.working_dir);
         let next_working_dir_kind = patch.working_dir_kind.unwrap_or(current.working_dir_kind);
+        let next_workspace_mode = patch.workspace_mode.unwrap_or(current.workspace_mode);
+        let next_source_project_path = patch
+            .source_project_path
+            .unwrap_or(current.source_project_path);
+        let next_git_root = patch.git_root.unwrap_or(current.git_root);
+        let next_worktree_path = patch.worktree_path.unwrap_or(current.worktree_path);
+        let next_git_branch = patch.git_branch.unwrap_or(current.git_branch);
+        let next_git_base_ref = patch.git_base_ref.unwrap_or(current.git_base_ref);
+        let next_git_head = patch.git_head.unwrap_or(current.git_head);
+        let next_git_dirty = patch.git_dirty.unwrap_or(current.git_dirty);
+        let next_git_untracked_count = patch
+            .git_untracked_count
+            .unwrap_or(current.git_untracked_count);
+        let next_git_remote_tracking_branch = patch
+            .git_remote_tracking_branch
+            .unwrap_or(current.git_remote_tracking_branch);
+        let next_workspace_warnings = patch
+            .workspace_warnings
+            .unwrap_or(current.workspace_warnings);
         let next_approval_mode = patch.approval_mode.unwrap_or(current.approval_mode);
         let next_execution_mode = patch.execution_mode.unwrap_or(current.execution_mode);
         let next_run_budget_mode = patch.run_budget_mode.unwrap_or(current.run_budget_mode);
@@ -1240,12 +1298,23 @@ impl StateStore {
                 provider_api_key = ?14,
                 working_dir = ?15,
                 working_dir_kind = ?16,
-                approval_mode = ?17,
-                execution_mode = ?18,
-                run_budget_mode = ?19,
-                state = ?20,
-                provider_session_id = ?21,
-                last_error = ?22,
+                workspace_mode = ?17,
+                source_project_path = ?18,
+                git_root = ?19,
+                worktree_path = ?20,
+                git_branch = ?21,
+                git_base_ref = ?22,
+                git_head = ?23,
+                git_dirty = ?24,
+                git_untracked_count = ?25,
+                git_remote_tracking_branch = ?26,
+                workspace_warnings_json = ?27,
+                approval_mode = ?28,
+                execution_mode = ?29,
+                run_budget_mode = ?30,
+                state = ?31,
+                provider_session_id = ?32,
+                last_error = ?33,
                 updated_at = unixepoch()
             WHERE id = ?1
             ",
@@ -1266,6 +1335,18 @@ impl StateStore {
                 next_provider_api_key,
                 next_working_dir,
                 next_working_dir_kind,
+                next_workspace_mode,
+                next_source_project_path,
+                next_git_root,
+                next_worktree_path,
+                next_git_branch,
+                next_git_base_ref,
+                next_git_head,
+                next_git_dirty,
+                next_git_untracked_count,
+                next_git_remote_tracking_branch,
+                serde_json::to_string(&next_workspace_warnings)
+                    .unwrap_or_else(|_| "[]".to_string()),
                 next_approval_mode,
                 next_execution_mode,
                 next_run_budget_mode,
@@ -1979,6 +2060,11 @@ impl StateStore {
                 command,
                 args_json,
                 cwd,
+                session_id,
+                project_id,
+                worktree_path,
+                branch,
+                port,
                 env_json,
                 network_policy,
                 timeout_secs,
@@ -1990,7 +2076,7 @@ impl StateStore {
                 started_at,
                 completed_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
             ",
             params![
                 record.id,
@@ -2003,6 +2089,11 @@ impl StateStore {
                 record.command,
                 args_json,
                 record.cwd,
+                record.session_id,
+                record.project_id,
+                record.worktree_path,
+                record.branch,
+                record.port.map(|port| port as i64),
                 env_json,
                 record.network_policy,
                 record.timeout_secs as i64,
@@ -2537,6 +2628,11 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             command TEXT NOT NULL,
             args_json TEXT NOT NULL DEFAULT '[]',
             cwd TEXT NOT NULL,
+            session_id TEXT NOT NULL DEFAULT '',
+            project_id TEXT NOT NULL DEFAULT '',
+            worktree_path TEXT NOT NULL DEFAULT '',
+            branch TEXT NOT NULL DEFAULT '',
+            port INTEGER,
             env_json TEXT NOT NULL DEFAULT '{}',
             network_policy TEXT NOT NULL DEFAULT 'inherit',
             timeout_secs INTEGER NOT NULL DEFAULT 300,
@@ -2802,6 +2898,97 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "working_dir_kind",
         "TEXT NOT NULL DEFAULT 'workspace_scratch'",
     )?;
+    ensure_column(
+        connection,
+        "sessions",
+        "workspace_mode",
+        "TEXT NOT NULL DEFAULT 'shared_project_root'",
+    )?;
+    ensure_column(
+        connection,
+        "sessions",
+        "source_project_path",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "sessions",
+        "git_root",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "sessions",
+        "worktree_path",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "sessions",
+        "git_branch",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "sessions",
+        "git_base_ref",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "sessions",
+        "git_head",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "sessions",
+        "git_dirty",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        connection,
+        "sessions",
+        "git_untracked_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        connection,
+        "sessions",
+        "git_remote_tracking_branch",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "sessions",
+        "workspace_warnings_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column(
+        connection,
+        "command_sessions",
+        "session_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "command_sessions",
+        "project_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "command_sessions",
+        "worktree_path",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "command_sessions",
+        "branch",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(connection, "command_sessions", "port", "INTEGER")?;
     ensure_column(
         connection,
         "sessions",
@@ -4860,6 +5047,7 @@ fn load_session_summary(connection: &Connection, session_id: &str) -> Result<Ses
                 provider_api_key,
                 working_dir,
                 working_dir_kind,
+                workspace_mode, source_project_path, git_root, worktree_path, git_branch, git_base_ref, git_head, git_dirty, git_untracked_count, git_remote_tracking_branch, workspace_warnings_json,
                 approval_mode,
                 execution_mode,
                 run_budget_mode,
@@ -4913,19 +5101,30 @@ fn map_session_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionS
         provider_api_key: row.get(13)?,
         working_dir: row.get(14)?,
         working_dir_kind: row.get(15)?,
-        approval_mode: row.get(16)?,
-        execution_mode: row.get(17)?,
-        run_budget_mode: row.get(18)?,
+        workspace_mode: row.get(16)?,
+        source_project_path: row.get(17)?,
+        git_root: row.get(18)?,
+        worktree_path: row.get(19)?,
+        git_branch: row.get(20)?,
+        git_base_ref: row.get(21)?,
+        git_head: row.get(22)?,
+        git_dirty: row.get::<_, i64>(23)? != 0,
+        git_untracked_count: row.get::<_, i64>(24)? as usize,
+        git_remote_tracking_branch: row.get(25)?,
+        workspace_warnings: serde_json::from_str(&row.get::<_, String>(26)?).unwrap_or_default(),
+        approval_mode: row.get(27)?,
+        execution_mode: row.get(28)?,
+        run_budget_mode: row.get(29)?,
         run_budget: RunBudgetSummary::default(),
         project_count: 0,
         projects: Vec::new(),
-        state: row.get(19)?,
-        provider_session_id: row.get(20)?,
-        last_error: row.get(21)?,
-        last_message_excerpt: row.get(22)?,
-        turn_count: row.get(23)?,
-        created_at: row.get(24)?,
-        updated_at: row.get(25)?,
+        state: row.get(30)?,
+        provider_session_id: row.get(31)?,
+        last_error: row.get(32)?,
+        last_message_excerpt: row.get(33)?,
+        turn_count: row.get(34)?,
+        created_at: row.get(35)?,
+        updated_at: row.get(36)?,
     })
 }
 
@@ -5706,6 +5905,11 @@ fn load_command_session_summary(
                 command,
                 args_json,
                 cwd,
+                session_id,
+                project_id,
+                worktree_path,
+                branch,
+                port,
                 network_policy,
                 timeout_secs,
                 output_limit_bytes,
@@ -5733,17 +5937,24 @@ fn load_command_session_summary(
                     command: row.get(7)?,
                     args: decode_string_list(row.get::<_, String>(8)?)?,
                     cwd: row.get(9)?,
-                    network_policy: row.get(10)?,
-                    timeout_secs: row.get::<_, i64>(11)?.max(0) as u64,
-                    output_limit_bytes: row.get::<_, i64>(12)?.max(0) as usize,
-                    last_error: row.get(13)?,
-                    exit_code: row.get(14)?,
-                    stdout_artifact_id: row.get(15)?,
-                    stderr_artifact_id: row.get(16)?,
-                    started_at: row.get(17)?,
-                    completed_at: row.get(18)?,
-                    created_at: row.get(19)?,
-                    updated_at: row.get(20)?,
+                    session_id: row.get(10)?,
+                    project_id: row.get(11)?,
+                    worktree_path: row.get(12)?,
+                    branch: row.get(13)?,
+                    port: row
+                        .get::<_, Option<i64>>(14)?
+                        .map(|port| port.max(0) as u16),
+                    network_policy: row.get(15)?,
+                    timeout_secs: row.get::<_, i64>(16)?.max(0) as u64,
+                    output_limit_bytes: row.get::<_, i64>(17)?.max(0) as usize,
+                    last_error: row.get(18)?,
+                    exit_code: row.get(19)?,
+                    stdout_artifact_id: row.get(20)?,
+                    stderr_artifact_id: row.get(21)?,
+                    started_at: row.get(22)?,
+                    completed_at: row.get(23)?,
+                    created_at: row.get(24)?,
+                    updated_at: row.get(25)?,
                 })
             },
         )
@@ -6410,6 +6621,52 @@ mod tests {
     }
 
     #[test]
+    fn persists_session_workspace_metadata() {
+        let state_dir = test_state_dir("session-workspace-metadata");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let mut record = test_session_record(
+            "workspace-session",
+            "Workspace session",
+            "project",
+            "/tmp/worktree".to_string(),
+        );
+        record.workspace_mode = "isolated_worktree".to_string();
+        record.source_project_path = "/tmp/source".to_string();
+        record.git_root = "/tmp/source".to_string();
+        record.worktree_path = "/tmp/worktree".to_string();
+        record.git_branch = "work/project/abcdef12".to_string();
+        record.git_base_ref = "dev".to_string();
+        record.git_head = "0123456789abcdef".to_string();
+        record.git_dirty = true;
+        record.git_untracked_count = 2;
+        record.git_remote_tracking_branch = "origin/dev".to_string();
+        record.workspace_warnings = vec!["warning".to_string()];
+
+        store
+            .create_session(record)
+            .expect("session should persist");
+        let detail = store
+            .get_session("workspace-session")
+            .expect("session should load");
+
+        assert_eq!(detail.session.workspace_mode, "isolated_worktree");
+        assert_eq!(detail.session.source_project_path, "/tmp/source");
+        assert_eq!(detail.session.worktree_path, "/tmp/worktree");
+        assert_eq!(detail.session.git_branch, "work/project/abcdef12");
+        assert_eq!(detail.session.git_base_ref, "dev");
+        assert_eq!(detail.session.git_head, "0123456789abcdef");
+        assert!(detail.session.git_dirty);
+        assert_eq!(detail.session.git_untracked_count, 2);
+        assert_eq!(detail.session.git_remote_tracking_branch, "origin/dev");
+        assert_eq!(
+            detail.session.workspace_warnings,
+            vec!["warning".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
     fn updates_existing_session_turn_content() {
         let state_dir = test_state_dir("update-session-turn");
         let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
@@ -6436,6 +6693,17 @@ mod tests {
                 provider_api_key: String::new(),
                 working_dir: scratch_dir,
                 working_dir_kind: "workspace_scratch".to_string(),
+                workspace_mode: "scratch_only".to_string(),
+                source_project_path: String::new(),
+                git_root: String::new(),
+                worktree_path: String::new(),
+                git_branch: String::new(),
+                git_base_ref: String::new(),
+                git_head: String::new(),
+                git_dirty: false,
+                git_untracked_count: 0,
+                git_remote_tracking_branch: String::new(),
+                workspace_warnings: Vec::new(),
                 approval_mode: "ask".to_string(),
                 execution_mode: "act".to_string(),
                 run_budget_mode: "inherit".to_string(),
@@ -6552,6 +6820,17 @@ mod tests {
                 provider_api_key: String::new(),
                 working_dir: scratch_dir,
                 working_dir_kind: "workspace_scratch".to_string(),
+                workspace_mode: "scratch_only".to_string(),
+                source_project_path: String::new(),
+                git_root: String::new(),
+                worktree_path: String::new(),
+                git_branch: String::new(),
+                git_base_ref: String::new(),
+                git_head: String::new(),
+                git_dirty: false,
+                git_untracked_count: 0,
+                git_remote_tracking_branch: String::new(),
+                workspace_warnings: Vec::new(),
                 approval_mode: "ask".to_string(),
                 execution_mode: "act".to_string(),
                 run_budget_mode: "inherit".to_string(),
@@ -6945,6 +7224,17 @@ mod tests {
             provider_api_key: String::new(),
             working_dir,
             working_dir_kind: "workspace_scratch".to_string(),
+            workspace_mode: "scratch_only".to_string(),
+            source_project_path: String::new(),
+            git_root: String::new(),
+            worktree_path: String::new(),
+            git_branch: String::new(),
+            git_base_ref: String::new(),
+            git_head: String::new(),
+            git_dirty: false,
+            git_untracked_count: 0,
+            git_remote_tracking_branch: String::new(),
+            workspace_warnings: Vec::new(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
             run_budget_mode: "inherit".to_string(),
