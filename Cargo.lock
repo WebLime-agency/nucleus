@@ -999,6 +999,7 @@ dependencies = [
  "axum",
  "base64",
  "dirs",
+ "flate2",
  "futures-util",
  "libc",
  "nucleus-core",
@@ -1008,11 +1009,14 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "sysinfo",
+ "tar",
  "tokio",
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 
