@@ -483,6 +483,7 @@ export const skillManifestSchema = z.object({
   id: z.string(),
   title: z.string(),
   description: z.string(),
+  instructions: z.string().default(''),
   activation_mode: z.string(),
   triggers: z.array(z.string()).default([]),
   include_paths: z.array(z.string()).default([]),
