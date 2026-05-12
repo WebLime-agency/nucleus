@@ -32,6 +32,7 @@
   import { Input } from '$lib/components/ui/input';
   import { Label } from '$lib/components/ui/label';
   import { Select } from '$lib/components/ui/select';
+  import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '$lib/components/ui/sheet';
   import { Textarea } from '$lib/components/ui/textarea';
   import {
     approveRequest,
@@ -2740,21 +2741,18 @@
           </div>
         </div>
 
-        {#if detailPanelOpen}
-          <button
-            type="button"
-            class="fixed inset-0 z-10 bg-black/50 lg:hidden"
-            aria-label="Close session details"
-            onclick={() => {
-              detailPanelOpen = false;
-            }}
-          ></button>
-
-          <aside class="fixed inset-y-0 right-0 z-20 flex w-full min-w-0 max-w-md flex-col overflow-y-auto overflow-x-hidden border-l border-zinc-900 bg-zinc-950 lg:static lg:z-auto lg:w-96 lg:max-w-96 lg:shrink-0">
-            <div class="flex items-center justify-between border-b border-zinc-900 px-5 py-4">
+        <Sheet bind:open={detailPanelOpen}>
+          <SheetContent
+            portalDisabled
+            trapFocus={false}
+            preventScroll={false}
+            overlayClass="lg:hidden"
+            class="z-20 max-w-md overflow-y-auto overflow-x-hidden border-zinc-900 lg:static lg:z-auto lg:w-96 lg:max-w-96 lg:shrink-0 lg:shadow-none"
+          >
+            <SheetHeader class="items-center border-zinc-900 px-5 py-4">
               <div>
-                <div class="text-sm font-medium text-zinc-100">Session Details</div>
-                <div class="mt-1 text-xs text-zinc-500">Secondary controls live here so the chat stays clear.</div>
+                <SheetTitle class="text-sm">Session Details</SheetTitle>
+                <SheetDescription class="mt-1 text-xs">Secondary controls live here so the chat stays clear.</SheetDescription>
               </div>
               <Button
                 variant="ghost"
@@ -2766,7 +2764,7 @@
               >
                 <X class="size-4" />
               </Button>
-            </div>
+            </SheetHeader>
 
             <div class="min-w-0 space-y-6 px-5 py-5">
               <section class="min-w-0 space-y-4">
@@ -3458,8 +3456,8 @@
                 </div>
               </section>
             </div>
-          </aside>
-        {/if}
+          </SheetContent>
+        </Sheet>
       </div>
     {/if}
   </div>
