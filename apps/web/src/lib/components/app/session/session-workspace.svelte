@@ -1557,7 +1557,35 @@
   }
 
   function formatToolCallSummary(toolCall: ToolCallSummary) {
+    if (toolCall.tool_id === 'command.run') {
+      return formatToolCallCommandDetail(toolCall) || toolCall.summary || toolCall.tool_id;
+    }
+
     return toolCall.summary || toolCall.tool_id;
+  }
+
+  function formatToolCallTitle(toolCall: ToolCallSummary) {
+    if (toolCall.tool_id === 'command.run') {
+      const commandDetail = formatToolCallCommandDetail(toolCall);
+      return commandDetail ? `Run: ${compactText(commandDetail, 96)}` : 'Run command';
+    }
+
+    return formatActionLabel(toolCall.tool_id);
+  }
+
+  function formatToolCallTiming(toolCall: ToolCallSummary) {
+    const started = toolCall.started_at ?? toolCall.created_at;
+    const parts = [`Created ${formatDateTime(toolCall.created_at)}`];
+
+    if (started && started !== toolCall.created_at) {
+      parts.push(`Started ${formatDateTime(started)}`);
+    }
+
+    if (toolCall.completed_at) {
+      parts.push(`Completed ${formatDateTime(toolCall.completed_at)}`);
+    }
+
+    return parts.join(' · ');
   }
 
   function normalizeApprovalMode(value: string | undefined): 'ask' | 'trusted' {
@@ -1733,6 +1761,20 @@
       .join(' ');
   }
 
+  function formatToolCallCommandDetail(toolCall: ToolCallSummary) {
+    const args = objectValue(toolCall.args_json);
+    const command = stringValue(args.command);
+    const commandArgs = formatArgs(args.args);
+    const cwd = stringValue(args.cwd);
+    const commandLine = [command, commandArgs].filter(Boolean).join(' ');
+
+    if (!commandLine) {
+      return '';
+    }
+
+    return cwd ? `${commandLine}  •  ${compactPath(cwd)}` : commandLine;
+  }
+
   function formatToolCallApprovalDetail(toolCall: ToolCallSummary) {
     const args = objectValue(toolCall.args_json);
 
@@ -1808,7 +1850,25 @@
       return commandSession.command;
     }
 
-    return `${commandSession.command} ${commandSession.args.join(' ')}`;
+    return `${commandSession.command} ${commandSession.args.map((arg) => (/\s/.test(arg) ? JSON.stringify(arg) : arg)).join(' ')}`;
+  }
+
+  function formatCommandSessionTiming(commandSession: CommandSessionSummary) {
+    const parts = [`Created ${formatDateTime(commandSession.created_at)}`];
+
+    if (commandSession.started_at) {
+      parts.push(`Started ${formatDateTime(commandSession.started_at)}`);
+    }
+
+    if (commandSession.completed_at) {
+      parts.push(`Completed ${formatDateTime(commandSession.completed_at)}`);
+    }
+
+    if (commandSession.timeout_secs > 0 && commandSession.state === 'running') {
+      parts.push(`Timeout ${commandSession.timeout_secs}s`);
+    }
+
+    return parts.join(' · ');
   }
 
   function latestPendingApproval(approvals: ApprovalRequestSummary[]) {
@@ -2290,10 +2350,13 @@
                               <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-2">
                                 <div class="flex items-start justify-between gap-3">
                                   <div class="min-w-0">
-                                    <div class="truncate text-sm text-zinc-100">{formatActionLabel(toolCall.tool_id)}</div>
-                                    <div class="mt-1 text-xs text-zinc-500">
-                                      {formatToolCallSummary(toolCall)}
-                                    </div>
+                                    <div class="truncate text-sm text-zinc-100">{formatToolCallTitle(toolCall)}</div>
+                                    <div class="mt-1 text-xs text-zinc-500">{formatToolCallTiming(toolCall)}</div>
+                                    {#if formatToolCallSummary(toolCall) !== formatToolCallTitle(toolCall)}
+                                      <div class="mt-1 text-xs leading-5 text-zinc-500">
+                                        {compactText(formatToolCallSummary(toolCall), 220)}
+                                      </div>
+                                    {/if}
                                   </div>
                                   <Badge variant={badgeVariantForToolCall(toolCall.status)}>
                                     {formatState(toolCall.status)}
@@ -2362,9 +2425,11 @@
                                 <div class="flex items-start justify-between gap-3">
                                   <div class="min-w-0">
                                     <div class="truncate text-sm text-zinc-100">{formatCommandSessionSummary(commandSession)}</div>
-                                    <div class="mt-1 text-xs leading-5 text-zinc-500">
-                                      {formatCommandInvocation(commandSession)}
-                                    </div>
+                                    <div class="mt-1 text-xs text-zinc-500">{formatCommandSessionTiming(commandSession)}</div>
+                                    <details class="mt-1 text-xs leading-5 text-zinc-500">
+                                      <summary class="cursor-pointer select-none text-zinc-400">Command</summary>
+                                      <pre class="mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-zinc-950 px-3 py-2 text-[11px] leading-5 text-zinc-400">{formatCommandInvocation(commandSession)}</pre>
+                                    </details>
                                   </div>
                                   <Badge variant={badgeVariantForToolCall(commandSession.state)}>
                                     {formatState(commandSession.state)}
@@ -3102,15 +3167,24 @@
                                 <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2">
                                   <div class="flex items-center justify-between gap-3">
                                     <div class="min-w-0">
-                                      <div class="truncate text-sm text-zinc-100">{formatActionLabel(toolCall.tool_id)}</div>
-                                      <div class="mt-1 text-xs text-zinc-500">
-                                        {formatToolCallSummary(toolCall)}
-                                      </div>
+                                      <div class="truncate text-sm text-zinc-100">{formatToolCallTitle(toolCall)}</div>
+                                      <div class="mt-1 text-xs text-zinc-500">{formatToolCallTiming(toolCall)}</div>
+                                      {#if formatToolCallSummary(toolCall) !== formatToolCallTitle(toolCall)}
+                                        <div class="mt-1 text-xs leading-5 text-zinc-500">
+                                          {compactText(formatToolCallSummary(toolCall), 240)}
+                                        </div>
+                                      {/if}
                                     </div>
                                     <Badge variant={badgeVariantForToolCall(toolCall.status)}>
                                       {formatState(toolCall.status)}
                                     </Badge>
                                   </div>
+                                  {#if toolCall.tool_id === 'command.run'}
+                                    <details class="mt-2 text-xs leading-5 text-zinc-500">
+                                      <summary class="cursor-pointer select-none text-zinc-400">Command details</summary>
+                                      <pre class="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded-lg bg-zinc-900 px-3 py-2 text-[11px] leading-5 text-zinc-400">{formatToolCallCommandDetail(toolCall)}</pre>
+                                    </details>
+                                  {/if}
                                   {#if toolCall.error_detail}
                                     <div class="mt-2 text-xs leading-5 text-red-200">{toolCall.error_detail}</div>
                                   {:else if toolCall.result_json}

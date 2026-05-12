@@ -440,6 +440,7 @@ fn normalize_worker_final_answer_value(
         .get("final_answer")
         .or_else(|| object.get("content"))
         .or_else(|| object.get("text"))
+        .or_else(|| object.get("message"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -771,6 +772,24 @@ mod tests {
 
         assert_eq!(summary, "The work is done.");
         assert_eq!(final_answer, "The requested work is in the local branch.");
+    }
+
+    #[test]
+    fn accepts_kind_final_answer_message_as_bounded_compatibility() {
+        let action =
+            parse_worker_action(r#"{"kind":"final_answer","message":"Completed and released."}"#)
+                .expect("kind/message final answer should normalize");
+
+        let WorkerAction::FinalAnswer {
+            summary,
+            final_answer,
+        } = action
+        else {
+            panic!("expected final answer");
+        };
+
+        assert_eq!(summary, "The work is done.");
+        assert_eq!(final_answer, "Completed and released.");
     }
 
     #[test]
