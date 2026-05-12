@@ -499,6 +499,21 @@ export const skillPackageRecordSchema = z.object({
   version: z.string(),
   manifest_json: z.unknown(),
   instructions: z.string(),
+  source_kind: z.string().default('manual'),
+  source_url: z.string().default(''),
+  source_repo_url: z.string().default(''),
+  source_owner: z.string().default(''),
+  source_repo: z.string().default(''),
+  source_ref: z.string().default(''),
+  source_parent_path: z.string().default(''),
+  source_skill_path: z.string().default(''),
+  source_commit: z.string().default(''),
+  imported_at: z.number().int().nullable().optional(),
+  last_checked_at: z.number().int().nullable().optional(),
+  latest_source_commit: z.string().default(''),
+  update_status: z.string().default('unknown'),
+  content_checksum: z.string().default(''),
+  dirty_status: z.string().default('unknown'),
   created_at: z.number().int(),
   updated_at: z.number().int()
 });
@@ -508,7 +523,55 @@ export const skillPackageUpsertRequestSchema = z.object({
   name: z.string(),
   version: z.string(),
   manifest_json: z.unknown(),
-  instructions: z.string()
+  instructions: z.string(),
+  source_kind: z.string().default('manual'),
+  source_url: z.string().default(''),
+  source_repo_url: z.string().default(''),
+  source_owner: z.string().default(''),
+  source_repo: z.string().default(''),
+  source_ref: z.string().default(''),
+  source_parent_path: z.string().default(''),
+  source_skill_path: z.string().default(''),
+  source_commit: z.string().default(''),
+  content_checksum: z.string().default('')
+});
+
+export const skillImportRequestSchema = z.object({
+  source: z.string(),
+  scope_kind: z.string().default('workspace'),
+  scope_id: z.string().default('default')
+});
+
+export const skillInstallVerificationSchema = z.object({
+  files_copied: z.boolean(),
+  manifest_registered: z.boolean(),
+  package_registered: z.boolean(),
+  installation_registered: z.boolean(),
+  instructions_non_empty: z.boolean(),
+  source_metadata_stored: z.boolean(),
+  checksum_recorded: z.boolean()
+});
+
+export const skillInstallResultSchema = z.object({
+  skill_id: z.string(),
+  package_id: z.string(),
+  installation_id: z.string(),
+  source_kind: z.string(),
+  source_url: z.string(),
+  source_repo: z.string(),
+  source_ref: z.string(),
+  source_skill_path: z.string(),
+  source_commit: z.string(),
+  content_checksum: z.string(),
+  dirty_status: z.string(),
+  update_status: z.string(),
+  status: z.string(),
+  verification: skillInstallVerificationSchema
+});
+
+export const skillImportResponseSchema = z.object({
+  installed: z.array(skillInstallResultSchema).default([]),
+  errors: z.array(z.string()).default([])
 });
 
 export const skillInstallationRecordSchema = z.object({
@@ -906,6 +969,9 @@ export type NucleusToolDescriptor = z.infer<typeof nucleusToolDescriptorSchema>;
 export type SkillManifest = z.infer<typeof skillManifestSchema>;
 export type SkillPackageRecord = z.infer<typeof skillPackageRecordSchema>;
 export type SkillPackageUpsertRequest = z.infer<typeof skillPackageUpsertRequestSchema>;
+export type SkillImportRequest = z.infer<typeof skillImportRequestSchema>;
+export type SkillInstallResult = z.infer<typeof skillInstallResultSchema>;
+export type SkillImportResponse = z.infer<typeof skillImportResponseSchema>;
 export type SkillInstallationRecord = z.infer<typeof skillInstallationRecordSchema>;
 export type SkillInstallationUpsertRequest = z.infer<typeof skillInstallationUpsertRequestSchema>;
 export type McpServerSummary = z.infer<typeof mcpServerSummarySchema>;
