@@ -538,6 +538,22 @@ export const mcpServerSummarySchema = z.object({
   resources: z.array(z.string()).default([])
 });
 
+export const mcpServerRecordSchema = z.object({
+  id: z.string(),
+  workspace_id: z.string(),
+  title: z.string(),
+  transport: z.string(),
+  command: z.string().default(''),
+  args: z.array(z.string()).default([]),
+  env_json: z.unknown().default({}),
+  enabled: z.boolean(),
+  sync_status: z.string(),
+  last_error: z.string().default(''),
+  last_synced_at: z.number().int().nullable(),
+  created_at: z.number().int(),
+  updated_at: z.number().int()
+});
+
 export const routerProfileSummarySchema = z.object({
   id: z.string(),
   title: z.string(),
@@ -679,6 +695,34 @@ export const diskStatSchema = z.object({
   total_bytes: z.number().int().nonnegative(),
   used_bytes: z.number().int().nonnegative(),
   available_bytes: z.number().int().nonnegative()
+});
+
+export const memoryEntrySchema = z.object({
+  id: z.string(),
+  scope_kind: z.string(),
+  scope_id: z.string(),
+  title: z.string(),
+  content: z.string(),
+  tags: z.array(z.string()),
+  enabled: z.boolean(),
+  created_at: z.number().int(),
+  updated_at: z.number().int()
+});
+
+export const memoryEntryUpsertRequestSchema = z.object({
+  id: z.string().optional(),
+  scope_kind: z.string(),
+  scope_id: z.string(),
+  title: z.string(),
+  content: z.string(),
+  tags: z.array(z.string()).default([]),
+  enabled: z.boolean().optional()
+});
+
+export const memorySummarySchema = z.object({
+  entries: z.array(memoryEntrySchema),
+  enabled_count: z.number().int(),
+  scope_count: z.number().int()
 });
 
 export const systemStatsSchema = z.object({
@@ -849,6 +893,10 @@ export type SkillPackageUpsertRequest = z.infer<typeof skillPackageUpsertRequest
 export type SkillInstallationRecord = z.infer<typeof skillInstallationRecordSchema>;
 export type SkillInstallationUpsertRequest = z.infer<typeof skillInstallationUpsertRequestSchema>;
 export type McpServerSummary = z.infer<typeof mcpServerSummarySchema>;
+export type McpServerRecord = z.infer<typeof mcpServerRecordSchema>;
+export type MemoryEntry = z.infer<typeof memoryEntrySchema>;
+export type MemoryEntryUpsertRequest = z.infer<typeof memoryEntryUpsertRequestSchema>;
+export type MemorySummary = z.infer<typeof memorySummarySchema>;
 export type SystemStats = z.infer<typeof systemStatsSchema>;
 export type ProcessListResponse = z.infer<typeof processListResponseSchema>;
 export type ProcessSnapshot = z.infer<typeof processSnapshotSchema>;

@@ -34,6 +34,7 @@ Nucleus should already be the product brain by that point. The web UI should be 
 Later phases can expand into:
 
 - richer long-term memory controls
+- workspace Skills, MCP, and durable memory management surfaces
 - automation and approval policies
 - more capable native clients
 - remote and multi-device workflows

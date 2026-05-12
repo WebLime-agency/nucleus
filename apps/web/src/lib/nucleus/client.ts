@@ -12,7 +12,11 @@ import {
   createSessionRequestSchema,
   jobDetailSchema,
   jobSummarySchema,
+  mcpServerRecordSchema,
   mcpServerSummarySchema,
+  memoryEntrySchema,
+  memoryEntryUpsertRequestSchema,
+  memorySummarySchema,
   playbookDetailSchema,
   playbookSummarySchema,
   processKillRequestSchema,
@@ -393,6 +397,13 @@ export async function upsertSkill(
   );
 }
 
+export async function deleteSkill(skillId: string, fetchImpl: FetchLike = fetch) {
+  await daemonFetch(fetchImpl, `/api/skills/${encodeURIComponent(skillId)}`, {
+    method: 'DELETE',
+    headers: { accept: 'application/json' }
+  });
+}
+
 export async function fetchSkillPackages(fetchImpl: FetchLike = fetch) {
   return parseJson(
     await daemonFetch(fetchImpl, '/api/skill-packages', {
@@ -458,6 +469,15 @@ export async function fetchMcpServers(fetchImpl: FetchLike = fetch) {
   );
 }
 
+export async function fetchMcpServerRecords(fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/mcps', {
+      headers: { accept: 'application/json' }
+    }),
+    z.array(mcpServerRecordSchema)
+  );
+}
+
 export async function discoverMcpServer(serverId: string, fetchImpl: FetchLike = fetch) {
   return parseJson(
     await daemonFetch(fetchImpl, `/api/mcps/${encodeURIComponent(serverId)}/discover`, {
@@ -469,10 +489,10 @@ export async function discoverMcpServer(serverId: string, fetchImpl: FetchLike =
 }
 
 export async function upsertMcpServer(
-  input: z.input<typeof mcpServerSummarySchema>,
+  input: z.input<typeof mcpServerRecordSchema>,
   fetchImpl: FetchLike = fetch
 ) {
-  const payload = mcpServerSummarySchema.parse(input);
+  const payload = mcpServerRecordSchema.parse(input);
 
   return parseJson(
     await daemonFetch(fetchImpl, '/api/mcps', {
@@ -483,8 +503,49 @@ export async function upsertMcpServer(
       },
       body: JSON.stringify(payload)
     }),
-    mcpServerSummarySchema
+    mcpServerRecordSchema
   );
+}
+
+export async function deleteMcpServer(serverId: string, fetchImpl: FetchLike = fetch) {
+  await daemonFetch(fetchImpl, `/api/mcps/${encodeURIComponent(serverId)}`, {
+    method: 'DELETE',
+    headers: { accept: 'application/json' }
+  });
+}
+
+export async function fetchMemory(fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/memory', {
+      headers: { accept: 'application/json' }
+    }),
+    memorySummarySchema
+  );
+}
+
+export async function upsertMemory(
+  input: z.input<typeof memoryEntryUpsertRequestSchema>,
+  fetchImpl: FetchLike = fetch
+) {
+  const payload = memoryEntryUpsertRequestSchema.parse(input);
+  return parseJson(
+    await daemonFetch(fetchImpl, payload.id ? `/api/memory/${encodeURIComponent(payload.id)}` : '/api/memory', {
+      method: payload.id ? 'PUT' : 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json'
+      },
+      body: JSON.stringify(payload)
+    }),
+    memoryEntrySchema
+  );
+}
+
+export async function deleteMemory(memoryId: string, fetchImpl: FetchLike = fetch) {
+  await daemonFetch(fetchImpl, `/api/memory/${encodeURIComponent(memoryId)}`, {
+    method: 'DELETE',
+    headers: { accept: 'application/json' }
+  });
 }
 
 export async function fetchActions(fetchImpl: FetchLike = fetch) {
