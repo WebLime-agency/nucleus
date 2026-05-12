@@ -14,7 +14,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use axum::{
     Json, Router,
     body::Bytes,
@@ -197,6 +197,10 @@ fn app(state: AppState) -> Router {
         .route(
             "/mcps/{server_id}/discover",
             axum::routing::post(discover_mcp_server_tools),
+        )
+        .route(
+            "/mcps/{server_id}/tools/{tool_name}/call",
+            axum::routing::post(call_mcp_server_tool),
         )
         .route("/memory", get(list_memory).post(upsert_memory))
         .route(
@@ -775,7 +779,7 @@ async fn discover_mcp_server_tools(
         .find(|server| server.id == server_id)
         .ok_or_else(|| ApiError::not_found(format!("MCP server '{server_id}' was not found")))?;
 
-    let result = discover_mcp_stdio_server(&record).await;
+    let result = discover_mcp_server(&record).await;
     match result {
         Ok(discovered) => {
             let now = SystemTime::now()
@@ -793,6 +797,17 @@ async fn discover_mcp_server_tools(
                 id: record.id.clone(),
                 title: record.title.clone(),
                 enabled: record.enabled,
+                transport: record.transport.clone(),
+                command: record.command.clone(),
+                args: record.args.clone(),
+                env_json: record.env_json.clone(),
+                url: record.url.clone(),
+                headers_json: record.headers_json.clone(),
+                auth_kind: record.auth_kind.clone(),
+                auth_ref: record.auth_ref.clone(),
+                sync_status: "ready".to_string(),
+                last_error: String::new(),
+                last_synced_at: Some(now),
                 tools: discovered.tools.clone(),
                 resources: discovered.resources.clone(),
             };
@@ -835,11 +850,65 @@ async fn discover_mcp_server_tools(
     }
 }
 
+async fn call_mcp_server_tool(
+    State(state): State<AppState>,
+    Path((server_id, tool_name)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let server_id = sanitize_registry_id(&server_id, "MCP server id")?;
+    let tool_name = tool_name.trim().to_string();
+    if tool_name.is_empty() {
+        return Err(ApiError::bad_request("MCP tool name is required"));
+    }
+    let params = if body.is_empty() {
+        json!({})
+    } else {
+        decode_json::<Value>(&body)?
+    };
+    let record = state
+        .store
+        .list_mcp_server_records()
+        .map_err(ApiError::from)?
+        .into_iter()
+        .find(|server| server.id == server_id)
+        .ok_or_else(|| ApiError::not_found(format!("MCP server '{server_id}' was not found")))?;
+    if record.transport != "streamable-http" && record.transport != "http" {
+        return Err(ApiError::bad_request(format!(
+            "unsupported_transport: tool call API currently supports native remote MCPs, got '{}'",
+            record.transport
+        )));
+    }
+    let _ = mcp_http_request(&record, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"nucleus","version":env!("CARGO_PKG_VERSION")}}}))
+        .await
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let _ = mcp_http_request(
+        &record,
+        json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+    )
+    .await;
+    let result = mcp_http_request(&record, json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool_name,"arguments":params}}))
+        .await
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    Ok(Json(result))
+}
+
 #[derive(Debug)]
 struct DiscoveredMcpCatalog {
     tools: Vec<NucleusToolDescriptor>,
     resources: Vec<String>,
     tool_records: Vec<McpToolRecord>,
+}
+
+async fn discover_mcp_server(record: &McpServerRecord) -> anyhow::Result<DiscoveredMcpCatalog> {
+    match record.transport.as_str() {
+        "stdio" => discover_mcp_stdio_server(record).await,
+        "streamable-http" | "http" => discover_mcp_http_server(record).await,
+        "sse" => bail!("unsupported_transport: SSE MCP transport is not implemented"),
+        other => bail!(
+            "unsupported_transport: unsupported MCP transport '{}'",
+            other
+        ),
+    }
 }
 
 async fn discover_mcp_stdio_server(
@@ -1013,6 +1082,155 @@ async fn discover_mcp_stdio_server(
         resources: Vec::new(),
         tool_records,
     })
+}
+
+async fn discover_mcp_http_server(
+    record: &McpServerRecord,
+) -> anyhow::Result<DiscoveredMcpCatalog> {
+    let result = mcp_http_request(record, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"nucleus","version":env!("CARGO_PKG_VERSION")}}})).await?;
+    let _ = result;
+    let _ = mcp_http_request(
+        record,
+        json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+    )
+    .await;
+    let result = mcp_http_request(
+        record,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+    )
+    .await?;
+    let tools_value = result
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_secs() as i64;
+    let mut tools = Vec::new();
+    let mut tool_records = Vec::new();
+    for item in tools_value {
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if name.is_empty() {
+            continue;
+        }
+        let description = item
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let input_schema = item
+            .get("inputSchema")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let source = record.id.clone();
+        let tool_id = format!("{}.{}", record.id, name);
+        tools.push(NucleusToolDescriptor {
+            id: tool_id.clone(),
+            title: name.to_string(),
+            description: description.clone(),
+            input_schema: input_schema.clone(),
+            source: source.clone(),
+        });
+        tool_records.push(McpToolRecord {
+            id: tool_id,
+            server_id: record.id.clone(),
+            name: name.to_string(),
+            description,
+            input_schema,
+            source,
+            discovered_at: now,
+            created_at: now,
+            updated_at: now,
+        });
+    }
+    Ok(DiscoveredMcpCatalog {
+        tools,
+        resources: Vec::new(),
+        tool_records,
+    })
+}
+
+async fn mcp_http_request(record: &McpServerRecord, payload: Value) -> anyhow::Result<Value> {
+    if record.url.trim().is_empty() {
+        bail!("missing_url: MCP remote URL is required");
+    }
+    let client = reqwest::Client::new();
+    let mut req = client
+        .post(record.url.trim())
+        .header("accept", "application/json, text/event-stream")
+        .header("content-type", "application/json")
+        .json(&payload);
+    if let Some(headers) = record.headers_json.as_object() {
+        for (key, value) in headers {
+            if key.trim().is_empty() {
+                continue;
+            }
+            if let Some(text) = value.as_str() {
+                req = req.header(key, text);
+            }
+        }
+    }
+    match record.auth_kind.as_str() {
+        "none" | "" => {}
+        "bearer_env" | "env_bearer" => {
+            if record.auth_ref.trim().is_empty() {
+                bail!("missing_credentials: bearer token environment variable is not configured");
+            }
+            let token = std::env::var(record.auth_ref.trim()).map_err(|_| {
+                anyhow::anyhow!("missing_credentials: bearer token environment variable is not set")
+            })?;
+            req = req.bearer_auth(token);
+        }
+        "static_headers" => {}
+        "oauth" | "device" => {
+            bail!("auth_required: interactive MCP auth is not available in unattended mode")
+        }
+        other => bail!("missing_credentials: unsupported MCP auth kind '{}'", other),
+    }
+    let resp = req.send().await.context("remote MCP request failed")?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        bail!("auth_required: remote MCP returned {}", status.as_u16());
+    }
+    if !status.is_success() {
+        bail!(
+            "remote_server_failure: remote MCP returned {}",
+            status.as_u16()
+        );
+    }
+    let text = resp
+        .text()
+        .await
+        .context("failed to read remote MCP response")?;
+    if text.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    let json_text = if text
+        .lines()
+        .any(|line| line.trim_start().starts_with("data:"))
+    {
+        text.lines()
+            .filter_map(|line| line.trim_start().strip_prefix("data:"))
+            .map(str::trim)
+            .find(|line| !line.is_empty() && *line != "[DONE]")
+            .unwrap_or("")
+            .to_string()
+    } else {
+        text
+    };
+    let value: Value = serde_json::from_str(&json_text)
+        .context("protocol_parse_failure: failed to parse remote MCP response")?;
+    if let Some(error) = value.get("error") {
+        bail!("remote_server_failure: MCP error {}", error);
+    }
+    Ok(value.get("result").cloned().unwrap_or(value))
 }
 
 async fn list_sessions(
@@ -3958,6 +4176,17 @@ mod tests {
                 id: "mcp.docs".to_string(),
                 title: "Docs MCP".to_string(),
                 enabled: true,
+                transport: "stdio".to_string(),
+                command: String::new(),
+                args: Vec::new(),
+                env_json: json!({}),
+                url: String::new(),
+                headers_json: json!({}),
+                auth_kind: "none".to_string(),
+                auth_ref: String::new(),
+                sync_status: "ready".to_string(),
+                last_error: String::new(),
+                last_synced_at: None,
                 tools: vec![NucleusToolDescriptor {
                     id: "mcp.docs.searchDocs".to_string(),
                     title: "searchDocs".to_string(),
@@ -4520,6 +4749,10 @@ for line in sys.stdin:
             command: "python3".to_string(),
             args: vec![script_path.to_string_lossy().to_string()],
             env_json: json!({}),
+            url: String::new(),
+            headers_json: json!({}),
+            auth_kind: "none".to_string(),
+            auth_ref: String::new(),
             enabled: true,
             sync_status: "pending".to_string(),
             last_error: String::new(),
@@ -4582,6 +4815,10 @@ for line in sys.stdin:
             command: String::new(),
             args: Vec::new(),
             env_json: json!({}),
+            url: String::new(),
+            headers_json: json!({}),
+            auth_kind: "none".to_string(),
+            auth_ref: String::new(),
             enabled: true,
             sync_status: "pending".to_string(),
             last_error: String::new(),
