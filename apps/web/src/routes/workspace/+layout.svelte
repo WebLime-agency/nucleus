@@ -1,12 +1,14 @@
 <script lang="ts">
   import { page } from '$app/state';
-  import { Bot, Cpu, MemoryStick, Settings2 } from 'lucide-svelte';
+  import { Bot, Cpu, MemoryStick, PlugZap, Settings2, Wrench } from 'lucide-svelte';
 
   import { cn } from '$lib/utils';
   import { ScrollArea, ScrollAreaCorner, ScrollAreaScrollbar, ScrollAreaThumb, ScrollAreaViewport } from '$lib/components/ui/scroll-area';
 
   const tabs = [
     { href: '/workspace', label: 'Profiles', icon: Bot, exact: true },
+    { href: '/workspace/skills', label: 'Skills', icon: Wrench, exact: false },
+    { href: '/workspace/mcps', label: 'MCPs', icon: PlugZap, exact: false },
     { href: '/workspace/memory', label: 'Memory', icon: MemoryStick, exact: false },
     { href: '/workspace/diagnostics', label: 'Diagnostics', icon: Cpu, exact: false },
     { href: '/workspace/settings', label: 'Settings', icon: Settings2, exact: false }
