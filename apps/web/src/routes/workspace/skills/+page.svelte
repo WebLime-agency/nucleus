@@ -8,8 +8,10 @@
   import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '$lib/components/ui/card';
   import { Input } from '$lib/components/ui/input';
   import { Label } from '$lib/components/ui/label';
+  import { Dialog, DialogContent, DialogDescription, DialogTitle } from '$lib/components/ui/dialog';
   import { Select } from '$lib/components/ui/select';
   import { Separator } from '$lib/components/ui/separator';
+  import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle } from '$lib/components/ui/sheet';
   import { Textarea } from '$lib/components/ui/textarea';
   import {
     checkSkillUpdate,
@@ -283,13 +285,12 @@
   {/if}
 </div>
 
-{#if drawerOpen}
-  <button type="button" class="fixed inset-0 z-40 bg-black/50 md:bg-black/20" aria-label="Close skill drawer" onclick={closeDrawer}></button>
-  <div class="fixed inset-y-0 right-0 z-50 flex w-full flex-col border-l border-zinc-800 bg-zinc-950 shadow-2xl outline-none transition-all md:w-[min(720px,92vw)] {drawerExpanded ? 'md:w-[min(1180px,96vw)]' : ''}" role="dialog" aria-modal="true" aria-labelledby="skill-drawer-title" tabindex="-1" onkeydown={(event) => event.key === 'Escape' && closeDrawer()}>
-    <div class="flex items-start justify-between gap-3 border-b border-zinc-800 p-4">
-      <div class="min-w-0"><h2 id="skill-drawer-title" tabindex="-1" class="flex items-center gap-2 text-lg font-semibold text-zinc-50"><Wrench class="size-5" /> {form.title || form.id || 'Skill editor'}</h2><p class="text-sm text-zinc-400">Edit settings, inspect package/source metadata, and run skill actions.</p></div>
+<Sheet bind:open={drawerOpen}>
+  <SheetContent class={drawerExpanded ? 'md:w-[min(1180px,96vw)]' : ''}>
+    <SheetHeader>
+      <div class="min-w-0"><SheetTitle id="skill-drawer-title" class="flex items-center gap-2"><Wrench class="size-5" /> {form.title || form.id || 'Skill editor'}</SheetTitle><SheetDescription>Edit settings, inspect package/source metadata, and run skill actions.</SheetDescription></div>
       <div class="flex gap-2"><Button variant="ghost" size="icon" onclick={() => (drawerExpanded = !drawerExpanded)} aria-label={drawerExpanded ? 'Collapse drawer' : 'Expand drawer'}>{#if drawerExpanded}<Minimize2 class="size-4" />{:else}<Maximize2 class="size-4" />{/if}</Button><Button variant="ghost" size="icon" onclick={closeDrawer} aria-label="Close skill drawer"><X class="size-4" /></Button></div>
-    </div>
+    </SheetHeader>
     <div class="min-h-0 flex-1 overflow-y-auto p-4">
       <div class="grid gap-6 {drawerExpanded ? 'xl:grid-cols-[1.1fr_0.9fr]' : ''}">
         <section class="space-y-4"><h3 class="font-medium text-zinc-100">Overview</h3><div class="grid gap-4 sm:grid-cols-2"><div class="space-y-1"><Label for="skill-id">ID</Label><Input id="skill-id" bind:value={form.id} /></div><div class="space-y-1"><Label for="skill-title">Title</Label><Input id="skill-title" bind:value={form.title} /></div></div><div class="space-y-1"><Label for="skill-description">Description</Label><Textarea id="skill-description" bind:value={form.description} rows={3} /></div><div class="grid gap-4 sm:grid-cols-2"><div class="space-y-1"><Label for="skill-activation">Activation mode</Label><Select id="skill-activation" bind:value={form.activation_mode}><option value="manual">manual</option><option value="auto">auto</option><option value="always">always</option></Select></div><label class="mt-7 flex items-center gap-2 text-sm text-zinc-300"><input type="checkbox" bind:checked={form.enabled} /> Enabled</label></div><div class="grid gap-4 sm:grid-cols-2"><div class="space-y-1"><Label for="skill-triggers">Triggers</Label><Textarea id="skill-triggers" value={form.triggers.join('\n')} oninput={(event) => (form.triggers = parseList((event.currentTarget as HTMLTextAreaElement).value))} rows={3} /></div><div class="space-y-1"><Label for="skill-tools">Required tools</Label><Textarea id="skill-tools" value={form.required_tools.join('\n')} oninput={(event) => (form.required_tools = parseList((event.currentTarget as HTMLTextAreaElement).value))} rows={3} /></div><div class="space-y-1"><Label for="skill-mcps">Required MCPs</Label><Textarea id="skill-mcps" value={form.required_mcps.join('\n')} oninput={(event) => (form.required_mcps = parseList((event.currentTarget as HTMLTextAreaElement).value))} rows={3} /></div><div class="space-y-1"><Label for="skill-projects">Project filters</Label><Textarea id="skill-projects" value={form.project_filters.join('\n')} oninput={(event) => (form.project_filters = parseList((event.currentTarget as HTMLTextAreaElement).value))} rows={3} /></div></div><div class="space-y-1"><Label for="skill-includes">Include paths / installed file paths</Label><Textarea id="skill-includes" value={form.include_paths.join('\n')} oninput={(event) => (form.include_paths = parseList((event.currentTarget as HTMLTextAreaElement).value))} rows={3} /></div></section>
@@ -311,17 +312,14 @@
           </div><Separator /><div class="space-y-2"><div class="flex items-center justify-between"><h3 class="font-medium text-zinc-100">SKILL.md preview</h3><Badge variant={form.instructions ? 'default' : 'outline'}>{form.instructions.length} chars</Badge></div><Textarea id="skill-instructions" bind:value={form.instructions} rows={drawerExpanded ? 22 : 14} class="font-mono text-xs leading-relaxed" placeholder="# Skill name&#10;&#10;Write the instructions this skill should contribute to prompt context." /></div></section>
       </div>
     </div>
-    <div class="flex flex-wrap justify-between gap-2 border-t border-zinc-800 p-4"><div class="flex flex-wrap gap-2"><Button onclick={save} disabled={saving || !form.id || !form.title}>{saving ? 'Saving…' : 'Save settings'}</Button><Button variant="secondary" onclick={() => runCheckUpdates(form.id)} disabled={!form.id || pendingAction === `check:${form.id}`}><RefreshCw class="size-4" /> {pendingAction === `check:${form.id}` ? 'Checking…' : 'Check update'}</Button><Button variant="outline" disabled title="Update apply is not available yet."><CheckCircle2 class="size-4" /> Apply update soon</Button></div><Button variant="destructive" onclick={() => removeSkill(form.id)} disabled={!form.id || pendingAction === `delete:${form.id}`}><Trash2 class="size-4" /> Delete</Button></div>
-  </div>
-{/if}
+    <SheetFooter><div class="flex flex-wrap gap-2"><Button onclick={save} disabled={saving || !form.id || !form.title}>{saving ? 'Saving…' : 'Save settings'}</Button><Button variant="secondary" onclick={() => runCheckUpdates(form.id)} disabled={!form.id || pendingAction === `check:${form.id}`}><RefreshCw class="size-4" /> {pendingAction === `check:${form.id}` ? 'Checking…' : 'Check update'}</Button><Button variant="outline" disabled title="Update apply is not available yet."><CheckCircle2 class="size-4" /> Apply update soon</Button></div><Button variant="destructive" onclick={() => removeSkill(form.id)} disabled={!form.id || pendingAction === `delete:${form.id}`}><Trash2 class="size-4" /> Delete</Button></SheetFooter>
+  </SheetContent>
+</Sheet>
 
-{#if importOpen}
-  <div class="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4" role="presentation">
-    <button type="button" class="absolute inset-0" aria-label="Close import dialog" onclick={() => (importOpen = false)}></button>
-    <div class="w-full max-w-2xl rounded-lg border border-zinc-800 bg-zinc-950 p-5 shadow-2xl" role="dialog" aria-modal="true" aria-labelledby="import-title" tabindex="-1" onkeydown={(event) => event.key === 'Escape' && (importOpen = false)}>
-      <div class="flex items-start justify-between"><div><h2 id="import-title" class="text-lg font-semibold text-zinc-50">Import skills</h2><p class="text-sm text-zinc-400">Import copies skill files into Nucleus, registers manifests/packages/installations, and stores repo metadata for update checks.</p></div><Button variant="ghost" size="icon" onclick={() => (importOpen = false)} aria-label="Close import dialog"><X class="size-4" /></Button></div>
-      <div class="mt-5 space-y-4"><div class="space-y-1"><Label for="import-source">Local path or GitHub tree URL</Label><Input id="import-source" bind:value={importSource} placeholder="https://github.com/coreyhaines31/marketingskills/tree/main/skills" /></div><div class="grid gap-4 sm:grid-cols-2"><div class="space-y-1"><Label for="scope-kind">Scope kind</Label><Input id="scope-kind" bind:value={importScopeKind} /></div><div class="space-y-1"><Label for="scope-id">Scope id</Label><Input id="scope-id" bind:value={importScopeId} /></div></div><p class="text-xs text-zinc-500">Copying folders manually is not enough; import registers the package and installation records Nucleus uses.</p></div>
-      <div class="mt-5 flex justify-end gap-2"><Button variant="secondary" onclick={() => (importOpen = false)}>Cancel</Button><Button onclick={runImport} disabled={!importSource.trim() || pendingAction === 'import'}>{pendingAction === 'import' ? 'Importing…' : 'Import skills'}</Button></div>
-    </div>
-  </div>
-{/if}
+<Dialog bind:open={importOpen}>
+  <DialogContent>
+    <div class="flex items-start justify-between"><div><DialogTitle id="import-title">Import skills</DialogTitle><DialogDescription>Import copies skill files into Nucleus, registers manifests/packages/installations, and stores repo metadata for update checks.</DialogDescription></div><Button variant="ghost" size="icon" onclick={() => (importOpen = false)} aria-label="Close import dialog"><X class="size-4" /></Button></div>
+    <div class="mt-5 space-y-4"><div class="space-y-1"><Label for="import-source">Local path or GitHub tree URL</Label><Input id="import-source" bind:value={importSource} placeholder="https://github.com/coreyhaines31/marketingskills/tree/main/skills" /></div><div class="grid gap-4 sm:grid-cols-2"><div class="space-y-1"><Label for="scope-kind">Scope kind</Label><Input id="scope-kind" bind:value={importScopeKind} /></div><div class="space-y-1"><Label for="scope-id">Scope id</Label><Input id="scope-id" bind:value={importScopeId} /></div></div><p class="text-xs text-zinc-500">Copying folders manually is not enough; import registers the package and installation records Nucleus uses.</p></div>
+    <div class="mt-5 flex justify-end gap-2"><Button variant="secondary" onclick={() => (importOpen = false)}>Cancel</Button><Button onclick={runImport} disabled={!importSource.trim() || pendingAction === 'import'}>{pendingAction === 'import' ? 'Importing…' : 'Import skills'}</Button></div>
+  </DialogContent>
+</Dialog>
