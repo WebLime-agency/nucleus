@@ -439,6 +439,7 @@ fn normalize_worker_final_answer_value(
     let final_answer = object
         .get("final_answer")
         .or_else(|| object.get("content"))
+        .or_else(|| object.get("answer"))
         .or_else(|| object.get("text"))
         .or_else(|| object.get("message"))
         .and_then(Value::as_str)
@@ -753,6 +754,25 @@ mod tests {
 
         assert_eq!(summary, "The work is done.");
         assert_eq!(final_answer, "Yes—I’m here. How can I help?");
+    }
+
+    #[test]
+    fn accepts_action_final_answer_answer_as_bounded_compatibility() {
+        let action = parse_worker_action(
+            r#"{"action":"final_answer","answer":"Yes — I can help with EmDash."}"#,
+        )
+        .expect("action/answer final answer should normalize");
+
+        let WorkerAction::FinalAnswer {
+            summary,
+            final_answer,
+        } = action
+        else {
+            panic!("expected final answer");
+        };
+
+        assert_eq!(summary, "The work is done.");
+        assert_eq!(final_answer, "Yes — I can help with EmDash.");
     }
 
     #[test]
