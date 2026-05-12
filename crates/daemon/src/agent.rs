@@ -4584,8 +4584,14 @@ async fn invoke_mcp_stdio_tool(
     tool: &McpToolRecord,
     params: Value,
 ) -> Result<Value> {
+    if server.transport == "streamable-http" || server.transport == "http" {
+        return invoke_mcp_http_tool(server, tool, params).await;
+    }
     if server.transport != "stdio" {
-        bail!("unsupported MCP transport '{}'", server.transport);
+        bail!(
+            "unsupported_transport: unsupported MCP transport '{}'",
+            server.transport
+        );
     }
     if server.command.trim().is_empty() {
         bail!("MCP stdio command is required");
@@ -4652,6 +4658,93 @@ async fn invoke_mcp_stdio_tool(
     let _ = child.kill().await;
     let _ = child.wait().await;
     Ok(result)
+}
+
+async fn invoke_mcp_http_tool(
+    server: &McpServerRecord,
+    tool: &McpToolRecord,
+    params: Value,
+) -> Result<Value> {
+    let _ = mcp_http_request_for_tool(server, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"nucleus","version":env!("CARGO_PKG_VERSION")}}})).await?;
+    let _ = mcp_http_request_for_tool(
+        server,
+        json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+    )
+    .await;
+    mcp_http_request_for_tool(server, json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool.name,"arguments":params}})).await
+}
+
+async fn mcp_http_request_for_tool(record: &McpServerRecord, payload: Value) -> Result<Value> {
+    if record.url.trim().is_empty() {
+        bail!("missing_url: MCP remote URL is required");
+    }
+    let client = reqwest::Client::new();
+    let mut req = client
+        .post(record.url.trim())
+        .header("accept", "application/json, text/event-stream")
+        .header("content-type", "application/json")
+        .json(&payload);
+    if let Some(headers) = record.headers_json.as_object() {
+        for (key, value) in headers {
+            if let Some(text) = value.as_str() {
+                req = req.header(key, text);
+            }
+        }
+    }
+    match record.auth_kind.as_str() {
+        "none" | "" => {}
+        "bearer_env" | "env_bearer" => {
+            if record.auth_ref.trim().is_empty() {
+                bail!("missing_credentials: bearer token environment variable is not configured");
+            }
+            let token = std::env::var(record.auth_ref.trim()).map_err(|_| {
+                anyhow!("missing_credentials: bearer token environment variable is not set")
+            })?;
+            req = req.bearer_auth(token);
+        }
+        "static_headers" => {}
+        "oauth" | "device" => {
+            bail!("auth_required: interactive MCP auth is not available in unattended mode")
+        }
+        other => bail!("missing_credentials: unsupported MCP auth kind '{}'", other),
+    }
+    let resp = req.send().await.context("remote MCP request failed")?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        bail!("auth_required: remote MCP returned {}", status.as_u16());
+    }
+    if !status.is_success() {
+        bail!(
+            "remote_server_failure: remote MCP returned {}",
+            status.as_u16()
+        );
+    }
+    let text = resp
+        .text()
+        .await
+        .context("failed to read remote MCP response")?;
+    if text.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    let json_text = if text
+        .lines()
+        .any(|line| line.trim_start().starts_with("data:"))
+    {
+        text.lines()
+            .filter_map(|line| line.trim_start().strip_prefix("data:"))
+            .map(str::trim)
+            .find(|line| !line.is_empty() && *line != "[DONE]")
+            .unwrap_or("")
+            .to_string()
+    } else {
+        text
+    };
+    let value: Value = serde_json::from_str(&json_text)
+        .context("protocol_parse_failure: failed to parse remote MCP response")?;
+    if let Some(error) = value.get("error") {
+        bail!("remote_server_failure: MCP error {}", error);
+    }
+    Ok(value.get("result").cloned().unwrap_or(value))
 }
 
 async fn write_mcp_message(stdin: &mut tokio::process::ChildStdin, value: Value) -> Result<()> {
@@ -8668,6 +8761,10 @@ for line in sys.stdin:
                     command: "python3".to_string(),
                     args: vec![script_path.to_string_lossy().to_string()],
                     env_json: json!({}),
+                    url: String::new(),
+                    headers_json: json!({}),
+                    auth_kind: "none".to_string(),
+                    auth_ref: String::new(),
                     enabled: true,
                     sync_status: "ready".to_string(),
                     last_error: String::new(),
