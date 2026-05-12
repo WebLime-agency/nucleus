@@ -527,6 +527,10 @@ impl StateStore {
         self.plan.summary()
     }
 
+    pub fn state_dir_path(&self) -> PathBuf {
+        self.plan.state_dir.clone()
+    }
+
     pub fn artifacts_dir_path(&self) -> PathBuf {
         self.plan.artifacts_dir.clone()
     }
@@ -970,14 +974,29 @@ impl StateStore {
         connection.execute(
             "
             INSERT INTO skill_packages (
-                id, name, version, manifest_json, instructions, created_at, updated_at
+                id, name, version, manifest_json, instructions, source_kind, source_url, source_repo_url, source_owner, source_repo, source_ref, source_parent_path, source_skill_path, source_commit, imported_at, last_checked_at, latest_source_commit, update_status, content_checksum, dirty_status, created_at, updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 version = excluded.version,
                 manifest_json = excluded.manifest_json,
                 instructions = excluded.instructions,
+                source_kind = excluded.source_kind,
+                source_url = excluded.source_url,
+                source_repo_url = excluded.source_repo_url,
+                source_owner = excluded.source_owner,
+                source_repo = excluded.source_repo,
+                source_ref = excluded.source_ref,
+                source_parent_path = excluded.source_parent_path,
+                source_skill_path = excluded.source_skill_path,
+                source_commit = excluded.source_commit,
+                imported_at = excluded.imported_at,
+                last_checked_at = excluded.last_checked_at,
+                latest_source_commit = excluded.latest_source_commit,
+                update_status = excluded.update_status,
+                content_checksum = excluded.content_checksum,
+                dirty_status = excluded.dirty_status,
                 updated_at = excluded.updated_at
             ",
             params![
@@ -986,6 +1005,21 @@ impl StateStore {
                 package.version,
                 serde_json::to_string(&package.manifest_json)?,
                 package.instructions,
+                package.source_kind,
+                package.source_url,
+                package.source_repo_url,
+                package.source_owner,
+                package.source_repo,
+                package.source_ref,
+                package.source_parent_path,
+                package.source_skill_path,
+                package.source_commit,
+                package.imported_at,
+                package.last_checked_at,
+                package.latest_source_commit,
+                package.update_status,
+                package.content_checksum,
+                package.dirty_status,
                 package.created_at,
                 package.updated_at,
             ],
@@ -2410,9 +2444,26 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             version TEXT NOT NULL DEFAULT '',
             manifest_json TEXT NOT NULL DEFAULT '{}',
             instructions TEXT NOT NULL DEFAULT '',
+            source_kind TEXT NOT NULL DEFAULT 'manual',
+            source_url TEXT NOT NULL DEFAULT '',
+            source_repo_url TEXT NOT NULL DEFAULT '',
+            source_owner TEXT NOT NULL DEFAULT '',
+            source_repo TEXT NOT NULL DEFAULT '',
+            source_ref TEXT NOT NULL DEFAULT '',
+            source_parent_path TEXT NOT NULL DEFAULT '',
+            source_skill_path TEXT NOT NULL DEFAULT '',
+            source_commit TEXT NOT NULL DEFAULT '',
+            imported_at INTEGER,
+            last_checked_at INTEGER,
+            latest_source_commit TEXT NOT NULL DEFAULT '',
+            update_status TEXT NOT NULL DEFAULT 'unknown',
+            content_checksum TEXT NOT NULL DEFAULT '',
+            dirty_status TEXT NOT NULL DEFAULT 'unknown',
             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
+
+
 
         CREATE TABLE IF NOT EXISTS skill_installations (
             id TEXT PRIMARY KEY,
@@ -2823,6 +2874,26 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "command_session_id",
         "TEXT REFERENCES command_sessions(id) ON DELETE SET NULL",
     )?;
+
+    for (column, definition) in [
+        ("source_kind", "TEXT NOT NULL DEFAULT 'manual'"),
+        ("source_url", "TEXT NOT NULL DEFAULT ''"),
+        ("source_repo_url", "TEXT NOT NULL DEFAULT ''"),
+        ("source_owner", "TEXT NOT NULL DEFAULT ''"),
+        ("source_repo", "TEXT NOT NULL DEFAULT ''"),
+        ("source_ref", "TEXT NOT NULL DEFAULT ''"),
+        ("source_parent_path", "TEXT NOT NULL DEFAULT ''"),
+        ("source_skill_path", "TEXT NOT NULL DEFAULT ''"),
+        ("source_commit", "TEXT NOT NULL DEFAULT ''"),
+        ("imported_at", "INTEGER"),
+        ("last_checked_at", "INTEGER"),
+        ("latest_source_commit", "TEXT NOT NULL DEFAULT ''"),
+        ("update_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("content_checksum", "TEXT NOT NULL DEFAULT ''"),
+        ("dirty_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+    ] {
+        ensure_column(connection, "skill_packages", column, definition)?;
+    }
 
     Ok(())
 }
@@ -4666,7 +4737,7 @@ fn load_skill_package(
     connection: &Connection,
     id: &str,
 ) -> Result<nucleus_protocol::SkillPackageRecord> {
-    connection.query_row("SELECT id, name, version, manifest_json, instructions, created_at, updated_at FROM skill_packages WHERE id = ?1", params![id], map_skill_package).optional()?.ok_or_else(|| anyhow!("skill package {id} was not found"))
+    connection.query_row("SELECT id, name, version, manifest_json, instructions, source_kind, source_url, source_repo_url, source_owner, source_repo, source_ref, source_parent_path, source_skill_path, source_commit, imported_at, last_checked_at, latest_source_commit, update_status, content_checksum, dirty_status, created_at, updated_at FROM skill_packages WHERE id = ?1", params![id], map_skill_package).optional()?.ok_or_else(|| anyhow!("skill package {id} was not found"))
 }
 
 fn map_skill_package(
@@ -4678,8 +4749,23 @@ fn map_skill_package(
         version: row.get(2)?,
         manifest_json: decode_json_value(row.get(3)?)?,
         instructions: row.get(4)?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
+        source_kind: row.get(5)?,
+        source_url: row.get(6)?,
+        source_repo_url: row.get(7)?,
+        source_owner: row.get(8)?,
+        source_repo: row.get(9)?,
+        source_ref: row.get(10)?,
+        source_parent_path: row.get(11)?,
+        source_skill_path: row.get(12)?,
+        source_commit: row.get(13)?,
+        imported_at: row.get(14)?,
+        last_checked_at: row.get(15)?,
+        latest_source_commit: row.get(16)?,
+        update_status: row.get(17)?,
+        content_checksum: row.get(18)?,
+        dirty_status: row.get(19)?,
+        created_at: row.get(20)?,
+        updated_at: row.get(21)?,
     })
 }
 
@@ -6950,6 +7036,21 @@ mod skills_mcp_phase2_tests {
             version: "0.1.0".to_string(),
             manifest_json: serde_json::json!({"manifest_id": manifest.id}),
             instructions: "Use docs skill".to_string(),
+            source_kind: "manual".to_string(),
+            source_url: String::new(),
+            source_repo_url: String::new(),
+            source_owner: String::new(),
+            source_repo: String::new(),
+            source_ref: String::new(),
+            source_parent_path: String::new(),
+            source_skill_path: String::new(),
+            source_commit: String::new(),
+            imported_at: Some(4),
+            last_checked_at: None,
+            latest_source_commit: String::new(),
+            update_status: "unknown".to_string(),
+            content_checksum: "abc".to_string(),
+            dirty_status: "clean".to_string(),
             created_at: 4,
             updated_at: 5,
         };

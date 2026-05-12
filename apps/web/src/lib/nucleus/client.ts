@@ -33,6 +33,9 @@ import {
   skillInstallationRecordSchema,
   skillInstallationUpsertRequestSchema,
   skillManifestSchema,
+  skillImportRequestSchema,
+  skillImportResponseSchema,
+  skillInstallResultSchema,
   skillPackageRecordSchema,
   skillPackageUpsertRequestSchema,
   updateConfigRequestSchema,
@@ -402,6 +405,35 @@ export async function deleteSkill(skillId: string, fetchImpl: FetchLike = fetch)
     method: 'DELETE',
     headers: { accept: 'application/json' }
   });
+}
+
+export async function importSkills(
+  input: z.input<typeof skillImportRequestSchema>,
+  fetchImpl: FetchLike = fetch
+) {
+  const payload = skillImportRequestSchema.parse(input);
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/skills/import', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify(payload)
+    }),
+    skillImportResponseSchema
+  );
+}
+
+export async function reconcileSkills(fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/skills/reconcile', { method: 'POST', headers: { accept: 'application/json' } }),
+    skillImportResponseSchema
+  );
+}
+
+export async function checkSkillUpdate(skillId: string, fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/skills/${encodeURIComponent(skillId)}/check-update`, { method: 'POST', headers: { accept: 'application/json' } }),
+    skillInstallResultSchema
+  );
 }
 
 export async function fetchSkillPackages(fetchImpl: FetchLike = fetch) {

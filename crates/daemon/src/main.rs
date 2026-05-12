@@ -5,10 +5,10 @@ mod updates;
 mod worker_action;
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{Path as FsPath, PathBuf},
     process::Command as StdCommand,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -27,6 +27,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use flate2::read::GzDecoder;
 use futures_util::SinkExt;
 use host::{DEFAULT_PROCESS_LIMIT, HostEngine, ProcessSort, resolve_process_limit};
 use nucleus_core::{
@@ -43,7 +44,8 @@ use nucleus_protocol::{
     NucleusToolDescriptor, PlaybookDetail, PlaybookSummary, ProcessKillRequest,
     ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate, ProjectUpdateRequest,
     PromptProgressUpdate, RouterProfileSummary, RunBudgetSummary, RuntimeOverview, RuntimeSummary,
-    SessionDetail, SessionPromptRequest, SessionSummary, SettingsSummary, SkillInstallationRecord,
+    SessionDetail, SessionPromptRequest, SessionSummary, SettingsSummary, SkillImportRequest,
+    SkillImportResponse, SkillInstallResult, SkillInstallVerification, SkillInstallationRecord,
     SkillInstallationUpsertRequest, SkillManifest, SkillPackageRecord, SkillPackageUpsertRequest,
     StreamConnected, SystemStats, UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest,
     UpdateStatus, WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceProfileWriteRequest,
@@ -56,6 +58,7 @@ use nucleus_storage::{
 use runtime::RuntimeManager;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
@@ -169,9 +172,19 @@ fn app(state: AppState) -> Router {
         )
         .route("/router/profiles", get(router_profiles))
         .route("/skills", get(list_skills).post(upsert_skill))
+        .route("/skills/import", axum::routing::post(import_skills))
+        .route("/skills/reconcile", axum::routing::post(reconcile_skills))
+        .route(
+            "/skills/check-updates",
+            axum::routing::post(check_skill_updates),
+        )
         .route(
             "/skills/{skill_id}",
             axum::routing::put(upsert_skill_by_id).delete(delete_skill),
+        )
+        .route(
+            "/skills/{skill_id}/check-update",
+            axum::routing::post(check_skill_update),
         )
         .route(
             "/skill-packages",
@@ -2336,6 +2349,829 @@ fn skill_instruction_path(skill: &SkillManifest) -> Option<PathBuf> {
     })
 }
 
+#[derive(Debug, Clone)]
+struct ImportSourceMeta {
+    source_kind: String,
+    source_url: String,
+    source_repo_url: String,
+    source_owner: String,
+    source_repo: String,
+    source_ref: String,
+    source_parent_path: String,
+    source_skill_path: String,
+    source_commit: String,
+}
+
+async fn import_skills(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<SkillImportResponse>, ApiError> {
+    let payload = decode_json::<SkillImportRequest>(&body)?;
+    Ok(Json(import_skills_from_source(&state, payload).await?))
+}
+
+async fn reconcile_skills(
+    State(state): State<AppState>,
+) -> Result<Json<SkillImportResponse>, ApiError> {
+    Ok(Json(reconcile_skill_folders(&state)?))
+}
+
+async fn check_skill_update(
+    State(state): State<AppState>,
+    Path(skill_id): Path<String>,
+) -> Result<Json<SkillInstallResult>, ApiError> {
+    let skill_id = sanitize_registry_id(&skill_id, "skill id")?;
+    Ok(Json(check_one_skill_update(&state, &skill_id).await?))
+}
+
+async fn check_skill_updates(
+    State(state): State<AppState>,
+) -> Result<Json<SkillImportResponse>, ApiError> {
+    let mut response = SkillImportResponse {
+        installed: Vec::new(),
+        errors: Vec::new(),
+    };
+    for skill in state.store.list_skill_manifests()? {
+        match check_one_skill_update(&state, &skill.id).await {
+            Ok(result) => response.installed.push(result),
+            Err(error) => response
+                .errors
+                .push(format!("{}: {}", skill.id, error.message)),
+        }
+    }
+    Ok(Json(response))
+}
+
+async fn import_skills_from_source(
+    state: &AppState,
+    payload: SkillImportRequest,
+) -> Result<SkillImportResponse, ApiError> {
+    let source = payload.source.trim();
+    if source.is_empty() {
+        return Err(ApiError::bad_request("skill import source is required"));
+    }
+    let scope_kind = default_scope_kind(&payload.scope_kind)?;
+    let scope_id = default_scope_id(&payload.scope_id);
+    let mut response = SkillImportResponse {
+        installed: Vec::new(),
+        errors: Vec::new(),
+    };
+
+    if source.starts_with("https://github.com/") {
+        let mut github = parse_github_tree_url(source)?;
+        if let Ok(commit) = resolve_github_commit(&github).await {
+            github.source_commit = commit;
+        }
+        let temp = std::env::temp_dir().join(format!("nucleus-skill-import-{}", Uuid::new_v4()));
+        let result = import_github_skill_dirs(state, &github, &temp, &scope_kind, &scope_id).await;
+        let _ = fs::remove_dir_all(&temp);
+        match result {
+            Ok(installed) => response.installed.extend(installed),
+            Err(error) => response.errors.push(error.message),
+        }
+    } else {
+        let base = PathBuf::from(source);
+        let meta = ImportSourceMeta {
+            source_kind: "local".to_string(),
+            source_url: source.to_string(),
+            source_repo_url: String::new(),
+            source_owner: String::new(),
+            source_repo: String::new(),
+            source_ref: String::new(),
+            source_parent_path: source.to_string(),
+            source_skill_path: String::new(),
+            source_commit: String::new(),
+        };
+        import_discovered_dirs(
+            state,
+            &base,
+            &base,
+            &meta,
+            &scope_kind,
+            &scope_id,
+            &mut response,
+        )?;
+    }
+
+    if response.installed.is_empty() && response.errors.is_empty() {
+        response
+            .errors
+            .push("no skill folders with SKILL.md were found".to_string());
+    }
+    Ok(response)
+}
+
+async fn import_github_skill_dirs(
+    state: &AppState,
+    github: &ImportSourceMeta,
+    temp: &FsPath,
+    scope_kind: &str,
+    scope_id: &str,
+) -> Result<Vec<SkillInstallResult>, ApiError> {
+    fs::create_dir_all(temp).map_err(api_io_error)?;
+    let archive = reqwest::get(github_codeload_url(github))
+        .await
+        .map_err(api_io_error)?
+        .bytes()
+        .await
+        .map_err(api_io_error)?;
+    safe_unpack_tar_gz(&archive, temp).map_err(api_io_error)?;
+    let root = archive_root_dir(temp)?;
+    let base = root.join(&github.source_parent_path);
+    let mut installed = Vec::new();
+    for dir in discover_skill_dirs(&base).map_err(api_io_error)? {
+        let mut meta = github.clone();
+        meta.source_skill_path = pathdiff(&root, &dir);
+        installed.push(install_skill_dir(state, &dir, &meta, scope_kind, scope_id)?);
+    }
+    Ok(installed)
+}
+
+fn import_discovered_dirs(
+    state: &AppState,
+    base: &FsPath,
+    root: &FsPath,
+    meta: &ImportSourceMeta,
+    scope_kind: &str,
+    scope_id: &str,
+    response: &mut SkillImportResponse,
+) -> Result<(), ApiError> {
+    for dir in discover_skill_dirs(base).map_err(api_io_error)? {
+        let mut child_meta = meta.clone();
+        child_meta.source_skill_path = pathdiff(root, &dir);
+        match install_skill_dir(state, &dir, &child_meta, scope_kind, scope_id) {
+            Ok(result) => response.installed.push(result),
+            Err(error) => response.errors.push(error.message),
+        }
+    }
+    Ok(())
+}
+
+fn reconcile_skill_folders(state: &AppState) -> Result<SkillImportResponse, ApiError> {
+    let skills_dir = state.store.state_dir_path().join("skills");
+    let mut response = SkillImportResponse {
+        installed: Vec::new(),
+        errors: Vec::new(),
+    };
+    if !skills_dir.exists() {
+        return Ok(response);
+    }
+    for dir in discover_skill_dirs(&skills_dir).map_err(api_io_error)? {
+        let id = dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("skill")
+            .to_string();
+        let meta = ImportSourceMeta {
+            source_kind: "unknown".to_string(),
+            source_url: String::new(),
+            source_repo_url: String::new(),
+            source_owner: String::new(),
+            source_repo: String::new(),
+            source_ref: String::new(),
+            source_parent_path: String::new(),
+            source_skill_path: id.clone(),
+            source_commit: String::new(),
+        };
+        match register_skill_dir(state, &dir, Some(id), &meta, "workspace", "default", false) {
+            Ok(result) => response.installed.push(result),
+            Err(error) => response.errors.push(error.message),
+        }
+    }
+    Ok(response)
+}
+
+fn discover_skill_dirs(base: &FsPath) -> anyhow::Result<Vec<PathBuf>> {
+    if base.join("SKILL.md").is_file() {
+        return Ok(vec![base.to_path_buf()]);
+    }
+    let mut dirs = Vec::new();
+    for entry in fs::read_dir(base).with_context(|| format!("failed to read {}", base.display()))? {
+        let path = entry?.path();
+        if path.is_dir() && path.join("SKILL.md").is_file() {
+            dirs.push(path);
+        }
+    }
+    dirs.sort();
+    Ok(dirs)
+}
+
+fn install_skill_dir(
+    state: &AppState,
+    source_dir: &FsPath,
+    meta: &ImportSourceMeta,
+    scope_kind: &str,
+    scope_id: &str,
+) -> Result<SkillInstallResult, ApiError> {
+    let parsed = parse_skill_file(source_dir)?;
+    let skill_id = derive_skill_id(source_dir, &parsed)?;
+    let skills_dir = state.store.state_dir_path().join("skills");
+    fs::create_dir_all(&skills_dir).map_err(api_io_error)?;
+    let dest = skills_dir.join(&skill_id);
+    let staging = skills_dir.join(format!(".{}.staging-{}", skill_id, Uuid::new_v4()));
+    copy_dir_all(source_dir, &staging).map_err(api_io_error)?;
+    if dest.exists() {
+        let backup = skills_dir.join(format!(".{}.backup-{}", skill_id, Uuid::new_v4()));
+        fs::rename(&dest, &backup).map_err(api_io_error)?;
+        if let Err(error) = fs::rename(&staging, &dest) {
+            let _ = fs::rename(&backup, &dest);
+            let _ = fs::remove_dir_all(&staging);
+            return Err(api_io_error(error));
+        }
+        let _ = fs::remove_dir_all(backup);
+    } else {
+        fs::rename(&staging, &dest).map_err(api_io_error)?;
+    }
+    register_skill_dir(
+        state,
+        &dest,
+        Some(skill_id),
+        meta,
+        scope_kind,
+        scope_id,
+        true,
+    )
+}
+
+fn register_skill_dir(
+    state: &AppState,
+    dir: &FsPath,
+    forced_id: Option<String>,
+    meta: &ImportSourceMeta,
+    scope_kind: &str,
+    scope_id: &str,
+    files_copied: bool,
+) -> Result<SkillInstallResult, ApiError> {
+    let parsed = parse_skill_file(dir)?;
+    let instructions = fs::read_to_string(dir.join("SKILL.md")).map_err(api_io_error)?;
+    if instructions.trim().is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "{} has an empty SKILL.md",
+            dir.display()
+        )));
+    }
+    let skill_id = match forced_id {
+        Some(id) => sanitize_registry_id(&id, "skill id")?,
+        None => derive_skill_id(dir, &parsed)?,
+    };
+    let existing_manifest = state
+        .store
+        .list_skill_manifests()?
+        .into_iter()
+        .find(|skill| skill.id == skill_id);
+    let title = parsed
+        .get("name")
+        .or_else(|| parsed.get("title"))
+        .cloned()
+        .or_else(|| existing_manifest.as_ref().map(|skill| skill.title.clone()))
+        .unwrap_or_else(|| titleize(&skill_id));
+    let description = parsed
+        .get("description")
+        .cloned()
+        .or_else(|| {
+            existing_manifest
+                .as_ref()
+                .map(|skill| skill.description.clone())
+        })
+        .unwrap_or_default();
+    let activation_mode = existing_manifest
+        .as_ref()
+        .map(|skill| skill.activation_mode.clone())
+        .or_else(|| parsed.get("activation_mode").cloned())
+        .unwrap_or_else(|| "manual".to_string());
+    let manifest = sanitize_skill_manifest(SkillManifest {
+        id: skill_id.clone(),
+        title: title.clone(),
+        description,
+        instructions: instructions.clone(),
+        activation_mode,
+        triggers: existing_manifest
+            .as_ref()
+            .map(|skill| skill.triggers.clone())
+            .unwrap_or_default(),
+        include_paths: vec![format!("skills/{}/SKILL.md", skill_id)],
+        required_tools: Vec::new(),
+        required_mcps: Vec::new(),
+        project_filters: Vec::new(),
+        enabled: existing_manifest
+            .as_ref()
+            .map(|skill| skill.enabled)
+            .unwrap_or(true),
+    })?;
+    state.store.upsert_skill_manifest(&manifest)?;
+
+    let now = unix_timestamp();
+    let checksum = checksum_dir(dir).map_err(api_io_error)?;
+    let package_id = format!("nucleus.{}", skill_id);
+    let installation_id = format!("workspace.nucleus.{}", skill_id);
+    let existing_package = state
+        .store
+        .list_skill_packages()?
+        .into_iter()
+        .find(|package| package.id == package_id);
+    let package = SkillPackageRecord {
+        id: package_id.clone(),
+        name: title,
+        version: existing_package
+            .as_ref()
+            .map(|package| package.version.clone())
+            .filter(|version| !version.is_empty())
+            .unwrap_or_else(|| "source".to_string()),
+        manifest_json: serde_json::to_value(&manifest).unwrap_or_else(|_| json!({})),
+        instructions,
+        source_kind: meta.source_kind.clone(),
+        source_url: meta.source_url.clone(),
+        source_repo_url: meta.source_repo_url.clone(),
+        source_owner: meta.source_owner.clone(),
+        source_repo: meta.source_repo.clone(),
+        source_ref: meta.source_ref.clone(),
+        source_parent_path: meta.source_parent_path.clone(),
+        source_skill_path: meta.source_skill_path.clone(),
+        source_commit: meta.source_commit.clone(),
+        imported_at: existing_package
+            .as_ref()
+            .and_then(|package| package.imported_at)
+            .or(Some(now)),
+        last_checked_at: existing_package
+            .as_ref()
+            .and_then(|package| package.last_checked_at),
+        latest_source_commit: existing_package
+            .as_ref()
+            .map(|package| package.latest_source_commit.clone())
+            .unwrap_or_default(),
+        update_status: "current".to_string(),
+        content_checksum: checksum.clone(),
+        dirty_status: "clean".to_string(),
+        created_at: existing_package
+            .as_ref()
+            .map(|package| package.created_at)
+            .unwrap_or(now),
+        updated_at: now,
+    };
+    state.store.upsert_skill_package(&package)?;
+
+    let existing_installation = state
+        .store
+        .list_skill_installations()?
+        .into_iter()
+        .find(|installation| installation.id == installation_id);
+    state
+        .store
+        .upsert_skill_installation(&SkillInstallationRecord {
+            id: installation_id.clone(),
+            package_id: package_id.clone(),
+            scope_kind: existing_installation
+                .as_ref()
+                .map(|installation| installation.scope_kind.clone())
+                .unwrap_or_else(|| scope_kind.to_string()),
+            scope_id: existing_installation
+                .as_ref()
+                .map(|installation| installation.scope_id.clone())
+                .unwrap_or_else(|| scope_id.to_string()),
+            enabled: existing_installation
+                .as_ref()
+                .map(|installation| installation.enabled)
+                .unwrap_or(true),
+            pinned_version: existing_installation
+                .and_then(|installation| installation.pinned_version),
+            created_at: now,
+            updated_at: now,
+        })?;
+
+    let result = verify_install(
+        state,
+        &skill_id,
+        &package_id,
+        &installation_id,
+        files_copied,
+        &package,
+    );
+    if result.status != "installed" {
+        return Err(ApiError::internal_message(format!(
+            "skill {} was only partially installed",
+            skill_id
+        )));
+    }
+    Ok(result)
+}
+
+fn verify_install(
+    state: &AppState,
+    skill_id: &str,
+    package_id: &str,
+    installation_id: &str,
+    files_copied: bool,
+    package: &SkillPackageRecord,
+) -> SkillInstallResult {
+    let manifests = state.store.list_skill_manifests().unwrap_or_default();
+    let packages = state.store.list_skill_packages().unwrap_or_default();
+    let installs = state.store.list_skill_installations().unwrap_or_default();
+    let manifest_registered = manifests.iter().any(|skill| skill.id == skill_id);
+    let package_registered = packages.iter().any(|stored| stored.id == package_id);
+    let installation_registered = installs
+        .iter()
+        .any(|installation| installation.id == installation_id);
+    let files_exist = state
+        .store
+        .state_dir_path()
+        .join("skills")
+        .join(skill_id)
+        .join("SKILL.md")
+        .is_file();
+    let installed =
+        files_exist && manifest_registered && package_registered && installation_registered;
+    SkillInstallResult {
+        skill_id: skill_id.to_string(),
+        package_id: package_id.to_string(),
+        installation_id: installation_id.to_string(),
+        source_kind: package.source_kind.clone(),
+        source_url: package.source_url.clone(),
+        source_repo: if package.source_owner.is_empty() {
+            package.source_repo.clone()
+        } else {
+            format!("{}/{}", package.source_owner, package.source_repo)
+        },
+        source_ref: package.source_ref.clone(),
+        source_skill_path: package.source_skill_path.clone(),
+        source_commit: package.source_commit.clone(),
+        content_checksum: package.content_checksum.clone(),
+        dirty_status: package.dirty_status.clone(),
+        update_status: package.update_status.clone(),
+        status: if installed { "installed" } else { "partial" }.to_string(),
+        verification: SkillInstallVerification {
+            files_copied: files_copied || files_exist,
+            manifest_registered,
+            package_registered,
+            installation_registered,
+            instructions_non_empty: !package.instructions.trim().is_empty(),
+            source_metadata_stored: package.source_kind != "github"
+                || !package.source_url.is_empty(),
+            checksum_recorded: !package.content_checksum.is_empty(),
+        },
+    }
+}
+
+fn parse_github_tree_url(source: &str) -> Result<ImportSourceMeta, ApiError> {
+    let url = url::Url::parse(source).map_err(|_| ApiError::bad_request("invalid GitHub URL"))?;
+    if url.host_str() != Some("github.com") {
+        return Err(ApiError::bad_request("only github.com URLs are supported"));
+    }
+    let parts: Vec<_> = url
+        .path_segments()
+        .ok_or_else(|| ApiError::bad_request("invalid GitHub URL"))?
+        .collect();
+    if parts.len() < 2 {
+        return Err(ApiError::bad_request(
+            "GitHub URL must include owner and repo",
+        ));
+    }
+    let owner = parts[0].to_string();
+    let repo = parts[1].trim_end_matches(".git").to_string();
+    let (reference, path) = if parts.get(2) == Some(&"tree") && parts.len() >= 4 {
+        (parts[3].to_string(), parts[4..].join("/"))
+    } else {
+        ("main".to_string(), String::new())
+    };
+    validate_relative_archive_path(&path)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    Ok(ImportSourceMeta {
+        source_kind: "github".to_string(),
+        source_url: source.to_string(),
+        source_repo_url: format!("https://github.com/{owner}/{repo}"),
+        source_owner: owner,
+        source_repo: repo,
+        source_ref: reference,
+        source_parent_path: path,
+        source_skill_path: String::new(),
+        source_commit: String::new(),
+    })
+}
+
+fn parse_skill_file(dir: &FsPath) -> Result<BTreeMap<String, String>, ApiError> {
+    let text = fs::read_to_string(dir.join("SKILL.md")).map_err(|_| {
+        ApiError::bad_request(format!("{} does not contain SKILL.md", dir.display()))
+    })?;
+    let mut out = BTreeMap::new();
+    if let Some(rest) = text.strip_prefix("---\n") {
+        if let Some(end) = rest.find("\n---") {
+            for line in rest[..end].lines() {
+                if let Some((key, value)) = line.split_once(':') {
+                    out.insert(
+                        key.trim().to_string(),
+                        value.trim().trim_matches('"').to_string(),
+                    );
+                }
+            }
+        }
+    }
+    if !out.contains_key("title") && !out.contains_key("name") {
+        if let Some(line) = text.lines().find(|line| line.starts_with("# ")) {
+            out.insert(
+                "title".to_string(),
+                line.trim_start_matches("# ").trim().to_string(),
+            );
+        }
+    }
+    Ok(out)
+}
+
+fn derive_skill_id(dir: &FsPath, parsed: &BTreeMap<String, String>) -> Result<String, ApiError> {
+    let raw = parsed
+        .get("id")
+        .cloned()
+        .or_else(|| {
+            dir.file_name()
+                .and_then(|value| value.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "skill".to_string());
+    sanitize_registry_id(&slugify_skill_id(&raw), "skill id")
+}
+
+fn slugify_skill_id(value: &str) -> String {
+    let mut slug = String::new();
+    let mut previous_dash = false;
+    for ch in value.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            previous_dash = false;
+        } else if matches!(ch, '.' | '_' | '-') {
+            slug.push(ch);
+            previous_dash = ch == '-';
+        } else if !previous_dash {
+            slug.push('-');
+            previous_dash = true;
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+fn copy_dir_all(src: &FsPath, dst: &FsPath) -> anyhow::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &to)?;
+        } else if ty.is_file() {
+            fs::copy(entry.path(), to)?;
+        }
+    }
+    Ok(())
+}
+
+fn checksum_dir(dir: &FsPath) -> anyhow::Result<String> {
+    let mut files = Vec::new();
+    collect_files(dir, dir, &mut files)?;
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hasher = Sha256::new();
+    for (rel, path) in files {
+        hasher.update(rel.as_bytes());
+        hasher.update([0]);
+        hasher.update(fs::read(path)?);
+        hasher.update([0]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn collect_files(
+    root: &FsPath,
+    dir: &FsPath,
+    out: &mut Vec<(String, PathBuf)>,
+) -> anyhow::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_files(root, &path, out)?;
+        } else if entry.file_type()?.is_file() {
+            out.push((pathdiff(root, &path), path));
+        }
+    }
+    Ok(())
+}
+
+fn pathdiff(root: &FsPath, path: &FsPath) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .trim_start_matches('/')
+        .to_string()
+}
+
+fn titleize(id: &str) -> String {
+    id.split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+async fn check_one_skill_update(
+    state: &AppState,
+    skill_id: &str,
+) -> Result<SkillInstallResult, ApiError> {
+    let package_id = format!("nucleus.{skill_id}");
+    let mut package = state
+        .store
+        .list_skill_packages()?
+        .into_iter()
+        .find(|package| package.id == package_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("skill package {package_id} was not found"))
+        })?;
+    let dir = state.store.state_dir_path().join("skills").join(skill_id);
+    package.dirty_status = if dir.exists() {
+        if checksum_dir(&dir).map_err(api_io_error)? == package.content_checksum {
+            "clean".to_string()
+        } else {
+            "modified".to_string()
+        }
+    } else {
+        "unknown".to_string()
+    };
+    package.last_checked_at = Some(unix_timestamp());
+    if package.source_kind == "github" {
+        match fetch_github_skill_checksum(&package).await {
+            Ok((latest_checksum, latest_commit)) => {
+                package.latest_source_commit =
+                    latest_commit.unwrap_or_else(|| latest_checksum.clone());
+                package.update_status = if latest_checksum == package.content_checksum {
+                    "current".to_string()
+                } else {
+                    "update_available".to_string()
+                };
+            }
+            Err(error) => {
+                package.update_status = "source_error".to_string();
+                package.latest_source_commit = error.to_string();
+            }
+        }
+    } else {
+        package.update_status = "unknown".to_string();
+    }
+    package.updated_at = unix_timestamp();
+    state.store.upsert_skill_package(&package)?;
+    Ok(verify_install(
+        state,
+        skill_id,
+        &package_id,
+        &format!("workspace.nucleus.{skill_id}"),
+        false,
+        &package,
+    ))
+}
+
+async fn fetch_github_skill_checksum(
+    package: &SkillPackageRecord,
+) -> anyhow::Result<(String, Option<String>)> {
+    if package.source_owner.is_empty()
+        || package.source_repo.is_empty()
+        || package.source_ref.is_empty()
+        || package.source_skill_path.is_empty()
+    {
+        bail!("missing GitHub source metadata");
+    }
+    let meta = ImportSourceMeta {
+        source_kind: "github".to_string(),
+        source_url: package.source_url.clone(),
+        source_repo_url: package.source_repo_url.clone(),
+        source_owner: package.source_owner.clone(),
+        source_repo: package.source_repo.clone(),
+        source_ref: package.source_ref.clone(),
+        source_parent_path: package.source_parent_path.clone(),
+        source_skill_path: package.source_skill_path.clone(),
+        source_commit: package.source_commit.clone(),
+    };
+    let latest_commit = resolve_github_commit(&meta).await.ok();
+    let temp = std::env::temp_dir().join(format!("nucleus-skill-check-{}", Uuid::new_v4()));
+    let result = async {
+        fs::create_dir_all(&temp)?;
+        let archive = reqwest::get(github_codeload_url(&meta))
+            .await?
+            .bytes()
+            .await?;
+        safe_unpack_tar_gz(&archive, &temp)?;
+        let root = archive_root_dir(&temp).map_err(|error| anyhow::anyhow!(error.message))?;
+        let checksum = checksum_dir(&root.join(&package.source_skill_path))?;
+        Ok::<_, anyhow::Error>((checksum, latest_commit))
+    }
+    .await;
+    let _ = fs::remove_dir_all(&temp);
+    result
+}
+
+fn github_codeload_url(meta: &ImportSourceMeta) -> String {
+    format!(
+        "https://codeload.github.com/{}/{}/tar.gz/{}",
+        meta.source_owner, meta.source_repo, meta.source_ref
+    )
+}
+
+async fn resolve_github_commit(meta: &ImportSourceMeta) -> anyhow::Result<String> {
+    #[derive(Deserialize)]
+    struct CommitResponse {
+        sha: String,
+    }
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/commits/{}",
+        meta.source_owner, meta.source_repo, meta.source_ref
+    );
+    let response = reqwest::Client::new()
+        .get(url)
+        .header("User-Agent", "nucleus-skill-import")
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<CommitResponse>()
+        .await?;
+    Ok(response.sha)
+}
+
+fn safe_unpack_tar_gz(bytes: &[u8], destination: &FsPath) -> anyhow::Result<()> {
+    let decoder = GzDecoder::new(std::io::Cursor::new(bytes));
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let entry_type = entry.header().entry_type();
+        if !(entry_type.is_file() || entry_type.is_dir()) {
+            bail!(
+                "unsupported archive entry type for {}",
+                entry.path()?.display()
+            );
+        }
+        let path = entry.path()?.to_path_buf();
+        validate_relative_archive_path(&path)?;
+        let out = destination.join(&path);
+        if let Some(parent) = out.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        entry.unpack(out)?;
+    }
+    Ok(())
+}
+
+fn validate_relative_archive_path(path: impl AsRef<FsPath>) -> anyhow::Result<()> {
+    use std::path::Component;
+    let path = path.as_ref();
+    for component in path.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("unsafe archive path {}", path.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn archive_root_dir(temp: &FsPath) -> Result<PathBuf, ApiError> {
+    let mut roots = fs::read_dir(temp)
+        .map_err(api_io_error)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::bad_request("GitHub archive did not contain a repository root"))
+}
+
+fn default_scope_kind(scope_kind: &str) -> Result<String, ApiError> {
+    let scope_kind = if scope_kind.trim().is_empty() {
+        "workspace"
+    } else {
+        scope_kind.trim()
+    };
+    match scope_kind {
+        "workspace" | "project" | "session" => Ok(scope_kind.to_string()),
+        _ => Err(ApiError::bad_request(
+            "skill import scope_kind must be workspace, project, or session",
+        )),
+    }
+}
+
+fn default_scope_id(scope_id: &str) -> String {
+    if scope_id.trim().is_empty() {
+        "default".to_string()
+    } else {
+        scope_id.trim().to_string()
+    }
+}
+
+fn api_io_error(error: impl std::fmt::Display) -> ApiError {
+    ApiError::internal_message(error.to_string())
+}
+
 fn sanitize_skill_manifest(mut manifest: SkillManifest) -> Result<SkillManifest, ApiError> {
     manifest.id = sanitize_registry_id(&manifest.id, "skill id")?;
     manifest.title = required_trimmed(manifest.title, "skill title")?;
@@ -2388,6 +3224,25 @@ fn build_skill_package_record(
         manifest_json: payload.manifest_json,
         instructions,
         created_at: now,
+        source_kind: if payload.source_kind.trim().is_empty() {
+            "manual".to_string()
+        } else {
+            payload.source_kind.trim().to_string()
+        },
+        source_url: payload.source_url.trim().to_string(),
+        source_repo_url: payload.source_repo_url.trim().to_string(),
+        source_owner: payload.source_owner.trim().to_string(),
+        source_repo: payload.source_repo.trim().to_string(),
+        source_ref: payload.source_ref.trim().to_string(),
+        source_parent_path: payload.source_parent_path.trim().to_string(),
+        source_skill_path: payload.source_skill_path.trim().to_string(),
+        source_commit: payload.source_commit.trim().to_string(),
+        imported_at: Some(now),
+        last_checked_at: None,
+        latest_source_commit: String::new(),
+        update_status: "unknown".to_string(),
+        content_checksum: payload.content_checksum.trim().to_string(),
+        dirty_status: "unknown".to_string(),
         updated_at: now,
     })
 }
@@ -5049,6 +5904,307 @@ mod tests {
         let _ = fs::remove_dir_all(&state_dir);
     }
 
+    #[tokio::test]
+    async fn imports_local_single_skill_and_registers_records() {
+        let state_dir = test_state_dir("skill-import-single");
+        let store = initialize_test_store(&state_dir);
+        let state = test_app_state(&store);
+        let source = state_dir.join("source-skill");
+        write_test_skill(&source, "Single Skill", "Use the single skill.");
+
+        let response = import_skills_from_source(
+            &state,
+            SkillImportRequest {
+                source: source.display().to_string(),
+                scope_kind: String::new(),
+                scope_id: String::new(),
+            },
+        )
+        .await
+        .expect("local import should succeed");
+
+        assert!(
+            response.errors.is_empty(),
+            "unexpected errors: {:?}",
+            response.errors
+        );
+        assert_eq!(response.installed.len(), 1);
+        let result = &response.installed[0];
+        assert_eq!(result.skill_id, "source-skill");
+        assert_eq!(result.source_kind, "local");
+        assert_eq!(result.status, "installed");
+        assert!(result.verification.manifest_registered);
+        assert!(result.verification.package_registered);
+        assert!(result.verification.installation_registered);
+        assert!(!result.content_checksum.is_empty());
+        assert!(state_dir.join("skills/source-skill/SKILL.md").is_file());
+
+        let manifests = store.list_skill_manifests().expect("manifests should list");
+        let packages = store.list_skill_packages().expect("packages should list");
+        let installations = store
+            .list_skill_installations()
+            .expect("installations should list");
+        assert!(manifests.iter().any(|skill| skill.id == "source-skill"));
+        let package = packages
+            .iter()
+            .find(|package| package.id == "nucleus.source-skill")
+            .expect("package should exist");
+        assert_eq!(
+            package.instructions,
+            "# Single Skill\n\nUse the single skill.\n"
+        );
+        assert_eq!(package.source_kind, "local");
+        assert_eq!(package.dirty_status, "clean");
+        assert!(
+            installations
+                .iter()
+                .any(|installation| installation.id == "workspace.nucleus.source-skill")
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn imports_local_parent_with_multiple_skills() {
+        let state_dir = test_state_dir("skill-import-parent");
+        let store = initialize_test_store(&state_dir);
+        let state = test_app_state(&store);
+        let parent = state_dir.join("skill-parent");
+        write_test_skill(&parent.join("alpha"), "Alpha", "Use alpha.");
+        write_test_skill(&parent.join("beta"), "Beta", "Use beta.");
+
+        let response = import_skills_from_source(
+            &state,
+            SkillImportRequest {
+                source: parent.display().to_string(),
+                scope_kind: "workspace".to_string(),
+                scope_id: "default".to_string(),
+            },
+        )
+        .await
+        .expect("parent import should succeed");
+
+        assert!(
+            response.errors.is_empty(),
+            "unexpected errors: {:?}",
+            response.errors
+        );
+        let installed = response
+            .installed
+            .iter()
+            .map(|result| result.skill_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(installed, vec!["alpha", "beta"]);
+        let packages = store.list_skill_packages().expect("packages should list");
+        assert!(packages.iter().any(|package| package.id == "nucleus.alpha"));
+        assert!(packages.iter().any(|package| package.id == "nucleus.beta"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn parses_github_tree_url_with_subpath() {
+        let meta = parse_github_tree_url(
+            "https://github.com/coreyhaines31/marketingskills/tree/main/skills",
+        )
+        .expect("GitHub tree URL should parse");
+        assert_eq!(meta.source_kind, "github");
+        assert_eq!(meta.source_owner, "coreyhaines31");
+        assert_eq!(meta.source_repo, "marketingskills");
+        assert_eq!(meta.source_ref, "main");
+        assert_eq!(meta.source_parent_path, "skills");
+        assert_eq!(
+            meta.source_repo_url,
+            "https://github.com/coreyhaines31/marketingskills"
+        );
+    }
+
+    #[test]
+    fn discovers_multi_skill_subpath() {
+        let state_dir = test_state_dir("skill-discovery");
+        let parent = state_dir.join("repo/skills");
+        write_test_skill(
+            &parent.join("copywriting"),
+            "Copywriting",
+            "Use copywriting.",
+        );
+        write_test_skill(
+            &parent.join("marketing-ideas"),
+            "Marketing Ideas",
+            "Use ideas.",
+        );
+        fs::create_dir_all(parent.join("not-a-skill")).expect("non skill dir should create");
+
+        let discovered = discover_skill_dirs(&parent).expect("discovery should succeed");
+        let names = discovered
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["copywriting", "marketing-ideas"]);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn rejects_invalid_skill_folder_without_skill_md() {
+        let state_dir = test_state_dir("skill-invalid");
+        let store = initialize_test_store(&state_dir);
+        let state = test_app_state(&store);
+        let invalid = state_dir.join("invalid-skill");
+        fs::create_dir_all(&invalid).expect("invalid dir should create");
+
+        let error = install_skill_dir(
+            &state,
+            &invalid,
+            &ImportSourceMeta {
+                source_kind: "local".to_string(),
+                source_url: invalid.display().to_string(),
+                source_repo_url: String::new(),
+                source_owner: String::new(),
+                source_repo: String::new(),
+                source_ref: String::new(),
+                source_parent_path: invalid.display().to_string(),
+                source_skill_path: String::new(),
+                source_commit: String::new(),
+            },
+            "workspace",
+            "default",
+        )
+        .expect_err("invalid skill should be rejected");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn rejects_unsafe_archive_paths() {
+        validate_relative_archive_path("repo/skills/copywriting/SKILL.md")
+            .expect("relative archive path should be allowed");
+        validate_relative_archive_path("../escape/SKILL.md")
+            .expect_err("parent traversal should be rejected");
+        validate_relative_archive_path("/tmp/escape/SKILL.md")
+            .expect_err("absolute paths should be rejected");
+    }
+
+    #[test]
+    fn safe_tar_unpack_extracts_safe_entries() {
+        let state_dir = test_state_dir("skill-safe-tar");
+        let mut tar_bytes = Vec::new();
+        {
+            let encoder =
+                flate2::write::GzEncoder::new(&mut tar_bytes, flate2::Compression::default());
+            let mut builder = tar::Builder::new(encoder);
+            let data = b"# Good\n";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "repo/skills/good/SKILL.md", &data[..])
+                .expect("tar entry should append");
+            let encoder = builder.into_inner().expect("tar should finish");
+            encoder.finish().expect("gzip should finish");
+        }
+
+        safe_unpack_tar_gz(&tar_bytes, &state_dir).expect("safe tar should unpack");
+        assert!(state_dir.join("repo/skills/good/SKILL.md").is_file());
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn reconcile_registers_existing_folders_and_is_idempotent() {
+        let state_dir = test_state_dir("skill-reconcile");
+        let store = initialize_test_store(&state_dir);
+        let state = test_app_state(&store);
+        write_test_skill(
+            &state_dir.join("skills/copywriting"),
+            "Copywriting",
+            "Use copywriting.",
+        );
+        write_test_skill(
+            &state_dir.join("skills/marketing-ideas"),
+            "Marketing Ideas",
+            "Use marketing ideas.",
+        );
+
+        let first = reconcile_skill_folders(&state).expect("reconcile should succeed");
+        assert!(
+            first.errors.is_empty(),
+            "unexpected errors: {:?}",
+            first.errors
+        );
+        assert_eq!(first.installed.len(), 2);
+        let second = reconcile_skill_folders(&state).expect("second reconcile should succeed");
+        assert!(
+            second.errors.is_empty(),
+            "unexpected errors: {:?}",
+            second.errors
+        );
+        assert_eq!(second.installed.len(), 2);
+
+        let manifests = store.list_skill_manifests().expect("manifests should list");
+        let packages = store.list_skill_packages().expect("packages should list");
+        let installations = store
+            .list_skill_installations()
+            .expect("installations should list");
+        assert!(manifests.iter().any(|skill| skill.id == "copywriting"));
+        assert!(manifests.iter().any(|skill| skill.id == "marketing-ideas"));
+        assert!(
+            packages
+                .iter()
+                .any(|package| package.id == "nucleus.copywriting"
+                    && package.source_kind == "unknown"
+                    && !package.content_checksum.is_empty())
+        );
+        assert!(
+            packages
+                .iter()
+                .any(|package| package.id == "nucleus.marketing-ideas"
+                    && package.instructions.contains("Use marketing ideas."))
+        );
+        assert_eq!(installations.len(), 2);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn check_update_detects_local_dirty_modification() {
+        let state_dir = test_state_dir("skill-dirty");
+        let store = initialize_test_store(&state_dir);
+        let state = test_app_state(&store);
+        let source = state_dir.join("dirty-source");
+        write_test_skill(&source, "Dirty Source", "Original instructions.");
+        let response = import_skills_from_source(
+            &state,
+            SkillImportRequest {
+                source: source.display().to_string(),
+                scope_kind: String::new(),
+                scope_id: String::new(),
+            },
+        )
+        .await
+        .expect("import should succeed");
+        assert_eq!(response.installed[0].dirty_status, "clean");
+
+        fs::write(state_dir.join("skills/dirty-source/notes.md"), "local edit")
+            .expect("local edit should write");
+        let result = check_one_skill_update(&state, "dirty-source")
+            .await
+            .expect("check update should succeed");
+        assert_eq!(result.dirty_status, "modified");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    fn write_test_skill(dir: &std::path::Path, title: &str, body: &str) {
+        fs::create_dir_all(dir).expect("skill dir should create");
+        fs::write(dir.join("SKILL.md"), format!("# {title}\n\n{body}\n"))
+            .expect("SKILL.md should write");
+        fs::create_dir_all(dir.join("references")).expect("references dir should create");
+        fs::write(dir.join("references/example.md"), "reference").expect("reference should write");
+    }
+
     fn test_state_dir(label: &str) -> PathBuf {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -5071,6 +6227,21 @@ mod tests {
                 version: "1.0.0".to_string(),
                 manifest_json: json!({"id": skill_id, "title": name, "name": name}),
                 instructions: instructions.to_string(),
+                source_kind: "manual".to_string(),
+                source_url: String::new(),
+                source_repo_url: String::new(),
+                source_owner: String::new(),
+                source_repo: String::new(),
+                source_ref: String::new(),
+                source_parent_path: String::new(),
+                source_skill_path: String::new(),
+                source_commit: String::new(),
+                imported_at: Some(0),
+                last_checked_at: None,
+                latest_source_commit: String::new(),
+                update_status: "unknown".to_string(),
+                content_checksum: String::new(),
+                dirty_status: "unknown".to_string(),
                 created_at: 0,
                 updated_at: 0,
             })

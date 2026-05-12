@@ -650,6 +650,36 @@ pub struct SkillPackageRecord {
     pub version: String,
     pub manifest_json: Value,
     pub instructions: String,
+    #[serde(default)]
+    pub source_kind: String,
+    #[serde(default)]
+    pub source_url: String,
+    #[serde(default)]
+    pub source_repo_url: String,
+    #[serde(default)]
+    pub source_owner: String,
+    #[serde(default)]
+    pub source_repo: String,
+    #[serde(default)]
+    pub source_ref: String,
+    #[serde(default)]
+    pub source_parent_path: String,
+    #[serde(default)]
+    pub source_skill_path: String,
+    #[serde(default)]
+    pub source_commit: String,
+    #[serde(default)]
+    pub imported_at: Option<i64>,
+    #[serde(default)]
+    pub last_checked_at: Option<i64>,
+    #[serde(default)]
+    pub latest_source_commit: String,
+    #[serde(default)]
+    pub update_status: String,
+    #[serde(default)]
+    pub content_checksum: String,
+    #[serde(default)]
+    pub dirty_status: String,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -673,6 +703,72 @@ pub struct SkillPackageUpsertRequest {
     pub version: String,
     pub manifest_json: Value,
     pub instructions: String,
+    #[serde(default)]
+    pub source_kind: String,
+    #[serde(default)]
+    pub source_url: String,
+    #[serde(default)]
+    pub source_repo_url: String,
+    #[serde(default)]
+    pub source_owner: String,
+    #[serde(default)]
+    pub source_repo: String,
+    #[serde(default)]
+    pub source_ref: String,
+    #[serde(default)]
+    pub source_parent_path: String,
+    #[serde(default)]
+    pub source_skill_path: String,
+    #[serde(default)]
+    pub source_commit: String,
+    #[serde(default)]
+    pub content_checksum: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillImportRequest {
+    pub source: String,
+    #[serde(default)]
+    pub scope_kind: String,
+    #[serde(default)]
+    pub scope_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillInstallVerification {
+    pub files_copied: bool,
+    pub manifest_registered: bool,
+    pub package_registered: bool,
+    pub installation_registered: bool,
+    pub instructions_non_empty: bool,
+    pub source_metadata_stored: bool,
+    pub checksum_recorded: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillInstallResult {
+    pub skill_id: String,
+    pub package_id: String,
+    pub installation_id: String,
+    pub source_kind: String,
+    pub source_url: String,
+    pub source_repo: String,
+    pub source_ref: String,
+    pub source_skill_path: String,
+    pub source_commit: String,
+    pub content_checksum: String,
+    pub dirty_status: String,
+    pub update_status: String,
+    pub status: String,
+    pub verification: SkillInstallVerification,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillImportResponse {
+    #[serde(default)]
+    pub installed: Vec<SkillInstallResult>,
+    #[serde(default)]
+    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
