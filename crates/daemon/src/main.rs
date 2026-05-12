@@ -39,15 +39,15 @@ use nucleus_protocol::{
     CompiledTurn, ConnectionSummary, CreatePlaybookRequest, CreateSessionRequest, DaemonEvent,
     HealthResponse, HostStatus, JobDetail, JobSummary, MAX_CONFIGURED_JOB_STEPS,
     MAX_CONFIGURED_JOB_TOOL_CALLS, MAX_CONFIGURED_JOB_WALL_CLOCK_SECS, McpServerRecord,
-    McpServerSummary, McpToolRecord, MemoryEntry, MemoryEntryUpsertRequest, MemorySummary,
-    NucleusToolDescriptor, PlaybookDetail, PlaybookSummary, ProcessKillRequest,
-    ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate, ProjectUpdateRequest,
-    PromptProgressUpdate, RouterProfileSummary, RunBudgetSummary, RuntimeOverview, RuntimeSummary,
-    SessionDetail, SessionPromptRequest, SessionSummary, SettingsSummary, SkillInstallationRecord,
-    SkillInstallationUpsertRequest, SkillManifest, SkillPackageRecord, SkillPackageUpsertRequest,
-    StreamConnected, SystemStats, UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest,
-    UpdateStatus, WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceProfileWriteRequest,
-    WorkspaceSummary, WorkspaceUpdateRequest,
+    McpServerSummary, McpToolRecord, NucleusToolDescriptor, PlaybookDetail, PlaybookSummary,
+    ProcessKillRequest, ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate,
+    ProjectUpdateRequest, PromptProgressUpdate, RouterProfileSummary, RunBudgetSummary,
+    RuntimeOverview, RuntimeSummary, SessionDetail, SessionPromptRequest, SessionSummary,
+    SettingsSummary, SkillInstallationRecord, SkillInstallationUpsertRequest, SkillManifest,
+    SkillPackageRecord, SkillPackageUpsertRequest, StreamConnected, SystemStats,
+    UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
+    WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceProfileWriteRequest, WorkspaceSummary,
+    WorkspaceUpdateRequest,
 };
 use nucleus_release::read_installed_release_metadata;
 use nucleus_storage::{
@@ -169,10 +169,7 @@ fn app(state: AppState) -> Router {
         )
         .route("/router/profiles", get(router_profiles))
         .route("/skills", get(list_skills).post(upsert_skill))
-        .route(
-            "/skills/{skill_id}",
-            axum::routing::put(upsert_skill_by_id).delete(delete_skill),
-        )
+        .route("/skills/{skill_id}", axum::routing::put(upsert_skill_by_id))
         .route(
             "/skill-packages",
             get(list_skill_packages).post(upsert_skill_package),
@@ -192,16 +189,11 @@ fn app(state: AppState) -> Router {
         .route("/mcps", get(list_mcp_servers).post(upsert_mcp_server))
         .route(
             "/mcps/{server_id}",
-            axum::routing::put(upsert_mcp_server_by_id).delete(delete_mcp_server),
+            axum::routing::put(upsert_mcp_server_by_id),
         )
         .route(
             "/mcps/{server_id}/discover",
             axum::routing::post(discover_mcp_server_tools),
-        )
-        .route("/memory", get(list_memory).post(upsert_memory))
-        .route(
-            "/memory/{memory_id}",
-            axum::routing::put(upsert_memory_by_id).delete(delete_memory),
         )
         .route("/actions", get(actions))
         .route("/actions/{action_id}", get(action_detail))
@@ -645,121 +637,6 @@ async fn upsert_mcp_server_by_id(
     let mut payload = sanitize_mcp_server(decode_json::<McpServerSummary>(&body)?)?;
     payload.id = sanitize_registry_id(&server_id, "MCP server id")?;
     Ok(Json(state.store.upsert_mcp_server(&payload)?))
-}
-
-async fn list_memory(State(state): State<AppState>) -> Result<Json<MemorySummary>, ApiError> {
-    let mut entries = state.store.list_memory_entries().map_err(ApiError::from)?;
-    entries.sort_by(|a, b| {
-        a.scope_kind
-            .cmp(&b.scope_kind)
-            .then(a.scope_id.cmp(&b.scope_id))
-            .then(a.title.cmp(&b.title))
-            .then(a.id.cmp(&b.id))
-    });
-    let enabled_count = entries.iter().filter(|entry| entry.enabled).count();
-    let scope_count = entries
-        .iter()
-        .map(|entry| format!("{}:{}", entry.scope_kind, entry.scope_id))
-        .collect::<std::collections::BTreeSet<_>>()
-        .len();
-    Ok(Json(MemorySummary {
-        entries,
-        enabled_count,
-        scope_count,
-    }))
-}
-
-async fn upsert_memory(
-    State(state): State<AppState>,
-    body: Bytes,
-) -> Result<Json<MemoryEntry>, ApiError> {
-    let payload = decode_json::<MemoryEntryUpsertRequest>(&body)?;
-    upsert_memory_from_request(&state, payload, None).map(Json)
-}
-
-async fn upsert_memory_by_id(
-    State(state): State<AppState>,
-    Path(memory_id): Path<String>,
-    body: Bytes,
-) -> Result<Json<MemoryEntry>, ApiError> {
-    let payload = decode_json::<MemoryEntryUpsertRequest>(&body)?;
-    upsert_memory_from_request(&state, payload, Some(memory_id)).map(Json)
-}
-
-async fn delete_memory(
-    State(state): State<AppState>,
-    Path(memory_id): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    let memory_id = sanitize_registry_id(&memory_id, "memory id")?;
-    state
-        .store
-        .delete_memory_entry(&memory_id)
-        .map_err(ApiError::from)?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-fn upsert_memory_from_request(
-    state: &AppState,
-    payload: MemoryEntryUpsertRequest,
-    id_override: Option<String>,
-) -> Result<MemoryEntry, ApiError> {
-    let scope_kind = payload.scope_kind.trim();
-    let scope_id = payload.scope_id.trim();
-    let title = payload.title.trim();
-    let content = payload.content.trim();
-    if scope_kind.is_empty() || scope_id.is_empty() || title.is_empty() || content.is_empty() {
-        return Err(ApiError::bad_request(
-            "memory scope, title, and content are required",
-        ));
-    }
-    let id = match id_override {
-        Some(value) => sanitize_registry_id(&value, "memory id")?,
-        None => sanitize_registry_id(payload.id.as_deref().unwrap_or(title), "memory id")?,
-    };
-    let entry = MemoryEntry {
-        id,
-        scope_kind: scope_kind.to_string(),
-        scope_id: scope_id.to_string(),
-        title: title.to_string(),
-        content: content.to_string(),
-        tags: payload
-            .tags
-            .into_iter()
-            .map(|tag: String| tag.trim().to_string())
-            .filter(|tag: &String| !tag.is_empty())
-            .collect(),
-        enabled: payload.enabled.unwrap_or(true),
-        created_at: 0,
-        updated_at: 0,
-    };
-    state
-        .store
-        .upsert_memory_entry(&entry)
-        .map_err(ApiError::from)
-}
-
-async fn delete_skill(
-    State(state): State<AppState>,
-    Path(skill_id): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    let skill_id = sanitize_registry_id(&skill_id, "skill id")?;
-    state
-        .store
-        .delete_skill_manifest(&skill_id)
-        .map_err(ApiError::from)?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn delete_mcp_server(
-    State(state): State<AppState>,
-    Path(server_id): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    let server_id = sanitize_registry_id(&server_id, "MCP server id")?;
-    state
-        .store
-        .delete_mcp_server(&server_id)
-        .map_err(ApiError::from)?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn discover_mcp_server_tools(

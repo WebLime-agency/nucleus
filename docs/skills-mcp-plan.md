@@ -383,25 +383,3 @@ That would give Nucleus:
 | 7 | Policy, safety, and secrets | not started |
 | 8 | UX and operator surfaces | in progress |
 | 9 | Packaging, trust, and distribution | not started |
-
-
----
-
-## Phase 7 — Workspace management UI + durable memory foundation
-**Status:** `complete`
-
-### Purpose
-Expose first-class workspace management for Skills, MCPs, and durable Memory in the official web client while keeping Nucleus as the system of record.
-
-### Scope
-- add workspace Skills management UI for list/create/edit/enable-disable/delete
-- add workspace MCP management UI for list/create/edit/enable-disable/delete/discover
-- add durable memory records with daemon-backed list/create/update/delete
-- keep memory separate from raw transcripts and prompt includes
-- preserve prompt assembly ownership in the daemon
-
-### Exit criteria
-- official workspace navigation exposes Skills, MCPs, and Memory
-- no fake controls; actions map to daemon API behavior
-- durable memory records persist and are editable from the workspace UI
-- delete flows exist for Skills and MCP servers

@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { BookOpenText, Brain, Database, FileClock } from 'lucide-svelte';
 
-  import { WorkspaceEmptyState, WorkspacePageHeader, WorkspaceStoragePathCard } from '$lib/components/app/workspace';
+  import { WorkspaceEmptyState, WorkspacePageHeader } from '$lib/components/app/workspace';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '$lib/components/ui/card';
   import { fetchOverview } from '$lib/nucleus/client';
   import { compactPath } from '$lib/nucleus/format';
@@ -61,10 +61,15 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '$lib/
 </svelte:head>
 
 <div class="space-y-8">
-  <WorkspacePageHeader
-    title="Memory"
-    description="This surface is reserved for long-term memory, reusable knowledge, and operator-managed context. Host RAM moved into Diagnostics so the product language stays clean."
-  />
+  <section class="space-y-3">
+    <div>
+      <h1 class="text-3xl font-semibold text-zinc-50">Memory</h1>
+      <p class="mt-2 max-w-3xl text-sm leading-6 text-zinc-400">
+        This surface is reserved for long-term memory, reusable knowledge, and operator-managed
+        context. Host RAM moved into Diagnostics so the product language stays clean.
+      </p>
+    </div>
+  </section>
 
   {#if error}
     <div class="rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">
@@ -89,14 +94,25 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '$lib/
       </CardContent>
     </Card>
 
-    <WorkspaceStoragePathCard
-      title="Stored State"
-      description="Nucleus keeps memory artifacts and structured state under its local storage root."
-      paths={[
-        storage ? compactPath(storage.memory_dir) : 'Waiting for storage details',
-        storage ? compactPath(storage.transcripts_dir) : 'Waiting for transcript details'
-      ]}
-    />
+    <Card>
+      <CardHeader>
+        <CardTitle class="flex items-center gap-2">
+          <Database class="size-5 text-zinc-400" />
+          Stored State
+        </CardTitle>
+        <CardDescription>
+          Nucleus keeps memory artifacts and structured state under its local storage root.
+        </CardDescription>
+      </CardHeader>
+      <CardContent class="space-y-2 text-sm text-zinc-400">
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-xs text-zinc-500">
+          {storage ? compactPath(storage.memory_dir) : 'Waiting for storage details'}
+        </div>
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-xs text-zinc-500">
+          {storage ? compactPath(storage.transcripts_dir) : 'Waiting for transcript details'}
+        </div>
+      </CardContent>
+    </Card>
 
     <Card>
       <CardHeader>

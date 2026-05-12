@@ -19,19 +19,11 @@
 
   import { Badge } from '$lib/components/ui/badge';
   import {
-    WorkspaceAccessCard,
-    WorkspaceCompatibilityCard,
-    WorkspaceConnectionCard,
-    WorkspaceInfoTile,
-    WorkspaceNoteGrid,
-    WorkspacePageHeader,
-    WorkspaceStoragePathCard,
-    WorkspaceUpdateBehaviorCard,
-    WorkspaceUpdateControlsCard,
-    WorkspaceUpdateStatusGrid,
-    WorkspaceUpdateTargetCard
-  } from '$lib/components/app/workspace';
-  import { Button } from '$lib/components/ui/button';
+  WorkspaceInfoTile,
+  WorkspaceNoteGrid,
+  WorkspacePageHeader
+} from '$lib/components/app/workspace';
+import { Button } from '$lib/components/ui/button';
   import {
     Card,
     CardContent,
@@ -685,81 +677,304 @@
               <div class="mt-1 text-xs text-zinc-500">{update.current_commit_short}</div>
             {/if}
           </div>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Tracked Target</div>
+            <div class="mt-2 text-sm font-medium text-zinc-50">
+              {trackedTargetLabel}
+            </div>
+          </div>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Latest Known Target</div>
+            <div class="mt-2 text-sm font-medium text-zinc-50">{latestTargetLabel}</div>
+          </div>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">{currentTargetLabel}</div>
+            <div class="mt-2 text-sm font-medium text-zinc-50">
+              {update?.current_ref ?? (isDevCheckout ? 'Detached or unknown' : 'Not applicable')}
+            </div>
+          </div>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Last Successful Check</div>
+            <div class="mt-2 text-sm font-medium text-zinc-50">
+              {update?.last_successful_check_at
+                ? formatDateTime(update.last_successful_check_at)
+                : 'Never'}
+            </div>
+          </div>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Last Attempted Check</div>
+            <div class="mt-2 text-sm font-medium text-zinc-50">
+              {update?.last_attempted_check_at
+                ? formatDateTime(update.last_attempted_check_at)
+                : 'Never'}
+            </div>
+            <div class="mt-1 text-xs text-zinc-500">
+              {update?.last_attempt_result ? formatState(update.last_attempt_result) : 'No attempts yet'}
+            </div>
+          </div>
         </div>
 
-        <WorkspaceUpdateStatusGrid
-          latestTargetLabel={trackedTargetLabel}
-          currentVersionLabel={latestTargetLabel}
-          updateStateLabel={currentTargetLabel}
-          lastSuccessfulCheckAt={update?.last_successful_check_at ?? null}
-          lastAttemptedCheckAt={update?.last_attempted_check_at ?? null}
-          lastAttemptResult={update?.last_attempt_result ?? null}
-        />
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-4">
+          <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">
+            {isDevCheckout ? 'Tracked Git Ref' : 'Tracked Release Channel'}
+          </div>
 
-        <WorkspaceUpdateTargetCard
-          managedRelease={update?.install_kind === 'managed_release'}
-          {releaseChannels}
-          {trackedChannelInput}
-          {trackedRefInput}
-          {canSaveUpdateConfig}
-          {savingUpdateConfig}
-          onTrackedChannelInput={(value) => {
-            trackedChannelInput = value;
-          }}
-          onTrackedRefInput={(value) => {
-            trackedRefInput = value;
-          }}
-          onSave={() => {
-            void handleSaveUpdateConfig();
-          }}
-        />
+          {#if update?.install_kind === 'managed_release'}
+            <div class="mt-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto]">
+              <Select
+                class="h-11"
+                bind:value={trackedChannelInput}
+                aria-label="Tracked release channel"
+              >
+                {#each releaseChannels as channel}
+                  <option value={channel}>{channel}</option>
+                {/each}
+              </Select>
+              <Button onclick={handleSaveUpdateConfig} disabled={!canSaveUpdateConfig}>
+                {savingUpdateConfig ? 'Saving' : 'Save target'}
+              </Button>
+            </div>
+            <div class="mt-3 text-xs leading-5 text-zinc-500">
+              Managed installs follow release channels, not git branches. Nucleus stores the
+              tracked channel separately from the currently running release and reuses it across
+              reconnects and restarts.
+            </div>
+          {:else}
+            <div class="mt-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto]">
+              <Input
+                class="h-11"
+                bind:value={trackedRefInput}
+                placeholder="main"
+                spellcheck="false"
+                autocapitalize="off"
+                aria-label="Tracked git ref"
+              />
+              <Button onclick={handleSaveUpdateConfig} disabled={!canSaveUpdateConfig}>
+                {savingUpdateConfig ? 'Saving' : 'Save target'}
+              </Button>
+            </div>
+            <div class="mt-3 text-xs leading-5 text-zinc-500">
+              Contributor installs can track an explicit ref such as <code>main</code>. Nucleus
+              keeps this target separate from the live checkout so mismatch states stay visible.
+            </div>
+          {/if}
+        </div>
 
-        <WorkspaceUpdateControlsCard
-          restartRequired={update?.restart_required ?? false}
-          restarting={update?.state === 'restarting' || restarting}
-          dirtyWorktree={update?.dirty_worktree ?? false}
-          latestError={update?.latest_error ?? null}
-          latestErrorAt={update?.latest_error_at ?? null}
-          {checking}
-          {applying}
-          {canCheck}
-          {canApply}
-          {canRestart}
-          onCheck={() => {
-            void handleCheckForUpdates();
-          }}
-          onApply={() => {
-            void handleApplyUpdate();
-          }}
-          onRestart={() => {
-            void handleRestartDaemon();
-          }}
-        />
+        {#if update?.restart_required}
+          <div class="rounded-md border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-sm text-amber-100">
+            The install payload is newer than the running Nucleus process. Restart Nucleus after
+            resolving the issue.
+          </div>
+        {/if}
+
+        {#if update?.state === 'restarting' || restarting}
+          <div class="rounded-md border border-sky-400/30 bg-sky-400/10 px-4 py-3 text-sm text-sky-100">
+            Nucleus is restarting now. This page should reconnect automatically.
+          </div>
+        {/if}
+
+        {#if update?.dirty_worktree}
+          <div class="rounded-md border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">
+            The working tree has local changes. Clean or commit them before applying an update.
+          </div>
+        {/if}
+
+        {#if update?.latest_error}
+          <div class="rounded-md border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">
+            <div class="font-medium text-red-100">Latest error</div>
+            <div class="mt-1">{update.latest_error}</div>
+            {#if update.latest_error_at}
+              <div class="mt-1 text-xs text-red-100/80">{formatDateTime(update.latest_error_at)}</div>
+            {/if}
+          </div>
+        {/if}
+
+        <div class="flex flex-wrap items-center gap-3">
+          <Button onclick={handleCheckForUpdates} disabled={!canCheck}>
+            <RefreshCcw class={checking ? 'size-4 animate-spin' : 'size-4'} />
+            {checking ? 'Checking' : 'Check for updates'}
+          </Button>
+
+          <Button variant="secondary" onclick={handleApplyUpdate} disabled={!canApply}>
+            <Download class={applying ? 'size-4 animate-spin' : 'size-4'} />
+            {applying ? 'Updating' : 'Update now'}
+          </Button>
+
+          <Button variant="secondary" onclick={handleRestartDaemon} disabled={!canRestart}>
+            <Power class={restarting || update?.state === 'restarting' ? 'size-4 animate-pulse' : 'size-4'} />
+            {restarting || update?.state === 'restarting' ? 'Restarting' : 'Restart Nucleus'}
+          </Button>
+        </div>
       </CardContent>
     </Card>
   </section>
 
   <section class="grid gap-4 xl:grid-cols-[0.95fr_1.05fr]">
-    <WorkspaceConnectionCard
-      localUrl={settings?.connection.local_url ?? 'Unavailable'}
-      hostnameUrl={settings?.connection.hostname_url}
-      tailscaleUrl={settings?.connection.tailscale_url}
-      webMode={settings?.connection.web_mode ?? 'unknown'}
-      authEnabled={settings?.auth.enabled ?? false}
-      webRoot={settings?.connection.web_root}
-    />
+    <Card>
+      <CardHeader>
+        <CardTitle>Connection</CardTitle>
+        <CardDescription>
+          These are the Nucleus URLs for this instance and the current web delivery mode.
+        </CardDescription>
+      </CardHeader>
+      <CardContent class="space-y-3">
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+          <div class="flex items-center gap-2 text-xs uppercase tracking-[0.16em] text-zinc-500">
+            <Link class="size-3.5" />
+            <span>Local</span>
+          </div>
+          <div class="mt-2 text-sm text-zinc-100">{settings?.connection.local_url ?? 'Unavailable'}</div>
+        </div>
 
-    <WorkspaceAccessCard tokenPath={settings?.auth.token_path} />
+        {#if settings?.connection.hostname_url}
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Host</div>
+            <div class="mt-2 text-sm text-zinc-100">{settings.connection.hostname_url}</div>
+          </div>
+        {/if}
+
+        {#if settings?.connection.tailscale_url}
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Tailscale</div>
+            <div class="mt-2 text-sm text-zinc-100">{settings.connection.tailscale_url}</div>
+          </div>
+        {/if}
+
+        <div class="grid gap-3 sm:grid-cols-2">
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Web mode</div>
+            <div class="mt-2 text-sm font-medium text-zinc-50">
+              {formatState(settings?.connection.web_mode ?? 'unknown')}
+            </div>
+          </div>
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Auth</div>
+            <div class="mt-2 text-sm font-medium text-zinc-50">
+              {settings?.auth.enabled ? 'Bearer token required' : 'Disabled'}
+            </div>
+          </div>
+        </div>
+
+        {#if settings?.connection.web_root}
+          <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+            <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Web build path</div>
+            <div class="mt-2 text-sm text-zinc-100" title={settings.connection.web_root}>
+              {compactPath(settings.connection.web_root)}
+            </div>
+          </div>
+        {/if}
+      </CardContent>
+    </Card>
+
+    <Card>
+      <CardHeader>
+        <CardTitle>Access</CardTitle>
+        <CardDescription>
+          Nucleus owns bearer-token auth. The local token is stored outside the repository.
+        </CardDescription>
+      </CardHeader>
+      <CardContent class="space-y-3">
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+          <div class="flex items-center gap-2 text-xs uppercase tracking-[0.16em] text-zinc-500">
+            <KeyRound class="size-3.5" />
+            <span>Local token path</span>
+          </div>
+          <div class="mt-2 text-sm text-zinc-100" title={settings?.auth.token_path}>
+            {settings ? compactPath(settings.auth.token_path) : 'Unavailable'}
+          </div>
+        </div>
+
+        <div class="rounded-md border border-amber-400/20 bg-amber-400/10 px-4 py-3 text-sm text-amber-100">
+          Retrieve the current token with <code>nucleus auth local-token</code>, then use it in the
+          web UI or any future client.
+        </div>
+      </CardContent>
+    </Card>
   </section>
 
-  <WorkspaceCompatibilityCard
-    clientVersion={CURRENT_CLIENT_VERSION}
-    clientSurfaceVersion={CURRENT_CLIENT_SURFACE_VERSION}
-    serverSurfaceVersion={settings?.compatibility.surface_version ?? 'Unavailable'}
-    minimumClientVersion={settings?.compatibility.minimum_client_version ?? 'Not set'}
-    minimumServerVersion={settings?.compatibility.minimum_server_version ?? 'Not set'}
-    capabilityFlags={settings?.compatibility.capability_flags ?? []}
-  />
+  <Card>
+    <CardHeader>
+      <CardTitle>Compatibility</CardTitle>
+      <CardDescription>
+        Clients should rely on explicit Nucleus compatibility metadata instead of inferring support
+        from transport or decode failures.
+      </CardDescription>
+    </CardHeader>
+    <CardContent class="space-y-3">
+      <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+          <div class="flex items-center gap-2 text-xs uppercase tracking-[0.16em] text-zinc-500">
+            <ShieldAlert class="size-3.5" />
+            <span>Client Version</span>
+          </div>
+          <div class="mt-2 text-sm font-medium text-zinc-50">{CURRENT_CLIENT_VERSION}</div>
+        </div>
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+          <div class="flex items-center gap-2 text-xs uppercase tracking-[0.16em] text-zinc-500">
+            <ShieldAlert class="size-3.5" />
+            <span>Client Surface</span>
+          </div>
+          <div class="mt-2 text-sm font-medium text-zinc-50">{CURRENT_CLIENT_SURFACE_VERSION}</div>
+        </div>
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+          <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Server Surface</div>
+          <div class="mt-2 text-sm font-medium text-zinc-50">
+            {settings?.compatibility.surface_version ?? 'Unavailable'}
+          </div>
+        </div>
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+          <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Minimum Client</div>
+          <div class="mt-2 text-sm font-medium text-zinc-50">
+            {settings?.compatibility.minimum_client_version ?? 'Not set'}
+          </div>
+        </div>
+        <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+          <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Minimum Server</div>
+          <div class="mt-2 text-sm font-medium text-zinc-50">
+            {settings?.compatibility.minimum_server_version ?? 'Not set'}
+          </div>
+        </div>
+      </div>
 
-  <WorkspaceUpdateBehaviorCard />
+      <div class="rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+        <div class="text-xs uppercase tracking-[0.16em] text-zinc-500">Capability Flags</div>
+        {#if settings?.compatibility.capability_flags.length}
+          <div class="mt-3 flex flex-wrap gap-2">
+            {#each settings.compatibility.capability_flags as capability}
+              <Badge variant="secondary">{capability}</Badge>
+            {/each}
+          </div>
+        {:else}
+          <div class="mt-2 text-sm text-zinc-500">No capability flags were published.</div>
+        {/if}
+      </div>
+    </CardContent>
+  </Card>
+
+  <Card>
+    <CardHeader>
+      <CardTitle>Update Behavior</CardTitle>
+      <CardDescription>
+        Nucleus keeps update truth locally and serves the embedded web client that matches
+        the running release.
+      </CardDescription>
+    </CardHeader>
+    <CardContent class="space-y-3 text-sm leading-6 text-zinc-400">
+      <div class="flex items-start gap-3 rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+        <Check class="mt-0.5 size-4 shrink-0 text-lime-300/80" />
+        <p>
+          Background checks update Nucleus-owned state and only raise an in-app toast when the latest
+          successful check found a newer target.
+        </p>
+      </div>
+      <div class="flex items-start gap-3 rounded-md border border-zinc-800 bg-zinc-950/40 px-4 py-3">
+        <ShieldAlert class="mt-0.5 size-4 shrink-0 text-zinc-500" />
+        <p>
+          Dev checkouts may still use git-based updates. Managed releases now resolve channel
+          artifacts, verify them, swap them into place, and restart onto the matching embedded web
+          build instead of pulling branches directly.
+        </p>
+      </div>
+    </CardContent>
+  </Card>
 </div>

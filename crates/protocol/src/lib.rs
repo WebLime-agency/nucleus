@@ -566,40 +566,6 @@ pub struct McpToolRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MemoryEntry {
-    pub id: String,
-    pub scope_kind: String,
-    pub scope_id: String,
-    pub title: String,
-    pub content: String,
-    #[serde(default)]
-    pub tags: Vec<String>,
-    pub enabled: bool,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MemoryEntryUpsertRequest {
-    pub id: Option<String>,
-    pub scope_kind: String,
-    pub scope_id: String,
-    pub title: String,
-    pub content: String,
-    #[serde(default)]
-    pub tags: Vec<String>,
-    pub enabled: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MemorySummary {
-    #[serde(default)]
-    pub entries: Vec<MemoryEntry>,
-    pub enabled_count: usize,
-    pub scope_count: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillPackageRecord {
     pub id: String,
     pub name: String,

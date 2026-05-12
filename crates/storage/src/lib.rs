@@ -12,12 +12,11 @@ use nucleus_core::{
 use nucleus_protocol::{
     ApprovalRequestSummary, ArtifactSummary, AuditEvent, CommandSessionSummary,
     DEFAULT_JOB_MAX_STEPS, DEFAULT_JOB_MAX_TOOL_CALLS, DEFAULT_JOB_MAX_WALL_CLOCK_SECS, JobDetail,
-    JobEvent, JobSummary, McpServerRecord, McpServerSummary, MemoryEntry, PlaybookDetail,
-    PlaybookSummary, PolicyDecisionSummary, ProjectSummary, RouteTarget, RouterProfileSummary,
-    RunBudgetSummary, RuntimeSummary, SessionDetail, SessionProjectSummary, SessionSummary,
-    SessionTurn, SessionTurnImage, SkillManifest, StorageSummary, ToolCallSummary,
-    ToolCapabilitySummary, WorkerSummary, WorkspaceModelConfig, WorkspaceProfileSummary,
-    WorkspaceSummary,
+    JobEvent, JobSummary, McpServerRecord, McpServerSummary, PlaybookDetail, PlaybookSummary,
+    PolicyDecisionSummary, ProjectSummary, RouteTarget, RouterProfileSummary, RunBudgetSummary,
+    RuntimeSummary, SessionDetail, SessionProjectSummary, SessionSummary, SessionTurn,
+    SessionTurnImage, SkillManifest, StorageSummary, ToolCallSummary, ToolCapabilitySummary,
+    WorkerSummary, WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -734,12 +733,6 @@ impl StateStore {
         load_skill_manifest(&connection, &manifest.id)
     }
 
-    pub fn delete_skill_manifest(&self, id: &str) -> Result<()> {
-        let connection = self.connection.lock().expect("storage mutex poisoned");
-        connection.execute("DELETE FROM skill_manifests WHERE id = ?1", params![id])?;
-        Ok(())
-    }
-
     pub fn list_mcp_servers(&self) -> Result<Vec<McpServerSummary>> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         list_mcp_servers_with_connection(&connection)
@@ -807,13 +800,6 @@ impl StateStore {
         load_mcp_server_record(&connection, &record.id)
     }
 
-    pub fn delete_mcp_server(&self, id: &str) -> Result<()> {
-        let connection = self.connection.lock().expect("storage mutex poisoned");
-        connection.execute("DELETE FROM mcp_tools WHERE server_id = ?1", params![id])?;
-        connection.execute("DELETE FROM mcp_servers WHERE id = ?1", params![id])?;
-        Ok(())
-    }
-
     pub fn list_mcp_tools(&self) -> Result<Vec<nucleus_protocol::McpToolRecord>> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         list_mcp_tools_with_connection(&connection)
@@ -852,49 +838,6 @@ impl StateStore {
             ],
         )?;
         load_mcp_tool(&connection, &tool.id)
-    }
-
-    pub fn list_memory_entries(&self) -> Result<Vec<MemoryEntry>> {
-        let connection = self.connection.lock().expect("storage mutex poisoned");
-        list_memory_entries_with_connection(&connection)
-    }
-
-    pub fn upsert_memory_entry(&self, entry: &MemoryEntry) -> Result<MemoryEntry> {
-        let connection = self.connection.lock().expect("storage mutex poisoned");
-        connection.execute(
-            "
-            INSERT INTO memory_entries (
-                id, scope_kind, scope_id, title, content, tags_json, enabled, created_at, updated_at
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-            ON CONFLICT(id) DO UPDATE SET
-                scope_kind = excluded.scope_kind,
-                scope_id = excluded.scope_id,
-                title = excluded.title,
-                content = excluded.content,
-                tags_json = excluded.tags_json,
-                enabled = excluded.enabled,
-                updated_at = excluded.updated_at
-            ",
-            params![
-                entry.id,
-                entry.scope_kind,
-                entry.scope_id,
-                entry.title,
-                entry.content,
-                serde_json::to_string(&entry.tags)?,
-                entry.enabled as i64,
-                entry.created_at,
-                entry.updated_at,
-            ],
-        )?;
-        load_memory_entry(&connection, &entry.id)
-    }
-
-    pub fn delete_memory_entry(&self, id: &str) -> Result<()> {
-        let connection = self.connection.lock().expect("storage mutex poisoned");
-        connection.execute("DELETE FROM memory_entries WHERE id = ?1", params![id])?;
-        Ok(())
     }
 
     pub fn list_skill_packages(&self) -> Result<Vec<nucleus_protocol::SkillPackageRecord>> {
@@ -2325,20 +2268,6 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_mcp_tools_server_id_name
             ON mcp_tools(server_id, name);
 
-        CREATE TABLE IF NOT EXISTS memory_entries (
-            id TEXT PRIMARY KEY,
-            scope_kind TEXT NOT NULL,
-            scope_id TEXT NOT NULL,
-            title TEXT NOT NULL,
-            content TEXT NOT NULL,
-            tags_json TEXT NOT NULL DEFAULT '[]',
-            enabled INTEGER NOT NULL DEFAULT 1,
-            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_memory_entries_scope
-            ON memory_entries(scope_kind, scope_id, enabled);
 
         CREATE TABLE IF NOT EXISTS skill_packages (
             id TEXT PRIMARY KEY,
@@ -4401,45 +4330,6 @@ fn map_mcp_tool(row: &rusqlite::Row<'_>) -> rusqlite::Result<nucleus_protocol::M
         input_schema: decode_json_value(row.get(4)?)?,
         source: row.get(5)?,
         discovered_at: row.get(6)?,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
-    })
-}
-
-fn list_memory_entries_with_connection(connection: &Connection) -> Result<Vec<MemoryEntry>> {
-    let mut statement = connection.prepare(
-        "SELECT id FROM memory_entries ORDER BY scope_kind ASC, scope_id ASC, title ASC, id ASC",
-    )?;
-    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-    let ids = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-    ids.into_iter()
-        .map(|id| load_memory_entry(connection, &id))
-        .collect()
-}
-
-fn load_memory_entry(connection: &Connection, id: &str) -> Result<MemoryEntry> {
-    connection.query_row(
-        "SELECT id, scope_kind, scope_id, title, content, tags_json, enabled, created_at, updated_at FROM memory_entries WHERE id = ?1",
-        params![id],
-        map_memory_entry,
-    ).optional()?.ok_or_else(|| anyhow!("memory entry {id} was not found"))
-}
-
-fn map_memory_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
-    Ok(MemoryEntry {
-        id: row.get(0)?,
-        scope_kind: row.get(1)?,
-        scope_id: row.get(2)?,
-        title: row.get(3)?,
-        content: row.get(4)?,
-        tags: serde_json::from_value(decode_json_value(row.get(5)?)?).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                5,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })?,
-        enabled: row.get::<_, i64>(6)? != 0,
         created_at: row.get(7)?,
         updated_at: row.get(8)?,
     })
