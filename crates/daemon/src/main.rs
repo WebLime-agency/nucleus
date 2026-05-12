@@ -3102,6 +3102,9 @@ fn safe_unpack_tar_gz(bytes: &[u8], destination: &FsPath) -> anyhow::Result<()> 
         let mut entry = entry?;
         let entry_type = entry.header().entry_type();
         if !(entry_type.is_file() || entry_type.is_dir()) {
+            if matches!(entry_type.as_byte(), b'g' | b'x') {
+                continue;
+            }
             bail!(
                 "unsupported archive entry type for {}",
                 entry.path()?.display()
