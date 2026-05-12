@@ -436,6 +436,16 @@ export async function checkSkillUpdate(skillId: string, fetchImpl: FetchLike = f
   );
 }
 
+export async function checkSkillUpdates(fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/skills/check-updates', {
+      method: 'POST',
+      headers: { accept: 'application/json' }
+    }),
+    skillImportResponseSchema
+  );
+}
+
 export async function fetchSkillPackages(fetchImpl: FetchLike = fetch) {
   return parseJson(
     await daemonFetch(fetchImpl, '/api/skill-packages', {
