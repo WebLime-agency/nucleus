@@ -551,7 +551,7 @@ export const mcpServerSummarySchema = z.object({
 
 export const mcpServerRecordSchema = z.object({
   id: z.string(),
-  workspace_id: z.string(),
+  workspace_id: z.string().default('workspace'),
   title: z.string(),
   transport: z.string(),
   command: z.string().default(''),
@@ -565,8 +565,8 @@ export const mcpServerRecordSchema = z.object({
   sync_status: z.string(),
   last_error: z.string().default(''),
   last_synced_at: z.number().int().nullable(),
-  created_at: z.number().int(),
-  updated_at: z.number().int()
+  created_at: z.number().int().default(0),
+  updated_at: z.number().int().default(0)
 });
 
 export const routerProfileSummarySchema = z.object({
