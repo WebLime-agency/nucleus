@@ -521,11 +521,43 @@ pub struct NucleusToolDescriptor {
     pub source: String,
 }
 
+fn default_mcp_transport() -> String {
+    "stdio".to_string()
+}
+fn default_mcp_auth_kind() -> String {
+    "none".to_string()
+}
+fn default_mcp_sync_status() -> String {
+    "pending".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpServerSummary {
     pub id: String,
     pub title: String,
     pub enabled: bool,
+    #[serde(default = "default_mcp_transport")]
+    pub transport: String,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env_json: Value,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub headers_json: Value,
+    #[serde(default = "default_mcp_auth_kind")]
+    pub auth_kind: String,
+    #[serde(default)]
+    pub auth_ref: String,
+    #[serde(default = "default_mcp_sync_status")]
+    pub sync_status: String,
+    #[serde(default)]
+    pub last_error: String,
+    #[serde(default)]
+    pub last_synced_at: Option<i64>,
     #[serde(default)]
     pub tools: Vec<NucleusToolDescriptor>,
     #[serde(default)]
@@ -542,6 +574,14 @@ pub struct McpServerRecord {
     #[serde(default)]
     pub args: Vec<String>,
     pub env_json: Value,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub headers_json: Value,
+    #[serde(default = "default_mcp_auth_kind")]
+    pub auth_kind: String,
+    #[serde(default)]
+    pub auth_ref: String,
     pub enabled: bool,
     pub sync_status: String,
     #[serde(default)]
@@ -563,6 +603,40 @@ pub struct McpToolRecord {
     pub discovered_at: i64,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryEntry {
+    pub id: String,
+    pub scope_kind: String,
+    pub scope_id: String,
+    pub title: String,
+    pub content: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub enabled: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryEntryUpsertRequest {
+    pub id: Option<String>,
+    pub scope_kind: String,
+    pub scope_id: String,
+    pub title: String,
+    pub content: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemorySummary {
+    #[serde(default)]
+    pub entries: Vec<MemoryEntry>,
+    pub enabled_count: usize,
+    pub scope_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

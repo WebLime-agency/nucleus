@@ -534,8 +534,39 @@ export const mcpServerSummarySchema = z.object({
   id: z.string(),
   title: z.string(),
   enabled: z.boolean(),
+  transport: z.string().default('stdio'),
+  command: z.string().default(''),
+  args: z.array(z.string()).default([]),
+  env_json: z.unknown().default({}),
+  url: z.string().default(''),
+  headers_json: z.unknown().default({}),
+  auth_kind: z.string().default('none'),
+  auth_ref: z.string().default(''),
+  sync_status: z.string().default('pending'),
+  last_error: z.string().default(''),
+  last_synced_at: z.number().int().nullable().default(null),
   tools: z.array(nucleusToolDescriptorSchema).default([]),
   resources: z.array(z.string()).default([])
+});
+
+export const mcpServerRecordSchema = z.object({
+  id: z.string(),
+  workspace_id: z.string(),
+  title: z.string(),
+  transport: z.string(),
+  command: z.string().default(''),
+  args: z.array(z.string()).default([]),
+  env_json: z.unknown().default({}),
+  url: z.string().default(''),
+  headers_json: z.unknown().default({}),
+  auth_kind: z.string().default('none'),
+  auth_ref: z.string().default(''),
+  enabled: z.boolean(),
+  sync_status: z.string(),
+  last_error: z.string().default(''),
+  last_synced_at: z.number().int().nullable(),
+  created_at: z.number().int(),
+  updated_at: z.number().int()
 });
 
 export const routerProfileSummarySchema = z.object({
@@ -679,22 +710,6 @@ export const diskStatSchema = z.object({
   total_bytes: z.number().int().nonnegative(),
   used_bytes: z.number().int().nonnegative(),
   available_bytes: z.number().int().nonnegative()
-});
-
-export const mcpServerRecordSchema = z.object({
-  id: z.string(),
-  workspace_id: z.string(),
-  title: z.string(),
-  transport: z.string(),
-  command: z.string(),
-  args: z.array(z.string()),
-  env_json: z.unknown(),
-  enabled: z.boolean(),
-  sync_status: z.string(),
-  last_error: z.string(),
-  last_synced_at: z.number().int().nullable(),
-  created_at: z.number().int(),
-  updated_at: z.number().int()
 });
 
 export const memoryEntrySchema = z.object({
