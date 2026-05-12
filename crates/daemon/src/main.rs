@@ -2929,6 +2929,20 @@ fn discover_prompt_sources(
     Ok(sources)
 }
 
+#[derive(Debug, Default)]
+struct SkillLayerCollection {
+    layers: Vec<CompiledPromptLayer>,
+    diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct InstalledSkillPackage {
+    package_id: String,
+    name: String,
+    instructions: String,
+    manifest_json: Value,
+}
+
 fn collect_skill_prompt_sources(
     state: &AppState,
     workspace: &WorkspaceSummary,
@@ -2942,24 +2956,21 @@ fn collect_skill_prompt_sources(
         return Ok(());
     }
 
-    let workspace_root = PathBuf::from(&workspace.root_path);
-    if !workspace_root.is_dir() {
-        return Ok(());
-    }
-    let workspace_root = fs::canonicalize(&workspace_root).map_err(|error| {
-        ApiError::internal_message(format!(
-            "failed to resolve workspace root '{}': {error}",
-            workspace.root_path
-        ))
-    })?;
+    let workspace_root = canonical_workspace_root(workspace)?;
+    let installed = installed_skill_packages_by_skill_id(state, session)?;
 
     for skill in state.store.list_skill_manifests()? {
-        if !skill_is_active_for_prompt(&skill, session, prompt) {
+        let packages = installed.get(&skill.id).cloned().unwrap_or_default();
+        if packages.is_empty() {
+            continue;
+        }
+        if skill_activation_match(&skill, &packages, prompt).is_none() {
             continue;
         }
 
         for include_path in &skill.include_paths {
-            let Some(path) = resolve_skill_include_path(&workspace_root, include_path) else {
+            let Some(path) = resolve_skill_include_path(&workspace_root, &skill.id, include_path)
+            else {
                 continue;
             };
 
@@ -2976,28 +2987,115 @@ fn collect_skill_prompt_sources(
     Ok(())
 }
 
-fn skill_is_active_for_prompt(
+fn canonical_workspace_root(workspace: &WorkspaceSummary) -> Result<PathBuf, ApiError> {
+    let workspace_root = PathBuf::from(&workspace.root_path);
+    if !workspace_root.is_dir() {
+        return Ok(workspace_root);
+    }
+    fs::canonicalize(&workspace_root).map_err(|error| {
+        ApiError::internal_message(format!(
+            "failed to resolve workspace root '{}': {error}",
+            workspace.root_path
+        ))
+    })
+}
+
+fn skill_activation_match(
     skill: &SkillManifest,
-    session: &SessionSummary,
+    packages: &[InstalledSkillPackage],
     prompt: &str,
-) -> bool {
-    if !skill.enabled || !skill_project_filter_matches(skill, session) {
-        return false;
+) -> Option<String> {
+    if !skill.enabled {
+        return None;
+    }
+    match skill.activation_mode.as_str() {
+        "always" => Some("always".to_string()),
+        "auto" => skill_match_reason(skill, packages, prompt, false),
+        "manual" => skill_match_reason(skill, packages, prompt, true),
+        _ => None,
+    }
+}
+
+fn skill_match_reason(
+    skill: &SkillManifest,
+    packages: &[InstalledSkillPackage],
+    prompt: &str,
+    exact_only: bool,
+) -> Option<String> {
+    let prompt_normalized = normalize_skill_match_text(prompt);
+    let prompt_lower = prompt.to_ascii_lowercase();
+
+    let exact_terms = [skill.id.as_str(), skill.title.as_str()]
+        .into_iter()
+        .map(normalize_skill_match_text)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    for term in &exact_terms {
+        if prompt_normalized.contains(term) {
+            return Some(format!("exact mention '{term}'"));
+        }
     }
 
-    match skill.activation_mode.as_str() {
-        "always" => true,
-        "auto" => {
-            let prompt = prompt.to_ascii_lowercase();
-            skill
-                .triggers
-                .iter()
-                .map(|trigger| trigger.trim().to_ascii_lowercase())
-                .filter(|trigger| !trigger.is_empty())
-                .any(|trigger| prompt.contains(&trigger))
-        }
-        _ => false,
+    let normalized_id = normalize_skill_match_text(&skill.id.replace(['-', '_', '.'], " "));
+    if !normalized_id.is_empty() && prompt_normalized.contains(&normalized_id) {
+        return Some(format!("normalized id '{normalized_id}'"));
     }
+
+    if exact_only {
+        return None;
+    }
+
+    for trigger in &skill.triggers {
+        let trigger = normalize_skill_match_text(trigger);
+        if !trigger.is_empty() && prompt_normalized.contains(&trigger) {
+            return Some(format!("trigger '{trigger}'"));
+        }
+    }
+
+    for package in packages {
+        for value in [
+            package.name.as_str(),
+            package.package_id.as_str(),
+            package
+                .manifest_json
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            package
+                .manifest_json
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            package
+                .manifest_json
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        ] {
+            let term = normalize_skill_match_text(value);
+            if !term.is_empty() && prompt_normalized.contains(&term) {
+                return Some(format!("package metadata '{term}'"));
+            }
+        }
+    }
+
+    let description = skill.description.to_ascii_lowercase();
+    description
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| token.len() >= 5)
+        .find(|token| prompt_lower.contains(*token))
+        .map(|token| format!("description token '{token}'"))
+}
+
+fn normalize_skill_match_text(value: &str) -> String {
+    value
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_alphanumeric() { ch } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn skill_project_filter_matches(skill: &SkillManifest, session: &SessionSummary) -> bool {
@@ -3018,24 +3116,123 @@ fn skill_project_filter_matches(skill: &SkillManifest, session: &SessionSummary)
     })
 }
 
-fn resolve_skill_include_path(workspace_root: &PathBuf, include_path: &str) -> Option<PathBuf> {
+fn installed_skill_packages_by_skill_id(
+    state: &AppState,
+    session: &SessionSummary,
+) -> Result<std::collections::BTreeMap<String, Vec<InstalledSkillPackage>>, ApiError> {
+    let packages = state.store.list_skill_packages()?;
+    let package_map = packages
+        .into_iter()
+        .map(|pkg| (pkg.id.clone(), pkg))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut installed = std::collections::BTreeMap::<String, Vec<InstalledSkillPackage>>::new();
+
+    for installation in state.store.list_skill_installations()? {
+        if !installation.enabled {
+            continue;
+        }
+        let Some(package) = package_map.get(&installation.package_id) else {
+            continue;
+        };
+        if !skill_installation_applies(&installation, session) {
+            continue;
+        }
+        if let Some(pinned) = installation.pinned_version.as_deref() {
+            if package.version != pinned {
+                continue;
+            }
+        }
+        let Some(skill_id) = package_skill_id(package) else {
+            continue;
+        };
+        installed
+            .entry(skill_id)
+            .or_default()
+            .push(InstalledSkillPackage {
+                package_id: package.id.clone(),
+                name: package.name.clone(),
+                instructions: package.instructions.clone(),
+                manifest_json: package.manifest_json.clone(),
+            });
+    }
+
+    Ok(installed)
+}
+
+fn package_skill_id(package: &SkillPackageRecord) -> Option<String> {
+    package
+        .manifest_json
+        .get("manifest_id")
+        .and_then(Value::as_str)
+        .or_else(|| package.manifest_json.get("id").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| package.id.strip_prefix("nucleus.").map(ToString::to_string))
+}
+
+fn skill_installation_applies(
+    installation: &SkillInstallationRecord,
+    session: &SessionSummary,
+) -> bool {
+    match installation.scope_kind.as_str() {
+        "workspace" => installation.scope_id == "workspace",
+        "project" => session
+            .projects
+            .iter()
+            .any(|project| installation.scope_id == project.id),
+        "session" => session.id == installation.scope_id,
+        _ => false,
+    }
+}
+
+fn resolve_skill_include_path(
+    workspace_root: &std::path::Path,
+    skill_id: &str,
+    include_path: &str,
+) -> Option<PathBuf> {
     let include_path = include_path.trim();
     if include_path.is_empty() {
         return None;
     }
 
-    let relative = PathBuf::from(include_path);
-    if relative.is_absolute() {
+    let raw_path = PathBuf::from(include_path);
+    let path = if raw_path.is_absolute() {
+        raw_path
+    } else {
+        workspace_root.join(raw_path)
+    };
+    let canonical = fs::canonicalize(path).ok()?;
+    if !canonical.is_file() {
         return None;
     }
-
-    let path = workspace_root.join(relative);
-    let canonical = fs::canonicalize(path).ok()?;
-    if canonical.is_file() && canonical.starts_with(workspace_root) {
+    if canonical.starts_with(workspace_root) || is_allowed_nucleus_skill_path(&canonical, skill_id)
+    {
         Some(canonical)
     } else {
         None
     }
+}
+
+fn is_allowed_nucleus_skill_path(path: &std::path::Path, skill_id: &str) -> bool {
+    if path.file_name().and_then(|name| name.to_str()) != Some("SKILL.md") {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if parent.file_name().and_then(|name| name.to_str()) != Some(skill_id) {
+        return false;
+    }
+    let Some(skills_dir) = parent.parent() else {
+        return false;
+    };
+    skills_dir.file_name().and_then(|name| name.to_str()) == Some("skills")
+        && skills_dir
+            .parent()
+            .and_then(|state_dir| state_dir.file_name())
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".nucleus"))
 }
 
 fn compile_session_turn(
@@ -3047,7 +3244,8 @@ fn compile_session_turn(
     compiler_role: &str,
 ) -> Result<CompiledTurn, ApiError> {
     let prompt_sources = discover_prompt_sources(state, session, prompt)?;
-    let skill_layers = collect_compiled_skill_layers(state, session, prompt)?;
+    let skill_collection = collect_compiled_skill_layers(state, session, prompt)?;
+    let skill_layers = skill_collection.layers;
     let mut mcp_catalog = state.store.list_mcp_servers()?;
     mcp_catalog.retain(|server| server.enabled);
     mcp_catalog.sort_by(|a, b| a.id.cmp(&b.id));
@@ -3067,6 +3265,7 @@ fn compile_session_turn(
     );
     compiled.debug_summary.include_count = prompt_sources.len();
     compiled.debug_summary.layer_count = compiled.skill_layers.len();
+    compiled.debug_summary.skill_diagnostics = skill_collection.diagnostics;
     compiled.debug_summary.summary = format!(
         "Compiled {} history turns for {} provider-neutral prompt with {} prompt includes, {} skill layers, {} MCP servers, and {} tools.",
         compiled.history.len(),
@@ -3083,94 +3282,118 @@ fn collect_compiled_skill_layers(
     state: &AppState,
     session: &SessionSummary,
     prompt: &str,
-) -> Result<Vec<CompiledPromptLayer>, ApiError> {
+) -> Result<SkillLayerCollection, ApiError> {
     let workspace = state.store.workspace()?;
-    let workspace_root = PathBuf::from(&workspace.root_path);
-    if !workspace_root.is_dir() {
-        return Ok(Vec::new());
-    }
-    let workspace_root = fs::canonicalize(&workspace_root).map_err(|error| {
-        ApiError::internal_message(format!(
-            "failed to resolve workspace root '{}': {error}",
-            workspace.root_path
-        ))
-    })?;
-
+    let workspace_root = canonical_workspace_root(&workspace)?;
     let mut layers = Vec::new();
-    let mut installed_skill_ids = std::collections::BTreeSet::new();
-    let packages = state.store.list_skill_packages()?;
-    let package_map = packages
-        .into_iter()
-        .map(|pkg| (pkg.id.clone(), pkg))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    for installation in state.store.list_skill_installations()? {
-        if !installation.enabled {
+    let mut diagnostics = Vec::new();
+    let mut seen_content = BTreeSet::new();
+    let installed = installed_skill_packages_by_skill_id(state, session)?;
+    for skill in state.store.list_skill_manifests()? {
+        let packages = installed.get(&skill.id).cloned().unwrap_or_default();
+        if !skill.enabled {
+            diagnostics.push(format!("skill {} skipped: disabled", skill.id));
             continue;
         }
-        let Some(package) = package_map.get(&installation.package_id) else {
-            continue;
-        };
-        let applies = match installation.scope_kind.as_str() {
-            "workspace" => installation.scope_id == "workspace",
-            "project" => session
-                .projects
-                .iter()
-                .any(|project| project.id == installation.scope_id),
-            "session" => session.id == installation.scope_id,
-            _ => false,
-        };
-        if !applies {
+        if packages.is_empty() {
+            diagnostics.push(format!(
+                "skill {} skipped: no enabled installation for this session",
+                skill.id
+            ));
             continue;
         }
-        if let Some(pinned) = installation.pinned_version.as_deref() {
-            if package.version != pinned {
+        if !skill_project_filter_matches(&skill, session) {
+            diagnostics.push(format!(
+                "skill {} skipped: project filter mismatch",
+                skill.id
+            ));
+            continue;
+        }
+        let Some(reason) = skill_activation_match(&skill, &packages, prompt) else {
+            diagnostics.push(format!(
+                "skill {} skipped: activation mode '{}' did not match trigger/title/id metadata",
+                skill.id, skill.activation_mode
+            ));
+            continue;
+        };
+        diagnostics.push(format!("skill {} selected: {}", skill.id, reason));
+        for package in &packages {
+            let content = package.instructions.trim();
+            if content.is_empty() {
+                diagnostics.push(format!(
+                    "skill {} package {} skipped: no package instructions",
+                    skill.id, package.package_id
+                ));
                 continue;
             }
-        }
-        if let Some(manifest_id) = package
-            .manifest_json
-            .get("manifest_id")
-            .and_then(|v| v.as_str())
-        {
-            installed_skill_ids.insert(manifest_id.to_string());
-        }
-    }
-    for skill in state.store.list_skill_manifests()? {
-        if !installed_skill_ids.is_empty() && !installed_skill_ids.contains(&skill.id) {
-            continue;
-        }
-        if !skill_is_active_for_prompt(&skill, session, prompt) {
-            continue;
+            if seen_content.insert(content.to_string()) {
+                layers.push(CompiledPromptLayer {
+                    id: format!("skill:{}:package:{}", skill.id, package.package_id),
+                    kind: "skill".to_string(),
+                    scope: "workspace".to_string(),
+                    title: skill.title.clone(),
+                    source_path: format!("skill-package:{}", package.package_id),
+                    content: package.instructions.clone(),
+                });
+                diagnostics.push(format!(
+                    "skill {} package {} loaded: package instructions",
+                    skill.id, package.package_id
+                ));
+            }
         }
         if !skill.instructions.trim().is_empty() {
-            layers.push(CompiledPromptLayer {
-                id: format!("skill:{}:instructions", skill.id),
-                kind: "skill".to_string(),
-                scope: "workspace".to_string(),
-                title: skill.title.clone(),
-                source_path: format!("skill:{}", skill.id),
-                content: skill.instructions.clone(),
-            });
+            let content = skill.instructions.trim().to_string();
+            if seen_content.insert(content) {
+                layers.push(CompiledPromptLayer {
+                    id: format!("skill:{}:instructions", skill.id),
+                    kind: "skill".to_string(),
+                    scope: "workspace".to_string(),
+                    title: skill.title.clone(),
+                    source_path: format!("skill:{}", skill.id),
+                    content: skill.instructions.clone(),
+                });
+                diagnostics.push(format!("skill {} loaded: manifest instructions", skill.id));
+            }
         }
         for include_path in &skill.include_paths {
-            let Some(path) = resolve_skill_include_path(&workspace_root, include_path) else {
+            let Some(path) = resolve_skill_include_path(&workspace_root, &skill.id, include_path)
+            else {
+                diagnostics.push(format!(
+                    "skill {} include rejected or missing: {}",
+                    skill.id, include_path
+                ));
                 continue;
             };
             let Ok(content) = fs::read_to_string(&path) else {
+                diagnostics.push(format!(
+                    "skill {} include unreadable: {}",
+                    skill.id,
+                    path.display()
+                ));
                 continue;
             };
-            layers.push(CompiledPromptLayer {
-                id: format!("skill:{}:{}", skill.id, include_path),
-                kind: "skill".to_string(),
-                scope: "workspace".to_string(),
-                title: skill.title.clone(),
-                source_path: path.display().to_string(),
-                content,
-            });
+            if seen_content.insert(content.trim().to_string()) {
+                layers.push(CompiledPromptLayer {
+                    id: format!("skill:{}:{}", skill.id, include_path),
+                    kind: "skill".to_string(),
+                    scope: "workspace".to_string(),
+                    title: skill.title.clone(),
+                    source_path: path.display().to_string(),
+                    content,
+                });
+                diagnostics.push(format!(
+                    "skill {} loaded: include {}",
+                    skill.id,
+                    path.display()
+                ));
+            }
         }
     }
     layers.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok(layers)
+    Ok(SkillLayerCollection {
+        layers,
+        diagnostics,
+    })
 }
 
 fn collect_prompt_sources_from_root(
@@ -4223,6 +4446,12 @@ mod tests {
                 enabled: true,
             })
             .expect("skill manifest should persist");
+        install_test_skill_package(
+            &store,
+            "rust",
+            "Rust",
+            "# Rust Skill\nPrefer small focused patches.\n",
+        );
         store
             .upsert_mcp_server(&McpServerSummary {
                 id: "mcp.docs".to_string(),
@@ -4356,6 +4585,7 @@ mod tests {
                 enabled: true,
             })
             .expect("skill manifest should persist");
+        install_test_skill_package(&store, "rust", "Rust", "");
 
         let (events, _) = broadcast::channel(4);
         let state = AppState {
@@ -4407,6 +4637,129 @@ mod tests {
         assert!(assembly.prompt.contains("Prefer small focused patches."));
         assert!(assembly.prompt.contains("[skill include:"));
 
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn skills_activate_on_title_id_manual_and_package_instructions() {
+        let state_dir = test_state_dir("skill-activation");
+        let store = initialize_test_store(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        store
+            .upsert_skill_manifest(&SkillManifest {
+                id: "emdash-site-architecture".to_string(),
+                title: "EmDash Site Architecture".to_string(),
+                description: "Design EmDash CMS sites".to_string(),
+                instructions: String::new(),
+                activation_mode: "auto".to_string(),
+                triggers: Vec::new(),
+                include_paths: Vec::new(),
+                required_tools: Vec::new(),
+                required_mcps: Vec::new(),
+                project_filters: Vec::new(),
+                enabled: true,
+            })
+            .expect("skill manifest should persist");
+        install_test_skill_package(
+            &store,
+            "emdash-site-architecture",
+            "EmDash Site Architecture",
+            "EMDASH_PACKAGE_INSTRUCTIONS",
+        );
+        let state = test_app_state(&store);
+        let session = test_session(&workspace_root);
+
+        let compiled = compile_session_turn(
+            &state,
+            &session,
+            &[],
+            "I'd like to work on EmDash Site Architecture with a particular repo i have in mind",
+            &[],
+            "main",
+        )
+        .expect("compiled turn should build");
+        assert_eq!(compiled.skill_layers.len(), 1);
+        assert!(
+            compiled.skill_layers[0]
+                .content
+                .contains("EMDASH_PACKAGE_INSTRUCTIONS")
+        );
+        assert!(compiled.debug_summary.skill_diagnostics.iter().any(|line| {
+            line.contains("emdash-site-architecture selected") && line.contains("exact mention")
+        }));
+
+        let compiled = compile_session_turn(
+            &state,
+            &session,
+            &[],
+            "Use emdash-site-architecture for this repo",
+            &[],
+            "main",
+        )
+        .expect("compiled turn should build");
+        assert_eq!(compiled.skill_layers.len(), 1);
+
+        store
+            .upsert_skill_manifest(&SkillManifest {
+                id: "manual-skill".to_string(),
+                title: "Manual Skill".to_string(),
+                description: String::new(),
+                instructions: String::new(),
+                activation_mode: "manual".to_string(),
+                triggers: vec!["loose".to_string()],
+                include_paths: Vec::new(),
+                required_tools: Vec::new(),
+                required_mcps: Vec::new(),
+                project_filters: Vec::new(),
+                enabled: true,
+            })
+            .expect("manual manifest should persist");
+        install_test_skill_package(
+            &store,
+            "manual-skill",
+            "Manual Skill",
+            "MANUAL_INSTRUCTIONS",
+        );
+        let compiled = compile_session_turn(
+            &state,
+            &session,
+            &[],
+            "Please use Manual Skill exactly",
+            &[],
+            "main",
+        )
+        .expect("compiled turn should build");
+        assert!(
+            compiled
+                .skill_layers
+                .iter()
+                .any(|layer| layer.content.contains("MANUAL_INSTRUCTIONS"))
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn skill_include_resolution_allows_nucleus_skill_root_and_rejects_other_absolute_paths() {
+        let state_dir = test_state_dir("skill-include-security");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let skill_dir = state_dir
+            .join(".nucleus-eba")
+            .join("skills")
+            .join("safe-skill");
+        fs::create_dir_all(&skill_dir).expect("nucleus skill dir should exist");
+        let skill_file = skill_dir.join("SKILL.md");
+        fs::write(&skill_file, "SAFE").expect("skill file should write");
+        assert!(
+            resolve_skill_include_path(
+                &workspace_root,
+                "safe-skill",
+                &skill_file.display().to_string()
+            )
+            .is_some()
+        );
+        assert!(resolve_skill_include_path(&workspace_root, "safe-skill", "/etc/passwd").is_none());
         let _ = fs::remove_dir_all(&state_dir);
     }
 
@@ -4736,6 +5089,87 @@ mod tests {
             .expect("time should be monotonic")
             .as_nanos();
         std::env::temp_dir().join(format!("nucleus-{label}-{}-{suffix}", std::process::id()))
+    }
+
+    fn install_test_skill_package(
+        store: &Arc<StateStore>,
+        skill_id: &str,
+        name: &str,
+        instructions: &str,
+    ) {
+        let package_id = format!("nucleus.{skill_id}");
+        store
+            .upsert_skill_package(&SkillPackageRecord {
+                id: package_id.clone(),
+                name: name.to_string(),
+                version: "1.0.0".to_string(),
+                manifest_json: json!({"id": skill_id, "title": name, "name": name}),
+                instructions: instructions.to_string(),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .expect("skill package should persist");
+        store
+            .upsert_skill_installation(&SkillInstallationRecord {
+                id: format!("workspace.{package_id}"),
+                package_id,
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                enabled: true,
+                pinned_version: None,
+                created_at: 0,
+                updated_at: 0,
+            })
+            .expect("skill installation should persist");
+    }
+
+    fn test_app_state(store: &Arc<StateStore>) -> AppState {
+        let (events, _) = broadcast::channel(4);
+        AppState {
+            version: "test".to_string(),
+            store: store.clone(),
+            host: Arc::new(HostEngine::new()),
+            runtimes: Arc::new(RuntimeManager::default()),
+            updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            agent: Arc::new(agent::AgentRuntime::default()),
+            web_dist_dir: None,
+            tailscale_dns_name: None,
+            events,
+        }
+    }
+
+    fn test_session(workspace_root: &std::path::Path) -> SessionSummary {
+        SessionSummary {
+            id: "session-test".to_string(),
+            title: "Test".to_string(),
+            profile_id: String::new(),
+            profile_title: String::new(),
+            route_id: String::new(),
+            route_title: String::new(),
+            project_id: String::new(),
+            project_title: String::new(),
+            project_path: workspace_root.display().to_string(),
+            provider: "openai_compatible".to_string(),
+            model: "gpt-5.4-mini".to_string(),
+            provider_base_url: "http://127.0.0.1:20128/v1".to_string(),
+            provider_api_key: String::new(),
+            working_dir: workspace_root.display().to_string(),
+            working_dir_kind: "workspace".to_string(),
+            scope: "workspace".to_string(),
+            approval_mode: "ask".to_string(),
+            execution_mode: "act".to_string(),
+            run_budget_mode: "inherit".to_string(),
+            run_budget: RunBudgetSummary::default(),
+            project_count: 0,
+            projects: Vec::new(),
+            state: "active".to_string(),
+            provider_session_id: String::new(),
+            last_error: String::new(),
+            last_message_excerpt: String::new(),
+            turn_count: 0,
+            created_at: 0,
+            updated_at: 0,
+        }
     }
 
     fn initialize_test_store(state_dir: &std::path::Path) -> Arc<StateStore> {
