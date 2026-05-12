@@ -125,6 +125,19 @@
     }
   }
 
+
+  function mcpHealth(server: McpServerRecord) {
+    const lastError = (server.last_error || '').toLowerCase();
+    if (!server.enabled) return { label: 'Disabled', variant: 'secondary' as const, detail: '' };
+    if (server.sync_status === 'missing_credentials' || lastError.includes('missing_credentials')) return { label: 'Auth missing', variant: 'destructive' as const, detail: 'Set the configured secret reference and rediscover.' };
+    if (server.sync_status === 'auth_required' || lastError.includes('auth_required')) return { label: 'Auth required', variant: 'destructive' as const, detail: 'Interactive auth is required before this MCP can be used.' };
+    if (server.sync_status === 'ready') return { label: 'Enabled', variant: 'default' as const, detail: '' };
+    if (server.sync_status === 'pending') return { label: 'Pending', variant: 'secondary' as const, detail: '' };
+    if (server.sync_status === 'unsupported_transport' || lastError.includes('unsupported_transport')) return { label: 'Unsupported', variant: 'destructive' as const, detail: server.last_error };
+    if (server.sync_status === 'error') return { label: 'Error', variant: 'destructive' as const, detail: server.last_error };
+    return { label: server.sync_status || 'Pending', variant: 'secondary' as const, detail: server.last_error };
+  }
+
   onMount(load);
 </script>
 
@@ -152,14 +165,14 @@
           <WorkspaceEmptyState message="No MCP servers configured yet." />
         {:else}
           {#each servers as server}
+            {@const health = mcpHealth(server)}
             <div class="rounded-lg border border-zinc-800 bg-zinc-950/40 p-4">
               <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div class="min-w-0 space-y-2">
                   <div class="flex flex-wrap items-center gap-2">
                     <div class="font-medium text-zinc-50">{server.title}</div>
-                    <Badge variant={server.enabled ? 'default' : 'secondary'}>{server.enabled ? 'Enabled' : 'Disabled'}</Badge>
+                    <Badge variant={health.variant}>{health.label}</Badge>
                     <Badge variant="secondary">{server.transport}</Badge>
-                    <Badge variant="secondary">{server.sync_status}</Badge>
                   </div>
                   <div class="text-xs text-zinc-500">{server.id}</div>
                   <div class="text-sm text-zinc-300 break-all">{server.transport === 'stdio' ? server.command || 'No command set.' : server.url || 'No URL set.'}</div>
@@ -167,8 +180,8 @@
                     <div><span class="text-zinc-500">Args/Auth:</span> {server.transport === 'stdio' ? server.args.join(' ') || '—' : `${server.auth_kind}${server.auth_ref ? ` (${server.auth_ref})` : ''}`}</div>
                     <div><span class="text-zinc-500">Last synced:</span> {server.last_synced_at ?? 'Never'}</div>
                   </div>
-                  {#if server.last_error}
-                    <div class="text-xs text-red-300">{server.last_error}</div>
+                  {#if health.detail}
+                    <div class="text-xs text-zinc-500">{health.detail}</div>
                   {/if}
                 </div>
                 <div class="flex flex-wrap gap-2">
