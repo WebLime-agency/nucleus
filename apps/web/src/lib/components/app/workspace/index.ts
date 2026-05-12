@@ -5,3 +5,12 @@ export { default as WorkspaceSegmentedControl } from './workspace-segmented-cont
 export { default as WorkspaceStatCard } from './workspace-stat-card.svelte';
 export { default as WorkspaceInfoTile } from './workspace-info-tile.svelte';
 export { default as WorkspaceNoteGrid } from './workspace-note-grid.svelte';
+export { default as WorkspaceStoragePathCard } from './workspace-storage-path-card.svelte';
+export { default as WorkspaceCoreGrid } from './workspace-core-grid.svelte';
+export { default as WorkspaceCompatibilityCard } from './workspace-compatibility-card.svelte';
+export { default as WorkspaceUpdateBehaviorCard } from './workspace-update-behavior-card.svelte';
+export { default as WorkspaceUpdateTargetCard } from './workspace-update-target-card.svelte';
+export { default as WorkspaceUpdateStatusGrid } from './workspace-update-status-grid.svelte';
+export { default as WorkspaceConnectionCard } from './workspace-connection-card.svelte';
+export { default as WorkspaceAccessCard } from './workspace-access-card.svelte';
+export { default as WorkspaceUpdateControlsCard } from './workspace-update-controls-card.svelte';
