@@ -701,14 +701,15 @@ impl StateStore {
         connection.execute(
             "
             INSERT INTO skill_manifests (
-                id, title, description, activation_mode, triggers_json,
+                id, title, description, instructions, activation_mode, triggers_json,
                 include_paths_json, required_tools_json, required_mcps_json,
                 project_filters_json, enabled
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 description = excluded.description,
+                instructions = excluded.instructions,
                 activation_mode = excluded.activation_mode,
                 triggers_json = excluded.triggers_json,
                 include_paths_json = excluded.include_paths_json,
@@ -722,6 +723,7 @@ impl StateStore {
                 manifest.id,
                 manifest.title,
                 manifest.description,
+                manifest.instructions,
                 manifest.activation_mode,
                 serde_json::to_string(&manifest.triggers)?,
                 serde_json::to_string(&manifest.include_paths)?,
@@ -2605,6 +2607,13 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
 
     ensure_column(
         connection,
+        "skill_manifests",
+        "instructions",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+
+    ensure_column(
+        connection,
         "mcp_servers",
         "workspace_id",
         "TEXT NOT NULL DEFAULT 'workspace'",
@@ -4339,7 +4348,7 @@ fn load_skill_manifest(connection: &Connection, id: &str) -> Result<SkillManifes
         .query_row(
             "
             SELECT
-                id, title, description, activation_mode, triggers_json,
+                id, title, description, instructions, activation_mode, triggers_json,
                 include_paths_json, required_tools_json, required_mcps_json,
                 project_filters_json, enabled
             FROM skill_manifests
@@ -4357,13 +4366,14 @@ fn map_skill_manifest(row: &rusqlite::Row<'_>) -> rusqlite::Result<SkillManifest
         id: row.get(0)?,
         title: row.get(1)?,
         description: row.get(2)?,
-        activation_mode: row.get(3)?,
-        triggers: decode_string_vec_column(row, 4)?,
-        include_paths: decode_string_vec_column(row, 5)?,
-        required_tools: decode_string_vec_column(row, 6)?,
-        required_mcps: decode_string_vec_column(row, 7)?,
-        project_filters: decode_string_vec_column(row, 8)?,
-        enabled: row.get::<_, i64>(9)? != 0,
+        instructions: row.get(3)?,
+        activation_mode: row.get(4)?,
+        triggers: decode_string_vec_column(row, 5)?,
+        include_paths: decode_string_vec_column(row, 6)?,
+        required_tools: decode_string_vec_column(row, 7)?,
+        required_mcps: decode_string_vec_column(row, 8)?,
+        project_filters: decode_string_vec_column(row, 9)?,
+        enabled: row.get::<_, i64>(10)? != 0,
     })
 }
 
@@ -6878,6 +6888,7 @@ mod skills_mcp_phase2_tests {
             id: "skill.manifest.docs".to_string(),
             title: "Docs Skill".to_string(),
             description: "Helps with docs".to_string(),
+            instructions: String::new(),
             activation_mode: "manual".to_string(),
             triggers: vec!["docs".to_string()],
             include_paths: vec!["docs/**".to_string()],

@@ -556,7 +556,11 @@ async fn router_profiles(
 }
 
 async fn list_skills(State(state): State<AppState>) -> Result<Json<Vec<SkillManifest>>, ApiError> {
-    Ok(Json(state.store.list_skill_manifests()?))
+    let mut skills = state.store.list_skill_manifests()?;
+    for skill in &mut skills {
+        hydrate_skill_instructions_from_include(skill);
+    }
+    Ok(Json(skills))
 }
 
 async fn upsert_skill(
@@ -564,6 +568,7 @@ async fn upsert_skill(
     body: Bytes,
 ) -> Result<Json<SkillManifest>, ApiError> {
     let payload = sanitize_skill_manifest(decode_json::<SkillManifest>(&body)?)?;
+    sync_skill_instructions_to_file(&payload);
     Ok(Json(state.store.upsert_skill_manifest(&payload)?))
 }
 
@@ -574,6 +579,7 @@ async fn upsert_skill_by_id(
 ) -> Result<Json<SkillManifest>, ApiError> {
     let mut payload = sanitize_skill_manifest(decode_json::<SkillManifest>(&body)?)?;
     payload.id = sanitize_registry_id(&skill_id, "skill id")?;
+    sync_skill_instructions_to_file(&payload);
     Ok(Json(state.store.upsert_skill_manifest(&payload)?))
 }
 
@@ -2296,10 +2302,45 @@ fn sanitize_workspace_model_config(
     })
 }
 
+fn hydrate_skill_instructions_from_include(skill: &mut SkillManifest) {
+    if !skill.instructions.trim().is_empty() {
+        return;
+    }
+    let Some(path) = skill_instruction_path(skill) else {
+        return;
+    };
+    if let Ok(content) = fs::read_to_string(path) {
+        skill.instructions = content;
+    }
+}
+
+fn sync_skill_instructions_to_file(skill: &SkillManifest) {
+    if skill.instructions.trim().is_empty() {
+        return;
+    }
+    let Some(path) = skill_instruction_path(skill) else {
+        return;
+    };
+    let _ = fs::write(path, &skill.instructions);
+}
+
+fn skill_instruction_path(skill: &SkillManifest) -> Option<PathBuf> {
+    skill.include_paths.iter().find_map(|include_path| {
+        let path = PathBuf::from(include_path.trim());
+        if path.is_absolute() && path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md")
+        {
+            Some(path)
+        } else {
+            None
+        }
+    })
+}
+
 fn sanitize_skill_manifest(mut manifest: SkillManifest) -> Result<SkillManifest, ApiError> {
     manifest.id = sanitize_registry_id(&manifest.id, "skill id")?;
     manifest.title = required_trimmed(manifest.title, "skill title")?;
     manifest.description = manifest.description.trim().to_string();
+    manifest.instructions = manifest.instructions.trim().to_string();
     manifest.activation_mode = match manifest.activation_mode.trim() {
         "always" | "auto" | "manual" => manifest.activation_mode.trim().to_string(),
         _ => {
@@ -3100,6 +3141,16 @@ fn collect_compiled_skill_layers(
         }
         if !skill_is_active_for_prompt(&skill, session, prompt) {
             continue;
+        }
+        if !skill.instructions.trim().is_empty() {
+            layers.push(CompiledPromptLayer {
+                id: format!("skill:{}:instructions", skill.id),
+                kind: "skill".to_string(),
+                scope: "workspace".to_string(),
+                title: skill.title.clone(),
+                source_path: format!("skill:{}", skill.id),
+                content: skill.instructions.clone(),
+            });
         }
         for include_path in &skill.include_paths {
             let Some(path) = resolve_skill_include_path(&workspace_root, include_path) else {
@@ -4162,6 +4213,7 @@ mod tests {
                 id: "rust".to_string(),
                 title: "Rust".to_string(),
                 description: "Rust conventions".to_string(),
+                instructions: String::new(),
                 activation_mode: "auto".to_string(),
                 triggers: vec!["cargo".to_string()],
                 include_paths: vec!["skills/rust.md".to_string()],
@@ -4294,6 +4346,7 @@ mod tests {
                 id: "rust".to_string(),
                 title: "Rust".to_string(),
                 description: "Rust conventions".to_string(),
+                instructions: String::new(),
                 activation_mode: "auto".to_string(),
                 triggers: vec!["cargo".to_string()],
                 include_paths: vec!["skills/rust.md".to_string()],
