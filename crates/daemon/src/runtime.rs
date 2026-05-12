@@ -218,6 +218,7 @@ pub(crate) fn compiled_turn_from_prompt(
                 "Compiled {} history turns for {} provider-neutral prompt with {} skill layers, {} MCP servers, and {} tools.",
                 compiled_history.len(), role, skill_layers.len(), mcp_catalog.len(), tool_catalog.len()
             ),
+            skill_diagnostics: Vec::new(),
         },
     }
 }

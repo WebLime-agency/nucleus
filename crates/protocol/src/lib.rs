@@ -490,6 +490,8 @@ pub struct CompiledTurnDebugSummary {
     pub tool_count: usize,
     pub layer_count: usize,
     pub summary: String,
+    #[serde(default)]
+    pub skill_diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
