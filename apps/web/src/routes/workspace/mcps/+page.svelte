@@ -27,6 +27,10 @@
     command: '',
     args: [],
     env_json: {},
+    url: '',
+    headers_json: {},
+    auth_kind: 'none',
+    auth_ref: '',
     enabled: true,
     sync_status: 'pending',
     last_error: '',
@@ -46,6 +50,10 @@
           command: '',
           args: [],
           env_json: {},
+          url: '',
+          headers_json: {},
+          auth_kind: 'none',
+          auth_ref: '',
           enabled: true,
           sync_status: 'pending',
           last_error: '',
@@ -154,9 +162,9 @@
                     <Badge variant="secondary">{server.sync_status}</Badge>
                   </div>
                   <div class="text-xs text-zinc-500">{server.id}</div>
-                  <div class="text-sm text-zinc-300 break-all">{server.command || 'No command set.'}</div>
+                  <div class="text-sm text-zinc-300 break-all">{server.transport === 'stdio' ? server.command || 'No command set.' : server.url || 'No URL set.'}</div>
                   <div class="grid gap-2 text-xs text-zinc-400 sm:grid-cols-2">
-                    <div><span class="text-zinc-500">Args:</span> {server.args.join(' ') || '—'}</div>
+                    <div><span class="text-zinc-500">Args/Auth:</span> {server.transport === 'stdio' ? server.args.join(' ') || '—' : `${server.auth_kind}${server.auth_ref ? ` (${server.auth_ref})` : ''}`}</div>
                     <div><span class="text-zinc-500">Last synced:</span> {server.last_synced_at ?? 'Never'}</div>
                   </div>
                   {#if server.last_error}
@@ -187,10 +195,17 @@
       <CardContent class="space-y-4">
         <div class="space-y-1"><Label for="mcp-id">ID</Label><Input id="mcp-id" bind:value={form.id} /></div>
         <div class="space-y-1"><Label for="mcp-title">Title</Label><Input id="mcp-title" bind:value={form.title} /></div>
-        <div class="space-y-1"><Label for="mcp-transport">Transport</Label><Input id="mcp-transport" bind:value={form.transport} /></div>
+        <div class="space-y-1"><Label for="mcp-transport">Transport</Label><select id="mcp-transport" class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100" bind:value={form.transport}><option value="stdio">stdio</option><option value="streamable-http">streamable-http</option><option value="http">http</option><option value="sse">sse (unsupported)</option></select></div>
+        {#if form.transport === 'stdio'}
         <div class="space-y-1"><Label for="mcp-command">Command</Label><Input id="mcp-command" bind:value={form.command} /></div>
         <div class="space-y-1"><Label for="mcp-args">Args</Label><Textarea id="mcp-args" value={form.args.join('\n')} oninput={(event) => (form.args = parseList((event.currentTarget as HTMLTextAreaElement).value))} rows={3} /></div>
         <div class="space-y-1"><Label for="mcp-env">Env JSON</Label><Textarea id="mcp-env" value={JSON.stringify(form.env_json, null, 2)} oninput={(event) => (form.env_json = parseEnv((event.currentTarget as HTMLTextAreaElement).value))} rows={5} /></div>
+        {:else}
+        <div class="space-y-1"><Label for="mcp-url">Remote URL</Label><Input id="mcp-url" bind:value={form.url} /></div>
+        <div class="space-y-1"><Label for="mcp-auth-kind">Auth mode</Label><select id="mcp-auth-kind" class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100" bind:value={form.auth_kind}><option value="none">none</option><option value="static_headers">static headers</option><option value="bearer_env">bearer from env</option><option value="oauth">oauth/device (future)</option></select></div>
+        <div class="space-y-1"><Label for="mcp-auth-ref">Auth ref</Label><Input id="mcp-auth-ref" bind:value={form.auth_ref} placeholder="ENV_VAR_NAME or future secret ref" /></div>
+        <div class="space-y-1"><Label for="mcp-headers">Headers JSON</Label><Textarea id="mcp-headers" value={JSON.stringify(form.headers_json, null, 2)} oninput={(event) => (form.headers_json = parseEnv((event.currentTarget as HTMLTextAreaElement).value))} rows={4} /></div>
+        {/if}
         <label class="flex items-center gap-2 text-sm text-zinc-300"><input type="checkbox" bind:checked={form.enabled} /> Enabled</label>
         <div class="flex gap-2">
           <Button onclick={save} disabled={saving || !form.id || !form.title}>{saving ? 'Saving…' : 'Save MCP'}</Button>

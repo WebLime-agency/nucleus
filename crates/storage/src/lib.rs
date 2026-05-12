@@ -764,32 +764,90 @@ impl StateStore {
                 .map(|value| value.workspace_id.clone())
                 .unwrap_or_else(|| "workspace".to_string()),
             title: server.title.clone(),
-            transport: existing
-                .as_ref()
-                .map(|value| value.transport.clone())
-                .unwrap_or_else(|| "stdio".to_string()),
-            command: existing
-                .as_ref()
-                .map(|value| value.command.clone())
-                .unwrap_or_default(),
-            args: existing
-                .as_ref()
-                .map(|value| value.args.clone())
-                .unwrap_or_default(),
-            env_json: existing
-                .as_ref()
-                .map(|value| value.env_json.clone())
-                .unwrap_or_else(|| json!({})),
+            transport: if server.transport.is_empty() {
+                existing
+                    .as_ref()
+                    .map(|value| value.transport.clone())
+                    .unwrap_or_else(|| "stdio".to_string())
+            } else {
+                server.transport.clone()
+            },
+            command: if server.command.is_empty() {
+                existing
+                    .as_ref()
+                    .map(|value| value.command.clone())
+                    .unwrap_or_default()
+            } else {
+                server.command.clone()
+            },
+            args: if server.args.is_empty() {
+                existing
+                    .as_ref()
+                    .map(|value| value.args.clone())
+                    .unwrap_or_default()
+            } else {
+                server.args.clone()
+            },
+            env_json: if server.env_json.is_null() {
+                existing
+                    .as_ref()
+                    .map(|value| value.env_json.clone())
+                    .unwrap_or_else(|| json!({}))
+            } else {
+                server.env_json.clone()
+            },
+            url: if server.url.is_empty() {
+                existing
+                    .as_ref()
+                    .map(|value| value.url.clone())
+                    .unwrap_or_default()
+            } else {
+                server.url.clone()
+            },
+            headers_json: if server.headers_json.is_null() {
+                existing
+                    .as_ref()
+                    .map(|value| value.headers_json.clone())
+                    .unwrap_or_else(|| json!({}))
+            } else {
+                server.headers_json.clone()
+            },
+            auth_kind: if server.auth_kind.is_empty() {
+                existing
+                    .as_ref()
+                    .map(|value| value.auth_kind.clone())
+                    .unwrap_or_else(|| "none".to_string())
+            } else {
+                server.auth_kind.clone()
+            },
+            auth_ref: if server.auth_ref.is_empty() {
+                existing
+                    .as_ref()
+                    .map(|value| value.auth_ref.clone())
+                    .unwrap_or_default()
+            } else {
+                server.auth_ref.clone()
+            },
             enabled: server.enabled,
-            sync_status: existing
-                .as_ref()
-                .map(|value| value.sync_status.clone())
-                .unwrap_or_else(|| "pending".to_string()),
-            last_error: existing
-                .as_ref()
-                .map(|value| value.last_error.clone())
-                .unwrap_or_default(),
-            last_synced_at: existing.as_ref().and_then(|value| value.last_synced_at),
+            sync_status: if server.sync_status.is_empty() {
+                existing
+                    .as_ref()
+                    .map(|value| value.sync_status.clone())
+                    .unwrap_or_else(|| "pending".to_string())
+            } else {
+                server.sync_status.clone()
+            },
+            last_error: if server.last_error.is_empty() {
+                existing
+                    .as_ref()
+                    .map(|value| value.last_error.clone())
+                    .unwrap_or_default()
+            } else {
+                server.last_error.clone()
+            },
+            last_synced_at: server
+                .last_synced_at
+                .or_else(|| existing.as_ref().and_then(|value| value.last_synced_at)),
             created_at: existing.as_ref().map(|value| value.created_at).unwrap_or(0),
             updated_at: existing.as_ref().map(|value| value.updated_at).unwrap_or(0),
         };
@@ -2300,6 +2358,10 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             command TEXT NOT NULL DEFAULT '',
             args_json TEXT NOT NULL DEFAULT '[]',
             env_json TEXT NOT NULL DEFAULT '{}',
+            url TEXT NOT NULL DEFAULT '',
+            headers_json TEXT NOT NULL DEFAULT '{}',
+            auth_kind TEXT NOT NULL DEFAULT 'none',
+            auth_ref TEXT NOT NULL DEFAULT '',
             enabled INTEGER NOT NULL DEFAULT 1,
             sync_status TEXT NOT NULL DEFAULT 'pending',
             last_error TEXT NOT NULL DEFAULT '',
@@ -2571,6 +2633,26 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "env_json",
         "TEXT NOT NULL DEFAULT '{}'",
     )?;
+    ensure_column(connection, "mcp_servers", "url", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(
+        connection,
+        "mcp_servers",
+        "headers_json",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )?;
+    ensure_column(
+        connection,
+        "mcp_servers",
+        "auth_kind",
+        "TEXT NOT NULL DEFAULT 'none'",
+    )?;
+    ensure_column(
+        connection,
+        "mcp_servers",
+        "auth_ref",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+
     ensure_column(
         connection,
         "mcp_servers",
@@ -2584,6 +2666,8 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "TEXT NOT NULL DEFAULT ''",
     )?;
     ensure_column(connection, "mcp_servers", "last_synced_at", "INTEGER")?;
+
+    migrate_mcp_remote_bridge_records(connection)?;
 
     ensure_column(
         connection,
@@ -3093,6 +3177,78 @@ fn ensure_local_auth_token_with_connection(
         write_token_file(&token_path, &token_value)?;
     }
 
+    Ok(())
+}
+
+fn migrate_mcp_remote_bridge_records(connection: &Connection) -> Result<()> {
+    let known = [
+        (
+            "cloudflare-api",
+            "https://mcp.cloudflare.com/mcp",
+            "bearer_env",
+            "CLOUDFLARE_API_TOKEN",
+        ),
+        (
+            "cloudflare-bindings",
+            "https://bindings.mcp.cloudflare.com/mcp",
+            "bearer_env",
+            "CLOUDFLARE_API_TOKEN",
+        ),
+        (
+            "cloudflare-builds",
+            "https://builds.mcp.cloudflare.com/mcp",
+            "bearer_env",
+            "CLOUDFLARE_API_TOKEN",
+        ),
+        (
+            "cloudflare-docs",
+            "https://docs.mcp.cloudflare.com/mcp",
+            "none",
+            "",
+        ),
+        (
+            "cloudflare-observability",
+            "https://observability.mcp.cloudflare.com/mcp",
+            "bearer_env",
+            "CLOUDFLARE_API_TOKEN",
+        ),
+        ("context7", "https://mcp.context7.com/mcp", "none", ""),
+        ("emdash-docs", "https://docs.emdashcms.com/mcp", "none", ""),
+        (
+            "supabase",
+            "https://mcp.supabase.com/mcp",
+            "bearer_env",
+            "SUPABASE_ACCESS_TOKEN",
+        ),
+        (
+            "vercel",
+            "https://mcp.vercel.com",
+            "bearer_env",
+            "VERCEL_TOKEN",
+        ),
+    ];
+    for (id, url, auth_kind, auth_ref) in known {
+        connection.execute(
+            "
+            UPDATE mcp_servers
+            SET transport = 'streamable-http',
+                url = ?2,
+                command = '',
+                args_json = '[]',
+                auth_kind = ?3,
+                auth_ref = ?4,
+                headers_json = COALESCE(NULLIF(headers_json, ''), '{}'),
+                sync_status = CASE WHEN ?3 = 'none' THEN 'pending' ELSE 'missing_credentials' END,
+                last_error = CASE WHEN ?3 = 'none' THEN '' ELSE 'missing_credentials: configure native MCP credentials' END,
+                updated_at = unixepoch()
+            WHERE id = ?1
+              AND transport = 'stdio'
+              AND command = 'npx'
+              AND args_json LIKE '%mcp-remote%'
+            ",
+            params![id, url, auth_kind, auth_ref],
+        )?;
+    }
     Ok(())
 }
 
@@ -4251,7 +4407,7 @@ fn load_mcp_server(connection: &Connection, id: &str) -> Result<McpServerSummary
     connection
         .query_row(
             "
-            SELECT id, title, enabled, tools_json, resources_json
+            SELECT id, title, enabled, transport, command, args_json, env_json, url, headers_json, auth_kind, auth_ref, sync_status, last_error, last_synced_at, tools_json, resources_json
             FROM mcp_servers
             WHERE id = ?1
             ",
@@ -4267,7 +4423,7 @@ fn load_mcp_server_record(connection: &Connection, id: &str) -> Result<McpServer
         .query_row(
             "
             SELECT
-                id, workspace_id, title, transport, command, args_json, env_json, enabled,
+                id, workspace_id, title, transport, command, args_json, env_json, url, headers_json, auth_kind, auth_ref, enabled,
                 sync_status, last_error, last_synced_at, created_at, updated_at
             FROM mcp_servers
             WHERE id = ?1
@@ -4280,8 +4436,8 @@ fn load_mcp_server_record(connection: &Connection, id: &str) -> Result<McpServer
 }
 
 fn map_mcp_server(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpServerSummary> {
-    let tools_json: String = row.get(3)?;
-    let resources_json: String = row.get(4)?;
+    let tools_json: String = row.get(14)?;
+    let resources_json: String = row.get(15)?;
     let tools = serde_json::from_str(&tools_json).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
     })?;
@@ -4293,6 +4449,17 @@ fn map_mcp_server(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpServerSummary>
         id: row.get(0)?,
         title: row.get(1)?,
         enabled: row.get::<_, i64>(2)? != 0,
+        transport: row.get(3)?,
+        command: row.get(4)?,
+        args: decode_string_list(row.get::<_, String>(5)?)?,
+        env_json: decode_json_value(row.get::<_, String>(6)?)?,
+        url: row.get(7)?,
+        headers_json: redact_mcp_headers(decode_json_value(row.get::<_, String>(8)?)?),
+        auth_kind: row.get(9)?,
+        auth_ref: row.get(10)?,
+        sync_status: row.get(11)?,
+        last_error: row.get(12)?,
+        last_synced_at: row.get(13)?,
         tools,
         resources,
     })
@@ -4307,13 +4474,33 @@ fn map_mcp_server_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpServerR
         command: row.get(4)?,
         args: decode_string_list(row.get::<_, String>(5)?)?,
         env_json: decode_json_value(row.get::<_, String>(6)?)?,
-        enabled: row.get::<_, i64>(7)? != 0,
-        sync_status: row.get(8)?,
-        last_error: row.get(9)?,
-        last_synced_at: row.get(10)?,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
+        url: row.get(7)?,
+        headers_json: decode_json_value(row.get::<_, String>(8)?)?,
+        auth_kind: row.get(9)?,
+        auth_ref: row.get(10)?,
+        enabled: row.get::<_, i64>(11)? != 0,
+        sync_status: row.get(12)?,
+        last_error: row.get(13)?,
+        last_synced_at: row.get(14)?,
+        created_at: row.get(15)?,
+        updated_at: row.get(16)?,
     })
+}
+
+fn redact_mcp_headers(mut value: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = value.as_object_mut() {
+        for (key, val) in object.iter_mut() {
+            let k = key.to_ascii_lowercase();
+            if k.contains("authorization")
+                || k.contains("token")
+                || k.contains("key")
+                || k.contains("cookie")
+            {
+                *val = serde_json::Value::String("[redacted]".to_string());
+            }
+        }
+    }
+    value
 }
 
 fn upsert_mcp_server_record_only(
@@ -4325,12 +4512,12 @@ fn upsert_mcp_server_record_only(
     connection.execute(
         "
         INSERT INTO mcp_servers (
-            id, workspace_id, title, transport, command, args_json, env_json, enabled,
+            id, workspace_id, title, transport, command, args_json, env_json, url, headers_json, auth_kind, auth_ref, enabled,
             sync_status, last_error, last_synced_at, tools_json, resources_json, created_at, updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-            COALESCE(NULLIF(?14, 0), unixepoch()),
-            COALESCE(NULLIF(?15, 0), unixepoch()))
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+            COALESCE(NULLIF(?18, 0), unixepoch()),
+            COALESCE(NULLIF(?19, 0), unixepoch()))
         ON CONFLICT(id) DO UPDATE SET
             workspace_id = excluded.workspace_id,
             title = excluded.title,
@@ -4338,6 +4525,10 @@ fn upsert_mcp_server_record_only(
             command = excluded.command,
             args_json = excluded.args_json,
             env_json = excluded.env_json,
+            url = excluded.url,
+            headers_json = excluded.headers_json,
+            auth_kind = excluded.auth_kind,
+            auth_ref = excluded.auth_ref,
             enabled = excluded.enabled,
             sync_status = excluded.sync_status,
             last_error = excluded.last_error,
@@ -4354,6 +4545,10 @@ fn upsert_mcp_server_record_only(
             record.command,
             serde_json::to_string(&record.args)?,
             serde_json::to_string(&record.env_json)?,
+            record.url,
+            serde_json::to_string(&record.headers_json)?,
+            record.auth_kind,
+            record.auth_ref,
             record.enabled as i64,
             record.sync_status,
             record.last_error,
@@ -6699,6 +6894,17 @@ mod skills_mcp_phase2_tests {
             id: "mcp.docs".to_string(),
             title: "Docs MCP".to_string(),
             enabled: true,
+            transport: "stdio".to_string(),
+            command: "mock".to_string(),
+            args: Vec::new(),
+            env_json: serde_json::json!({}),
+            url: String::new(),
+            headers_json: serde_json::json!({}),
+            auth_kind: "none".to_string(),
+            auth_ref: String::new(),
+            sync_status: "ready".to_string(),
+            last_error: String::new(),
+            last_synced_at: None,
             tools: vec![NucleusToolDescriptor {
                 id: "docs.search".to_string(),
                 title: "Docs Search".to_string(),
