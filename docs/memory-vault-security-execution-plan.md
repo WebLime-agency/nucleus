@@ -142,7 +142,7 @@ Exit criteria:
 Completion notes:
 
 - Branch: `feat/security-posture-redaction`.
-- Commit: `61f5ba5`.
+- Commit: `c932880`.
 - Added daemon secure-origin classification helpers for localhost/loopback HTTP, HTTPS, and unsafe plain HTTP non-loopback origins.
 - Added daemon security posture reporting through the existing Settings summary, including configured bind, exposure classification, HTTPS status, current origin Vault-safe status, and non-secret warnings.
 - Added central redaction primitives for sensitive headers, common secret field names, URLs with embedded credentials, PEM private-key blocks, and registered exact secret values. Broad log/audit adoption is intentionally deferred to later phases to avoid risky churn.
