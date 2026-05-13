@@ -2842,15 +2842,40 @@
                   </div>
 
                   <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
-                  <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Working Dir</div>
+                    <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Workspace</div>
                     <div class="mt-2 break-all text-sm text-zinc-100">
                       {compactPath(selectedSession.working_dir)}
                     </div>
                     <div class="mt-1 text-xs text-zinc-500">
-                      {formatState(selectedSession.working_dir_kind)}
+                      {formatState(selectedSession.workspace_mode)} · {formatState(selectedSession.working_dir_kind)}
                     </div>
+                    {#if selectedSession.git_branch || selectedSession.git_head}
+                      <div class="mt-2 text-xs text-zinc-400">
+                        {selectedSession.git_branch || 'detached'}
+                        {#if selectedSession.git_head}
+                          · {selectedSession.git_head.slice(0, 12)}
+                        {/if}
+                        {#if selectedSession.git_dirty}
+                          · dirty
+                        {/if}
+                      </div>
+                    {/if}
+                    {#if selectedSession.source_project_path && selectedSession.source_project_path !== selectedSession.working_dir}
+                      <div class="mt-1 break-all text-xs text-zinc-500">Source: {compactPath(selectedSession.source_project_path)}</div>
+                    {/if}
                   </div>
                 </div>
+
+                {#if selectedSession.workspace_warnings.length > 0}
+                  <div class="rounded-xl border border-amber-700/60 bg-amber-950/30 px-3 py-3 text-sm text-amber-100">
+                    <div class="text-[11px] uppercase tracking-[0.14em] text-amber-300">Workspace warning</div>
+                    <ul class="mt-2 list-disc space-y-1 pl-4">
+                      {#each selectedSession.workspace_warnings as warning}
+                        <li>{warning}</li>
+                      {/each}
+                    </ul>
+                  </div>
+                {/if}
 
                 <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
                   <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Routing</div>
