@@ -671,7 +671,10 @@ async fn upsert_mcp_server_by_id(
 }
 
 async fn list_memory(State(state): State<AppState>) -> Result<Json<MemorySummary>, ApiError> {
-    let mut entries = state.store.list_memory_entries().map_err(ApiError::from)?;
+    let mut entries = state
+        .store
+        .list_memory_entries()
+        .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
     entries.sort_by(|a, b| {
         a.scope_kind
             .cmp(&b.scope_kind)
@@ -717,7 +720,7 @@ async fn delete_memory(
     state
         .store
         .delete_memory_entry(&memory_id)
-        .map_err(ApiError::from)?;
+        .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -769,7 +772,7 @@ async fn delete_skill(
     state
         .store
         .delete_skill_manifest(&skill_id)
-        .map_err(ApiError::from)?;
+        .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -781,7 +784,7 @@ async fn delete_mcp_server(
     state
         .store
         .delete_mcp_server(&server_id)
-        .map_err(ApiError::from)?;
+        .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -793,7 +796,7 @@ async fn discover_mcp_server_tools(
     let record = state
         .store
         .list_mcp_server_records()
-        .map_err(ApiError::from)?
+        .map_err(|error| ApiError::from(anyhow::Error::from(error)))?
         .into_iter()
         .find(|server| server.id == server_id)
         .ok_or_else(|| ApiError::not_found(format!("MCP server '{server_id}' was not found")))?;
@@ -833,15 +836,18 @@ async fn discover_mcp_server_tools(
             state
                 .store
                 .upsert_mcp_server_record(&updated_record, &summary.tools, &summary.resources)
-                .map_err(ApiError::from)?;
+                .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
             for tool in &discovered.tool_records {
-                state.store.upsert_mcp_tool(tool).map_err(ApiError::from)?;
+                state
+                    .store
+                    .upsert_mcp_tool(tool)
+                    .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
             }
             Ok(Json(
                 state
                     .store
                     .list_mcp_servers()
-                    .map_err(ApiError::from)?
+                    .map_err(|error| ApiError::from(anyhow::Error::from(error)))?
                     .into_iter()
                     .find(|server| server.id == record.id)
                     .expect("discovered MCP server should be present"),
@@ -863,7 +869,7 @@ async fn discover_mcp_server_tools(
             state
                 .store
                 .upsert_mcp_server_record(&updated_record, &[], &[])
-                .map_err(ApiError::from)?;
+                .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
             Err(ApiError::bad_request(message))
         }
     }
@@ -887,7 +893,7 @@ async fn call_mcp_server_tool(
     let record = state
         .store
         .list_mcp_server_records()
-        .map_err(ApiError::from)?
+        .map_err(|error| ApiError::from(anyhow::Error::from(error)))?
         .into_iter()
         .find(|server| server.id == server_id)
         .ok_or_else(|| ApiError::not_found(format!("MCP server '{server_id}' was not found")))?;
@@ -1391,6 +1397,13 @@ async fn create_session(
     let approval_mode = normalize_session_approval_mode(payload.approval_mode.as_deref())?;
     let execution_mode = normalize_session_execution_mode(payload.execution_mode.as_deref())?;
     let run_budget_mode = normalize_session_run_budget_mode(payload.run_budget_mode.as_deref())?;
+    let workspace = prepare_session_workspace(
+        &state,
+        &session_id,
+        &projects,
+        payload.workspace_mode.as_deref(),
+        payload.branch_name.as_deref(),
+    )?;
 
     state.store.create_session(SessionRecord {
         id: session_id.clone(),
@@ -1408,8 +1421,19 @@ async fn create_session(
         model: selection.model,
         provider_base_url: selection.provider_base_url,
         provider_api_key: selection.provider_api_key,
-        working_dir: projects.working_dir.clone(),
-        working_dir_kind: projects.working_dir_kind.clone(),
+        working_dir: workspace.working_dir.clone(),
+        working_dir_kind: workspace.working_dir_kind.clone(),
+        workspace_mode: workspace.workspace_mode.clone(),
+        source_project_path: workspace.source_project_path.clone(),
+        git_root: workspace.git_root.clone(),
+        worktree_path: workspace.worktree_path.clone(),
+        git_branch: workspace.git_branch.clone(),
+        git_base_ref: workspace.git_base_ref.clone(),
+        git_head: workspace.git_head.clone(),
+        git_dirty: workspace.git_dirty,
+        git_untracked_count: workspace.git_untracked_count,
+        git_remote_tracking_branch: workspace.git_remote_tracking_branch.clone(),
+        workspace_warnings: workspace.workspace_warnings.clone(),
         approval_mode,
         execution_mode,
         run_budget_mode,
@@ -1447,7 +1471,9 @@ async fn session_detail(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<SessionDetail>, ApiError> {
-    Ok(Json(state.store.get_session(&session_id)?))
+    let mut detail = state.store.get_session(&session_id)?;
+    refresh_session_workspace_warnings(&mut detail.session);
+    Ok(Json(detail))
 }
 
 async fn update_session(
@@ -1457,10 +1483,12 @@ async fn update_session(
 ) -> Result<Json<SessionDetail>, ApiError> {
     let payload = decode_json::<UpdateSessionRequest>(&body)?;
     let before = state.store.get_session(&session_id)?;
-    let project_selection = if payload.project_ids.is_some()
+    let workspace_affecting_update = payload.project_ids.is_some()
         || payload.primary_project_id.is_some()
         || payload.project_id.is_some()
-    {
+        || payload.workspace_mode.is_some()
+        || payload.branch_name.is_some();
+    let project_selection = if workspace_affecting_update {
         Some(resolve_session_projects(
             &state,
             payload.project_id.as_deref(),
@@ -1510,6 +1538,20 @@ async fn update_session(
     } else {
         None
     };
+    let prepared_workspace = if let Some(selection) = project_selection.as_ref() {
+        Some(prepare_session_workspace(
+            &state,
+            &session_id,
+            selection,
+            payload
+                .workspace_mode
+                .as_deref()
+                .or(Some(before.session.workspace_mode.as_str())),
+            payload.branch_name.as_deref(),
+        )?)
+    } else {
+        None
+    };
     let reset_provider_session = project_selection.is_some() || next_target.is_some();
     let patch = SessionPatch {
         title: payload.title.map(|value| value.trim().to_string()),
@@ -1553,12 +1595,45 @@ async fn update_session(
         provider_api_key: next_target
             .as_ref()
             .map(|selection| selection.provider_api_key.clone()),
-        working_dir: project_selection
+        working_dir: prepared_workspace
             .as_ref()
-            .map(|selection| selection.working_dir.clone()),
-        working_dir_kind: project_selection
+            .map(|workspace| workspace.working_dir.clone()),
+        working_dir_kind: prepared_workspace
             .as_ref()
-            .map(|selection| selection.working_dir_kind.clone()),
+            .map(|workspace| workspace.working_dir_kind.clone()),
+        workspace_mode: prepared_workspace
+            .as_ref()
+            .map(|workspace| workspace.workspace_mode.clone()),
+        source_project_path: prepared_workspace
+            .as_ref()
+            .map(|workspace| workspace.source_project_path.clone()),
+        git_root: prepared_workspace
+            .as_ref()
+            .map(|workspace| workspace.git_root.clone()),
+        worktree_path: prepared_workspace
+            .as_ref()
+            .map(|workspace| workspace.worktree_path.clone()),
+        git_branch: prepared_workspace
+            .as_ref()
+            .map(|workspace| workspace.git_branch.clone()),
+        git_base_ref: prepared_workspace
+            .as_ref()
+            .map(|workspace| workspace.git_base_ref.clone()),
+        git_head: prepared_workspace
+            .as_ref()
+            .map(|workspace| workspace.git_head.clone()),
+        git_dirty: prepared_workspace
+            .as_ref()
+            .map(|workspace| workspace.git_dirty),
+        git_untracked_count: prepared_workspace
+            .as_ref()
+            .map(|workspace| workspace.git_untracked_count),
+        git_remote_tracking_branch: prepared_workspace
+            .as_ref()
+            .map(|workspace| workspace.git_remote_tracking_branch.clone()),
+        workspace_warnings: prepared_workspace
+            .as_ref()
+            .map(|workspace| workspace.workspace_warnings.clone()),
         approval_mode: match payload.approval_mode {
             Some(value) => Some(normalize_session_approval_mode(Some(&value))?),
             None => None,
@@ -1615,6 +1690,7 @@ async fn delete_session(
     Path(session_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let current = state.store.get_session(&session_id)?;
+    cleanup_session_worktree_before_delete(&current.session)?;
     state.store.delete_session(&session_id)?;
     let _ = try_record_audit_event(
         &state,
@@ -3373,6 +3449,403 @@ struct SessionProjectSelection {
     working_dir_kind: String,
 }
 
+#[derive(Debug, Clone)]
+struct PreparedSessionWorkspace {
+    working_dir: String,
+    working_dir_kind: String,
+    workspace_mode: String,
+    source_project_path: String,
+    git_root: String,
+    worktree_path: String,
+    git_branch: String,
+    git_base_ref: String,
+    git_head: String,
+    git_dirty: bool,
+    git_untracked_count: usize,
+    git_remote_tracking_branch: String,
+    workspace_warnings: Vec<String>,
+}
+
+fn prepare_session_workspace(
+    state: &AppState,
+    session_id: &str,
+    projects: &SessionProjectSelection,
+    requested_mode: Option<&str>,
+    requested_branch: Option<&str>,
+) -> Result<PreparedSessionWorkspace, ApiError> {
+    let mut mode = requested_mode.unwrap_or("").trim().to_string();
+    if mode.is_empty() {
+        mode = if projects.primary_project_path.is_empty() {
+            "scratch_only"
+        } else {
+            "isolated_worktree"
+        }
+        .to_string();
+    }
+    if !matches!(
+        mode.as_str(),
+        "shared_project_root" | "isolated_worktree" | "scratch_only"
+    ) {
+        return Err(ApiError::bad_request(format!(
+            "unknown workspace mode '{mode}'"
+        )));
+    }
+    if mode == "scratch_only" || projects.primary_project_path.is_empty() {
+        let scratch_dir = state
+            .store
+            .scratch_dir_for_session(session_id)
+            .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
+        return Ok(PreparedSessionWorkspace::empty(
+            scratch_dir,
+            "workspace_scratch",
+            "scratch_only",
+        ));
+    }
+    let git = snapshot_git_state(&projects.primary_project_path).unwrap_or_default();
+    if mode == "shared_project_root" || git.git_root.is_empty() {
+        let mut prepared = PreparedSessionWorkspace::from_git(
+            projects.working_dir.clone(),
+            projects.working_dir_kind.clone(),
+            &mode,
+            &projects.primary_project_path,
+            git,
+        );
+        let active = state
+            .store
+            .list_sessions()
+            .map_err(|error| ApiError::from(anyhow::Error::from(error)))?
+            .into_iter()
+            .filter(|s| s.state == "active" && s.working_dir == projects.working_dir)
+            .count();
+        if mode == "shared_project_root" && active > 0 {
+            prepared.workspace_warnings.push(format!("shared checkout already has {active} active session(s); branch and dirty state can cross session boundaries"));
+        }
+        if mode == "isolated_worktree" && prepared.git_root.is_empty() {
+            prepared.workspace_warnings.push("requested isolated_worktree but project is not git-backed; using shared project directory".to_string());
+            prepared.workspace_mode = "shared_project_root".to_string();
+        }
+        return Ok(prepared);
+    }
+    let git_root = git.git_root.clone();
+    let base_ref = choose_session_base_ref(&git_root, &git);
+    let slug = slugify(&projects.primary_project_title).if_empty("project");
+    let short = session_id.chars().take(8).collect::<String>();
+    let branch = requested_branch
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("work/{slug}/{short}"));
+    if let Some(owner) = branch_worktree_path(&git_root, &branch)? {
+        return Err(ApiError::bad_request(format!(
+            "branch '{branch}' is already checked out at {owner}; attach to the owning session/worktree or choose a different branch"
+        )));
+    }
+    let wt = state
+        .store
+        .state_dir_path()
+        .join("worktrees")
+        .join(&projects.primary_project_id)
+        .join(session_id);
+    fs::create_dir_all(wt.parent().unwrap())
+        .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
+    let mut command = StdCommand::new("git");
+    command
+        .arg("-C")
+        .arg(&git_root)
+        .arg("worktree")
+        .arg("add")
+        .arg(&wt);
+    if requested_branch
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+        && branch_exists(&git_root, &branch)
+    {
+        command.arg(&branch);
+    } else {
+        command.arg("-b").arg(&branch).arg(&base_ref);
+    }
+    let output = command
+        .output()
+        .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
+    if !output.status.success() {
+        let _ = fs::remove_dir_all(&wt);
+        return Err(ApiError::bad_request(format!(
+            "failed to create git worktree: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let mut wt_git = snapshot_git_state(&display(&wt)).unwrap_or_default();
+    wt_git.git_base_ref = base_ref.clone();
+    Ok(PreparedSessionWorkspace::from_git(
+        display(&wt),
+        "managed_git_worktree".to_string(),
+        "isolated_worktree",
+        &projects.primary_project_path,
+        wt_git,
+    ))
+}
+
+trait IfEmpty {
+    fn if_empty(self, fallback: &str) -> String;
+}
+impl IfEmpty for String {
+    fn if_empty(self, fallback: &str) -> String {
+        if self.is_empty() {
+            fallback.to_string()
+        } else {
+            self
+        }
+    }
+}
+
+impl PreparedSessionWorkspace {
+    fn empty(working_dir: String, working_dir_kind: &str, mode: &str) -> Self {
+        Self {
+            working_dir,
+            working_dir_kind: working_dir_kind.to_string(),
+            workspace_mode: mode.to_string(),
+            source_project_path: String::new(),
+            git_root: String::new(),
+            worktree_path: String::new(),
+            git_branch: String::new(),
+            git_base_ref: String::new(),
+            git_head: String::new(),
+            git_dirty: false,
+            git_untracked_count: 0,
+            git_remote_tracking_branch: String::new(),
+            workspace_warnings: Vec::new(),
+        }
+    }
+    fn from_git(
+        working_dir: String,
+        working_dir_kind: String,
+        mode: &str,
+        source: &str,
+        git: GitSnapshot,
+    ) -> Self {
+        Self {
+            working_dir: working_dir.clone(),
+            working_dir_kind,
+            workspace_mode: mode.to_string(),
+            source_project_path: source.to_string(),
+            git_root: git.git_root,
+            worktree_path: working_dir,
+            git_branch: git.git_branch,
+            git_base_ref: git.git_base_ref,
+            git_head: git.git_head,
+            git_dirty: git.git_dirty,
+            git_untracked_count: git.git_untracked_count,
+            git_remote_tracking_branch: git.git_remote_tracking_branch,
+            workspace_warnings: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct GitSnapshot {
+    git_root: String,
+    git_branch: String,
+    git_base_ref: String,
+    git_head: String,
+    git_dirty: bool,
+    git_untracked_count: usize,
+    git_remote_tracking_branch: String,
+}
+
+fn snapshot_git_state(path: &str) -> Result<GitSnapshot, ApiError> {
+    let root = git_output(path, &["rev-parse", "--show-toplevel"])?;
+    let branch = git_output(path, &["branch", "--show-current"]).unwrap_or_default();
+    let head = git_output(path, &["rev-parse", "HEAD"]).unwrap_or_default();
+    let upstream = git_output(
+        path,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    .unwrap_or_default();
+    let status = git_output(path, &["status", "--porcelain"]).unwrap_or_default();
+    let untracked = status.lines().filter(|l| l.starts_with("??")).count();
+    Ok(GitSnapshot {
+        git_root: root,
+        git_branch: branch,
+        git_base_ref: String::new(),
+        git_head: head,
+        git_dirty: !status.trim().is_empty(),
+        git_untracked_count: untracked,
+        git_remote_tracking_branch: upstream,
+    })
+}
+
+fn cleanup_session_worktree_before_delete(session: &SessionSummary) -> Result<(), ApiError> {
+    if session.workspace_mode != "isolated_worktree" || session.worktree_path.is_empty() {
+        return Ok(());
+    }
+    let current = snapshot_git_state(&session.worktree_path).map_err(|_| {
+        ApiError::bad_request(format!(
+            "managed worktree '{}' is missing or unreadable; archive the session or prune stale metadata before deleting",
+            session.worktree_path
+        ))
+    })?;
+    if current.git_dirty || current.git_untracked_count > 0 {
+        return Err(ApiError::bad_request(format!(
+            "refusing to delete dirty managed worktree '{}' ({} untracked file(s)); commit, clean, or archive it first",
+            session.worktree_path, current.git_untracked_count
+        )));
+    }
+    let output = StdCommand::new("git")
+        .arg("-C")
+        .arg(&session.git_root)
+        .args(["worktree", "remove", &session.worktree_path])
+        .output()
+        .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
+    if !output.status.success() {
+        return Err(ApiError::bad_request(format!(
+            "failed to remove managed worktree '{}': {}",
+            session.worktree_path,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(())
+}
+
+fn refresh_session_workspace_warnings(session: &mut SessionSummary) {
+    let current = snapshot_git_state(&session.working_dir).ok();
+    let warnings = workspace_drift_warnings(session, current.as_ref());
+    for warning in warnings {
+        if !session
+            .workspace_warnings
+            .iter()
+            .any(|existing| existing == &warning)
+        {
+            session.workspace_warnings.push(warning);
+        }
+    }
+}
+
+fn workspace_drift_warnings(
+    session: &SessionSummary,
+    current: Option<&GitSnapshot>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if session.git_root.is_empty() {
+        return warnings;
+    }
+    let Some(current) = current else {
+        warnings.push(format!(
+            "workspace git state could not be read for {}; the worktree may have been removed",
+            session.working_dir
+        ));
+        return warnings;
+    };
+    if !session.git_branch.is_empty() && current.git_branch != session.git_branch {
+        warnings.push(format!(
+            "branch changed since session start: was {}, now {}",
+            session.git_branch,
+            if current.git_branch.is_empty() {
+                "detached HEAD"
+            } else {
+                &current.git_branch
+            }
+        ));
+    }
+    if !session.git_head.is_empty() && current.git_head != session.git_head {
+        warnings.push(format!(
+            "HEAD changed since session start: was {}, now {}",
+            short_sha(&session.git_head),
+            short_sha(&current.git_head)
+        ));
+    }
+    if current.git_dirty != session.git_dirty {
+        warnings.push(format!(
+            "dirty state changed since session start: was {}, now {}",
+            session.git_dirty, current.git_dirty
+        ));
+    }
+    if current.git_untracked_count != session.git_untracked_count {
+        warnings.push(format!(
+            "untracked file count changed since session start: was {}, now {}",
+            session.git_untracked_count, current.git_untracked_count
+        ));
+    }
+    warnings
+}
+
+fn short_sha(value: &str) -> String {
+    value.chars().take(12).collect()
+}
+
+fn choose_session_base_ref(git_root: &str, git: &GitSnapshot) -> String {
+    for candidate in ["dev", "origin/dev", "main", "origin/main"] {
+        if git_output(git_root, &["rev-parse", "--verify", candidate]).is_ok() {
+            return candidate.to_string();
+        }
+    }
+    if !git.git_branch.is_empty() {
+        git.git_branch.clone()
+    } else {
+        "HEAD".to_string()
+    }
+}
+
+fn branch_worktree_path(git_root: &str, branch: &str) -> Result<Option<String>, ApiError> {
+    let output = git_output(git_root, &["worktree", "list", "--porcelain"])?;
+    let mut current_path = String::new();
+    let mut current_branch = String::new();
+    for line in output.lines().chain(std::iter::once("")) {
+        if line.is_empty() {
+            if current_branch == format!("refs/heads/{branch}") {
+                return Ok(Some(current_path));
+            }
+            current_path.clear();
+            current_branch.clear();
+        } else if let Some(path) = line.strip_prefix("worktree ") {
+            current_path = path.to_string();
+        } else if let Some(value) = line.strip_prefix("branch ") {
+            current_branch = value.to_string();
+        }
+    }
+    Ok(None)
+}
+
+fn branch_exists(git_root: &str, branch: &str) -> bool {
+    git_output(
+        git_root,
+        &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+    )
+    .is_ok()
+}
+
+fn git_output(path: &str, args: &[&str]) -> Result<String, ApiError> {
+    let out = StdCommand::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(ApiError::bad_request(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ))
+    }
+}
+
+fn display(path: &FsPath) -> String {
+    path.to_string_lossy().to_string()
+}
+
+fn slugify(value: &str) -> String {
+    value
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 #[derive(Debug, Clone, Default)]
 struct WorkspaceTargetSelection {
     route_id: Option<String>,
@@ -3492,7 +3965,7 @@ fn resolve_session_projects(
     let resolved = state
         .store
         .resolve_projects(&requested_ids)
-        .map_err(ApiError::from)?;
+        .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
 
     if resolved.is_empty() {
         let scratch_dir = state
@@ -3502,7 +3975,7 @@ fn resolve_session_projects(
                     .or_else(|| fallback.map(|session| session.id.as_str()))
                     .unwrap_or("ad-hoc-preview"),
             )
-            .map_err(ApiError::from)?;
+            .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
 
         return Ok(SessionProjectSelection {
             scope: "ad_hoc".to_string(),
@@ -4907,7 +5380,7 @@ fn authorize_access(
     if state
         .store
         .validate_access_token(token)
-        .map_err(ApiError::from)?
+        .map_err(|error| ApiError::from(anyhow::Error::from(error)))?
     {
         return Ok(());
     }
@@ -5127,6 +5600,153 @@ mod tests {
     };
 
     #[test]
+    fn refuses_dirty_worktree_cleanup() {
+        let root = test_state_dir("dirty-worktree-cleanup");
+        fs::create_dir_all(&root).expect("repo dir should create");
+        run_git(&root, &["init", "-b", "dev"]);
+        run_git(&root, &["config", "user.email", "nucleus@example.test"]);
+        run_git(&root, &["config", "user.name", "Nucleus Test"]);
+        fs::write(root.join("README.md"), "hello").expect("file should write");
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-m", "initial"]);
+        let worktree = root.with_file_name(format!(
+            "{}-cleanup",
+            root.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("repo")
+        ));
+        run_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                &worktree.display().to_string(),
+                "-b",
+                "work/test",
+            ],
+        );
+        fs::write(worktree.join("dirty.txt"), "dirty").expect("dirty file should write");
+
+        let mut session = test_session(&worktree);
+        session.workspace_mode = "isolated_worktree".to_string();
+        session.git_root = root.display().to_string();
+        session.worktree_path = worktree.display().to_string();
+
+        let error = cleanup_session_worktree_before_delete(&session)
+            .expect_err("dirty worktree should be refused");
+        assert!(
+            error
+                .message
+                .contains("refusing to delete dirty managed worktree")
+        );
+
+        let _ = StdCommand::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                &worktree.display().to_string(),
+            ])
+            .output();
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&worktree);
+    }
+
+    #[test]
+    fn reports_workspace_git_state_drift() {
+        let mut session = test_session(std::path::Path::new("/tmp/example"));
+        session.git_root = "/tmp/example".to_string();
+        session.git_branch = "dev".to_string();
+        session.git_head = "aaaaaaaaaaaabbbb".to_string();
+        session.git_dirty = false;
+        session.git_untracked_count = 0;
+
+        let current = GitSnapshot {
+            git_root: "/tmp/example".to_string(),
+            git_branch: "feature".to_string(),
+            git_base_ref: String::new(),
+            git_head: "bbbbbbbbbbbbcccc".to_string(),
+            git_dirty: true,
+            git_untracked_count: 2,
+            git_remote_tracking_branch: String::new(),
+        };
+
+        let warnings = workspace_drift_warnings(&session, Some(&current));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("branch changed"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("HEAD changed"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("dirty state changed"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("untracked file count changed"))
+        );
+    }
+
+    #[test]
+    fn detects_branch_checked_out_in_another_worktree() {
+        let root = test_state_dir("branch-worktree-owner");
+        fs::create_dir_all(&root).expect("repo dir should create");
+        run_git(&root, &["init", "-b", "dev"]);
+        run_git(&root, &["config", "user.email", "nucleus@example.test"]);
+        run_git(&root, &["config", "user.name", "Nucleus Test"]);
+        fs::write(root.join("README.md"), "hello").expect("file should write");
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-m", "initial"]);
+
+        let feature = root.with_file_name(format!(
+            "{}-feature",
+            root.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("repo")
+        ));
+        run_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                &feature.display().to_string(),
+                "-b",
+                "feature/test",
+            ],
+        );
+
+        let owner = branch_worktree_path(&root.display().to_string(), "feature/test")
+            .expect("worktree list should parse");
+        assert_eq!(owner, Some(feature.display().to_string()));
+
+        let missing = branch_worktree_path(&root.display().to_string(), "feature/missing")
+            .expect("worktree list should parse");
+        assert_eq!(missing, None);
+
+        let _ = StdCommand::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                &feature.display().to_string(),
+            ])
+            .output();
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&feature);
+    }
+
+    #[test]
     fn rejects_zero_audit_limit() {
         let error = resolve_audit_limit(Some(0)).expect_err("limit 0 should fail");
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
@@ -5164,6 +5784,17 @@ mod tests {
             provider_api_key: String::new(),
             working_dir: "/home/eba/dev-projects/project-one".to_string(),
             working_dir_kind: "project_root".to_string(),
+            workspace_mode: "shared_project_root".to_string(),
+            source_project_path: String::new(),
+            git_root: String::new(),
+            worktree_path: String::new(),
+            git_branch: String::new(),
+            git_base_ref: String::new(),
+            git_head: String::new(),
+            git_dirty: false,
+            git_untracked_count: 0,
+            git_remote_tracking_branch: String::new(),
+            workspace_warnings: Vec::new(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
             run_budget_mode: "standard".to_string(),
@@ -5342,6 +5973,17 @@ mod tests {
             provider_api_key: String::new(),
             working_dir: workspace_root.display().to_string(),
             working_dir_kind: "workspace".to_string(),
+            workspace_mode: "shared_project_root".to_string(),
+            source_project_path: String::new(),
+            git_root: String::new(),
+            worktree_path: String::new(),
+            git_branch: String::new(),
+            git_base_ref: String::new(),
+            git_head: String::new(),
+            git_dirty: false,
+            git_untracked_count: 0,
+            git_remote_tracking_branch: String::new(),
+            workspace_warnings: Vec::new(),
             scope: "workspace".to_string(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
@@ -5440,6 +6082,17 @@ mod tests {
             provider_api_key: String::new(),
             working_dir: workspace_root.display().to_string(),
             working_dir_kind: "workspace_scratch".to_string(),
+            workspace_mode: "shared_project_root".to_string(),
+            source_project_path: String::new(),
+            git_root: String::new(),
+            worktree_path: String::new(),
+            git_branch: String::new(),
+            git_base_ref: String::new(),
+            git_head: String::new(),
+            git_dirty: false,
+            git_untracked_count: 0,
+            git_remote_tracking_branch: String::new(),
+            workspace_warnings: Vec::new(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
             run_budget_mode: "standard".to_string(),
@@ -5743,6 +6396,8 @@ mod tests {
                     approval_mode: None,
                     execution_mode: None,
                     run_budget_mode: None,
+                    workspace_mode: None,
+                    branch_name: None,
                 })
                 .expect("session payload should serialize"),
             ),
@@ -5810,6 +6465,17 @@ mod tests {
             provider_api_key: String::new(),
             working_dir: "/tmp".to_string(),
             working_dir_kind: "workspace_scratch".to_string(),
+            workspace_mode: "shared_project_root".to_string(),
+            source_project_path: String::new(),
+            git_root: String::new(),
+            worktree_path: String::new(),
+            git_branch: String::new(),
+            git_base_ref: String::new(),
+            git_head: String::new(),
+            git_dirty: false,
+            git_untracked_count: 0,
+            git_remote_tracking_branch: String::new(),
+            workspace_warnings: Vec::new(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
             run_budget_mode: "standard".to_string(),
@@ -5878,6 +6544,17 @@ mod tests {
             provider_api_key: String::new(),
             working_dir: "/tmp".to_string(),
             working_dir_kind: "workspace_scratch".to_string(),
+            workspace_mode: "shared_project_root".to_string(),
+            source_project_path: String::new(),
+            git_root: String::new(),
+            worktree_path: String::new(),
+            git_branch: String::new(),
+            git_base_ref: String::new(),
+            git_head: String::new(),
+            git_dirty: false,
+            git_untracked_count: 0,
+            git_remote_tracking_branch: String::new(),
+            workspace_warnings: Vec::new(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
             run_budget_mode: "standard".to_string(),
@@ -6208,6 +6885,21 @@ mod tests {
         fs::write(dir.join("references/example.md"), "reference").expect("reference should write");
     }
 
+    fn run_git(root: &FsPath, args: &[&str]) {
+        let output = StdCommand::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn test_state_dir(label: &str) -> PathBuf {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -6295,6 +6987,17 @@ mod tests {
             provider_api_key: String::new(),
             working_dir: workspace_root.display().to_string(),
             working_dir_kind: "workspace".to_string(),
+            workspace_mode: "shared_project_root".to_string(),
+            source_project_path: String::new(),
+            git_root: String::new(),
+            worktree_path: String::new(),
+            git_branch: String::new(),
+            git_base_ref: String::new(),
+            git_head: String::new(),
+            git_dirty: false,
+            git_untracked_count: 0,
+            git_remote_tracking_branch: String::new(),
+            workspace_warnings: Vec::new(),
             scope: "workspace".to_string(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),

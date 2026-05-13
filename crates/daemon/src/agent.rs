@@ -3151,6 +3151,17 @@ fn build_execution_session(worker: &WorkerSummary) -> SessionSummary {
         provider_api_key: worker.provider_api_key.clone(),
         working_dir: worker.working_dir.clone(),
         working_dir_kind: "project_root".to_string(),
+        workspace_mode: "shared_project_root".to_string(),
+        source_project_path: String::new(),
+        git_root: String::new(),
+        worktree_path: String::new(),
+        git_branch: String::new(),
+        git_base_ref: String::new(),
+        git_head: String::new(),
+        git_dirty: false,
+        git_untracked_count: 0,
+        git_remote_tracking_branch: String::new(),
+        workspace_warnings: Vec::new(),
         scope: "job".to_string(),
         approval_mode: "ask".to_string(),
         execution_mode: "act".to_string(),
@@ -4514,6 +4525,7 @@ async fn execute_command_run_tool(
         args.env,
         false,
     )?;
+    record_shared_checkout_git_command_warning(state, job_id, worker, tool_call_id, &spec).await;
     run_bounded_command_tool(
         state,
         job_id,
@@ -4781,6 +4793,141 @@ where
     bail!("MCP server did not return a tools/call result")
 }
 
+#[derive(Debug, Clone, Default)]
+struct CommandSessionWorkspaceMetadata {
+    session_id: String,
+    project_id: String,
+    worktree_path: String,
+    branch: String,
+    port: Option<u16>,
+}
+
+fn command_session_workspace_metadata(
+    state: &AppState,
+    job_id: &str,
+    spec: &ResolvedCommandSpec,
+) -> CommandSessionWorkspaceMetadata {
+    let mut metadata = CommandSessionWorkspaceMetadata {
+        port: detect_command_port(spec),
+        ..CommandSessionWorkspaceMetadata::default()
+    };
+    let Ok(job) = state.store.get_job(job_id) else {
+        return metadata;
+    };
+    let Some(session_id) = job.job.session_id else {
+        return metadata;
+    };
+    metadata.session_id = session_id.clone();
+    let Ok(detail) = state.store.get_session(&session_id) else {
+        return metadata;
+    };
+    metadata.project_id = detail.session.project_id;
+    metadata.worktree_path = if detail.session.worktree_path.is_empty() {
+        detail.session.working_dir
+    } else {
+        detail.session.worktree_path
+    };
+    metadata.branch = detail.session.git_branch;
+    metadata
+}
+
+fn detect_command_port(spec: &ResolvedCommandSpec) -> Option<u16> {
+    let text = std::iter::once(spec.command.as_str())
+        .chain(spec.args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    for marker in ["--port", "-p", "PORT="] {
+        if let Some(index) = text.find(marker) {
+            let rest = &text[index + marker.len()..];
+            let digits = rest
+                .trim_start_matches(['=', ' ', ':'])
+                .chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>();
+            if let Ok(port) = digits.parse::<u16>() {
+                return Some(port);
+            }
+        }
+    }
+    None
+}
+
+async fn record_shared_checkout_git_command_warning(
+    state: &AppState,
+    job_id: &str,
+    worker: &WorkerSummary,
+    tool_call_id: &str,
+    spec: &ResolvedCommandSpec,
+) {
+    if !is_risky_git_command(spec) {
+        return;
+    }
+    let Ok(job) = state.store.get_job(job_id) else {
+        return;
+    };
+    let Some(session_id) = job.job.session_id.as_deref() else {
+        return;
+    };
+    let Ok(detail) = state.store.get_session(session_id) else {
+        return;
+    };
+    if detail.session.workspace_mode != "shared_project_root" {
+        return;
+    }
+    let shared_count = state
+        .store
+        .list_sessions()
+        .map(|sessions| {
+            sessions
+                .into_iter()
+                .filter(|session| {
+                    session.state == "active"
+                        && session.id != session_id
+                        && session.working_dir == detail.session.working_dir
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    if shared_count == 0 {
+        return;
+    }
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: job_id.to_string(),
+        worker_id: Some(worker.id.clone()),
+        event_type: "workspace.warning".to_string(),
+        status: "warning".to_string(),
+        summary: "Risky git command in shared checkout".to_string(),
+        detail: format!(
+            "Command '{}' may change branch or discard changes while {shared_count} other active session(s) share {}.",
+            command_label(spec),
+            detail.session.working_dir
+        ),
+        data_json: json!({
+            "tool_call_id": tool_call_id,
+            "session_id": session_id,
+            "workspace_mode": detail.session.workspace_mode,
+            "working_dir": detail.session.working_dir,
+            "shared_session_count": shared_count,
+        }),
+    });
+}
+
+fn is_risky_git_command(spec: &ResolvedCommandSpec) -> bool {
+    let mut parts = Vec::with_capacity(spec.args.len() + 1);
+    parts.push(spec.command.as_str());
+    parts.extend(spec.args.iter().map(String::as_str));
+    let line = parts.join(" ");
+    let normalized = line.trim();
+    normalized.starts_with("git checkout")
+        || normalized.starts_with("git switch")
+        || normalized.starts_with("git reset")
+        || normalized.starts_with("git clean")
+        || normalized.contains(" git checkout")
+        || normalized.contains(" git switch")
+        || normalized.contains(" git reset")
+        || normalized.contains(" git clean")
+}
+
 async fn run_bounded_command_tool(
     state: &AppState,
     job_id: &str,
@@ -4943,6 +5090,8 @@ async fn start_command_session(
     fs::write(&stderr_path, b"")
         .with_context(|| format!("failed to prepare '{}'", stderr_path.display()))?;
 
+    let command_session_workspace = command_session_workspace_metadata(state, job_id, spec);
+
     state.store.create_command_session(CommandSessionRecord {
         id: command_session_id.clone(),
         job_id: job_id.to_string(),
@@ -4954,6 +5103,11 @@ async fn start_command_session(
         command: spec.command.clone(),
         args: spec.args.clone(),
         cwd: spec.cwd.display().to_string(),
+        session_id: command_session_workspace.session_id,
+        project_id: command_session_workspace.project_id,
+        worktree_path: command_session_workspace.worktree_path,
+        branch: command_session_workspace.branch,
+        port: command_session_workspace.port,
         env_json: serde_json::to_value(&spec.env).context("failed to encode command env")?,
         network_policy: spec.network_policy.clone(),
         timeout_secs: spec.timeout_secs,
@@ -6626,6 +6780,17 @@ async fn create_playbook_session(
         provider_api_key: target.provider_api_key,
         working_dir: projects.working_dir,
         working_dir_kind: projects.working_dir_kind,
+        workspace_mode: "scratch_only".to_string(),
+        source_project_path: String::new(),
+        git_root: String::new(),
+        worktree_path: String::new(),
+        git_branch: String::new(),
+        git_base_ref: String::new(),
+        git_head: String::new(),
+        git_dirty: false,
+        git_untracked_count: 0,
+        git_remote_tracking_branch: String::new(),
+        workspace_warnings: Vec::new(),
         approval_mode: "ask".to_string(),
         execution_mode: "act".to_string(),
         run_budget_mode: "inherit".to_string(),
@@ -7906,6 +8071,55 @@ mod tests {
     }
 
     #[test]
+    fn detects_command_ports() {
+        let mut spec = ResolvedCommandSpec {
+            mode: "interactive".to_string(),
+            title: "Dev server".to_string(),
+            command: "npm".to_string(),
+            args: vec![
+                "run".to_string(),
+                "dev".to_string(),
+                "--".to_string(),
+                "--port".to_string(),
+                "5173".to_string(),
+            ],
+            cwd: PathBuf::from("/tmp"),
+            timeout_secs: 30,
+            output_limit_bytes: 1024,
+            network_policy: "inherit".to_string(),
+            env: BTreeMap::new(),
+        };
+        assert_eq!(detect_command_port(&spec), Some(5173));
+
+        spec.args = vec!["-lc".to_string(), "PORT=5202 npm run dev".to_string()];
+        spec.command = "sh".to_string();
+        assert_eq!(detect_command_port(&spec), Some(5202));
+    }
+
+    #[test]
+    fn detects_risky_git_commands() {
+        let mut spec = ResolvedCommandSpec {
+            mode: "oneshot".to_string(),
+            title: "Command".to_string(),
+            command: "git".to_string(),
+            args: vec!["switch".to_string(), "feature".to_string()],
+            cwd: PathBuf::from("/tmp"),
+            timeout_secs: 30,
+            output_limit_bytes: 1024,
+            network_policy: "inherit".to_string(),
+            env: BTreeMap::new(),
+        };
+        assert!(is_risky_git_command(&spec));
+
+        spec.command = "sh".to_string();
+        spec.args = vec!["-lc".to_string(), "git reset --hard".to_string()];
+        assert!(is_risky_git_command(&spec));
+
+        spec.args = vec!["-lc".to_string(), "git status".to_string()];
+        assert!(!is_risky_git_command(&spec));
+    }
+
+    #[test]
     fn parses_provider_native_shell_tool_call_as_command_run() {
         let action = parse_worker_action(
             r#"{"tool_call":{"tool_name":"shell","arguments":{"command":"pwd && ps -ef | grep -i stfr","cwd":"stfr","timeout_secs":20}}}"#,
@@ -8307,6 +8521,17 @@ mod tests {
             provider_api_key: String::new(),
             working_dir: "/tmp/project".to_string(),
             working_dir_kind: "project_root".to_string(),
+            workspace_mode: "shared_project_root".to_string(),
+            source_project_path: String::new(),
+            git_root: String::new(),
+            worktree_path: String::new(),
+            git_branch: String::new(),
+            git_base_ref: String::new(),
+            git_head: String::new(),
+            git_dirty: false,
+            git_untracked_count: 0,
+            git_remote_tracking_branch: String::new(),
+            workspace_warnings: Vec::new(),
             scope: "project".to_string(),
             approval_mode: "trusted".to_string(),
             execution_mode: "act".to_string(),
@@ -8386,6 +8611,17 @@ mod tests {
             provider_api_key: String::new(),
             working_dir: workspace_root.display().to_string(),
             working_dir_kind: "workspace_scratch".to_string(),
+            workspace_mode: "shared_project_root".to_string(),
+            source_project_path: String::new(),
+            git_root: String::new(),
+            worktree_path: String::new(),
+            git_branch: String::new(),
+            git_base_ref: String::new(),
+            git_head: String::new(),
+            git_dirty: false,
+            git_untracked_count: 0,
+            git_remote_tracking_branch: String::new(),
+            workspace_warnings: Vec::new(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
             run_budget_mode: "standard".to_string(),
@@ -8441,6 +8677,17 @@ mod tests {
             provider_api_key: String::new(),
             working_dir: workspace_root.display().to_string(),
             working_dir_kind: "workspace_scratch".to_string(),
+            workspace_mode: "shared_project_root".to_string(),
+            source_project_path: String::new(),
+            git_root: String::new(),
+            worktree_path: String::new(),
+            git_branch: String::new(),
+            git_base_ref: String::new(),
+            git_head: String::new(),
+            git_dirty: false,
+            git_untracked_count: 0,
+            git_remote_tracking_branch: String::new(),
+            workspace_warnings: Vec::new(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
             run_budget_mode: "standard".to_string(),
@@ -8560,6 +8807,17 @@ mod tests {
                 provider_api_key: String::new(),
                 working_dir: workspace_root.display().to_string(),
                 working_dir_kind: "workspace_scratch".to_string(),
+                workspace_mode: "scratch_only".to_string(),
+                source_project_path: String::new(),
+                git_root: String::new(),
+                worktree_path: String::new(),
+                git_branch: String::new(),
+                git_base_ref: String::new(),
+                git_head: String::new(),
+                git_dirty: false,
+                git_untracked_count: 0,
+                git_remote_tracking_branch: String::new(),
+                workspace_warnings: Vec::new(),
                 approval_mode: "ask".to_string(),
                 execution_mode: "act".to_string(),
                 run_budget_mode: "inherit".to_string(),

@@ -57,6 +57,7 @@
   let error = $state<string | null>(null);
   let streamStatus = $state<StreamStatus>('connecting');
   let createProjectId = $state('');
+  let createWorkspaceMode = $state<'isolated_worktree' | 'shared_project_root' | 'scratch_only'>('isolated_worktree');
   let sidebarOpen = $state(false);
   let updateToastVisible = $state(false);
   let dismissedUpdateTarget = $state('');
@@ -227,9 +228,10 @@
         createProjectId
           ? {
               primary_project_id: createProjectId,
-              project_ids: [createProjectId]
+              project_ids: [createProjectId],
+              workspace_mode: createWorkspaceMode
             }
-          : {}
+          : { workspace_mode: 'scratch_only' }
       );
 
       prependSession(detail.session);
@@ -385,6 +387,7 @@
     {compatibilityBlocked}
     {createSessionTitle}
     createProjectId={createProjectId}
+    createWorkspaceMode={createWorkspaceMode}
     projects={discoveredProjects}
     {hasUpdateAvailable}
     {restartRequired}
@@ -399,6 +402,9 @@
     {handleCreateSession}
     onSelectCreateProject={(projectId) => {
       createProjectId = projectId;
+    }}
+    onSelectCreateWorkspaceMode={(mode) => {
+      createWorkspaceMode = mode;
     }}
     closeSidebar={() => {
       sidebarOpen = false;
