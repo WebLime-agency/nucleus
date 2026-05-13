@@ -1167,6 +1167,28 @@ pub struct ConnectionSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalInterfaceSummary {
+    pub name: String,
+    pub address: String,
+    pub is_loopback: bool,
+    pub is_private: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecurityPostureSummary {
+    pub configured_bind: String,
+    pub exposure: String,
+    pub https_active: bool,
+    pub current_origin: Option<String>,
+    pub current_origin_vault_safe: bool,
+    pub current_origin_reason: String,
+    #[serde(default)]
+    pub local_interfaces: Vec<LocalInterfaceSummary>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompatibilitySummary {
     pub server_version: String,
     pub minimum_client_version: Option<String>,
@@ -1211,6 +1233,7 @@ pub struct SettingsSummary {
     pub storage: StorageSummary,
     pub auth: AuthSummary,
     pub connection: ConnectionSummary,
+    pub security: SecurityPostureSummary,
     pub compatibility: CompatibilitySummary,
     pub update: UpdateStatus,
 }

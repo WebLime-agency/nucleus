@@ -729,6 +729,24 @@ export const connectionSummarySchema = z.object({
   web_root: z.string().nullable()
 });
 
+export const localInterfaceSummarySchema = z.object({
+  name: z.string(),
+  address: z.string(),
+  is_loopback: z.boolean(),
+  is_private: z.boolean()
+});
+
+export const securityPostureSummarySchema = z.object({
+  configured_bind: z.string(),
+  exposure: z.string(),
+  https_active: z.boolean(),
+  current_origin: z.string().nullable(),
+  current_origin_vault_safe: z.boolean(),
+  current_origin_reason: z.string(),
+  local_interfaces: z.array(localInterfaceSummarySchema).default([]),
+  warnings: z.array(z.string()).default([])
+});
+
 export const compatibilitySummarySchema = z.object({
   server_version: z.string(),
   minimum_client_version: z.string().nullable(),
@@ -770,6 +788,7 @@ export const settingsSummarySchema = z.object({
   storage: storageSummarySchema,
   auth: authSummarySchema,
   connection: connectionSummarySchema,
+  security: securityPostureSummarySchema,
   compatibility: compatibilitySummarySchema,
   update: updateStatusSchema
 });
