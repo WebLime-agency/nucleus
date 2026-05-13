@@ -51,6 +51,17 @@ export const sessionSummarySchema = z.object({
   provider_api_key: z.string(),
   working_dir: z.string(),
   working_dir_kind: z.string(),
+  workspace_mode: z.string().default('shared_project_root'),
+  source_project_path: z.string().default(''),
+  git_root: z.string().default(''),
+  worktree_path: z.string().default(''),
+  git_branch: z.string().default(''),
+  git_base_ref: z.string().default(''),
+  git_head: z.string().default(''),
+  git_dirty: z.boolean().default(false),
+  git_untracked_count: z.number().int().nonnegative().default(0),
+  git_remote_tracking_branch: z.string().default(''),
+  workspace_warnings: z.array(z.string()).default([]),
   approval_mode: z.string().default('ask'),
   execution_mode: z.string().default('act'),
   run_budget_mode: z.string().default('inherit'),
@@ -222,6 +233,11 @@ export const commandSessionSummarySchema = z.object({
   command: z.string(),
   args: z.array(z.string()).default([]),
   cwd: z.string(),
+  session_id: z.string().default(''),
+  project_id: z.string().default(''),
+  worktree_path: z.string().default(''),
+  branch: z.string().default(''),
+  port: z.number().int().nonnegative().nullable().default(null),
   network_policy: z.string(),
   timeout_secs: z.number().int().nonnegative(),
   output_limit_bytes: z.number().int().nonnegative(),
@@ -316,7 +332,9 @@ export const createSessionRequestSchema = z.object({
   project_ids: z.array(z.string().trim()).optional(),
   approval_mode: z.enum(['ask', 'trusted']).optional(),
   execution_mode: z.enum(['act', 'plan']).optional(),
-  run_budget_mode: z.enum(['inherit', 'standard', 'extended', 'marathon', 'unbounded']).optional()
+  run_budget_mode: z.enum(['inherit', 'standard', 'extended', 'marathon', 'unbounded']).optional(),
+  workspace_mode: z.enum(['shared_project_root', 'isolated_worktree', 'scratch_only']).optional(),
+  branch_name: z.string().trim().optional()
 });
 
 export const updateSessionRequestSchema = z.object({
@@ -331,7 +349,9 @@ export const updateSessionRequestSchema = z.object({
   project_ids: z.array(z.string().trim()).optional(),
   approval_mode: z.enum(['ask', 'trusted']).optional(),
   execution_mode: z.enum(['act', 'plan']).optional(),
-  run_budget_mode: z.enum(['inherit', 'standard', 'extended', 'marathon', 'unbounded']).optional()
+  run_budget_mode: z.enum(['inherit', 'standard', 'extended', 'marathon', 'unbounded']).optional(),
+  workspace_mode: z.enum(['shared_project_root', 'isolated_worktree', 'scratch_only']).optional(),
+  branch_name: z.string().trim().optional()
 });
 
 export const sessionPromptRequestSchema = z.object({

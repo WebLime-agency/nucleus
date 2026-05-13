@@ -1,6 +1,8 @@
 <script lang="ts">
   import { cn } from '$lib/utils';
   import { Button } from '$lib/components/ui/button';
+  import { Label } from '$lib/components/ui/label';
+  import { Select } from '$lib/components/ui/select';
   import type {
     ProjectSummary,
     RuntimeOverview,
@@ -32,6 +34,7 @@
     compatibilityBlocked?: boolean;
     createSessionTitle?: string;
     createProjectId?: string;
+    createWorkspaceMode?: 'isolated_worktree' | 'shared_project_root' | 'scratch_only';
     projects?: ProjectSummary[];
     hasUpdateAvailable?: boolean;
     restartRequired?: boolean;
@@ -45,6 +48,7 @@
     openNavigation: (href: string) => void | Promise<void>;
     handleCreateSession: () => void | Promise<void>;
     onSelectCreateProject?: (projectId: string) => void;
+    onSelectCreateWorkspaceMode?: (mode: 'isolated_worktree' | 'shared_project_root' | 'scratch_only') => void;
     closeSidebar: () => void;
   };
 
@@ -58,6 +62,7 @@
     compatibilityBlocked = false,
     createSessionTitle = '',
     createProjectId = '',
+    createWorkspaceMode = 'isolated_worktree',
     projects = [],
     hasUpdateAvailable = false,
     restartRequired = false,
@@ -71,6 +76,7 @@
     openNavigation,
     handleCreateSession,
     onSelectCreateProject = () => {},
+    onSelectCreateWorkspaceMode = () => {},
     closeSidebar
   }: Props = $props();
 
@@ -149,6 +155,26 @@
           {headerContext.label}
         </button>
       </div>
+        <div class="mt-2 grid gap-1.5">
+          <Label for="create-workspace-mode">Mode</Label>
+          <Select
+            id="create-workspace-mode"
+            class="h-8 text-xs"
+            value={createWorkspaceMode}
+            disabled={creating || compatibilityBlocked}
+            onchange={(event) =>
+              onSelectCreateWorkspaceMode(
+                (event.currentTarget as HTMLSelectElement).value as
+                  | 'isolated_worktree'
+                  | 'shared_project_root'
+                  | 'scratch_only'
+              )}
+          >
+            <option value="isolated_worktree">Isolated worktree</option>
+            <option value="shared_project_root">Shared project root</option>
+            <option value="scratch_only">Scratch only</option>
+          </Select>
+        </div>
 
       <div class="flex shrink-0 items-center gap-1">
         <Button
