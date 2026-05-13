@@ -91,6 +91,28 @@ pub struct SessionSummary {
     pub provider_api_key: String,
     pub working_dir: String,
     pub working_dir_kind: String,
+    #[serde(default = "default_workspace_mode")]
+    pub workspace_mode: String,
+    #[serde(default)]
+    pub source_project_path: String,
+    #[serde(default)]
+    pub git_root: String,
+    #[serde(default)]
+    pub worktree_path: String,
+    #[serde(default)]
+    pub git_branch: String,
+    #[serde(default)]
+    pub git_base_ref: String,
+    #[serde(default)]
+    pub git_head: String,
+    #[serde(default)]
+    pub git_dirty: bool,
+    #[serde(default)]
+    pub git_untracked_count: usize,
+    #[serde(default)]
+    pub git_remote_tracking_branch: String,
+    #[serde(default)]
+    pub workspace_warnings: Vec<String>,
     pub scope: String,
     #[serde(default = "default_session_approval_mode")]
     pub approval_mode: String,
@@ -290,6 +312,16 @@ pub struct CommandSessionSummary {
     pub args: Vec<String>,
     pub cwd: String,
     #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub worktree_path: String,
+    #[serde(default)]
+    pub branch: String,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
     pub network_policy: String,
     pub timeout_secs: u64,
     pub output_limit_bytes: usize,
@@ -401,6 +433,12 @@ pub struct CreateSessionRequest {
     pub approval_mode: Option<String>,
     pub execution_mode: Option<String>,
     pub run_budget_mode: Option<String>,
+    pub workspace_mode: Option<String>,
+    pub branch_name: Option<String>,
+}
+
+fn default_workspace_mode() -> String {
+    "shared_project_root".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -417,6 +455,8 @@ pub struct UpdateSessionRequest {
     pub approval_mode: Option<String>,
     pub execution_mode: Option<String>,
     pub run_budget_mode: Option<String>,
+    pub workspace_mode: Option<String>,
+    pub branch_name: Option<String>,
 }
 
 fn default_session_approval_mode() -> String {

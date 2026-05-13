@@ -72,3 +72,17 @@ Prompt context should layer like this:
 5. session-specific user prompt
 
 That keeps product truth stable while still allowing local overrides and project-specific guidance.
+
+## Session Workspace Isolation
+
+Project sessions run in one of three explicit workspace modes:
+
+- `isolated_worktree`: Nucleus creates a per-session git worktree under the state directory. This is the default for code-writing sessions attached to git-backed projects.
+- `shared_project_root`: the session runs directly in the project root. This is the legacy mode and should warn when multiple active sessions share the same checkout.
+- `scratch_only`: the session runs in a Nucleus scratch directory and should not mutate the project checkout.
+
+For isolated worktree sessions, Nucleus records the source project path, git root, worktree path, branch, base ref, HEAD, dirty state, untracked count, and remote tracking branch. Clients should display this metadata so users can tell which branch/worktree a session is using.
+
+Shared checkout sessions should warn when branch or dirty state changes after session start, or when risky git commands such as `git switch`, `git checkout`, `git reset`, or `git clean` are attempted while another active session shares the checkout.
+
+Long-running dev servers and command sessions belong to the session/worktree/branch that started them. Another session must not assume a running server on the same port represents its own branch.
