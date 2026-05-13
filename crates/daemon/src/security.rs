@@ -15,6 +15,10 @@ const SENSITIVE_FIELD_NAMES: &[&str] = &[
     "password",
     "private_key",
     "client_secret",
+    "authorization",
+    "proxy_authorization",
+    "cookie",
+    "set_cookie",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]

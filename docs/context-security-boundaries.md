@@ -24,7 +24,7 @@ The core rule:
 - **Prompt include**: deterministic file-based context from `include/`, `.nucleus/include/`, or legacy promptinclude files.
 - **Skill**: procedural capability and activation instructions. Skills may reference tools and concepts but must not contain secrets.
 - **MCP record**: tool/resource server configuration and metadata. MCP records may contain non-secret Vault references.
-- **Vault secret**: confidential execution-time material such as API tokens, cookies, private keys, passwords, bearer credentials, recovery phrases, database URLs with credentials, or `.env` values.
+- **Vault secret**: confidential execution-time material such as API tokens, provider API keys, cookies, private keys, passwords, bearer credentials, recovery phrases, database URLs with credentials, or `.env` values. Existing provider credentials are secret material even before they are migrated into Vault.
 - **Vault reference**: a non-secret pointer to a Vault secret, scoped and policy-gated by the daemon, such as `vault://workspace/SUPABASE_ACCESS_TOKEN`.
 - **Secret resolution**: daemon-only operation that decrypts or retrieves a secret for an approved consumer.
 - **Consumer**: runtime entity requesting secret use, such as an MCP server, action, tool, workflow, or project environment.
@@ -72,6 +72,7 @@ Forbidden:
 
 - Plaintext secret values in MCP records or action definitions.
 - Secret-bearing headers in client-visible API responses.
+- Provider API keys, router target keys, workspace profile keys, MCP env values, and MCP header values in normal browser-visible API responses. Responses may return non-secret metadata, an empty value, or a redacted placeholder, but never the raw credential.
 
 ### Transcripts, logs, and audit events
 

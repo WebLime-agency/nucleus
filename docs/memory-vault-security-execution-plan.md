@@ -151,6 +151,14 @@ Completion notes:
 - Rust test attempt: `cargo test -p nucleus-daemon security` is blocked by unrelated pre-existing workspace compile errors in session workspace/toolchain changes (`CreateSessionRequest`, `prepare_session_workspace`, and added `SessionRecord`/`SessionPatch` fields), not by the Phase 1 security module itself.
 - Remaining: rerun daemon Rust tests after the unrelated workspace/toolchain worktree is reconciled; wire redaction into broader audit/log persistence in the future phase that touches those call sites.
 
+Follow-up: provider/API credential response hardening
+
+- Branch: `fix/redact-provider-secrets-api`.
+- Goal: treat existing provider API keys, router target keys, workspace profile keys, MCP env/header values, and job/tool debug payload credentials as secret material even before the Vault migration.
+- API responses must not return raw provider credentials or other secret-like config. Keep write/upsert request behavior for setting new values, but redact or empty sensitive values in normal browser-visible responses.
+- Commit: this follow-up commit.
+- Checks run: `cargo fmt --all --check` passed; `cargo test -p nucleus-daemon redacts -- --nocapture` attempted but remains blocked by unrelated dirty-worktree compile errors in the pre-existing workspace/toolchain changes. Web checks were not rerun because this follow-up did not touch web code or schemas.
+
 ## Phase 2 — Memory prompt integration + real Memory UI
 
 Status: `not_started`
