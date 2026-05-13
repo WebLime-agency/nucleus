@@ -774,6 +774,29 @@ pub struct SkillImportRequest {
     pub scope_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SkillReconcileRequest {
+    #[serde(default)]
+    pub skill_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillReconcileCandidate {
+    pub skill_id: String,
+    pub title: String,
+    pub path: String,
+    pub already_registered: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillReconcileScanResponse {
+    pub skills_dir: String,
+    #[serde(default)]
+    pub candidates: Vec<SkillReconcileCandidate>,
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillInstallVerification {
     pub files_copied: bool,

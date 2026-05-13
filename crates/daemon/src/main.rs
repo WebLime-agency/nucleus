@@ -47,9 +47,10 @@ use nucleus_protocol::{
     SessionDetail, SessionPromptRequest, SessionSummary, SettingsSummary, SkillImportRequest,
     SkillImportResponse, SkillInstallResult, SkillInstallVerification, SkillInstallationRecord,
     SkillInstallationUpsertRequest, SkillManifest, SkillPackageRecord, SkillPackageUpsertRequest,
-    StreamConnected, SystemStats, UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest,
-    UpdateStatus, WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceProfileWriteRequest,
-    WorkspaceSummary, WorkspaceUpdateRequest,
+    SkillReconcileCandidate, SkillReconcileRequest, SkillReconcileScanResponse, StreamConnected,
+    SystemStats, UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
+    WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceProfileWriteRequest, WorkspaceSummary,
+    WorkspaceUpdateRequest,
 };
 use nucleus_release::read_installed_release_metadata;
 use nucleus_storage::{
@@ -174,6 +175,7 @@ fn app(state: AppState) -> Router {
         .route("/skills", get(list_skills).post(upsert_skill))
         .route("/skills/import", axum::routing::post(import_skills))
         .route("/skills/reconcile", axum::routing::post(reconcile_skills))
+        .route("/skills/reconcile/scan", get(scan_reconcile_skills))
         .route(
             "/skills/check-updates",
             axum::routing::post(check_skill_updates),
@@ -2446,10 +2448,22 @@ async fn import_skills(
     Ok(Json(import_skills_from_source(&state, payload).await?))
 }
 
+async fn scan_reconcile_skills(
+    State(state): State<AppState>,
+) -> Result<Json<SkillReconcileScanResponse>, ApiError> {
+    Ok(Json(scan_skill_folders(&state)?))
+}
+
 async fn reconcile_skills(
     State(state): State<AppState>,
+    body: Bytes,
 ) -> Result<Json<SkillImportResponse>, ApiError> {
-    Ok(Json(reconcile_skill_folders(&state)?))
+    let payload = if body.is_empty() {
+        SkillReconcileRequest::default()
+    } else {
+        decode_json::<SkillReconcileRequest>(&body)?
+    };
+    Ok(Json(reconcile_skill_folders(&state, &payload.skill_ids)?))
 }
 
 async fn check_skill_update(
@@ -2583,7 +2597,56 @@ fn import_discovered_dirs(
     Ok(())
 }
 
-fn reconcile_skill_folders(state: &AppState) -> Result<SkillImportResponse, ApiError> {
+fn scan_skill_folders(state: &AppState) -> Result<SkillReconcileScanResponse, ApiError> {
+    let skills_dir = state.store.state_dir_path().join("skills");
+    let mut response = SkillReconcileScanResponse {
+        skills_dir: display(&skills_dir),
+        candidates: Vec::new(),
+        errors: Vec::new(),
+    };
+    if !skills_dir.exists() {
+        return Ok(response);
+    }
+    let registered = state
+        .store
+        .list_skill_manifests()?
+        .into_iter()
+        .map(|skill| skill.id)
+        .collect::<BTreeSet<_>>();
+    for dir in discover_skill_dirs(&skills_dir).map_err(api_io_error)? {
+        let parsed = match parse_skill_file(&dir) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                response.errors.push(error.message);
+                continue;
+            }
+        };
+        let skill_id = match derive_skill_id(&dir, &parsed) {
+            Ok(skill_id) => skill_id,
+            Err(error) => {
+                response.errors.push(error.message);
+                continue;
+            }
+        };
+        let title = parsed
+            .get("name")
+            .or_else(|| parsed.get("title"))
+            .cloned()
+            .unwrap_or_else(|| titleize(&skill_id));
+        response.candidates.push(SkillReconcileCandidate {
+            skill_id: skill_id.clone(),
+            title,
+            path: display(&dir),
+            already_registered: registered.contains(&skill_id),
+        });
+    }
+    Ok(response)
+}
+
+fn reconcile_skill_folders(
+    state: &AppState,
+    requested_skill_ids: &[String],
+) -> Result<SkillImportResponse, ApiError> {
     let skills_dir = state.store.state_dir_path().join("skills");
     let mut response = SkillImportResponse {
         installed: Vec::new(),
@@ -2592,12 +2655,29 @@ fn reconcile_skill_folders(state: &AppState) -> Result<SkillImportResponse, ApiE
     if !skills_dir.exists() {
         return Ok(response);
     }
+    let requested = requested_skill_ids
+        .iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect::<BTreeSet<_>>();
     for dir in discover_skill_dirs(&skills_dir).map_err(api_io_error)? {
-        let id = dir
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("skill")
-            .to_string();
+        let parsed = match parse_skill_file(&dir) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                response.errors.push(error.message);
+                continue;
+            }
+        };
+        let id = match derive_skill_id(&dir, &parsed) {
+            Ok(id) => id,
+            Err(error) => {
+                response.errors.push(error.message);
+                continue;
+            }
+        };
+        if !requested.is_empty() && !requested.contains(&id) {
+            continue;
+        }
         let meta = ImportSourceMeta {
             source_kind: "unknown".to_string(),
             source_url: String::new(),
@@ -6808,14 +6888,14 @@ mod tests {
             "Use marketing ideas.",
         );
 
-        let first = reconcile_skill_folders(&state).expect("reconcile should succeed");
+        let first = reconcile_skill_folders(&state, &[]).expect("reconcile should succeed");
         assert!(
             first.errors.is_empty(),
             "unexpected errors: {:?}",
             first.errors
         );
         assert_eq!(first.installed.len(), 2);
-        let second = reconcile_skill_folders(&state).expect("second reconcile should succeed");
+        let second = reconcile_skill_folders(&state, &[]).expect("second reconcile should succeed");
         assert!(
             second.errors.is_empty(),
             "unexpected errors: {:?}",
