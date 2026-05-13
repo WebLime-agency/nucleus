@@ -49,7 +49,7 @@ Source plans:
 | Phase | Track | Title | Status | Depends on | PR / release notes |
 | --- | --- | --- | --- | --- | --- |
 | 0 | Planning | Plan split and master execution plan | completed | none | Planning docs reviewed for consistency; no implementation started. |
-| 1 | Security | Network posture + secure-origin + redaction primitives | in_progress | Phase 0 | Implementation complete; Rust tests blocked by unrelated pre-existing workspace compile errors. |
+| 1 | Security | Network posture + secure-origin + redaction primitives | completed | Phase 0 | PR #134 includes posture/redaction primitives plus provider/API credential response hardening. |
 | 2 | Memory | Prompt integration + real Memory UI | not_started | Phase 0 |  |
 | 3 | Vault | Passphrase-protected local Vault backend | not_started | Phase 1 |  |
 | 4 | Memory | Candidates + explicit/automatic capture loop | not_started | Phase 1, Phase 2 |  |
@@ -91,7 +91,7 @@ Completion notes:
 
 ## Phase 1 — Security posture, secure-origin, and redaction primitives
 
-Status: `in_progress`
+Status: `completed`
 
 Source docs:
 
@@ -148,16 +148,17 @@ Completion notes:
 - Added central redaction primitives for sensitive headers, common secret field names, URLs with embedded credentials, PEM private-key blocks, and registered exact secret values. Broad log/audit adoption is intentionally deferred to later phases to avoid risky churn.
 - Added Settings connection-card UI fields for security posture and warnings; no Vault secret management UI was added.
 - Checks run: `cargo fmt --all --check` passed; `npm run check:web` passed; `npm run build:web` passed.
-- Rust test attempt: `cargo test -p nucleus-daemon security` is blocked by unrelated pre-existing workspace compile errors in session workspace/toolchain changes (`CreateSessionRequest`, `prepare_session_workspace`, and added `SessionRecord`/`SessionPatch` fields), not by the Phase 1 security module itself.
-- Remaining: rerun daemon Rust tests after the unrelated workspace/toolchain worktree is reconciled; wire redaction into broader audit/log persistence in the future phase that touches those call sites.
+- PR #134 repair rebased Phase 1 onto latest `origin/dev`, resolved the duplicate daemon `url.workspace = true` dependency entry, and reran clean-worktree validation successfully.
+- Clean-worktree checks after repair: `cargo fmt --all --check`, `cargo test -p nucleus-daemon security`, `cargo test -p nucleus-daemon redacts`, `npm run check:web`, and `npm run build:web` all passed.
+- Remaining: wire redaction into any future audit/log persistence call sites introduced by later phases.
 
 Follow-up: provider/API credential response hardening
 
 - Branch: `fix/redact-provider-secrets-api`.
 - Goal: treat existing provider API keys, router target keys, workspace profile keys, MCP env/header values, and job/tool debug payload credentials as secret material even before the Vault migration.
 - API responses must not return raw provider credentials or other secret-like config. Keep write/upsert request behavior for setting new values, but redact or empty sensitive values in normal browser-visible responses.
-- Commit: this follow-up commit.
-- Checks run: `cargo fmt --all --check` passed; `cargo test -p nucleus-daemon redacts -- --nocapture` attempted but remains blocked by unrelated dirty-worktree compile errors in the pre-existing workspace/toolchain changes. Web checks were not rerun because this follow-up did not touch web code or schemas.
+- Included in PR #134 as `fix: redact provider secrets from API responses`.
+- Checks run in the clean PR repair worktree: `cargo fmt --all --check`, `cargo test -p nucleus-daemon security`, `cargo test -p nucleus-daemon redacts`, `npm run check:web`, and `npm run build:web` all passed.
 
 ## Phase 2 — Memory prompt integration + real Memory UI
 
