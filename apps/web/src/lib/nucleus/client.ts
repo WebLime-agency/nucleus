@@ -36,6 +36,8 @@ import {
   skillImportRequestSchema,
   skillImportResponseSchema,
   skillInstallResultSchema,
+  skillReconcileRequestSchema,
+  skillReconcileScanResponseSchema,
   skillPackageRecordSchema,
   skillPackageUpsertRequestSchema,
   updateConfigRequestSchema,
@@ -422,9 +424,27 @@ export async function importSkills(
   );
 }
 
-export async function reconcileSkills(fetchImpl: FetchLike = fetch) {
+export async function scanReconcileSkills(fetchImpl: FetchLike = fetch) {
   return parseJson(
-    await daemonFetch(fetchImpl, '/api/skills/reconcile', { method: 'POST', headers: { accept: 'application/json' } }),
+    await daemonFetch(fetchImpl, '/api/skills/reconcile/scan', {
+      method: 'GET',
+      headers: { accept: 'application/json' }
+    }),
+    skillReconcileScanResponseSchema
+  );
+}
+
+export async function reconcileSkills(
+  input: z.input<typeof skillReconcileRequestSchema> = { skill_ids: [] },
+  fetchImpl: FetchLike = fetch
+) {
+  const payload = skillReconcileRequestSchema.parse(input);
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/skills/reconcile', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify(payload)
+    }),
     skillImportResponseSchema
   );
 }

@@ -22,9 +22,10 @@
     fetchSkills,
     importSkills,
     reconcileSkills,
+    scanReconcileSkills,
     upsertSkill
   } from '$lib/nucleus/client';
-  import type { SkillImportResponse, SkillInstallationRecord, SkillManifest, SkillPackageRecord } from '$lib/nucleus/schemas';
+  import type { SkillImportResponse, SkillInstallationRecord, SkillManifest, SkillPackageRecord, SkillReconcileScanResponse } from '$lib/nucleus/schemas';
 
   let skills: SkillManifest[] = [];
   let packages: SkillPackageRecord[] = [];
@@ -40,6 +41,9 @@
   let drawerOpen = false;
   let drawerExpanded = false;
   let importOpen = false;
+  let reconcileOpen = false;
+  let reconcileScan: SkillReconcileScanResponse | null = null;
+  let selectedReconcileSkillIds: string[] = [];
   let search = '';
   let enabledFilter = 'all';
   let sourceFilter = 'all';
@@ -184,15 +188,42 @@
     }
   }
 
+  async function openReconcileDialog() {
+    reconcileOpen = true;
+    pendingAction = 'reconcile-scan';
+    error = null;
+    result = null;
+    reconcileScan = null;
+    selectedReconcileSkillIds = [];
+    try {
+      reconcileScan = await scanReconcileSkills();
+      selectedReconcileSkillIds = reconcileScan.candidates
+        .filter((candidate) => !candidate.already_registered)
+        .map((candidate) => candidate.skill_id);
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to scan local skill folders.';
+      reconcileOpen = false;
+    } finally {
+      pendingAction = null;
+    }
+  }
+
+  function toggleReconcileSkill(skillId: string, checked: boolean) {
+    selectedReconcileSkillIds = checked
+      ? Array.from(new Set([...selectedReconcileSkillIds, skillId]))
+      : selectedReconcileSkillIds.filter((id) => id !== skillId);
+  }
+
   async function runReconcile() {
     pendingAction = 'reconcile';
     result = null;
     try {
-      result = await reconcileSkills();
-      success = `Reconcile completed with ${result.installed.length} registered skill${result.installed.length === 1 ? '' : 's'}.`;
+      result = await reconcileSkills({ skill_ids: selectedReconcileSkillIds });
+      success = `Registered ${result.installed.length} local skill${result.installed.length === 1 ? '' : 's'} from the scan.`;
+      reconcileOpen = false;
       await load();
     } catch (cause) {
-      error = cause instanceof Error ? cause.message : 'Failed to reconcile skills.';
+      error = cause instanceof Error ? cause.message : 'Failed to register selected local skills.';
     } finally {
       pendingAction = null;
     }
@@ -238,7 +269,7 @@
       </div>
       <div class="flex flex-wrap gap-2">
         <Button variant="secondary" onclick={() => (importOpen = true)}><Download class="size-4" /> Import</Button>
-        <Button variant="outline" onclick={runReconcile} disabled={pendingAction === 'reconcile'}><ChevronsRightLeft class="size-4" /> {pendingAction === 'reconcile' ? 'Reconciling…' : 'Reconcile local skills'}</Button>
+        <Button variant="outline" onclick={openReconcileDialog} disabled={pendingAction === 'reconcile-scan'} title="Scan the Nucleus state skills directory before choosing which folders to register."><ChevronsRightLeft class="size-4" /> {pendingAction === 'reconcile-scan' ? 'Scanning…' : 'Scan local skills'}</Button>
         <Button variant="outline" onclick={() => runCheckUpdates()} disabled={pendingAction === 'check-all'}><RefreshCw class="size-4" /> {pendingAction === 'check-all' ? 'Checking…' : 'Check all updates'}</Button>
       </div>
     </CardHeader>
@@ -315,6 +346,74 @@
     <SheetFooter><div class="flex flex-wrap gap-2"><Button onclick={save} disabled={saving || !form.id || !form.title}>{saving ? 'Saving…' : 'Save settings'}</Button><Button variant="secondary" onclick={() => runCheckUpdates(form.id)} disabled={!form.id || pendingAction === `check:${form.id}`}><RefreshCw class="size-4" /> {pendingAction === `check:${form.id}` ? 'Checking…' : 'Check update'}</Button><Button variant="outline" disabled title="Update apply is not available yet."><CheckCircle2 class="size-4" /> Apply update soon</Button></div><Button variant="destructive" onclick={() => removeSkill(form.id)} disabled={!form.id || pendingAction === `delete:${form.id}`}><Trash2 class="size-4" /> Delete</Button></SheetFooter>
   </SheetContent>
 </Sheet>
+
+<Dialog bind:open={reconcileOpen}>
+  <DialogContent>
+    <div class="flex items-start justify-between gap-4">
+      <div>
+        <DialogTitle id="reconcile-title">Scan local skill folders</DialogTitle>
+        <DialogDescription>
+          This scans the Nucleus state <code>skills/</code> directory and only registers the folders you select. It does not prune deleted skills or decide what should be enabled.
+        </DialogDescription>
+      </div>
+      <Button variant="ghost" size="icon" onclick={() => (reconcileOpen = false)} aria-label="Close local skill scan"><X class="size-4" /></Button>
+    </div>
+
+    <div class="mt-5 space-y-4">
+      <div class="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-100">
+        Registering a folder adds it to the catalog as an unknown-source workspace skill. Review the list first; a large state directory can contain many old or experimental skills.
+      </div>
+
+      {#if pendingAction === 'reconcile-scan'}
+        <div class="text-sm text-zinc-400">Scanning local skill folders…</div>
+      {:else if reconcileScan}
+        <div class="space-y-1 text-sm text-zinc-400">
+          <div>Scanned: <span class="break-all text-zinc-200">{reconcileScan.skills_dir}</span></div>
+          <div>Found {reconcileScan.candidates.length} skill folder{reconcileScan.candidates.length === 1 ? '' : 's'}.</div>
+        </div>
+
+        {#if reconcileScan.errors.length > 0}
+          <div class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-200">
+            {reconcileScan.errors.join(' · ')}
+          </div>
+        {/if}
+
+        {#if reconcileScan.candidates.length === 0}
+          <WorkspaceEmptyState message="No local SKILL.md folders were found." />
+        {:else}
+          <div class="max-h-80 space-y-2 overflow-y-auto rounded-lg border border-zinc-800 p-2">
+            {#each reconcileScan.candidates as candidate, index (`${candidate.path}:${index}`)}
+              <label class="flex cursor-pointer items-start gap-3 rounded-md px-2 py-2 hover:bg-zinc-900/70">
+                <input
+                  type="checkbox"
+                  class="mt-1"
+                  checked={selectedReconcileSkillIds.includes(candidate.skill_id)}
+                  onchange={(event) => toggleReconcileSkill(candidate.skill_id, (event.currentTarget as HTMLInputElement).checked)}
+                />
+                <span class="min-w-0 flex-1">
+                  <span class="flex flex-wrap items-center gap-2">
+                    <span class="font-medium text-zinc-100">{candidate.title}</span>
+                    <code class="rounded bg-zinc-900 px-1.5 py-0.5 text-xs text-zinc-300">{candidate.skill_id}</code>
+                    {#if candidate.already_registered}<Badge variant="secondary">Registered</Badge>{/if}
+                  </span>
+                  <span class="mt-1 block break-all text-xs text-zinc-500">{candidate.path}</span>
+                </span>
+              </label>
+            {/each}
+          </div>
+        {/if}
+      {/if}
+    </div>
+
+    <div class="mt-5 flex flex-wrap items-center justify-between gap-2">
+      <div class="text-xs text-zinc-500">{selectedReconcileSkillIds.length} selected</div>
+      <div class="flex gap-2">
+        <Button variant="secondary" onclick={() => (reconcileOpen = false)}>Cancel</Button>
+        <Button onclick={runReconcile} disabled={!reconcileScan || selectedReconcileSkillIds.length === 0 || pendingAction === 'reconcile' || pendingAction === 'reconcile-scan'}>{pendingAction === 'reconcile' ? 'Registering…' : 'Register selected'}</Button>
+      </div>
+    </div>
+  </DialogContent>
+</Dialog>
 
 <Dialog bind:open={importOpen}>
   <DialogContent>

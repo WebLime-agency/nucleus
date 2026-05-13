@@ -562,6 +562,23 @@ export const skillImportRequestSchema = z.object({
   scope_id: z.string().default('default')
 });
 
+export const skillReconcileRequestSchema = z.object({
+  skill_ids: z.array(z.string()).default([])
+});
+
+export const skillReconcileCandidateSchema = z.object({
+  skill_id: z.string(),
+  title: z.string(),
+  path: z.string(),
+  already_registered: z.boolean()
+});
+
+export const skillReconcileScanResponseSchema = z.object({
+  skills_dir: z.string(),
+  candidates: z.array(skillReconcileCandidateSchema).default([]),
+  errors: z.array(z.string()).default([])
+});
+
 export const skillInstallVerificationSchema = z.object({
   files_copied: z.boolean(),
   manifest_registered: z.boolean(),
@@ -990,6 +1007,9 @@ export type SkillManifest = z.infer<typeof skillManifestSchema>;
 export type SkillPackageRecord = z.infer<typeof skillPackageRecordSchema>;
 export type SkillPackageUpsertRequest = z.infer<typeof skillPackageUpsertRequestSchema>;
 export type SkillImportRequest = z.infer<typeof skillImportRequestSchema>;
+export type SkillReconcileRequest = z.infer<typeof skillReconcileRequestSchema>;
+export type SkillReconcileCandidate = z.infer<typeof skillReconcileCandidateSchema>;
+export type SkillReconcileScanResponse = z.infer<typeof skillReconcileScanResponseSchema>;
 export type SkillInstallResult = z.infer<typeof skillInstallResultSchema>;
 export type SkillImportResponse = z.infer<typeof skillImportResponseSchema>;
 export type SkillInstallationRecord = z.infer<typeof skillInstallationRecordSchema>;
