@@ -747,6 +747,7 @@
       webMode={settings?.connection.web_mode ?? 'unknown'}
       authEnabled={settings?.auth.enabled ?? false}
       webRoot={settings?.connection.web_root}
+      security={settings?.security ?? null}
     />
 
     <WorkspaceAccessCard tokenPath={settings?.auth.token_path} />

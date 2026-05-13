@@ -49,7 +49,7 @@ Source plans:
 | Phase | Track | Title | Status | Depends on | PR / release notes |
 | --- | --- | --- | --- | --- | --- |
 | 0 | Planning | Plan split and master execution plan | completed | none | Planning docs reviewed for consistency; no implementation started. |
-| 1 | Security | Network posture + secure-origin + redaction primitives | not_started | Phase 0 |  |
+| 1 | Security | Network posture + secure-origin + redaction primitives | in_progress | Phase 0 | Implementation complete; Rust tests blocked by unrelated pre-existing workspace compile errors. |
 | 2 | Memory | Prompt integration + real Memory UI | not_started | Phase 0 |  |
 | 3 | Vault | Passphrase-protected local Vault backend | not_started | Phase 1 |  |
 | 4 | Memory | Candidates + explicit/automatic capture loop | not_started | Phase 1, Phase 2 |  |
@@ -91,7 +91,7 @@ Completion notes:
 
 ## Phase 1 — Security posture, secure-origin, and redaction primitives
 
-Status: `not_started`
+Status: `in_progress`
 
 Source docs:
 
@@ -141,7 +141,15 @@ Exit criteria:
 
 Completion notes:
 
-- Pending.
+- Branch: `feat/security-posture-redaction`.
+- Commit: `61f5ba5`.
+- Added daemon secure-origin classification helpers for localhost/loopback HTTP, HTTPS, and unsafe plain HTTP non-loopback origins.
+- Added daemon security posture reporting through the existing Settings summary, including configured bind, exposure classification, HTTPS status, current origin Vault-safe status, and non-secret warnings.
+- Added central redaction primitives for sensitive headers, common secret field names, URLs with embedded credentials, PEM private-key blocks, and registered exact secret values. Broad log/audit adoption is intentionally deferred to later phases to avoid risky churn.
+- Added Settings connection-card UI fields for security posture and warnings; no Vault secret management UI was added.
+- Checks run: `cargo fmt --all --check` passed; `npm run check:web` passed; `npm run build:web` passed.
+- Rust test attempt: `cargo test -p nucleus-daemon security` is blocked by unrelated pre-existing workspace compile errors in session workspace/toolchain changes (`CreateSessionRequest`, `prepare_session_workspace`, and added `SessionRecord`/`SessionPatch` fields), not by the Phase 1 security module itself.
+- Remaining: rerun daemon Rust tests after the unrelated workspace/toolchain worktree is reconciled; wire redaction into broader audit/log persistence in the future phase that touches those call sites.
 
 ## Phase 2 — Memory prompt integration + real Memory UI
 

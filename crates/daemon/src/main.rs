@@ -1,6 +1,7 @@
 mod agent;
 mod host;
 mod runtime;
+mod security;
 mod updates;
 mod worker_action;
 
@@ -325,8 +326,11 @@ async fn runtimes(
     Ok(Json(load_runtimes(&state, force_refresh).await?))
 }
 
-async fn settings(State(state): State<AppState>) -> Result<Json<SettingsSummary>, ApiError> {
-    Ok(Json(build_settings_summary(&state).await))
+async fn settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<SettingsSummary>, ApiError> {
+    Ok(Json(build_settings_summary(&state, &headers).await))
 }
 
 async fn check_for_updates(State(state): State<AppState>) -> Result<Json<UpdateStatus>, ApiError> {
@@ -2122,7 +2126,7 @@ fn schedule_daemon_restart(state: AppState) {
     });
 }
 
-async fn build_settings_summary(state: &AppState) -> SettingsSummary {
+async fn build_settings_summary(state: &AppState, headers: &HeaderMap) -> SettingsSummary {
     let instance = state.updates.instance_summary();
     let hostname = state.host.host_status().hostname;
 
@@ -2141,6 +2145,7 @@ async fn build_settings_summary(state: &AppState) -> SettingsSummary {
             state.tailscale_dns_name.as_deref(),
             state.web_dist_dir.as_ref(),
         ),
+        security: security::build_security_posture(&instance.daemon_bind, headers),
         compatibility: build_compatibility_summary(
             &state.version,
             &state.updates.instance_summary(),
