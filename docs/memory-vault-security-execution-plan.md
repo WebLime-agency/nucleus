@@ -162,7 +162,7 @@ Follow-up: provider/API credential response hardening
 
 ## Phase 2 — Memory prompt integration + real Memory UI
 
-Status: `not_started`
+Status: `completed`
 
 Source doc:
 
@@ -203,7 +203,14 @@ Exit criteria:
 
 Completion notes:
 
-- Pending.
+- Implemented on branch `feat/memory-prompt-ui`.
+- Commit: branch HEAD for `feat: add memory prompt integration and management UI`.
+- Extended Memory protocol/storage/API handling with accepted/manual defaults, validation/normalization, and prompt-visible safety redaction for stored text.
+- Fixed compiled prompt assembly so prompt include contents become provider-visible compiled layers before memory and skills.
+- Added accepted-memory prompt layers with workspace/project/session scope filtering, conservative budgeting/truncation, and debug counts.
+- Replaced the placeholder Memory page with a real accepted-memory management UI and prompt-visible/secret warning copy.
+- Checks run: `cargo fmt --all --check`, `cargo test -p nucleus-daemon memory`, `cargo test -p nucleus-daemon compiled_turn_includes_prompt_includes_and_accepted_memory`, full `cargo test`, `npm run check:web`, and `npm run build:web`.
+- Deferred: candidate extraction/review, Vault backend/UI, MCP `vault_bearer`, semantic/vector memory, and FTS search remain out of Phase 2 scope.
 
 ## Phase 3 — Passphrase-protected local Vault backend
 

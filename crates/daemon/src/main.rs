@@ -83,6 +83,7 @@ const MAX_AUDIT_LIMIT: usize = 100;
 const MAX_PROMPT_INCLUDE_FILES: usize = 24;
 const MAX_PROMPT_INCLUDE_FILE_CHARS: usize = 6_000;
 const MAX_PROMPT_INCLUDE_TOTAL_CHARS: usize = 24_000;
+const MAX_MEMORY_CONTEXT_CHARS: usize = 12_000;
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(900);
 const INITIAL_UPDATE_CHECK_DELAY: Duration = Duration::from_secs(3);
 const RESTART_AFTER_RESPONSE_DELAY: Duration = Duration::from_millis(800);
@@ -741,11 +742,11 @@ fn upsert_memory_from_request(
     payload: MemoryEntryUpsertRequest,
     id_override: Option<String>,
 ) -> Result<MemoryEntry, ApiError> {
-    let scope_kind = payload.scope_kind.trim();
+    let scope_kind = normalize_memory_scope_kind(&payload.scope_kind)?;
     let scope_id = payload.scope_id.trim();
     let title = payload.title.trim();
-    let content = payload.content.trim();
-    if scope_kind.is_empty() || scope_id.is_empty() || title.is_empty() || content.is_empty() {
+    let content = security::RedactionSet::new().redact_text(payload.content.trim());
+    if scope_id.is_empty() || title.is_empty() || content.is_empty() {
         return Err(ApiError::bad_request(
             "memory scope, title, and content are required",
         ));
@@ -756,10 +757,10 @@ fn upsert_memory_from_request(
     };
     let entry = MemoryEntry {
         id,
-        scope_kind: scope_kind.to_string(),
+        scope_kind,
         scope_id: scope_id.to_string(),
         title: title.to_string(),
-        content: content.to_string(),
+        content,
         tags: payload
             .tags
             .into_iter()
@@ -767,6 +768,16 @@ fn upsert_memory_from_request(
             .filter(|tag: &String| !tag.is_empty())
             .collect(),
         enabled: payload.enabled.unwrap_or(true),
+        status: normalize_memory_status(payload.status.as_deref())?,
+        memory_kind: normalize_memory_kind(payload.memory_kind.as_deref())?,
+        source_kind: normalize_memory_source_kind(payload.source_kind.as_deref())?,
+        source_id: payload.source_id.unwrap_or_default().trim().to_string(),
+        confidence: payload.confidence.unwrap_or(1.0).clamp(0.0, 1.0),
+        created_by: normalize_memory_created_by(payload.created_by.as_deref())?,
+        last_used_at: payload.last_used_at,
+        use_count: payload.use_count.unwrap_or(0).max(0),
+        supersedes_id: payload.supersedes_id.unwrap_or_default().trim().to_string(),
+        metadata_json: payload.metadata_json.unwrap_or_else(|| json!({})),
         created_at: 0,
         updated_at: 0,
     };
@@ -774,6 +785,55 @@ fn upsert_memory_from_request(
         .store
         .upsert_memory_entry(&entry)
         .map_err(ApiError::from)
+}
+
+fn normalize_memory_scope_kind(value: &str) -> Result<String, ApiError> {
+    match value.trim() {
+        "workspace" | "project" | "session" => Ok(value.trim().to_string()),
+        _ => Err(ApiError::bad_request(
+            "memory scope kind must be workspace, project, or session",
+        )),
+    }
+}
+
+fn normalize_memory_status(value: Option<&str>) -> Result<String, ApiError> {
+    let value = value.unwrap_or("accepted").trim();
+    match value {
+        "accepted" | "archived" => Ok(value.to_string()),
+        _ => Err(ApiError::bad_request(
+            "memory status must be accepted or archived",
+        )),
+    }
+}
+
+fn normalize_memory_kind(value: Option<&str>) -> Result<String, ApiError> {
+    let value = value.unwrap_or("note").trim();
+    match value {
+        "note" | "preference" | "instruction" | "fact" => Ok(value.to_string()),
+        _ => Err(ApiError::bad_request(
+            "memory kind must be note, preference, instruction, or fact",
+        )),
+    }
+}
+
+fn normalize_memory_source_kind(value: Option<&str>) -> Result<String, ApiError> {
+    let value = value.unwrap_or("manual").trim();
+    match value {
+        "manual" | "import" | "system" => Ok(value.to_string()),
+        _ => Err(ApiError::bad_request(
+            "memory source kind must be manual, import, or system",
+        )),
+    }
+}
+
+fn normalize_memory_created_by(value: Option<&str>) -> Result<String, ApiError> {
+    let value = value.unwrap_or("user").trim();
+    match value {
+        "user" | "system" => Ok(value.to_string()),
+        _ => Err(ApiError::bad_request(
+            "memory created_by must be user or system",
+        )),
+    }
 }
 
 async fn delete_skill(
@@ -4692,6 +4752,107 @@ fn is_allowed_nucleus_skill_path(path: &std::path::Path, skill_id: &str) -> bool
             .is_some_and(|name| name.starts_with(".nucleus"))
 }
 
+#[derive(Debug, Clone, Default)]
+struct MemoryLayerCollection {
+    layers: Vec<CompiledPromptLayer>,
+    total_count: usize,
+    included_count: usize,
+    skipped_count: usize,
+    truncated_count: usize,
+}
+
+fn compiled_include_layers(sources: &[PromptIncludeSource]) -> Vec<CompiledPromptLayer> {
+    sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| CompiledPromptLayer {
+            id: format!("include:{}", index + 1),
+            kind: "include".to_string(),
+            scope: source.scope.to_string(),
+            title: source
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("prompt include")
+                .to_string(),
+            source_path: source.path.display().to_string(),
+            content: source.content.clone(),
+        })
+        .collect()
+}
+
+fn collect_memory_layers(
+    state: &AppState,
+    session: &SessionSummary,
+) -> Result<MemoryLayerCollection, ApiError> {
+    let mut collection = MemoryLayerCollection::default();
+    let mut remaining = MAX_MEMORY_CONTEXT_CHARS;
+    let mut layers = Vec::new();
+    let project_ids = session
+        .projects
+        .iter()
+        .map(|project| project.id.as_str())
+        .collect::<BTreeSet<_>>();
+
+    for entry in state.store.list_memory_entries()? {
+        if !memory_entry_applies_to_session(&entry, session, &project_ids) {
+            continue;
+        }
+        collection.total_count += 1;
+        if !entry.enabled || entry.status != "accepted" {
+            collection.skipped_count += 1;
+            continue;
+        }
+        let mut content = format!(
+            "Title: {}\nScope: {}/{}\nKind: {}\nTags: {}\n\n{}",
+            entry.title,
+            entry.scope_kind,
+            entry.scope_id,
+            entry.memory_kind,
+            if entry.tags.is_empty() {
+                "none".to_string()
+            } else {
+                entry.tags.join(", ")
+            },
+            entry.content
+        );
+        if content.len() > remaining {
+            collection.truncated_count += 1;
+            if remaining < 256 {
+                collection.skipped_count += 1;
+                continue;
+            }
+            content.truncate(remaining);
+            content.push_str("\n[Memory entry truncated by Nucleus context budget]");
+        }
+        remaining = remaining.saturating_sub(content.len());
+        layers.push(CompiledPromptLayer {
+            id: format!("memory:{}", entry.id),
+            kind: "memory".to_string(),
+            scope: format!("{}:{}", entry.scope_kind, entry.scope_id),
+            title: entry.title,
+            source_path: String::new(),
+            content,
+        });
+        collection.included_count += 1;
+    }
+    collection.layers = layers;
+    Ok(collection)
+}
+
+fn memory_entry_applies_to_session(
+    entry: &MemoryEntry,
+    session: &SessionSummary,
+    project_ids: &BTreeSet<&str>,
+) -> bool {
+    match entry.scope_kind.as_str() {
+        "workspace" => entry.scope_id == "workspace",
+        "project" => project_ids.contains(entry.scope_id.as_str()),
+        "session" => entry.scope_id == session.id,
+        _ => false,
+    }
+}
+
 fn compile_session_turn(
     state: &AppState,
     session: &SessionSummary,
@@ -4701,6 +4862,9 @@ fn compile_session_turn(
     compiler_role: &str,
 ) -> Result<CompiledTurn, ApiError> {
     let prompt_sources = discover_prompt_sources(state, session)?;
+    let mut project_layers = compiled_include_layers(&prompt_sources);
+    let memory_collection = collect_memory_layers(state, session)?;
+    project_layers.extend(memory_collection.layers.clone());
     let skill_collection = collect_compiled_skill_layers(state, session, prompt)?;
     let skill_layers = skill_collection.layers;
     let mut mcp_catalog = state.store.list_mcp_servers()?;
@@ -4720,14 +4884,21 @@ fn compile_session_turn(
         &tool_catalog,
         &mcp_catalog,
     );
+    compiled.project_layers = project_layers;
     compiled.debug_summary.include_count = prompt_sources.len();
-    compiled.debug_summary.layer_count = compiled.skill_layers.len();
+    compiled.debug_summary.memory_count = memory_collection.total_count;
+    compiled.debug_summary.memory_included_count = memory_collection.included_count;
+    compiled.debug_summary.memory_skipped_count = memory_collection.skipped_count;
+    compiled.debug_summary.memory_truncated_count = memory_collection.truncated_count;
+    compiled.debug_summary.layer_count =
+        compiled.system_layers.len() + compiled.project_layers.len() + compiled.skill_layers.len();
     compiled.debug_summary.skill_diagnostics = skill_collection.diagnostics;
     compiled.debug_summary.summary = format!(
-        "Compiled {} history turns for {} provider-neutral prompt with {} prompt includes, {} skill layers, {} MCP servers, and {} tools.",
+        "Compiled {} history turns for {} provider-neutral prompt with {} prompt includes, {} accepted memory entries included, {} skill layers, {} MCP servers, and {} tools.",
         compiled.history.len(),
         compiled.role,
         compiled.debug_summary.include_count,
+        compiled.debug_summary.memory_included_count,
         compiled.debug_summary.skill_count,
         compiled.debug_summary.mcp_server_count,
         compiled.debug_summary.tool_count,
@@ -7210,6 +7381,141 @@ mod tests {
             tailscale_dns_name: None,
             events,
         }
+    }
+
+    fn test_named_app_state(name: &str) -> (PathBuf, AppState) {
+        let state_dir = test_state_dir(name);
+        let store = initialize_test_store(&state_dir);
+        let (events, _) = broadcast::channel(4);
+        let state = AppState {
+            version: "test".to_string(),
+            store: store.clone(),
+            host: Arc::new(HostEngine::new()),
+            runtimes: Arc::new(RuntimeManager::default()),
+            updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            agent: Arc::new(agent::AgentRuntime::default()),
+            web_dist_dir: None,
+            tailscale_dns_name: None,
+            events,
+        };
+        (state_dir, state)
+    }
+
+    #[test]
+    fn memory_upsert_normalizes_phase2_defaults() {
+        let (state_dir, state) = test_named_app_state("memory-defaults");
+        let entry = upsert_memory_from_request(
+            &state,
+            MemoryEntryUpsertRequest {
+                id: Some("phase2-defaults".to_string()),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "Phase 2 defaults".to_string(),
+                content: "Remember this preference.".to_string(),
+                tags: vec![" docs ".to_string(), "".to_string()],
+                enabled: None,
+                status: None,
+                memory_kind: None,
+                source_kind: None,
+                source_id: None,
+                confidence: Some(1.8),
+                created_by: None,
+                last_used_at: None,
+                use_count: Some(-3),
+                supersedes_id: None,
+                metadata_json: None,
+            },
+            None,
+        )
+        .expect("memory should save");
+
+        assert_eq!(entry.status, "accepted");
+        assert_eq!(entry.memory_kind, "note");
+        assert_eq!(entry.source_kind, "manual");
+        assert_eq!(entry.created_by, "user");
+        assert_eq!(entry.confidence, 1.0);
+        assert_eq!(entry.use_count, 0);
+        assert_eq!(entry.tags, vec!["docs"]);
+        assert_eq!(entry.metadata_json, json!({}));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn compiled_turn_includes_prompt_includes_and_accepted_memory() {
+        let (state_dir, state) = test_named_app_state("memory-compiled-context");
+        let workspace_root = state_dir.join("workspace");
+        let include_dir = workspace_root.join("include");
+        fs::create_dir_all(&include_dir).expect("include dir should exist");
+        fs::write(
+            include_dir.join("phase2.md"),
+            "Provider-visible include text.",
+        )
+        .expect("include should write");
+        state
+            .store
+            .upsert_memory_entry(&MemoryEntry {
+                id: "workspace-memory".to_string(),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "Workspace memory".to_string(),
+                content: "Provider-visible accepted memory.".to_string(),
+                tags: vec!["phase2".to_string()],
+                enabled: true,
+                status: "accepted".to_string(),
+                memory_kind: "note".to_string(),
+                source_kind: "manual".to_string(),
+                source_id: String::new(),
+                confidence: 1.0,
+                created_by: "user".to_string(),
+                last_used_at: None,
+                use_count: 0,
+                supersedes_id: String::new(),
+                metadata_json: json!({}),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .expect("memory should persist");
+        state
+            .store
+            .upsert_memory_entry(&MemoryEntry {
+                id: "archived-memory".to_string(),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "Archived memory".to_string(),
+                content: "This archived memory must not appear.".to_string(),
+                tags: Vec::new(),
+                enabled: true,
+                status: "archived".to_string(),
+                memory_kind: "note".to_string(),
+                source_kind: "manual".to_string(),
+                source_id: String::new(),
+                confidence: 1.0,
+                created_by: "user".to_string(),
+                last_used_at: None,
+                use_count: 0,
+                supersedes_id: String::new(),
+                metadata_json: json!({}),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .expect("archived memory should persist");
+
+        let session = test_session(&workspace_root);
+        let compiled = compile_session_turn(&state, &session, &[], "Hello", &[], "main")
+            .expect("turn should compile");
+        let rendered = nucleus_core::render_compiled_turn_system_text(&compiled);
+
+        assert!(rendered.contains("Provider-visible include text."));
+        assert!(rendered.contains("Provider-visible accepted memory."));
+        assert!(!rendered.contains("This archived memory must not appear."));
+        assert_eq!(compiled.debug_summary.include_count, 1);
+        assert_eq!(compiled.debug_summary.memory_count, 2);
+        assert_eq!(compiled.debug_summary.memory_included_count, 1);
+        assert_eq!(compiled.debug_summary.memory_skipped_count, 1);
+        let include_index = rendered.find("Provider-visible include text.").unwrap();
+        let memory_index = rendered.find("Provider-visible accepted memory.").unwrap();
+        assert!(include_index < memory_index);
+        let _ = fs::remove_dir_all(&state_dir);
     }
 
     fn test_session(workspace_root: &std::path::Path) -> SessionSummary {
