@@ -44,6 +44,8 @@
   let reconcileOpen = false;
   let reconcileScan: SkillReconcileScanResponse | null = null;
   let selectedReconcileSkillIds: string[] = [];
+  let reconcileCandidateFilter = 'unregistered';
+  let reconcileCandidateSearch = '';
   let search = '';
   let enabledFilter = 'all';
   let sourceFilter = 'all';
@@ -57,6 +59,17 @@
   $: selectedPackage = packageForSkill(form.id || selectedSkillId || '');
   $: selectedInstallation = installationForPackage(selectedPackage?.id || '');
   $: filteredSkills = skills.filter(matchesFilters);
+  $: filteredReconcileCandidates = reconcileScan
+    ? reconcileScan.candidates.filter((candidate) => {
+        const query = reconcileCandidateSearch.trim().toLowerCase();
+        const matchesQuery = !query || [candidate.title, candidate.skill_id, candidate.path].join(' ').toLowerCase().includes(query);
+        const matchesFilter =
+          reconcileCandidateFilter === 'all' ||
+          (reconcileCandidateFilter === 'registered' && candidate.already_registered) ||
+          (reconcileCandidateFilter === 'unregistered' && !candidate.already_registered);
+        return matchesQuery && matchesFilter;
+      })
+    : [];
 
   function blankSkill(): SkillManifest {
     return { id: '', title: '', description: '', instructions: '', activation_mode: 'manual', triggers: [], include_paths: [], required_tools: [], required_mcps: [], project_filters: [], enabled: true };
@@ -195,6 +208,8 @@
     result = null;
     reconcileScan = null;
     selectedReconcileSkillIds = [];
+    reconcileCandidateFilter = 'unregistered';
+    reconcileCandidateSearch = '';
     try {
       reconcileScan = await scanReconcileSkills();
       selectedReconcileSkillIds = reconcileScan.candidates
@@ -212,6 +227,22 @@
     selectedReconcileSkillIds = checked
       ? Array.from(new Set([...selectedReconcileSkillIds, skillId]))
       : selectedReconcileSkillIds.filter((id) => id !== skillId);
+  }
+
+  function selectVisibleReconcileSkills() {
+    selectedReconcileSkillIds = Array.from(
+      new Set([
+        ...selectedReconcileSkillIds,
+        ...filteredReconcileCandidates
+          .filter((candidate) => !candidate.already_registered)
+          .map((candidate) => candidate.skill_id)
+      ])
+    );
+  }
+
+  function clearVisibleReconcileSkills() {
+    const visible = new Set(filteredReconcileCandidates.map((candidate) => candidate.skill_id));
+    selectedReconcileSkillIds = selectedReconcileSkillIds.filter((skillId) => !visible.has(skillId));
   }
 
   async function runReconcile() {
@@ -369,7 +400,16 @@
       {:else if reconcileScan}
         <div class="space-y-1 text-sm text-zinc-400">
           <div>Scanned: <span class="break-all text-zinc-200">{reconcileScan.skills_dir}</span></div>
-          <div>Found {reconcileScan.candidates.length} skill folder{reconcileScan.candidates.length === 1 ? '' : 's'}.</div>
+          <div>Found {reconcileScan.candidates.length} skill folder{reconcileScan.candidates.length === 1 ? '' : 's'} · {reconcileScan.candidates.filter((candidate) => !candidate.already_registered).length} not registered.</div>
+        </div>
+
+        <div class="grid gap-2 sm:grid-cols-[minmax(0,1fr)_12rem]">
+          <Input placeholder="Filter found folders…" bind:value={reconcileCandidateSearch} />
+          <Select bind:value={reconcileCandidateFilter} aria-label="Local skill folder filter">
+            <option value="unregistered">Not registered</option>
+            <option value="registered">Registered</option>
+            <option value="all">All found</option>
+          </Select>
         </div>
 
         {#if reconcileScan.errors.length > 0}
@@ -380,9 +420,18 @@
 
         {#if reconcileScan.candidates.length === 0}
           <WorkspaceEmptyState message="No local SKILL.md folders were found." />
+        {:else if filteredReconcileCandidates.length === 0}
+          <WorkspaceEmptyState message={reconcileCandidateFilter === 'unregistered' ? 'No unregistered local skill folders were found.' : 'No local skill folders match the current filter.'} />
         {:else}
+          <div class="flex flex-wrap items-center justify-between gap-2 text-xs text-zinc-500">
+            <span>Showing {filteredReconcileCandidates.length} of {reconcileScan.candidates.length}</span>
+            <div class="flex gap-2">
+              <Button variant="ghost" size="sm" onclick={selectVisibleReconcileSkills}>Select visible unregistered</Button>
+              <Button variant="ghost" size="sm" onclick={clearVisibleReconcileSkills}>Clear visible</Button>
+            </div>
+          </div>
           <div class="max-h-80 space-y-2 overflow-y-auto rounded-lg border border-zinc-800 p-2">
-            {#each reconcileScan.candidates as candidate, index (`${candidate.path}:${index}`)}
+            {#each filteredReconcileCandidates as candidate, index (`${candidate.path}:${index}`)}
               <label class="flex cursor-pointer items-start gap-3 rounded-md px-2 py-2 hover:bg-zinc-900/70">
                 <input
                   type="checkbox"
@@ -393,7 +442,6 @@
                 <span class="min-w-0 flex-1">
                   <span class="flex flex-wrap items-center gap-2">
                     <span class="font-medium text-zinc-100">{candidate.title}</span>
-                    <code class="rounded bg-zinc-900 px-1.5 py-0.5 text-xs text-zinc-300">{candidate.skill_id}</code>
                     {#if candidate.already_registered}<Badge variant="secondary">Registered</Badge>{/if}
                   </span>
                   <span class="mt-1 block break-all text-xs text-zinc-500">{candidate.path}</span>
