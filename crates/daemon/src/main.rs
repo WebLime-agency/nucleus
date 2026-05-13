@@ -1,6 +1,7 @@
 mod agent;
 mod host;
 mod runtime;
+mod security;
 mod updates;
 mod worker_action;
 
@@ -325,8 +326,11 @@ async fn runtimes(
     Ok(Json(load_runtimes(&state, force_refresh).await?))
 }
 
-async fn settings(State(state): State<AppState>) -> Result<Json<SettingsSummary>, ApiError> {
-    Ok(Json(build_settings_summary(&state).await))
+async fn settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<SettingsSummary>, ApiError> {
+    Ok(Json(build_settings_summary(&state, &headers).await))
 }
 
 async fn check_for_updates(State(state): State<AppState>) -> Result<Json<UpdateStatus>, ApiError> {
@@ -375,7 +379,7 @@ async fn restart_daemon(State(state): State<AppState>) -> Result<Json<UpdateStat
 }
 
 async fn workspace(State(state): State<AppState>) -> Result<Json<WorkspaceSummary>, ApiError> {
-    Ok(Json(state.store.workspace()?))
+    Ok(Json(redact_workspace_summary(state.store.workspace()?)))
 }
 
 async fn update_workspace(
@@ -434,7 +438,7 @@ async fn update_workspace(
     )
     .await;
     let _ = publish_overview_event(&state).await;
-    Ok(Json(workspace))
+    Ok(Json(redact_workspace_summary(workspace)))
 }
 
 async fn create_workspace_profile(
@@ -459,7 +463,7 @@ async fn create_workspace_profile(
     )
     .await;
     let _ = publish_overview_event(&state).await;
-    Ok(Json(profile))
+    Ok(Json(redact_workspace_profile(profile)))
 }
 
 async fn update_workspace_profile(
@@ -485,7 +489,7 @@ async fn update_workspace_profile(
     )
     .await;
     let _ = publish_overview_event(&state).await;
-    Ok(Json(profile))
+    Ok(Json(redact_workspace_profile(profile)))
 }
 
 async fn delete_workspace_profile(
@@ -509,7 +513,7 @@ async fn delete_workspace_profile(
     )
     .await;
     let _ = publish_overview_event(&state).await;
-    Ok(Json(workspace))
+    Ok(Json(redact_workspace_summary(workspace)))
 }
 
 async fn sync_projects(State(state): State<AppState>) -> Result<Json<WorkspaceSummary>, ApiError> {
@@ -534,7 +538,7 @@ async fn sync_projects(State(state): State<AppState>) -> Result<Json<WorkspaceSu
         );
     }
     let _ = publish_overview_event(&state).await;
-    Ok(Json(workspace))
+    Ok(Json(redact_workspace_summary(workspace)))
 }
 
 async fn update_project(
@@ -561,13 +565,15 @@ async fn update_project(
     )
     .await;
     let _ = publish_overview_event(&state).await;
-    Ok(Json(state.store.workspace()?))
+    Ok(Json(redact_workspace_summary(state.store.workspace()?)))
 }
 
 async fn router_profiles(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<RouterProfileSummary>>, ApiError> {
-    Ok(Json(load_router_profiles(&state, false).await?))
+    Ok(Json(redact_router_profiles(
+        load_router_profiles(&state, false).await?,
+    )))
 }
 
 async fn list_skills(State(state): State<AppState>) -> Result<Json<Vec<SkillManifest>>, ApiError> {
@@ -651,7 +657,7 @@ async fn upsert_skill_installation_by_id(
 async fn list_mcp_servers(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<McpServerSummary>>, ApiError> {
-    Ok(Json(state.store.list_mcp_servers()?))
+    Ok(Json(redact_mcp_servers(state.store.list_mcp_servers()?)))
 }
 
 async fn upsert_mcp_server(
@@ -659,7 +665,9 @@ async fn upsert_mcp_server(
     body: Bytes,
 ) -> Result<Json<McpServerSummary>, ApiError> {
     let payload = sanitize_mcp_server(decode_json::<McpServerSummary>(&body)?)?;
-    Ok(Json(state.store.upsert_mcp_server(&payload)?))
+    Ok(Json(redact_mcp_server(
+        state.store.upsert_mcp_server(&payload)?,
+    )))
 }
 
 async fn upsert_mcp_server_by_id(
@@ -669,7 +677,9 @@ async fn upsert_mcp_server_by_id(
 ) -> Result<Json<McpServerSummary>, ApiError> {
     let mut payload = sanitize_mcp_server(decode_json::<McpServerSummary>(&body)?)?;
     payload.id = sanitize_registry_id(&server_id, "MCP server id")?;
-    Ok(Json(state.store.upsert_mcp_server(&payload)?))
+    Ok(Json(redact_mcp_server(
+        state.store.upsert_mcp_server(&payload)?,
+    )))
 }
 
 async fn list_memory(State(state): State<AppState>) -> Result<Json<MemorySummary>, ApiError> {
@@ -845,7 +855,7 @@ async fn discover_mcp_server_tools(
                     .upsert_mcp_tool(tool)
                     .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
             }
-            Ok(Json(
+            Ok(Json(redact_mcp_server(
                 state
                     .store
                     .list_mcp_servers()
@@ -853,7 +863,7 @@ async fn discover_mcp_server_tools(
                     .into_iter()
                     .find(|server| server.id == record.id)
                     .expect("discovered MCP server should be present"),
-            ))
+            )))
         }
         Err(error) => {
             let now = SystemTime::now()
@@ -1263,7 +1273,7 @@ async fn mcp_http_request(record: &McpServerRecord, payload: Value) -> anyhow::R
 async fn list_sessions(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<SessionSummary>>, ApiError> {
-    Ok(Json(state.store.list_sessions()?))
+    Ok(Json(redact_session_summaries(state.store.list_sessions()?)))
 }
 
 async fn playbooks(State(state): State<AppState>) -> Result<Json<Vec<PlaybookSummary>>, ApiError> {
@@ -1307,7 +1317,9 @@ async fn run_playbook(
     State(state): State<AppState>,
     Path(playbook_id): Path<String>,
 ) -> Result<Json<JobDetail>, ApiError> {
-    Ok(Json(agent::run_playbook(state, playbook_id).await?))
+    Ok(Json(redact_job_detail(
+        agent::run_playbook(state, playbook_id).await?,
+    )))
 }
 
 async fn actions() -> Json<Vec<ActionSummary>> {
@@ -1466,7 +1478,7 @@ async fn create_session(
     )
     .await;
     let _ = publish_overview_event(&state).await;
-    Ok(Json(detail))
+    Ok(Json(redact_session_detail(detail)))
 }
 
 async fn session_detail(
@@ -1475,7 +1487,7 @@ async fn session_detail(
 ) -> Result<Json<SessionDetail>, ApiError> {
     let mut detail = state.store.get_session(&session_id)?;
     refresh_session_workspace_warnings(&mut detail.session);
-    Ok(Json(detail))
+    Ok(Json(redact_session_detail(detail)))
 }
 
 async fn update_session(
@@ -1684,7 +1696,7 @@ async fn update_session(
     )
     .await;
     let _ = publish_overview_event(&state).await;
-    Ok(Json(detail))
+    Ok(Json(redact_session_detail(detail)))
 }
 
 async fn delete_session(
@@ -1726,21 +1738,25 @@ async fn job_detail(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Result<Json<JobDetail>, ApiError> {
-    Ok(Json(state.store.get_job(&job_id)?))
+    Ok(Json(redact_job_detail(state.store.get_job(&job_id)?)))
 }
 
 async fn cancel_job(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Result<Json<JobDetail>, ApiError> {
-    Ok(Json(agent::cancel_job(state, job_id).await?))
+    Ok(Json(redact_job_detail(
+        agent::cancel_job(state, job_id).await?,
+    )))
 }
 
 async fn resume_job(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Result<Json<JobDetail>, ApiError> {
-    Ok(Json(agent::resume_job(state, job_id).await?))
+    Ok(Json(redact_job_detail(
+        agent::resume_job(state, job_id).await?,
+    )))
 }
 
 async fn pending_approvals(
@@ -1759,9 +1775,9 @@ async fn approve_request(
     } else {
         decode_json::<ApprovalResolutionRequest>(&body)?
     };
-    Ok(Json(
+    Ok(Json(redact_job_detail(
         agent::approve_request(state, approval_id, payload.note).await?,
-    ))
+    )))
 }
 
 async fn deny_request(
@@ -1774,9 +1790,9 @@ async fn deny_request(
     } else {
         decode_json::<ApprovalResolutionRequest>(&body)?
     };
-    Ok(Json(
+    Ok(Json(redact_job_detail(
         agent::deny_request(state, approval_id, payload.note).await?,
-    ))
+    )))
 }
 
 async fn prompt_session(
@@ -1809,7 +1825,7 @@ async fn prompt_session(
         ));
     }
 
-    Ok(Json(
+    Ok(Json(redact_session_detail(
         agent::start_prompt_job(
             state,
             session_id,
@@ -1819,7 +1835,7 @@ async fn prompt_session(
             compiler_role,
         )
         .await?,
-    ))
+    )))
 }
 
 async fn host_status(State(state): State<AppState>) -> Json<nucleus_protocol::HostStatus> {
@@ -2085,7 +2101,9 @@ async fn publish_overview_event(state: &AppState) -> anyhow::Result<()> {
 }
 
 async fn publish_session_event(state: &AppState, detail: SessionDetail) -> anyhow::Result<()> {
-    let _ = state.events.send(DaemonEvent::SessionUpdated(detail));
+    let _ = state
+        .events
+        .send(DaemonEvent::SessionUpdated(redact_session_detail(detail)));
     Ok(())
 }
 
@@ -2122,7 +2140,7 @@ fn schedule_daemon_restart(state: AppState) {
     });
 }
 
-async fn build_settings_summary(state: &AppState) -> SettingsSummary {
+async fn build_settings_summary(state: &AppState, headers: &HeaderMap) -> SettingsSummary {
     let instance = state.updates.instance_summary();
     let hostname = state.host.host_status().hostname;
 
@@ -2141,6 +2159,7 @@ async fn build_settings_summary(state: &AppState) -> SettingsSummary {
             state.tailscale_dns_name.as_deref(),
             state.web_dist_dir.as_ref(),
         ),
+        security: security::build_security_posture(&instance.daemon_bind, headers),
         compatibility: build_compatibility_summary(
             &state.version,
             &state.updates.instance_summary(),
@@ -2196,12 +2215,93 @@ async fn build_runtime_overview(
         product: PRODUCT_NAME.to_string(),
         version: state.version.clone(),
         runtimes: runtimes.clone(),
-        router_profiles: enrich_router_profiles(state.store.list_router_profiles()?, &runtimes),
-        workspace: state.store.workspace()?,
-        sessions: state.store.list_sessions()?,
+        router_profiles: redact_router_profiles(enrich_router_profiles(
+            state.store.list_router_profiles()?,
+            &runtimes,
+        )),
+        workspace: redact_workspace_summary(state.store.workspace()?),
+        sessions: redact_session_summaries(state.store.list_sessions()?),
         host,
         storage: state.store.storage_summary(),
     })
+}
+
+fn redact_session_summaries(sessions: Vec<SessionSummary>) -> Vec<SessionSummary> {
+    sessions.into_iter().map(redact_session_summary).collect()
+}
+
+fn redact_session_detail(mut detail: SessionDetail) -> SessionDetail {
+    detail.session = redact_session_summary(detail.session);
+    detail
+}
+
+fn redact_session_summary(mut session: SessionSummary) -> SessionSummary {
+    session.provider_api_key.clear();
+    session
+}
+
+fn redact_job_detail(mut detail: JobDetail) -> JobDetail {
+    for worker in &mut detail.workers {
+        worker.provider_api_key.clear();
+    }
+
+    let redactor = security::RedactionSet::new();
+    for call in &mut detail.tool_calls {
+        call.args_json = redactor.redact_json(&call.args_json);
+        call.result_json = call
+            .result_json
+            .as_ref()
+            .map(|value| redactor.redact_json(value));
+        call.error_detail = redactor.redact_text(&call.error_detail);
+    }
+    for event in &mut detail.events {
+        event.detail = redactor.redact_text(&event.detail);
+        event.data_json = redactor.redact_json(&event.data_json);
+    }
+    detail
+}
+
+fn redact_workspace_summary(mut workspace: WorkspaceSummary) -> WorkspaceSummary {
+    workspace.profiles = workspace
+        .profiles
+        .into_iter()
+        .map(redact_workspace_profile)
+        .collect();
+    workspace
+}
+
+fn redact_workspace_profile(mut profile: WorkspaceProfileSummary) -> WorkspaceProfileSummary {
+    profile.main = redact_workspace_model_config(profile.main);
+    profile.utility = redact_workspace_model_config(profile.utility);
+    profile
+}
+
+fn redact_workspace_model_config(mut config: WorkspaceModelConfig) -> WorkspaceModelConfig {
+    config.api_key.clear();
+    config
+}
+
+fn redact_router_profiles(profiles: Vec<RouterProfileSummary>) -> Vec<RouterProfileSummary> {
+    profiles.into_iter().map(redact_router_profile).collect()
+}
+
+fn redact_router_profile(mut profile: RouterProfileSummary) -> RouterProfileSummary {
+    for target in &mut profile.targets {
+        target.api_key.clear();
+    }
+    profile
+}
+
+fn redact_mcp_servers(servers: Vec<McpServerSummary>) -> Vec<McpServerSummary> {
+    servers.into_iter().map(redact_mcp_server).collect()
+}
+
+fn redact_mcp_server(mut server: McpServerSummary) -> McpServerSummary {
+    let redactor = security::RedactionSet::new();
+    server.env_json = redactor.redact_json(&server.env_json);
+    server.headers_json = redactor.redact_json(&server.headers_json);
+    server.last_error = redactor.redact_text(&server.last_error);
+    server
 }
 
 async fn load_runtimes(
@@ -5675,9 +5775,71 @@ mod tests {
     use serde_json::json;
     use std::{
         env, fs,
-        path::PathBuf,
+        path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn api_session_response_redacts_provider_api_key() {
+        let mut session = test_session(Path::new("/tmp/nucleus-redaction-test"));
+        session.provider_api_key = "nuctk_super_secret".to_string();
+        let detail = SessionDetail {
+            session,
+            turns: Vec::new(),
+        };
+
+        let redacted = redact_session_detail(detail);
+
+        assert_eq!(redacted.session.provider_api_key, "");
+    }
+
+    #[test]
+    fn router_profile_response_redacts_target_api_keys() {
+        let profiles = redact_router_profiles(vec![RouterProfileSummary {
+            id: "route".to_string(),
+            title: "Route".to_string(),
+            summary: String::new(),
+            enabled: true,
+            state: "ready".to_string(),
+            targets: vec![nucleus_protocol::RouteTarget {
+                provider: "openai-compatible".to_string(),
+                model: "model".to_string(),
+                base_url: "https://example.test".to_string(),
+                api_key: "nuctk_route_secret".to_string(),
+            }],
+        }]);
+
+        assert_eq!(profiles[0].targets[0].api_key, "");
+    }
+
+    #[test]
+    fn mcp_response_redacts_env_and_header_secret_values() {
+        let server = redact_mcp_server(McpServerSummary {
+            id: "server".to_string(),
+            title: "Server".to_string(),
+            enabled: true,
+            transport: "streamable-http".to_string(),
+            command: String::new(),
+            args: Vec::new(),
+            env_json: json!({ "SUPABASE_ACCESS_TOKEN": "nuctk_env_secret", "SAFE": "ok" }),
+            url: "https://example.test/mcp".to_string(),
+            headers_json: json!({ "Authorization": "Bearer nuctk_header_secret" }),
+            auth_kind: "none".to_string(),
+            auth_ref: String::new(),
+            sync_status: "ready".to_string(),
+            last_error: String::new(),
+            last_synced_at: None,
+            tools: Vec::new(),
+            resources: Vec::new(),
+        });
+
+        assert_eq!(
+            server.env_json["SUPABASE_ACCESS_TOKEN"],
+            "[REDACTED_SECRET]"
+        );
+        assert_eq!(server.env_json["SAFE"], "ok");
+        assert_eq!(server.headers_json["Authorization"], "[REDACTED_SECRET]");
+    }
 
     #[test]
     fn refuses_dirty_worktree_cleanup() {
@@ -6492,7 +6654,7 @@ mod tests {
             result.0.session.provider_base_url,
             "http://127.0.0.1:20128/v1"
         );
-        assert_eq!(result.0.session.provider_api_key, "nuctk_test");
+        assert_eq!(result.0.session.provider_api_key, "");
 
         let workspace = state.store.workspace().expect("workspace should load");
         let profile =
