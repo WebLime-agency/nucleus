@@ -50,7 +50,7 @@ Source plans:
 | --- | --- | --- | --- | --- | --- |
 | 0 | Planning | Plan split and master execution plan | completed | none | Planning docs reviewed for consistency; no implementation started. |
 | 1 | Security | Network posture + secure-origin + redaction primitives | completed | Phase 0 | PR #134 includes posture/redaction primitives plus provider/API credential response hardening. |
-| 2 | Memory | Prompt integration + real Memory UI | not_started | Phase 0 |  |
+| 2 | Memory | Prompt integration + real Memory UI | completed | Phase 0 | Phase 2 implementation committed on `feat/memory-prompt-ui`. |
 | 3 | Vault | Passphrase-protected local Vault backend | not_started | Phase 1 |  |
 | 4 | Memory | Candidates + explicit/automatic capture loop | not_started | Phase 1, Phase 2 |  |
 | 5 | Vault | Workspace Vault UI + policy model | not_started | Phase 3 |  |

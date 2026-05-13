@@ -3,8 +3,14 @@
   import { AlertTriangle, Brain, Pencil, Plus, RefreshCw, Trash2 } from 'lucide-svelte';
 
   import { WorkspacePageHeader } from '$lib/components/app/workspace';
+  import { Badge } from '$lib/components/ui/badge';
   import { Button } from '$lib/components/ui/button';
   import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '$lib/components/ui/card';
+  import { Checkbox } from '$lib/components/ui/checkbox';
+  import { Input } from '$lib/components/ui/input';
+  import { Label } from '$lib/components/ui/label';
+  import { Select } from '$lib/components/ui/select';
+  import { Textarea } from '$lib/components/ui/textarea';
   import { fetchMemory, upsertMemory, deleteMemory } from '$lib/nucleus/client';
   import type { MemoryEntry, MemoryEntryUpsertRequest } from '$lib/nucleus/schemas';
 
@@ -141,7 +147,12 @@
               <div class="flex flex-wrap items-start justify-between gap-3">
                 <div>
                   <CardTitle class="flex items-center gap-2"><Brain class="size-4 text-zinc-400" />{entry.title}</CardTitle>
-                  <CardDescription>{entry.scope_kind}/{entry.scope_id} · {entry.memory_kind} · {entry.status} · {entry.source_kind}{entry.source_id ? `/${entry.source_id}` : ''}</CardDescription>
+                  <CardDescription class="mt-2 flex flex-wrap gap-2">
+                    <Badge variant="outline">{entry.scope_kind}/{entry.scope_id}</Badge>
+                    <Badge variant="secondary">{entry.memory_kind}</Badge>
+                    <Badge variant={entry.status === 'accepted' ? 'default' : 'secondary'}>{entry.status}</Badge>
+                    <Badge variant="outline">{entry.source_kind}{entry.source_id ? `/${entry.source_id}` : ''}</Badge>
+                  </CardDescription>
                 </div>
                 <div class="flex flex-wrap gap-2">
                   <Button variant="outline" size="sm" onclick={() => editEntry(entry)}><Pencil class="mr-2 size-4" />Edit</Button>
@@ -172,16 +183,37 @@
         <CardDescription>Manual entries default to accepted and can be disabled or archived later.</CardDescription>
       </CardHeader>
       <CardContent class="space-y-3">
-        <input class="w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm" placeholder="Title" bind:value={form.title} />
-        <textarea class="min-h-36 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm" placeholder="Prompt-visible memory content" bind:value={form.content}></textarea>
-        <div class="grid grid-cols-2 gap-2">
-          <select class="rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm" bind:value={form.scope_kind}><option value="workspace">workspace</option><option value="project">project</option><option value="session">session</option></select>
-          <input class="rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm" placeholder="Scope id" bind:value={form.scope_id} />
-          <select class="rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm" bind:value={form.memory_kind}><option value="note">note</option><option value="preference">preference</option><option value="instruction">instruction</option><option value="fact">fact</option></select>
-          <select class="rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm" bind:value={form.status}><option value="accepted">accepted</option><option value="archived">archived</option></select>
+        <div class="space-y-2">
+          <Label for="memory-title">Title</Label>
+          <Input id="memory-title" placeholder="Title" bind:value={form.title} />
         </div>
-        <input class="w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm" placeholder="Tags, comma separated" bind:value={form.tags} />
-        <label class="flex items-center gap-2 text-sm text-zinc-300"><input type="checkbox" bind:checked={form.enabled} /> Enabled</label>
+        <div class="space-y-2">
+          <Label for="memory-content">Content</Label>
+          <Textarea id="memory-content" class="min-h-36" placeholder="Prompt-visible memory content" bind:value={form.content} />
+        </div>
+        <div class="grid grid-cols-2 gap-2">
+          <div class="space-y-2">
+            <Label for="memory-scope-kind">Scope</Label>
+            <Select id="memory-scope-kind" bind:value={form.scope_kind}><option value="workspace">workspace</option><option value="project">project</option><option value="session">session</option></Select>
+          </div>
+          <div class="space-y-2">
+            <Label for="memory-scope-id">Scope id</Label>
+            <Input id="memory-scope-id" placeholder="Scope id" bind:value={form.scope_id} />
+          </div>
+          <div class="space-y-2">
+            <Label for="memory-kind">Kind</Label>
+            <Select id="memory-kind" bind:value={form.memory_kind}><option value="note">note</option><option value="fact">fact</option><option value="preference">preference</option><option value="decision">decision</option><option value="project_note">project_note</option><option value="solution">solution</option><option value="constraint">constraint</option><option value="todo">todo</option></Select>
+          </div>
+          <div class="space-y-2">
+            <Label for="memory-status">Status</Label>
+            <Select id="memory-status" bind:value={form.status}><option value="accepted">accepted</option><option value="archived">archived</option></Select>
+          </div>
+        </div>
+        <div class="space-y-2">
+          <Label for="memory-tags">Tags</Label>
+          <Input id="memory-tags" placeholder="Tags, comma separated" bind:value={form.tags} />
+        </div>
+        <Label class="flex items-center gap-2 text-sm text-zinc-300"><Checkbox bind:checked={form.enabled} /> Enabled</Label>
         <div class="flex gap-2">
           <Button disabled={saving || !form.title || !form.content || !form.scope_id} onclick={() => void saveEntry()}>{saving ? 'Saving…' : 'Save memory'}</Button>
           {#if editingId}<Button variant="outline" onclick={resetForm}>Cancel</Button>{/if}

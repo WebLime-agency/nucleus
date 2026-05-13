@@ -777,7 +777,8 @@ fn upsert_memory_from_request(
         last_used_at: payload.last_used_at,
         use_count: payload.use_count.unwrap_or(0).max(0),
         supersedes_id: payload.supersedes_id.unwrap_or_default().trim().to_string(),
-        metadata_json: payload.metadata_json.unwrap_or_else(|| json!({})),
+        metadata_json: security::RedactionSet::new()
+            .redact_json(&payload.metadata_json.unwrap_or_else(|| json!({}))),
         created_at: 0,
         updated_at: 0,
     };
@@ -809,9 +810,10 @@ fn normalize_memory_status(value: Option<&str>) -> Result<String, ApiError> {
 fn normalize_memory_kind(value: Option<&str>) -> Result<String, ApiError> {
     let value = value.unwrap_or("note").trim();
     match value {
-        "note" | "preference" | "instruction" | "fact" => Ok(value.to_string()),
+        "note" | "fact" | "preference" | "decision" | "project_note" | "solution"
+        | "constraint" | "todo" => Ok(value.to_string()),
         _ => Err(ApiError::bad_request(
-            "memory kind must be note, preference, instruction, or fact",
+            "memory kind must be note, fact, preference, decision, project_note, solution, constraint, or todo",
         )),
     }
 }
@@ -819,9 +821,9 @@ fn normalize_memory_kind(value: Option<&str>) -> Result<String, ApiError> {
 fn normalize_memory_source_kind(value: Option<&str>) -> Result<String, ApiError> {
     let value = value.unwrap_or("manual").trim();
     match value {
-        "manual" | "import" | "system" => Ok(value.to_string()),
+        "manual" | "candidate" | "explicit_remember" | "import" | "system" => Ok(value.to_string()),
         _ => Err(ApiError::bad_request(
-            "memory source kind must be manual, import, or system",
+            "memory source kind must be manual, candidate, explicit_remember, import, or system",
         )),
     }
 }
@@ -829,9 +831,9 @@ fn normalize_memory_source_kind(value: Option<&str>) -> Result<String, ApiError>
 fn normalize_memory_created_by(value: Option<&str>) -> Result<String, ApiError> {
     let value = value.unwrap_or("user").trim();
     match value {
-        "user" | "system" => Ok(value.to_string()),
+        "user" | "assistant" | "utility_worker" | "system" => Ok(value.to_string()),
         _ => Err(ApiError::bad_request(
-            "memory created_by must be user or system",
+            "memory created_by must be user, assistant, utility_worker, or system",
         )),
     }
 }
@@ -4822,7 +4824,7 @@ fn collect_memory_layers(
                 collection.skipped_count += 1;
                 continue;
             }
-            content.truncate(remaining);
+            content = truncate_utf8_to_byte_budget(&content, remaining);
             content.push_str("\n[Memory entry truncated by Nucleus context budget]");
         }
         remaining = remaining.saturating_sub(content.len());
@@ -4838,6 +4840,22 @@ fn collect_memory_layers(
     }
     collection.layers = layers;
     Ok(collection)
+}
+
+fn truncate_utf8_to_byte_budget(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+
+    let mut end = 0usize;
+    for (index, character) in value.char_indices() {
+        let next = index + character.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    value[..end].to_string()
 }
 
 fn memory_entry_applies_to_session(
@@ -4885,24 +4903,34 @@ fn compile_session_turn(
         &mcp_catalog,
     );
     compiled.project_layers = project_layers;
-    compiled.debug_summary.include_count = prompt_sources.len();
-    compiled.debug_summary.memory_count = memory_collection.total_count;
-    compiled.debug_summary.memory_included_count = memory_collection.included_count;
-    compiled.debug_summary.memory_skipped_count = memory_collection.skipped_count;
-    compiled.debug_summary.memory_truncated_count = memory_collection.truncated_count;
-    compiled.debug_summary.layer_count =
+    let include_count = prompt_sources.len();
+    let skill_count = compiled.skill_layers.len();
+    let mcp_server_count = compiled.mcp_catalog.len();
+    let tool_count = compiled.tool_catalog.len();
+    let layer_count =
         compiled.system_layers.len() + compiled.project_layers.len() + compiled.skill_layers.len();
-    compiled.debug_summary.skill_diagnostics = skill_collection.diagnostics;
-    compiled.debug_summary.summary = format!(
-        "Compiled {} history turns for {} provider-neutral prompt with {} prompt includes, {} accepted memory entries included, {} skill layers, {} MCP servers, and {} tools.",
-        compiled.history.len(),
-        compiled.role,
-        compiled.debug_summary.include_count,
-        compiled.debug_summary.memory_included_count,
-        compiled.debug_summary.skill_count,
-        compiled.debug_summary.mcp_server_count,
-        compiled.debug_summary.tool_count,
-    );
+    compiled.debug_summary = nucleus_protocol::CompiledTurnDebugSummary {
+        include_count,
+        memory_count: memory_collection.total_count,
+        memory_included_count: memory_collection.included_count,
+        memory_skipped_count: memory_collection.skipped_count,
+        memory_truncated_count: memory_collection.truncated_count,
+        skill_count,
+        mcp_server_count,
+        tool_count,
+        layer_count,
+        summary: format!(
+            "Compiled {} history turns for {} provider-neutral prompt with {} prompt includes, {} accepted memory entries included, {} skill layers, {} MCP servers, and {} tools.",
+            compiled.history.len(),
+            compiled.role,
+            include_count,
+            memory_collection.included_count,
+            skill_count,
+            mcp_server_count,
+            tool_count,
+        ),
+        skill_diagnostics: skill_collection.diagnostics,
+    };
     Ok(compiled)
 }
 
@@ -7437,6 +7465,89 @@ mod tests {
         assert_eq!(entry.use_count, 0);
         assert_eq!(entry.tags, vec!["docs"]);
         assert_eq!(entry.metadata_json, json!({}));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn memory_upsert_redacts_sensitive_metadata() {
+        let (state_dir, state) = test_named_app_state("memory-metadata-redaction");
+        let entry = upsert_memory_from_request(
+            &state,
+            MemoryEntryUpsertRequest {
+                id: Some("metadata-redaction".to_string()),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "Metadata redaction".to_string(),
+                content: "Safe visible memory.".to_string(),
+                tags: Vec::new(),
+                enabled: None,
+                status: None,
+                memory_kind: Some("decision".to_string()),
+                source_kind: Some("explicit_remember".to_string()),
+                source_id: None,
+                confidence: None,
+                created_by: Some("assistant".to_string()),
+                last_used_at: None,
+                use_count: None,
+                supersedes_id: None,
+                metadata_json: Some(json!({
+                    "api_key": "nuctk_secret",
+                    "nested": { "password": "also-secret", "token": "bearer-secret" },
+                    "safe": "ok"
+                })),
+            },
+            None,
+        )
+        .expect("memory should save");
+
+        assert_eq!(entry.memory_kind, "decision");
+        assert_eq!(entry.source_kind, "explicit_remember");
+        assert_eq!(entry.created_by, "assistant");
+        assert_eq!(entry.metadata_json["api_key"], "[REDACTED_SECRET]");
+        assert_eq!(
+            entry.metadata_json["nested"]["password"],
+            "[REDACTED_SECRET]"
+        );
+        assert_eq!(entry.metadata_json["nested"]["token"], "[REDACTED_SECRET]");
+        assert_eq!(entry.metadata_json["safe"], "ok");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn compiled_turn_truncates_multibyte_memory_without_panic() {
+        let (state_dir, state) = test_named_app_state("memory-emoji-truncation");
+        let workspace_root = state_dir.join("workspace");
+        state
+            .store
+            .upsert_memory_entry(&MemoryEntry {
+                id: "emoji-memory".to_string(),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "Emoji memory".to_string(),
+                content: "🚀".repeat(MAX_MEMORY_CONTEXT_CHARS),
+                tags: Vec::new(),
+                enabled: true,
+                status: "accepted".to_string(),
+                memory_kind: "note".to_string(),
+                source_kind: "manual".to_string(),
+                source_id: String::new(),
+                confidence: 1.0,
+                created_by: "user".to_string(),
+                last_used_at: None,
+                use_count: 0,
+                supersedes_id: String::new(),
+                metadata_json: json!({}),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .expect("emoji memory should persist");
+
+        let session = test_session(&workspace_root);
+        let compiled = compile_session_turn(&state, &session, &[], "Hello", &[], "main")
+            .expect("multibyte memory should compile without panic");
+        let rendered = nucleus_core::render_compiled_turn_system_text(&compiled);
+        assert!(rendered.contains("[Memory entry truncated by Nucleus context budget]"));
+        assert_eq!(compiled.debug_summary.memory_truncated_count, 1);
         let _ = fs::remove_dir_all(&state_dir);
     }
 
