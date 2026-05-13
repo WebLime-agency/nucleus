@@ -6654,7 +6654,7 @@ mod tests {
             result.0.session.provider_base_url,
             "http://127.0.0.1:20128/v1"
         );
-        assert_eq!(result.0.session.provider_api_key, "nuctk_test");
+        assert_eq!(result.0.session.provider_api_key, "");
 
         let workspace = state.store.workspace().expect("workspace should load");
         let profile =
