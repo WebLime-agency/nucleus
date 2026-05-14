@@ -52,7 +52,7 @@ Source plans:
 | 1 | Security | Network posture + secure-origin + redaction primitives | completed | Phase 0 | PR #134 includes posture/redaction primitives plus provider/API credential response hardening. |
 | 2 | Memory | Prompt integration + real Memory UI | completed | Phase 0 | Phase 2 implementation committed on `feat/memory-prompt-ui`. |
 | 3 | Vault | Passphrase-protected local Vault backend | completed | Phase 1 | PR #137 merged into `dev` at `724eb2115e02d2d660de41ee890724ebac85fab6`; UI/MCP remain deferred. |
-| 4 | Memory | Candidates + explicit/automatic capture loop | not_started | Phase 1, Phase 2 |  |
+| 4 | Memory | Candidates + explicit/automatic capture loop | in_progress | Phase 1, Phase 2 | Local implementation branch `feat/memory-candidates`; not merged. |
 | 5 | Vault | Workspace Vault UI + policy model | not_started | Phase 3 |  |
 | 6 | Vault/MCP | MCP `vault_bearer` integration | not_started | Phase 3, Phase 5 |  |
 | 7 | Vault | Project Vaults | not_started | Phase 5 |  |
@@ -273,7 +273,7 @@ Completion notes:
 
 ## Phase 4 — Memory candidates + explicit/automatic capture loop
 
-Status: `not_started`
+Status: `in_progress`
 
 Source docs:
 
@@ -316,7 +316,10 @@ Exit criteria:
 
 Completion notes:
 
-- Pending.
+- In progress on branch `feat/memory-candidates`; not merged.
+- Added candidate schema/storage/API, explicit remember endpoint, candidate review UI, redaction/credential guardrails, and lifecycle/prompt visibility tests.
+- Added automatic post-turn candidate extraction after successful visible assistant turns. Automatic extraction stores pending candidates only, skips duplicates and credential-like content, and records non-secret extraction audit events.
+- Remaining before completion/merge: complete final validation and PR review/merge workflow when requested.
 
 ## Phase 5 — Workspace Vault UI and policy model
 
@@ -614,7 +617,7 @@ When asked to work on this plan:
 
 - Operator/manager sessions should review executor reports, maintain gates, and provide prompts/checklists. They should not directly patch, commit, push, merge, promote, or release unless explicitly asked.
 - Keep implementation, cleanup, PR/release, and verification work in separate focused sessions/worktrees.
-- Phase 3 is merged/completed via PR #137. Phase 4 remains `not_started` and must not start until explicitly approved.
+- Phase 3 is merged/completed via PR #137. Phase 4 is now explicitly approved and `in_progress`; Phase 5 and later remain `not_started`.
 - Main worktree cleanup was completed after Phase 2. The stale dirty branch was cleaned back to current dev. Future implementation work should still prefer fresh clean worktrees.
 - A Node/toolchain runtime-resolution experiment was preserved separately and should be reviewed later as its own focused PR. It must not be mixed into Memory/Vault/Security phase work.
 - Memory UI currently treats edited entries mostly as manual/user entries. After candidate capture and explicit remember flows exist, revisit preserving richer source metadata during edits.

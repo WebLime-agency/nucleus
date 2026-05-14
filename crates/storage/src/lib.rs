@@ -12,10 +12,10 @@ use nucleus_core::{
 use nucleus_protocol::{
     ApprovalRequestSummary, ArtifactSummary, AuditEvent, CommandSessionSummary,
     DEFAULT_JOB_MAX_STEPS, DEFAULT_JOB_MAX_TOOL_CALLS, DEFAULT_JOB_MAX_WALL_CLOCK_SECS, JobDetail,
-    JobEvent, JobSummary, McpServerRecord, McpServerSummary, MemoryEntry, PlaybookDetail,
-    PlaybookSummary, PolicyDecisionSummary, ProjectSummary, RouteTarget, RouterProfileSummary,
-    RunBudgetSummary, RuntimeSummary, SessionDetail, SessionProjectSummary, SessionSummary,
-    SessionTurn, SessionTurnImage, SkillManifest, StorageSummary, ToolCallSummary,
+    JobEvent, JobSummary, McpServerRecord, McpServerSummary, MemoryCandidate, MemoryEntry,
+    PlaybookDetail, PlaybookSummary, PolicyDecisionSummary, ProjectSummary, RouteTarget,
+    RouterProfileSummary, RunBudgetSummary, RuntimeSummary, SessionDetail, SessionProjectSummary,
+    SessionSummary, SessionTurn, SessionTurnImage, SkillManifest, StorageSummary, ToolCallSummary,
     ToolCapabilitySummary, WorkerSummary, WorkspaceModelConfig, WorkspaceProfileSummary,
     WorkspaceSummary,
 };
@@ -1052,6 +1052,31 @@ impl StateStore {
     pub fn delete_memory_entry(&self, id: &str) -> Result<()> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         connection.execute("DELETE FROM memory_entries WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn list_memory_candidates(&self) -> Result<Vec<MemoryCandidate>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_memory_candidates_with_connection(&connection)
+    }
+
+    pub fn upsert_memory_candidate(&self, candidate: &MemoryCandidate) -> Result<MemoryCandidate> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        connection.execute(
+            "INSERT INTO memory_candidates (id, scope_kind, scope_id, session_id, turn_id_start, turn_id_end, candidate_kind, title, content, tags_json, evidence_json, reason, confidence, status, dedupe_key, accepted_memory_id, created_by, metadata_json, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,unixepoch(),unixepoch()) ON CONFLICT(id) DO UPDATE SET scope_kind=excluded.scope_kind, scope_id=excluded.scope_id, session_id=excluded.session_id, turn_id_start=excluded.turn_id_start, turn_id_end=excluded.turn_id_end, candidate_kind=excluded.candidate_kind, title=excluded.title, content=excluded.content, tags_json=excluded.tags_json, evidence_json=excluded.evidence_json, reason=excluded.reason, confidence=excluded.confidence, status=excluded.status, dedupe_key=excluded.dedupe_key, accepted_memory_id=excluded.accepted_memory_id, created_by=excluded.created_by, metadata_json=excluded.metadata_json, updated_at=unixepoch()",
+            params![candidate.id,candidate.scope_kind,candidate.scope_id,candidate.session_id,candidate.turn_id_start,candidate.turn_id_end,candidate.candidate_kind,candidate.title,candidate.content,serde_json::to_string(&candidate.tags)?,serde_json::to_string(&candidate.evidence)?,candidate.reason,candidate.confidence,candidate.status,candidate.dedupe_key,candidate.accepted_memory_id,candidate.created_by,serde_json::to_string(&candidate.metadata_json)?],
+        )?;
+        load_memory_candidate(&connection, &candidate.id)
+    }
+
+    pub fn load_memory_candidate(&self, id: &str) -> Result<MemoryCandidate> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        load_memory_candidate(&connection, id)
+    }
+
+    pub fn delete_memory_candidate(&self, id: &str) -> Result<()> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        connection.execute("UPDATE memory_candidates SET status = 'dismissed', updated_at = unixepoch() WHERE id = ?1 AND status != 'accepted'", params![id])?;
         Ok(())
     }
 
@@ -2716,6 +2741,38 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_memory_entries_scope
             ON memory_entries(scope_kind, scope_id, enabled);
+
+        CREATE TABLE IF NOT EXISTS memory_candidates (
+            id TEXT PRIMARY KEY,
+            scope_kind TEXT NOT NULL,
+            scope_id TEXT NOT NULL,
+            session_id TEXT NOT NULL DEFAULT '',
+            turn_id_start TEXT NOT NULL DEFAULT '',
+            turn_id_end TEXT NOT NULL DEFAULT '',
+            candidate_kind TEXT NOT NULL DEFAULT 'note',
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            evidence_json TEXT NOT NULL DEFAULT '[]',
+            reason TEXT NOT NULL DEFAULT '',
+            confidence REAL NOT NULL DEFAULT 0.0,
+            status TEXT NOT NULL DEFAULT 'pending',
+            dedupe_key TEXT NOT NULL DEFAULT '',
+            accepted_memory_id TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT 'utility_worker',
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_memory_candidates_status
+            ON memory_candidates(status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_memory_candidates_scope
+            ON memory_candidates(scope_kind, scope_id, status);
+        CREATE INDEX IF NOT EXISTS idx_memory_candidates_session
+            ON memory_candidates(session_id, status);
+        CREATE INDEX IF NOT EXISTS idx_memory_candidates_dedupe
+            ON memory_candidates(dedupe_key, status);
 
         CREATE TABLE IF NOT EXISTS vault_state (
             id TEXT PRIMARY KEY,
@@ -5224,6 +5281,50 @@ fn list_memory_entries_with_connection(connection: &Connection) -> Result<Vec<Me
     ids.into_iter()
         .map(|id| load_memory_entry(connection, &id))
         .collect()
+}
+
+fn list_memory_candidates_with_connection(connection: &Connection) -> Result<Vec<MemoryCandidate>> {
+    let mut statement = connection
+        .prepare("SELECT id FROM memory_candidates ORDER BY status ASC, created_at DESC, id ASC")?;
+    let ids = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    ids.into_iter()
+        .map(|id| load_memory_candidate(connection, &id))
+        .collect()
+}
+
+fn load_memory_candidate(connection: &Connection, id: &str) -> Result<MemoryCandidate> {
+    connection.query_row("SELECT id, scope_kind, scope_id, session_id, turn_id_start, turn_id_end, candidate_kind, title, content, tags_json, evidence_json, reason, confidence, status, dedupe_key, accepted_memory_id, created_by, created_at, updated_at, metadata_json FROM memory_candidates WHERE id = ?1", params![id], map_memory_candidate).optional()?.ok_or_else(|| anyhow!("memory candidate {id} was not found"))
+}
+
+fn map_memory_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryCandidate> {
+    Ok(MemoryCandidate {
+        id: row.get(0)?,
+        scope_kind: row.get(1)?,
+        scope_id: row.get(2)?,
+        session_id: row.get(3)?,
+        turn_id_start: row.get(4)?,
+        turn_id_end: row.get(5)?,
+        candidate_kind: row.get(6)?,
+        title: row.get(7)?,
+        content: row.get(8)?,
+        tags: serde_json::from_value(decode_json_value(row.get(9)?)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+        evidence: serde_json::from_value(decode_json_value(row.get(10)?)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+        reason: row.get(11)?,
+        confidence: row.get(12)?,
+        status: row.get(13)?,
+        dedupe_key: row.get(14)?,
+        accepted_memory_id: row.get(15)?,
+        created_by: row.get(16)?,
+        created_at: row.get(17)?,
+        updated_at: row.get(18)?,
+        metadata_json: decode_json_value(row.get(19)?)?,
+    })
 }
 
 fn load_memory_entry(connection: &Connection, id: &str) -> Result<MemoryEntry> {
