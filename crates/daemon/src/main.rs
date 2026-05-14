@@ -3,6 +3,7 @@ mod host;
 mod runtime;
 mod security;
 mod updates;
+mod vault;
 mod worker_action;
 
 use std::{
@@ -50,7 +51,9 @@ use nucleus_protocol::{
     SkillInstallationUpsertRequest, SkillManifest, SkillPackageRecord, SkillPackageUpsertRequest,
     SkillReconcileCandidate, SkillReconcileRequest, SkillReconcileScanResponse, StreamConnected,
     SystemStats, UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
-    WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceProfileWriteRequest, WorkspaceSummary,
+    VaultInitRequest, VaultSecretListResponse, VaultSecretSummary, VaultSecretUpdateRequest,
+    VaultSecretUpsertRequest, VaultStatusSummary, VaultUnlockRequest, WorkspaceModelConfig,
+    WorkspaceProfileSummary, WorkspaceProfileWriteRequest, WorkspaceSummary,
     WorkspaceUpdateRequest,
 };
 use nucleus_release::read_installed_release_metadata;
@@ -96,6 +99,7 @@ struct AppState {
     host: Arc<HostEngine>,
     runtimes: Arc<RuntimeManager>,
     updates: Arc<UpdateManager>,
+    vault: Arc<tokio::sync::Mutex<vault::VaultRuntime>>,
     agent: Arc<agent::AgentRuntime>,
     web_dist_dir: Option<PathBuf>,
     tailscale_dns_name: Option<String>,
@@ -118,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
         host: Arc::new(HostEngine::new()),
         runtimes: Arc::new(RuntimeManager::default()),
         updates,
+        vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
         agent: Arc::new(agent::AgentRuntime::default()),
         web_dist_dir,
         tailscale_dns_name: detect_tailscale_dns_name(),
@@ -224,6 +229,18 @@ fn app(state: AppState) -> Router {
         .route(
             "/memory/{memory_id}",
             axum::routing::put(upsert_memory_by_id).delete(delete_memory),
+        )
+        .route("/vault/status", get(vault_status))
+        .route("/vault/init", axum::routing::post(vault_init))
+        .route("/vault/unlock", axum::routing::post(vault_unlock))
+        .route("/vault/lock", axum::routing::post(vault_lock))
+        .route(
+            "/vault/secrets",
+            get(list_vault_secrets).post(create_vault_secret),
+        )
+        .route(
+            "/vault/secrets/{secret_id}",
+            axum::routing::patch(update_vault_secret).delete(delete_vault_secret),
         )
         .route("/actions", get(actions))
         .route("/actions/{action_id}", get(action_detail))
@@ -837,6 +854,317 @@ fn normalize_memory_created_by(value: Option<&str>) -> Result<String, ApiError> 
             "memory created_by must be user, assistant, utility_worker, or system",
         )),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct VaultSecretListQuery {
+    scope_kind: Option<String>,
+    scope_id: Option<String>,
+}
+
+async fn vault_status(State(state): State<AppState>) -> Result<Json<VaultStatusSummary>, ApiError> {
+    Ok(Json(vault_status_summary(&state).await?))
+}
+
+async fn vault_init(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<VaultStatusSummary>, ApiError> {
+    require_vault_safe_origin(&headers)?;
+    let payload = decode_json::<VaultInitRequest>(&body)?;
+    let mut vault = state.vault.lock().await;
+    let record = vault
+        .initialize(&state.store, &payload.passphrase)
+        .map_err(vault_api_error)?;
+    drop(vault);
+    record_vault_audit(
+        &state,
+        "vault.initialized",
+        "vault:default",
+        "Initialized local Vault.",
+    )
+    .await;
+    Ok(Json(vault_status_from_record(Some(record), true)))
+}
+
+async fn vault_unlock(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<VaultStatusSummary>, ApiError> {
+    require_vault_safe_origin(&headers)?;
+    let payload = decode_json::<VaultUnlockRequest>(&body)?;
+    let mut vault = state.vault.lock().await;
+    match vault.unlock(&state.store, &payload.passphrase) {
+        Ok(record) => {
+            drop(vault);
+            record_vault_audit(
+                &state,
+                "vault.unlocked",
+                "vault:default",
+                "Unlocked local Vault.",
+            )
+            .await;
+            Ok(Json(vault_status_from_record(Some(record), true)))
+        }
+        Err(error) => {
+            drop(vault);
+            record_vault_audit(
+                &state,
+                "vault.unlock_failed",
+                "vault:default",
+                "Vault unlock failed.",
+            )
+            .await;
+            Err(vault_api_error(error))
+        }
+    }
+}
+
+async fn vault_lock(State(state): State<AppState>) -> Result<Json<VaultStatusSummary>, ApiError> {
+    state.vault.lock().await.lock();
+    record_vault_audit(
+        &state,
+        "vault.locked",
+        "vault:default",
+        "Locked local Vault.",
+    )
+    .await;
+    Ok(Json(vault_status_summary(&state).await?))
+}
+
+async fn list_vault_secrets(
+    State(state): State<AppState>,
+    Query(query): Query<VaultSecretListQuery>,
+) -> Result<Json<VaultSecretListResponse>, ApiError> {
+    let secrets = state
+        .store
+        .list_vault_secrets(query.scope_kind.as_deref(), query.scope_id.as_deref())?
+        .into_iter()
+        .map(vault_secret_summary)
+        .collect();
+    Ok(Json(VaultSecretListResponse { secrets }))
+}
+
+async fn create_vault_secret(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<VaultSecretSummary>, ApiError> {
+    require_vault_safe_origin(&headers)?;
+    let payload = decode_json::<VaultSecretUpsertRequest>(&body)?;
+    let input = validate_vault_secret_create(payload)?;
+    let mut vault = state.vault.lock().await;
+    let saved = vault
+        .create_or_update_secret(&state.store, input)
+        .map_err(vault_api_error)?;
+    drop(vault);
+    record_vault_audit(
+        &state,
+        "vault.secret.created",
+        &format!("vault_secret:{}", saved.id),
+        "Created Vault secret metadata.",
+    )
+    .await;
+    Ok(Json(vault_secret_summary(saved)))
+}
+
+async fn update_vault_secret(
+    State(state): State<AppState>,
+    Path(secret_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<VaultSecretSummary>, ApiError> {
+    require_vault_safe_origin(&headers)?;
+    let secret_id = sanitize_registry_id(&secret_id, "vault secret id")?;
+    let existing = state.store.load_vault_secret(&secret_id)?;
+    let payload = decode_json::<VaultSecretUpdateRequest>(&body)?;
+    let secret = payload
+        .secret
+        .ok_or_else(|| ApiError::bad_request("vault secret value is required for update"))?;
+    let input = vault::VaultSecretInput {
+        id: Some(secret_id),
+        scope_kind: normalize_vault_scope_kind(
+            payload
+                .scope_kind
+                .as_deref()
+                .unwrap_or(&existing.scope_kind),
+        )?,
+        scope_id: payload
+            .scope_id
+            .unwrap_or(existing.scope_id)
+            .trim()
+            .to_string(),
+        name: sanitize_vault_secret_name(payload.name.as_deref().unwrap_or(&existing.name))?,
+        description: payload
+            .description
+            .unwrap_or(existing.description)
+            .trim()
+            .to_string(),
+        secret,
+    };
+    let mut vault = state.vault.lock().await;
+    let saved = vault
+        .create_or_update_secret(&state.store, input)
+        .map_err(vault_api_error)?;
+    drop(vault);
+    record_vault_audit(
+        &state,
+        "vault.secret.updated",
+        &format!("vault_secret:{}", saved.id),
+        "Updated Vault secret metadata.",
+    )
+    .await;
+    Ok(Json(vault_secret_summary(saved)))
+}
+
+async fn delete_vault_secret(
+    State(state): State<AppState>,
+    Path(secret_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    require_vault_safe_origin(&headers)?;
+    let secret_id = sanitize_registry_id(&secret_id, "vault secret id")?;
+    state.store.delete_vault_secret(&secret_id)?;
+    record_vault_audit(
+        &state,
+        "vault.secret.deleted",
+        &format!("vault_secret:{secret_id}"),
+        "Deleted Vault secret metadata.",
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn require_vault_safe_origin(headers: &HeaderMap) -> Result<(), ApiError> {
+    let origin = security::classify_request_origin(headers);
+    if origin.safe {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(format!(
+            "vault operation requires a safe origin: {}",
+            origin.reason
+        )))
+    }
+}
+
+fn validate_vault_secret_create(
+    payload: VaultSecretUpsertRequest,
+) -> Result<vault::VaultSecretInput, ApiError> {
+    Ok(vault::VaultSecretInput {
+        id: payload
+            .id
+            .map(|id| sanitize_registry_id(&id, "vault secret id"))
+            .transpose()?,
+        scope_kind: normalize_vault_scope_kind(&payload.scope_kind)?,
+        scope_id: non_empty_trimmed(payload.scope_id, "vault scope id")?,
+        name: sanitize_vault_secret_name(&payload.name)?,
+        description: payload.description.trim().to_string(),
+        secret: non_empty_trimmed(payload.secret, "vault secret value")?,
+    })
+}
+
+fn normalize_vault_scope_kind(value: &str) -> Result<String, ApiError> {
+    match value.trim() {
+        "workspace" | "project" => Ok(value.trim().to_string()),
+        _ => Err(ApiError::bad_request(
+            "vault scope kind must be workspace or project",
+        )),
+    }
+}
+
+fn sanitize_vault_secret_name(value: &str) -> Result<String, ApiError> {
+    sanitize_registry_id(value, "vault secret name")
+}
+
+fn non_empty_trimmed(value: String, label: &str) -> Result<String, ApiError> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        Err(ApiError::bad_request(format!("{label} is required")))
+    } else {
+        Ok(value)
+    }
+}
+
+async fn vault_status_summary(state: &AppState) -> Result<VaultStatusSummary, ApiError> {
+    let record = state.store.load_vault_state()?;
+    let unlocked = state.vault.lock().await.is_unlocked();
+    Ok(vault_status_from_record(record, unlocked))
+}
+
+fn vault_status_from_record(
+    record: Option<nucleus_storage::VaultStateRecord>,
+    unlocked: bool,
+) -> VaultStatusSummary {
+    match record {
+        Some(record) => VaultStatusSummary {
+            initialized: true,
+            locked: !unlocked,
+            state: if unlocked { "unlocked" } else { "locked" }.to_string(),
+            vault_id: record.vault_id,
+            cipher: record.cipher,
+            kdf_algorithm: record.kdf_algorithm,
+            created_at: Some(record.created_at),
+            updated_at: Some(record.updated_at),
+        },
+        None => VaultStatusSummary {
+            initialized: false,
+            locked: true,
+            state: "uninitialized".to_string(),
+            vault_id: String::new(),
+            cipher: String::new(),
+            kdf_algorithm: String::new(),
+            created_at: None,
+            updated_at: None,
+        },
+    }
+}
+
+fn vault_secret_summary(secret: nucleus_storage::VaultSecretRecord) -> VaultSecretSummary {
+    VaultSecretSummary {
+        id: secret.id,
+        scope_kind: secret.scope_kind,
+        scope_id: secret.scope_id,
+        name: secret.name,
+        description: secret.description,
+        configured: true,
+        version: secret.version,
+        created_at: secret.created_at,
+        updated_at: secret.updated_at,
+        last_used_at: secret.last_used_at,
+    }
+}
+
+fn vault_api_error(error: anyhow::Error) -> ApiError {
+    let message = error.to_string();
+    if message.contains("not initialized") {
+        ApiError::bad_request(message)
+    } else if message.contains("already initialized") {
+        ApiError::bad_request(message)
+    } else if message.contains("locked") {
+        ApiError::forbidden(message)
+    } else if message.contains("at least") {
+        ApiError::bad_request(message)
+    } else if message.contains("invalid vault passphrase") {
+        ApiError::unauthorized("invalid vault passphrase")
+    } else {
+        ApiError::internal_message(message)
+    }
+}
+
+async fn record_vault_audit(state: &AppState, kind: &str, target: &str, summary: &str) {
+    let _ = try_record_audit_event(
+        state,
+        AuditEventRecord {
+            kind: kind.to_string(),
+            target: target.to_string(),
+            status: "success".to_string(),
+            summary: summary.to_string(),
+            detail: String::new(),
+        },
+    )
+    .await;
 }
 
 async fn delete_skill(
@@ -6398,6 +6726,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
@@ -6507,6 +6836,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
@@ -6699,6 +7029,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
@@ -6744,6 +7075,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
@@ -6775,6 +7107,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
@@ -6822,6 +7155,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
@@ -6889,6 +7223,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
@@ -6968,6 +7303,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
@@ -7410,6 +7746,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
@@ -7427,6 +7764,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
@@ -7641,6 +7979,146 @@ mod tests {
         let _ = fs::remove_dir_all(&state_dir);
     }
 
+    #[tokio::test]
+    async fn vault_initializes_unlocks_and_encrypts_without_plaintext_storage() {
+        let (state_dir, state) = test_named_app_state("vault-init-encrypt");
+        {
+            let mut vault = state.vault.lock().await;
+            vault
+                .initialize(&state.store, "correct horse battery staple")
+                .expect("vault initializes");
+            let secret = vault
+                .create_or_update_secret(
+                    &state.store,
+                    vault::VaultSecretInput {
+                        id: Some("cloudflare-token".to_string()),
+                        scope_kind: "workspace".to_string(),
+                        scope_id: "workspace".to_string(),
+                        name: "CLOUDFLARE_API_TOKEN".to_string(),
+                        description: "Cloudflare API token".to_string(),
+                        secret: "super-secret-token".to_string(),
+                    },
+                )
+                .expect("secret persists encrypted");
+            let decrypted = vault::decrypt_secret_for_test(&mut vault, &state.store, &secret)
+                .expect("secret decrypts while unlocked");
+            assert_eq!(decrypted, "super-secret-token");
+        }
+
+        let raw = state
+            .store
+            .load_vault_secret("cloudflare-token")
+            .expect("secret should load");
+        assert_ne!(raw.ciphertext, b"super-secret-token");
+        let ciphertext_text = String::from_utf8_lossy(&raw.ciphertext);
+        assert!(!ciphertext_text.contains("super-secret-token"));
+        {
+            let mut vault = state.vault.lock().await;
+            vault.lock();
+            vault
+                .unlock(&state.store, "correct horse battery staple")
+                .expect("correct passphrase unlocks");
+            let mut tampered = raw.clone();
+            tampered.aad.push_str(":tampered");
+            let error = vault::decrypt_secret_for_test(&mut vault, &state.store, &tampered)
+                .expect_err("tampered AAD fails");
+            assert!(error.to_string().contains("failed to decrypt vault secret"));
+        }
+
+        let listed = state
+            .store
+            .list_vault_secrets(None, None)
+            .expect("secrets should list")
+            .into_iter()
+            .map(vault_secret_summary)
+            .collect::<Vec<_>>();
+        let serialized = serde_json::to_string(&listed).expect("summary serializes");
+        assert!(serialized.contains("CLOUDFLARE_API_TOKEN"));
+        assert!(!serialized.contains("super-secret-token"));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn vault_wrong_passphrase_fails_and_lock_blocks_secret_writes() {
+        let (state_dir, state) = test_named_app_state("vault-lock-wrong-pass");
+        {
+            let mut vault = state.vault.lock().await;
+            vault
+                .initialize(&state.store, "correct horse battery staple")
+                .expect("vault initializes");
+            vault.lock();
+        }
+        {
+            let mut vault = state.vault.lock().await;
+            let error = vault
+                .unlock(&state.store, "wrong horse battery staple")
+                .expect_err("wrong passphrase fails");
+            assert!(error.to_string().contains("invalid vault passphrase"));
+            let error = vault
+                .create_or_update_secret(
+                    &state.store,
+                    vault::VaultSecretInput {
+                        id: Some("blocked".to_string()),
+                        scope_kind: "workspace".to_string(),
+                        scope_id: "workspace".to_string(),
+                        name: "BLOCKED".to_string(),
+                        description: String::new(),
+                        secret: "must-not-store".to_string(),
+                    },
+                )
+                .expect_err("locked vault blocks writes");
+            assert!(error.to_string().contains("vault is locked"));
+        }
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn vault_plaintext_operations_require_safe_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "origin",
+            axum::http::HeaderValue::from_static("http://192.168.1.2:5201"),
+        );
+        let error = require_vault_safe_origin(&headers).expect_err("LAN HTTP is unsafe");
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+
+        let mut safe_headers = HeaderMap::new();
+        safe_headers.insert(
+            "origin",
+            axum::http::HeaderValue::from_static("http://localhost:5201"),
+        );
+        require_vault_safe_origin(&safe_headers).expect("localhost origin is vault-safe");
+    }
+
+    #[tokio::test]
+    async fn vault_audit_payloads_do_not_include_secret_values() {
+        let (state_dir, state) = test_named_app_state("vault-audit-redacted");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "origin",
+            axum::http::HeaderValue::from_static("http://localhost:5201"),
+        );
+        let _ = vault_init(
+            State(state.clone()),
+            headers.clone(),
+            Bytes::from(r#"{"passphrase":"correct horse battery staple"}"#),
+        )
+        .await
+        .expect("vault init succeeds");
+        let _ = create_vault_secret(
+            State(state.clone()),
+            headers,
+            Bytes::from(r#"{"id":"audit-token","scope_kind":"workspace","scope_id":"workspace","name":"AUDIT_TOKEN","secret":"audit-secret-value"}"#),
+        )
+        .await
+        .expect("secret create succeeds");
+        let audit = state.store.list_audit_events(20).expect("audit lists");
+        let serialized = serde_json::to_string(&audit).expect("audit serializes");
+        assert!(serialized.contains("vault.secret.created"));
+        assert!(!serialized.contains("audit-secret-value"));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
     fn test_session(workspace_root: &std::path::Path) -> SessionSummary {
         SessionSummary {
             id: "session-test".to_string(),
@@ -7722,6 +8200,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
@@ -7802,6 +8281,7 @@ for line in sys.stdin:
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
