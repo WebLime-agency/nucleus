@@ -895,6 +895,34 @@ pub struct VaultSecretSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultSecretPolicySummary {
+    pub id: String,
+    pub secret_id: String,
+    pub consumer_kind: String,
+    pub consumer_id: String,
+    pub permission: String,
+    pub approval_mode: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultSecretPolicyListResponse {
+    #[serde(default)]
+    pub policies: Vec<VaultSecretPolicySummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultSecretPolicyUpsertRequest {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub consumer_kind: String,
+    pub consumer_id: String,
+    pub permission: String,
+    pub approval_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VaultSecretListResponse {
     #[serde(default)]
     pub secrets: Vec<VaultSecretSummary>,

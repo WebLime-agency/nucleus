@@ -78,6 +78,18 @@ pub struct VaultSecretRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultSecretPolicyRecord {
+    pub id: String,
+    pub secret_id: String,
+    pub consumer_kind: String,
+    pub consumer_id: String,
+    pub permission: String,
+    pub approval_mode: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoragePlan {
     pub state_dir: PathBuf,
     pub database_path: PathBuf,
@@ -1188,6 +1200,48 @@ impl StateStore {
             params![id],
         )?;
         connection.execute("DELETE FROM vault_secrets WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn list_vault_secret_policies(
+        &self,
+        secret_id: &str,
+    ) -> Result<Vec<VaultSecretPolicyRecord>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id, secret_id, consumer_kind, consumer_id, permission, approval_mode, created_at, updated_at
+             FROM vault_secret_policies WHERE secret_id = ?1 ORDER BY consumer_kind ASC, consumer_id ASC, permission ASC",
+        )?;
+        let rows = statement.query_map(params![secret_id], map_vault_secret_policy)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn upsert_vault_secret_policy(
+        &self,
+        record: &VaultSecretPolicyRecord,
+    ) -> Result<VaultSecretPolicyRecord> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        connection.execute(
+            "INSERT INTO vault_secret_policies (id, secret_id, consumer_kind, consumer_id, permission, approval_mode, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(NULLIF(?7, 0), unixepoch()), COALESCE(NULLIF(?8, 0), unixepoch()))
+             ON CONFLICT(secret_id, consumer_kind, consumer_id, permission) DO UPDATE SET approval_mode = excluded.approval_mode, updated_at = unixepoch()",
+            params![record.id, record.secret_id, record.consumer_kind, record.consumer_id, record.permission, record.approval_mode, record.created_at, record.updated_at],
+        )?;
+        connection.query_row(
+            "SELECT id, secret_id, consumer_kind, consumer_id, permission, approval_mode, created_at, updated_at
+             FROM vault_secret_policies WHERE secret_id = ?1 AND consumer_kind = ?2 AND consumer_id = ?3 AND permission = ?4",
+            params![record.secret_id, record.consumer_kind, record.consumer_id, record.permission],
+            map_vault_secret_policy,
+        ).map_err(Into::into)
+    }
+
+    pub fn delete_vault_secret_policy(&self, secret_id: &str, policy_id: &str) -> Result<()> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        connection.execute(
+            "DELETE FROM vault_secret_policies WHERE secret_id = ?1 AND id = ?2",
+            params![secret_id, policy_id],
+        )?;
         Ok(())
     }
 
@@ -5269,6 +5323,19 @@ fn map_vault_secret(row: &rusqlite::Row<'_>) -> rusqlite::Result<VaultSecretReco
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
         last_used_at: row.get(12)?,
+    })
+}
+
+fn map_vault_secret_policy(row: &rusqlite::Row<'_>) -> rusqlite::Result<VaultSecretPolicyRecord> {
+    Ok(VaultSecretPolicyRecord {
+        id: row.get(0)?,
+        secret_id: row.get(1)?,
+        consumer_kind: row.get(2)?,
+        consumer_id: row.get(3)?,
+        permission: row.get(4)?,
+        approval_mode: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
     })
 }
 

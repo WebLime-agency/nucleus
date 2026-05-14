@@ -479,6 +479,70 @@ export const projectUpdateRequestSchema = z.object({
   title: z.string().trim().optional()
 });
 
+export const vaultStatusSummarySchema = z.object({
+  initialized: z.boolean(),
+  locked: z.boolean(),
+  state: z.string(),
+  vault_id: z.string().default(''),
+  cipher: z.string().default(''),
+  kdf_algorithm: z.string().default(''),
+  created_at: z.number().int().nullable().optional(),
+  updated_at: z.number().int().nullable().optional()
+});
+
+export const vaultSecretSummarySchema = z.object({
+  id: z.string(),
+  scope_kind: z.string(),
+  scope_id: z.string(),
+  name: z.string(),
+  description: z.string().default(''),
+  configured: z.boolean(),
+  version: z.number().int(),
+  created_at: z.number().int(),
+  updated_at: z.number().int(),
+  last_used_at: z.number().int().nullable().optional()
+});
+
+export const vaultSecretListResponseSchema = z.object({
+  secrets: z.array(vaultSecretSummarySchema).default([])
+});
+
+export const vaultSecretUpsertRequestSchema = z.object({
+  id: z.string().optional(),
+  scope_kind: z.string().default('workspace'),
+  scope_id: z.string().default('workspace'),
+  name: z.string().trim().min(1),
+  description: z.string().default(''),
+  secret: z.string().min(1)
+});
+
+export const vaultSecretUpdateRequestSchema = vaultSecretUpsertRequestSchema.partial().extend({
+  secret: z.string().min(1)
+});
+
+export const vaultSecretPolicySummarySchema = z.object({
+  id: z.string(),
+  secret_id: z.string(),
+  consumer_kind: z.string(),
+  consumer_id: z.string(),
+  permission: z.string(),
+  approval_mode: z.string(),
+  created_at: z.number().int(),
+  updated_at: z.number().int()
+});
+
+export const vaultSecretPolicyListResponseSchema = z.object({
+  policies: z.array(vaultSecretPolicySummarySchema).default([])
+});
+
+export const vaultSecretPolicyUpsertRequestSchema = z.object({
+  id: z.string().optional(),
+  consumer_kind: z.string().trim().min(1),
+  consumer_id: z.string().trim().min(1),
+  permission: z.string().trim().min(1),
+  approval_mode: z.string().trim().min(1)
+});
+
 export const updateConfigRequestSchema = z.object({
   tracked_channel: z.string().trim().min(1).optional(),
   tracked_ref: z.string().trim().min(1).optional()
@@ -1108,6 +1172,11 @@ export type MemoryCandidate = z.infer<typeof memoryCandidateSchema>;
 export type MemoryCandidateUpsertRequest = z.infer<typeof memoryCandidateUpsertRequestSchema>;
 export type MemoryEntryUpsertRequest = z.infer<typeof memoryEntryUpsertRequestSchema>;
 export type MemorySummary = z.infer<typeof memorySummarySchema>;
+export type VaultStatusSummary = z.infer<typeof vaultStatusSummarySchema>;
+export type VaultSecretSummary = z.infer<typeof vaultSecretSummarySchema>;
+export type VaultSecretPolicySummary = z.infer<typeof vaultSecretPolicySummarySchema>;
+export type VaultSecretUpsertRequest = z.infer<typeof vaultSecretUpsertRequestSchema>;
+export type VaultSecretPolicyUpsertRequest = z.infer<typeof vaultSecretPolicyUpsertRequestSchema>;
 export type SystemStats = z.infer<typeof systemStatsSchema>;
 export type ProcessListResponse = z.infer<typeof processListResponseSchema>;
 export type ProcessSnapshot = z.infer<typeof processSnapshotSchema>;
