@@ -84,6 +84,7 @@ const MAX_PROMPT_INCLUDE_FILES: usize = 24;
 const MAX_PROMPT_INCLUDE_FILE_CHARS: usize = 6_000;
 const MAX_PROMPT_INCLUDE_TOTAL_CHARS: usize = 24_000;
 const MAX_MEMORY_CONTEXT_CHARS: usize = 12_000;
+const MEMORY_TRUNCATION_NOTICE: &str = "\n[Memory entry truncated by Nucleus context budget]";
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(900);
 const INITIAL_UPDATE_CHECK_DELAY: Duration = Duration::from_secs(3);
 const RESTART_AFTER_RESPONSE_DELAY: Duration = Duration::from_millis(800);
@@ -4824,8 +4825,13 @@ fn collect_memory_layers(
                 collection.skipped_count += 1;
                 continue;
             }
-            content = truncate_utf8_to_byte_budget(&content, remaining);
-            content.push_str("\n[Memory entry truncated by Nucleus context budget]");
+            let content_budget = remaining.saturating_sub(MEMORY_TRUNCATION_NOTICE.len());
+            if content_budget == 0 {
+                collection.skipped_count += 1;
+                continue;
+            }
+            content = truncate_utf8_to_byte_budget(&content, content_budget);
+            content.push_str(MEMORY_TRUNCATION_NOTICE);
         }
         remaining = remaining.saturating_sub(content.len());
         layers.push(CompiledPromptLayer {
@@ -7548,6 +7554,12 @@ mod tests {
         let rendered = nucleus_core::render_compiled_turn_system_text(&compiled);
         assert!(rendered.contains("[Memory entry truncated by Nucleus context budget]"));
         assert_eq!(compiled.debug_summary.memory_truncated_count, 1);
+        let memory_layer = compiled
+            .project_layers
+            .iter()
+            .find(|layer| layer.kind == "memory")
+            .expect("memory layer should be present");
+        assert!(memory_layer.content.len() <= MAX_MEMORY_CONTEXT_CHARS);
         let _ = fs::remove_dir_all(&state_dir);
     }
 

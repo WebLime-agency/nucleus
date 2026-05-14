@@ -91,18 +91,33 @@
   }
 
   async function setEnabled(entry: MemoryEntry, enabled: boolean) {
-    await upsertMemory({ ...entry, enabled });
-    await loadMemory();
+    try {
+      await upsertMemory({ ...entry, enabled });
+      await loadMemory();
+      error = null;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to update memory entry.';
+    }
   }
 
   async function archiveEntry(entry: MemoryEntry) {
-    await upsertMemory({ ...entry, status: 'archived' });
-    await loadMemory();
+    try {
+      await upsertMemory({ ...entry, status: 'archived' });
+      await loadMemory();
+      error = null;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to archive memory entry.';
+    }
   }
 
   async function removeEntry(entry: MemoryEntry) {
-    await deleteMemory(entry.id);
-    await loadMemory();
+    try {
+      await deleteMemory(entry.id);
+      await loadMemory();
+      error = null;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to delete memory entry.';
+    }
   }
 
   function formatTime(value?: number | null) {
