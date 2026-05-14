@@ -51,7 +51,7 @@ Source plans:
 | 0 | Planning | Plan split and master execution plan | completed | none | Planning docs reviewed for consistency; no implementation started. |
 | 1 | Security | Network posture + secure-origin + redaction primitives | completed | Phase 0 | PR #134 includes posture/redaction primitives plus provider/API credential response hardening. |
 | 2 | Memory | Prompt integration + real Memory UI | completed | Phase 0 | Phase 2 implementation committed on `feat/memory-prompt-ui`. |
-| 3 | Vault | Passphrase-protected local Vault backend | completed | Phase 1 | PR #137 merged into `dev`; UI/MCP remain deferred. |
+| 3 | Vault | Passphrase-protected local Vault backend | completed | Phase 1 | PR #137 merged into `dev` at `724eb2115e02d2d660de41ee890724ebac85fab6`; UI/MCP remain deferred. |
 | 4 | Memory | Candidates + explicit/automatic capture loop | not_started | Phase 1, Phase 2 |  |
 | 5 | Vault | Workspace Vault UI + policy model | not_started | Phase 3 |  |
 | 6 | Vault/MCP | MCP `vault_bearer` integration | not_started | Phase 3, Phase 5 |  |
@@ -261,7 +261,7 @@ Exit criteria:
 
 Completion notes:
 
-- Implemented on branch `feat/vault-backend` and merged via PR #137.
+- Implemented on branch `feat/vault-backend` and merged via PR #137 (`724eb2115e02d2d660de41ee890724ebac85fab6`).
 - Added passphrase-protected local Vault backend with Argon2id KDF, XChaCha20-Poly1305 encryption, per-scope encrypted keys, per-secret nonces, and AAD binding for encrypted scope keys/secrets.
 - Added daemon-owned lock/unlock runtime state; Vault locks by default on daemon start because only encrypted state is persisted.
 - Added metadata-only Vault APIs for status, init, unlock, lock, create/update/list/delete secrets. No reveal endpoint exists.
