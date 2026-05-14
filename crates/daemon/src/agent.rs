@@ -33,10 +33,10 @@ use uuid::Uuid;
 
 use super::{
     ApiError, AppState, assemble_prompt_input, ensure_prompting_runtime, excerpt,
-    load_router_profiles, publish_overview_event, publish_prompt_progress_event,
-    publish_session_event, resolve_profile_targets, resolve_session_projects,
-    resolve_workspace_profile, resolve_workspace_profile_target, try_record_audit_event,
-    unix_timestamp, vault,
+    extract_memory_candidates_after_successful_turn, load_router_profiles, publish_overview_event,
+    publish_prompt_progress_event, publish_session_event, resolve_mcp_vault_bearer_token,
+    resolve_profile_targets, resolve_session_projects, resolve_workspace_profile,
+    resolve_workspace_profile_target, try_record_audit_event, unix_timestamp,
 };
 use crate::runtime::{PromptStreamEvent, ProviderTurnResult};
 use crate::worker_action::{ChildJobProposal, WorkerAction, parse_worker_action};
@@ -2509,6 +2509,8 @@ async fn complete_job_with_final_answer(
             final_answer,
             &[],
         )?;
+        extract_memory_candidates_after_successful_turn(state, &session.session.id, &final_turn_id)
+            .await;
         visible_turn_id = Some(final_turn_id);
         state.store.update_session(
             &session.session.id,
@@ -3705,7 +3707,13 @@ async fn execute_granted_tool(
         other if other.starts_with("mcp.") => {
             let args = serde_json::from_value::<McpToolCallArgs>(args.clone())
                 .unwrap_or(McpToolCallArgs { params: args });
-            execute_mcp_tool_call(state, other, args.params).await
+            execute_mcp_tool_call(
+                state,
+                other,
+                args.params,
+                Some(session.session.project_id.as_str()),
+            )
+            .await
         }
         other => bail!("unsupported tool '{}'", other),
     }
@@ -4572,7 +4580,12 @@ async fn execute_tests_run_tool(
     .await
 }
 
-async fn execute_mcp_tool_call(state: &AppState, tool_id: &str, params: Value) -> Result<Value> {
+async fn execute_mcp_tool_call(
+    state: &AppState,
+    tool_id: &str,
+    params: Value,
+    project_context: Option<&str>,
+) -> Result<Value> {
     let tool = state
         .store
         .list_mcp_tools()?
@@ -4588,16 +4601,18 @@ async fn execute_mcp_tool_call(state: &AppState, tool_id: &str, params: Value) -
     if !server.enabled {
         bail!("MCP server '{}' is disabled", server.id);
     }
-    invoke_mcp_stdio_tool(&server, &tool, params).await
+    invoke_mcp_stdio_tool(state, &server, &tool, params, project_context).await
 }
 
 async fn invoke_mcp_stdio_tool(
+    state: &AppState,
     server: &McpServerRecord,
     tool: &McpToolRecord,
     params: Value,
+    project_context: Option<&str>,
 ) -> Result<Value> {
     if server.transport == "streamable-http" || server.transport == "http" {
-        return invoke_mcp_http_tool(server, tool, params).await;
+        return invoke_mcp_http_tool(state, server, tool, params, project_context).await;
     }
     if server.transport != "stdio" {
         bail!(
@@ -4673,20 +4688,29 @@ async fn invoke_mcp_stdio_tool(
 }
 
 async fn invoke_mcp_http_tool(
+    state: &AppState,
     server: &McpServerRecord,
     tool: &McpToolRecord,
     params: Value,
+    project_context: Option<&str>,
 ) -> Result<Value> {
-    let _ = mcp_http_request_for_tool(server, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"nucleus","version":env!("CARGO_PKG_VERSION")}}})).await?;
+    let _ = mcp_http_request_for_tool(state, server, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"nucleus","version":env!("CARGO_PKG_VERSION")}}}), project_context).await?;
     let _ = mcp_http_request_for_tool(
+        state,
         server,
         json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        project_context,
     )
     .await;
-    mcp_http_request_for_tool(server, json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool.name,"arguments":params}})).await
+    mcp_http_request_for_tool(state, server, json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool.name,"arguments":params}}), project_context).await
 }
 
-async fn mcp_http_request_for_tool(record: &McpServerRecord, payload: Value) -> Result<Value> {
+async fn mcp_http_request_for_tool(
+    state: &AppState,
+    record: &McpServerRecord,
+    payload: Value,
+    project_context: Option<&str>,
+) -> Result<Value> {
     if record.url.trim().is_empty() {
         bail!("missing_url: MCP remote URL is required");
     }
@@ -4712,6 +4736,10 @@ async fn mcp_http_request_for_tool(record: &McpServerRecord, payload: Value) -> 
             let token = std::env::var(record.auth_ref.trim()).map_err(|_| {
                 anyhow!("missing_credentials: bearer token environment variable is not set")
             })?;
+            req = req.bearer_auth(token);
+        }
+        "vault_bearer" => {
+            let token = resolve_mcp_vault_bearer_token(state, record, project_context).await?;
             req = req.bearer_auth(token);
         }
         "static_headers" => {}
@@ -7572,6 +7600,7 @@ async fn publish_prompt_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vault;
 
     #[test]
     fn interrupted_restart_recovery_only_rewrites_non_terminal_tool_calls() {
@@ -9053,10 +9082,14 @@ for line in sys.stdin:
         assert_eq!(capabilities.len(), 1);
         assert_eq!(capabilities[0].tool_id, "mcp.docs.searchDocs");
 
-        let result =
-            execute_mcp_tool_call(&state, "mcp.docs.searchDocs", json!({"query":"nucleus"}))
-                .await
-                .expect("mcp tool call should succeed");
+        let result = execute_mcp_tool_call(
+            &state,
+            "mcp.docs.searchDocs",
+            json!({"query":"nucleus"}),
+            None,
+        )
+        .await
+        .expect("mcp tool call should succeed");
 
         assert_eq!(result["content"][0]["text"], "result:nucleus");
 

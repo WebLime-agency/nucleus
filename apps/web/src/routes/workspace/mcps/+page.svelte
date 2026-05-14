@@ -130,6 +130,9 @@
     const lastError = (server.last_error || '').toLowerCase();
     if (!server.enabled) return { label: 'Disabled', variant: 'secondary' as const, detail: '' };
     if (server.sync_status === 'missing_credentials' || lastError.includes('missing_credentials')) return { label: 'Auth missing', variant: 'destructive' as const, detail: 'Set the configured secret reference and rediscover.' };
+    if (server.sync_status === 'vault_locked' || lastError.includes('vault_locked')) return { label: 'Vault locked', variant: 'destructive' as const, detail: 'Unlock Workspace Vault before discovering or invoking this MCP.' };
+    if (server.sync_status === 'vault_secret_missing' || lastError.includes('vault_secret_missing')) return { label: 'Vault secret missing', variant: 'destructive' as const, detail: 'Check the configured vault://workspace/... reference.' };
+    if (server.sync_status === 'vault_policy_denied' || lastError.includes('vault_policy_denied')) return { label: 'Vault policy denied', variant: 'destructive' as const, detail: 'Allow this MCP server as a Vault consumer before use.' };
     if (server.sync_status === 'auth_required' || lastError.includes('auth_required')) return { label: 'Auth required', variant: 'destructive' as const, detail: 'Interactive auth is required before this MCP can be used.' };
     if (server.sync_status === 'ready') return { label: 'Enabled', variant: 'default' as const, detail: '' };
     if (server.sync_status === 'pending') return { label: 'Pending', variant: 'secondary' as const, detail: '' };
@@ -215,8 +218,13 @@
         <div class="space-y-1"><Label for="mcp-env">Env JSON</Label><Textarea id="mcp-env" value={JSON.stringify(form.env_json, null, 2)} oninput={(event) => (form.env_json = parseEnv((event.currentTarget as HTMLTextAreaElement).value))} rows={5} /></div>
         {:else}
         <div class="space-y-1"><Label for="mcp-url">Remote URL</Label><Input id="mcp-url" bind:value={form.url} /></div>
-        <div class="space-y-1"><Label for="mcp-auth-kind">Auth mode</Label><select id="mcp-auth-kind" class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100" bind:value={form.auth_kind}><option value="none">none</option><option value="static_headers">static headers</option><option value="bearer_env">bearer from env</option><option value="oauth">oauth/device (future)</option></select></div>
-        <div class="space-y-1"><Label for="mcp-auth-ref">Auth ref</Label><Input id="mcp-auth-ref" bind:value={form.auth_ref} placeholder="ENV_VAR_NAME or future secret ref" /></div>
+        <div class="space-y-1"><Label for="mcp-auth-kind">Auth mode</Label><select id="mcp-auth-kind" class="h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100" bind:value={form.auth_kind}><option value="none">none</option><option value="vault_bearer">bearer from Vault</option><option value="static_headers">static headers</option><option value="bearer_env">bearer from env (advanced)</option><option value="oauth">oauth/device (future)</option></select></div>
+        <div class="space-y-1"><Label for="mcp-auth-ref">Auth ref</Label><Input id="mcp-auth-ref" bind:value={form.auth_ref} placeholder={form.auth_kind === 'vault_bearer' ? 'vault://workspace/SECRET_NAME' : 'ENV_VAR_NAME'} /></div>
+        {#if form.auth_kind === 'vault_bearer'}
+          <div class="rounded-md border border-lime-300/20 bg-lime-300/10 p-3 text-xs text-lime-100">Normal users should store bearer tokens in Workspace Vault and reference them here. Nucleus resolves the token daemon-side only; values are not returned to the UI, model, logs, audit events, or MCP tool catalog. Add an allowed-consumer policy for this MCP id in Workspace Vault.</div>
+        {:else if form.auth_kind === 'bearer_env'}
+          <div class="rounded-md border border-amber-300/20 bg-amber-300/10 p-3 text-xs text-amber-100">Advanced/operator fallback. Prefer Vault references so users do not need copied files or environment variables.</div>
+        {/if}
         <div class="space-y-1"><Label for="mcp-headers">Headers JSON</Label><Textarea id="mcp-headers" value={JSON.stringify(form.headers_json, null, 2)} oninput={(event) => (form.headers_json = parseEnv((event.currentTarget as HTMLTextAreaElement).value))} rows={4} /></div>
         {/if}
         <label class="flex items-center gap-2 text-sm text-zinc-300"><input type="checkbox" bind:checked={form.enabled} /> Enabled</label>

@@ -14,6 +14,8 @@ import {
   jobSummarySchema,
   mcpServerRecordSchema,
   mcpServerSummarySchema,
+  memoryCandidateListResponseSchema,
+  memoryCandidateUpsertRequestSchema,
   memoryEntrySchema,
   memoryEntryUpsertRequestSchema,
   memorySummarySchema,
@@ -48,7 +50,15 @@ import {
   workspaceProfileSummarySchema,
   workspaceProfileWriteRequestSchema,
   workspaceSummarySchema,
-  workspaceUpdateRequestSchema
+  workspaceUpdateRequestSchema,
+  vaultSecretListResponseSchema,
+  vaultSecretPolicyListResponseSchema,
+  vaultSecretPolicySummarySchema,
+  vaultSecretPolicyUpsertRequestSchema,
+  vaultSecretSummarySchema,
+  vaultSecretUpdateRequestSchema,
+  vaultSecretUpsertRequestSchema,
+  vaultStatusSummarySchema
 } from './schemas';
 
 type FetchLike = typeof fetch;
@@ -576,6 +586,46 @@ export async function deleteMcpServer(serverId: string, fetchImpl: FetchLike = f
   });
 }
 
+export async function fetchMemoryCandidates(status = 'pending', fetchImpl: FetchLike = fetch) {
+  const params = new URLSearchParams();
+  if (status) params.set('status', status);
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/memory/candidates?${params.toString()}`, { headers: { accept: 'application/json' } }),
+    memoryCandidateListResponseSchema
+  );
+}
+
+export async function upsertMemoryCandidate(input: z.input<typeof memoryCandidateUpsertRequestSchema>, fetchImpl: FetchLike = fetch) {
+  const payload = memoryCandidateUpsertRequestSchema.parse(input);
+  return parseJson(
+    await daemonFetch(fetchImpl, payload.id ? `/api/memory/candidates/${encodeURIComponent(payload.id)}` : '/api/memory/candidates', {
+      method: payload.id ? 'PUT' : 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify(payload)
+    }),
+    memoryCandidateUpsertRequestSchema.extend({ created_at: z.number().int().optional(), updated_at: z.number().int().optional() })
+  );
+}
+
+export async function acceptMemoryCandidate(candidateId: string, input: Record<string, unknown> = {}, fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/memory/candidates/${encodeURIComponent(candidateId)}/accept`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify(input)
+    }),
+    memoryEntrySchema
+  );
+}
+
+export async function rejectMemoryCandidate(candidateId: string, fetchImpl: FetchLike = fetch) {
+  return parseJson(await daemonFetch(fetchImpl, `/api/memory/candidates/${encodeURIComponent(candidateId)}/reject`, { method: 'POST', headers: { accept: 'application/json' } }), memoryCandidateUpsertRequestSchema.extend({ id: z.string(), created_at: z.number().int().optional(), updated_at: z.number().int().optional() }));
+}
+
+export async function deleteMemoryCandidate(candidateId: string, fetchImpl: FetchLike = fetch) {
+  await daemonFetch(fetchImpl, `/api/memory/candidates/${encodeURIComponent(candidateId)}`, { method: 'DELETE', headers: { accept: 'application/json' } });
+}
+
 export async function fetchMemory(fetchImpl: FetchLike = fetch) {
   return parseJson(
     await daemonFetch(fetchImpl, '/api/memory', {
@@ -608,6 +658,64 @@ export async function deleteMemory(memoryId: string, fetchImpl: FetchLike = fetc
     method: 'DELETE',
     headers: { accept: 'application/json' }
   });
+}
+
+export async function fetchVaultStatus(fetchImpl: FetchLike = fetch) {
+  return parseJson(await daemonFetch(fetchImpl, '/api/vault/status', { headers: { accept: 'application/json' } }), vaultStatusSummarySchema);
+}
+
+export async function initVault(passphrase: string, fetchImpl: FetchLike = fetch) {
+  return parseJson(await daemonFetch(fetchImpl, '/api/vault/init', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify({ passphrase }) }), vaultStatusSummarySchema);
+}
+
+export async function unlockVault(passphrase: string, fetchImpl: FetchLike = fetch) {
+  return parseJson(await daemonFetch(fetchImpl, '/api/vault/unlock', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify({ passphrase }) }), vaultStatusSummarySchema);
+}
+
+export async function lockVault(fetchImpl: FetchLike = fetch) {
+  return parseJson(await daemonFetch(fetchImpl, '/api/vault/lock', { method: 'POST', headers: { accept: 'application/json' } }), vaultStatusSummarySchema);
+}
+
+export async function fetchVaultSecrets(
+  scope: { scope_kind?: string; scope_id?: string } = { scope_kind: 'workspace', scope_id: 'workspace' },
+  fetchImpl: FetchLike = fetch
+) {
+  const scopeKind = scope.scope_kind ?? 'workspace';
+  const scopeId = scope.scope_id ?? 'workspace';
+  const query = new URLSearchParams({ scope_kind: scopeKind, scope_id: scopeId });
+  return parseJson(await daemonFetch(fetchImpl, `/api/vault/secrets?${query.toString()}`, { headers: { accept: 'application/json' } }), vaultSecretListResponseSchema);
+}
+
+export async function createVaultSecret(input: z.input<typeof vaultSecretUpsertRequestSchema>, fetchImpl: FetchLike = fetch) {
+  const payload = vaultSecretUpsertRequestSchema.parse(input);
+  return parseJson(await daemonFetch(fetchImpl, '/api/vault/secrets', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify(payload) }), vaultSecretSummarySchema);
+}
+
+export async function updateVaultSecret(secretId: string, input: z.input<typeof vaultSecretUpdateRequestSchema>, fetchImpl: FetchLike = fetch) {
+  const payload = vaultSecretUpdateRequestSchema.parse(input);
+  return parseJson(await daemonFetch(fetchImpl, `/api/vault/secrets/${encodeURIComponent(secretId)}`, { method: 'PATCH', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify(payload) }), vaultSecretSummarySchema);
+}
+
+export async function deleteVaultSecret(secretId: string, fetchImpl: FetchLike = fetch) {
+  await daemonFetch(fetchImpl, `/api/vault/secrets/${encodeURIComponent(secretId)}`, { method: 'DELETE', headers: { accept: 'application/json' } });
+}
+
+function vaultScopeQuery(scope?: { scope_kind?: string; scope_id?: string }) {
+  if (!scope?.scope_kind || !scope?.scope_id) return '';
+  return `?${new URLSearchParams({ scope_kind: scope.scope_kind, scope_id: scope.scope_id }).toString()}`;
+}
+
+export async function fetchVaultSecretPolicies(secretId: string, scope?: { scope_kind?: string; scope_id?: string }, fetchImpl: FetchLike = fetch) {
+  return parseJson(await daemonFetch(fetchImpl, `/api/vault/secrets/${encodeURIComponent(secretId)}/policies${vaultScopeQuery(scope)}`, { headers: { accept: 'application/json' } }), vaultSecretPolicyListResponseSchema);
+}
+
+export async function upsertVaultSecretPolicy(secretId: string, input: z.input<typeof vaultSecretPolicyUpsertRequestSchema>, scope?: { scope_kind?: string; scope_id?: string }, fetchImpl: FetchLike = fetch) {
+  const payload = vaultSecretPolicyUpsertRequestSchema.parse(input);
+  return parseJson(await daemonFetch(fetchImpl, `/api/vault/secrets/${encodeURIComponent(secretId)}/policies${vaultScopeQuery(scope)}`, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify(payload) }), vaultSecretPolicySummarySchema);
+}
+
+export async function deleteVaultSecretPolicy(secretId: string, policyId: string, scope?: { scope_kind?: string; scope_id?: string }, fetchImpl: FetchLike = fetch) {
+  await daemonFetch(fetchImpl, `/api/vault/secrets/${encodeURIComponent(secretId)}/policies/${encodeURIComponent(policyId)}${vaultScopeQuery(scope)}`, { method: 'DELETE', headers: { accept: 'application/json' } });
 }
 
 export async function fetchActions(fetchImpl: FetchLike = fetch) {
