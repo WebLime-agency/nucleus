@@ -8803,7 +8803,7 @@ mod tests {
         let (state_dir, state) = test_named_app_state("memory-secret-guardrails");
         let entry = explicit_remember(
             State(state.clone()),
-            Bytes::from_static(br#"{"scope_kind":"workspace","scope_id":"workspace","title":"Remember safely","content":"This project uses a project-scoped token stored in Vault."}"#),
+            Bytes::from_static(br#"{"id":"remember-safely","scope_kind":"workspace","scope_id":"workspace","title":"Remember safely","content":"This project uses a project-scoped token stored in Vault."}"#),
         ).await.unwrap().0;
         assert_eq!(entry.source_kind, "explicit_remember");
 
