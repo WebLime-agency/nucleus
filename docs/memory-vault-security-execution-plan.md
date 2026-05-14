@@ -51,7 +51,7 @@ Source plans:
 | 0 | Planning | Plan split and master execution plan | completed | none | Planning docs reviewed for consistency; no implementation started. |
 | 1 | Security | Network posture + secure-origin + redaction primitives | completed | Phase 0 | PR #134 includes posture/redaction primitives plus provider/API credential response hardening. |
 | 2 | Memory | Prompt integration + real Memory UI | completed | Phase 0 | Phase 2 implementation committed on `feat/memory-prompt-ui`. |
-| 3 | Vault | Passphrase-protected local Vault backend | not_started | Phase 1 |  |
+| 3 | Vault | Passphrase-protected local Vault backend | in_progress | Phase 1 | Active implementation phase; do not start Phase 4 until Phase 3 is reviewed, PR’d, merged into dev, and this plan is updated. |
 | 4 | Memory | Candidates + explicit/automatic capture loop | not_started | Phase 1, Phase 2 |  |
 | 5 | Vault | Workspace Vault UI + policy model | not_started | Phase 3 |  |
 | 6 | Vault/MCP | MCP `vault_bearer` integration | not_started | Phase 3, Phase 5 |  |
@@ -601,3 +601,20 @@ When asked to work on this plan:
    - add completion notes
    - add follow-up tasks if scope was intentionally deferred
 9. If a stable EBA release is requested, follow repo workflow and managed-release docs rather than stopping at local implementation.
+
+## Deferred operator notes and follow-ups
+
+- Operator/manager sessions should review executor reports, maintain gates, and provide prompts/checklists. They should not directly patch, commit, push, merge, promote, or release unless explicitly asked.
+- Keep implementation, cleanup, PR/release, and verification work in separate focused sessions/worktrees.
+- Phase 3 is currently the active implementation phase: passphrase-protected local Vault backend. Phase 4 must not start until Phase 3 is reviewed, PR’d, merged into dev, and this execution plan is updated.
+- Main worktree cleanup was completed after Phase 2. The stale dirty branch was cleaned back to current dev. Future implementation work should still prefer fresh clean worktrees.
+- A Node/toolchain runtime-resolution experiment was preserved separately and should be reviewed later as its own focused PR. It must not be mixed into Memory/Vault/Security phase work.
+- Memory UI currently treats edited entries mostly as manual/user entries. After candidate capture and explicit remember flows exist, revisit preserving richer source metadata during edits.
+- Vault and Memory boundaries remain strict:
+  - Memory is prompt-visible context.
+  - Vault is never prompt-visible.
+  - Vault list/status APIs must never return plaintext secret values.
+  - Secrets must never enter prompts, Memory, transcripts, logs, audit events, debug payloads, or normal browser-visible responses.
+  - Plaintext Vault operations, including unlock/create/update secret flows, must require safe-origin/security posture checks.
+- Old temporary worktrees should be pruned in a later maintenance pass, not during active Vault/Memory implementation.
+- Stable release/promotion should happen only when explicitly requested after the selected phase batch is complete.
