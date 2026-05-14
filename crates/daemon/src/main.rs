@@ -62,7 +62,7 @@ use nucleus_protocol::{
 use nucleus_release::read_installed_release_metadata;
 use nucleus_storage::{
     AuditEventRecord, ProjectPatch, SessionPatch, SessionRecord, StateStore,
-    VaultSecretPolicyRecord, WorkspaceProfilePatch,
+    VaultSecretPolicyRecord, VaultSecretRecord, WorkspaceProfilePatch,
 };
 use runtime::RuntimeManager;
 use serde::{Deserialize, de::DeserializeOwned};
@@ -1466,6 +1466,12 @@ struct VaultSecretListQuery {
     scope_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct VaultSecretPolicyScopeQuery {
+    scope_kind: Option<String>,
+    scope_id: Option<String>,
+}
+
 async fn vault_status(State(state): State<AppState>) -> Result<Json<VaultStatusSummary>, ApiError> {
     Ok(Json(vault_status_summary(&state).await?))
 }
@@ -1542,9 +1548,17 @@ async fn list_vault_secrets(
     State(state): State<AppState>,
     Query(query): Query<VaultSecretListQuery>,
 ) -> Result<Json<VaultSecretListResponse>, ApiError> {
+    let scope = validate_vault_scope_query(
+        &state,
+        query.scope_kind.as_deref(),
+        query.scope_id.as_deref(),
+    )?;
     let secrets = state
         .store
-        .list_vault_secrets(query.scope_kind.as_deref(), query.scope_id.as_deref())?
+        .list_vault_secrets(
+            scope.as_ref().map(|(kind, _)| kind.as_str()),
+            scope.as_ref().map(|(_, id)| id.as_str()),
+        )?
         .into_iter()
         .map(vault_secret_summary)
         .collect();
@@ -1558,7 +1572,7 @@ async fn create_vault_secret(
 ) -> Result<Json<VaultSecretSummary>, ApiError> {
     require_vault_safe_origin(&headers)?;
     let payload = decode_json::<VaultSecretUpsertRequest>(&body)?;
-    let input = validate_vault_secret_create(payload)?;
+    let input = validate_vault_secret_create(&state, payload)?;
     let mut vault = state.vault.lock().await;
     let saved = vault
         .create_or_update_secret(&state.store, input)
@@ -1591,14 +1605,16 @@ async fn update_vault_secret(
         Some(scope_id) => non_empty_trimmed(scope_id, "vault scope id")?,
         None => existing.scope_id,
     };
+    let scope_kind = normalize_vault_scope_kind(
+        payload
+            .scope_kind
+            .as_deref()
+            .unwrap_or(&existing.scope_kind),
+    )?;
+    validate_vault_scope(&state, &scope_kind, &scope_id)?;
     let input = vault::VaultSecretInput {
         id: Some(secret_id),
-        scope_kind: normalize_vault_scope_kind(
-            payload
-                .scope_kind
-                .as_deref()
-                .unwrap_or(&existing.scope_kind),
-        )?,
+        scope_kind,
         scope_id,
         name: sanitize_vault_secret_name(payload.name.as_deref().unwrap_or(&existing.name))?,
         description: payload
@@ -1647,9 +1663,11 @@ async fn delete_vault_secret(
 async fn list_vault_secret_policies(
     State(state): State<AppState>,
     Path(secret_id): Path<String>,
+    Query(query): Query<VaultSecretPolicyScopeQuery>,
 ) -> Result<Json<VaultSecretPolicyListResponse>, ApiError> {
     let secret_id = sanitize_registry_id(&secret_id, "vault secret id")?;
-    let _ = state.store.load_vault_secret(&secret_id)?;
+    let secret = state.store.load_vault_secret(&secret_id)?;
+    validate_vault_secret_policy_context(&state, &secret, &query)?;
     let policies = state
         .store
         .list_vault_secret_policies(&secret_id)?
@@ -1662,12 +1680,14 @@ async fn list_vault_secret_policies(
 async fn upsert_vault_secret_policy(
     State(state): State<AppState>,
     Path(secret_id): Path<String>,
+    Query(query): Query<VaultSecretPolicyScopeQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<VaultSecretPolicySummary>, ApiError> {
     require_vault_safe_origin(&headers)?;
     let secret_id = sanitize_registry_id(&secret_id, "vault secret id")?;
-    let _ = state.store.load_vault_secret(&secret_id)?;
+    let secret = state.store.load_vault_secret(&secret_id)?;
+    validate_vault_secret_policy_context(&state, &secret, &query)?;
     if !state.vault.lock().await.is_unlocked() {
         return Err(ApiError::forbidden("vault is locked"));
     }
@@ -1700,12 +1720,14 @@ async fn upsert_vault_secret_policy(
 async fn delete_vault_secret_policy(
     State(state): State<AppState>,
     Path((secret_id, policy_id)): Path<(String, String)>,
+    Query(query): Query<VaultSecretPolicyScopeQuery>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     require_vault_safe_origin(&headers)?;
     let secret_id = sanitize_registry_id(&secret_id, "vault secret id")?;
     let policy_id = sanitize_registry_id(&policy_id, "vault policy id")?;
-    let _ = state.store.load_vault_secret(&secret_id)?;
+    let secret = state.store.load_vault_secret(&secret_id)?;
+    validate_vault_secret_policy_context(&state, &secret, &query)?;
     if !state.vault.lock().await.is_unlocked() {
         return Err(ApiError::forbidden("vault is locked"));
     }
@@ -1734,20 +1756,107 @@ fn require_vault_safe_origin(headers: &HeaderMap) -> Result<(), ApiError> {
     }
 }
 
+fn validate_vault_secret_policy_context(
+    state: &AppState,
+    secret: &VaultSecretRecord,
+    query: &VaultSecretPolicyScopeQuery,
+) -> Result<(), ApiError> {
+    if secret.scope_kind == "workspace" {
+        if let (Some(kind), Some(id)) = (query.scope_kind.as_deref(), query.scope_id.as_deref()) {
+            let kind = normalize_vault_scope_kind(kind)?;
+            let id = non_empty_trimmed(id.to_string(), "vault scope id")?;
+            if kind != "workspace" || id != "workspace" {
+                return Err(ApiError::forbidden(
+                    "vault_project_context_mismatch: policy operation scope does not match secret scope",
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    if secret.scope_kind != "project" {
+        return Err(ApiError::bad_request("unsupported Vault secret scope"));
+    }
+
+    let Some(kind) = query.scope_kind.as_deref() else {
+        return Err(ApiError::forbidden(
+            "vault_project_context_missing: project Vault policy operation requires matching project scope",
+        ));
+    };
+    let Some(id) = query.scope_id.as_deref() else {
+        return Err(ApiError::forbidden(
+            "vault_project_context_missing: project Vault policy operation requires matching project scope",
+        ));
+    };
+    let kind = normalize_vault_scope_kind(kind)?;
+    let id = non_empty_trimmed(id.to_string(), "vault scope id")?;
+    validate_vault_scope(state, &kind, &id)?;
+    if kind != secret.scope_kind || id != secret.scope_id {
+        return Err(ApiError::forbidden(
+            "vault_project_context_mismatch: policy operation scope does not match secret scope",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_vault_secret_create(
+    state: &AppState,
     payload: VaultSecretUpsertRequest,
 ) -> Result<vault::VaultSecretInput, ApiError> {
+    let scope_kind = normalize_vault_scope_kind(&payload.scope_kind)?;
+    let scope_id = non_empty_trimmed(payload.scope_id, "vault scope id")?;
+    validate_vault_scope(state, &scope_kind, &scope_id)?;
     Ok(vault::VaultSecretInput {
         id: payload
             .id
             .map(|id| sanitize_registry_id(&id, "vault secret id"))
             .transpose()?,
-        scope_kind: normalize_vault_scope_kind(&payload.scope_kind)?,
-        scope_id: non_empty_trimmed(payload.scope_id, "vault scope id")?,
+        scope_kind,
+        scope_id,
         name: sanitize_vault_secret_name(&payload.name)?,
         description: payload.description.trim().to_string(),
         secret: non_empty_secret(payload.secret, "vault secret value")?,
     })
+}
+
+fn validate_vault_scope_query(
+    state: &AppState,
+    scope_kind: Option<&str>,
+    scope_id: Option<&str>,
+) -> Result<Option<(String, String)>, ApiError> {
+    match (scope_kind, scope_id) {
+        (Some(kind), Some(id)) => {
+            let kind = normalize_vault_scope_kind(kind)?;
+            let id = non_empty_trimmed(id.to_string(), "vault scope id")?;
+            validate_vault_scope(state, &kind, &id)?;
+            Ok(Some((kind, id)))
+        }
+        (None, None) => Ok(None),
+        _ => Err(ApiError::bad_request(
+            "vault scope filters require both scope_kind and scope_id",
+        )),
+    }
+}
+
+fn validate_vault_scope(
+    state: &AppState,
+    scope_kind: &str,
+    scope_id: &str,
+) -> Result<(), ApiError> {
+    match scope_kind {
+        "workspace" if scope_id == "workspace" => Ok(()),
+        "workspace" => Err(ApiError::bad_request(
+            "workspace Vault scope_id must be workspace",
+        )),
+        "project" => state
+            .store
+            .resolve_project(scope_id)
+            .map(|_| ())
+            .map_err(|_| ApiError::not_found(format!("project '{scope_id}' was not found"))),
+        _ => Err(ApiError::bad_request(
+            "vault scope kind must be workspace or project",
+        )),
+    }
 }
 
 fn normalize_vault_scope_kind(value: &str) -> Result<String, ApiError> {
@@ -2037,16 +2146,17 @@ async fn call_mcp_server_tool(
             record.transport
         )));
     }
-    let _ = mcp_http_request(&state, &record, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"nucleus","version":env!("CARGO_PKG_VERSION")}}}))
+    let _ = mcp_http_request(&state, &record, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"nucleus","version":env!("CARGO_PKG_VERSION")}}}), None)
         .await
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let _ = mcp_http_request(
         &state,
         &record,
         json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        None,
     )
     .await;
-    let result = mcp_http_request(&state, &record, json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool_name,"arguments":params}}))
+    let result = mcp_http_request(&state, &record, json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool_name,"arguments":params}}), None)
         .await
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     Ok(Json(result))
@@ -2251,18 +2361,20 @@ async fn discover_mcp_http_server(
     state: &AppState,
     record: &McpServerRecord,
 ) -> anyhow::Result<DiscoveredMcpCatalog> {
-    let result = mcp_http_request(state, record, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"nucleus","version":env!("CARGO_PKG_VERSION")}}})).await?;
+    let result = mcp_http_request(state, record, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"nucleus","version":env!("CARGO_PKG_VERSION")}}}), None).await?;
     let _ = result;
     let _ = mcp_http_request(
         state,
         record,
         json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        None,
     )
     .await;
     let result = mcp_http_request(
         state,
         record,
         json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+        None,
     )
     .await?;
     let tools_value = result
@@ -2327,6 +2439,7 @@ async fn mcp_http_request(
     state: &AppState,
     record: &McpServerRecord,
     payload: Value,
+    project_context: Option<&str>,
 ) -> anyhow::Result<Value> {
     if record.url.trim().is_empty() {
         bail!("missing_url: MCP remote URL is required");
@@ -2359,7 +2472,7 @@ async fn mcp_http_request(
             req = req.bearer_auth(token);
         }
         "vault_bearer" => {
-            let token = resolve_mcp_vault_bearer_token(state, record).await?;
+            let token = resolve_mcp_vault_bearer_token(state, record, project_context).await?;
             req = req.bearer_auth(token);
         }
         "static_headers" => {}
@@ -2415,6 +2528,10 @@ fn mcp_sync_status_for_error(message: &str) -> &'static str {
         "vault_secret_missing"
     } else if lower.contains("vault_policy_denied") {
         "vault_policy_denied"
+    } else if lower.contains("vault_project_context_missing") {
+        "vault_project_context_missing"
+    } else if lower.contains("vault_project_context_mismatch") {
+        "vault_project_context_mismatch"
     } else if lower.contains("missing_credentials") {
         "missing_credentials"
     } else if lower.contains("auth_required") {
@@ -2429,8 +2546,10 @@ fn mcp_sync_status_for_error(message: &str) -> &'static str {
 pub(crate) async fn resolve_mcp_vault_bearer_token(
     state: &AppState,
     record: &McpServerRecord,
+    project_context: Option<&str>,
 ) -> anyhow::Result<String> {
     let reference = parse_vault_reference(&record.auth_ref)?;
+    enforce_vault_reference_context(&reference, project_context)?;
     let secret = state
         .store
         .list_vault_secrets(Some(&reference.scope_kind), Some(&reference.scope_id))?
@@ -2480,6 +2599,29 @@ struct ParsedVaultReference {
     name: String,
 }
 
+fn enforce_vault_reference_context(
+    reference: &ParsedVaultReference,
+    project_context: Option<&str>,
+) -> anyhow::Result<()> {
+    if reference.scope_kind != "project" {
+        return Ok(());
+    }
+    let Some(context) = project_context
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        anyhow::bail!(
+            "vault_project_context_missing: project Vault reference requires matching project context"
+        );
+    };
+    if context != reference.scope_id {
+        anyhow::bail!(
+            "vault_project_context_mismatch: project Vault reference does not match current project context"
+        );
+    }
+    Ok(())
+}
+
 fn parse_vault_reference(value: &str) -> anyhow::Result<ParsedVaultReference> {
     let value = value.trim();
     let Some(rest) = value.strip_prefix("vault://") else {
@@ -2497,9 +2639,23 @@ fn parse_vault_reference(value: &str) -> anyhow::Result<ParsedVaultReference> {
                 name,
             })
         }
-        Some("project") => anyhow::bail!(
-            "vault_secret_missing: project Vault references are deferred until Phase 7"
-        ),
+        Some("project") => {
+            let project_id = parts.next().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing_credentials: project Vault reference requires a project id"
+                )
+            })?;
+            let project_id = sanitize_registry_id(project_id, "vault project id")
+                .map_err(|error| anyhow::anyhow!(error.message))?;
+            let name = parts.collect::<Vec<_>>().join("/");
+            let name = sanitize_registry_id(&name, "vault secret name")
+                .map_err(|error| anyhow::anyhow!(error.message))?;
+            Ok(ParsedVaultReference {
+                scope_kind: "project".to_string(),
+                scope_id: project_id,
+                name,
+            })
+        }
         _ => anyhow::bail!("missing_credentials: unsupported Vault reference scope"),
     }
 }
@@ -9365,6 +9521,7 @@ mod tests {
         let policy = upsert_vault_secret_policy(
             State(state.clone()),
             Path("policy-token".to_string()),
+            Query(VaultSecretPolicyScopeQuery { scope_kind: None, scope_id: None }),
             headers.clone(),
             Bytes::from(r#"{"consumer_kind":"mcp","consumer_id":"server-1","permission":"read","approval_mode":"ask"}"#),
         )
@@ -9374,11 +9531,17 @@ mod tests {
         assert_eq!(policy.consumer_kind, "mcp");
         assert_eq!(policy.approval_mode, "ask");
 
-        let listed =
-            list_vault_secret_policies(State(state.clone()), Path("policy-token".to_string()))
-                .await
-                .expect("policies list")
-                .0;
+        let listed = list_vault_secret_policies(
+            State(state.clone()),
+            Path("policy-token".to_string()),
+            Query(VaultSecretPolicyScopeQuery {
+                scope_kind: None,
+                scope_id: None,
+            }),
+        )
+        .await
+        .expect("policies list")
+        .0;
         assert_eq!(listed.policies.len(), 1);
         let serialized = serde_json::to_string(&listed).expect("policy list serializes");
         assert!(!serialized.contains("policy-secret-value"));
@@ -9389,6 +9552,7 @@ mod tests {
         let locked_error = upsert_vault_secret_policy(
             State(state.clone()),
             Path("policy-token".to_string()),
+            Query(VaultSecretPolicyScopeQuery { scope_kind: None, scope_id: None }),
             headers.clone(),
             Bytes::from(r#"{"consumer_kind":"mcp","consumer_id":"server-2","permission":"read","approval_mode":"ask"}"#),
         )
@@ -10017,6 +10181,7 @@ for line in sys.stdin:
                 auth_ref: "vault://workspace/NOPE".to_string(),
                 ..record.clone()
             },
+            None,
         )
         .await
         .expect_err("missing secret blocks");
@@ -10049,6 +10214,7 @@ for line in sys.stdin:
                 id: "mcp.denied".to_string(),
                 ..record.clone()
             },
+            None,
         )
         .await
         .expect_err("policy denied blocks");
@@ -10072,6 +10238,7 @@ for line in sys.stdin:
                 ..record.clone()
             },
             json!({"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}),
+            None,
         )
         .await
         .expect("bearer_env fallback still works");
@@ -10079,6 +10246,298 @@ for line in sys.stdin:
         unsafe {
             env::remove_var("NUCLEUS_TEST_PHASE6_MCP_TOKEN");
         }
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn project_vaults_are_isolated_and_mcp_project_context_is_enforced() {
+        let (state_dir, state) = test_named_app_state("phase7-project-vaults");
+        let workspace = state.store.workspace().expect("workspace loads");
+        let alpha_dir = PathBuf::from(&workspace.root_path).join("alpha");
+        let beta_dir = PathBuf::from(&workspace.root_path).join("beta");
+        fs::create_dir_all(&alpha_dir).expect("alpha project dir creates");
+        fs::create_dir_all(&beta_dir).expect("beta project dir creates");
+        fs::write(alpha_dir.join("README.md"), "alpha").expect("alpha marker writes");
+        fs::write(beta_dir.join("README.md"), "beta").expect("beta marker writes");
+        let workspace = state.store.sync_projects().expect("projects sync");
+        assert!(
+            workspace
+                .projects
+                .iter()
+                .any(|project| project.id == "alpha")
+        );
+        assert!(
+            workspace
+                .projects
+                .iter()
+                .any(|project| project.id == "beta")
+        );
+
+        let url = start_auth_check_mcp_server("phase6-vault-token").await;
+        let mut project_record = vault_http_mcp_record(url.clone());
+        project_record.id = "mcp.project".to_string();
+        project_record.auth_ref = "vault://project/alpha/MCP_TOKEN".to_string();
+        state
+            .store
+            .upsert_mcp_server_record(&project_record, &[], &[])
+            .expect("project mcp record persists");
+        let mut workspace_record = vault_http_mcp_record(url);
+        workspace_record.id = "mcp.workspace".to_string();
+        workspace_record.auth_ref = "vault://workspace/MCP_TOKEN".to_string();
+        state
+            .store
+            .upsert_mcp_server_record(&workspace_record, &[], &[])
+            .expect("workspace mcp record persists");
+
+        {
+            let mut vault = state.vault.lock().await;
+            vault
+                .initialize(&state.store, "correct horse battery staple")
+                .expect("vault initializes");
+            let workspace_secret = vault
+                .create_or_update_secret(
+                    &state.store,
+                    vault::VaultSecretInput {
+                        id: Some("workspace-token".to_string()),
+                        scope_kind: "workspace".to_string(),
+                        scope_id: "workspace".to_string(),
+                        name: "MCP_TOKEN".to_string(),
+                        description: String::new(),
+                        secret: "phase6-vault-token".to_string(),
+                    },
+                )
+                .expect("workspace secret stores");
+            let alpha_secret = vault
+                .create_or_update_secret(
+                    &state.store,
+                    vault::VaultSecretInput {
+                        id: Some("alpha-token".to_string()),
+                        scope_kind: "project".to_string(),
+                        scope_id: "alpha".to_string(),
+                        name: "MCP_TOKEN".to_string(),
+                        description: String::new(),
+                        secret: "phase6-vault-token".to_string(),
+                    },
+                )
+                .expect("alpha secret stores");
+            let beta_secret = vault
+                .create_or_update_secret(
+                    &state.store,
+                    vault::VaultSecretInput {
+                        id: Some("beta-token".to_string()),
+                        scope_kind: "project".to_string(),
+                        scope_id: "beta".to_string(),
+                        name: "MCP_TOKEN".to_string(),
+                        description: String::new(),
+                        secret: "wrong-project-token".to_string(),
+                    },
+                )
+                .expect("beta secret stores");
+            for (id, consumer_id) in [
+                (workspace_secret.id.as_str(), workspace_record.id.as_str()),
+                (alpha_secret.id.as_str(), project_record.id.as_str()),
+            ] {
+                state
+                    .store
+                    .upsert_vault_secret_policy(&VaultSecretPolicyRecord {
+                        id: format!("policy-{id}"),
+                        secret_id: id.to_string(),
+                        consumer_kind: "mcp".to_string(),
+                        consumer_id: consumer_id.to_string(),
+                        permission: "read".to_string(),
+                        approval_mode: "allow".to_string(),
+                        created_at: 0,
+                        updated_at: 0,
+                    })
+                    .expect("allow policy stores");
+            }
+            state
+                .store
+                .upsert_vault_secret_policy(&VaultSecretPolicyRecord {
+                    id: "policy-beta-denied".to_string(),
+                    secret_id: beta_secret.id,
+                    consumer_kind: "mcp".to_string(),
+                    consumer_id: project_record.id.clone(),
+                    permission: "read".to_string(),
+                    approval_mode: "deny".to_string(),
+                    created_at: 0,
+                    updated_at: 0,
+                })
+                .expect("deny policy stores");
+        }
+
+        let workspace_secrets = state
+            .store
+            .list_vault_secrets(Some("workspace"), Some("workspace"))
+            .expect("workspace secrets list");
+        let alpha_secrets = state
+            .store
+            .list_vault_secrets(Some("project"), Some("alpha"))
+            .expect("alpha secrets list");
+        let beta_secrets = state
+            .store
+            .list_vault_secrets(Some("project"), Some("beta"))
+            .expect("beta secrets list");
+        assert_eq!(workspace_secrets.len(), 1);
+        assert_eq!(alpha_secrets.len(), 1);
+        assert_eq!(beta_secrets.len(), 1);
+        assert_ne!(
+            workspace_secrets[0].scope_key_id,
+            alpha_secrets[0].scope_key_id
+        );
+        assert_ne!(alpha_secrets[0].scope_key_id, beta_secrets[0].scope_key_id);
+        assert!(validate_vault_scope(&state, "project", "alpha").is_ok());
+        assert!(validate_vault_scope(&state, "project", "missing-project").is_err());
+        assert!(validate_vault_scope(&state, "workspace", "alpha").is_err());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "origin",
+            axum::http::HeaderValue::from_static("http://localhost:5201"),
+        );
+        let alpha_scope = VaultSecretPolicyScopeQuery {
+            scope_kind: Some("project".to_string()),
+            scope_id: Some("alpha".to_string()),
+        };
+        let beta_scope = VaultSecretPolicyScopeQuery {
+            scope_kind: Some("project".to_string()),
+            scope_id: Some("beta".to_string()),
+        };
+        let missing_policy_context = list_vault_secret_policies(
+            State(state.clone()),
+            Path("alpha-token".to_string()),
+            Query(VaultSecretPolicyScopeQuery {
+                scope_kind: None,
+                scope_id: None,
+            }),
+        )
+        .await
+        .expect_err("missing project policy context fails closed");
+        assert_eq!(missing_policy_context.status, StatusCode::FORBIDDEN);
+        assert!(
+            missing_policy_context
+                .message
+                .contains("vault_project_context_missing")
+        );
+        let wrong_policy_context = list_vault_secret_policies(
+            State(state.clone()),
+            Path("alpha-token".to_string()),
+            Query(beta_scope),
+        )
+        .await
+        .expect_err("wrong project policy context fails closed");
+        assert_eq!(wrong_policy_context.status, StatusCode::FORBIDDEN);
+        assert!(
+            wrong_policy_context
+                .message
+                .contains("vault_project_context_mismatch")
+        );
+        let endpoint_policy = upsert_vault_secret_policy(
+            State(state.clone()),
+            Path("alpha-token".to_string()),
+            Query(VaultSecretPolicyScopeQuery {
+                scope_kind: alpha_scope.scope_kind.clone(),
+                scope_id: alpha_scope.scope_id.clone(),
+            }),
+            headers.clone(),
+            Bytes::from(r#"{"id":"policy-alpha-endpoint","consumer_kind":"mcp","consumer_id":"mcp.project.extra","permission":"read","approval_mode":"allow"}"#),
+        )
+        .await
+        .expect("matching project policy context allows upsert")
+        .0;
+        assert_eq!(endpoint_policy.consumer_id, "mcp.project.extra");
+        let listed_project_policies = list_vault_secret_policies(
+            State(state.clone()),
+            Path("alpha-token".to_string()),
+            Query(VaultSecretPolicyScopeQuery {
+                scope_kind: alpha_scope.scope_kind.clone(),
+                scope_id: alpha_scope.scope_id.clone(),
+            }),
+        )
+        .await
+        .expect("matching project policy context allows list")
+        .0;
+        assert!(
+            listed_project_policies
+                .policies
+                .iter()
+                .any(|policy| policy.id == endpoint_policy.id)
+        );
+        let wrong_delete = delete_vault_secret_policy(
+            State(state.clone()),
+            Path(("alpha-token".to_string(), endpoint_policy.id.clone())),
+            Query(VaultSecretPolicyScopeQuery {
+                scope_kind: Some("project".to_string()),
+                scope_id: Some("beta".to_string()),
+            }),
+            headers.clone(),
+        )
+        .await
+        .expect_err("wrong project policy context blocks delete");
+        assert_eq!(wrong_delete.status, StatusCode::FORBIDDEN);
+        let deleted = delete_vault_secret_policy(
+            State(state.clone()),
+            Path(("alpha-token".to_string(), endpoint_policy.id.clone())),
+            Query(alpha_scope),
+            headers.clone(),
+        )
+        .await
+        .expect("matching project policy context allows delete");
+        assert_eq!(deleted, StatusCode::NO_CONTENT);
+
+        let project_token = resolve_mcp_vault_bearer_token(&state, &project_record, Some("alpha"))
+            .await
+            .expect("matching project context resolves");
+        assert_eq!(project_token, "phase6-vault-token");
+        let missing_context = resolve_mcp_vault_bearer_token(&state, &project_record, None)
+            .await
+            .expect_err("missing project context fails closed");
+        assert!(
+            missing_context
+                .to_string()
+                .contains("vault_project_context_missing")
+        );
+        let wrong_context = resolve_mcp_vault_bearer_token(&state, &project_record, Some("beta"))
+            .await
+            .expect_err("wrong project context fails closed");
+        assert!(
+            wrong_context
+                .to_string()
+                .contains("vault_project_context_mismatch")
+        );
+
+        let workspace_result = mcp_http_request(
+            &state,
+            &workspace_record,
+            json!({"jsonrpc":"2.0","id":7,"method":"tools/list","params":{}}),
+            None,
+        )
+        .await
+        .expect("workspace vault reference still works");
+        assert_eq!(workspace_result["tools"][0]["name"], "lookup");
+
+        state.vault.lock().await.lock();
+        let locked = resolve_mcp_vault_bearer_token(&state, &project_record, Some("alpha"))
+            .await
+            .expect_err("locked project vault fails closed");
+        assert!(locked.to_string().contains("vault_locked"));
+
+        let audit = state.store.list_audit_events(50).expect("audit lists");
+        let audit_serialized = serde_json::to_string(&audit).expect("audit serializes");
+        assert!(!audit_serialized.contains("phase6-vault-token"));
+        let records = state.store.list_mcp_server_records().expect("records load");
+        let records_serialized = serde_json::to_string(&records).expect("records serialize");
+        assert!(!records_serialized.contains("phase6-vault-token"));
+        let summaries = serde_json::to_string(
+            &workspace_secrets
+                .iter()
+                .cloned()
+                .map(vault_secret_summary)
+                .collect::<Vec<_>>(),
+        )
+        .expect("secrets serialize");
+        assert!(!summaries.contains("phase6-vault-token"));
+
         let _ = fs::remove_dir_all(&state_dir);
     }
 

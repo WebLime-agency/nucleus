@@ -676,8 +676,14 @@ export async function lockVault(fetchImpl: FetchLike = fetch) {
   return parseJson(await daemonFetch(fetchImpl, '/api/vault/lock', { method: 'POST', headers: { accept: 'application/json' } }), vaultStatusSummarySchema);
 }
 
-export async function fetchVaultSecrets(fetchImpl: FetchLike = fetch) {
-  return parseJson(await daemonFetch(fetchImpl, '/api/vault/secrets?scope_kind=workspace&scope_id=workspace', { headers: { accept: 'application/json' } }), vaultSecretListResponseSchema);
+export async function fetchVaultSecrets(
+  scope: { scope_kind?: string; scope_id?: string } = { scope_kind: 'workspace', scope_id: 'workspace' },
+  fetchImpl: FetchLike = fetch
+) {
+  const scopeKind = scope.scope_kind ?? 'workspace';
+  const scopeId = scope.scope_id ?? 'workspace';
+  const query = new URLSearchParams({ scope_kind: scopeKind, scope_id: scopeId });
+  return parseJson(await daemonFetch(fetchImpl, `/api/vault/secrets?${query.toString()}`, { headers: { accept: 'application/json' } }), vaultSecretListResponseSchema);
 }
 
 export async function createVaultSecret(input: z.input<typeof vaultSecretUpsertRequestSchema>, fetchImpl: FetchLike = fetch) {
@@ -694,17 +700,22 @@ export async function deleteVaultSecret(secretId: string, fetchImpl: FetchLike =
   await daemonFetch(fetchImpl, `/api/vault/secrets/${encodeURIComponent(secretId)}`, { method: 'DELETE', headers: { accept: 'application/json' } });
 }
 
-export async function fetchVaultSecretPolicies(secretId: string, fetchImpl: FetchLike = fetch) {
-  return parseJson(await daemonFetch(fetchImpl, `/api/vault/secrets/${encodeURIComponent(secretId)}/policies`, { headers: { accept: 'application/json' } }), vaultSecretPolicyListResponseSchema);
+function vaultScopeQuery(scope?: { scope_kind?: string; scope_id?: string }) {
+  if (!scope?.scope_kind || !scope?.scope_id) return '';
+  return `?${new URLSearchParams({ scope_kind: scope.scope_kind, scope_id: scope.scope_id }).toString()}`;
 }
 
-export async function upsertVaultSecretPolicy(secretId: string, input: z.input<typeof vaultSecretPolicyUpsertRequestSchema>, fetchImpl: FetchLike = fetch) {
+export async function fetchVaultSecretPolicies(secretId: string, scope?: { scope_kind?: string; scope_id?: string }, fetchImpl: FetchLike = fetch) {
+  return parseJson(await daemonFetch(fetchImpl, `/api/vault/secrets/${encodeURIComponent(secretId)}/policies${vaultScopeQuery(scope)}`, { headers: { accept: 'application/json' } }), vaultSecretPolicyListResponseSchema);
+}
+
+export async function upsertVaultSecretPolicy(secretId: string, input: z.input<typeof vaultSecretPolicyUpsertRequestSchema>, scope?: { scope_kind?: string; scope_id?: string }, fetchImpl: FetchLike = fetch) {
   const payload = vaultSecretPolicyUpsertRequestSchema.parse(input);
-  return parseJson(await daemonFetch(fetchImpl, `/api/vault/secrets/${encodeURIComponent(secretId)}/policies`, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify(payload) }), vaultSecretPolicySummarySchema);
+  return parseJson(await daemonFetch(fetchImpl, `/api/vault/secrets/${encodeURIComponent(secretId)}/policies${vaultScopeQuery(scope)}`, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify(payload) }), vaultSecretPolicySummarySchema);
 }
 
-export async function deleteVaultSecretPolicy(secretId: string, policyId: string, fetchImpl: FetchLike = fetch) {
-  await daemonFetch(fetchImpl, `/api/vault/secrets/${encodeURIComponent(secretId)}/policies/${encodeURIComponent(policyId)}`, { method: 'DELETE', headers: { accept: 'application/json' } });
+export async function deleteVaultSecretPolicy(secretId: string, policyId: string, scope?: { scope_kind?: string; scope_id?: string }, fetchImpl: FetchLike = fetch) {
+  await daemonFetch(fetchImpl, `/api/vault/secrets/${encodeURIComponent(secretId)}/policies/${encodeURIComponent(policyId)}${vaultScopeQuery(scope)}`, { method: 'DELETE', headers: { accept: 'application/json' } });
 }
 
 export async function fetchActions(fetchImpl: FetchLike = fetch) {

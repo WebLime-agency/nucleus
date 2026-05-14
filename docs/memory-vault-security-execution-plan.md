@@ -55,7 +55,7 @@ Source plans:
 | 4 | Memory | Candidates + explicit/automatic capture loop | completed | Phase 1, Phase 2 | PR #141 merged into `dev` at `c3e0f60ce23b9878a0d331cc1a6cc6d67c56e5b4`; not released. |
 | 5 | Vault | Workspace Vault UI + policy model | completed | Phase 3 | PR #143 merged into `dev` at `0fbe03ee9e331c69eb896348cefdc373ba521511`; not released. |
 | 6 | Vault/MCP | MCP `vault_bearer` integration | completed | Phase 3, Phase 5 | PR #145 merged into `dev` at `30478a9c4424d511b7a1298536053e26e5c22595`; not released. |
-| 7 | Vault | Project Vaults | not_started | Phase 5 |  |
+| 7 | Vault | Project Vaults | in_progress | Phase 5 | Local Phase 7 work on `feat/project-vaults`; not merged or released. |
 | 8 | Memory | SQLite FTS5 searchable memory provider | not_started | Phase 4 |  |
 | 9 | Security | Built-in/guided HTTPS and bind-mode hardening | not_started | Phase 1 |  |
 | 10 | Release | Stable managed release and EBA verification | not_started | Phases required by release scope |  |
@@ -443,7 +443,7 @@ Completion notes:
 
 ## Phase 7 — Project Vaults
 
-Status: `not_started`
+Status: `in_progress`
 
 Source docs:
 
@@ -474,7 +474,12 @@ Exit criteria:
 
 Completion notes:
 
-- Pending.
+- Local work in progress on `feat/project-vaults`.
+- Added daemon-enforced project Vault scope validation for list/create/update flows and project-scoped policy list/upsert/delete operations while preserving workspace scope behavior.
+- Added project-scoped Vault reference parsing for `vault://project/<project_id>/...` with matching project-context enforcement for MCP `vault_bearer` resolution.
+- Added project isolation coverage for distinct workspace/project scope keys, cross-project context failures, locked Vault failures, metadata-only API/audit surfaces, and workspace Vault regression behavior.
+- Updated Workspace Vault UI to switch between Workspace and Project scopes, manage project-scoped secrets/policies, and copy `vault://project/<project_id>/...` references without revealing values.
+- Phase 8+ remain `not_started`; FTS/search, semantic memory, promotion, release, and managed install work have not started.
 
 ## Phase 8 — SQLite FTS5 searchable memory provider
 
@@ -649,7 +654,7 @@ When asked to work on this plan:
 
 - Operator/manager sessions should review executor reports, maintain gates, and provide prompts/checklists. They should not directly patch, commit, push, merge, promote, or release unless explicitly asked.
 - Keep implementation, cleanup, PR/release, and verification work in separate focused sessions/worktrees.
-- Phase 3 is merged/completed via PR #137. Phase 4 is merged/completed via PR #141. Phase 5 is merged/completed via PR #143. Phase 6 is merged/completed via PR #145. Phase 7 and later remain `not_started`.
+- Phase 3 is merged/completed via PR #137. Phase 4 is merged/completed via PR #141. Phase 5 is merged/completed via PR #143. Phase 6 is merged/completed via PR #145. Phase 7 is `in_progress`; Phase 8 and later remain `not_started`.
 - Main worktree cleanup was completed after Phase 2. The stale dirty branch was cleaned back to current dev. Future implementation work should still prefer fresh clean worktrees.
 - A Node/toolchain runtime-resolution experiment was preserved separately and should be reviewed later as its own focused PR. It must not be mixed into Memory/Vault/Security phase work.
 - Memory UI currently treats edited entries mostly as manual/user entries. After candidate capture and explicit remember flows exist, revisit preserving richer source metadata during edits.
