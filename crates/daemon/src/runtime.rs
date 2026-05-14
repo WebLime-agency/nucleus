@@ -210,6 +210,10 @@ pub(crate) fn compiled_turn_from_prompt(
         },
         debug_summary: CompiledTurnDebugSummary {
             include_count: 0,
+            memory_count: 0,
+            memory_included_count: 0,
+            memory_skipped_count: 0,
+            memory_truncated_count: 0,
             skill_count: skill_layers.len(),
             mcp_server_count: mcp_catalog.len(),
             tool_count: tool_catalog.len(),

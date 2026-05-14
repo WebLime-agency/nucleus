@@ -840,6 +840,16 @@ export const memoryEntrySchema = z.object({
   content: z.string(),
   tags: z.array(z.string()),
   enabled: z.boolean(),
+  status: z.string().default('accepted'),
+  memory_kind: z.string().default('note'),
+  source_kind: z.string().default('manual'),
+  source_id: z.string().default(''),
+  confidence: z.number().default(1),
+  created_by: z.string().default('user'),
+  last_used_at: z.number().int().nullable().optional(),
+  use_count: z.number().int().default(0),
+  supersedes_id: z.string().default(''),
+  metadata_json: z.unknown().default({}),
   created_at: z.number().int(),
   updated_at: z.number().int()
 });
@@ -851,7 +861,17 @@ export const memoryEntryUpsertRequestSchema = z.object({
   title: z.string(),
   content: z.string(),
   tags: z.array(z.string()).default([]),
-  enabled: z.boolean().optional()
+  enabled: z.boolean().optional(),
+  status: z.string().optional(),
+  memory_kind: z.string().optional(),
+  source_kind: z.string().optional(),
+  source_id: z.string().optional(),
+  confidence: z.number().optional(),
+  created_by: z.string().optional(),
+  last_used_at: z.number().int().nullable().optional(),
+  use_count: z.number().int().optional(),
+  supersedes_id: z.string().optional(),
+  metadata_json: z.unknown().optional()
 });
 
 export const memorySummarySchema = z.object({

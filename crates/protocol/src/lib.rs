@@ -525,6 +525,14 @@ pub struct CompiledTurnCapabilities {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompiledTurnDebugSummary {
     pub include_count: usize,
+    #[serde(default)]
+    pub memory_count: usize,
+    #[serde(default)]
+    pub memory_included_count: usize,
+    #[serde(default)]
+    pub memory_skipped_count: usize,
+    #[serde(default)]
+    pub memory_truncated_count: usize,
     pub skill_count: usize,
     pub mcp_server_count: usize,
     pub tool_count: usize,
@@ -649,7 +657,7 @@ pub struct McpToolRecord {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MemoryEntry {
     pub id: String,
     pub scope_kind: String,
@@ -659,11 +667,31 @@ pub struct MemoryEntry {
     #[serde(default)]
     pub tags: Vec<String>,
     pub enabled: bool,
+    #[serde(default = "default_memory_status")]
+    pub status: String,
+    #[serde(default = "default_memory_kind")]
+    pub memory_kind: String,
+    #[serde(default = "default_memory_source_kind")]
+    pub source_kind: String,
+    #[serde(default)]
+    pub source_id: String,
+    #[serde(default = "default_memory_confidence")]
+    pub confidence: f64,
+    #[serde(default = "default_memory_created_by")]
+    pub created_by: String,
+    #[serde(default)]
+    pub last_used_at: Option<i64>,
+    #[serde(default)]
+    pub use_count: i64,
+    #[serde(default)]
+    pub supersedes_id: String,
+    #[serde(default)]
+    pub metadata_json: Value,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MemoryEntryUpsertRequest {
     pub id: Option<String>,
     pub scope_kind: String,
@@ -673,9 +701,45 @@ pub struct MemoryEntryUpsertRequest {
     #[serde(default)]
     pub tags: Vec<String>,
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub memory_kind: Option<String>,
+    #[serde(default)]
+    pub source_kind: Option<String>,
+    #[serde(default)]
+    pub source_id: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    #[serde(default)]
+    pub last_used_at: Option<i64>,
+    #[serde(default)]
+    pub use_count: Option<i64>,
+    #[serde(default)]
+    pub supersedes_id: Option<String>,
+    #[serde(default)]
+    pub metadata_json: Option<Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+fn default_memory_status() -> String {
+    "accepted".to_string()
+}
+fn default_memory_kind() -> String {
+    "note".to_string()
+}
+fn default_memory_source_kind() -> String {
+    "manual".to_string()
+}
+fn default_memory_created_by() -> String {
+    "user".to_string()
+}
+fn default_memory_confidence() -> f64 {
+    1.0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MemorySummary {
     #[serde(default)]
     pub entries: Vec<MemoryEntry>,

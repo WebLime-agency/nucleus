@@ -955,9 +955,9 @@ impl StateStore {
         connection.execute(
             "
             INSERT INTO memory_entries (
-                id, scope_kind, scope_id, title, content, tags_json, enabled, created_at, updated_at
+                id, scope_kind, scope_id, title, content, tags_json, enabled, status, memory_kind, source_kind, source_id, confidence, created_by, last_used_at, use_count, supersedes_id, metadata_json, created_at, updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
             ON CONFLICT(id) DO UPDATE SET
                 scope_kind = excluded.scope_kind,
                 scope_id = excluded.scope_id,
@@ -965,6 +965,16 @@ impl StateStore {
                 content = excluded.content,
                 tags_json = excluded.tags_json,
                 enabled = excluded.enabled,
+                status = excluded.status,
+                memory_kind = excluded.memory_kind,
+                source_kind = excluded.source_kind,
+                source_id = excluded.source_id,
+                confidence = excluded.confidence,
+                created_by = excluded.created_by,
+                last_used_at = excluded.last_used_at,
+                use_count = excluded.use_count,
+                supersedes_id = excluded.supersedes_id,
+                metadata_json = excluded.metadata_json,
                 updated_at = excluded.updated_at
             ",
             params![
@@ -975,6 +985,16 @@ impl StateStore {
                 entry.content,
                 serde_json::to_string(&entry.tags)?,
                 entry.enabled as i64,
+                entry.status,
+                entry.memory_kind,
+                entry.source_kind,
+                entry.source_id,
+                entry.confidence,
+                entry.created_by,
+                entry.last_used_at,
+                entry.use_count,
+                entry.supersedes_id,
+                serde_json::to_string(&entry.metadata_json)?,
                 entry.created_at,
                 entry.updated_at,
             ],
@@ -2522,6 +2542,16 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             content TEXT NOT NULL,
             tags_json TEXT NOT NULL DEFAULT '[]',
             enabled INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'accepted',
+            memory_kind TEXT NOT NULL DEFAULT 'note',
+            source_kind TEXT NOT NULL DEFAULT 'manual',
+            source_id TEXT NOT NULL DEFAULT '',
+            confidence REAL NOT NULL DEFAULT 1.0,
+            created_by TEXT NOT NULL DEFAULT 'user',
+            last_used_at INTEGER,
+            use_count INTEGER NOT NULL DEFAULT 0,
+            supersedes_id TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
@@ -2757,6 +2787,33 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "skill_manifests",
         "instructions",
         "TEXT NOT NULL DEFAULT ''",
+    )?;
+    for (column, definition) in [
+        ("status", "TEXT NOT NULL DEFAULT 'accepted'"),
+        ("memory_kind", "TEXT NOT NULL DEFAULT 'note'"),
+        ("source_kind", "TEXT NOT NULL DEFAULT 'manual'"),
+        ("source_id", "TEXT NOT NULL DEFAULT ''"),
+        ("confidence", "REAL NOT NULL DEFAULT 1.0"),
+        ("created_by", "TEXT NOT NULL DEFAULT 'user'"),
+        ("last_used_at", "INTEGER"),
+        ("use_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("supersedes_id", "TEXT NOT NULL DEFAULT ''"),
+        ("metadata_json", "TEXT NOT NULL DEFAULT '{}'"),
+    ] {
+        ensure_column(connection, "memory_entries", column, definition)?;
+    }
+
+    connection.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_memory_entries_context
+            ON memory_entries(scope_kind, scope_id, enabled, status);
+        CREATE INDEX IF NOT EXISTS idx_memory_entries_kind
+            ON memory_entries(memory_kind);
+        CREATE INDEX IF NOT EXISTS idx_memory_entries_source
+            ON memory_entries(source_kind, source_id);
+        CREATE INDEX IF NOT EXISTS idx_memory_entries_last_used
+            ON memory_entries(last_used_at);
+        ",
     )?;
 
     ensure_column(
@@ -4882,7 +4939,7 @@ fn list_memory_entries_with_connection(connection: &Connection) -> Result<Vec<Me
 
 fn load_memory_entry(connection: &Connection, id: &str) -> Result<MemoryEntry> {
     connection.query_row(
-        "SELECT id, scope_kind, scope_id, title, content, tags_json, enabled, created_at, updated_at FROM memory_entries WHERE id = ?1",
+        "SELECT id, scope_kind, scope_id, title, content, tags_json, enabled, status, memory_kind, source_kind, source_id, confidence, created_by, last_used_at, use_count, supersedes_id, metadata_json, created_at, updated_at FROM memory_entries WHERE id = ?1",
         params![id],
         map_memory_entry,
     ).optional()?.ok_or_else(|| anyhow!("memory entry {id} was not found"))
@@ -4903,8 +4960,18 @@ fn map_memory_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
             )
         })?,
         enabled: row.get::<_, i64>(6)? != 0,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
+        status: row.get(7)?,
+        memory_kind: row.get(8)?,
+        source_kind: row.get(9)?,
+        source_id: row.get(10)?,
+        confidence: row.get(11)?,
+        created_by: row.get(12)?,
+        last_used_at: row.get(13)?,
+        use_count: row.get(14)?,
+        supersedes_id: row.get(15)?,
+        metadata_json: decode_json_value(row.get(16)?)?,
+        created_at: row.get(17)?,
+        updated_at: row.get(18)?,
     })
 }
 
