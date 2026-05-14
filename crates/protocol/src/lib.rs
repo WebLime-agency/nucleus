@@ -1461,6 +1461,14 @@ pub struct LocalInterfaceSummary {
 pub struct SecurityPostureSummary {
     pub configured_bind: String,
     pub exposure: String,
+    #[serde(default)]
+    pub bind_mode: String,
+    #[serde(default)]
+    pub bind_mode_label: String,
+    #[serde(default)]
+    pub recommended_bind: Option<String>,
+    #[serde(default)]
+    pub vault_origin_requirement: String,
     pub https_active: bool,
     pub current_origin: Option<String>,
     pub current_origin_vault_safe: bool,
