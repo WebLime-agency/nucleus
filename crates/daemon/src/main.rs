@@ -983,6 +983,10 @@ async fn update_vault_secret(
     let secret = payload
         .secret
         .ok_or_else(|| ApiError::bad_request("vault secret value is required for update"))?;
+    let scope_id = match payload.scope_id {
+        Some(scope_id) => non_empty_trimmed(scope_id, "vault scope id")?,
+        None => existing.scope_id,
+    };
     let input = vault::VaultSecretInput {
         id: Some(secret_id),
         scope_kind: normalize_vault_scope_kind(
@@ -991,11 +995,7 @@ async fn update_vault_secret(
                 .as_deref()
                 .unwrap_or(&existing.scope_kind),
         )?,
-        scope_id: payload
-            .scope_id
-            .unwrap_or(existing.scope_id)
-            .trim()
-            .to_string(),
+        scope_id,
         name: sanitize_vault_secret_name(payload.name.as_deref().unwrap_or(&existing.name))?,
         description: payload
             .description
@@ -1026,6 +1026,9 @@ async fn delete_vault_secret(
 ) -> Result<StatusCode, ApiError> {
     require_vault_safe_origin(&headers)?;
     let secret_id = sanitize_registry_id(&secret_id, "vault secret id")?;
+    if !state.vault.lock().await.is_unlocked() {
+        return Err(ApiError::forbidden("vault is locked"));
+    }
     state.store.delete_vault_secret(&secret_id)?;
     record_vault_audit(
         &state,
@@ -1061,7 +1064,7 @@ fn validate_vault_secret_create(
         scope_id: non_empty_trimmed(payload.scope_id, "vault scope id")?,
         name: sanitize_vault_secret_name(&payload.name)?,
         description: payload.description.trim().to_string(),
-        secret: non_empty_trimmed(payload.secret, "vault secret value")?,
+        secret: non_empty_secret(payload.secret, "vault secret value")?,
     })
 }
 
@@ -1081,6 +1084,14 @@ fn sanitize_vault_secret_name(value: &str) -> Result<String, ApiError> {
 fn non_empty_trimmed(value: String, label: &str) -> Result<String, ApiError> {
     let value = value.trim().to_string();
     if value.is_empty() {
+        Err(ApiError::bad_request(format!("{label} is required")))
+    } else {
+        Ok(value)
+    }
+}
+
+fn non_empty_secret(value: String, label: &str) -> Result<String, ApiError> {
+    if value.trim().is_empty() {
         Err(ApiError::bad_request(format!("{label} is required")))
     } else {
         Ok(value)
@@ -8227,13 +8238,25 @@ mod tests {
         let created = create_vault_secret(
             State(state.clone()),
             headers,
-            Bytes::from(r#"{"id":"status-token","scope_kind":"workspace","scope_id":"workspace","name":"STATUS_TOKEN","secret":"status-secret-value"}"#),
+            Bytes::from(
+                "{\"id\":\"status-token\",\"scope_kind\":\"workspace\",\"scope_id\":\"workspace\",\"name\":\"STATUS_TOKEN\",\"secret\":\"  status-secret-value\\n\"}",
+            ),
         )
         .await
         .expect("secret create succeeds")
         .0;
         let created_serialized = serde_json::to_string(&created).expect("summary serializes");
         assert!(!created_serialized.contains("status-secret-value"));
+        let raw = state
+            .store
+            .load_vault_secret("status-token")
+            .expect("secret should load");
+        let decrypted = {
+            let mut vault = state.vault.lock().await;
+            vault::decrypt_secret_for_test(&mut vault, &state.store, &raw)
+                .expect("secret decrypts while unlocked")
+        };
+        assert_eq!(decrypted, "  status-secret-value\n");
 
         let listed = list_vault_secrets(
             State(state.clone()),
@@ -8300,6 +8323,16 @@ mod tests {
         .await
         .expect_err("unsafe origin should fail");
         assert_eq!(unsafe_error.status, StatusCode::FORBIDDEN);
+
+        let blank_scope_error = update_vault_secret(
+            State(state.clone()),
+            Path("update-token".to_string()),
+            safe_headers.clone(),
+            Bytes::from(r#"{"scope_id":"   ","secret":"blank-scope-secret-value"}"#),
+        )
+        .await
+        .expect_err("blank scope id should fail");
+        assert_eq!(blank_scope_error.status, StatusCode::BAD_REQUEST);
 
         let _ = vault_lock(State(state.clone()))
             .await
@@ -8381,6 +8414,27 @@ mod tests {
         .expect_err("unsafe origin should fail");
         assert_eq!(unsafe_error.status, StatusCode::FORBIDDEN);
         assert!(state.store.load_vault_secret("delete-token").is_ok());
+
+        let _ = vault_lock(State(state.clone()))
+            .await
+            .expect("lock succeeds");
+        let locked_error = delete_vault_secret(
+            State(state.clone()),
+            Path("delete-token".to_string()),
+            safe_headers.clone(),
+        )
+        .await
+        .expect_err("locked vault should block delete");
+        assert_eq!(locked_error.status, StatusCode::FORBIDDEN);
+        assert!(state.store.load_vault_secret("delete-token").is_ok());
+
+        let _ = vault_unlock(
+            State(state.clone()),
+            safe_headers.clone(),
+            Bytes::from(r#"{"passphrase":"correct horse battery staple"}"#),
+        )
+        .await
+        .expect("unlock succeeds");
 
         let status = delete_vault_secret(
             State(state.clone()),
