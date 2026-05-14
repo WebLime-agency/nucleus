@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { AlertTriangle, Brain, Pencil, Plus, RefreshCw, Trash2 } from 'lucide-svelte';
+  import { AlertTriangle, Brain, Check, Pencil, Plus, RefreshCw, Trash2, X } from 'lucide-svelte';
 
   import { WorkspacePageHeader } from '$lib/components/app/workspace';
   import { Badge } from '$lib/components/ui/badge';
@@ -11,10 +11,11 @@
   import { Label } from '$lib/components/ui/label';
   import { Select } from '$lib/components/ui/select';
   import { Textarea } from '$lib/components/ui/textarea';
-  import { fetchMemory, upsertMemory, deleteMemory } from '$lib/nucleus/client';
-  import type { MemoryEntry, MemoryEntryUpsertRequest } from '$lib/nucleus/schemas';
+  import { acceptMemoryCandidate, deleteMemoryCandidate, fetchMemory, fetchMemoryCandidates, rejectMemoryCandidate, upsertMemory, deleteMemory } from '$lib/nucleus/client';
+  import type { MemoryCandidate, MemoryEntry, MemoryEntryUpsertRequest } from '$lib/nucleus/schemas';
 
   let entries = $state<MemoryEntry[]>([]);
+  let candidates = $state<MemoryCandidate[]>([]);
   let loading = $state(true);
   let saving = $state(false);
   let error = $state<string | null>(null);
@@ -31,12 +32,14 @@
   });
 
   let acceptedEntries = $derived(entries.filter((entry) => entry.status === 'accepted'));
+  let pendingCandidates = $derived(candidates.filter((candidate) => candidate.status === 'pending'));
 
   async function loadMemory() {
     loading = true;
     try {
-      const summary = await fetchMemory();
+      const [summary, candidateSummary] = await Promise.all([fetchMemory(), fetchMemoryCandidates('pending')]);
       entries = summary.entries;
+      candidates = candidateSummary.candidates;
       error = null;
     } catch (cause) {
       error = cause instanceof Error ? cause.message : 'Failed to load memory entries.';
@@ -120,6 +123,51 @@
     }
   }
 
+
+  async function acceptCandidate(candidate: MemoryCandidate) {
+    try {
+      await acceptMemoryCandidate(candidate.id);
+      await loadMemory();
+      error = null;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to accept memory candidate.';
+    }
+  }
+
+  function editCandidate(candidate: MemoryCandidate) {
+    editingId = null;
+    form = {
+      title: candidate.title,
+      content: candidate.content,
+      scope_kind: candidate.scope_kind,
+      scope_id: candidate.scope_id,
+      memory_kind: candidate.candidate_kind,
+      status: 'accepted',
+      tags: candidate.tags.join(', '),
+      enabled: true
+    };
+  }
+
+  async function rejectCandidate(candidate: MemoryCandidate) {
+    try {
+      await rejectMemoryCandidate(candidate.id);
+      await loadMemory();
+      error = null;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to reject memory candidate.';
+    }
+  }
+
+  async function dismissCandidate(candidate: MemoryCandidate) {
+    try {
+      await deleteMemoryCandidate(candidate.id);
+      await loadMemory();
+      error = null;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to dismiss memory candidate.';
+    }
+  }
+
   function formatTime(value?: number | null) {
     if (!value) return 'Never';
     return new Date(value * 1000).toLocaleString();
@@ -143,6 +191,47 @@
       <div><strong>Memory is prompt-visible context.</strong> Do not store secrets, API keys, passwords, private keys, cookies, or bearer tokens here. Use Vault for credentials and secret material.</div>
     </CardContent>
   </Card>
+
+  <section class="space-y-4">
+    <div class="flex items-center justify-between">
+      <h2 class="text-lg font-semibold text-zinc-100">Memory candidates ({pendingCandidates.length})</h2>
+      <Badge variant="outline">review-only; not prompt-visible</Badge>
+    </div>
+    {#if pendingCandidates.length === 0}
+      <Card><CardContent class="py-6 text-sm text-zinc-400">No pending candidates. Automatic extraction only proposes review items and never auto-accepts memory.</CardContent></Card>
+    {:else}
+      <div class="grid gap-3">
+        {#each pendingCandidates as candidate (candidate.id)}
+          <Card>
+            <CardHeader>
+              <div class="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <CardTitle class="flex items-center gap-2"><Brain class="size-4 text-zinc-400" />{candidate.title}</CardTitle>
+                  <CardDescription class="mt-2 flex flex-wrap gap-2">
+                    <Badge variant="outline">{candidate.scope_kind}/{candidate.scope_id}</Badge>
+                    <Badge variant="secondary">{candidate.candidate_kind}</Badge>
+                    <Badge variant="outline">confidence {Math.round(candidate.confidence * 100)}%</Badge>
+                  </CardDescription>
+                </div>
+                <div class="flex flex-wrap gap-2">
+                  <Button variant="outline" size="sm" onclick={() => void acceptCandidate(candidate)}><Check class="mr-2 size-4" />Accept</Button>
+                  <Button variant="outline" size="sm" onclick={() => editCandidate(candidate)}><Pencil class="mr-2 size-4" />Edit & accept</Button>
+                  <Button variant="outline" size="sm" onclick={() => void rejectCandidate(candidate)}><X class="mr-2 size-4" />Reject</Button>
+                  <Button variant="destructive" size="sm" onclick={() => void dismissCandidate(candidate)}><Trash2 class="mr-2 size-4" />Dismiss</Button>
+                </div>
+              </div>
+            </CardHeader>
+            <CardContent class="space-y-3 text-sm text-zinc-300">
+              <p class="whitespace-pre-wrap leading-6">{candidate.content}</p>
+              {#if candidate.reason}<p class="text-zinc-400"><strong>Reason:</strong> {candidate.reason}</p>{/if}
+              {#if candidate.evidence.length}<p class="text-zinc-400"><strong>Evidence:</strong> {candidate.evidence.join(' · ')}</p>{/if}
+              <p class="text-xs text-zinc-500">Created {formatTime(candidate.created_at)} · {candidate.session_id ? `session ${candidate.session_id}` : 'no session scope'}</p>
+            </CardContent>
+          </Card>
+        {/each}
+      </div>
+    {/if}
+  </section>
 
   <section class="grid gap-4 lg:grid-cols-[minmax(0,1fr)_24rem]">
     <div class="space-y-4">
