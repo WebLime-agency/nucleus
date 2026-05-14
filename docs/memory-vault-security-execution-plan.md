@@ -54,7 +54,7 @@ Source plans:
 | 3 | Vault | Passphrase-protected local Vault backend | completed | Phase 1 | PR #137 merged into `dev` at `724eb2115e02d2d660de41ee890724ebac85fab6`; UI/MCP remain deferred. |
 | 4 | Memory | Candidates + explicit/automatic capture loop | completed | Phase 1, Phase 2 | PR #141 merged into `dev` at `c3e0f60ce23b9878a0d331cc1a6cc6d67c56e5b4`; not released. |
 | 5 | Vault | Workspace Vault UI + policy model | completed | Phase 3 | PR #143 merged into `dev` at `0fbe03ee9e331c69eb896348cefdc373ba521511`; not released. |
-| 6 | Vault/MCP | MCP `vault_bearer` integration | in_progress | Phase 3, Phase 5 | Local work on `feat/mcp-vault-bearer`; not merged or released. |
+| 6 | Vault/MCP | MCP `vault_bearer` integration | completed | Phase 3, Phase 5 | PR #145 merged into `dev` at `30478a9c4424d511b7a1298536053e26e5c22595`; not released. |
 | 7 | Vault | Project Vaults | not_started | Phase 5 |  |
 | 8 | Memory | SQLite FTS5 searchable memory provider | not_started | Phase 4 |  |
 | 9 | Security | Built-in/guided HTTPS and bind-mode hardening | not_started | Phase 1 |  |
@@ -386,7 +386,7 @@ Completion notes:
 
 ## Phase 6 — MCP `vault_bearer` integration
 
-Status: `in_progress`
+Status: `completed`
 
 Source docs:
 
@@ -425,10 +425,20 @@ Exit criteria:
 - MCP check/discovery uses daemon-side Vault resolution.
 - Env vars are no longer the primary product path.
 
-Progress notes:
+Completion notes:
 
-- Phase 6 implementation started on `feat/mcp-vault-bearer`.
-- Current scope is MCP `vault_bearer` auth with daemon-side Workspace Vault reference resolution, policy enforcement, safe failure states, and UI guidance.
+- PR #145 merged into `dev` at `30478a9c4424d511b7a1298536053e26e5c22595`; Phase 6 is completed but not released.
+- Added MCP `vault_bearer` auth mode for remote MCP discovery and invocation.
+- Added daemon-side Workspace Vault reference resolution for `vault://workspace/...`.
+- Safely deferred `vault://project/...` behavior until Phase 7.
+- Enforced Vault allowed-consumer policy for MCP read access.
+- Injected resolved bearer token only into outbound MCP HTTP auth.
+- Preserved `bearer_env` / `env_bearer` fallback as the advanced/operator path.
+- Added safe failure states: `vault_locked`, `vault_secret_missing`, and `vault_policy_denied`.
+- Updated MCP UI guidance and status handling for Vault-backed auth.
+- Added metadata-only Vault usage recording.
+- Confirmed no secret value exposure in API, sync state, audit events, tool catalogs, or UI surfaces.
+- PR #145 checks passed: Promotion, Rust, and Web.
 - Phase 7+ remain `not_started`; Project Vaults, FTS/search, semantic memory, promotion, release, and managed install work have not started.
 
 ## Phase 7 — Project Vaults
@@ -639,7 +649,7 @@ When asked to work on this plan:
 
 - Operator/manager sessions should review executor reports, maintain gates, and provide prompts/checklists. They should not directly patch, commit, push, merge, promote, or release unless explicitly asked.
 - Keep implementation, cleanup, PR/release, and verification work in separate focused sessions/worktrees.
-- Phase 3 is merged/completed via PR #137. Phase 4 is merged/completed via PR #141. Phase 5 is merged/completed via PR #143. Phase 6 is `in_progress`; Phase 7 and later remain `not_started`.
+- Phase 3 is merged/completed via PR #137. Phase 4 is merged/completed via PR #141. Phase 5 is merged/completed via PR #143. Phase 6 is merged/completed via PR #145. Phase 7 and later remain `not_started`.
 - Main worktree cleanup was completed after Phase 2. The stale dirty branch was cleaned back to current dev. Future implementation work should still prefer fresh clean worktrees.
 - A Node/toolchain runtime-resolution experiment was preserved separately and should be reviewed later as its own focused PR. It must not be mixed into Memory/Vault/Security phase work.
 - Memory UI currently treats edited entries mostly as manual/user entries. After candidate capture and explicit remember flows exist, revisit preserving richer source metadata during edits.
