@@ -14,6 +14,8 @@ import {
   jobSummarySchema,
   mcpServerRecordSchema,
   mcpServerSummarySchema,
+  memoryCandidateListResponseSchema,
+  memoryCandidateUpsertRequestSchema,
   memoryEntrySchema,
   memoryEntryUpsertRequestSchema,
   memorySummarySchema,
@@ -574,6 +576,46 @@ export async function deleteMcpServer(serverId: string, fetchImpl: FetchLike = f
     method: 'DELETE',
     headers: { accept: 'application/json' }
   });
+}
+
+export async function fetchMemoryCandidates(status = 'pending', fetchImpl: FetchLike = fetch) {
+  const params = new URLSearchParams();
+  if (status) params.set('status', status);
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/memory/candidates?${params.toString()}`, { headers: { accept: 'application/json' } }),
+    memoryCandidateListResponseSchema
+  );
+}
+
+export async function upsertMemoryCandidate(input: z.input<typeof memoryCandidateUpsertRequestSchema>, fetchImpl: FetchLike = fetch) {
+  const payload = memoryCandidateUpsertRequestSchema.parse(input);
+  return parseJson(
+    await daemonFetch(fetchImpl, payload.id ? `/api/memory/candidates/${encodeURIComponent(payload.id)}` : '/api/memory/candidates', {
+      method: payload.id ? 'PUT' : 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify(payload)
+    }),
+    memoryCandidateUpsertRequestSchema.extend({ created_at: z.number().int().optional(), updated_at: z.number().int().optional() })
+  );
+}
+
+export async function acceptMemoryCandidate(candidateId: string, input: Record<string, unknown> = {}, fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/memory/candidates/${encodeURIComponent(candidateId)}/accept`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify(input)
+    }),
+    memoryEntrySchema
+  );
+}
+
+export async function rejectMemoryCandidate(candidateId: string, fetchImpl: FetchLike = fetch) {
+  return parseJson(await daemonFetch(fetchImpl, `/api/memory/candidates/${encodeURIComponent(candidateId)}/reject`, { method: 'POST', headers: { accept: 'application/json' } }), memoryCandidateUpsertRequestSchema.extend({ id: z.string(), created_at: z.number().int().optional(), updated_at: z.number().int().optional() }));
+}
+
+export async function deleteMemoryCandidate(candidateId: string, fetchImpl: FetchLike = fetch) {
+  await daemonFetch(fetchImpl, `/api/memory/candidates/${encodeURIComponent(candidateId)}`, { method: 'DELETE', headers: { accept: 'application/json' } });
 }
 
 export async function fetchMemory(fetchImpl: FetchLike = fetch) {
