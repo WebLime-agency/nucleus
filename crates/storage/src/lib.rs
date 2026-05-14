@@ -13,11 +13,11 @@ use nucleus_protocol::{
     ApprovalRequestSummary, ArtifactSummary, AuditEvent, CommandSessionSummary,
     DEFAULT_JOB_MAX_STEPS, DEFAULT_JOB_MAX_TOOL_CALLS, DEFAULT_JOB_MAX_WALL_CLOCK_SECS, JobDetail,
     JobEvent, JobSummary, McpServerRecord, McpServerSummary, MemoryCandidate, MemoryEntry,
-    PlaybookDetail, PlaybookSummary, PolicyDecisionSummary, ProjectSummary, RouteTarget,
-    RouterProfileSummary, RunBudgetSummary, RuntimeSummary, SessionDetail, SessionProjectSummary,
-    SessionSummary, SessionTurn, SessionTurnImage, SkillManifest, StorageSummary, ToolCallSummary,
-    ToolCapabilitySummary, WorkerSummary, WorkspaceModelConfig, WorkspaceProfileSummary,
-    WorkspaceSummary,
+    MemorySearchResult, PlaybookDetail, PlaybookSummary, PolicyDecisionSummary, ProjectSummary,
+    RouteTarget, RouterProfileSummary, RunBudgetSummary, RuntimeSummary, SessionDetail,
+    SessionProjectSummary, SessionSummary, SessionTurn, SessionTurnImage, SkillManifest,
+    StorageSummary, ToolCallSummary, ToolCapabilitySummary, WorkerSummary, WorkspaceModelConfig,
+    WorkspaceProfileSummary, WorkspaceSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -1009,6 +1009,11 @@ impl StateStore {
         list_memory_entries_with_connection(&connection)
     }
 
+    pub fn get_memory_entry(&self, id: &str) -> Result<MemoryEntry> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        load_memory_entry(&connection, id)
+    }
+
     pub fn upsert_memory_entry(&self, entry: &MemoryEntry) -> Result<MemoryEntry> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         connection.execute(
@@ -1058,12 +1063,41 @@ impl StateStore {
                 entry.updated_at,
             ],
         )?;
+        refresh_memory_fts_row(&connection, &entry.id)?;
         load_memory_entry(&connection, &entry.id)
     }
 
     pub fn delete_memory_entry(&self, id: &str) -> Result<()> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
+        delete_memory_fts_row(&connection, id)?;
         connection.execute("DELETE FROM memory_entries WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn rebuild_memory_search_index(&self) -> Result<()> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        rebuild_memory_search_index_with_connection(&connection)
+    }
+
+    pub fn search_memory_entries(
+        &self,
+        query: &str,
+        scope_kind: Option<&str>,
+        scope_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MemorySearchResult>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        search_memory_entries_with_connection(&connection, query, scope_kind, scope_id, limit)
+    }
+
+    pub fn record_memory_entries_used(&self, ids: &[String]) -> Result<()> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        for id in ids {
+            connection.execute(
+                "UPDATE memory_entries SET use_count = use_count + 1, last_used_at = unixepoch(), updated_at = updated_at WHERE id = ?1",
+                params![id],
+            )?;
+        }
         Ok(())
     }
 
@@ -2817,6 +2851,13 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_memory_entries_scope
             ON memory_entries(scope_kind, scope_id, enabled);
 
+        CREATE VIRTUAL TABLE IF NOT EXISTS memory_entries_fts USING fts5(
+            id UNINDEXED,
+            title,
+            content,
+            tags
+        );
+
         CREATE TABLE IF NOT EXISTS memory_candidates (
             id TEXT PRIMARY KEY,
             scope_kind TEXT NOT NULL,
@@ -3176,6 +3217,12 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             ON memory_entries(source_kind, source_id);
         CREATE INDEX IF NOT EXISTS idx_memory_entries_last_used
             ON memory_entries(last_used_at);
+        CREATE VIRTUAL TABLE IF NOT EXISTS memory_entries_fts USING fts5(
+            id UNINDEXED,
+            title,
+            content,
+            tags
+        );
         ",
     )?;
 
@@ -5371,6 +5418,108 @@ fn list_memory_entries_with_connection(connection: &Connection) -> Result<Vec<Me
         .collect()
 }
 
+fn memory_entry_is_searchable(entry: &MemoryEntry) -> bool {
+    entry.enabled && entry.status == "accepted"
+}
+
+fn delete_memory_fts_row(connection: &Connection, id: &str) -> Result<()> {
+    connection.execute("DELETE FROM memory_entries_fts WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+fn refresh_memory_fts_row(connection: &Connection, id: &str) -> Result<()> {
+    delete_memory_fts_row(connection, id)?;
+    let entry = load_memory_entry(connection, id)?;
+    if memory_entry_is_searchable(&entry) {
+        connection.execute(
+            "INSERT INTO memory_entries_fts (id, title, content, tags) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                entry.id,
+                entry.title,
+                entry.content,
+                serde_json::to_string(&entry.tags)?
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn rebuild_memory_search_index_with_connection(connection: &Connection) -> Result<()> {
+    connection.execute("DELETE FROM memory_entries_fts", [])?;
+    for entry in list_memory_entries_with_connection(connection)? {
+        if memory_entry_is_searchable(&entry) {
+            connection.execute(
+                "INSERT INTO memory_entries_fts (id, title, content, tags) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    entry.id,
+                    entry.title,
+                    entry.content,
+                    serde_json::to_string(&entry.tags)?
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn memory_fts_query(input: &str) -> Option<String> {
+    let terms = input
+        .split_whitespace()
+        .map(|term| {
+            term.trim_matches(|character: char| {
+                !character.is_alphanumeric() && character != '_' && character != '-'
+            })
+        })
+        .filter(|term| !term.is_empty())
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" "))
+    }
+}
+
+fn search_memory_entries_with_connection(
+    connection: &Connection,
+    query: &str,
+    scope_kind: Option<&str>,
+    scope_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<MemorySearchResult>> {
+    let Some(match_query) = memory_fts_query(query) else {
+        return Ok(Vec::new());
+    };
+    let limit = limit.clamp(1, 50) as i64;
+    let mut statement = connection.prepare(
+        "
+        SELECT memory_entries.id, bm25(memory_entries_fts) AS rank
+        FROM memory_entries_fts
+        JOIN memory_entries ON memory_entries.id = memory_entries_fts.id
+        WHERE memory_entries_fts MATCH ?1
+          AND memory_entries.enabled = 1
+          AND memory_entries.status = 'accepted'
+          AND (?2 IS NULL OR memory_entries.scope_kind = ?2)
+          AND (?3 IS NULL OR memory_entries.scope_id = ?3)
+        ORDER BY rank ASC, memory_entries.updated_at DESC, memory_entries.id ASC
+        LIMIT ?4
+        ",
+    )?;
+    let rows = statement.query_map(params![match_query, scope_kind, scope_id, limit], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+    })?;
+    let matches = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    matches
+        .into_iter()
+        .map(|(id, rank)| {
+            Ok(MemorySearchResult {
+                entry: load_memory_entry(connection, &id)?,
+                rank,
+            })
+        })
+        .collect()
+}
+
 fn list_memory_candidates_with_connection(connection: &Connection) -> Result<Vec<MemoryCandidate>> {
     let mut statement = connection
         .prepare("SELECT id FROM memory_candidates ORDER BY status ASC, created_at DESC, id ASC")?;
@@ -6991,6 +7140,121 @@ mod tests {
             .expect("usage count should load");
         assert_eq!(policy_count, 0);
         assert_eq!(usage_count, 0);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn memory_fts_indexes_only_searchable_entries_and_rebuilds() {
+        let state_dir = test_state_dir("memory-fts");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+
+        for entry in [
+            MemoryEntry {
+                id: "accepted".to_string(),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "Release preference".to_string(),
+                content: "Prefer concise release notes with exact validation results.".to_string(),
+                tags: vec!["release".to_string()],
+                enabled: true,
+                status: "accepted".to_string(),
+                memory_kind: "preference".to_string(),
+                source_kind: "manual".to_string(),
+                source_id: String::new(),
+                confidence: 1.0,
+                created_by: "user".to_string(),
+                last_used_at: None,
+                use_count: 0,
+                supersedes_id: String::new(),
+                metadata_json: serde_json::json!({}),
+                created_at: 0,
+                updated_at: 0,
+            },
+            MemoryEntry {
+                id: "archived".to_string(),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "Archived release note".to_string(),
+                content: "This archived validation phrase must not be searchable.".to_string(),
+                tags: Vec::new(),
+                enabled: true,
+                status: "archived".to_string(),
+                memory_kind: "note".to_string(),
+                source_kind: "manual".to_string(),
+                source_id: String::new(),
+                confidence: 1.0,
+                created_by: "user".to_string(),
+                last_used_at: None,
+                use_count: 0,
+                supersedes_id: String::new(),
+                metadata_json: serde_json::json!({}),
+                created_at: 0,
+                updated_at: 0,
+            },
+            MemoryEntry {
+                id: "disabled".to_string(),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "Disabled release note".to_string(),
+                content: "This disabled validation phrase must not be searchable.".to_string(),
+                tags: Vec::new(),
+                enabled: false,
+                status: "accepted".to_string(),
+                memory_kind: "note".to_string(),
+                source_kind: "manual".to_string(),
+                source_id: String::new(),
+                confidence: 1.0,
+                created_by: "user".to_string(),
+                last_used_at: None,
+                use_count: 0,
+                supersedes_id: String::new(),
+                metadata_json: serde_json::json!({}),
+                created_at: 0,
+                updated_at: 0,
+            },
+        ] {
+            store
+                .upsert_memory_entry(&entry)
+                .expect("memory entry should persist");
+        }
+
+        let results = store
+            .search_memory_entries("validation", Some("workspace"), Some("workspace"), 10)
+            .expect("memory search should work");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entry.id, "accepted");
+
+        {
+            let connection = store.connection.lock().expect("storage mutex poisoned");
+            connection
+                .execute("DELETE FROM memory_entries_fts", [])
+                .expect("derived fts rows should be removable");
+        }
+        assert!(
+            store
+                .search_memory_entries("validation", Some("workspace"), Some("workspace"), 10)
+                .expect("empty derived index should search")
+                .is_empty()
+        );
+        store
+            .rebuild_memory_search_index()
+            .expect("fts index should rebuild from source memory entries");
+        let rebuilt = store
+            .search_memory_entries("validation", Some("workspace"), Some("workspace"), 10)
+            .expect("rebuilt memory search should work");
+        assert_eq!(rebuilt.len(), 1);
+        assert_eq!(rebuilt[0].entry.id, "accepted");
+
+        store
+            .delete_memory_entry("accepted")
+            .expect("delete should remove source and fts row");
+        assert!(
+            store
+                .search_memory_entries("validation", Some("workspace"), Some("workspace"), 10)
+                .expect("memory search after delete should work")
+                .is_empty()
+        );
 
         let _ = fs::remove_dir_all(&state_dir);
     }
