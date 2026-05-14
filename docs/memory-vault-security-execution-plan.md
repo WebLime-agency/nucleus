@@ -51,7 +51,7 @@ Source plans:
 | 0 | Planning | Plan split and master execution plan | completed | none | Planning docs reviewed for consistency; no implementation started. |
 | 1 | Security | Network posture + secure-origin + redaction primitives | completed | Phase 0 | PR #134 includes posture/redaction primitives plus provider/API credential response hardening. |
 | 2 | Memory | Prompt integration + real Memory UI | completed | Phase 0 | Phase 2 implementation committed on `feat/memory-prompt-ui`. |
-| 3 | Vault | Passphrase-protected local Vault backend | in_progress | Phase 1 | Phase 3 backend committed on `feat/vault-backend`; pending PR review/merge. UI/MCP remain deferred. |
+| 3 | Vault | Passphrase-protected local Vault backend | completed | Phase 1 | PR #137 merged into `dev`; UI/MCP remain deferred. |
 | 4 | Memory | Candidates + explicit/automatic capture loop | not_started | Phase 1, Phase 2 |  |
 | 5 | Vault | Workspace Vault UI + policy model | not_started | Phase 3 |  |
 | 6 | Vault/MCP | MCP `vault_bearer` integration | not_started | Phase 3, Phase 5 |  |
@@ -214,7 +214,7 @@ Completion notes:
 
 ## Phase 3 — Passphrase-protected local Vault backend
 
-Status: `in_progress`
+Status: `completed`
 
 Source docs:
 
@@ -261,7 +261,7 @@ Exit criteria:
 
 Completion notes:
 
-- Implemented on branch `feat/vault-backend`.
+- Implemented on branch `feat/vault-backend` and merged via PR #137.
 - Added passphrase-protected local Vault backend with Argon2id KDF, XChaCha20-Poly1305 encryption, per-scope encrypted keys, per-secret nonces, and AAD binding for encrypted scope keys/secrets.
 - Added daemon-owned lock/unlock runtime state; Vault locks by default on daemon start because only encrypted state is persisted.
 - Added metadata-only Vault APIs for status, init, unlock, lock, create/update/list/delete secrets. No reveal endpoint exists.
@@ -614,7 +614,7 @@ When asked to work on this plan:
 
 - Operator/manager sessions should review executor reports, maintain gates, and provide prompts/checklists. They should not directly patch, commit, push, merge, promote, or release unless explicitly asked.
 - Keep implementation, cleanup, PR/release, and verification work in separate focused sessions/worktrees.
-- Phase 3 is currently the active implementation phase: passphrase-protected local Vault backend. Phase 4 must not start until Phase 3 is reviewed, PR’d, merged into dev, and this execution plan is updated.
+- Phase 3 is merged/completed via PR #137. Phase 4 remains `not_started` and must not start until explicitly approved.
 - Main worktree cleanup was completed after Phase 2. The stale dirty branch was cleaned back to current dev. Future implementation work should still prefer fresh clean worktrees.
 - A Node/toolchain runtime-resolution experiment was preserved separately and should be reviewed later as its own focused PR. It must not be mixed into Memory/Vault/Security phase work.
 - Memory UI currently treats edited entries mostly as manual/user entries. After candidate capture and explicit remember flows exist, revisit preserving richer source metadata during edits.
