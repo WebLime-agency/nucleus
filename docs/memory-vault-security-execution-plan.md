@@ -53,7 +53,7 @@ Source plans:
 | 2 | Memory | Prompt integration + real Memory UI | completed | Phase 0 | Phase 2 implementation committed on `feat/memory-prompt-ui`. |
 | 3 | Vault | Passphrase-protected local Vault backend | completed | Phase 1 | PR #137 merged into `dev` at `724eb2115e02d2d660de41ee890724ebac85fab6`; UI/MCP remain deferred. |
 | 4 | Memory | Candidates + explicit/automatic capture loop | completed | Phase 1, Phase 2 | PR #141 merged into `dev` at `c3e0f60ce23b9878a0d331cc1a6cc6d67c56e5b4`; not released. |
-| 5 | Vault | Workspace Vault UI + policy model | not_started | Phase 3 |  |
+| 5 | Vault | Workspace Vault UI + policy model | in_progress | Phase 3 | Local work on `feat/workspace-vault-ui`; not merged or released. |
 | 6 | Vault/MCP | MCP `vault_bearer` integration | not_started | Phase 3, Phase 5 |  |
 | 7 | Vault | Project Vaults | not_started | Phase 5 |  |
 | 8 | Memory | SQLite FTS5 searchable memory provider | not_started | Phase 4 |  |
@@ -330,7 +330,7 @@ Completion notes:
 
 ## Phase 5 — Workspace Vault UI and policy model
 
-Status: `not_started`
+Status: `in_progress`
 
 Source doc:
 
@@ -367,9 +367,11 @@ Exit criteria:
 - User can initialize/unlock Vault and manage workspace secrets without touching env files.
 - UI copy clearly explains security posture and no-reveal behavior.
 
-Completion notes:
+Progress notes:
 
-- Pending.
+- Phase 5 implementation started on `feat/workspace-vault-ui`.
+- Current scope is Workspace Vault UI plus metadata-only allowed-consumer policy APIs.
+- Phase 6+ remain `not_started`; no MCP `vault_bearer`, Project Vaults, FTS/search, semantic memory, promotion, release, or managed install work has started.
 
 ## Phase 6 — MCP `vault_bearer` integration
 
@@ -624,7 +626,7 @@ When asked to work on this plan:
 
 - Operator/manager sessions should review executor reports, maintain gates, and provide prompts/checklists. They should not directly patch, commit, push, merge, promote, or release unless explicitly asked.
 - Keep implementation, cleanup, PR/release, and verification work in separate focused sessions/worktrees.
-- Phase 3 is merged/completed via PR #137. Phase 4 is merged/completed via PR #141. Phase 5 and later remain `not_started`.
+- Phase 3 is merged/completed via PR #137. Phase 4 is merged/completed via PR #141. Phase 5 is `in_progress`; Phase 6 and later remain `not_started`.
 - Main worktree cleanup was completed after Phase 2. The stale dirty branch was cleaned back to current dev. Future implementation work should still prefer fresh clean worktrees.
 - A Node/toolchain runtime-resolution experiment was preserved separately and should be reviewed later as its own focused PR. It must not be mixed into Memory/Vault/Security phase work.
 - Memory UI currently treats edited entries mostly as manual/user entries. After candidate capture and explicit remember flows exist, revisit preserving richer source metadata during edits.

@@ -50,7 +50,15 @@ import {
   workspaceProfileSummarySchema,
   workspaceProfileWriteRequestSchema,
   workspaceSummarySchema,
-  workspaceUpdateRequestSchema
+  workspaceUpdateRequestSchema,
+  vaultSecretListResponseSchema,
+  vaultSecretPolicyListResponseSchema,
+  vaultSecretPolicySummarySchema,
+  vaultSecretPolicyUpsertRequestSchema,
+  vaultSecretSummarySchema,
+  vaultSecretUpdateRequestSchema,
+  vaultSecretUpsertRequestSchema,
+  vaultStatusSummarySchema
 } from './schemas';
 
 type FetchLike = typeof fetch;
@@ -650,6 +658,53 @@ export async function deleteMemory(memoryId: string, fetchImpl: FetchLike = fetc
     method: 'DELETE',
     headers: { accept: 'application/json' }
   });
+}
+
+export async function fetchVaultStatus(fetchImpl: FetchLike = fetch) {
+  return parseJson(await daemonFetch(fetchImpl, '/api/vault/status', { headers: { accept: 'application/json' } }), vaultStatusSummarySchema);
+}
+
+export async function initVault(passphrase: string, fetchImpl: FetchLike = fetch) {
+  return parseJson(await daemonFetch(fetchImpl, '/api/vault/init', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify({ passphrase }) }), vaultStatusSummarySchema);
+}
+
+export async function unlockVault(passphrase: string, fetchImpl: FetchLike = fetch) {
+  return parseJson(await daemonFetch(fetchImpl, '/api/vault/unlock', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify({ passphrase }) }), vaultStatusSummarySchema);
+}
+
+export async function lockVault(fetchImpl: FetchLike = fetch) {
+  return parseJson(await daemonFetch(fetchImpl, '/api/vault/lock', { method: 'POST', headers: { accept: 'application/json' } }), vaultStatusSummarySchema);
+}
+
+export async function fetchVaultSecrets(fetchImpl: FetchLike = fetch) {
+  return parseJson(await daemonFetch(fetchImpl, '/api/vault/secrets?scope_kind=workspace&scope_id=workspace', { headers: { accept: 'application/json' } }), vaultSecretListResponseSchema);
+}
+
+export async function createVaultSecret(input: z.input<typeof vaultSecretUpsertRequestSchema>, fetchImpl: FetchLike = fetch) {
+  const payload = vaultSecretUpsertRequestSchema.parse(input);
+  return parseJson(await daemonFetch(fetchImpl, '/api/vault/secrets', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify(payload) }), vaultSecretSummarySchema);
+}
+
+export async function updateVaultSecret(secretId: string, input: z.input<typeof vaultSecretUpdateRequestSchema>, fetchImpl: FetchLike = fetch) {
+  const payload = vaultSecretUpdateRequestSchema.parse(input);
+  return parseJson(await daemonFetch(fetchImpl, `/api/vault/secrets/${encodeURIComponent(secretId)}`, { method: 'PATCH', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify(payload) }), vaultSecretSummarySchema);
+}
+
+export async function deleteVaultSecret(secretId: string, fetchImpl: FetchLike = fetch) {
+  await daemonFetch(fetchImpl, `/api/vault/secrets/${encodeURIComponent(secretId)}`, { method: 'DELETE', headers: { accept: 'application/json' } });
+}
+
+export async function fetchVaultSecretPolicies(secretId: string, fetchImpl: FetchLike = fetch) {
+  return parseJson(await daemonFetch(fetchImpl, `/api/vault/secrets/${encodeURIComponent(secretId)}/policies`, { headers: { accept: 'application/json' } }), vaultSecretPolicyListResponseSchema);
+}
+
+export async function upsertVaultSecretPolicy(secretId: string, input: z.input<typeof vaultSecretPolicyUpsertRequestSchema>, fetchImpl: FetchLike = fetch) {
+  const payload = vaultSecretPolicyUpsertRequestSchema.parse(input);
+  return parseJson(await daemonFetch(fetchImpl, `/api/vault/secrets/${encodeURIComponent(secretId)}/policies`, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify(payload) }), vaultSecretPolicySummarySchema);
+}
+
+export async function deleteVaultSecretPolicy(secretId: string, policyId: string, fetchImpl: FetchLike = fetch) {
+  await daemonFetch(fetchImpl, `/api/vault/secrets/${encodeURIComponent(secretId)}/policies/${encodeURIComponent(policyId)}`, { method: 'DELETE', headers: { accept: 'application/json' } });
 }
 
 export async function fetchActions(fetchImpl: FetchLike = fetch) {
