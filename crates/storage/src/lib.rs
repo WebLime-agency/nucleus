@@ -6681,6 +6681,132 @@ mod tests {
     }
 
     #[test]
+    fn vault_records_persist_metadata_and_delete_cascades_policy_usage_rows() {
+        let state_dir = test_state_dir("vault-records");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+
+        let state = store
+            .upsert_vault_state(&VaultStateRecord {
+                id: "default".to_string(),
+                version: 1,
+                vault_id: "vault-1".to_string(),
+                status: "locked".to_string(),
+                kdf_algorithm: "argon2id".to_string(),
+                kdf_params_json:
+                    r#"{"memory_kib":256,"time_cost":1,"parallelism":1,"output_len":32}"#
+                        .to_string(),
+                salt: b"random-salt-placeholder".to_vec(),
+                cipher: "xchacha20poly1305".to_string(),
+                encrypted_root_check: b"encrypted-root-check".to_vec(),
+                root_check_nonce: b"root-check-nonce-24-bytes".to_vec(),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .expect("vault state should persist");
+        assert_eq!(state.vault_id, "vault-1");
+        assert_eq!(state.kdf_algorithm, "argon2id");
+
+        let scope = store
+            .upsert_vault_scope_key(&VaultScopeKeyRecord {
+                id: "scope-key-1".to_string(),
+                vault_id: "vault-1".to_string(),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                encrypted_key: b"encrypted-scope-key".to_vec(),
+                nonce: b"scope-key-nonce-24-bytes".to_vec(),
+                aad: "nucleus:vault:v1:vault-1:scope-key:workspace:workspace:1".to_string(),
+                key_version: 1,
+                created_at: 0,
+                rotated_at: None,
+            })
+            .expect("scope key should persist");
+
+        store
+            .upsert_vault_secret(&VaultSecretRecord {
+                id: "secret-1".to_string(),
+                scope_key_id: scope.id,
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                name: "API_TOKEN".to_string(),
+                description: "API token".to_string(),
+                ciphertext: b"encrypted-secret-value".to_vec(),
+                nonce: b"secret-nonce-24-bytes".to_vec(),
+                aad: "nucleus:vault:v1:vault-1:workspace:workspace:secret-1:API_TOKEN:1"
+                    .to_string(),
+                version: 1,
+                created_at: 0,
+                updated_at: 0,
+                last_used_at: None,
+            })
+            .expect("secret should persist");
+
+        {
+            let connection = store.connection.lock().expect("storage mutex poisoned");
+            connection
+                .execute(
+                    "INSERT INTO vault_secret_policies (id, secret_id, consumer_kind, consumer_id, permission, approval_mode) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params!["policy-1", "secret-1", "mcp", "server-1", "read", "allow"],
+                )
+                .expect("policy should insert");
+            connection
+                .execute(
+                    "INSERT INTO vault_secret_usages (id, secret_id, consumer_kind, consumer_id, purpose) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params!["usage-1", "secret-1", "mcp", "server-1", "auth"],
+                )
+                .expect("usage should insert");
+        }
+
+        let listed = store
+            .list_vault_secrets(Some("workspace"), Some("workspace"))
+            .expect("secrets should list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "API_TOKEN");
+        assert_eq!(listed[0].ciphertext, b"encrypted-secret-value");
+
+        drop(store);
+        let store = StateStore::initialize_at(&state_dir).expect("store should reopen");
+        assert_eq!(
+            store
+                .load_vault_state()
+                .expect("state should load")
+                .expect("state should exist")
+                .vault_id,
+            "vault-1"
+        );
+        assert_eq!(
+            store
+                .load_vault_secret("secret-1")
+                .expect("secret should load")
+                .ciphertext,
+            b"encrypted-secret-value"
+        );
+
+        store
+            .delete_vault_secret("secret-1")
+            .expect("secret should delete");
+        assert!(store.load_vault_secret("secret-1").is_err());
+        let connection = store.connection.lock().expect("storage mutex poisoned");
+        let policy_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM vault_secret_policies WHERE secret_id = ?1",
+                params!["secret-1"],
+                |row| row.get(0),
+            )
+            .expect("policy count should load");
+        let usage_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM vault_secret_usages WHERE secret_id = ?1",
+                params!["secret-1"],
+                |row| row.get(0),
+            )
+            .expect("usage count should load");
+        assert_eq!(policy_count, 0);
+        assert_eq!(usage_count, 0);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
     fn seeds_workspace_profiles_and_default_profile() {
         let state_dir = test_state_dir("workspace-profiles");
         let store = StateStore::initialize_at(&state_dir).expect("store should initialize");

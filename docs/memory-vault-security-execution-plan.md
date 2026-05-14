@@ -214,7 +214,7 @@ Completion notes:
 
 ## Phase 3 — Passphrase-protected local Vault backend
 
-Status: `completed`
+Status: `in_progress`
 
 Source docs:
 
@@ -267,6 +267,7 @@ Completion notes:
 - Added metadata-only Vault APIs for status, init, unlock, lock, create/update/list/delete secrets. No reveal endpoint exists.
 - Enforced safe-origin checks for init, unlock, create, update, and delete operations.
 - Added redacted audit events for Vault lifecycle and secret metadata changes without secret values.
+- Cleanup added endpoint-level status/list/lock/update/delete coverage, restart persistence coverage, and storage-level Vault persistence/delete cascade coverage before PR.
 - Checks run: `cargo fmt --all --check`, `cargo test -p nucleus-daemon vault`, `cargo test -p nucleus-storage vault`, and full `cargo test`.
 - Deferred to later phases: Workspace Vault management UI/policy editing, daemon-only secret resolution for MCP consumers, MCP `vault_bearer`, idle-timeout tuning surface, secret reveal/test endpoint, project Vault UI, external providers/keychain wrapping.
 

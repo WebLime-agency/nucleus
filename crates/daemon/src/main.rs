@@ -8119,6 +8119,295 @@ mod tests {
         let _ = fs::remove_dir_all(&state_dir);
     }
 
+    #[tokio::test]
+    async fn vault_persists_locked_across_restart_and_unlocks_metadata_only() {
+        let state_dir = test_state_dir("vault-restart-persistence");
+        let store = initialize_test_store(&state_dir);
+        let state = test_app_state(&store);
+        {
+            let mut vault = state.vault.lock().await;
+            vault
+                .initialize(&state.store, "correct horse battery staple")
+                .expect("vault initializes");
+            vault
+                .create_or_update_secret(
+                    &state.store,
+                    vault::VaultSecretInput {
+                        id: Some("restart-token".to_string()),
+                        scope_kind: "workspace".to_string(),
+                        scope_id: "workspace".to_string(),
+                        name: "RESTART_TOKEN".to_string(),
+                        description: "Restart token".to_string(),
+                        secret: "restart-secret-value".to_string(),
+                    },
+                )
+                .expect("secret persists encrypted");
+        }
+        drop(state);
+        drop(store);
+
+        let reopened_store = Arc::new(
+            StateStore::initialize_at(&state_dir).expect("store should reopen after restart"),
+        );
+        let restarted = test_app_state(&reopened_store);
+        let status = vault_status(State(restarted.clone()))
+            .await
+            .expect("status should load")
+            .0;
+        assert!(status.initialized);
+        assert!(status.locked);
+        assert_eq!(status.state, "locked");
+
+        let listed = list_vault_secrets(
+            State(restarted.clone()),
+            Query(VaultSecretListQuery {
+                scope_kind: None,
+                scope_id: None,
+            }),
+        )
+        .await
+        .expect("secrets should list")
+        .0;
+        assert_eq!(listed.secrets.len(), 1);
+        assert_eq!(listed.secrets[0].id, "restart-token");
+        let serialized = serde_json::to_string(&listed).expect("list serializes");
+        assert!(!serialized.contains("restart-secret-value"));
+
+        let raw = restarted
+            .store
+            .load_vault_secret("restart-token")
+            .expect("secret should load");
+        assert_ne!(raw.ciphertext, b"restart-secret-value");
+        assert!(!String::from_utf8_lossy(&raw.ciphertext).contains("restart-secret-value"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "origin",
+            axum::http::HeaderValue::from_static("http://localhost:5201"),
+        );
+        let unlocked = vault_unlock(
+            State(restarted.clone()),
+            headers,
+            Bytes::from(r#"{"passphrase":"correct horse battery staple"}"#),
+        )
+        .await
+        .expect("correct passphrase unlocks after restart")
+        .0;
+        assert!(!unlocked.locked);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn vault_endpoints_report_status_lock_and_metadata_only_list() {
+        let (state_dir, state) = test_named_app_state("vault-endpoint-status-list");
+        let initial = vault_status(State(state.clone()))
+            .await
+            .expect("status should load")
+            .0;
+        assert!(!initial.initialized);
+        assert!(initial.locked);
+        assert_eq!(initial.state, "uninitialized");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "origin",
+            axum::http::HeaderValue::from_static("http://localhost:5201"),
+        );
+        let initialized = vault_init(
+            State(state.clone()),
+            headers.clone(),
+            Bytes::from(r#"{"passphrase":"correct horse battery staple"}"#),
+        )
+        .await
+        .expect("vault init succeeds")
+        .0;
+        assert!(initialized.initialized);
+        assert!(!initialized.locked);
+
+        let created = create_vault_secret(
+            State(state.clone()),
+            headers,
+            Bytes::from(r#"{"id":"status-token","scope_kind":"workspace","scope_id":"workspace","name":"STATUS_TOKEN","secret":"status-secret-value"}"#),
+        )
+        .await
+        .expect("secret create succeeds")
+        .0;
+        let created_serialized = serde_json::to_string(&created).expect("summary serializes");
+        assert!(!created_serialized.contains("status-secret-value"));
+
+        let listed = list_vault_secrets(
+            State(state.clone()),
+            Query(VaultSecretListQuery {
+                scope_kind: None,
+                scope_id: None,
+            }),
+        )
+        .await
+        .expect("secrets list")
+        .0;
+        let serialized = serde_json::to_string(&listed).expect("list serializes");
+        assert!(serialized.contains("STATUS_TOKEN"));
+        assert!(!serialized.contains("status-secret-value"));
+
+        let locked = vault_lock(State(state.clone()))
+            .await
+            .expect("lock succeeds")
+            .0;
+        assert!(locked.initialized);
+        assert!(locked.locked);
+        assert_eq!(locked.state, "locked");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn vault_update_endpoint_requires_safe_origin_unlocked_and_stays_metadata_only() {
+        let (state_dir, state) = test_named_app_state("vault-endpoint-update");
+        let mut safe_headers = HeaderMap::new();
+        safe_headers.insert(
+            "origin",
+            axum::http::HeaderValue::from_static("http://localhost:5201"),
+        );
+        let _ = vault_init(
+            State(state.clone()),
+            safe_headers.clone(),
+            Bytes::from(r#"{"passphrase":"correct horse battery staple"}"#),
+        )
+        .await
+        .expect("vault init succeeds");
+        let _ = create_vault_secret(
+            State(state.clone()),
+            safe_headers.clone(),
+            Bytes::from(r#"{"id":"update-token","scope_kind":"workspace","scope_id":"workspace","name":"UPDATE_TOKEN","secret":"old-secret-value"}"#),
+        )
+        .await
+        .expect("secret create succeeds");
+        let before = state
+            .store
+            .load_vault_secret("update-token")
+            .expect("secret should load");
+
+        let mut unsafe_headers = HeaderMap::new();
+        unsafe_headers.insert(
+            "origin",
+            axum::http::HeaderValue::from_static("http://192.168.1.2:5201"),
+        );
+        let unsafe_error = update_vault_secret(
+            State(state.clone()),
+            Path("update-token".to_string()),
+            unsafe_headers,
+            Bytes::from(r#"{"secret":"unsafe-secret-value"}"#),
+        )
+        .await
+        .expect_err("unsafe origin should fail");
+        assert_eq!(unsafe_error.status, StatusCode::FORBIDDEN);
+
+        let _ = vault_lock(State(state.clone()))
+            .await
+            .expect("lock succeeds");
+        let locked_error = update_vault_secret(
+            State(state.clone()),
+            Path("update-token".to_string()),
+            safe_headers.clone(),
+            Bytes::from(r#"{"secret":"locked-secret-value"}"#),
+        )
+        .await
+        .expect_err("locked vault should block update");
+        assert_eq!(locked_error.status, StatusCode::FORBIDDEN);
+
+        let _ = vault_unlock(
+            State(state.clone()),
+            safe_headers.clone(),
+            Bytes::from(r#"{"passphrase":"correct horse battery staple"}"#),
+        )
+        .await
+        .expect("unlock succeeds");
+        let updated = update_vault_secret(
+            State(state.clone()),
+            Path("update-token".to_string()),
+            safe_headers,
+            Bytes::from(r#"{"description":"Updated token","secret":"new-secret-value"}"#),
+        )
+        .await
+        .expect("update succeeds")
+        .0;
+        assert_eq!(updated.version, before.version + 1);
+        assert_eq!(updated.description, "Updated token");
+        let serialized = serde_json::to_string(&updated).expect("summary serializes");
+        assert!(!serialized.contains("new-secret-value"));
+
+        let after = state
+            .store
+            .load_vault_secret("update-token")
+            .expect("updated secret should load");
+        assert_ne!(after.ciphertext, before.ciphertext);
+        assert!(!String::from_utf8_lossy(&after.ciphertext).contains("new-secret-value"));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn vault_delete_endpoint_requires_safe_origin_and_removes_secret_from_list() {
+        let (state_dir, state) = test_named_app_state("vault-endpoint-delete");
+        let mut safe_headers = HeaderMap::new();
+        safe_headers.insert(
+            "origin",
+            axum::http::HeaderValue::from_static("http://localhost:5201"),
+        );
+        let _ = vault_init(
+            State(state.clone()),
+            safe_headers.clone(),
+            Bytes::from(r#"{"passphrase":"correct horse battery staple"}"#),
+        )
+        .await
+        .expect("vault init succeeds");
+        let _ = create_vault_secret(
+            State(state.clone()),
+            safe_headers.clone(),
+            Bytes::from(r#"{"id":"delete-token","scope_kind":"workspace","scope_id":"workspace","name":"DELETE_TOKEN","secret":"delete-secret-value"}"#),
+        )
+        .await
+        .expect("secret create succeeds");
+
+        let mut unsafe_headers = HeaderMap::new();
+        unsafe_headers.insert(
+            "origin",
+            axum::http::HeaderValue::from_static("http://192.168.1.2:5201"),
+        );
+        let unsafe_error = delete_vault_secret(
+            State(state.clone()),
+            Path("delete-token".to_string()),
+            unsafe_headers,
+        )
+        .await
+        .expect_err("unsafe origin should fail");
+        assert_eq!(unsafe_error.status, StatusCode::FORBIDDEN);
+        assert!(state.store.load_vault_secret("delete-token").is_ok());
+
+        let status = delete_vault_secret(
+            State(state.clone()),
+            Path("delete-token".to_string()),
+            safe_headers,
+        )
+        .await
+        .expect("delete succeeds");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(state.store.load_vault_secret("delete-token").is_err());
+
+        let listed = list_vault_secrets(
+            State(state.clone()),
+            Query(VaultSecretListQuery {
+                scope_kind: None,
+                scope_id: None,
+            }),
+        )
+        .await
+        .expect("secrets list")
+        .0;
+        assert!(listed.secrets.is_empty());
+        let serialized = serde_json::to_string(&listed).expect("list serializes");
+        assert!(!serialized.contains("delete-secret-value"));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
     fn test_session(workspace_root: &std::path::Path) -> SessionSummary {
         SessionSummary {
             id: "session-test".to_string(),
