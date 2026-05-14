@@ -30,6 +30,53 @@ const LOCAL_AUTH_TOKEN_FILE_NAME: &str = "local-auth-token";
 const UPDATE_STATE_KEY: &str = "updates.state.v1";
 const PLAYBOOK_RECENT_JOB_LIMIT: usize = 12;
 
+#[derive(Debug, Clone)]
+pub struct VaultStateRecord {
+    pub id: String,
+    pub version: i64,
+    pub vault_id: String,
+    pub status: String,
+    pub kdf_algorithm: String,
+    pub kdf_params_json: String,
+    pub salt: Vec<u8>,
+    pub cipher: String,
+    pub encrypted_root_check: Vec<u8>,
+    pub root_check_nonce: Vec<u8>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct VaultScopeKeyRecord {
+    pub id: String,
+    pub vault_id: String,
+    pub scope_kind: String,
+    pub scope_id: String,
+    pub encrypted_key: Vec<u8>,
+    pub nonce: Vec<u8>,
+    pub aad: String,
+    pub key_version: i64,
+    pub created_at: i64,
+    pub rotated_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VaultSecretRecord {
+    pub id: String,
+    pub scope_key_id: String,
+    pub scope_kind: String,
+    pub scope_id: String,
+    pub name: String,
+    pub description: String,
+    pub ciphertext: Vec<u8>,
+    pub nonce: Vec<u8>,
+    pub aad: String,
+    pub version: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_used_at: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoragePlan {
     pub state_dir: PathBuf,
@@ -1005,6 +1052,117 @@ impl StateStore {
     pub fn delete_memory_entry(&self, id: &str) -> Result<()> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         connection.execute("DELETE FROM memory_entries WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn load_vault_state(&self) -> Result<Option<VaultStateRecord>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        connection.query_row(
+            "SELECT id, version, vault_id, status, kdf_algorithm, kdf_params_json, salt, cipher, encrypted_root_check, root_check_nonce, created_at, updated_at FROM vault_state WHERE id = 'default'",
+            [],
+            map_vault_state,
+        ).optional().map_err(Into::into)
+    }
+
+    pub fn upsert_vault_state(&self, record: &VaultStateRecord) -> Result<VaultStateRecord> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        connection.execute(
+            "INSERT INTO vault_state (id, version, vault_id, status, kdf_algorithm, kdf_params_json, salt, cipher, encrypted_root_check, root_check_nonce, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, COALESCE(NULLIF(?11, 0), unixepoch()), COALESCE(NULLIF(?12, 0), unixepoch()))
+             ON CONFLICT(id) DO UPDATE SET status = excluded.status, kdf_algorithm = excluded.kdf_algorithm, kdf_params_json = excluded.kdf_params_json, salt = excluded.salt, cipher = excluded.cipher, encrypted_root_check = excluded.encrypted_root_check, root_check_nonce = excluded.root_check_nonce, updated_at = unixepoch()",
+            params![record.id, record.version, record.vault_id, record.status, record.kdf_algorithm, record.kdf_params_json, record.salt, record.cipher, record.encrypted_root_check, record.root_check_nonce, record.created_at, record.updated_at],
+        )?;
+        drop(connection);
+        self.load_vault_state()?
+            .ok_or_else(|| anyhow!("vault state was not found"))
+    }
+
+    pub fn load_vault_scope_key(
+        &self,
+        scope_kind: &str,
+        scope_id: &str,
+    ) -> Result<Option<VaultScopeKeyRecord>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        connection.query_row(
+            "SELECT id, vault_id, scope_kind, scope_id, encrypted_key, nonce, aad, key_version, created_at, rotated_at FROM vault_scope_keys WHERE scope_kind = ?1 AND scope_id = ?2",
+            params![scope_kind, scope_id],
+            map_vault_scope_key,
+        ).optional().map_err(Into::into)
+    }
+
+    pub fn upsert_vault_scope_key(
+        &self,
+        record: &VaultScopeKeyRecord,
+    ) -> Result<VaultScopeKeyRecord> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        connection.execute(
+            "INSERT INTO vault_scope_keys (id, vault_id, scope_kind, scope_id, encrypted_key, nonce, aad, key_version, created_at, rotated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(NULLIF(?9, 0), unixepoch()), ?10)
+             ON CONFLICT(vault_id, scope_kind, scope_id) DO UPDATE SET encrypted_key = excluded.encrypted_key, nonce = excluded.nonce, aad = excluded.aad, key_version = excluded.key_version, rotated_at = excluded.rotated_at",
+            params![record.id, record.vault_id, record.scope_kind, record.scope_id, record.encrypted_key, record.nonce, record.aad, record.key_version, record.created_at, record.rotated_at],
+        )?;
+        drop(connection);
+        self.load_vault_scope_key(&record.scope_kind, &record.scope_id)?
+            .ok_or_else(|| anyhow!("vault scope key was not found"))
+    }
+
+    pub fn list_vault_secrets(
+        &self,
+        scope_kind: Option<&str>,
+        scope_id: Option<&str>,
+    ) -> Result<Vec<VaultSecretRecord>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let mut query = "SELECT id FROM vault_secrets".to_string();
+        let mut values = Vec::new();
+        if let (Some(kind), Some(id)) = (scope_kind, scope_id) {
+            query.push_str(" WHERE scope_kind = ?1 AND scope_id = ?2");
+            values.push(kind.to_string());
+            values.push(id.to_string());
+        }
+        query.push_str(" ORDER BY scope_kind ASC, scope_id ASC, name ASC");
+        let mut statement = connection.prepare(&query)?;
+        let ids = if values.is_empty() {
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            statement
+                .query_map(params![values[0], values[1]], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        ids.into_iter()
+            .map(|id| load_vault_secret(&connection, &id))
+            .collect()
+    }
+
+    pub fn load_vault_secret(&self, id: &str) -> Result<VaultSecretRecord> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        load_vault_secret(&connection, id)
+    }
+
+    pub fn upsert_vault_secret(&self, record: &VaultSecretRecord) -> Result<VaultSecretRecord> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        connection.execute(
+            "INSERT INTO vault_secrets (id, scope_key_id, scope_kind, scope_id, name, description, ciphertext, nonce, aad, version, created_at, updated_at, last_used_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, COALESCE(NULLIF(?11, 0), unixepoch()), COALESCE(NULLIF(?12, 0), unixepoch()), ?13)
+             ON CONFLICT(id) DO UPDATE SET scope_key_id = excluded.scope_key_id, scope_kind = excluded.scope_kind, scope_id = excluded.scope_id, name = excluded.name, description = excluded.description, ciphertext = excluded.ciphertext, nonce = excluded.nonce, aad = excluded.aad, version = excluded.version, updated_at = unixepoch(), last_used_at = excluded.last_used_at",
+            params![record.id, record.scope_key_id, record.scope_kind, record.scope_id, record.name, record.description, record.ciphertext, record.nonce, record.aad, record.version, record.created_at, record.updated_at, record.last_used_at],
+        )?;
+        drop(connection);
+        self.load_vault_secret(&record.id)
+    }
+
+    pub fn delete_vault_secret(&self, id: &str) -> Result<()> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        connection.execute(
+            "DELETE FROM vault_secret_policies WHERE secret_id = ?1",
+            params![id],
+        )?;
+        connection.execute(
+            "DELETE FROM vault_secret_usages WHERE secret_id = ?1",
+            params![id],
+        )?;
+        connection.execute("DELETE FROM vault_secrets WHERE id = ?1", params![id])?;
         Ok(())
     }
 
@@ -2558,6 +2716,79 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_memory_entries_scope
             ON memory_entries(scope_kind, scope_id, enabled);
+
+        CREATE TABLE IF NOT EXISTS vault_state (
+            id TEXT PRIMARY KEY,
+            version INTEGER NOT NULL,
+            vault_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            kdf_algorithm TEXT NOT NULL,
+            kdf_params_json TEXT NOT NULL,
+            salt BLOB NOT NULL,
+            cipher TEXT NOT NULL,
+            encrypted_root_check BLOB NOT NULL,
+            root_check_nonce BLOB NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+
+        CREATE TABLE IF NOT EXISTS vault_scope_keys (
+            id TEXT PRIMARY KEY,
+            vault_id TEXT NOT NULL,
+            scope_kind TEXT NOT NULL,
+            scope_id TEXT NOT NULL,
+            encrypted_key BLOB NOT NULL,
+            nonce BLOB NOT NULL,
+            aad TEXT NOT NULL,
+            key_version INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            rotated_at INTEGER,
+            UNIQUE(vault_id, scope_kind, scope_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS vault_secrets (
+            id TEXT PRIMARY KEY,
+            scope_key_id TEXT NOT NULL,
+            scope_kind TEXT NOT NULL,
+            scope_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            ciphertext BLOB NOT NULL,
+            nonce BLOB NOT NULL,
+            aad TEXT NOT NULL,
+            version INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            last_used_at INTEGER,
+            UNIQUE(scope_kind, scope_id, name)
+        );
+
+        CREATE TABLE IF NOT EXISTS vault_secret_policies (
+            id TEXT PRIMARY KEY,
+            secret_id TEXT NOT NULL,
+            consumer_kind TEXT NOT NULL,
+            consumer_id TEXT NOT NULL,
+            permission TEXT NOT NULL,
+            approval_mode TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            UNIQUE(secret_id, consumer_kind, consumer_id, permission)
+        );
+
+        CREATE TABLE IF NOT EXISTS vault_secret_usages (
+            id TEXT PRIMARY KEY,
+            secret_id TEXT NOT NULL,
+            consumer_kind TEXT NOT NULL,
+            consumer_id TEXT NOT NULL,
+            purpose TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            last_used_at INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_vault_secrets_scope
+            ON vault_secrets(scope_kind, scope_id, name);
+        CREATE INDEX IF NOT EXISTS idx_vault_scope_keys_scope
+            ON vault_scope_keys(scope_kind, scope_id);
 
         CREATE TABLE IF NOT EXISTS skill_packages (
             id TEXT PRIMARY KEY,
@@ -4926,6 +5157,64 @@ fn map_mcp_tool(row: &rusqlite::Row<'_>) -> rusqlite::Result<nucleus_protocol::M
     })
 }
 
+fn map_vault_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<VaultStateRecord> {
+    Ok(VaultStateRecord {
+        id: row.get(0)?,
+        version: row.get(1)?,
+        vault_id: row.get(2)?,
+        status: row.get(3)?,
+        kdf_algorithm: row.get(4)?,
+        kdf_params_json: row.get(5)?,
+        salt: row.get(6)?,
+        cipher: row.get(7)?,
+        encrypted_root_check: row.get(8)?,
+        root_check_nonce: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
+fn map_vault_scope_key(row: &rusqlite::Row<'_>) -> rusqlite::Result<VaultScopeKeyRecord> {
+    Ok(VaultScopeKeyRecord {
+        id: row.get(0)?,
+        vault_id: row.get(1)?,
+        scope_kind: row.get(2)?,
+        scope_id: row.get(3)?,
+        encrypted_key: row.get(4)?,
+        nonce: row.get(5)?,
+        aad: row.get(6)?,
+        key_version: row.get(7)?,
+        created_at: row.get(8)?,
+        rotated_at: row.get(9)?,
+    })
+}
+
+fn load_vault_secret(connection: &Connection, id: &str) -> Result<VaultSecretRecord> {
+    connection.query_row(
+        "SELECT id, scope_key_id, scope_kind, scope_id, name, description, ciphertext, nonce, aad, version, created_at, updated_at, last_used_at FROM vault_secrets WHERE id = ?1",
+        params![id],
+        map_vault_secret,
+    ).optional()?.ok_or_else(|| anyhow!("vault secret {id} was not found"))
+}
+
+fn map_vault_secret(row: &rusqlite::Row<'_>) -> rusqlite::Result<VaultSecretRecord> {
+    Ok(VaultSecretRecord {
+        id: row.get(0)?,
+        scope_key_id: row.get(1)?,
+        scope_kind: row.get(2)?,
+        scope_id: row.get(3)?,
+        name: row.get(4)?,
+        description: row.get(5)?,
+        ciphertext: row.get(6)?,
+        nonce: row.get(7)?,
+        aad: row.get(8)?,
+        version: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+        last_used_at: row.get(12)?,
+    })
+}
+
 fn list_memory_entries_with_connection(connection: &Connection) -> Result<Vec<MemoryEntry>> {
     let mut statement = connection.prepare(
         "SELECT id FROM memory_entries ORDER BY scope_kind ASC, scope_id ASC, title ASC, id ASC",
@@ -6387,6 +6676,132 @@ mod tests {
         assert_eq!(recent[0].summary, "Refreshed runtime health.");
         assert_eq!(recent[1].id, first.id);
         assert_eq!(recent[1].target, "session:test-1");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn vault_records_persist_metadata_and_delete_cascades_policy_usage_rows() {
+        let state_dir = test_state_dir("vault-records");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+
+        let state = store
+            .upsert_vault_state(&VaultStateRecord {
+                id: "default".to_string(),
+                version: 1,
+                vault_id: "vault-1".to_string(),
+                status: "locked".to_string(),
+                kdf_algorithm: "argon2id".to_string(),
+                kdf_params_json:
+                    r#"{"memory_kib":256,"time_cost":1,"parallelism":1,"output_len":32}"#
+                        .to_string(),
+                salt: b"random-salt-placeholder".to_vec(),
+                cipher: "xchacha20poly1305".to_string(),
+                encrypted_root_check: b"encrypted-root-check".to_vec(),
+                root_check_nonce: b"root-check-nonce-24-bytes".to_vec(),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .expect("vault state should persist");
+        assert_eq!(state.vault_id, "vault-1");
+        assert_eq!(state.kdf_algorithm, "argon2id");
+
+        let scope = store
+            .upsert_vault_scope_key(&VaultScopeKeyRecord {
+                id: "scope-key-1".to_string(),
+                vault_id: "vault-1".to_string(),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                encrypted_key: b"encrypted-scope-key".to_vec(),
+                nonce: b"scope-key-nonce-24-bytes".to_vec(),
+                aad: "nucleus:vault:v1:vault-1:scope-key:workspace:workspace:1".to_string(),
+                key_version: 1,
+                created_at: 0,
+                rotated_at: None,
+            })
+            .expect("scope key should persist");
+
+        store
+            .upsert_vault_secret(&VaultSecretRecord {
+                id: "secret-1".to_string(),
+                scope_key_id: scope.id,
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                name: "API_TOKEN".to_string(),
+                description: "API token".to_string(),
+                ciphertext: b"encrypted-secret-value".to_vec(),
+                nonce: b"secret-nonce-24-bytes".to_vec(),
+                aad: "nucleus:vault:v1:vault-1:workspace:workspace:secret-1:API_TOKEN:1"
+                    .to_string(),
+                version: 1,
+                created_at: 0,
+                updated_at: 0,
+                last_used_at: None,
+            })
+            .expect("secret should persist");
+
+        {
+            let connection = store.connection.lock().expect("storage mutex poisoned");
+            connection
+                .execute(
+                    "INSERT INTO vault_secret_policies (id, secret_id, consumer_kind, consumer_id, permission, approval_mode) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params!["policy-1", "secret-1", "mcp", "server-1", "read", "allow"],
+                )
+                .expect("policy should insert");
+            connection
+                .execute(
+                    "INSERT INTO vault_secret_usages (id, secret_id, consumer_kind, consumer_id, purpose) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params!["usage-1", "secret-1", "mcp", "server-1", "auth"],
+                )
+                .expect("usage should insert");
+        }
+
+        let listed = store
+            .list_vault_secrets(Some("workspace"), Some("workspace"))
+            .expect("secrets should list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "API_TOKEN");
+        assert_eq!(listed[0].ciphertext, b"encrypted-secret-value");
+
+        drop(store);
+        let store = StateStore::initialize_at(&state_dir).expect("store should reopen");
+        assert_eq!(
+            store
+                .load_vault_state()
+                .expect("state should load")
+                .expect("state should exist")
+                .vault_id,
+            "vault-1"
+        );
+        assert_eq!(
+            store
+                .load_vault_secret("secret-1")
+                .expect("secret should load")
+                .ciphertext,
+            b"encrypted-secret-value"
+        );
+
+        store
+            .delete_vault_secret("secret-1")
+            .expect("secret should delete");
+        assert!(store.load_vault_secret("secret-1").is_err());
+        let connection = store.connection.lock().expect("storage mutex poisoned");
+        let policy_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM vault_secret_policies WHERE secret_id = ?1",
+                params!["secret-1"],
+                |row| row.get(0),
+            )
+            .expect("policy count should load");
+        let usage_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM vault_secret_usages WHERE secret_id = ?1",
+                params!["secret-1"],
+                |row| row.get(0),
+            )
+            .expect("usage count should load");
+        assert_eq!(policy_count, 0);
+        assert_eq!(usage_count, 0);
 
         let _ = fs::remove_dir_all(&state_dir);
     }
