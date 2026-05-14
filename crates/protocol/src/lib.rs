@@ -748,6 +748,81 @@ pub struct MemorySummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultStatusSummary {
+    pub initialized: bool,
+    pub locked: bool,
+    pub state: String,
+    #[serde(default)]
+    pub vault_id: String,
+    #[serde(default)]
+    pub cipher: String,
+    #[serde(default)]
+    pub kdf_algorithm: String,
+    #[serde(default)]
+    pub created_at: Option<i64>,
+    #[serde(default)]
+    pub updated_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultInitRequest {
+    pub passphrase: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultUnlockRequest {
+    pub passphrase: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultSecretSummary {
+    pub id: String,
+    pub scope_kind: String,
+    pub scope_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub configured: bool,
+    pub version: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    #[serde(default)]
+    pub last_used_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultSecretListResponse {
+    #[serde(default)]
+    pub secrets: Vec<VaultSecretSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultSecretUpsertRequest {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub scope_kind: String,
+    pub scope_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultSecretUpdateRequest {
+    #[serde(default)]
+    pub scope_kind: Option<String>,
+    #[serde(default)]
+    pub scope_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub secret: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillPackageRecord {
     pub id: String,
     pub name: String,

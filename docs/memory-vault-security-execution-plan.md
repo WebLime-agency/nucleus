@@ -51,7 +51,7 @@ Source plans:
 | 0 | Planning | Plan split and master execution plan | completed | none | Planning docs reviewed for consistency; no implementation started. |
 | 1 | Security | Network posture + secure-origin + redaction primitives | completed | Phase 0 | PR #134 includes posture/redaction primitives plus provider/API credential response hardening. |
 | 2 | Memory | Prompt integration + real Memory UI | completed | Phase 0 | Phase 2 implementation committed on `feat/memory-prompt-ui`. |
-| 3 | Vault | Passphrase-protected local Vault backend | in_progress | Phase 1 | Active implementation phase; do not start Phase 4 until Phase 3 is reviewed, PR’d, merged into dev, and this plan is updated. |
+| 3 | Vault | Passphrase-protected local Vault backend | in_progress | Phase 1 | Phase 3 backend committed on `feat/vault-backend`; pending PR review/merge. UI/MCP remain deferred. |
 | 4 | Memory | Candidates + explicit/automatic capture loop | not_started | Phase 1, Phase 2 |  |
 | 5 | Vault | Workspace Vault UI + policy model | not_started | Phase 3 |  |
 | 6 | Vault/MCP | MCP `vault_bearer` integration | not_started | Phase 3, Phase 5 |  |
@@ -214,7 +214,7 @@ Completion notes:
 
 ## Phase 3 — Passphrase-protected local Vault backend
 
-Status: `not_started`
+Status: `in_progress`
 
 Source docs:
 
@@ -261,7 +261,15 @@ Exit criteria:
 
 Completion notes:
 
-- Pending.
+- Implemented on branch `feat/vault-backend`.
+- Added passphrase-protected local Vault backend with Argon2id KDF, XChaCha20-Poly1305 encryption, per-scope encrypted keys, per-secret nonces, and AAD binding for encrypted scope keys/secrets.
+- Added daemon-owned lock/unlock runtime state; Vault locks by default on daemon start because only encrypted state is persisted.
+- Added metadata-only Vault APIs for status, init, unlock, lock, create/update/list/delete secrets. No reveal endpoint exists.
+- Enforced safe-origin checks for init, unlock, create, update, and delete operations.
+- Added redacted audit events for Vault lifecycle and secret metadata changes without secret values.
+- Cleanup added endpoint-level status/list/lock/update/delete coverage, restart persistence coverage, and storage-level Vault persistence/delete cascade coverage before PR.
+- Checks run: `cargo fmt --all --check`, `cargo test -p nucleus-daemon vault`, `cargo test -p nucleus-storage vault`, and full `cargo test`.
+- Deferred to later phases: Workspace Vault management UI/policy editing, daemon-only secret resolution for MCP consumers, MCP `vault_bearer`, idle-timeout tuning surface, secret reveal/test endpoint, project Vault UI, external providers/keychain wrapping.
 
 ## Phase 4 — Memory candidates + explicit/automatic capture loop
 

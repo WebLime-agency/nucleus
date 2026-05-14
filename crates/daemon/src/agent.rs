@@ -36,7 +36,7 @@ use super::{
     load_router_profiles, publish_overview_event, publish_prompt_progress_event,
     publish_session_event, resolve_profile_targets, resolve_session_projects,
     resolve_workspace_profile, resolve_workspace_profile_target, try_record_audit_event,
-    unix_timestamp,
+    unix_timestamp, vault,
 };
 use crate::runtime::{PromptStreamEvent, ProviderTurnResult};
 use crate::worker_action::{ChildJobProposal, WorkerAction, parse_worker_action};
@@ -9093,6 +9093,7 @@ for line in sys.stdin:
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store)),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
