@@ -190,6 +190,20 @@ impl VaultRuntime {
         store.upsert_vault_secret(&record)
     }
 
+    pub fn decrypt_secret(
+        &mut self,
+        store: &StateStore,
+        secret: &VaultSecretRecord,
+    ) -> Result<String> {
+        self.lock_if_idle();
+        self.touch();
+        let root_key = self
+            .root_key
+            .as_ref()
+            .ok_or_else(|| anyhow!("vault is locked"))?;
+        decrypt_secret_with_root_key(root_key, store, secret)
+    }
+
     fn mark_unlocked(&mut self, key: [u8; 32], vault_id: String) {
         let now = now_seconds();
         self.root_key = Some(key);
@@ -272,6 +286,14 @@ pub fn decrypt_secret_for_test(
         .root_key
         .as_ref()
         .ok_or_else(|| anyhow!("vault is locked"))?;
+    decrypt_secret_with_root_key(root_key, store, secret)
+}
+
+fn decrypt_secret_with_root_key(
+    root_key: &[u8; 32],
+    store: &StateStore,
+    secret: &VaultSecretRecord,
+) -> Result<String> {
     let scope = store
         .load_vault_scope_key(&secret.scope_kind, &secret.scope_id)?
         .ok_or_else(|| anyhow!("vault scope key was not found"))?;
