@@ -57,7 +57,7 @@ Source plans:
 | 6 | Vault/MCP | MCP `vault_bearer` integration | completed | Phase 3, Phase 5 | PR #145 merged into `dev` at `30478a9c4424d511b7a1298536053e26e5c22595`; not released. |
 | 7 | Vault | Project Vaults | completed | Phase 5 | PR #147 merged into `dev` at `b1339246357fd9df29ba70b9e7b983b37ee8e1c5`; not released. |
 | 8 | Memory | SQLite FTS5 searchable memory provider | completed | Phase 4 | PR #149 merged into `dev` at `69adddf83a3181acda5f1497a88814cf37aced22`; not released. |
-| 9 | Security | Built-in/guided HTTPS and bind-mode hardening | in_progress | Phase 1 | Local work on `feat/bind-mode-hardening`; not merged or released. |
+| 9 | Security | Built-in/guided HTTPS and bind-mode hardening | completed | Phase 1 | PR #151 merged into `dev` at `1038591ef11d23ab692f4e0e1eea420c942d584a`; not released. |
 | 10 | Release | Stable managed release and EBA verification | not_started | Phases required by release scope |  |
 | 11 | Future | Retrieval provider interface and optional semantic search | not_started | Phase 8 |  |
 | 12 | Future | Optional external Vault providers / OS keychain wrapping | not_started | Phase 6 |  |
@@ -523,11 +523,11 @@ Completion notes:
 - Search updates `use_count` and `last_used_at` for returned/recalled memory.
 - Search indexes and returns accepted/enabled memory only; pending/rejected/dismissed candidates are not indexed or searched, and archived/disabled memory is excluded.
 - No Vault changes, semantic/vector memory, promotion, release, or managed install work was included.
-- Phase 9 and later remain `not_started`.
+- Phase 10 and later remain `not_started`.
 
 ## Phase 9 — HTTPS and bind-mode hardening
 
-Status: `in_progress`
+Status: `completed`
 
 Source docs:
 
@@ -554,9 +554,16 @@ Exit criteria:
 
 Completion notes:
 
-- Local Phase 9 work is in progress on `feat/bind-mode-hardening`.
-- Target implementation adds explicit bind-mode posture/guidance, keeps Vault safe-origin enforcement intact, and updates managed install guidance to avoid silent remote exposure.
-- Phase 10 and later remain `not_started`; no promotion, release, or managed install updates have been performed.
+- PR #151 merged into `dev` at `1038591ef11d23ab692f4e0e1eea420c942d584a`; checks passed and Phase 9 is not released.
+- Added explicit bind-mode posture metadata and guidance.
+- Added bind-mode classifications for localhost-only, Tailscale/private, LAN/all-interface, custom/public, and custom/unknown exposure.
+- Surfaced bind-mode labels, recommendations, and Vault origin requirements in settings/security posture.
+- Updated the workspace connection card to display bind mode and Vault origin guidance.
+- Preserved Phase 1 safe-origin behavior: Vault plaintext operations still require loopback HTTP or HTTPS, and LAN/VPN/public plain HTTP remains not Vault-safe.
+- CLI setup, install-service, and release install now require explicit `--allow-unsafe-bind` for remote-exposing binds, and unsafe bind opt-in prints a warning.
+- Managed release docs now discourage casual `0.0.0.0` exposure and explain localhost, Tailscale/private, LAN/all-interface, and custom/public exposure modes.
+- No Vault/MCP policy weakening, reveal endpoint, release, promotion, or managed install updates were included.
+- Phase 10 and later remain `not_started`.
 
 ## Phase 10 — Stable managed release and EBA verification
 
