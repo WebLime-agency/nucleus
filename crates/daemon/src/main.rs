@@ -53,14 +53,16 @@ use nucleus_protocol::{
     SkillManifest, SkillPackageRecord, SkillPackageUpsertRequest, SkillReconcileCandidate,
     SkillReconcileRequest, SkillReconcileScanResponse, StreamConnected, SystemStats,
     UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
-    VaultInitRequest, VaultSecretListResponse, VaultSecretSummary, VaultSecretUpdateRequest,
-    VaultSecretUpsertRequest, VaultStatusSummary, VaultUnlockRequest, WorkspaceModelConfig,
-    WorkspaceProfileSummary, WorkspaceProfileWriteRequest, WorkspaceSummary,
+    VaultInitRequest, VaultSecretListResponse, VaultSecretPolicyListResponse,
+    VaultSecretPolicySummary, VaultSecretPolicyUpsertRequest, VaultSecretSummary,
+    VaultSecretUpdateRequest, VaultSecretUpsertRequest, VaultStatusSummary, VaultUnlockRequest,
+    WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceProfileWriteRequest, WorkspaceSummary,
     WorkspaceUpdateRequest,
 };
 use nucleus_release::read_installed_release_metadata;
 use nucleus_storage::{
-    AuditEventRecord, ProjectPatch, SessionPatch, SessionRecord, StateStore, WorkspaceProfilePatch,
+    AuditEventRecord, ProjectPatch, SessionPatch, SessionRecord, StateStore,
+    VaultSecretPolicyRecord, WorkspaceProfilePatch,
 };
 use runtime::RuntimeManager;
 use serde::{Deserialize, de::DeserializeOwned};
@@ -262,6 +264,14 @@ fn app(state: AppState) -> Router {
         .route(
             "/vault/secrets/{secret_id}",
             axum::routing::patch(update_vault_secret).delete(delete_vault_secret),
+        )
+        .route(
+            "/vault/secrets/{secret_id}/policies",
+            get(list_vault_secret_policies).post(upsert_vault_secret_policy),
+        )
+        .route(
+            "/vault/secrets/{secret_id}/policies/{policy_id}",
+            axum::routing::delete(delete_vault_secret_policy),
         )
         .route("/actions", get(actions))
         .route("/actions/{action_id}", get(action_detail))
@@ -1634,6 +1644,84 @@ async fn delete_vault_secret(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn list_vault_secret_policies(
+    State(state): State<AppState>,
+    Path(secret_id): Path<String>,
+) -> Result<Json<VaultSecretPolicyListResponse>, ApiError> {
+    let secret_id = sanitize_registry_id(&secret_id, "vault secret id")?;
+    let _ = state.store.load_vault_secret(&secret_id)?;
+    let policies = state
+        .store
+        .list_vault_secret_policies(&secret_id)?
+        .into_iter()
+        .map(vault_secret_policy_summary)
+        .collect();
+    Ok(Json(VaultSecretPolicyListResponse { policies }))
+}
+
+async fn upsert_vault_secret_policy(
+    State(state): State<AppState>,
+    Path(secret_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<VaultSecretPolicySummary>, ApiError> {
+    require_vault_safe_origin(&headers)?;
+    let secret_id = sanitize_registry_id(&secret_id, "vault secret id")?;
+    let _ = state.store.load_vault_secret(&secret_id)?;
+    if !state.vault.lock().await.is_unlocked() {
+        return Err(ApiError::forbidden("vault is locked"));
+    }
+    let payload = decode_json::<VaultSecretPolicyUpsertRequest>(&body)?;
+    let record = VaultSecretPolicyRecord {
+        id: payload
+            .id
+            .map(|id| sanitize_registry_id(&id, "vault policy id"))
+            .transpose()?
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        secret_id: secret_id.clone(),
+        consumer_kind: normalize_vault_consumer_kind(&payload.consumer_kind)?,
+        consumer_id: sanitize_registry_id(&payload.consumer_id, "vault consumer id")?,
+        permission: normalize_vault_permission(&payload.permission)?,
+        approval_mode: normalize_vault_approval_mode(&payload.approval_mode)?,
+        created_at: 0,
+        updated_at: 0,
+    };
+    let saved = state.store.upsert_vault_secret_policy(&record)?;
+    record_vault_audit(
+        &state,
+        "vault.secret.policy.updated",
+        &format!("vault_secret:{}", secret_id),
+        "Updated Vault secret access policy metadata.",
+    )
+    .await;
+    Ok(Json(vault_secret_policy_summary(saved)))
+}
+
+async fn delete_vault_secret_policy(
+    State(state): State<AppState>,
+    Path((secret_id, policy_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    require_vault_safe_origin(&headers)?;
+    let secret_id = sanitize_registry_id(&secret_id, "vault secret id")?;
+    let policy_id = sanitize_registry_id(&policy_id, "vault policy id")?;
+    let _ = state.store.load_vault_secret(&secret_id)?;
+    if !state.vault.lock().await.is_unlocked() {
+        return Err(ApiError::forbidden("vault is locked"));
+    }
+    state
+        .store
+        .delete_vault_secret_policy(&secret_id, &policy_id)?;
+    record_vault_audit(
+        &state,
+        "vault.secret.policy.deleted",
+        &format!("vault_secret:{}", secret_id),
+        "Deleted Vault secret access policy metadata.",
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 fn require_vault_safe_origin(headers: &HeaderMap) -> Result<(), ApiError> {
     let origin = security::classify_request_origin(headers);
     if origin.safe {
@@ -1667,6 +1755,31 @@ fn normalize_vault_scope_kind(value: &str) -> Result<String, ApiError> {
         "workspace" | "project" => Ok(value.trim().to_string()),
         _ => Err(ApiError::bad_request(
             "vault scope kind must be workspace or project",
+        )),
+    }
+}
+
+fn normalize_vault_consumer_kind(value: &str) -> Result<String, ApiError> {
+    match value.trim() {
+        "mcp" | "action" | "tool" | "workspace" => Ok(value.trim().to_string()),
+        _ => Err(ApiError::bad_request(
+            "vault consumer kind must be mcp, action, tool, or workspace",
+        )),
+    }
+}
+
+fn normalize_vault_permission(value: &str) -> Result<String, ApiError> {
+    match value.trim() {
+        "read" => Ok(value.trim().to_string()),
+        _ => Err(ApiError::bad_request("vault permission must be read")),
+    }
+}
+
+fn normalize_vault_approval_mode(value: &str) -> Result<String, ApiError> {
+    match value.trim() {
+        "allow" | "ask" | "deny" => Ok(value.trim().to_string()),
+        _ => Err(ApiError::bad_request(
+            "vault approval mode must be allow, ask, or deny",
         )),
     }
 }
@@ -1738,6 +1851,19 @@ fn vault_secret_summary(secret: nucleus_storage::VaultSecretRecord) -> VaultSecr
         created_at: secret.created_at,
         updated_at: secret.updated_at,
         last_used_at: secret.last_used_at,
+    }
+}
+
+fn vault_secret_policy_summary(policy: VaultSecretPolicyRecord) -> VaultSecretPolicySummary {
+    VaultSecretPolicySummary {
+        id: policy.id,
+        secret_id: policy.secret_id,
+        consumer_kind: policy.consumer_kind,
+        consumer_id: policy.consumer_id,
+        permission: policy.permission,
+        approval_mode: policy.approval_mode,
+        created_at: policy.created_at,
+        updated_at: policy.updated_at,
     }
 }
 
@@ -9098,6 +9224,70 @@ mod tests {
         let serialized = serde_json::to_string(&audit).expect("audit serializes");
         assert!(serialized.contains("vault.secret.created"));
         assert!(!serialized.contains("audit-secret-value"));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn vault_policy_api_is_metadata_only_and_requires_safe_unlocked_vault() {
+        let (state_dir, state) = test_named_app_state("vault-policy-api");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "origin",
+            axum::http::HeaderValue::from_static("http://localhost:5201"),
+        );
+        let _ = vault_init(
+            State(state.clone()),
+            headers.clone(),
+            Bytes::from(r#"{"passphrase":"correct horse battery staple"}"#),
+        )
+        .await
+        .expect("vault init succeeds");
+        let _ = create_vault_secret(
+            State(state.clone()),
+            headers.clone(),
+            Bytes::from(r#"{"id":"policy-token","scope_kind":"workspace","scope_id":"workspace","name":"POLICY_TOKEN","secret":"policy-secret-value"}"#),
+        )
+        .await
+        .expect("secret create succeeds");
+
+        let policy = upsert_vault_secret_policy(
+            State(state.clone()),
+            Path("policy-token".to_string()),
+            headers.clone(),
+            Bytes::from(r#"{"consumer_kind":"mcp","consumer_id":"server-1","permission":"read","approval_mode":"ask"}"#),
+        )
+        .await
+        .expect("policy upsert succeeds")
+        .0;
+        assert_eq!(policy.consumer_kind, "mcp");
+        assert_eq!(policy.approval_mode, "ask");
+
+        let listed =
+            list_vault_secret_policies(State(state.clone()), Path("policy-token".to_string()))
+                .await
+                .expect("policies list")
+                .0;
+        assert_eq!(listed.policies.len(), 1);
+        let serialized = serde_json::to_string(&listed).expect("policy list serializes");
+        assert!(!serialized.contains("policy-secret-value"));
+
+        let _ = vault_lock(State(state.clone()))
+            .await
+            .expect("lock succeeds");
+        let locked_error = upsert_vault_secret_policy(
+            State(state.clone()),
+            Path("policy-token".to_string()),
+            headers.clone(),
+            Bytes::from(r#"{"consumer_kind":"mcp","consumer_id":"server-2","permission":"read","approval_mode":"ask"}"#),
+        )
+        .await
+        .expect_err("locked vault rejects policy writes");
+        assert_eq!(locked_error.status, StatusCode::FORBIDDEN);
+
+        let audit = state.store.list_audit_events(20).expect("audit lists");
+        let audit_serialized = serde_json::to_string(&audit).expect("audit serializes");
+        assert!(audit_serialized.contains("vault.secret.policy.updated"));
+        assert!(!audit_serialized.contains("policy-secret-value"));
         let _ = fs::remove_dir_all(&state_dir);
     }
 
