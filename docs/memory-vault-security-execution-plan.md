@@ -50,7 +50,7 @@ Source plans:
 | --- | --- | --- | --- | --- | --- |
 | 0 | Planning | Plan split and master execution plan | completed | none | Planning docs reviewed for consistency; no implementation started. |
 | 1 | Security | Network posture + secure-origin + redaction primitives | completed | Phase 0 | PR #134 includes posture/redaction primitives plus provider/API credential response hardening. |
-| 2 | Memory | Prompt integration + real Memory UI | not_started | Phase 0 |  |
+| 2 | Memory | Prompt integration + real Memory UI | completed | Phase 0 | Phase 2 implementation committed on `feat/memory-prompt-ui`. |
 | 3 | Vault | Passphrase-protected local Vault backend | not_started | Phase 1 |  |
 | 4 | Memory | Candidates + explicit/automatic capture loop | not_started | Phase 1, Phase 2 |  |
 | 5 | Vault | Workspace Vault UI + policy model | not_started | Phase 3 |  |
@@ -162,7 +162,7 @@ Follow-up: provider/API credential response hardening
 
 ## Phase 2 — Memory prompt integration + real Memory UI
 
-Status: `not_started`
+Status: `completed`
 
 Source doc:
 
@@ -203,7 +203,14 @@ Exit criteria:
 
 Completion notes:
 
-- Pending.
+- Implemented on branch `feat/memory-prompt-ui`.
+- Commit: branch HEAD for `feat: add memory prompt integration and management UI`.
+- Extended Memory protocol/storage/API handling with accepted/manual defaults, validation/normalization, and prompt-visible safety redaction for stored text.
+- Fixed compiled prompt assembly so prompt include contents become provider-visible compiled layers before memory and skills.
+- Added accepted-memory prompt layers with workspace/project/session scope filtering, conservative budgeting/truncation, and debug counts.
+- Replaced the placeholder Memory page with a real accepted-memory management UI and prompt-visible/secret warning copy.
+- Checks run: `cargo fmt --all --check`, `cargo test -p nucleus-daemon memory`, `cargo test -p nucleus-daemon compiled_turn_includes_prompt_includes_and_accepted_memory`, full `cargo test`, `npm run check:web`, and `npm run build:web`.
+- Deferred: candidate extraction/review, Vault backend/UI, MCP `vault_bearer`, semantic/vector memory, and FTS search remain out of Phase 2 scope.
 
 ## Phase 3 — Passphrase-protected local Vault backend
 
