@@ -186,17 +186,23 @@ pub fn build_security_posture(bind: &str, headers: &HeaderMap) -> SecurityPostur
     let origin = classify_request_origin(headers);
     let bind_ip = parse_bind_ip(bind);
     let exposure = classify_bind_exposure(bind, bind_ip);
+    let bind_mode = classify_bind_mode(&exposure);
     let mut warnings = Vec::new();
 
     if exposure == "all_interfaces" {
         warnings.push(
-            "Daemon is bound to all interfaces; plain HTTP LAN access is not Vault-safe."
+            "Daemon is bound to all interfaces; use localhost-only unless you explicitly need LAN/VPN access. Plain HTTP remote access is not Vault-safe."
                 .to_string(),
         );
     } else if exposure == "lan_or_private_interface" || exposure == "tailscale_or_private_interface"
     {
         warnings.push(
-            "Daemon is reachable beyond loopback; use HTTPS before future Vault operations."
+            "Daemon is reachable beyond loopback; Vault plaintext operations still require localhost or HTTPS."
+                .to_string(),
+        );
+    } else if exposure == "public_interface" {
+        warnings.push(
+            "Daemon appears to be bound to a public interface; place it behind HTTPS and explicit access controls before remote use."
                 .to_string(),
         );
     }
@@ -211,6 +217,12 @@ pub fn build_security_posture(bind: &str, headers: &HeaderMap) -> SecurityPostur
     SecurityPostureSummary {
         configured_bind: bind.to_string(),
         exposure,
+        bind_mode: bind_mode.to_string(),
+        bind_mode_label: bind_mode_label(bind_mode).to_string(),
+        recommended_bind: recommended_bind(bind_mode).map(str::to_string),
+        vault_origin_requirement:
+            "Vault unlock/create/update require a loopback HTTP origin or HTTPS; plain HTTP over LAN, VPN, or public interfaces is blocked by default."
+                .to_string(),
         https_active: origin.https,
         current_origin: if origin.origin.is_empty() {
             None
@@ -221,6 +233,42 @@ pub fn build_security_posture(bind: &str, headers: &HeaderMap) -> SecurityPostur
         current_origin_reason: origin.reason,
         local_interfaces: detected_interfaces(bind, bind_ip),
         warnings,
+    }
+}
+
+fn classify_bind_mode(exposure: &str) -> &'static str {
+    match exposure {
+        "localhost_only" => "localhost_only",
+        "tailscale_or_private_interface" => "tailscale_private",
+        "lan_or_private_interface" | "all_interfaces" => "lan",
+        "public_interface" => "custom_public",
+        _ => "custom_unknown",
+    }
+}
+
+fn bind_mode_label(bind_mode: &str) -> &'static str {
+    match bind_mode {
+        "localhost_only" => "Localhost only",
+        "tailscale_private" => "Tailscale/private interface",
+        "lan" => "LAN/all interfaces",
+        "custom_public" => "Custom/public",
+        _ => "Custom/unknown",
+    }
+}
+
+fn recommended_bind(bind_mode: &str) -> Option<&'static str> {
+    match bind_mode {
+        "localhost_only" => None,
+        "tailscale_private" => {
+            Some("Use a specific Tailscale/private interface IP and HTTPS for Vault operations.")
+        }
+        "lan" => Some(
+            "Prefer 127.0.0.1:<port>; choose LAN/all-interface binding only with an explicit warning and keep Vault operations on localhost or HTTPS.",
+        ),
+        "custom_public" => Some(
+            "Avoid direct public binding; use localhost behind an HTTPS reverse proxy or Tailscale certificate.",
+        ),
+        _ => Some("Prefer 127.0.0.1:<port> unless you have an explicit network exposure plan."),
     }
 }
 
@@ -393,6 +441,45 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("origin", HeaderValue::from_static("http://localhost:5173"));
         assert!(classify_request_origin(&headers).safe);
+    }
+
+    #[test]
+    fn classifies_bind_modes_and_warns_for_remote_plain_http_exposure() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "origin",
+            HeaderValue::from_static("http://192.168.1.20:5201"),
+        );
+
+        let localhost = build_security_posture("127.0.0.1:5201", &headers);
+        assert_eq!(localhost.bind_mode, "localhost_only");
+        assert_eq!(localhost.exposure, "localhost_only");
+
+        let all_interfaces = build_security_posture("0.0.0.0:5201", &headers);
+        assert_eq!(all_interfaces.bind_mode, "lan");
+        assert_eq!(all_interfaces.exposure, "all_interfaces");
+        assert!(!all_interfaces.current_origin_vault_safe);
+        assert!(
+            all_interfaces
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("all interfaces"))
+        );
+        assert!(
+            all_interfaces
+                .vault_origin_requirement
+                .contains("loopback HTTP origin or HTTPS")
+        );
+
+        let tailscale = build_security_posture("100.80.12.4:5201", &headers);
+        assert_eq!(tailscale.bind_mode, "tailscale_private");
+        assert_eq!(tailscale.exposure, "tailscale_or_private_interface");
+        assert!(
+            tailscale
+                .recommended_bind
+                .unwrap_or_default()
+                .contains("Tailscale")
+        );
     }
 
     #[test]
