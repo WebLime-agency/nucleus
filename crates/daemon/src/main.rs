@@ -1,7 +1,9 @@
 mod agent;
 mod host;
 mod runtime;
+mod security;
 mod updates;
+mod vault;
 mod worker_action;
 
 use std::{
@@ -49,7 +51,9 @@ use nucleus_protocol::{
     SkillInstallationUpsertRequest, SkillManifest, SkillPackageRecord, SkillPackageUpsertRequest,
     SkillReconcileCandidate, SkillReconcileRequest, SkillReconcileScanResponse, StreamConnected,
     SystemStats, UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
-    WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceProfileWriteRequest, WorkspaceSummary,
+    VaultInitRequest, VaultSecretListResponse, VaultSecretSummary, VaultSecretUpdateRequest,
+    VaultSecretUpsertRequest, VaultStatusSummary, VaultUnlockRequest, WorkspaceModelConfig,
+    WorkspaceProfileSummary, WorkspaceProfileWriteRequest, WorkspaceSummary,
     WorkspaceUpdateRequest,
 };
 use nucleus_release::read_installed_release_metadata;
@@ -82,6 +86,8 @@ const MAX_AUDIT_LIMIT: usize = 100;
 const MAX_PROMPT_INCLUDE_FILES: usize = 24;
 const MAX_PROMPT_INCLUDE_FILE_CHARS: usize = 6_000;
 const MAX_PROMPT_INCLUDE_TOTAL_CHARS: usize = 24_000;
+const MAX_MEMORY_CONTEXT_CHARS: usize = 12_000;
+const MEMORY_TRUNCATION_NOTICE: &str = "\n[Memory entry truncated by Nucleus context budget]";
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(900);
 const INITIAL_UPDATE_CHECK_DELAY: Duration = Duration::from_secs(3);
 const RESTART_AFTER_RESPONSE_DELAY: Duration = Duration::from_millis(800);
@@ -93,6 +99,7 @@ struct AppState {
     host: Arc<HostEngine>,
     runtimes: Arc<RuntimeManager>,
     updates: Arc<UpdateManager>,
+    vault: Arc<tokio::sync::Mutex<vault::VaultRuntime>>,
     agent: Arc<agent::AgentRuntime>,
     web_dist_dir: Option<PathBuf>,
     tailscale_dns_name: Option<String>,
@@ -115,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
         host: Arc::new(HostEngine::new()),
         runtimes: Arc::new(RuntimeManager::default()),
         updates,
+        vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
         agent: Arc::new(agent::AgentRuntime::default()),
         web_dist_dir,
         tailscale_dns_name: detect_tailscale_dns_name(),
@@ -222,6 +230,18 @@ fn app(state: AppState) -> Router {
             "/memory/{memory_id}",
             axum::routing::put(upsert_memory_by_id).delete(delete_memory),
         )
+        .route("/vault/status", get(vault_status))
+        .route("/vault/init", axum::routing::post(vault_init))
+        .route("/vault/unlock", axum::routing::post(vault_unlock))
+        .route("/vault/lock", axum::routing::post(vault_lock))
+        .route(
+            "/vault/secrets",
+            get(list_vault_secrets).post(create_vault_secret),
+        )
+        .route(
+            "/vault/secrets/{secret_id}",
+            axum::routing::patch(update_vault_secret).delete(delete_vault_secret),
+        )
         .route("/actions", get(actions))
         .route("/actions/{action_id}", get(action_detail))
         .route("/actions/{action_id}/run", axum::routing::post(run_action))
@@ -325,8 +345,11 @@ async fn runtimes(
     Ok(Json(load_runtimes(&state, force_refresh).await?))
 }
 
-async fn settings(State(state): State<AppState>) -> Result<Json<SettingsSummary>, ApiError> {
-    Ok(Json(build_settings_summary(&state).await))
+async fn settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<SettingsSummary>, ApiError> {
+    Ok(Json(build_settings_summary(&state, &headers).await))
 }
 
 async fn check_for_updates(State(state): State<AppState>) -> Result<Json<UpdateStatus>, ApiError> {
@@ -375,7 +398,7 @@ async fn restart_daemon(State(state): State<AppState>) -> Result<Json<UpdateStat
 }
 
 async fn workspace(State(state): State<AppState>) -> Result<Json<WorkspaceSummary>, ApiError> {
-    Ok(Json(state.store.workspace()?))
+    Ok(Json(redact_workspace_summary(state.store.workspace()?)))
 }
 
 async fn update_workspace(
@@ -434,7 +457,7 @@ async fn update_workspace(
     )
     .await;
     let _ = publish_overview_event(&state).await;
-    Ok(Json(workspace))
+    Ok(Json(redact_workspace_summary(workspace)))
 }
 
 async fn create_workspace_profile(
@@ -459,7 +482,7 @@ async fn create_workspace_profile(
     )
     .await;
     let _ = publish_overview_event(&state).await;
-    Ok(Json(profile))
+    Ok(Json(redact_workspace_profile(profile)))
 }
 
 async fn update_workspace_profile(
@@ -485,7 +508,7 @@ async fn update_workspace_profile(
     )
     .await;
     let _ = publish_overview_event(&state).await;
-    Ok(Json(profile))
+    Ok(Json(redact_workspace_profile(profile)))
 }
 
 async fn delete_workspace_profile(
@@ -509,7 +532,7 @@ async fn delete_workspace_profile(
     )
     .await;
     let _ = publish_overview_event(&state).await;
-    Ok(Json(workspace))
+    Ok(Json(redact_workspace_summary(workspace)))
 }
 
 async fn sync_projects(State(state): State<AppState>) -> Result<Json<WorkspaceSummary>, ApiError> {
@@ -534,7 +557,7 @@ async fn sync_projects(State(state): State<AppState>) -> Result<Json<WorkspaceSu
         );
     }
     let _ = publish_overview_event(&state).await;
-    Ok(Json(workspace))
+    Ok(Json(redact_workspace_summary(workspace)))
 }
 
 async fn update_project(
@@ -561,13 +584,15 @@ async fn update_project(
     )
     .await;
     let _ = publish_overview_event(&state).await;
-    Ok(Json(state.store.workspace()?))
+    Ok(Json(redact_workspace_summary(state.store.workspace()?)))
 }
 
 async fn router_profiles(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<RouterProfileSummary>>, ApiError> {
-    Ok(Json(load_router_profiles(&state, false).await?))
+    Ok(Json(redact_router_profiles(
+        load_router_profiles(&state, false).await?,
+    )))
 }
 
 async fn list_skills(State(state): State<AppState>) -> Result<Json<Vec<SkillManifest>>, ApiError> {
@@ -651,7 +676,7 @@ async fn upsert_skill_installation_by_id(
 async fn list_mcp_servers(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<McpServerSummary>>, ApiError> {
-    Ok(Json(state.store.list_mcp_servers()?))
+    Ok(Json(redact_mcp_servers(state.store.list_mcp_servers()?)))
 }
 
 async fn upsert_mcp_server(
@@ -659,7 +684,9 @@ async fn upsert_mcp_server(
     body: Bytes,
 ) -> Result<Json<McpServerSummary>, ApiError> {
     let payload = sanitize_mcp_server(decode_json::<McpServerSummary>(&body)?)?;
-    Ok(Json(state.store.upsert_mcp_server(&payload)?))
+    Ok(Json(redact_mcp_server(
+        state.store.upsert_mcp_server(&payload)?,
+    )))
 }
 
 async fn upsert_mcp_server_by_id(
@@ -669,7 +696,9 @@ async fn upsert_mcp_server_by_id(
 ) -> Result<Json<McpServerSummary>, ApiError> {
     let mut payload = sanitize_mcp_server(decode_json::<McpServerSummary>(&body)?)?;
     payload.id = sanitize_registry_id(&server_id, "MCP server id")?;
-    Ok(Json(state.store.upsert_mcp_server(&payload)?))
+    Ok(Json(redact_mcp_server(
+        state.store.upsert_mcp_server(&payload)?,
+    )))
 }
 
 async fn list_memory(State(state): State<AppState>) -> Result<Json<MemorySummary>, ApiError> {
@@ -731,11 +760,11 @@ fn upsert_memory_from_request(
     payload: MemoryEntryUpsertRequest,
     id_override: Option<String>,
 ) -> Result<MemoryEntry, ApiError> {
-    let scope_kind = payload.scope_kind.trim();
+    let scope_kind = normalize_memory_scope_kind(&payload.scope_kind)?;
     let scope_id = payload.scope_id.trim();
     let title = payload.title.trim();
-    let content = payload.content.trim();
-    if scope_kind.is_empty() || scope_id.is_empty() || title.is_empty() || content.is_empty() {
+    let content = security::RedactionSet::new().redact_text(payload.content.trim());
+    if scope_id.is_empty() || title.is_empty() || content.is_empty() {
         return Err(ApiError::bad_request(
             "memory scope, title, and content are required",
         ));
@@ -746,10 +775,10 @@ fn upsert_memory_from_request(
     };
     let entry = MemoryEntry {
         id,
-        scope_kind: scope_kind.to_string(),
+        scope_kind,
         scope_id: scope_id.to_string(),
         title: title.to_string(),
-        content: content.to_string(),
+        content,
         tags: payload
             .tags
             .into_iter()
@@ -757,6 +786,17 @@ fn upsert_memory_from_request(
             .filter(|tag: &String| !tag.is_empty())
             .collect(),
         enabled: payload.enabled.unwrap_or(true),
+        status: normalize_memory_status(payload.status.as_deref())?,
+        memory_kind: normalize_memory_kind(payload.memory_kind.as_deref())?,
+        source_kind: normalize_memory_source_kind(payload.source_kind.as_deref())?,
+        source_id: payload.source_id.unwrap_or_default().trim().to_string(),
+        confidence: payload.confidence.unwrap_or(1.0).clamp(0.0, 1.0),
+        created_by: normalize_memory_created_by(payload.created_by.as_deref())?,
+        last_used_at: payload.last_used_at,
+        use_count: payload.use_count.unwrap_or(0).max(0),
+        supersedes_id: payload.supersedes_id.unwrap_or_default().trim().to_string(),
+        metadata_json: security::RedactionSet::new()
+            .redact_json(&payload.metadata_json.unwrap_or_else(|| json!({}))),
         created_at: 0,
         updated_at: 0,
     };
@@ -764,6 +804,378 @@ fn upsert_memory_from_request(
         .store
         .upsert_memory_entry(&entry)
         .map_err(ApiError::from)
+}
+
+fn normalize_memory_scope_kind(value: &str) -> Result<String, ApiError> {
+    match value.trim() {
+        "workspace" | "project" | "session" => Ok(value.trim().to_string()),
+        _ => Err(ApiError::bad_request(
+            "memory scope kind must be workspace, project, or session",
+        )),
+    }
+}
+
+fn normalize_memory_status(value: Option<&str>) -> Result<String, ApiError> {
+    let value = value.unwrap_or("accepted").trim();
+    match value {
+        "accepted" | "archived" => Ok(value.to_string()),
+        _ => Err(ApiError::bad_request(
+            "memory status must be accepted or archived",
+        )),
+    }
+}
+
+fn normalize_memory_kind(value: Option<&str>) -> Result<String, ApiError> {
+    let value = value.unwrap_or("note").trim();
+    match value {
+        "note" | "fact" | "preference" | "decision" | "project_note" | "solution"
+        | "constraint" | "todo" => Ok(value.to_string()),
+        _ => Err(ApiError::bad_request(
+            "memory kind must be note, fact, preference, decision, project_note, solution, constraint, or todo",
+        )),
+    }
+}
+
+fn normalize_memory_source_kind(value: Option<&str>) -> Result<String, ApiError> {
+    let value = value.unwrap_or("manual").trim();
+    match value {
+        "manual" | "candidate" | "explicit_remember" | "import" | "system" => Ok(value.to_string()),
+        _ => Err(ApiError::bad_request(
+            "memory source kind must be manual, candidate, explicit_remember, import, or system",
+        )),
+    }
+}
+
+fn normalize_memory_created_by(value: Option<&str>) -> Result<String, ApiError> {
+    let value = value.unwrap_or("user").trim();
+    match value {
+        "user" | "assistant" | "utility_worker" | "system" => Ok(value.to_string()),
+        _ => Err(ApiError::bad_request(
+            "memory created_by must be user, assistant, utility_worker, or system",
+        )),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct VaultSecretListQuery {
+    scope_kind: Option<String>,
+    scope_id: Option<String>,
+}
+
+async fn vault_status(State(state): State<AppState>) -> Result<Json<VaultStatusSummary>, ApiError> {
+    Ok(Json(vault_status_summary(&state).await?))
+}
+
+async fn vault_init(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<VaultStatusSummary>, ApiError> {
+    require_vault_safe_origin(&headers)?;
+    let payload = decode_json::<VaultInitRequest>(&body)?;
+    let mut vault = state.vault.lock().await;
+    let record = vault
+        .initialize(&state.store, &payload.passphrase)
+        .map_err(vault_api_error)?;
+    drop(vault);
+    record_vault_audit(
+        &state,
+        "vault.initialized",
+        "vault:default",
+        "Initialized local Vault.",
+    )
+    .await;
+    Ok(Json(vault_status_from_record(Some(record), true)))
+}
+
+async fn vault_unlock(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<VaultStatusSummary>, ApiError> {
+    require_vault_safe_origin(&headers)?;
+    let payload = decode_json::<VaultUnlockRequest>(&body)?;
+    let mut vault = state.vault.lock().await;
+    match vault.unlock(&state.store, &payload.passphrase) {
+        Ok(record) => {
+            drop(vault);
+            record_vault_audit(
+                &state,
+                "vault.unlocked",
+                "vault:default",
+                "Unlocked local Vault.",
+            )
+            .await;
+            Ok(Json(vault_status_from_record(Some(record), true)))
+        }
+        Err(error) => {
+            drop(vault);
+            record_vault_audit(
+                &state,
+                "vault.unlock_failed",
+                "vault:default",
+                "Vault unlock failed.",
+            )
+            .await;
+            Err(vault_api_error(error))
+        }
+    }
+}
+
+async fn vault_lock(State(state): State<AppState>) -> Result<Json<VaultStatusSummary>, ApiError> {
+    state.vault.lock().await.lock();
+    record_vault_audit(
+        &state,
+        "vault.locked",
+        "vault:default",
+        "Locked local Vault.",
+    )
+    .await;
+    Ok(Json(vault_status_summary(&state).await?))
+}
+
+async fn list_vault_secrets(
+    State(state): State<AppState>,
+    Query(query): Query<VaultSecretListQuery>,
+) -> Result<Json<VaultSecretListResponse>, ApiError> {
+    let secrets = state
+        .store
+        .list_vault_secrets(query.scope_kind.as_deref(), query.scope_id.as_deref())?
+        .into_iter()
+        .map(vault_secret_summary)
+        .collect();
+    Ok(Json(VaultSecretListResponse { secrets }))
+}
+
+async fn create_vault_secret(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<VaultSecretSummary>, ApiError> {
+    require_vault_safe_origin(&headers)?;
+    let payload = decode_json::<VaultSecretUpsertRequest>(&body)?;
+    let input = validate_vault_secret_create(payload)?;
+    let mut vault = state.vault.lock().await;
+    let saved = vault
+        .create_or_update_secret(&state.store, input)
+        .map_err(vault_api_error)?;
+    drop(vault);
+    record_vault_audit(
+        &state,
+        "vault.secret.created",
+        &format!("vault_secret:{}", saved.id),
+        "Created Vault secret metadata.",
+    )
+    .await;
+    Ok(Json(vault_secret_summary(saved)))
+}
+
+async fn update_vault_secret(
+    State(state): State<AppState>,
+    Path(secret_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<VaultSecretSummary>, ApiError> {
+    require_vault_safe_origin(&headers)?;
+    let secret_id = sanitize_registry_id(&secret_id, "vault secret id")?;
+    let existing = state.store.load_vault_secret(&secret_id)?;
+    let payload = decode_json::<VaultSecretUpdateRequest>(&body)?;
+    let secret = payload
+        .secret
+        .ok_or_else(|| ApiError::bad_request("vault secret value is required for update"))?;
+    let scope_id = match payload.scope_id {
+        Some(scope_id) => non_empty_trimmed(scope_id, "vault scope id")?,
+        None => existing.scope_id,
+    };
+    let input = vault::VaultSecretInput {
+        id: Some(secret_id),
+        scope_kind: normalize_vault_scope_kind(
+            payload
+                .scope_kind
+                .as_deref()
+                .unwrap_or(&existing.scope_kind),
+        )?,
+        scope_id,
+        name: sanitize_vault_secret_name(payload.name.as_deref().unwrap_or(&existing.name))?,
+        description: payload
+            .description
+            .unwrap_or(existing.description)
+            .trim()
+            .to_string(),
+        secret,
+    };
+    let mut vault = state.vault.lock().await;
+    let saved = vault
+        .create_or_update_secret(&state.store, input)
+        .map_err(vault_api_error)?;
+    drop(vault);
+    record_vault_audit(
+        &state,
+        "vault.secret.updated",
+        &format!("vault_secret:{}", saved.id),
+        "Updated Vault secret metadata.",
+    )
+    .await;
+    Ok(Json(vault_secret_summary(saved)))
+}
+
+async fn delete_vault_secret(
+    State(state): State<AppState>,
+    Path(secret_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    require_vault_safe_origin(&headers)?;
+    let secret_id = sanitize_registry_id(&secret_id, "vault secret id")?;
+    if !state.vault.lock().await.is_unlocked() {
+        return Err(ApiError::forbidden("vault is locked"));
+    }
+    state.store.delete_vault_secret(&secret_id)?;
+    record_vault_audit(
+        &state,
+        "vault.secret.deleted",
+        &format!("vault_secret:{secret_id}"),
+        "Deleted Vault secret metadata.",
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn require_vault_safe_origin(headers: &HeaderMap) -> Result<(), ApiError> {
+    let origin = security::classify_request_origin(headers);
+    if origin.safe {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(format!(
+            "vault operation requires a safe origin: {}",
+            origin.reason
+        )))
+    }
+}
+
+fn validate_vault_secret_create(
+    payload: VaultSecretUpsertRequest,
+) -> Result<vault::VaultSecretInput, ApiError> {
+    Ok(vault::VaultSecretInput {
+        id: payload
+            .id
+            .map(|id| sanitize_registry_id(&id, "vault secret id"))
+            .transpose()?,
+        scope_kind: normalize_vault_scope_kind(&payload.scope_kind)?,
+        scope_id: non_empty_trimmed(payload.scope_id, "vault scope id")?,
+        name: sanitize_vault_secret_name(&payload.name)?,
+        description: payload.description.trim().to_string(),
+        secret: non_empty_secret(payload.secret, "vault secret value")?,
+    })
+}
+
+fn normalize_vault_scope_kind(value: &str) -> Result<String, ApiError> {
+    match value.trim() {
+        "workspace" | "project" => Ok(value.trim().to_string()),
+        _ => Err(ApiError::bad_request(
+            "vault scope kind must be workspace or project",
+        )),
+    }
+}
+
+fn sanitize_vault_secret_name(value: &str) -> Result<String, ApiError> {
+    sanitize_registry_id(value, "vault secret name")
+}
+
+fn non_empty_trimmed(value: String, label: &str) -> Result<String, ApiError> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        Err(ApiError::bad_request(format!("{label} is required")))
+    } else {
+        Ok(value)
+    }
+}
+
+fn non_empty_secret(value: String, label: &str) -> Result<String, ApiError> {
+    if value.trim().is_empty() {
+        Err(ApiError::bad_request(format!("{label} is required")))
+    } else {
+        Ok(value)
+    }
+}
+
+async fn vault_status_summary(state: &AppState) -> Result<VaultStatusSummary, ApiError> {
+    let record = state.store.load_vault_state()?;
+    let unlocked = state.vault.lock().await.is_unlocked();
+    Ok(vault_status_from_record(record, unlocked))
+}
+
+fn vault_status_from_record(
+    record: Option<nucleus_storage::VaultStateRecord>,
+    unlocked: bool,
+) -> VaultStatusSummary {
+    match record {
+        Some(record) => VaultStatusSummary {
+            initialized: true,
+            locked: !unlocked,
+            state: if unlocked { "unlocked" } else { "locked" }.to_string(),
+            vault_id: record.vault_id,
+            cipher: record.cipher,
+            kdf_algorithm: record.kdf_algorithm,
+            created_at: Some(record.created_at),
+            updated_at: Some(record.updated_at),
+        },
+        None => VaultStatusSummary {
+            initialized: false,
+            locked: true,
+            state: "uninitialized".to_string(),
+            vault_id: String::new(),
+            cipher: String::new(),
+            kdf_algorithm: String::new(),
+            created_at: None,
+            updated_at: None,
+        },
+    }
+}
+
+fn vault_secret_summary(secret: nucleus_storage::VaultSecretRecord) -> VaultSecretSummary {
+    VaultSecretSummary {
+        id: secret.id,
+        scope_kind: secret.scope_kind,
+        scope_id: secret.scope_id,
+        name: secret.name,
+        description: secret.description,
+        configured: true,
+        version: secret.version,
+        created_at: secret.created_at,
+        updated_at: secret.updated_at,
+        last_used_at: secret.last_used_at,
+    }
+}
+
+fn vault_api_error(error: anyhow::Error) -> ApiError {
+    let message = error.to_string();
+    if message.contains("not initialized") {
+        ApiError::bad_request(message)
+    } else if message.contains("already initialized") {
+        ApiError::bad_request(message)
+    } else if message.contains("locked") {
+        ApiError::forbidden(message)
+    } else if message.contains("at least") {
+        ApiError::bad_request(message)
+    } else if message.contains("invalid vault passphrase") {
+        ApiError::unauthorized("invalid vault passphrase")
+    } else {
+        ApiError::internal_message(message)
+    }
+}
+
+async fn record_vault_audit(state: &AppState, kind: &str, target: &str, summary: &str) {
+    let _ = try_record_audit_event(
+        state,
+        AuditEventRecord {
+            kind: kind.to_string(),
+            target: target.to_string(),
+            status: "success".to_string(),
+            summary: summary.to_string(),
+            detail: String::new(),
+        },
+    )
+    .await;
 }
 
 async fn delete_skill(
@@ -845,7 +1257,7 @@ async fn discover_mcp_server_tools(
                     .upsert_mcp_tool(tool)
                     .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
             }
-            Ok(Json(
+            Ok(Json(redact_mcp_server(
                 state
                     .store
                     .list_mcp_servers()
@@ -853,7 +1265,7 @@ async fn discover_mcp_server_tools(
                     .into_iter()
                     .find(|server| server.id == record.id)
                     .expect("discovered MCP server should be present"),
-            ))
+            )))
         }
         Err(error) => {
             let now = SystemTime::now()
@@ -1263,7 +1675,7 @@ async fn mcp_http_request(record: &McpServerRecord, payload: Value) -> anyhow::R
 async fn list_sessions(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<SessionSummary>>, ApiError> {
-    Ok(Json(state.store.list_sessions()?))
+    Ok(Json(redact_session_summaries(state.store.list_sessions()?)))
 }
 
 async fn playbooks(State(state): State<AppState>) -> Result<Json<Vec<PlaybookSummary>>, ApiError> {
@@ -1307,7 +1719,9 @@ async fn run_playbook(
     State(state): State<AppState>,
     Path(playbook_id): Path<String>,
 ) -> Result<Json<JobDetail>, ApiError> {
-    Ok(Json(agent::run_playbook(state, playbook_id).await?))
+    Ok(Json(redact_job_detail(
+        agent::run_playbook(state, playbook_id).await?,
+    )))
 }
 
 async fn actions() -> Json<Vec<ActionSummary>> {
@@ -1466,7 +1880,7 @@ async fn create_session(
     )
     .await;
     let _ = publish_overview_event(&state).await;
-    Ok(Json(detail))
+    Ok(Json(redact_session_detail(detail)))
 }
 
 async fn session_detail(
@@ -1475,7 +1889,7 @@ async fn session_detail(
 ) -> Result<Json<SessionDetail>, ApiError> {
     let mut detail = state.store.get_session(&session_id)?;
     refresh_session_workspace_warnings(&mut detail.session);
-    Ok(Json(detail))
+    Ok(Json(redact_session_detail(detail)))
 }
 
 async fn update_session(
@@ -1684,7 +2098,7 @@ async fn update_session(
     )
     .await;
     let _ = publish_overview_event(&state).await;
-    Ok(Json(detail))
+    Ok(Json(redact_session_detail(detail)))
 }
 
 async fn delete_session(
@@ -1726,21 +2140,25 @@ async fn job_detail(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Result<Json<JobDetail>, ApiError> {
-    Ok(Json(state.store.get_job(&job_id)?))
+    Ok(Json(redact_job_detail(state.store.get_job(&job_id)?)))
 }
 
 async fn cancel_job(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Result<Json<JobDetail>, ApiError> {
-    Ok(Json(agent::cancel_job(state, job_id).await?))
+    Ok(Json(redact_job_detail(
+        agent::cancel_job(state, job_id).await?,
+    )))
 }
 
 async fn resume_job(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Result<Json<JobDetail>, ApiError> {
-    Ok(Json(agent::resume_job(state, job_id).await?))
+    Ok(Json(redact_job_detail(
+        agent::resume_job(state, job_id).await?,
+    )))
 }
 
 async fn pending_approvals(
@@ -1759,9 +2177,9 @@ async fn approve_request(
     } else {
         decode_json::<ApprovalResolutionRequest>(&body)?
     };
-    Ok(Json(
+    Ok(Json(redact_job_detail(
         agent::approve_request(state, approval_id, payload.note).await?,
-    ))
+    )))
 }
 
 async fn deny_request(
@@ -1774,9 +2192,9 @@ async fn deny_request(
     } else {
         decode_json::<ApprovalResolutionRequest>(&body)?
     };
-    Ok(Json(
+    Ok(Json(redact_job_detail(
         agent::deny_request(state, approval_id, payload.note).await?,
-    ))
+    )))
 }
 
 async fn prompt_session(
@@ -1809,7 +2227,7 @@ async fn prompt_session(
         ));
     }
 
-    Ok(Json(
+    Ok(Json(redact_session_detail(
         agent::start_prompt_job(
             state,
             session_id,
@@ -1819,7 +2237,7 @@ async fn prompt_session(
             compiler_role,
         )
         .await?,
-    ))
+    )))
 }
 
 async fn host_status(State(state): State<AppState>) -> Json<nucleus_protocol::HostStatus> {
@@ -2085,7 +2503,9 @@ async fn publish_overview_event(state: &AppState) -> anyhow::Result<()> {
 }
 
 async fn publish_session_event(state: &AppState, detail: SessionDetail) -> anyhow::Result<()> {
-    let _ = state.events.send(DaemonEvent::SessionUpdated(detail));
+    let _ = state
+        .events
+        .send(DaemonEvent::SessionUpdated(redact_session_detail(detail)));
     Ok(())
 }
 
@@ -2122,7 +2542,7 @@ fn schedule_daemon_restart(state: AppState) {
     });
 }
 
-async fn build_settings_summary(state: &AppState) -> SettingsSummary {
+async fn build_settings_summary(state: &AppState, headers: &HeaderMap) -> SettingsSummary {
     let instance = state.updates.instance_summary();
     let hostname = state.host.host_status().hostname;
 
@@ -2141,6 +2561,7 @@ async fn build_settings_summary(state: &AppState) -> SettingsSummary {
             state.tailscale_dns_name.as_deref(),
             state.web_dist_dir.as_ref(),
         ),
+        security: security::build_security_posture(&instance.daemon_bind, headers),
         compatibility: build_compatibility_summary(
             &state.version,
             &state.updates.instance_summary(),
@@ -2196,12 +2617,93 @@ async fn build_runtime_overview(
         product: PRODUCT_NAME.to_string(),
         version: state.version.clone(),
         runtimes: runtimes.clone(),
-        router_profiles: enrich_router_profiles(state.store.list_router_profiles()?, &runtimes),
-        workspace: state.store.workspace()?,
-        sessions: state.store.list_sessions()?,
+        router_profiles: redact_router_profiles(enrich_router_profiles(
+            state.store.list_router_profiles()?,
+            &runtimes,
+        )),
+        workspace: redact_workspace_summary(state.store.workspace()?),
+        sessions: redact_session_summaries(state.store.list_sessions()?),
         host,
         storage: state.store.storage_summary(),
     })
+}
+
+fn redact_session_summaries(sessions: Vec<SessionSummary>) -> Vec<SessionSummary> {
+    sessions.into_iter().map(redact_session_summary).collect()
+}
+
+fn redact_session_detail(mut detail: SessionDetail) -> SessionDetail {
+    detail.session = redact_session_summary(detail.session);
+    detail
+}
+
+fn redact_session_summary(mut session: SessionSummary) -> SessionSummary {
+    session.provider_api_key.clear();
+    session
+}
+
+fn redact_job_detail(mut detail: JobDetail) -> JobDetail {
+    for worker in &mut detail.workers {
+        worker.provider_api_key.clear();
+    }
+
+    let redactor = security::RedactionSet::new();
+    for call in &mut detail.tool_calls {
+        call.args_json = redactor.redact_json(&call.args_json);
+        call.result_json = call
+            .result_json
+            .as_ref()
+            .map(|value| redactor.redact_json(value));
+        call.error_detail = redactor.redact_text(&call.error_detail);
+    }
+    for event in &mut detail.events {
+        event.detail = redactor.redact_text(&event.detail);
+        event.data_json = redactor.redact_json(&event.data_json);
+    }
+    detail
+}
+
+fn redact_workspace_summary(mut workspace: WorkspaceSummary) -> WorkspaceSummary {
+    workspace.profiles = workspace
+        .profiles
+        .into_iter()
+        .map(redact_workspace_profile)
+        .collect();
+    workspace
+}
+
+fn redact_workspace_profile(mut profile: WorkspaceProfileSummary) -> WorkspaceProfileSummary {
+    profile.main = redact_workspace_model_config(profile.main);
+    profile.utility = redact_workspace_model_config(profile.utility);
+    profile
+}
+
+fn redact_workspace_model_config(mut config: WorkspaceModelConfig) -> WorkspaceModelConfig {
+    config.api_key.clear();
+    config
+}
+
+fn redact_router_profiles(profiles: Vec<RouterProfileSummary>) -> Vec<RouterProfileSummary> {
+    profiles.into_iter().map(redact_router_profile).collect()
+}
+
+fn redact_router_profile(mut profile: RouterProfileSummary) -> RouterProfileSummary {
+    for target in &mut profile.targets {
+        target.api_key.clear();
+    }
+    profile
+}
+
+fn redact_mcp_servers(servers: Vec<McpServerSummary>) -> Vec<McpServerSummary> {
+    servers.into_iter().map(redact_mcp_server).collect()
+}
+
+fn redact_mcp_server(mut server: McpServerSummary) -> McpServerSummary {
+    let redactor = security::RedactionSet::new();
+    server.env_json = redactor.redact_json(&server.env_json);
+    server.headers_json = redactor.redact_json(&server.headers_json);
+    server.last_error = redactor.redact_text(&server.last_error);
+    server
 }
 
 async fn load_runtimes(
@@ -4592,6 +5094,128 @@ fn is_allowed_nucleus_skill_path(path: &std::path::Path, skill_id: &str) -> bool
             .is_some_and(|name| name.starts_with(".nucleus"))
 }
 
+#[derive(Debug, Clone, Default)]
+struct MemoryLayerCollection {
+    layers: Vec<CompiledPromptLayer>,
+    total_count: usize,
+    included_count: usize,
+    skipped_count: usize,
+    truncated_count: usize,
+}
+
+fn compiled_include_layers(sources: &[PromptIncludeSource]) -> Vec<CompiledPromptLayer> {
+    sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| CompiledPromptLayer {
+            id: format!("include:{}", index + 1),
+            kind: "include".to_string(),
+            scope: source.scope.to_string(),
+            title: source
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("prompt include")
+                .to_string(),
+            source_path: source.path.display().to_string(),
+            content: source.content.clone(),
+        })
+        .collect()
+}
+
+fn collect_memory_layers(
+    state: &AppState,
+    session: &SessionSummary,
+) -> Result<MemoryLayerCollection, ApiError> {
+    let mut collection = MemoryLayerCollection::default();
+    let mut remaining = MAX_MEMORY_CONTEXT_CHARS;
+    let mut layers = Vec::new();
+    let project_ids = session
+        .projects
+        .iter()
+        .map(|project| project.id.as_str())
+        .collect::<BTreeSet<_>>();
+
+    for entry in state.store.list_memory_entries()? {
+        if !memory_entry_applies_to_session(&entry, session, &project_ids) {
+            continue;
+        }
+        collection.total_count += 1;
+        if !entry.enabled || entry.status != "accepted" {
+            collection.skipped_count += 1;
+            continue;
+        }
+        let mut content = format!(
+            "Title: {}\nScope: {}/{}\nKind: {}\nTags: {}\n\n{}",
+            entry.title,
+            entry.scope_kind,
+            entry.scope_id,
+            entry.memory_kind,
+            if entry.tags.is_empty() {
+                "none".to_string()
+            } else {
+                entry.tags.join(", ")
+            },
+            entry.content
+        );
+        if content.len() > remaining {
+            collection.truncated_count += 1;
+            if remaining < 256 {
+                collection.skipped_count += 1;
+                continue;
+            }
+            let content_budget = remaining.saturating_sub(MEMORY_TRUNCATION_NOTICE.len());
+            if content_budget == 0 {
+                collection.skipped_count += 1;
+                continue;
+            }
+            content = truncate_utf8_to_byte_budget(&content, content_budget);
+            content.push_str(MEMORY_TRUNCATION_NOTICE);
+        }
+        remaining = remaining.saturating_sub(content.len());
+        layers.push(CompiledPromptLayer {
+            id: format!("memory:{}", entry.id),
+            kind: "memory".to_string(),
+            scope: format!("{}:{}", entry.scope_kind, entry.scope_id),
+            title: entry.title,
+            source_path: String::new(),
+            content,
+        });
+        collection.included_count += 1;
+    }
+    collection.layers = layers;
+    Ok(collection)
+}
+
+fn truncate_utf8_to_byte_budget(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+
+    let mut end = 0usize;
+    for (index, character) in value.char_indices() {
+        let next = index + character.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    value[..end].to_string()
+}
+
+fn memory_entry_applies_to_session(
+    entry: &MemoryEntry,
+    session: &SessionSummary,
+    project_ids: &BTreeSet<&str>,
+) -> bool {
+    match entry.scope_kind.as_str() {
+        "workspace" => entry.scope_id == "workspace",
+        "project" => project_ids.contains(entry.scope_id.as_str()),
+        "session" => entry.scope_id == session.id,
+        _ => false,
+    }
+}
+
 fn compile_session_turn(
     state: &AppState,
     session: &SessionSummary,
@@ -4601,6 +5225,9 @@ fn compile_session_turn(
     compiler_role: &str,
 ) -> Result<CompiledTurn, ApiError> {
     let prompt_sources = discover_prompt_sources(state, session)?;
+    let mut project_layers = compiled_include_layers(&prompt_sources);
+    let memory_collection = collect_memory_layers(state, session)?;
+    project_layers.extend(memory_collection.layers.clone());
     let skill_collection = collect_compiled_skill_layers(state, session, prompt)?;
     let skill_layers = skill_collection.layers;
     let mut mcp_catalog = state.store.list_mcp_servers()?;
@@ -4620,18 +5247,35 @@ fn compile_session_turn(
         &tool_catalog,
         &mcp_catalog,
     );
-    compiled.debug_summary.include_count = prompt_sources.len();
-    compiled.debug_summary.layer_count = compiled.skill_layers.len();
-    compiled.debug_summary.skill_diagnostics = skill_collection.diagnostics;
-    compiled.debug_summary.summary = format!(
-        "Compiled {} history turns for {} provider-neutral prompt with {} prompt includes, {} skill layers, {} MCP servers, and {} tools.",
-        compiled.history.len(),
-        compiled.role,
-        compiled.debug_summary.include_count,
-        compiled.debug_summary.skill_count,
-        compiled.debug_summary.mcp_server_count,
-        compiled.debug_summary.tool_count,
-    );
+    compiled.project_layers = project_layers;
+    let include_count = prompt_sources.len();
+    let skill_count = compiled.skill_layers.len();
+    let mcp_server_count = compiled.mcp_catalog.len();
+    let tool_count = compiled.tool_catalog.len();
+    let layer_count =
+        compiled.system_layers.len() + compiled.project_layers.len() + compiled.skill_layers.len();
+    compiled.debug_summary = nucleus_protocol::CompiledTurnDebugSummary {
+        include_count,
+        memory_count: memory_collection.total_count,
+        memory_included_count: memory_collection.included_count,
+        memory_skipped_count: memory_collection.skipped_count,
+        memory_truncated_count: memory_collection.truncated_count,
+        skill_count,
+        mcp_server_count,
+        tool_count,
+        layer_count,
+        summary: format!(
+            "Compiled {} history turns for {} provider-neutral prompt with {} prompt includes, {} accepted memory entries included, {} skill layers, {} MCP servers, and {} tools.",
+            compiled.history.len(),
+            compiled.role,
+            include_count,
+            memory_collection.included_count,
+            skill_count,
+            mcp_server_count,
+            tool_count,
+        ),
+        skill_diagnostics: skill_collection.diagnostics,
+    };
     Ok(compiled)
 }
 
@@ -5675,9 +6319,71 @@ mod tests {
     use serde_json::json;
     use std::{
         env, fs,
-        path::PathBuf,
+        path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn api_session_response_redacts_provider_api_key() {
+        let mut session = test_session(Path::new("/tmp/nucleus-redaction-test"));
+        session.provider_api_key = "nuctk_super_secret".to_string();
+        let detail = SessionDetail {
+            session,
+            turns: Vec::new(),
+        };
+
+        let redacted = redact_session_detail(detail);
+
+        assert_eq!(redacted.session.provider_api_key, "");
+    }
+
+    #[test]
+    fn router_profile_response_redacts_target_api_keys() {
+        let profiles = redact_router_profiles(vec![RouterProfileSummary {
+            id: "route".to_string(),
+            title: "Route".to_string(),
+            summary: String::new(),
+            enabled: true,
+            state: "ready".to_string(),
+            targets: vec![nucleus_protocol::RouteTarget {
+                provider: "openai-compatible".to_string(),
+                model: "model".to_string(),
+                base_url: "https://example.test".to_string(),
+                api_key: "nuctk_route_secret".to_string(),
+            }],
+        }]);
+
+        assert_eq!(profiles[0].targets[0].api_key, "");
+    }
+
+    #[test]
+    fn mcp_response_redacts_env_and_header_secret_values() {
+        let server = redact_mcp_server(McpServerSummary {
+            id: "server".to_string(),
+            title: "Server".to_string(),
+            enabled: true,
+            transport: "streamable-http".to_string(),
+            command: String::new(),
+            args: Vec::new(),
+            env_json: json!({ "SUPABASE_ACCESS_TOKEN": "nuctk_env_secret", "SAFE": "ok" }),
+            url: "https://example.test/mcp".to_string(),
+            headers_json: json!({ "Authorization": "Bearer nuctk_header_secret" }),
+            auth_kind: "none".to_string(),
+            auth_ref: String::new(),
+            sync_status: "ready".to_string(),
+            last_error: String::new(),
+            last_synced_at: None,
+            tools: Vec::new(),
+            resources: Vec::new(),
+        });
+
+        assert_eq!(
+            server.env_json["SUPABASE_ACCESS_TOKEN"],
+            "[REDACTED_SECRET]"
+        );
+        assert_eq!(server.env_json["SAFE"], "ok");
+        assert_eq!(server.headers_json["Authorization"], "[REDACTED_SECRET]");
+    }
 
     #[test]
     fn refuses_dirty_worktree_cleanup() {
@@ -6031,6 +6737,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
@@ -6140,6 +6847,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
@@ -6332,6 +7040,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
@@ -6377,6 +7086,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
@@ -6408,6 +7118,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
@@ -6455,6 +7166,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
@@ -6492,7 +7204,7 @@ mod tests {
             result.0.session.provider_base_url,
             "http://127.0.0.1:20128/v1"
         );
-        assert_eq!(result.0.session.provider_api_key, "nuctk_test");
+        assert_eq!(result.0.session.provider_api_key, "");
 
         let workspace = state.store.workspace().expect("workspace should load");
         let profile =
@@ -6522,6 +7234,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
@@ -6601,6 +7314,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
@@ -7043,11 +7757,709 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
         }
+    }
+
+    fn test_named_app_state(name: &str) -> (PathBuf, AppState) {
+        let state_dir = test_state_dir(name);
+        let store = initialize_test_store(&state_dir);
+        let (events, _) = broadcast::channel(4);
+        let state = AppState {
+            version: "test".to_string(),
+            store: store.clone(),
+            host: Arc::new(HostEngine::new()),
+            runtimes: Arc::new(RuntimeManager::default()),
+            updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
+            agent: Arc::new(agent::AgentRuntime::default()),
+            web_dist_dir: None,
+            tailscale_dns_name: None,
+            events,
+        };
+        (state_dir, state)
+    }
+
+    #[test]
+    fn memory_upsert_normalizes_phase2_defaults() {
+        let (state_dir, state) = test_named_app_state("memory-defaults");
+        let entry = upsert_memory_from_request(
+            &state,
+            MemoryEntryUpsertRequest {
+                id: Some("phase2-defaults".to_string()),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "Phase 2 defaults".to_string(),
+                content: "Remember this preference.".to_string(),
+                tags: vec![" docs ".to_string(), "".to_string()],
+                enabled: None,
+                status: None,
+                memory_kind: None,
+                source_kind: None,
+                source_id: None,
+                confidence: Some(1.8),
+                created_by: None,
+                last_used_at: None,
+                use_count: Some(-3),
+                supersedes_id: None,
+                metadata_json: None,
+            },
+            None,
+        )
+        .expect("memory should save");
+
+        assert_eq!(entry.status, "accepted");
+        assert_eq!(entry.memory_kind, "note");
+        assert_eq!(entry.source_kind, "manual");
+        assert_eq!(entry.created_by, "user");
+        assert_eq!(entry.confidence, 1.0);
+        assert_eq!(entry.use_count, 0);
+        assert_eq!(entry.tags, vec!["docs"]);
+        assert_eq!(entry.metadata_json, json!({}));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn memory_upsert_redacts_sensitive_metadata() {
+        let (state_dir, state) = test_named_app_state("memory-metadata-redaction");
+        let entry = upsert_memory_from_request(
+            &state,
+            MemoryEntryUpsertRequest {
+                id: Some("metadata-redaction".to_string()),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "Metadata redaction".to_string(),
+                content: "Safe visible memory.".to_string(),
+                tags: Vec::new(),
+                enabled: None,
+                status: None,
+                memory_kind: Some("decision".to_string()),
+                source_kind: Some("explicit_remember".to_string()),
+                source_id: None,
+                confidence: None,
+                created_by: Some("assistant".to_string()),
+                last_used_at: None,
+                use_count: None,
+                supersedes_id: None,
+                metadata_json: Some(json!({
+                    "api_key": "nuctk_secret",
+                    "nested": { "password": "also-secret", "token": "bearer-secret" },
+                    "safe": "ok"
+                })),
+            },
+            None,
+        )
+        .expect("memory should save");
+
+        assert_eq!(entry.memory_kind, "decision");
+        assert_eq!(entry.source_kind, "explicit_remember");
+        assert_eq!(entry.created_by, "assistant");
+        assert_eq!(entry.metadata_json["api_key"], "[REDACTED_SECRET]");
+        assert_eq!(
+            entry.metadata_json["nested"]["password"],
+            "[REDACTED_SECRET]"
+        );
+        assert_eq!(entry.metadata_json["nested"]["token"], "[REDACTED_SECRET]");
+        assert_eq!(entry.metadata_json["safe"], "ok");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn compiled_turn_truncates_multibyte_memory_without_panic() {
+        let (state_dir, state) = test_named_app_state("memory-emoji-truncation");
+        let workspace_root = state_dir.join("workspace");
+        state
+            .store
+            .upsert_memory_entry(&MemoryEntry {
+                id: "emoji-memory".to_string(),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "Emoji memory".to_string(),
+                content: "🚀".repeat(MAX_MEMORY_CONTEXT_CHARS),
+                tags: Vec::new(),
+                enabled: true,
+                status: "accepted".to_string(),
+                memory_kind: "note".to_string(),
+                source_kind: "manual".to_string(),
+                source_id: String::new(),
+                confidence: 1.0,
+                created_by: "user".to_string(),
+                last_used_at: None,
+                use_count: 0,
+                supersedes_id: String::new(),
+                metadata_json: json!({}),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .expect("emoji memory should persist");
+
+        let session = test_session(&workspace_root);
+        let compiled = compile_session_turn(&state, &session, &[], "Hello", &[], "main")
+            .expect("multibyte memory should compile without panic");
+        let rendered = nucleus_core::render_compiled_turn_system_text(&compiled);
+        assert!(rendered.contains("[Memory entry truncated by Nucleus context budget]"));
+        assert_eq!(compiled.debug_summary.memory_truncated_count, 1);
+        let memory_layer = compiled
+            .project_layers
+            .iter()
+            .find(|layer| layer.kind == "memory")
+            .expect("memory layer should be present");
+        assert!(memory_layer.content.len() <= MAX_MEMORY_CONTEXT_CHARS);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn compiled_turn_includes_prompt_includes_and_accepted_memory() {
+        let (state_dir, state) = test_named_app_state("memory-compiled-context");
+        let workspace_root = state_dir.join("workspace");
+        let include_dir = workspace_root.join("include");
+        fs::create_dir_all(&include_dir).expect("include dir should exist");
+        fs::write(
+            include_dir.join("phase2.md"),
+            "Provider-visible include text.",
+        )
+        .expect("include should write");
+        state
+            .store
+            .upsert_memory_entry(&MemoryEntry {
+                id: "workspace-memory".to_string(),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "Workspace memory".to_string(),
+                content: "Provider-visible accepted memory.".to_string(),
+                tags: vec!["phase2".to_string()],
+                enabled: true,
+                status: "accepted".to_string(),
+                memory_kind: "note".to_string(),
+                source_kind: "manual".to_string(),
+                source_id: String::new(),
+                confidence: 1.0,
+                created_by: "user".to_string(),
+                last_used_at: None,
+                use_count: 0,
+                supersedes_id: String::new(),
+                metadata_json: json!({}),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .expect("memory should persist");
+        state
+            .store
+            .upsert_memory_entry(&MemoryEntry {
+                id: "archived-memory".to_string(),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "Archived memory".to_string(),
+                content: "This archived memory must not appear.".to_string(),
+                tags: Vec::new(),
+                enabled: true,
+                status: "archived".to_string(),
+                memory_kind: "note".to_string(),
+                source_kind: "manual".to_string(),
+                source_id: String::new(),
+                confidence: 1.0,
+                created_by: "user".to_string(),
+                last_used_at: None,
+                use_count: 0,
+                supersedes_id: String::new(),
+                metadata_json: json!({}),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .expect("archived memory should persist");
+
+        let session = test_session(&workspace_root);
+        let compiled = compile_session_turn(&state, &session, &[], "Hello", &[], "main")
+            .expect("turn should compile");
+        let rendered = nucleus_core::render_compiled_turn_system_text(&compiled);
+
+        assert!(rendered.contains("Provider-visible include text."));
+        assert!(rendered.contains("Provider-visible accepted memory."));
+        assert!(!rendered.contains("This archived memory must not appear."));
+        assert_eq!(compiled.debug_summary.include_count, 1);
+        assert_eq!(compiled.debug_summary.memory_count, 2);
+        assert_eq!(compiled.debug_summary.memory_included_count, 1);
+        assert_eq!(compiled.debug_summary.memory_skipped_count, 1);
+        let include_index = rendered.find("Provider-visible include text.").unwrap();
+        let memory_index = rendered.find("Provider-visible accepted memory.").unwrap();
+        assert!(include_index < memory_index);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn vault_initializes_unlocks_and_encrypts_without_plaintext_storage() {
+        let (state_dir, state) = test_named_app_state("vault-init-encrypt");
+        {
+            let mut vault = state.vault.lock().await;
+            vault
+                .initialize(&state.store, "correct horse battery staple")
+                .expect("vault initializes");
+            let secret = vault
+                .create_or_update_secret(
+                    &state.store,
+                    vault::VaultSecretInput {
+                        id: Some("cloudflare-token".to_string()),
+                        scope_kind: "workspace".to_string(),
+                        scope_id: "workspace".to_string(),
+                        name: "CLOUDFLARE_API_TOKEN".to_string(),
+                        description: "Cloudflare API token".to_string(),
+                        secret: "super-secret-token".to_string(),
+                    },
+                )
+                .expect("secret persists encrypted");
+            let decrypted = vault::decrypt_secret_for_test(&mut vault, &state.store, &secret)
+                .expect("secret decrypts while unlocked");
+            assert_eq!(decrypted, "super-secret-token");
+        }
+
+        let raw = state
+            .store
+            .load_vault_secret("cloudflare-token")
+            .expect("secret should load");
+        assert_ne!(raw.ciphertext, b"super-secret-token");
+        let ciphertext_text = String::from_utf8_lossy(&raw.ciphertext);
+        assert!(!ciphertext_text.contains("super-secret-token"));
+        {
+            let mut vault = state.vault.lock().await;
+            vault.lock();
+            vault
+                .unlock(&state.store, "correct horse battery staple")
+                .expect("correct passphrase unlocks");
+            let mut tampered = raw.clone();
+            tampered.aad.push_str(":tampered");
+            let error = vault::decrypt_secret_for_test(&mut vault, &state.store, &tampered)
+                .expect_err("tampered AAD fails");
+            assert!(error.to_string().contains("failed to decrypt vault secret"));
+        }
+
+        let listed = state
+            .store
+            .list_vault_secrets(None, None)
+            .expect("secrets should list")
+            .into_iter()
+            .map(vault_secret_summary)
+            .collect::<Vec<_>>();
+        let serialized = serde_json::to_string(&listed).expect("summary serializes");
+        assert!(serialized.contains("CLOUDFLARE_API_TOKEN"));
+        assert!(!serialized.contains("super-secret-token"));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn vault_wrong_passphrase_fails_and_lock_blocks_secret_writes() {
+        let (state_dir, state) = test_named_app_state("vault-lock-wrong-pass");
+        {
+            let mut vault = state.vault.lock().await;
+            vault
+                .initialize(&state.store, "correct horse battery staple")
+                .expect("vault initializes");
+            vault.lock();
+        }
+        {
+            let mut vault = state.vault.lock().await;
+            let error = vault
+                .unlock(&state.store, "wrong horse battery staple")
+                .expect_err("wrong passphrase fails");
+            assert!(error.to_string().contains("invalid vault passphrase"));
+            let error = vault
+                .create_or_update_secret(
+                    &state.store,
+                    vault::VaultSecretInput {
+                        id: Some("blocked".to_string()),
+                        scope_kind: "workspace".to_string(),
+                        scope_id: "workspace".to_string(),
+                        name: "BLOCKED".to_string(),
+                        description: String::new(),
+                        secret: "must-not-store".to_string(),
+                    },
+                )
+                .expect_err("locked vault blocks writes");
+            assert!(error.to_string().contains("vault is locked"));
+        }
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn vault_plaintext_operations_require_safe_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "origin",
+            axum::http::HeaderValue::from_static("http://192.168.1.2:5201"),
+        );
+        let error = require_vault_safe_origin(&headers).expect_err("LAN HTTP is unsafe");
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+
+        let mut safe_headers = HeaderMap::new();
+        safe_headers.insert(
+            "origin",
+            axum::http::HeaderValue::from_static("http://localhost:5201"),
+        );
+        require_vault_safe_origin(&safe_headers).expect("localhost origin is vault-safe");
+    }
+
+    #[tokio::test]
+    async fn vault_audit_payloads_do_not_include_secret_values() {
+        let (state_dir, state) = test_named_app_state("vault-audit-redacted");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "origin",
+            axum::http::HeaderValue::from_static("http://localhost:5201"),
+        );
+        let _ = vault_init(
+            State(state.clone()),
+            headers.clone(),
+            Bytes::from(r#"{"passphrase":"correct horse battery staple"}"#),
+        )
+        .await
+        .expect("vault init succeeds");
+        let _ = create_vault_secret(
+            State(state.clone()),
+            headers,
+            Bytes::from(r#"{"id":"audit-token","scope_kind":"workspace","scope_id":"workspace","name":"AUDIT_TOKEN","secret":"audit-secret-value"}"#),
+        )
+        .await
+        .expect("secret create succeeds");
+        let audit = state.store.list_audit_events(20).expect("audit lists");
+        let serialized = serde_json::to_string(&audit).expect("audit serializes");
+        assert!(serialized.contains("vault.secret.created"));
+        assert!(!serialized.contains("audit-secret-value"));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn vault_persists_locked_across_restart_and_unlocks_metadata_only() {
+        let state_dir = test_state_dir("vault-restart-persistence");
+        let store = initialize_test_store(&state_dir);
+        let state = test_app_state(&store);
+        {
+            let mut vault = state.vault.lock().await;
+            vault
+                .initialize(&state.store, "correct horse battery staple")
+                .expect("vault initializes");
+            vault
+                .create_or_update_secret(
+                    &state.store,
+                    vault::VaultSecretInput {
+                        id: Some("restart-token".to_string()),
+                        scope_kind: "workspace".to_string(),
+                        scope_id: "workspace".to_string(),
+                        name: "RESTART_TOKEN".to_string(),
+                        description: "Restart token".to_string(),
+                        secret: "restart-secret-value".to_string(),
+                    },
+                )
+                .expect("secret persists encrypted");
+        }
+        drop(state);
+        drop(store);
+
+        let reopened_store = Arc::new(
+            StateStore::initialize_at(&state_dir).expect("store should reopen after restart"),
+        );
+        let restarted = test_app_state(&reopened_store);
+        let status = vault_status(State(restarted.clone()))
+            .await
+            .expect("status should load")
+            .0;
+        assert!(status.initialized);
+        assert!(status.locked);
+        assert_eq!(status.state, "locked");
+
+        let listed = list_vault_secrets(
+            State(restarted.clone()),
+            Query(VaultSecretListQuery {
+                scope_kind: None,
+                scope_id: None,
+            }),
+        )
+        .await
+        .expect("secrets should list")
+        .0;
+        assert_eq!(listed.secrets.len(), 1);
+        assert_eq!(listed.secrets[0].id, "restart-token");
+        let serialized = serde_json::to_string(&listed).expect("list serializes");
+        assert!(!serialized.contains("restart-secret-value"));
+
+        let raw = restarted
+            .store
+            .load_vault_secret("restart-token")
+            .expect("secret should load");
+        assert_ne!(raw.ciphertext, b"restart-secret-value");
+        assert!(!String::from_utf8_lossy(&raw.ciphertext).contains("restart-secret-value"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "origin",
+            axum::http::HeaderValue::from_static("http://localhost:5201"),
+        );
+        let unlocked = vault_unlock(
+            State(restarted.clone()),
+            headers,
+            Bytes::from(r#"{"passphrase":"correct horse battery staple"}"#),
+        )
+        .await
+        .expect("correct passphrase unlocks after restart")
+        .0;
+        assert!(!unlocked.locked);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn vault_endpoints_report_status_lock_and_metadata_only_list() {
+        let (state_dir, state) = test_named_app_state("vault-endpoint-status-list");
+        let initial = vault_status(State(state.clone()))
+            .await
+            .expect("status should load")
+            .0;
+        assert!(!initial.initialized);
+        assert!(initial.locked);
+        assert_eq!(initial.state, "uninitialized");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "origin",
+            axum::http::HeaderValue::from_static("http://localhost:5201"),
+        );
+        let initialized = vault_init(
+            State(state.clone()),
+            headers.clone(),
+            Bytes::from(r#"{"passphrase":"correct horse battery staple"}"#),
+        )
+        .await
+        .expect("vault init succeeds")
+        .0;
+        assert!(initialized.initialized);
+        assert!(!initialized.locked);
+
+        let created = create_vault_secret(
+            State(state.clone()),
+            headers,
+            Bytes::from(
+                "{\"id\":\"status-token\",\"scope_kind\":\"workspace\",\"scope_id\":\"workspace\",\"name\":\"STATUS_TOKEN\",\"secret\":\"  status-secret-value\\n\"}",
+            ),
+        )
+        .await
+        .expect("secret create succeeds")
+        .0;
+        let created_serialized = serde_json::to_string(&created).expect("summary serializes");
+        assert!(!created_serialized.contains("status-secret-value"));
+        let raw = state
+            .store
+            .load_vault_secret("status-token")
+            .expect("secret should load");
+        let decrypted = {
+            let mut vault = state.vault.lock().await;
+            vault::decrypt_secret_for_test(&mut vault, &state.store, &raw)
+                .expect("secret decrypts while unlocked")
+        };
+        assert_eq!(decrypted, "  status-secret-value\n");
+
+        let listed = list_vault_secrets(
+            State(state.clone()),
+            Query(VaultSecretListQuery {
+                scope_kind: None,
+                scope_id: None,
+            }),
+        )
+        .await
+        .expect("secrets list")
+        .0;
+        let serialized = serde_json::to_string(&listed).expect("list serializes");
+        assert!(serialized.contains("STATUS_TOKEN"));
+        assert!(!serialized.contains("status-secret-value"));
+
+        let locked = vault_lock(State(state.clone()))
+            .await
+            .expect("lock succeeds")
+            .0;
+        assert!(locked.initialized);
+        assert!(locked.locked);
+        assert_eq!(locked.state, "locked");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn vault_update_endpoint_requires_safe_origin_unlocked_and_stays_metadata_only() {
+        let (state_dir, state) = test_named_app_state("vault-endpoint-update");
+        let mut safe_headers = HeaderMap::new();
+        safe_headers.insert(
+            "origin",
+            axum::http::HeaderValue::from_static("http://localhost:5201"),
+        );
+        let _ = vault_init(
+            State(state.clone()),
+            safe_headers.clone(),
+            Bytes::from(r#"{"passphrase":"correct horse battery staple"}"#),
+        )
+        .await
+        .expect("vault init succeeds");
+        let _ = create_vault_secret(
+            State(state.clone()),
+            safe_headers.clone(),
+            Bytes::from(r#"{"id":"update-token","scope_kind":"workspace","scope_id":"workspace","name":"UPDATE_TOKEN","secret":"old-secret-value"}"#),
+        )
+        .await
+        .expect("secret create succeeds");
+        let before = state
+            .store
+            .load_vault_secret("update-token")
+            .expect("secret should load");
+
+        let mut unsafe_headers = HeaderMap::new();
+        unsafe_headers.insert(
+            "origin",
+            axum::http::HeaderValue::from_static("http://192.168.1.2:5201"),
+        );
+        let unsafe_error = update_vault_secret(
+            State(state.clone()),
+            Path("update-token".to_string()),
+            unsafe_headers,
+            Bytes::from(r#"{"secret":"unsafe-secret-value"}"#),
+        )
+        .await
+        .expect_err("unsafe origin should fail");
+        assert_eq!(unsafe_error.status, StatusCode::FORBIDDEN);
+
+        let blank_scope_error = update_vault_secret(
+            State(state.clone()),
+            Path("update-token".to_string()),
+            safe_headers.clone(),
+            Bytes::from(r#"{"scope_id":"   ","secret":"blank-scope-secret-value"}"#),
+        )
+        .await
+        .expect_err("blank scope id should fail");
+        assert_eq!(blank_scope_error.status, StatusCode::BAD_REQUEST);
+
+        let _ = vault_lock(State(state.clone()))
+            .await
+            .expect("lock succeeds");
+        let locked_error = update_vault_secret(
+            State(state.clone()),
+            Path("update-token".to_string()),
+            safe_headers.clone(),
+            Bytes::from(r#"{"secret":"locked-secret-value"}"#),
+        )
+        .await
+        .expect_err("locked vault should block update");
+        assert_eq!(locked_error.status, StatusCode::FORBIDDEN);
+
+        let _ = vault_unlock(
+            State(state.clone()),
+            safe_headers.clone(),
+            Bytes::from(r#"{"passphrase":"correct horse battery staple"}"#),
+        )
+        .await
+        .expect("unlock succeeds");
+        let updated = update_vault_secret(
+            State(state.clone()),
+            Path("update-token".to_string()),
+            safe_headers,
+            Bytes::from(r#"{"description":"Updated token","secret":"new-secret-value"}"#),
+        )
+        .await
+        .expect("update succeeds")
+        .0;
+        assert_eq!(updated.version, before.version + 1);
+        assert_eq!(updated.description, "Updated token");
+        let serialized = serde_json::to_string(&updated).expect("summary serializes");
+        assert!(!serialized.contains("new-secret-value"));
+
+        let after = state
+            .store
+            .load_vault_secret("update-token")
+            .expect("updated secret should load");
+        assert_ne!(after.ciphertext, before.ciphertext);
+        assert!(!String::from_utf8_lossy(&after.ciphertext).contains("new-secret-value"));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn vault_delete_endpoint_requires_safe_origin_and_removes_secret_from_list() {
+        let (state_dir, state) = test_named_app_state("vault-endpoint-delete");
+        let mut safe_headers = HeaderMap::new();
+        safe_headers.insert(
+            "origin",
+            axum::http::HeaderValue::from_static("http://localhost:5201"),
+        );
+        let _ = vault_init(
+            State(state.clone()),
+            safe_headers.clone(),
+            Bytes::from(r#"{"passphrase":"correct horse battery staple"}"#),
+        )
+        .await
+        .expect("vault init succeeds");
+        let _ = create_vault_secret(
+            State(state.clone()),
+            safe_headers.clone(),
+            Bytes::from(r#"{"id":"delete-token","scope_kind":"workspace","scope_id":"workspace","name":"DELETE_TOKEN","secret":"delete-secret-value"}"#),
+        )
+        .await
+        .expect("secret create succeeds");
+
+        let mut unsafe_headers = HeaderMap::new();
+        unsafe_headers.insert(
+            "origin",
+            axum::http::HeaderValue::from_static("http://192.168.1.2:5201"),
+        );
+        let unsafe_error = delete_vault_secret(
+            State(state.clone()),
+            Path("delete-token".to_string()),
+            unsafe_headers,
+        )
+        .await
+        .expect_err("unsafe origin should fail");
+        assert_eq!(unsafe_error.status, StatusCode::FORBIDDEN);
+        assert!(state.store.load_vault_secret("delete-token").is_ok());
+
+        let _ = vault_lock(State(state.clone()))
+            .await
+            .expect("lock succeeds");
+        let locked_error = delete_vault_secret(
+            State(state.clone()),
+            Path("delete-token".to_string()),
+            safe_headers.clone(),
+        )
+        .await
+        .expect_err("locked vault should block delete");
+        assert_eq!(locked_error.status, StatusCode::FORBIDDEN);
+        assert!(state.store.load_vault_secret("delete-token").is_ok());
+
+        let _ = vault_unlock(
+            State(state.clone()),
+            safe_headers.clone(),
+            Bytes::from(r#"{"passphrase":"correct horse battery staple"}"#),
+        )
+        .await
+        .expect("unlock succeeds");
+
+        let status = delete_vault_secret(
+            State(state.clone()),
+            Path("delete-token".to_string()),
+            safe_headers,
+        )
+        .await
+        .expect("delete succeeds");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(state.store.load_vault_secret("delete-token").is_err());
+
+        let listed = list_vault_secrets(
+            State(state.clone()),
+            Query(VaultSecretListQuery {
+                scope_kind: None,
+                scope_id: None,
+            }),
+        )
+        .await
+        .expect("secrets list")
+        .0;
+        assert!(listed.secrets.is_empty());
+        let serialized = serde_json::to_string(&listed).expect("list serializes");
+        assert!(!serialized.contains("delete-secret-value"));
+        let _ = fs::remove_dir_all(&state_dir);
     }
 
     fn test_session(workspace_root: &std::path::Path) -> SessionSummary {
@@ -7131,6 +8543,7 @@ mod tests {
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
@@ -7211,6 +8624,7 @@ for line in sys.stdin:
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
+            vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,

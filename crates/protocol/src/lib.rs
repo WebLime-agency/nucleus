@@ -525,6 +525,14 @@ pub struct CompiledTurnCapabilities {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompiledTurnDebugSummary {
     pub include_count: usize,
+    #[serde(default)]
+    pub memory_count: usize,
+    #[serde(default)]
+    pub memory_included_count: usize,
+    #[serde(default)]
+    pub memory_skipped_count: usize,
+    #[serde(default)]
+    pub memory_truncated_count: usize,
     pub skill_count: usize,
     pub mcp_server_count: usize,
     pub tool_count: usize,
@@ -649,7 +657,7 @@ pub struct McpToolRecord {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MemoryEntry {
     pub id: String,
     pub scope_kind: String,
@@ -659,11 +667,31 @@ pub struct MemoryEntry {
     #[serde(default)]
     pub tags: Vec<String>,
     pub enabled: bool,
+    #[serde(default = "default_memory_status")]
+    pub status: String,
+    #[serde(default = "default_memory_kind")]
+    pub memory_kind: String,
+    #[serde(default = "default_memory_source_kind")]
+    pub source_kind: String,
+    #[serde(default)]
+    pub source_id: String,
+    #[serde(default = "default_memory_confidence")]
+    pub confidence: f64,
+    #[serde(default = "default_memory_created_by")]
+    pub created_by: String,
+    #[serde(default)]
+    pub last_used_at: Option<i64>,
+    #[serde(default)]
+    pub use_count: i64,
+    #[serde(default)]
+    pub supersedes_id: String,
+    #[serde(default)]
+    pub metadata_json: Value,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MemoryEntryUpsertRequest {
     pub id: Option<String>,
     pub scope_kind: String,
@@ -673,14 +701,125 @@ pub struct MemoryEntryUpsertRequest {
     #[serde(default)]
     pub tags: Vec<String>,
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub memory_kind: Option<String>,
+    #[serde(default)]
+    pub source_kind: Option<String>,
+    #[serde(default)]
+    pub source_id: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    #[serde(default)]
+    pub last_used_at: Option<i64>,
+    #[serde(default)]
+    pub use_count: Option<i64>,
+    #[serde(default)]
+    pub supersedes_id: Option<String>,
+    #[serde(default)]
+    pub metadata_json: Option<Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+fn default_memory_status() -> String {
+    "accepted".to_string()
+}
+fn default_memory_kind() -> String {
+    "note".to_string()
+}
+fn default_memory_source_kind() -> String {
+    "manual".to_string()
+}
+fn default_memory_created_by() -> String {
+    "user".to_string()
+}
+fn default_memory_confidence() -> f64 {
+    1.0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MemorySummary {
     #[serde(default)]
     pub entries: Vec<MemoryEntry>,
     pub enabled_count: usize,
     pub scope_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultStatusSummary {
+    pub initialized: bool,
+    pub locked: bool,
+    pub state: String,
+    #[serde(default)]
+    pub vault_id: String,
+    #[serde(default)]
+    pub cipher: String,
+    #[serde(default)]
+    pub kdf_algorithm: String,
+    #[serde(default)]
+    pub created_at: Option<i64>,
+    #[serde(default)]
+    pub updated_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultInitRequest {
+    pub passphrase: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultUnlockRequest {
+    pub passphrase: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultSecretSummary {
+    pub id: String,
+    pub scope_kind: String,
+    pub scope_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub configured: bool,
+    pub version: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    #[serde(default)]
+    pub last_used_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultSecretListResponse {
+    #[serde(default)]
+    pub secrets: Vec<VaultSecretSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultSecretUpsertRequest {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub scope_kind: String,
+    pub scope_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultSecretUpdateRequest {
+    #[serde(default)]
+    pub scope_kind: Option<String>,
+    #[serde(default)]
+    pub scope_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1167,6 +1306,28 @@ pub struct ConnectionSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalInterfaceSummary {
+    pub name: String,
+    pub address: String,
+    pub is_loopback: bool,
+    pub is_private: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecurityPostureSummary {
+    pub configured_bind: String,
+    pub exposure: String,
+    pub https_active: bool,
+    pub current_origin: Option<String>,
+    pub current_origin_vault_safe: bool,
+    pub current_origin_reason: String,
+    #[serde(default)]
+    pub local_interfaces: Vec<LocalInterfaceSummary>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompatibilitySummary {
     pub server_version: String,
     pub minimum_client_version: Option<String>,
@@ -1211,6 +1372,7 @@ pub struct SettingsSummary {
     pub storage: StorageSummary,
     pub auth: AuthSummary,
     pub connection: ConnectionSummary,
+    pub security: SecurityPostureSummary,
     pub compatibility: CompatibilitySummary,
     pub update: UpdateStatus,
 }
