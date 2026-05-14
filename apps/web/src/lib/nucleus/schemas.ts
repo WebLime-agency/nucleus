@@ -803,6 +803,10 @@ export const localInterfaceSummarySchema = z.object({
 export const securityPostureSummarySchema = z.object({
   configured_bind: z.string(),
   exposure: z.string(),
+  bind_mode: z.string().default('custom_unknown'),
+  bind_mode_label: z.string().default('Custom/unknown'),
+  recommended_bind: z.string().nullable().default(null),
+  vault_origin_requirement: z.string().default('Vault operations require localhost or HTTPS.'),
   https_active: z.boolean(),
   current_origin: z.string().nullable(),
   current_origin_vault_safe: z.boolean(),

@@ -86,6 +86,10 @@
             <div class="mt-1 text-sm text-zinc-100">{formatState(security.exposure)}</div>
           </div>
           <div>
+            <div class="text-xs text-zinc-500">Bind mode</div>
+            <div class="mt-1 text-sm text-zinc-100">{security.bind_mode_label}</div>
+          </div>
+          <div>
             <div class="text-xs text-zinc-500">HTTPS</div>
             <div class="mt-1 text-sm text-zinc-100">{security.https_active ? 'Active' : 'Inactive'}</div>
           </div>
@@ -99,6 +103,12 @@
         {#if security.current_origin}
           <div class="mt-3 text-xs text-zinc-500">Origin: {security.current_origin}</div>
         {/if}
+        <div class="mt-3 rounded-md border border-zinc-800 bg-zinc-900/50 px-3 py-2 text-sm text-zinc-300">
+          {security.vault_origin_requirement}
+          {#if security.recommended_bind}
+            <div class="mt-2 text-xs text-zinc-400">Guidance: {security.recommended_bind}</div>
+          {/if}
+        </div>
         {#if security.warnings.length > 0}
           <div class="mt-3 space-y-2">
             {#each security.warnings as warning}

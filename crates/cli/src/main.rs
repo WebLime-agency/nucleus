@@ -21,7 +21,7 @@ use reqwest::header::AUTHORIZATION;
 use serde_json::Value;
 
 const DEFAULT_LOCAL_SETUP_BIND: &str = "127.0.0.1:5201";
-const DEFAULT_SERVER_SETUP_BIND: &str = "0.0.0.0:5201";
+const DEFAULT_SERVER_SETUP_BIND: &str = "127.0.0.1:5201";
 const DEFAULT_SERVICE_NAME: &str = "nucleus-daemon";
 
 #[derive(Debug, Parser)]
@@ -96,6 +96,9 @@ struct SetupRuntimeArgs {
 
     #[arg(long)]
     enable: bool,
+
+    #[arg(long)]
+    allow_unsafe_bind: bool,
 }
 
 #[derive(Debug, Args)]
@@ -126,6 +129,9 @@ struct InstallServiceArgs {
 
     #[arg(long)]
     enable: bool,
+
+    #[arg(long)]
+    allow_unsafe_bind: bool,
 }
 
 #[derive(Debug, Args)]
@@ -210,6 +216,9 @@ struct ReleaseInstallArgs {
 
     #[arg(long)]
     enable: bool,
+
+    #[arg(long)]
+    allow_unsafe_bind: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -315,6 +324,7 @@ async fn run_setup_runtime(
     let instance_name = args
         .instance_name
         .unwrap_or_else(|| PRODUCT_NAME.to_string());
+    require_explicit_remote_bind(&bind, args.allow_unsafe_bind)?;
     let hints = connection_hints(&bind);
 
     if args.install_service {
@@ -390,6 +400,7 @@ async fn run_setup_client(args: SetupClientArgs) -> Result<()> {
 }
 
 fn run_install_service(command: InstallServiceArgs, state_dir: Option<PathBuf>) -> Result<()> {
+    require_explicit_remote_bind(&command.bind, command.allow_unsafe_bind)?;
     let plan = build_install_plan(
         &command.service_name,
         &command.bind,
@@ -571,6 +582,7 @@ async fn run_release_install(
     })?;
 
     if args.install_service {
+        require_explicit_remote_bind(&args.bind, args.allow_unsafe_bind)?;
         let plan = build_managed_release_install_plan(
             &args.service_name,
             &args.bind,
@@ -959,6 +971,42 @@ fn bind_exposes_remote_access(bind: &str) -> bool {
     }
 }
 
+fn bind_mode_label(bind: &str) -> &'static str {
+    match bind.parse::<SocketAddr>() {
+        Ok(addr) if addr.ip().is_loopback() => "localhost only",
+        Ok(addr) if addr.ip().is_unspecified() => "LAN/all interfaces",
+        Ok(SocketAddr::V4(addr)) if is_tailscale_ipv4(*addr.ip()) => "Tailscale/private interface",
+        Ok(SocketAddr::V4(addr)) if addr.ip().is_private() || addr.ip().is_link_local() => {
+            "LAN/private interface"
+        }
+        Ok(SocketAddr::V6(addr)) if !addr.ip().is_loopback() => "LAN/private interface",
+        Ok(_) => "custom/public",
+        Err(_) if bind.starts_with("localhost:") => "localhost only",
+        Err(_) => "custom/unknown",
+    }
+}
+
+fn is_tailscale_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
+fn require_explicit_remote_bind(bind: &str, allow_unsafe_bind: bool) -> Result<()> {
+    if !bind_exposes_remote_access(bind) {
+        return Ok(());
+    }
+
+    let message = format!(
+        "bind '{bind}' exposes Nucleus beyond localhost ({mode}). Use --allow-unsafe-bind to confirm this explicit choice, and keep Vault plaintext operations on localhost or HTTPS.",
+        mode = bind_mode_label(bind)
+    );
+    if allow_unsafe_bind {
+        eprintln!("Warning: {message}");
+        return Ok(());
+    }
+    bail!(message)
+}
+
 fn escape_env_value(value: &str) -> String {
     value.replace('\n', " ").trim().to_string()
 }
@@ -1031,6 +1079,7 @@ mod tests {
     use super::{
         InstallPlan, ManagedReleaseInstallPlan, managed_release_archive_name,
         normalized_capability_flags, render_dev_service_unit, render_managed_release_service_unit,
+        require_explicit_remote_bind,
     };
     use std::path::PathBuf;
 
@@ -1070,6 +1119,24 @@ mod tests {
         assert!(unit.contains(
             "Environment=NUCLEUS_RELEASE_MANIFEST_URL=https://example.com/manifest-stable.json"
         ));
+    }
+
+    #[test]
+    fn remote_bind_requires_explicit_confirmation() {
+        assert!(require_explicit_remote_bind("127.0.0.1:5201", false).is_ok());
+        assert!(require_explicit_remote_bind("localhost:5201", false).is_ok());
+        let error = require_explicit_remote_bind("0.0.0.0:5201", false)
+            .expect_err("all-interface bind should require confirmation")
+            .to_string();
+        assert!(error.contains("--allow-unsafe-bind"));
+        assert!(error.contains("Vault plaintext operations"));
+        assert!(require_explicit_remote_bind("0.0.0.0:5201", true).is_ok());
+    }
+
+    #[test]
+    fn managed_install_default_bind_is_localhost_only() {
+        assert_eq!(super::DEFAULT_SERVER_SETUP_BIND, "127.0.0.1:5201");
+        assert!(require_explicit_remote_bind(super::DEFAULT_SERVER_SETUP_BIND, false).is_ok());
     }
 
     #[test]

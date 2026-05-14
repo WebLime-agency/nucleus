@@ -27,7 +27,7 @@ The `nucleus release install` command defaults to the correct manifest URL for t
 Install the current stable channel:
 
 ```bash
-nucleus release install --channel stable --enable --bind 0.0.0.0:5201
+nucleus release install --channel stable --enable
 ```
 
 That command:
@@ -57,6 +57,21 @@ current/web/                web bundle matching the active Nucleus release
 ```
 
 The service unit points at `current/bin/nucleus-daemon` and `current/web`, so an update swaps both the Nucleus process and the served web client together.
+
+Managed installs default to `127.0.0.1:5201` so a new install is local-only unless the operator explicitly chooses otherwise. Bind modes are intentionally separate from Vault safe-origin rules:
+
+- Localhost only: `127.0.0.1:<port>`; default and safest for local use.
+- Tailscale/private interface only: bind to the specific Tailscale/private interface IP and prefer HTTPS/Tailscale certificates for browser access.
+- LAN/all interfaces: binding to a LAN IP or `0.0.0.0` requires `--allow-unsafe-bind` and should be paired with clear operator intent.
+- Custom/public: advanced only; prefer a localhost bind behind an HTTPS reverse proxy rather than direct public binding.
+
+Example explicit LAN install:
+
+```bash
+nucleus release install --channel stable --enable --bind 0.0.0.0:5201 --allow-unsafe-bind
+```
+
+Plain HTTP remote origins remain unsafe for Vault plaintext operations. Vault unlock/create/update flows require localhost or HTTPS by default even when the daemon is intentionally reachable over LAN or VPN.
 
 ## Switching Channels
 
