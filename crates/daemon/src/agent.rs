@@ -33,10 +33,10 @@ use uuid::Uuid;
 
 use super::{
     ApiError, AppState, assemble_prompt_input, ensure_prompting_runtime, excerpt,
-    load_router_profiles, publish_overview_event, publish_prompt_progress_event,
-    publish_session_event, resolve_profile_targets, resolve_session_projects,
-    resolve_workspace_profile, resolve_workspace_profile_target, try_record_audit_event,
-    unix_timestamp, vault,
+    extract_memory_candidates_after_successful_turn, load_router_profiles, publish_overview_event,
+    publish_prompt_progress_event, publish_session_event, resolve_profile_targets,
+    resolve_session_projects, resolve_workspace_profile, resolve_workspace_profile_target,
+    try_record_audit_event, unix_timestamp, vault,
 };
 use crate::runtime::{PromptStreamEvent, ProviderTurnResult};
 use crate::worker_action::{ChildJobProposal, WorkerAction, parse_worker_action};
@@ -2509,6 +2509,8 @@ async fn complete_job_with_final_answer(
             final_answer,
             &[],
         )?;
+        extract_memory_candidates_after_successful_turn(state, &session.session.id, &final_turn_id)
+            .await;
         visible_turn_id = Some(final_turn_id);
         state.store.update_session(
             &session.session.id,

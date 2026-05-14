@@ -747,6 +747,110 @@ pub struct MemorySummary {
     pub scope_count: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryCandidate {
+    pub id: String,
+    pub scope_kind: String,
+    pub scope_id: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub turn_id_start: String,
+    #[serde(default)]
+    pub turn_id_end: String,
+    #[serde(default = "default_memory_kind")]
+    pub candidate_kind: String,
+    pub title: String,
+    pub content: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default = "default_candidate_status")]
+    pub status: String,
+    #[serde(default)]
+    pub dedupe_key: String,
+    #[serde(default)]
+    pub accepted_memory_id: String,
+    #[serde(default = "default_candidate_created_by")]
+    pub created_by: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    #[serde(default)]
+    pub metadata_json: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryCandidateUpsertRequest {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub scope_kind: String,
+    pub scope_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub turn_id_start: Option<String>,
+    #[serde(default)]
+    pub turn_id_end: Option<String>,
+    #[serde(default)]
+    pub candidate_kind: Option<String>,
+    pub title: String,
+    pub content: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub dedupe_key: Option<String>,
+    #[serde(default)]
+    pub accepted_memory_id: Option<String>,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    #[serde(default)]
+    pub metadata_json: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryCandidateAcceptRequest {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub memory_kind: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    #[serde(default)]
+    pub metadata_json: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryCandidateListResponse {
+    #[serde(default)]
+    pub candidates: Vec<MemoryCandidate>,
+}
+
+fn default_candidate_status() -> String {
+    "pending".to_string()
+}
+fn default_candidate_created_by() -> String {
+    "utility_worker".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VaultStatusSummary {
     pub initialized: bool,

@@ -42,15 +42,17 @@ use nucleus_protocol::{
     CompiledTurn, ConnectionSummary, CreatePlaybookRequest, CreateSessionRequest, DaemonEvent,
     HealthResponse, HostStatus, JobDetail, JobSummary, MAX_CONFIGURED_JOB_STEPS,
     MAX_CONFIGURED_JOB_TOOL_CALLS, MAX_CONFIGURED_JOB_WALL_CLOCK_SECS, McpServerRecord,
-    McpServerSummary, McpToolRecord, MemoryEntry, MemoryEntryUpsertRequest, MemorySummary,
-    NucleusToolDescriptor, PlaybookDetail, PlaybookSummary, ProcessKillRequest,
-    ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate, ProjectUpdateRequest,
-    PromptProgressUpdate, RouterProfileSummary, RunBudgetSummary, RuntimeOverview, RuntimeSummary,
-    SessionDetail, SessionPromptRequest, SessionSummary, SettingsSummary, SkillImportRequest,
-    SkillImportResponse, SkillInstallResult, SkillInstallVerification, SkillInstallationRecord,
-    SkillInstallationUpsertRequest, SkillManifest, SkillPackageRecord, SkillPackageUpsertRequest,
-    SkillReconcileCandidate, SkillReconcileRequest, SkillReconcileScanResponse, StreamConnected,
-    SystemStats, UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
+    McpServerSummary, McpToolRecord, MemoryCandidate, MemoryCandidateAcceptRequest,
+    MemoryCandidateListResponse, MemoryCandidateUpsertRequest, MemoryEntry,
+    MemoryEntryUpsertRequest, MemorySummary, NucleusToolDescriptor, PlaybookDetail,
+    PlaybookSummary, ProcessKillRequest, ProcessKillResponse, ProcessListResponse,
+    ProcessStreamUpdate, ProjectUpdateRequest, PromptProgressUpdate, RouterProfileSummary,
+    RunBudgetSummary, RuntimeOverview, RuntimeSummary, SessionDetail, SessionPromptRequest,
+    SessionSummary, SettingsSummary, SkillImportRequest, SkillImportResponse, SkillInstallResult,
+    SkillInstallVerification, SkillInstallationRecord, SkillInstallationUpsertRequest,
+    SkillManifest, SkillPackageRecord, SkillPackageUpsertRequest, SkillReconcileCandidate,
+    SkillReconcileRequest, SkillReconcileScanResponse, StreamConnected, SystemStats,
+    UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
     VaultInitRequest, VaultSecretListResponse, VaultSecretSummary, VaultSecretUpdateRequest,
     VaultSecretUpsertRequest, VaultStatusSummary, VaultUnlockRequest, WorkspaceModelConfig,
     WorkspaceProfileSummary, WorkspaceProfileWriteRequest, WorkspaceSummary,
@@ -226,6 +228,25 @@ fn app(state: AppState) -> Router {
             axum::routing::post(call_mcp_server_tool),
         )
         .route("/memory", get(list_memory).post(upsert_memory))
+        .route(
+            "/memory/candidates",
+            get(list_memory_candidates).post(upsert_memory_candidate),
+        )
+        .route(
+            "/memory/candidates/{candidate_id}",
+            axum::routing::put(upsert_memory_candidate_by_id)
+                .patch(upsert_memory_candidate_by_id)
+                .delete(delete_memory_candidate),
+        )
+        .route(
+            "/memory/candidates/{candidate_id}/accept",
+            axum::routing::post(accept_memory_candidate),
+        )
+        .route(
+            "/memory/candidates/{candidate_id}/reject",
+            axum::routing::post(reject_memory_candidate),
+        )
+        .route("/memory/remember", axum::routing::post(explicit_remember))
         .route(
             "/memory/{memory_id}",
             axum::routing::put(upsert_memory_by_id).delete(delete_memory),
@@ -804,6 +825,579 @@ fn upsert_memory_from_request(
         .store
         .upsert_memory_entry(&entry)
         .map_err(ApiError::from)
+}
+
+const MEMORY_EXTRACTION_CONTEXT_CHAR_BUDGET: usize = 8_000;
+
+#[derive(Debug, Deserialize)]
+struct ExtractedMemoryCandidate {
+    title: String,
+    content: String,
+    #[serde(default = "default_extracted_candidate_kind")]
+    candidate_kind: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    evidence: Vec<String>,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    confidence: Option<f64>,
+    #[serde(default)]
+    scope_kind: Option<String>,
+    #[serde(default)]
+    scope_id: Option<String>,
+}
+
+fn default_extracted_candidate_kind() -> String {
+    "note".to_string()
+}
+
+pub(crate) async fn extract_memory_candidates_after_successful_turn(
+    state: &AppState,
+    session_id: &str,
+    assistant_turn_id: &str,
+) {
+    record_memory_audit(
+        state,
+        "memory.candidate.extraction_started",
+        session_id,
+        "started",
+        "Started automatic memory candidate extraction.",
+    )
+    .await;
+
+    match extract_memory_candidates_after_successful_turn_inner(
+        state,
+        session_id,
+        assistant_turn_id,
+    )
+    .await
+    {
+        Ok(count) => {
+            record_memory_audit(
+                state,
+                "memory.candidate.extraction_completed",
+                session_id,
+                "completed",
+                &format!("Completed automatic memory candidate extraction; stored {count} pending candidates."),
+            )
+            .await;
+        }
+        Err(error) => {
+            warn!(error = ?error, session_id, assistant_turn_id, "automatic memory candidate extraction failed without affecting the user turn");
+            record_memory_audit(
+                state,
+                "memory.candidate.extraction_failed",
+                session_id,
+                "failed",
+                "Automatic memory candidate extraction failed without affecting the user turn.",
+            )
+            .await;
+        }
+    }
+}
+
+async fn extract_memory_candidates_after_successful_turn_inner(
+    state: &AppState,
+    session_id: &str,
+    assistant_turn_id: &str,
+) -> Result<usize, ApiError> {
+    let detail = state
+        .store
+        .get_session(session_id)
+        .map_err(ApiError::from)?;
+    let Some(assistant_turn) = detail
+        .turns
+        .iter()
+        .find(|turn| turn.id == assistant_turn_id && turn.role == "assistant")
+    else {
+        return Err(ApiError::bad_request(
+            "assistant turn was not found for memory extraction",
+        ));
+    };
+    let recent_context = bounded_recent_turn_context(&detail.turns);
+    let extracted = parse_structured_memory_candidates(&assistant_turn.content, &recent_context)?;
+    let mut stored_count = 0usize;
+    for item in extracted {
+        let scope_kind = item
+            .scope_kind
+            .unwrap_or_else(|| infer_session_memory_scope_kind(&detail.session));
+        let scope_id = item
+            .scope_id
+            .unwrap_or_else(|| infer_session_memory_scope_id(&detail.session, &scope_kind));
+        let payload = MemoryCandidateUpsertRequest {
+            id: Some(format!(
+                "auto-{}-{}",
+                assistant_turn_id,
+                stable_short_hash(&format!("{}:{}", item.title, item.content))
+            )),
+            scope_kind,
+            scope_id,
+            session_id: Some(session_id.to_string()),
+            turn_id_start: detail.turns.first().map(|turn| turn.id.clone()),
+            turn_id_end: Some(assistant_turn_id.to_string()),
+            candidate_kind: Some(item.candidate_kind),
+            title: item.title,
+            content: item.content,
+            tags: item.tags,
+            evidence: item.evidence,
+            reason: Some(item.reason),
+            confidence: item.confidence,
+            status: Some("pending".to_string()),
+            dedupe_key: None,
+            accepted_memory_id: None,
+            created_by: Some("utility_worker".to_string()),
+            metadata_json: Some(json!({
+                "source": "automatic_extraction",
+                "assistant_turn_id": assistant_turn_id,
+                "context_char_budget": MEMORY_EXTRACTION_CONTEXT_CHAR_BUDGET,
+                "context_chars_used": recent_context.len(),
+                "format": "structured_json_candidates"
+            })),
+        };
+        match upsert_memory_candidate_from_request(state, payload, None, false).await {
+            Ok(_) => stored_count += 1,
+            Err(error) if error.message.contains("duplicate pending memory candidate") => {}
+            Err(error) if error.message.contains("credential-like") => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(stored_count)
+}
+
+fn parse_structured_memory_candidates(
+    assistant_content: &str,
+    _recent_context: &str,
+) -> Result<Vec<ExtractedMemoryCandidate>, ApiError> {
+    if assistant_content.contains("NUCLEUS_MEMORY_EXTRACT_FAIL") {
+        return Err(ApiError::bad_request("simulated memory extraction failure"));
+    }
+    if let Some(json_text) = extract_tagged_json_array(assistant_content, "memory_candidates") {
+        return serde_json::from_str::<Vec<ExtractedMemoryCandidate>>(json_text)
+            .map_err(|_| ApiError::bad_request("memory extraction returned invalid JSON"));
+    }
+
+    let mut candidates = Vec::new();
+    for line in assistant_content.lines() {
+        let trimmed = line.trim();
+        let Some(content) = trimmed
+            .strip_prefix("Remember:")
+            .or_else(|| trimmed.strip_prefix("Memory:"))
+            .map(str::trim)
+        else {
+            continue;
+        };
+        if content.len() < 12 {
+            continue;
+        }
+        candidates.push(ExtractedMemoryCandidate {
+            title: excerpt(content, 64),
+            content: content.to_string(),
+            candidate_kind: "note".to_string(),
+            tags: vec!["automatic".to_string()],
+            evidence: vec![excerpt(trimmed, 160)],
+            reason: "Assistant marked this as durable information to remember.".to_string(),
+            confidence: Some(0.7),
+            scope_kind: None,
+            scope_id: None,
+        });
+    }
+    Ok(candidates)
+}
+
+fn extract_tagged_json_array<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let start = text.find(&start_tag)? + start_tag.len();
+    let end = text[start..].find(&end_tag)? + start;
+    Some(text[start..end].trim())
+}
+
+fn bounded_recent_turn_context(turns: &[nucleus_protocol::SessionTurn]) -> String {
+    let mut selected = Vec::new();
+    let mut remaining = MEMORY_EXTRACTION_CONTEXT_CHAR_BUDGET;
+    for turn in turns.iter().rev() {
+        let rendered = format!("{}: {}", turn.role, turn.content);
+        if rendered.len() > remaining {
+            continue;
+        }
+        remaining -= rendered.len();
+        selected.push(rendered);
+    }
+    selected.reverse();
+    selected.join("\n")
+}
+
+fn infer_session_memory_scope_kind(session: &SessionSummary) -> String {
+    if !session.project_id.is_empty() {
+        "project".to_string()
+    } else {
+        "workspace".to_string()
+    }
+}
+
+fn infer_session_memory_scope_id(session: &SessionSummary, scope_kind: &str) -> String {
+    if scope_kind == "project" && !session.project_id.is_empty() {
+        session.project_id.clone()
+    } else {
+        "workspace".to_string()
+    }
+}
+
+fn stable_short_hash(input: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(input.as_bytes());
+    format!("{:x}", h.finalize())[..16].to_string()
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryCandidateQuery {
+    status: Option<String>,
+    scope_kind: Option<String>,
+    scope_id: Option<String>,
+    session_id: Option<String>,
+}
+
+async fn list_memory_candidates(
+    State(state): State<AppState>,
+    Query(query): Query<MemoryCandidateQuery>,
+) -> Result<Json<MemoryCandidateListResponse>, ApiError> {
+    let mut candidates = state
+        .store
+        .list_memory_candidates()
+        .map_err(ApiError::from)?;
+    candidates.retain(|candidate| {
+        query.status.as_ref().is_none_or(|v| candidate.status == *v)
+            && query
+                .scope_kind
+                .as_ref()
+                .is_none_or(|v| candidate.scope_kind == *v)
+            && query
+                .scope_id
+                .as_ref()
+                .is_none_or(|v| candidate.scope_id == *v)
+            && query
+                .session_id
+                .as_ref()
+                .is_none_or(|v| candidate.session_id == *v)
+    });
+    Ok(Json(MemoryCandidateListResponse { candidates }))
+}
+
+async fn upsert_memory_candidate(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<MemoryCandidate>, ApiError> {
+    let payload = decode_json::<MemoryCandidateUpsertRequest>(&body)?;
+    upsert_memory_candidate_from_request(&state, payload, None, true)
+        .await
+        .map(Json)
+}
+
+async fn upsert_memory_candidate_by_id(
+    State(state): State<AppState>,
+    Path(candidate_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<MemoryCandidate>, ApiError> {
+    let payload = decode_json::<MemoryCandidateUpsertRequest>(&body)?;
+    upsert_memory_candidate_from_request(&state, payload, Some(candidate_id), true)
+        .await
+        .map(Json)
+}
+
+async fn accept_memory_candidate(
+    State(state): State<AppState>,
+    Path(candidate_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<MemoryEntry>, ApiError> {
+    let candidate_id = sanitize_registry_id(&candidate_id, "memory candidate id")?;
+    let request = if body.is_empty() {
+        MemoryCandidateAcceptRequest {
+            title: None,
+            content: None,
+            tags: None,
+            memory_kind: None,
+            confidence: None,
+            created_by: None,
+            metadata_json: None,
+        }
+    } else {
+        decode_json::<MemoryCandidateAcceptRequest>(&body)?
+    };
+    let mut candidate = state
+        .store
+        .load_memory_candidate(&candidate_id)
+        .map_err(ApiError::from)?;
+    if candidate.status == "accepted" && !candidate.accepted_memory_id.is_empty() {
+        return state
+            .store
+            .upsert_memory_entry(
+                &state
+                    .store
+                    .list_memory_entries()?
+                    .into_iter()
+                    .find(|entry| entry.id == candidate.accepted_memory_id)
+                    .ok_or_else(|| ApiError::bad_request("accepted memory entry is missing"))?,
+            )
+            .map(Json)
+            .map_err(ApiError::from);
+    }
+    let title = request
+        .title
+        .unwrap_or_else(|| candidate.title.clone())
+        .trim()
+        .to_string();
+    let content = security::RedactionSet::new().redact_text(
+        request
+            .content
+            .unwrap_or_else(|| candidate.content.clone())
+            .trim(),
+    );
+    if title.is_empty() || content.is_empty() || contains_credential_like_value(&content) {
+        return Err(ApiError::bad_request(
+            "accepted memory content is empty or credential-like",
+        ));
+    }
+    let memory_id = sanitize_registry_id(&format!("candidate-{}", candidate.id), "memory id")?;
+    let entry = MemoryEntry { id: memory_id.clone(), scope_kind: candidate.scope_kind.clone(), scope_id: candidate.scope_id.clone(), title, content, tags: request.tags.unwrap_or_else(|| candidate.tags.clone()), enabled: true, status: "accepted".to_string(), memory_kind: normalize_memory_kind(request.memory_kind.as_deref().or(Some(candidate.candidate_kind.as_str())))?, source_kind: "candidate".to_string(), source_id: candidate.id.clone(), confidence: request.confidence.unwrap_or(candidate.confidence).clamp(0.0,1.0), created_by: normalize_memory_created_by(request.created_by.as_deref())?, last_used_at: None, use_count: 0, supersedes_id: String::new(), metadata_json: security::RedactionSet::new().redact_json(&request.metadata_json.unwrap_or_else(|| json!({"candidate_evidence": candidate.evidence, "candidate_reason": candidate.reason}))), created_at: 0, updated_at: 0 };
+    let entry = state
+        .store
+        .upsert_memory_entry(&entry)
+        .map_err(ApiError::from)?;
+    candidate.status = "accepted".to_string();
+    candidate.accepted_memory_id = entry.id.clone();
+    state
+        .store
+        .upsert_memory_candidate(&candidate)
+        .map_err(ApiError::from)?;
+    record_memory_audit(
+        &state,
+        "memory.candidate.accepted",
+        &candidate.id,
+        "accepted",
+        &format!("Accepted memory candidate '{}'.", candidate.title),
+    )
+    .await;
+    Ok(Json(entry))
+}
+
+async fn reject_memory_candidate(
+    State(state): State<AppState>,
+    Path(candidate_id): Path<String>,
+) -> Result<Json<MemoryCandidate>, ApiError> {
+    let candidate_id = sanitize_registry_id(&candidate_id, "memory candidate id")?;
+    let mut candidate = state
+        .store
+        .load_memory_candidate(&candidate_id)
+        .map_err(ApiError::from)?;
+    candidate.status = "rejected".to_string();
+    let candidate = state
+        .store
+        .upsert_memory_candidate(&candidate)
+        .map_err(ApiError::from)?;
+    record_memory_audit(
+        &state,
+        "memory.candidate.rejected",
+        &candidate.id,
+        "rejected",
+        &format!("Rejected memory candidate '{}'.", candidate.title),
+    )
+    .await;
+    Ok(Json(candidate))
+}
+
+async fn delete_memory_candidate(
+    State(state): State<AppState>,
+    Path(candidate_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let candidate_id = sanitize_registry_id(&candidate_id, "memory candidate id")?;
+    state
+        .store
+        .delete_memory_candidate(&candidate_id)
+        .map_err(ApiError::from)?;
+    record_memory_audit(
+        &state,
+        "memory.candidate.dismissed",
+        &candidate_id,
+        "dismissed",
+        "Dismissed memory candidate.",
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn explicit_remember(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<MemoryEntry>, ApiError> {
+    let mut payload = decode_json::<MemoryEntryUpsertRequest>(&body)?;
+    payload.source_kind = Some("explicit_remember".to_string());
+    payload.created_by = Some(payload.created_by.unwrap_or_else(|| "user".to_string()));
+    let entry = upsert_memory_from_request(&state, payload, None)?;
+    record_memory_audit(
+        &state,
+        "memory.explicit.created",
+        &entry.id,
+        "created",
+        &format!("Created explicit memory '{}'.", entry.title),
+    )
+    .await;
+    Ok(Json(entry))
+}
+
+async fn upsert_memory_candidate_from_request(
+    state: &AppState,
+    payload: MemoryCandidateUpsertRequest,
+    id_override: Option<String>,
+    audit: bool,
+) -> Result<MemoryCandidate, ApiError> {
+    let scope_kind = normalize_memory_scope_kind(&payload.scope_kind)?;
+    let scope_id = payload.scope_id.trim();
+    let title = payload.title.trim();
+    let redactor = security::RedactionSet::new();
+    let content = redactor.redact_text(payload.content.trim());
+    if scope_id.is_empty()
+        || title.is_empty()
+        || content.is_empty()
+        || contains_credential_like_value(&content)
+    {
+        return Err(ApiError::bad_request(
+            "candidate scope, title, and non-secret content are required",
+        ));
+    }
+    let candidate_kind = normalize_memory_kind(payload.candidate_kind.as_deref())?;
+    let dedupe_key = payload.dedupe_key.unwrap_or_else(|| {
+        memory_dedupe_key(&scope_kind, scope_id, &candidate_kind, title, &content)
+    });
+    if !dedupe_key.is_empty()
+        && state
+            .store
+            .list_memory_candidates()?
+            .into_iter()
+            .any(|existing| {
+                existing.id != payload.id.clone().unwrap_or_default()
+                    && existing.dedupe_key == dedupe_key
+                    && existing.status == "pending"
+            })
+    {
+        return Err(ApiError::bad_request("duplicate pending memory candidate"));
+    }
+    let id = match id_override {
+        Some(value) => sanitize_registry_id(&value, "memory candidate id")?,
+        None => sanitize_registry_id(
+            payload.id.as_deref().unwrap_or(title),
+            "memory candidate id",
+        )?,
+    };
+    let candidate = MemoryCandidate {
+        id,
+        scope_kind,
+        scope_id: scope_id.to_string(),
+        session_id: payload.session_id.unwrap_or_default(),
+        turn_id_start: payload.turn_id_start.unwrap_or_default(),
+        turn_id_end: payload.turn_id_end.unwrap_or_default(),
+        candidate_kind,
+        title: title.to_string(),
+        content,
+        tags: payload
+            .tags
+            .into_iter()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect(),
+        evidence: payload
+            .evidence
+            .into_iter()
+            .map(|e| redactor.redact_text(e.trim()))
+            .filter(|e| !e.is_empty() && !contains_credential_like_value(e))
+            .collect(),
+        reason: redactor.redact_text(payload.reason.unwrap_or_default().trim()),
+        confidence: payload.confidence.unwrap_or(0.0).clamp(0.0, 1.0),
+        status: normalize_candidate_status(payload.status.as_deref())?,
+        dedupe_key,
+        accepted_memory_id: payload.accepted_memory_id.unwrap_or_default(),
+        created_by: normalize_memory_created_by(
+            payload.created_by.as_deref().or(Some("utility_worker")),
+        )?,
+        created_at: 0,
+        updated_at: 0,
+        metadata_json: redactor.redact_json(&payload.metadata_json.unwrap_or_else(|| json!({}))),
+    };
+    let candidate = state
+        .store
+        .upsert_memory_candidate(&candidate)
+        .map_err(ApiError::from)?;
+    if audit {
+        record_memory_audit(
+            state,
+            "memory.candidate.created",
+            &candidate.id,
+            "created",
+            &format!("Created memory candidate '{}'.", candidate.title),
+        )
+        .await;
+    }
+    Ok(candidate)
+}
+
+fn normalize_candidate_status(value: Option<&str>) -> Result<String, ApiError> {
+    match value.unwrap_or("pending").trim() {
+        "pending" | "accepted" | "rejected" | "dismissed" | "superseded" => {
+            Ok(value.unwrap_or("pending").trim().to_string())
+        }
+        _ => Err(ApiError::bad_request(
+            "candidate status must be pending, accepted, rejected, dismissed, or superseded",
+        )),
+    }
+}
+fn memory_dedupe_key(
+    scope_kind: &str,
+    scope_id: &str,
+    kind: &str,
+    title: &str,
+    content: &str,
+) -> String {
+    let mut h = Sha256::new();
+    h.update(format!(
+        "{}:{}:{}:{}:{}",
+        scope_kind,
+        scope_id,
+        kind,
+        title.to_lowercase(),
+        content.to_lowercase()
+    ));
+    format!("memory-candidate:{:x}", h.finalize())
+}
+fn contains_credential_like_value(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("authorization: bearer")
+        || lower.contains("-----begin ")
+        || lower.contains("password=")
+        || lower.contains("api_key=")
+        || lower.contains("access_token=")
+        || lower.contains("refresh_token=")
+        || lower.contains("://") && lower.contains('@')
+}
+async fn record_memory_audit(
+    state: &AppState,
+    kind: &str,
+    target: &str,
+    status: &str,
+    summary: &str,
+) {
+    let redactor = security::RedactionSet::new();
+    let _ = try_record_audit_event(
+        state,
+        AuditEventRecord {
+            kind: kind.to_string(),
+            target: target.to_string(),
+            status: status.to_string(),
+            summary: redactor.redact_text(summary),
+            detail: "{}".to_string(),
+        },
+    )
+    .await;
 }
 
 fn normalize_memory_scope_kind(value: &str) -> Result<String, ApiError> {
@@ -7865,6 +8459,383 @@ mod tests {
         );
         assert_eq!(entry.metadata_json["nested"]["token"], "[REDACTED_SECRET]");
         assert_eq!(entry.metadata_json["safe"], "ok");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    fn create_test_persisted_session(
+        state: &AppState,
+        session_id: &str,
+        workspace_root: &std::path::Path,
+    ) -> SessionSummary {
+        state
+            .store
+            .create_session(SessionRecord {
+                id: session_id.to_string(),
+                title: "Test session".to_string(),
+                profile_id: String::new(),
+                profile_title: String::new(),
+                route_id: String::new(),
+                route_title: String::new(),
+                scope: "workspace".to_string(),
+                project_id: String::new(),
+                project_title: String::new(),
+                project_path: workspace_root.display().to_string(),
+                project_ids: Vec::new(),
+                provider: "openai_compatible".to_string(),
+                model: "gpt-5.4-mini".to_string(),
+                provider_base_url: "http://127.0.0.1:20128/v1".to_string(),
+                provider_api_key: String::new(),
+                working_dir: workspace_root.display().to_string(),
+                working_dir_kind: "workspace".to_string(),
+                workspace_mode: "shared_project_root".to_string(),
+                source_project_path: String::new(),
+                git_root: String::new(),
+                worktree_path: String::new(),
+                git_branch: String::new(),
+                git_base_ref: String::new(),
+                git_head: String::new(),
+                git_dirty: false,
+                git_untracked_count: 0,
+                git_remote_tracking_branch: String::new(),
+                workspace_warnings: Vec::new(),
+                approval_mode: "ask".to_string(),
+                execution_mode: "act".to_string(),
+                run_budget_mode: "inherit".to_string(),
+            })
+            .expect("test session should persist")
+    }
+
+    #[tokio::test]
+    async fn automatic_memory_extraction_creates_pending_only_and_is_prompt_safe() {
+        let (state_dir, state) = test_named_app_state("memory-auto-extraction");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let session = create_test_persisted_session(&state, "auto-session", &workspace_root);
+        state
+            .store
+            .append_session_turn(
+                &session.id,
+                "user-turn",
+                "user",
+                "Please capture durable preferences.",
+                &[],
+            )
+            .unwrap();
+        let assistant = r#"Done.
+<memory_candidates>[{"title":"Preferred release notes","content":"The workspace prefers concise release notes with exact check results.","candidate_kind":"preference","tags":["release"],"evidence":["User asked for concise exact checks."],"reason":"Useful for future release work.","confidence":0.86}]</memory_candidates>"#;
+        state
+            .store
+            .append_session_turn(&session.id, "assistant-turn", "assistant", assistant, &[])
+            .unwrap();
+
+        extract_memory_candidates_after_successful_turn(&state, &session.id, "assistant-turn")
+            .await;
+        let candidates = state.store.list_memory_candidates().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].status, "pending");
+        assert_eq!(
+            state.store.list_memory_entries().unwrap().len(),
+            0,
+            "automatic extraction must not create accepted memory"
+        );
+
+        let compiled = compile_session_turn(&state, &session, &[], "future", &[], "main").unwrap();
+        let rendered = nucleus_core::render_compiled_turn_system_text(&compiled);
+        assert!(!rendered.contains("concise release notes"));
+
+        let entry = accept_memory_candidate(
+            State(state.clone()),
+            Path(candidates[0].id.clone()),
+            Bytes::new(),
+        )
+        .await
+        .unwrap()
+        .0;
+        let compiled = compile_session_turn(&state, &session, &[], "future", &[], "main").unwrap();
+        let rendered = nucleus_core::render_compiled_turn_system_text(&compiled);
+        assert!(rendered.contains(&entry.content));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn automatic_memory_extraction_failure_secrets_dedupe_and_audit_are_safe() {
+        let (state_dir, state) = test_named_app_state("memory-auto-guardrails");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let session = create_test_persisted_session(&state, "auto-guardrails", &workspace_root);
+        state
+            .store
+            .append_session_turn(
+                &session.id,
+                "user-turn",
+                "user",
+                "Remember operational context.",
+                &[],
+            )
+            .unwrap();
+        let secret = "sk-raw-secret-test-value";
+        let assistant = format!(
+            r#"Done.
+<memory_candidates>[
+{{"title":"Safe durable note","content":"The project prefers candidate review before durable memory acceptance.","candidate_kind":"decision","reason":"Future useful.","confidence":0.8}},
+{{"title":"Unsafe token","content":"authorization: bearer {secret}","candidate_kind":"note","reason":"Must be skipped.","confidence":0.9}}
+]</memory_candidates>"#
+        );
+        state
+            .store
+            .append_session_turn(&session.id, "assistant-safe", "assistant", &assistant, &[])
+            .unwrap();
+        extract_memory_candidates_after_successful_turn(&state, &session.id, "assistant-safe")
+            .await;
+        extract_memory_candidates_after_successful_turn(&state, &session.id, "assistant-safe")
+            .await;
+        let candidates = state.store.list_memory_candidates().unwrap();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "duplicate and secret-like extracted candidates should be skipped"
+        );
+        assert!(!format!("{candidates:?}").contains(secret));
+
+        state
+            .store
+            .append_session_turn(
+                &session.id,
+                "assistant-fail",
+                "assistant",
+                "NUCLEUS_MEMORY_EXTRACT_FAIL",
+                &[],
+            )
+            .unwrap();
+        extract_memory_candidates_after_successful_turn(&state, &session.id, "assistant-fail")
+            .await;
+        assert!(
+            state
+                .store
+                .get_session(&session.id)
+                .unwrap()
+                .turns
+                .iter()
+                .any(|turn| turn.id == "assistant-fail")
+        );
+        let audits = state.store.list_audit_events(50).unwrap();
+        let rendered_audits = format!("{audits:?}");
+        assert!(rendered_audits.contains("memory.candidate.extraction_failed"));
+        assert!(!rendered_audits.contains(secret));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn memory_candidate_lifecycle_accepts_rejects_and_dismisses() {
+        let (state_dir, state) = test_named_app_state("memory-candidate-lifecycle");
+        let candidate = upsert_memory_candidate_from_request(
+            &state,
+            MemoryCandidateUpsertRequest {
+                id: Some("candidate-one".to_string()),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                session_id: Some("session-one".to_string()),
+                turn_id_start: Some("turn-a".to_string()),
+                turn_id_end: Some("turn-b".to_string()),
+                candidate_kind: Some("decision".to_string()),
+                title: "Use compact memory".to_string(),
+                content: "Nucleus should keep memory candidates review-only until accepted."
+                    .to_string(),
+                tags: vec!["memory".to_string()],
+                evidence: vec!["User asked for candidate review.".to_string()],
+                reason: Some("Durable product behavior.".to_string()),
+                confidence: Some(0.9),
+                status: None,
+                dedupe_key: None,
+                accepted_memory_id: None,
+                created_by: None,
+                metadata_json: None,
+            },
+            None,
+            true,
+        )
+        .await
+        .expect("candidate should save");
+        assert_eq!(candidate.status, "pending");
+
+        let entry = accept_memory_candidate(
+            State(state.clone()),
+            Path(candidate.id.clone()),
+            Bytes::from_static(br#"{"content":"Edited accepted memory."}"#),
+        )
+        .await
+        .expect("candidate should accept")
+        .0;
+        assert_eq!(entry.source_kind, "candidate");
+        assert_eq!(entry.content, "Edited accepted memory.");
+        let accepted = state.store.load_memory_candidate(&candidate.id).unwrap();
+        assert_eq!(accepted.status, "accepted");
+        assert_eq!(accepted.accepted_memory_id, entry.id);
+
+        let rejected = upsert_memory_candidate_from_request(
+            &state,
+            MemoryCandidateUpsertRequest {
+                id: Some("reject-me".to_string()),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "Reject me".to_string(),
+                content: "A non-secret pending candidate.".to_string(),
+                session_id: None,
+                turn_id_start: None,
+                turn_id_end: None,
+                candidate_kind: None,
+                tags: vec![],
+                evidence: vec![],
+                reason: None,
+                confidence: None,
+                status: None,
+                dedupe_key: None,
+                accepted_memory_id: None,
+                created_by: None,
+                metadata_json: None,
+            },
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let rejected = reject_memory_candidate(State(state.clone()), Path(rejected.id))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(rejected.status, "rejected");
+
+        let dismissed = upsert_memory_candidate_from_request(
+            &state,
+            MemoryCandidateUpsertRequest {
+                id: Some("dismiss-me".to_string()),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "Dismiss me".to_string(),
+                content: "A candidate to dismiss.".to_string(),
+                session_id: None,
+                turn_id_start: None,
+                turn_id_end: None,
+                candidate_kind: None,
+                tags: vec![],
+                evidence: vec![],
+                reason: None,
+                confidence: None,
+                status: None,
+                dedupe_key: None,
+                accepted_memory_id: None,
+                created_by: None,
+                metadata_json: None,
+            },
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        delete_memory_candidate(State(state.clone()), Path(dismissed.id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .store
+                .load_memory_candidate(&dismissed.id)
+                .unwrap()
+                .status,
+            "dismissed"
+        );
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn memory_candidate_prompt_visibility_and_dedupe_guardrails() {
+        let (state_dir, state) = test_named_app_state("memory-candidate-prompt");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session = test_session(&workspace_root);
+        let payload = MemoryCandidateUpsertRequest {
+            id: Some("pending-memory".to_string()),
+            scope_kind: "workspace".to_string(),
+            scope_id: "workspace".to_string(),
+            title: "Pending invisible".to_string(),
+            content: "Pending candidates must not enter compiled prompts.".to_string(),
+            session_id: None,
+            turn_id_start: None,
+            turn_id_end: None,
+            candidate_kind: None,
+            tags: vec![],
+            evidence: vec![],
+            reason: None,
+            confidence: None,
+            status: None,
+            dedupe_key: None,
+            accepted_memory_id: None,
+            created_by: None,
+            metadata_json: None,
+        };
+        upsert_memory_candidate_from_request(&state, payload.clone(), None, false)
+            .await
+            .unwrap();
+        let mut duplicate_payload = payload;
+        duplicate_payload.id = Some("pending-memory-duplicate".to_string());
+        upsert_memory_candidate_from_request(&state, duplicate_payload, None, false)
+            .await
+            .expect_err("duplicate pending candidates should be rejected");
+        let compiled = compile_session_turn(&state, &session, &[], "prompt", &[], "main").unwrap();
+        assert!(
+            !nucleus_core::render_compiled_turn_system_text(&compiled)
+                .contains("Pending candidates must not enter")
+        );
+        let entry = accept_memory_candidate(
+            State(state.clone()),
+            Path("pending-memory".to_string()),
+            Bytes::new(),
+        )
+        .await
+        .unwrap()
+        .0;
+        let compiled = compile_session_turn(&state, &session, &[], "prompt", &[], "main").unwrap();
+        assert!(nucleus_core::render_compiled_turn_system_text(&compiled).contains(&entry.content));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn explicit_remember_and_candidates_reject_credential_like_content() {
+        let (state_dir, state) = test_named_app_state("memory-secret-guardrails");
+        let entry = explicit_remember(
+            State(state.clone()),
+            Bytes::from_static(br#"{"scope_kind":"workspace","scope_id":"workspace","title":"Remember safely","content":"This project uses a project-scoped token stored in Vault."}"#),
+        ).await.unwrap().0;
+        assert_eq!(entry.source_kind, "explicit_remember");
+
+        let bad = upsert_memory_candidate_from_request(
+            &state,
+            MemoryCandidateUpsertRequest {
+                id: Some("secret-candidate".to_string()),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "Secret".to_string(),
+                content: "authorization: bearer sk-super-secret".to_string(),
+                session_id: None,
+                turn_id_start: None,
+                turn_id_end: None,
+                candidate_kind: None,
+                tags: vec![],
+                evidence: vec![],
+                reason: None,
+                confidence: None,
+                status: None,
+                dedupe_key: None,
+                accepted_memory_id: None,
+                created_by: None,
+                metadata_json: None,
+            },
+            None,
+            true,
+        )
+        .await;
+        assert!(bad.is_err());
+        let audits = state.store.list_audit_events(20).unwrap();
+        assert!(!format!("{audits:?}").contains("sk-super-secret"));
         let _ = fs::remove_dir_all(&state_dir);
     }
 
