@@ -748,6 +748,18 @@ pub struct MemorySummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemorySearchResult {
+    pub entry: MemoryEntry,
+    pub rank: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemorySearchResponse {
+    #[serde(default)]
+    pub results: Vec<MemorySearchResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MemoryCandidate {
     pub id: String,
     pub scope_kind: String,
