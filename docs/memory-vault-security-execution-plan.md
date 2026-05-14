@@ -54,7 +54,7 @@ Source plans:
 | 3 | Vault | Passphrase-protected local Vault backend | completed | Phase 1 | PR #137 merged into `dev` at `724eb2115e02d2d660de41ee890724ebac85fab6`; UI/MCP remain deferred. |
 | 4 | Memory | Candidates + explicit/automatic capture loop | completed | Phase 1, Phase 2 | PR #141 merged into `dev` at `c3e0f60ce23b9878a0d331cc1a6cc6d67c56e5b4`; not released. |
 | 5 | Vault | Workspace Vault UI + policy model | completed | Phase 3 | PR #143 merged into `dev` at `0fbe03ee9e331c69eb896348cefdc373ba521511`; not released. |
-| 6 | Vault/MCP | MCP `vault_bearer` integration | not_started | Phase 3, Phase 5 |  |
+| 6 | Vault/MCP | MCP `vault_bearer` integration | in_progress | Phase 3, Phase 5 | Local work on `feat/mcp-vault-bearer`; not merged or released. |
 | 7 | Vault | Project Vaults | not_started | Phase 5 |  |
 | 8 | Memory | SQLite FTS5 searchable memory provider | not_started | Phase 4 |  |
 | 9 | Security | Built-in/guided HTTPS and bind-mode hardening | not_started | Phase 1 |  |
@@ -382,11 +382,11 @@ Completion notes:
 - Policy write/delete operations require a safe origin and unlocked Vault.
 - Added non-secret audit events for policy metadata changes.
 - PR #143 checks passed: Promotion, Rust, and Web.
-- Phase 6+ remain `not_started`; no MCP `vault_bearer`, Project Vaults, FTS/search, semantic memory, promotion, release, or managed install work has started.
+- Phase 6 is now `in_progress`; Phase 7+ remain `not_started`. No Project Vaults, FTS/search, semantic memory, promotion, release, or managed install work has started.
 
 ## Phase 6 — MCP `vault_bearer` integration
 
-Status: `not_started`
+Status: `in_progress`
 
 Source docs:
 
@@ -425,9 +425,11 @@ Exit criteria:
 - MCP check/discovery uses daemon-side Vault resolution.
 - Env vars are no longer the primary product path.
 
-Completion notes:
+Progress notes:
 
-- Pending.
+- Phase 6 implementation started on `feat/mcp-vault-bearer`.
+- Current scope is MCP `vault_bearer` auth with daemon-side Workspace Vault reference resolution, policy enforcement, safe failure states, and UI guidance.
+- Phase 7+ remain `not_started`; Project Vaults, FTS/search, semantic memory, promotion, release, and managed install work have not started.
 
 ## Phase 7 — Project Vaults
 
@@ -637,7 +639,7 @@ When asked to work on this plan:
 
 - Operator/manager sessions should review executor reports, maintain gates, and provide prompts/checklists. They should not directly patch, commit, push, merge, promote, or release unless explicitly asked.
 - Keep implementation, cleanup, PR/release, and verification work in separate focused sessions/worktrees.
-- Phase 3 is merged/completed via PR #137. Phase 4 is merged/completed via PR #141. Phase 5 is merged/completed via PR #143. Phase 6 and later remain `not_started`.
+- Phase 3 is merged/completed via PR #137. Phase 4 is merged/completed via PR #141. Phase 5 is merged/completed via PR #143. Phase 6 is `in_progress`; Phase 7 and later remain `not_started`.
 - Main worktree cleanup was completed after Phase 2. The stale dirty branch was cleaned back to current dev. Future implementation work should still prefer fresh clean worktrees.
 - A Node/toolchain runtime-resolution experiment was preserved separately and should be reviewed later as its own focused PR. It must not be mixed into Memory/Vault/Security phase work.
 - Memory UI currently treats edited entries mostly as manual/user entries. After candidate capture and explicit remember flows exist, revisit preserving richer source metadata during edits.

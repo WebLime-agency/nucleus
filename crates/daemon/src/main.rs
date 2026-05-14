@@ -1935,7 +1935,7 @@ async fn discover_mcp_server_tools(
         .find(|server| server.id == server_id)
         .ok_or_else(|| ApiError::not_found(format!("MCP server '{server_id}' was not found")))?;
 
-    let result = discover_mcp_server(&record).await;
+    let result = discover_mcp_server(&state, &record).await;
     match result {
         Ok(discovered) => {
             let now = SystemTime::now()
@@ -1994,7 +1994,7 @@ async fn discover_mcp_server_tools(
                 .as_secs() as i64;
             let message = error.to_string();
             let updated_record = McpServerRecord {
-                sync_status: "error".to_string(),
+                sync_status: mcp_sync_status_for_error(&message).to_string(),
                 last_error: message.clone(),
                 last_synced_at: Some(now),
                 updated_at: now,
@@ -2037,15 +2037,16 @@ async fn call_mcp_server_tool(
             record.transport
         )));
     }
-    let _ = mcp_http_request(&record, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"nucleus","version":env!("CARGO_PKG_VERSION")}}}))
+    let _ = mcp_http_request(&state, &record, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"nucleus","version":env!("CARGO_PKG_VERSION")}}}))
         .await
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let _ = mcp_http_request(
+        &state,
         &record,
         json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
     )
     .await;
-    let result = mcp_http_request(&record, json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool_name,"arguments":params}}))
+    let result = mcp_http_request(&state, &record, json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool_name,"arguments":params}}))
         .await
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     Ok(Json(result))
@@ -2058,10 +2059,13 @@ struct DiscoveredMcpCatalog {
     tool_records: Vec<McpToolRecord>,
 }
 
-async fn discover_mcp_server(record: &McpServerRecord) -> anyhow::Result<DiscoveredMcpCatalog> {
+async fn discover_mcp_server(
+    state: &AppState,
+    record: &McpServerRecord,
+) -> anyhow::Result<DiscoveredMcpCatalog> {
     match record.transport.as_str() {
         "stdio" => discover_mcp_stdio_server(record).await,
-        "streamable-http" | "http" => discover_mcp_http_server(record).await,
+        "streamable-http" | "http" => discover_mcp_http_server(state, record).await,
         "sse" => bail!("unsupported_transport: SSE MCP transport is not implemented"),
         other => bail!(
             "unsupported_transport: unsupported MCP transport '{}'",
@@ -2244,16 +2248,19 @@ async fn discover_mcp_stdio_server(
 }
 
 async fn discover_mcp_http_server(
+    state: &AppState,
     record: &McpServerRecord,
 ) -> anyhow::Result<DiscoveredMcpCatalog> {
-    let result = mcp_http_request(record, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"nucleus","version":env!("CARGO_PKG_VERSION")}}})).await?;
+    let result = mcp_http_request(state, record, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"nucleus","version":env!("CARGO_PKG_VERSION")}}})).await?;
     let _ = result;
     let _ = mcp_http_request(
+        state,
         record,
         json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
     )
     .await;
     let result = mcp_http_request(
+        state,
         record,
         json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
     )
@@ -2316,7 +2323,11 @@ async fn discover_mcp_http_server(
     })
 }
 
-async fn mcp_http_request(record: &McpServerRecord, payload: Value) -> anyhow::Result<Value> {
+async fn mcp_http_request(
+    state: &AppState,
+    record: &McpServerRecord,
+    payload: Value,
+) -> anyhow::Result<Value> {
     if record.url.trim().is_empty() {
         bail!("missing_url: MCP remote URL is required");
     }
@@ -2345,6 +2356,10 @@ async fn mcp_http_request(record: &McpServerRecord, payload: Value) -> anyhow::R
             let token = std::env::var(record.auth_ref.trim()).map_err(|_| {
                 anyhow::anyhow!("missing_credentials: bearer token environment variable is not set")
             })?;
+            req = req.bearer_auth(token);
+        }
+        "vault_bearer" => {
+            let token = resolve_mcp_vault_bearer_token(state, record).await?;
             req = req.bearer_auth(token);
         }
         "static_headers" => {}
@@ -2390,6 +2405,103 @@ async fn mcp_http_request(record: &McpServerRecord, payload: Value) -> anyhow::R
         bail!("remote_server_failure: MCP error {}", error);
     }
     Ok(value.get("result").cloned().unwrap_or(value))
+}
+
+fn mcp_sync_status_for_error(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("vault_locked") {
+        "vault_locked"
+    } else if lower.contains("vault_secret_missing") {
+        "vault_secret_missing"
+    } else if lower.contains("vault_policy_denied") {
+        "vault_policy_denied"
+    } else if lower.contains("missing_credentials") {
+        "missing_credentials"
+    } else if lower.contains("auth_required") {
+        "auth_required"
+    } else if lower.contains("unsupported_transport") {
+        "unsupported_transport"
+    } else {
+        "error"
+    }
+}
+
+pub(crate) async fn resolve_mcp_vault_bearer_token(
+    state: &AppState,
+    record: &McpServerRecord,
+) -> anyhow::Result<String> {
+    let reference = parse_vault_reference(&record.auth_ref)?;
+    let secret = state
+        .store
+        .list_vault_secrets(Some(&reference.scope_kind), Some(&reference.scope_id))?
+        .into_iter()
+        .find(|secret| secret.name == reference.name)
+        .ok_or_else(|| {
+            anyhow::anyhow!("vault_secret_missing: configured Vault reference was not found")
+        })?;
+
+    let allowed = state
+        .store
+        .list_vault_secret_policies(&secret.id)?
+        .into_iter()
+        .any(|policy| {
+            policy.consumer_kind == "mcp"
+                && policy.consumer_id == record.id
+                && policy.permission == "read"
+                && policy.approval_mode == "allow"
+        });
+    if !allowed {
+        anyhow::bail!(
+            "vault_policy_denied: MCP server is not allowed to read this Vault reference"
+        );
+    }
+
+    let mut vault = state.vault.lock().await;
+    let token = vault
+        .decrypt_secret(&state.store, &secret)
+        .map_err(|error| match error.to_string().as_str() {
+            "vault is locked" => {
+                anyhow::anyhow!("vault_locked: unlock Vault before using this MCP credential")
+            }
+            _ => anyhow::anyhow!(
+                "vault_secret_missing: configured Vault reference could not be resolved"
+            ),
+        })?;
+    drop(vault);
+    state
+        .store
+        .record_vault_secret_usage(&secret.id, "mcp", &record.id, "bearer_auth")?;
+    Ok(token)
+}
+
+struct ParsedVaultReference {
+    scope_kind: String,
+    scope_id: String,
+    name: String,
+}
+
+fn parse_vault_reference(value: &str) -> anyhow::Result<ParsedVaultReference> {
+    let value = value.trim();
+    let Some(rest) = value.strip_prefix("vault://") else {
+        anyhow::bail!("missing_credentials: vault_bearer auth_ref must be a vault:// reference");
+    };
+    let mut parts = rest.split('/').filter(|part| !part.trim().is_empty());
+    match parts.next() {
+        Some("workspace") => {
+            let name = parts.collect::<Vec<_>>().join("/");
+            let name = sanitize_registry_id(&name, "vault secret name")
+                .map_err(|error| anyhow::anyhow!(error.message))?;
+            Ok(ParsedVaultReference {
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                name,
+            })
+        }
+        Some("project") => anyhow::bail!(
+            "vault_secret_missing: project Vault references are deferred until Phase 7"
+        ),
+        _ => anyhow::bail!("missing_credentials: unsupported Vault reference scope"),
+    }
 }
 
 async fn list_sessions(
@@ -9771,6 +9883,202 @@ for line in sys.stdin:
         assert!(record.last_error.is_empty());
         assert!(record.last_synced_at.is_some());
 
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    async fn start_auth_check_mcp_server(expected_token: &'static str) -> String {
+        async fn handler(
+            headers: HeaderMap,
+            Json(payload): Json<Value>,
+        ) -> Result<Json<Value>, StatusCode> {
+            let expected = "Bearer phase6-vault-token";
+            if headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                != Some(expected)
+            {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            let id = payload.get("id").cloned().unwrap_or_else(|| json!(null));
+            let method = payload.get("method").and_then(Value::as_str).unwrap_or("");
+            let result = if method == "tools/list" {
+                json!({"tools":[{"name":"lookup","description":"Lookup docs","inputSchema":{"type":"object"}}]})
+            } else {
+                json!({"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake","version":"1.0"}})
+            };
+            Ok(Json(json!({"jsonrpc":"2.0","id":id,"result":result})))
+        }
+
+        assert_eq!(expected_token, "phase6-vault-token");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener binds");
+        let addr = listener.local_addr().expect("listener has addr");
+        let app = Router::new().route("/mcp", axum::routing::post(handler));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}/mcp")
+    }
+
+    fn vault_http_mcp_record(url: String) -> McpServerRecord {
+        McpServerRecord {
+            id: "mcp.vault-docs".to_string(),
+            workspace_id: "workspace".to_string(),
+            title: "Vault Docs MCP".to_string(),
+            transport: "streamable-http".to_string(),
+            command: String::new(),
+            args: Vec::new(),
+            env_json: json!({}),
+            url,
+            headers_json: json!({}),
+            auth_kind: "vault_bearer".to_string(),
+            auth_ref: "vault://workspace/MCP_TOKEN".to_string(),
+            enabled: true,
+            sync_status: "pending".to_string(),
+            last_error: String::new(),
+            last_synced_at: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_vault_bearer_discovery_resolves_daemon_side_and_fails_closed() {
+        let (state_dir, state) = test_named_app_state("mcp-vault-bearer");
+        let url = start_auth_check_mcp_server("phase6-vault-token").await;
+        let record = vault_http_mcp_record(url);
+        state
+            .store
+            .upsert_mcp_server_record(&record, &[], &[])
+            .expect("mcp record persists");
+
+        {
+            let mut vault = state.vault.lock().await;
+            vault
+                .initialize(&state.store, "correct horse battery staple")
+                .expect("vault initializes");
+            let secret = vault
+                .create_or_update_secret(
+                    &state.store,
+                    vault::VaultSecretInput {
+                        id: Some("mcp-token".to_string()),
+                        scope_kind: "workspace".to_string(),
+                        scope_id: "workspace".to_string(),
+                        name: "MCP_TOKEN".to_string(),
+                        description: "MCP bearer token".to_string(),
+                        secret: "phase6-vault-token".to_string(),
+                    },
+                )
+                .expect("secret stores");
+            state
+                .store
+                .upsert_vault_secret_policy(&VaultSecretPolicyRecord {
+                    id: "policy-allow".to_string(),
+                    secret_id: secret.id,
+                    consumer_kind: "mcp".to_string(),
+                    consumer_id: record.id.clone(),
+                    permission: "read".to_string(),
+                    approval_mode: "allow".to_string(),
+                    created_at: 0,
+                    updated_at: 0,
+                })
+                .expect("policy stores");
+        }
+
+        let summary = discover_mcp_server_tools(State(state.clone()), Path(record.id.clone()))
+            .await
+            .expect("vault-backed discovery succeeds")
+            .0;
+        assert_eq!(summary.sync_status, "ready");
+        assert_eq!(summary.auth_kind, "vault_bearer");
+        assert_eq!(summary.auth_ref, "vault://workspace/MCP_TOKEN");
+        let serialized = serde_json::to_string(&summary).expect("summary serializes");
+        assert!(!serialized.contains("phase6-vault-token"));
+
+        state.vault.lock().await.lock();
+        let locked = discover_mcp_server_tools(State(state.clone()), Path(record.id.clone()))
+            .await
+            .expect_err("locked vault blocks discovery");
+        assert_eq!(locked.status, StatusCode::BAD_REQUEST);
+        assert!(locked.message.contains("vault_locked"));
+        let stored = state
+            .store
+            .list_mcp_server_records()
+            .expect("records load")
+            .into_iter()
+            .find(|row| row.id == record.id)
+            .expect("record exists");
+        assert_eq!(stored.sync_status, "vault_locked");
+
+        let missing = resolve_mcp_vault_bearer_token(
+            &state,
+            &McpServerRecord {
+                auth_ref: "vault://workspace/NOPE".to_string(),
+                ..record.clone()
+            },
+        )
+        .await
+        .expect_err("missing secret blocks");
+        assert!(missing.to_string().contains("vault_secret_missing"));
+
+        {
+            let _ = state
+                .vault
+                .lock()
+                .await
+                .unlock(&state.store, "correct horse battery staple")
+                .expect("vault unlocks");
+        }
+        state
+            .store
+            .upsert_vault_secret_policy(&VaultSecretPolicyRecord {
+                id: "policy-deny".to_string(),
+                secret_id: "mcp-token".to_string(),
+                consumer_kind: "mcp".to_string(),
+                consumer_id: "mcp.denied".to_string(),
+                permission: "read".to_string(),
+                approval_mode: "deny".to_string(),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .expect("deny policy stores");
+        let denied = resolve_mcp_vault_bearer_token(
+            &state,
+            &McpServerRecord {
+                id: "mcp.denied".to_string(),
+                ..record.clone()
+            },
+        )
+        .await
+        .expect_err("policy denied blocks");
+        assert!(denied.to_string().contains("vault_policy_denied"));
+
+        let audit = state.store.list_audit_events(50).expect("audit lists");
+        let audit_serialized = serde_json::to_string(&audit).expect("audit serializes");
+        assert!(!audit_serialized.contains("phase6-vault-token"));
+        let records = state.store.list_mcp_server_records().expect("records load");
+        let records_serialized = serde_json::to_string(&records).expect("records serialize");
+        assert!(!records_serialized.contains("phase6-vault-token"));
+
+        unsafe {
+            env::set_var("NUCLEUS_TEST_PHASE6_MCP_TOKEN", "phase6-vault-token");
+        }
+        let env_result = mcp_http_request(
+            &state,
+            &McpServerRecord {
+                auth_kind: "bearer_env".to_string(),
+                auth_ref: "NUCLEUS_TEST_PHASE6_MCP_TOKEN".to_string(),
+                ..record.clone()
+            },
+            json!({"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}),
+        )
+        .await
+        .expect("bearer_env fallback still works");
+        assert_eq!(env_result["tools"][0]["name"], "lookup");
+        unsafe {
+            env::remove_var("NUCLEUS_TEST_PHASE6_MCP_TOKEN");
+        }
         let _ = fs::remove_dir_all(&state_dir);
     }
 
