@@ -1245,6 +1245,27 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn record_vault_secret_usage(
+        &self,
+        secret_id: &str,
+        consumer_kind: &str,
+        consumer_id: &str,
+        purpose: &str,
+    ) -> Result<()> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        connection.execute(
+            "UPDATE vault_secrets SET last_used_at = unixepoch(), updated_at = updated_at WHERE id = ?1",
+            params![secret_id],
+        )?;
+        connection.execute(
+            "INSERT INTO vault_secret_usages (id, secret_id, consumer_kind, consumer_id, purpose, created_at, last_used_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, unixepoch(), unixepoch())
+             ",
+            params![Uuid::new_v4().to_string(), secret_id, consumer_kind, consumer_id, purpose],
+        )?;
+        Ok(())
+    }
+
     pub fn list_skill_packages(&self) -> Result<Vec<nucleus_protocol::SkillPackageRecord>> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         list_skill_packages_with_connection(&connection)
