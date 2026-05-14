@@ -56,7 +56,7 @@ Source plans:
 | 5 | Vault | Workspace Vault UI + policy model | completed | Phase 3 | PR #143 merged into `dev` at `0fbe03ee9e331c69eb896348cefdc373ba521511`; not released. |
 | 6 | Vault/MCP | MCP `vault_bearer` integration | completed | Phase 3, Phase 5 | PR #145 merged into `dev` at `30478a9c4424d511b7a1298536053e26e5c22595`; not released. |
 | 7 | Vault | Project Vaults | completed | Phase 5 | PR #147 merged into `dev` at `b1339246357fd9df29ba70b9e7b983b37ee8e1c5`; not released. |
-| 8 | Memory | SQLite FTS5 searchable memory provider | in_progress | Phase 4 | Local work on `feat/memory-fts-search`; not merged or released. |
+| 8 | Memory | SQLite FTS5 searchable memory provider | completed | Phase 4 | PR #149 merged into `dev` at `69adddf83a3181acda5f1497a88814cf37aced22`; not released. |
 | 9 | Security | Built-in/guided HTTPS and bind-mode hardening | not_started | Phase 1 |  |
 | 10 | Release | Stable managed release and EBA verification | not_started | Phases required by release scope |  |
 | 11 | Future | Retrieval provider interface and optional semantic search | not_started | Phase 8 |  |
@@ -491,7 +491,7 @@ Completion notes:
 
 ## Phase 8 — SQLite FTS5 searchable memory provider
 
-Status: `in_progress`
+Status: `completed`
 
 Source doc:
 
@@ -514,9 +514,16 @@ Exit criteria:
 
 Completion notes:
 
-- Local Phase 8 work is in progress on `feat/memory-fts-search`.
-- Target implementation keeps `memory_entries` as the source of truth and maintains SQLite FTS5 rows as derived/rebuildable search indexes for accepted, enabled memory only.
-- Phase 9 and later remain `not_started`; no semantic/vector memory, Vault changes, promotion, release, or managed install work has started.
+- PR #149 merged into `dev` at `69adddf83a3181acda5f1497a88814cf37aced22`; checks passed and Codex comments were addressed.
+- Added a SQLite FTS5 derived memory search index while keeping `memory_entries` as the canonical source of truth.
+- FTS rows are derived/rebuildable; storage initialization populates/rebuilds FTS from existing accepted/enabled memory.
+- Memory upsert/delete paths maintain FTS rows.
+- Added `/api/memory/search` with explicit `scope_kind`/`scope_id` filters.
+- Session-scoped search filtering uses existing memory prompt scope rules and applies the final result limit after session filtering.
+- Search updates `use_count` and `last_used_at` for returned/recalled memory.
+- Search indexes and returns accepted/enabled memory only; pending/rejected/dismissed candidates are not indexed or searched, and archived/disabled memory is excluded.
+- No Vault changes, semantic/vector memory, promotion, release, or managed install work was included.
+- Phase 9 and later remain `not_started`.
 
 ## Phase 9 — HTTPS and bind-mode hardening
 
