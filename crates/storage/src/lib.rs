@@ -3185,6 +3185,7 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         );
         ",
     )?;
+    rebuild_memory_search_index_with_connection(connection)?;
 
     ensure_column(
         connection,
@@ -7255,6 +7256,59 @@ mod tests {
                 .expect("memory search after delete should work")
                 .is_empty()
         );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn memory_fts_initialization_populates_existing_accepted_entries() {
+        let state_dir = test_state_dir("memory-fts-init-rebuild");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        {
+            let connection = store.connection.lock().expect("storage mutex poisoned");
+            for (id, enabled, status, content) in [
+                (
+                    "legacy-accepted",
+                    1_i64,
+                    "accepted",
+                    "Legacy accepted migration phrase should become searchable.",
+                ),
+                (
+                    "legacy-archived",
+                    1_i64,
+                    "archived",
+                    "Legacy archived migration phrase must stay excluded.",
+                ),
+                (
+                    "legacy-disabled",
+                    0_i64,
+                    "accepted",
+                    "Legacy disabled migration phrase must stay excluded.",
+                ),
+            ] {
+                connection
+                    .execute(
+                        "INSERT INTO memory_entries (id, scope_kind, scope_id, title, content, tags_json, enabled, status, memory_kind, source_kind, source_id, confidence, created_by, metadata_json) VALUES (?1, 'workspace', 'workspace', ?2, ?3, '[]', ?4, ?5, 'note', 'manual', '', 1.0, 'user', '{}')",
+                        params![id, id, content, enabled, status],
+                    )
+                    .expect("legacy memory row should insert");
+            }
+            connection
+                .execute("DELETE FROM memory_entries_fts", [])
+                .expect("legacy database should have empty derived fts table");
+        }
+        drop(store);
+
+        let reopened = StateStore::initialize_at(&state_dir)
+            .expect("storage reinitialization should populate derived fts rows");
+        let results = reopened
+            .search_memory_entries("migration phrase", Some("workspace"), Some("workspace"), 10)
+            .expect("search should use populated fts rows");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entry.id, "legacy-accepted");
+        let debug = format!("{results:?}");
+        assert!(!debug.contains("Legacy archived"));
+        assert!(!debug.contains("Legacy disabled"));
 
         let _ = fs::remove_dir_all(&state_dir);
     }

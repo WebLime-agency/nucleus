@@ -91,6 +91,8 @@ const MAX_PROMPT_INCLUDE_FILES: usize = 24;
 const MAX_PROMPT_INCLUDE_FILE_CHARS: usize = 6_000;
 const MAX_PROMPT_INCLUDE_TOTAL_CHARS: usize = 24_000;
 const MAX_MEMORY_CONTEXT_CHARS: usize = 12_000;
+const MAX_MEMORY_SEARCH_RESULTS: usize = 50;
+const SESSION_MEMORY_SEARCH_CANDIDATE_LIMIT: usize = 50;
 const MEMORY_TRUNCATION_NOTICE: &str = "\n[Memory entry truncated by Nucleus context budget]";
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(900);
 const INITIAL_UPDATE_CHECK_DELAY: Duration = Duration::from_secs(3);
@@ -793,13 +795,26 @@ async fn search_memory(
         ));
     }
 
+    let requested_limit = query
+        .limit
+        .unwrap_or(20)
+        .clamp(1, MAX_MEMORY_SEARCH_RESULTS);
+    let storage_limit = if query.session_id.is_some() {
+        // Session applicability is enforced with the same prompt-context rules below. Pull a
+        // bounded candidate set first so unrelated high-ranked scopes cannot consume the final
+        // caller-requested limit before daemon-side session filtering runs.
+        SESSION_MEMORY_SEARCH_CANDIDATE_LIMIT
+    } else {
+        requested_limit
+    };
+
     let mut results = state
         .store
         .search_memory_entries(
             search_text,
             scope_kind.as_deref(),
             scope_id.as_deref(),
-            query.limit.unwrap_or(20),
+            storage_limit,
         )
         .map_err(ApiError::from)?;
 
@@ -818,6 +833,7 @@ async fn search_memory(
             memory_entry_applies_to_session(&result.entry, &detail.session, &project_ids)
         });
     }
+    results.truncate(requested_limit);
 
     let used_ids = results
         .iter()
@@ -8979,6 +8995,30 @@ mod tests {
             .expect("test session should persist")
     }
 
+    fn test_memory_entry(id: &str, scope_kind: &str, scope_id: &str, content: &str) -> MemoryEntry {
+        MemoryEntry {
+            id: id.to_string(),
+            scope_kind: scope_kind.to_string(),
+            scope_id: scope_id.to_string(),
+            title: id.to_string(),
+            content: content.to_string(),
+            tags: Vec::new(),
+            enabled: true,
+            status: "accepted".to_string(),
+            memory_kind: "note".to_string(),
+            source_kind: "manual".to_string(),
+            source_id: String::new(),
+            confidence: 1.0,
+            created_by: "user".to_string(),
+            last_used_at: None,
+            use_count: 0,
+            supersedes_id: String::new(),
+            metadata_json: json!({}),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
     #[tokio::test]
     async fn automatic_memory_extraction_creates_pending_only_and_is_prompt_safe() {
         let (state_dir, state) = test_named_app_state("memory-auto-extraction");
@@ -9414,6 +9454,74 @@ mod tests {
         assert!(!debug.contains("Pending validation candidates"));
         assert!(!debug.contains("Archived exact validation"));
         assert!(!debug.contains("sk-super-secret"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn memory_search_session_filtering_happens_before_final_limit() {
+        let (state_dir, state) = test_named_app_state("memory-fts-session-limit");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace root should exist");
+        let session = create_test_persisted_session(&state, "search-session", &workspace_root);
+
+        for index in 0..3 {
+            state
+                .store
+                .upsert_memory_entry(&test_memory_entry(
+                    &format!("other-project-{index}"),
+                    "project",
+                    "other-project",
+                    "validation validation validation non-applicable project memory",
+                ))
+                .expect("non-applicable memory should persist");
+        }
+        state
+            .store
+            .upsert_memory_entry(&test_memory_entry(
+                "applicable-session-memory",
+                "session",
+                &session.id,
+                "validation applicable session memory should survive final limit",
+            ))
+            .expect("session memory should persist");
+        state
+            .store
+            .upsert_memory_entry(&test_memory_entry(
+                "second-applicable-session-memory",
+                "session",
+                &session.id,
+                "validation second applicable session memory should be truncated by final limit",
+            ))
+            .expect("second session memory should persist");
+
+        let response = search_memory(
+            State(state.clone()),
+            Query(MemorySearchQuery {
+                q: "validation".to_string(),
+                scope_kind: None,
+                scope_id: None,
+                session_id: Some(session.id.clone()),
+                limit: Some(1),
+            }),
+        )
+        .await
+        .expect("session-filtered memory search should succeed")
+        .0;
+
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].entry.scope_kind, "session");
+        assert_eq!(response.results[0].entry.scope_id, session.id);
+        assert!(
+            response.results[0]
+                .entry
+                .id
+                .contains("applicable-session-memory")
+        );
+        assert_eq!(response.results[0].entry.use_count, 1);
+        assert!(response.results[0].entry.last_used_at.is_some());
+        let debug = format!("{response:?}");
+        assert!(!debug.contains("non-applicable project memory"));
 
         let _ = fs::remove_dir_all(&state_dir);
     }
