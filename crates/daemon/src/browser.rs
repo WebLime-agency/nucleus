@@ -211,11 +211,40 @@ fn normalize_url(input: &str) -> anyhow::Result<String> {
 }
 
 fn extract_title(html: &str) -> Option<String> {
-    let lower = html.to_lowercase();
-    let start = lower.find("<title")?;
-    let gt = lower[start..].find('>')? + start + 1;
-    let end = lower[gt..].find("</title>")? + gt;
-    Some(html[gt..end].trim().to_owned()).filter(|value| !value.is_empty())
+    let mut scan_start = 0;
+    let mut title_start = None;
+
+    for (index, _) in html.char_indices() {
+        if index < scan_start {
+            continue;
+        }
+        let rest = &html[index..];
+        if starts_with_ignore_ascii_case(rest, "<title") {
+            let after_tag = rest.find('>')?;
+            title_start = Some(index + after_tag + 1);
+            break;
+        }
+        scan_start = index + 1;
+    }
+
+    let title_start = title_start?;
+    let rest = &html[title_start..];
+    let title_end = find_ignore_ascii_case(rest, "</title>")? + title_start;
+    Some(html[title_start..title_end].trim().to_owned()).filter(|value| !value.is_empty())
+}
+
+fn find_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .char_indices()
+        .find(|(index, _)| starts_with_ignore_ascii_case(&haystack[*index..], needle))
+        .map(|(index, _)| index)
+}
+
+fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
+    let Some(candidate) = value.get(..prefix.len()) else {
+        return false;
+    };
+    candidate.eq_ignore_ascii_case(prefix)
 }
 
 fn extract_refs(html: &str) -> Vec<BrowserSnapshotRef> {
