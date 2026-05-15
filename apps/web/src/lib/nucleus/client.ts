@@ -8,6 +8,8 @@ import {
   apiErrorSchema,
   auditEventSchema,
   approvalResolutionRequestSchema,
+  browserContextSummarySchema,
+  browserSnapshotSchema,
   createPlaybookRequestSchema,
   createSessionRequestSchema,
   jobDetailSchema,
@@ -967,5 +969,50 @@ export async function killProcess(pid: number, fetchImpl: FetchLike = fetch) {
       body: JSON.stringify(payload)
     }),
     processKillResponseSchema
+  );
+}
+
+export async function fetchBrowserContext(sessionId: string, fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/sessions/${sessionId}/browser`, {
+      headers: { accept: 'application/json' }
+    }),
+    browserContextSummarySchema
+  );
+}
+
+export async function navigateBrowser(
+  sessionId: string,
+  input: { url: string; page_id?: string | null },
+  fetchImpl: FetchLike = fetch
+) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/sessions/${sessionId}/browser/navigate`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json'
+      },
+      body: JSON.stringify(input)
+    }),
+    browserContextSummarySchema
+  );
+}
+
+export async function captureBrowserSnapshot(
+  sessionId: string,
+  input: { page_id?: string | null } = {},
+  fetchImpl: FetchLike = fetch
+) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/sessions/${sessionId}/browser/snapshot`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json'
+      },
+      body: JSON.stringify(input)
+    }),
+    browserSnapshotSchema
   );
 }

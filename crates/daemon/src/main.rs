@@ -1,4 +1,5 @@
 mod agent;
+mod browser;
 mod host;
 mod runtime;
 mod security;
@@ -38,21 +39,22 @@ use nucleus_core::{
 };
 use nucleus_protocol::{
     ActionParameter, ActionRunRequest, ActionRunResponse, ActionSummary, ApprovalRequestSummary,
-    ApprovalResolutionRequest, AuditEvent, AuthSummary, CompatibilitySummary, CompiledPromptLayer,
-    CompiledTurn, ConnectionSummary, CreatePlaybookRequest, CreateSessionRequest, DaemonEvent,
-    HealthResponse, HostStatus, JobDetail, JobSummary, MAX_CONFIGURED_JOB_STEPS,
-    MAX_CONFIGURED_JOB_TOOL_CALLS, MAX_CONFIGURED_JOB_WALL_CLOCK_SECS, McpServerRecord,
-    McpServerSummary, McpToolRecord, MemoryCandidate, MemoryCandidateAcceptRequest,
-    MemoryCandidateListResponse, MemoryCandidateUpsertRequest, MemoryEntry,
-    MemoryEntryUpsertRequest, MemorySearchResponse, MemorySummary, NucleusToolDescriptor,
-    PlaybookDetail, PlaybookSummary, ProcessKillRequest, ProcessKillResponse, ProcessListResponse,
-    ProcessStreamUpdate, ProjectUpdateRequest, PromptProgressUpdate, RouterProfileSummary,
-    RunBudgetSummary, RuntimeOverview, RuntimeSummary, SessionDetail, SessionPromptRequest,
-    SessionSummary, SettingsSummary, SkillImportRequest, SkillImportResponse, SkillInstallResult,
-    SkillInstallVerification, SkillInstallationRecord, SkillInstallationUpsertRequest,
-    SkillManifest, SkillPackageRecord, SkillPackageUpsertRequest, SkillReconcileCandidate,
-    SkillReconcileRequest, SkillReconcileScanResponse, StreamConnected, SystemStats,
-    UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
+    ApprovalResolutionRequest, AuditEvent, AuthSummary, BrowserActionRequest,
+    BrowserContextSummary, BrowserNavigateRequest, BrowserSnapshot, CompatibilitySummary,
+    CompiledPromptLayer, CompiledTurn, ConnectionSummary, CreatePlaybookRequest,
+    CreateSessionRequest, DaemonEvent, HealthResponse, HostStatus, JobDetail, JobSummary,
+    MAX_CONFIGURED_JOB_STEPS, MAX_CONFIGURED_JOB_TOOL_CALLS, MAX_CONFIGURED_JOB_WALL_CLOCK_SECS,
+    McpServerRecord, McpServerSummary, McpToolRecord, MemoryCandidate,
+    MemoryCandidateAcceptRequest, MemoryCandidateListResponse, MemoryCandidateUpsertRequest,
+    MemoryEntry, MemoryEntryUpsertRequest, MemorySearchResponse, MemorySummary,
+    NucleusToolDescriptor, PlaybookDetail, PlaybookSummary, ProcessKillRequest,
+    ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate, ProjectUpdateRequest,
+    PromptProgressUpdate, RouterProfileSummary, RunBudgetSummary, RuntimeOverview, RuntimeSummary,
+    SessionDetail, SessionPromptRequest, SessionSummary, SettingsSummary, SkillImportRequest,
+    SkillImportResponse, SkillInstallResult, SkillInstallVerification, SkillInstallationRecord,
+    SkillInstallationUpsertRequest, SkillManifest, SkillPackageRecord, SkillPackageUpsertRequest,
+    SkillReconcileCandidate, SkillReconcileRequest, SkillReconcileScanResponse, StreamConnected,
+    SystemStats, UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
     VaultInitRequest, VaultSecretListResponse, VaultSecretPolicyListResponse,
     VaultSecretPolicySummary, VaultSecretPolicyUpsertRequest, VaultSecretSummary,
     VaultSecretUpdateRequest, VaultSecretUpsertRequest, VaultStatusSummary, VaultUnlockRequest,
@@ -107,6 +109,7 @@ struct AppState {
     updates: Arc<UpdateManager>,
     vault: Arc<tokio::sync::Mutex<vault::VaultRuntime>>,
     agent: Arc<agent::AgentRuntime>,
+    browser: Arc<browser::BrowserRuntime>,
     web_dist_dir: Option<PathBuf>,
     tailscale_dns_name: Option<String>,
     events: broadcast::Sender<DaemonEvent>,
@@ -130,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
         updates,
         vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
         agent: Arc::new(agent::AgentRuntime::default()),
+        browser: Arc::new(browser::BrowserRuntime::default()),
         web_dist_dir,
         tailscale_dns_name: detect_tailscale_dns_name(),
         events,
@@ -302,6 +306,19 @@ fn app(state: AppState) -> Router {
         )
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{session_id}/jobs", get(session_jobs))
+        .route("/sessions/{session_id}/browser", get(browser_context))
+        .route(
+            "/sessions/{session_id}/browser/navigate",
+            axum::routing::post(browser_navigate),
+        )
+        .route(
+            "/sessions/{session_id}/browser/snapshot",
+            axum::routing::post(browser_snapshot),
+        )
+        .route(
+            "/sessions/{session_id}/browser/action",
+            axum::routing::post(browser_action),
+        )
         .route(
             "/sessions/{session_id}",
             get(session_detail)
@@ -340,6 +357,59 @@ fn app(state: AppState) -> Router {
 
 async fn root() -> &'static str {
     "Nucleus"
+}
+
+async fn browser_context(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<BrowserContextSummary>, ApiError> {
+    ensure_session_exists(&state, &session_id)?;
+    Ok(Json(state.browser.context(&session_id).await))
+}
+
+async fn browser_navigate(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<BrowserContextSummary>, ApiError> {
+    ensure_session_exists(&state, &session_id)?;
+    let payload = decode_json::<BrowserNavigateRequest>(&body)?;
+    Ok(Json(state.browser.navigate(&session_id, payload).await?))
+}
+
+async fn browser_snapshot(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<BrowserSnapshot>, ApiError> {
+    ensure_session_exists(&state, &session_id)?;
+    #[derive(Deserialize)]
+    struct SnapshotRequest {
+        page_id: Option<String>,
+    }
+    let payload = if body.is_empty() {
+        SnapshotRequest { page_id: None }
+    } else {
+        decode_json::<SnapshotRequest>(&body)?
+    };
+    Ok(Json(
+        state.browser.snapshot(&session_id, payload.page_id).await?,
+    ))
+}
+
+async fn browser_action(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<BrowserSnapshot>, ApiError> {
+    ensure_session_exists(&state, &session_id)?;
+    let payload = decode_json::<BrowserActionRequest>(&body)?;
+    Ok(Json(state.browser.action(&session_id, payload).await?))
+}
+
+fn ensure_session_exists(state: &AppState, session_id: &str) -> Result<(), ApiError> {
+    state.store.get_session(session_id)?;
+    Ok(())
 }
 
 async fn require_api_auth(
@@ -7823,6 +7893,7 @@ mod tests {
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
             vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
+            browser: Arc::new(browser::BrowserRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -7933,6 +8004,7 @@ mod tests {
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
             vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
+            browser: Arc::new(browser::BrowserRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -8126,6 +8198,7 @@ mod tests {
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
             vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
+            browser: Arc::new(browser::BrowserRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -8172,6 +8245,7 @@ mod tests {
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
             vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
+            browser: Arc::new(browser::BrowserRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -8204,6 +8278,7 @@ mod tests {
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
             vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
+            browser: Arc::new(browser::BrowserRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -8252,6 +8327,7 @@ mod tests {
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
             vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
+            browser: Arc::new(browser::BrowserRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -8320,6 +8396,7 @@ mod tests {
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
             vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
+            browser: Arc::new(browser::BrowserRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -8400,6 +8477,7 @@ mod tests {
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
             vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
+            browser: Arc::new(browser::BrowserRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -8843,6 +8921,7 @@ mod tests {
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
             vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
+            browser: Arc::new(browser::BrowserRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -8861,6 +8940,7 @@ mod tests {
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
             vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
+            browser: Arc::new(browser::BrowserRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -10275,6 +10355,7 @@ mod tests {
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
             vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
+            browser: Arc::new(browser::BrowserRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
@@ -10847,6 +10928,7 @@ for line in sys.stdin:
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store.clone())),
             vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(agent::AgentRuntime::default()),
+            browser: Arc::new(browser::BrowserRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,

@@ -1585,3 +1585,57 @@ pub enum DaemonEvent {
     #[serde(rename = "update.updated")]
     UpdateUpdated(UpdateStatus),
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserPageSummary {
+    pub id: String,
+    pub url: String,
+    pub title: String,
+    pub loading: bool,
+    pub error: String,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserContextSummary {
+    pub session_id: String,
+    pub active_page_id: Option<String>,
+    pub pages: Vec<BrowserPageSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserNavigateRequest {
+    pub url: String,
+    #[serde(default)]
+    pub page_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserActionRequest {
+    pub action: String,
+    #[serde(default)]
+    pub page_id: Option<String>,
+    #[serde(default)]
+    pub target_ref: Option<String>,
+    #[serde(default)]
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserSnapshotRef {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub selector: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserSnapshot {
+    pub session_id: String,
+    pub page_id: String,
+    pub url: String,
+    pub title: String,
+    pub content: String,
+    pub refs: Vec<BrowserSnapshotRef>,
+    pub captured_at: i64,
+}

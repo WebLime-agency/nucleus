@@ -9128,6 +9128,7 @@ for line in sys.stdin:
             updates: Arc::new(UpdateManager::new(test_instance_runtime(), store)),
             vault: Arc::new(tokio::sync::Mutex::new(vault::VaultRuntime::default())),
             agent: Arc::new(AgentRuntime::default()),
+            browser: Arc::new(crate::browser::BrowserRuntime::default()),
             web_dist_dir: None,
             tailscale_dns_name: None,
             events,
