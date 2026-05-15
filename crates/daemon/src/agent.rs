@@ -7643,19 +7643,35 @@ async fn dispatch_playbook_event_inner(state: &AppState, event_kind: &str) -> Re
 }
 
 fn worker_read_roots(session: &SessionSummary) -> Vec<String> {
-    if session.projects.is_empty() {
-        return vec![session.working_dir.clone()];
+    let mut roots = Vec::new();
+    push_unique_root(&mut roots, &session.working_dir);
+    for project in &session.projects {
+        push_unique_root(&mut roots, &project.absolute_path);
     }
-
-    session
-        .projects
-        .iter()
-        .map(|project| project.absolute_path.clone())
-        .collect()
+    roots
 }
 
 fn worker_write_roots(session: &SessionSummary) -> Vec<String> {
+    if session.working_dir_kind == "managed_git_worktree"
+        || session.workspace_mode == "isolated_worktree"
+        || session.projects.is_empty()
+    {
+        return worker_session_root(session);
+    }
     worker_read_roots(session)
+}
+
+fn worker_session_root(session: &SessionSummary) -> Vec<String> {
+    let mut roots = Vec::new();
+    push_unique_root(&mut roots, &session.working_dir);
+    roots
+}
+
+fn push_unique_root(roots: &mut Vec<String>, value: &str) {
+    let trimmed = value.trim();
+    if !trimmed.is_empty() && !roots.iter().any(|root| root == trimmed) {
+        roots.push(trimmed.to_string());
+    }
 }
 
 fn root_worker_capabilities() -> Vec<ToolCapabilityGrantRecord> {
@@ -8402,6 +8418,7 @@ async fn publish_prompt_status(
 mod tests {
     use super::*;
     use crate::vault;
+    use nucleus_protocol::SessionProjectSummary;
 
     #[test]
     fn interrupted_restart_recovery_only_rewrites_non_terminal_tool_calls() {
@@ -8458,6 +8475,126 @@ mod tests {
             error.to_string().contains("matched multiple locations"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn worker_roots_use_worktree_for_isolated_session_writes() {
+        let worktree = "/state/worktrees/nucleus/session";
+        let source = "/home/eba/dev-projects/nucleus";
+        let session = scope_test_session(
+            worktree,
+            "managed_git_worktree",
+            "isolated_worktree",
+            vec![scope_test_project("nucleus", source, true)],
+        );
+
+        assert_eq!(
+            worker_read_roots(&session),
+            vec![worktree.to_string(), source.to_string()]
+        );
+        assert_eq!(worker_write_roots(&session), vec![worktree.to_string()]);
+    }
+
+    #[test]
+    fn worker_roots_keep_attached_projects_writable_for_shared_sessions() {
+        let primary = "/home/eba/dev-projects/nucleus";
+        let secondary = "/home/eba/dev-projects/other";
+        let session = scope_test_session(
+            primary,
+            "project_root",
+            "shared_project_root",
+            vec![
+                scope_test_project("nucleus", primary, true),
+                scope_test_project("other", secondary, false),
+            ],
+        );
+
+        assert_eq!(
+            worker_read_roots(&session),
+            vec![primary.to_string(), secondary.to_string()]
+        );
+        assert_eq!(
+            worker_write_roots(&session),
+            vec![primary.to_string(), secondary.to_string()]
+        );
+    }
+
+    fn scope_test_project(
+        id: &str,
+        absolute_path: &str,
+        is_primary: bool,
+    ) -> SessionProjectSummary {
+        SessionProjectSummary {
+            id: id.to_string(),
+            title: id.to_string(),
+            slug: id.to_string(),
+            relative_path: id.to_string(),
+            absolute_path: absolute_path.to_string(),
+            is_primary,
+        }
+    }
+
+    fn scope_test_session(
+        working_dir: &str,
+        working_dir_kind: &str,
+        workspace_mode: &str,
+        projects: Vec<SessionProjectSummary>,
+    ) -> SessionSummary {
+        let primary = projects.iter().find(|project| project.is_primary);
+        SessionSummary {
+            id: "session".to_string(),
+            title: "Session".to_string(),
+            profile_id: String::new(),
+            profile_title: String::new(),
+            route_id: String::new(),
+            route_title: String::new(),
+            project_id: primary
+                .map(|project| project.id.clone())
+                .unwrap_or_default(),
+            project_title: primary
+                .map(|project| project.title.clone())
+                .unwrap_or_default(),
+            project_path: primary
+                .map(|project| project.absolute_path.clone())
+                .unwrap_or_default(),
+            provider: "openai_compatible".to_string(),
+            model: "cx/gpt-5.4".to_string(),
+            provider_base_url: String::new(),
+            provider_api_key: String::new(),
+            working_dir: working_dir.to_string(),
+            working_dir_kind: working_dir_kind.to_string(),
+            workspace_mode: workspace_mode.to_string(),
+            source_project_path: primary
+                .map(|project| project.absolute_path.clone())
+                .unwrap_or_default(),
+            git_root: working_dir.to_string(),
+            worktree_path: working_dir.to_string(),
+            git_branch: String::new(),
+            git_base_ref: String::new(),
+            git_head: String::new(),
+            git_dirty: false,
+            git_untracked_count: 0,
+            git_remote_tracking_branch: String::new(),
+            workspace_warnings: Vec::new(),
+            scope: if projects.len() > 1 {
+                "multi_project".to_string()
+            } else {
+                "project".to_string()
+            },
+            approval_mode: "ask".to_string(),
+            execution_mode: "act".to_string(),
+            run_budget_mode: "standard".to_string(),
+            run_budget: RunBudgetSummary::default(),
+            project_count: projects.len(),
+            projects,
+            state: "active".to_string(),
+            provider_session_id: String::new(),
+            last_error: String::new(),
+            last_message_excerpt: String::new(),
+            turn_count: 0,
+            created_at: 0,
+            updated_at: 0,
+        }
     }
 
     #[test]
