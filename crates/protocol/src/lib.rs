@@ -1584,6 +1584,19 @@ pub enum DaemonEvent {
     ProcessesUpdated(ProcessStreamUpdate),
     #[serde(rename = "update.updated")]
     UpdateUpdated(UpdateStatus),
+    #[serde(rename = "browser.frame")]
+    BrowserFrame(BrowserFrameEvent),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BrowserFrameEvent {
+    pub session_id: String,
+    pub page_id: String,
+    pub mime: String,
+    pub image: String,
+    pub url: String,
+    pub title: String,
+    pub captured_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1619,6 +1632,8 @@ pub struct BrowserActionRequest {
     pub target_ref: Option<String>,
     #[serde(default)]
     pub value: Option<String>,
+    #[serde(default)]
+    pub snapshot: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1637,5 +1652,6 @@ pub struct BrowserSnapshot {
     pub title: String,
     pub content: String,
     pub refs: Vec<BrowserSnapshotRef>,
+    pub screenshot_data_url: String,
     pub captured_at: i64,
 }

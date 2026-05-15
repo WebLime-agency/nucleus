@@ -1049,6 +1049,17 @@ export const processStreamUpdateSchema = z.object({
   response: processListResponseSchema
 });
 
+
+const browserFrameEventSchema = z.object({
+  session_id: z.string(),
+  page_id: z.string(),
+  mime: z.string(),
+  image: z.string(),
+  url: z.string(),
+  title: z.string(),
+  captured_at: z.number().int()
+});
+
 export const daemonEventSchema = z.discriminatedUnion('event', [
   z.object({
     event: z.literal('connected'),
@@ -1117,6 +1128,10 @@ export const daemonEventSchema = z.discriminatedUnion('event', [
   z.object({
     event: z.literal('update.updated'),
     data: updateStatusSchema
+  }),
+  z.object({
+    event: z.literal('browser.frame'),
+    data: browserFrameEventSchema
   })
 ]);
 
@@ -1189,6 +1204,7 @@ export type SettingsSummary = z.infer<typeof settingsSummarySchema>;
 export type CompatibilitySummary = z.infer<typeof compatibilitySummarySchema>;
 export type UpdateStatus = z.infer<typeof updateStatusSchema>;
 export type UpdateConfigRequest = z.infer<typeof updateConfigRequestSchema>;
+export type BrowserFrameEvent = z.infer<typeof browserFrameEventSchema>;
 export type DaemonEvent = z.infer<typeof daemonEventSchema>;
 
 export const browserPageSummarySchema = z.object({
@@ -1220,6 +1236,7 @@ export const browserSnapshotSchema = z.object({
   title: z.string(),
   content: z.string(),
   refs: z.array(browserSnapshotRefSchema),
+  screenshot_data_url: z.string().default(''),
   captured_at: z.number().int()
 });
 export type BrowserPageSummary = z.infer<typeof browserPageSummarySchema>;

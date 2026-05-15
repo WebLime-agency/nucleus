@@ -21,6 +21,8 @@ Rules:
 - do not push directly to `main`
 - do not push directly to `dev` unless you are repairing the branch itself
 - keep feature branches narrow and disposable
+- run dedicated feature-branch or worktree testing against a matching source daemon from that same checkout
+- use disposable state and non-canonical ports for source-checkout runtime testing; never point a feature-branch web client at a managed release daemon
 - let `main` move only through the nightly promotion path unless there is an explicit hotfix
 - `dev` should keep linear history
 - the nightly promotion branch must start from `main`, not `dev`
@@ -30,6 +32,13 @@ Rules:
 - nightly promotion must verify the disposable promotion branch itself and publish the required `Rust` and `Web` checks on that promotion head
 - do not rely on `pull_request` or `push` workflows firing from `GITHUB_TOKEN` activity during promotion
 - do not publish public product artifacts from feature branches
+
+Feature branch runtime rule:
+
+- A source-checkout web client and daemon are a matched pair. If a branch changes daemon APIs, protocol schemas, browser runtime behavior, storage, or embedded web expectations, run both processes from that branch or worktree.
+- Use scratch state for branch testing. Do not reuse managed instance state directories.
+- Treat managed product instances as consumers of released artifacts, not as feature-branch test targets.
+- Browser feature work is especially strict because browser profiles, cookies, tabs, downloads, and sidecar state are daemon-owned and may persist under the active state directory.
 
 CI expectations:
 
