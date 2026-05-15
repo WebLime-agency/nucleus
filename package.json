@@ -10,5 +10,8 @@
     "dev:web": "npm run dev --workspace @nucleus/web",
     "build:web": "npm run build --workspace @nucleus/web",
     "check:web": "npm run check --workspace @nucleus/web"
+  },
+  "dependencies": {
+    "playwright": "^1.60.0"
   }
 }

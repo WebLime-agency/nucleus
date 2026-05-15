@@ -312,12 +312,36 @@ fn app(state: AppState) -> Router {
             axum::routing::post(browser_navigate),
         )
         .route(
+            "/sessions/{session_id}/browser/open",
+            axum::routing::post(browser_open_tab),
+        )
+        .route(
+            "/sessions/{session_id}/browser/select",
+            axum::routing::post(browser_select_page),
+        )
+        .route(
+            "/sessions/{session_id}/browser/command",
+            axum::routing::post(browser_command),
+        )
+        .route(
+            "/sessions/{session_id}/browser/annotation",
+            axum::routing::post(browser_annotation),
+        )
+        .route(
             "/sessions/{session_id}/browser/snapshot",
             axum::routing::post(browser_snapshot),
         )
         .route(
             "/sessions/{session_id}/browser/action",
             axum::routing::post(browser_action),
+        )
+        .route(
+            "/sessions/{session_id}/browser/stream/start",
+            axum::routing::post(browser_stream_start),
+        )
+        .route(
+            "/sessions/{session_id}/browser/stream/stop",
+            axum::routing::post(browser_stream_stop),
         )
         .route(
             "/sessions/{session_id}",
@@ -377,6 +401,81 @@ async fn browser_navigate(
     Ok(Json(state.browser.navigate(&session_id, payload).await?))
 }
 
+async fn browser_open_tab(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<BrowserContextSummary>, ApiError> {
+    ensure_session_exists(&state, &session_id)?;
+    Ok(Json(state.browser.open_tab(&session_id).await?))
+}
+
+async fn browser_select_page(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<BrowserContextSummary>, ApiError> {
+    ensure_session_exists(&state, &session_id)?;
+    #[derive(Deserialize)]
+    struct SelectRequest {
+        page_id: String,
+    }
+    let payload = decode_json::<SelectRequest>(&body)?;
+    Ok(Json(
+        state
+            .browser
+            .select_page(&session_id, &payload.page_id)
+            .await?,
+    ))
+}
+
+async fn browser_command(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<BrowserContextSummary>, ApiError> {
+    ensure_session_exists(&state, &session_id)?;
+    #[derive(Deserialize)]
+    struct CommandRequest {
+        page_id: String,
+        command: String,
+        #[serde(default)]
+        args: serde_json::Value,
+    }
+    let payload = decode_json::<CommandRequest>(&body)?;
+    Ok(Json(
+        state
+            .browser
+            .command(
+                &session_id,
+                &payload.page_id,
+                &payload.command,
+                payload.args,
+            )
+            .await?,
+    ))
+}
+
+async fn browser_annotation(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ensure_session_exists(&state, &session_id)?;
+    #[derive(Deserialize)]
+    struct AnnotationRequest {
+        page_id: String,
+        #[serde(default)]
+        payload: serde_json::Value,
+    }
+    let payload = decode_json::<AnnotationRequest>(&body)?;
+    Ok(Json(
+        state
+            .browser
+            .annotation(&session_id, &payload.page_id, payload.payload)
+            .await?,
+    ))
+}
+
 async fn browser_snapshot(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -405,6 +504,46 @@ async fn browser_action(
     ensure_session_exists(&state, &session_id)?;
     let payload = decode_json::<BrowserActionRequest>(&body)?;
     Ok(Json(state.browser.action(&session_id, payload).await?))
+}
+
+async fn browser_stream_start(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<BrowserContextSummary>, ApiError> {
+    ensure_session_exists(&state, &session_id)?;
+    #[derive(Deserialize)]
+    struct StreamRequest {
+        page_id: Option<String>,
+    }
+    let payload = if body.is_empty() {
+        StreamRequest { page_id: None }
+    } else {
+        decode_json::<StreamRequest>(&body)?
+    };
+    state
+        .browser
+        .start_stream(session_id.clone(), payload.page_id, state.events.clone())
+        .await?;
+    Ok(Json(state.browser.context(&session_id).await))
+}
+
+async fn browser_stream_stop(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<BrowserContextSummary>, ApiError> {
+    ensure_session_exists(&state, &session_id)?;
+    #[derive(Deserialize)]
+    struct StreamRequest {
+        page_id: String,
+    }
+    let payload = decode_json::<StreamRequest>(&body)?;
+    state
+        .browser
+        .stop_stream(&session_id, &payload.page_id)
+        .await;
+    Ok(Json(state.browser.context(&session_id).await))
 }
 
 fn ensure_session_exists(state: &AppState, session_id: &str) -> Result<(), ApiError> {

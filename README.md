@@ -96,10 +96,7 @@ What they do:
 
 ## Local Development
 
-Development still uses a split runtime:
-
-- Nucleus server on `127.0.0.1:42240`
-- Vite dev server on `http://mini-server:5201`
+Source-checkout development should use disposable state and a matched daemon/web pair from the same branch or worktree. Do not point a feature-branch web client at a managed release daemon, and do not reuse managed release state for branch testing.
 
 Rust:
 
@@ -115,11 +112,21 @@ npm run check:web
 npm run build:web
 ```
 
-If you want the Vite client during development:
+If you want the Vite client during development, start a disposable daemon first and clean it up afterward:
 
 ```bash
+state_dir=$(mktemp -d)
+NUCLEUS_STATE_DIR="$state_dir" \
+NUCLEUS_BIND=127.0.0.1:5299 \
+cargo run -p nucleus-daemon
+
+# In another shell:
 source ~/.nvm/nvm.sh
+NUCLEUS_DAEMON_ORIGIN=http://127.0.0.1:5299 \
+NUCLEUS_WEB_PORT=5300 \
 npm run dev:web
+
+# After testing: stop both processes and remove "$state_dir".
 ```
 
 ## Production-Style Local Run
@@ -134,8 +141,8 @@ npm run build:web
 Then run Nucleus with the built web output:
 
 ```bash
-NUCLEUS_BIND=0.0.0.0:5201 \
-NUCLEUS_WEB_DIST_DIR=/home/eba/tools/nucleus/apps/web/build \
+NUCLEUS_BIND=127.0.0.1:5299 \
+NUCLEUS_WEB_DIST_DIR="$PWD/apps/web/build" \
 cargo run -p nucleus-daemon
 ```
 
@@ -154,7 +161,7 @@ On Linux, the CLI can install a `systemd --user` service that runs Nucleus and s
 ```bash
 source ~/.nvm/nvm.sh
 npm run build:web
-cargo run -p nucleus-cli --bin nucleus -- install-service --enable --bind 0.0.0.0:5201
+cargo run -p nucleus-cli --bin nucleus -- install-service --enable --bind 127.0.0.1:5299
 ```
 
 That unit writes the key runtime env vars:
@@ -171,7 +178,7 @@ That unit writes the key runtime env vars:
 Managed releases are the public product install path. They track release channels rather than git branches.
 
 ```bash
-nucleus release install --channel stable --enable --bind 0.0.0.0:5201
+nucleus release install --channel stable --enable --bind 127.0.0.1:5201
 ```
 
 The default channel manifests are published as GitHub release assets:

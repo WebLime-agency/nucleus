@@ -1016,3 +1016,128 @@ export async function captureBrowserSnapshot(
     browserSnapshotSchema
   );
 }
+
+
+export async function openBrowserTab(sessionId: string, fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/sessions/${sessionId}/browser/open`, {
+      method: 'POST',
+      headers: { accept: 'application/json' }
+    }),
+    browserContextSummarySchema
+  );
+}
+
+export async function selectBrowserPage(
+  sessionId: string,
+  input: { page_id: string },
+  fetchImpl: FetchLike = fetch
+) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/sessions/${sessionId}/browser/select`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json'
+      },
+      body: JSON.stringify(input)
+    }),
+    browserContextSummarySchema
+  );
+}
+
+export async function sendBrowserCommand(
+  sessionId: string,
+  input: { page_id: string; command: string; args?: Record<string, unknown> },
+  fetchImpl: FetchLike = fetch
+) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/sessions/${sessionId}/browser/command`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json'
+      },
+      body: JSON.stringify(input)
+    }),
+    browserContextSummarySchema
+  );
+}
+
+export async function requestBrowserAnnotation(
+  sessionId: string,
+  input: { page_id: string; payload?: Record<string, unknown> },
+  fetchImpl: FetchLike = fetch
+) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/sessions/${sessionId}/browser/annotation`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json'
+      },
+      body: JSON.stringify(input)
+    }),
+    z.unknown()
+  );
+}
+
+export async function startBrowserStream(
+  sessionId: string,
+  input: { page_id?: string | null } = {},
+  fetchImpl: FetchLike = fetch
+) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/sessions/${sessionId}/browser/stream/start`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json'
+      },
+      body: JSON.stringify(input)
+    }),
+    browserContextSummarySchema
+  );
+}
+
+export async function stopBrowserStream(
+  sessionId: string,
+  input: { page_id: string },
+  fetchImpl: FetchLike = fetch
+) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/sessions/${sessionId}/browser/stream/stop`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json'
+      },
+      body: JSON.stringify(input)
+    }),
+    browserContextSummarySchema
+  );
+}
+
+export async function sendBrowserAction(
+  sessionId: string,
+  input: {
+    action: string;
+    page_id?: string | null;
+    value?: string | null;
+    target_ref?: string | null;
+    snapshot?: boolean;
+  },
+  fetchImpl: FetchLike = fetch
+) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/sessions/${sessionId}/browser/action`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json'
+      },
+      body: JSON.stringify(input)
+    }),
+    browserSnapshotSchema
+  );
+}
