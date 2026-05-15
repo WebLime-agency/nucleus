@@ -491,17 +491,18 @@ async fn browser_annotation(
         .filter(|value| !value.is_empty())
     {
         let turn_id = Uuid::new_v4().to_string();
-        let element = annotation.get("element").cloned().unwrap_or(Value::Null);
+        let annotation_metadata = annotation.clone();
         state.store.append_session_turn(
             &session_id,
             &turn_id,
             "user",
             &format!(
-                "Browser annotation on {} ({})\n\nComment: {}\n\nPoint/element metadata:\n{}",
+                "Browser annotation on {} ({})\n\nComment: {}\n\nAnnotation metadata:\n{}",
                 snapshot.title,
                 snapshot.url,
                 comment,
-                serde_json::to_string_pretty(&element).unwrap_or_else(|_| element.to_string())
+                serde_json::to_string_pretty(&annotation_metadata)
+                    .unwrap_or_else(|_| annotation_metadata.to_string())
             ),
             &[],
         )?;
