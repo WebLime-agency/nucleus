@@ -28,11 +28,11 @@
 </script>
 
 <ScrollArea
-  class="sticky top-0 z-10 -mx-4 shrink-0 border-b border-zinc-900 bg-zinc-950/95 backdrop-blur sm:-mx-6 lg:top-6 lg:z-auto lg:mx-0 lg:max-h-[calc(100dvh-3rem)] lg:w-44 lg:self-start lg:border-r lg:border-b-0 lg:bg-transparent lg:backdrop-blur-none"
+  class="z-10 shrink-0 border-b border-zinc-900 bg-zinc-950/95 backdrop-blur lg:h-full lg:w-52 lg:border-r lg:border-b-0 lg:bg-transparent lg:backdrop-blur-none"
 >
   <ScrollAreaViewport>
     <nav
-      class="flex gap-2 px-4 py-3 sm:px-6 lg:flex-col lg:gap-1 lg:px-0 lg:py-0 lg:pr-4"
+      class="flex gap-2 px-4 py-3 sm:px-6 lg:flex-col lg:gap-1 lg:px-6 lg:py-6"
       aria-label={label}
     >
       {#each items as item}
