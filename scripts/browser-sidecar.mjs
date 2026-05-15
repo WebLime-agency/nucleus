@@ -255,7 +255,8 @@ async function applyInput(state, entry, body) {
   const action = body.action || body.type;
   const target = await targetLocator(state, entry, body);
   if (target && action === 'click') await target.click({ button: body.button || 'left' });
-  else if (target && (action === 'fill' || action === 'type')) await target.fill(String(body.text ?? body.value ?? ''));
+  else if (target && action === 'fill') await target.fill(String(body.text ?? body.value ?? ''));
+  else if (target && action === 'type') await target.type(String(body.text ?? body.value ?? ''), { delay: 5 });
   else if (target && action === 'press') await target.press(String(body.key || body.value || 'Enter'));
   else if (target && action === 'scroll') await target.scrollIntoViewIfNeeded();
   else if (target && action === 'submit') {
