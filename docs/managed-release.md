@@ -54,9 +54,11 @@ releases/<release_id>/      unpacked release payload
 current/bin/nucleus-daemon  server binary for the active release
 current/bin/nucleus         operator CLI included in official channel artifacts
 current/web/                web bundle matching the active Nucleus release
+current/scripts/            Browser sidecar runtime assets
+current/node_modules/       Browser sidecar Playwright runtime modules
 ```
 
-The service unit points at `current/bin/nucleus-daemon` and `current/web`, so an update swaps both the Nucleus process and the served web client together.
+The service unit points at `current/bin/nucleus-daemon` and `current/web`, so an update swaps both the Nucleus process and the served web client together. Browser-capable releases also ship `current/scripts/browser-sidecar.mjs`, `current/node_modules/playwright`, and `current/node_modules/playwright-core`; the daemon must launch Browser from these managed-release assets rather than from the current working directory.
 
 Managed installs default to `127.0.0.1:5201` so a new install is local-only unless the operator explicitly chooses otherwise. Bind modes are intentionally separate from Vault safe-origin rules:
 

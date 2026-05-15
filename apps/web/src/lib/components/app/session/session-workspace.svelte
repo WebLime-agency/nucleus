@@ -105,6 +105,7 @@
   type SessionRunBudgetMode = 'inherit' | 'standard' | 'extended' | 'marathon' | 'unbounded';
   type SessionDrawerMode = 'details' | 'browser';
   type BrowserViewportMode = 'fit' | 'mobile' | 'desktop' | 'wide';
+  type BrowserAnnotationDraft = { page_id: string; x: number; y: number };
 
   const COMPOSER_MODES: SessionComposerMode[] = ['plan', 'ask', 'trusted'];
   const RUN_BUDGET_MODES: SessionRunBudgetMode[] = [
@@ -164,6 +165,9 @@
   let browserStreamStarting = false;
   let browserAnnotating = $state(false);
   let browserAnnotation = $state<unknown>(null);
+  let browserAnnotationDraft = $state<BrowserAnnotationDraft | null>(null);
+  let browserAnnotationComment = $state('');
+  let browserAnnotationSaving = $state(false);
   let browserStarting = $state(false);
   let browserTabChanging = $state(false);
   let browserViewportMode = $state<BrowserViewportMode>('fit');
@@ -802,6 +806,9 @@
     browserTabChanging = false;
     browserReadyRequestKey = '';
     browserStreamPageId = '';
+    browserAnnotationDraft = null;
+    browserAnnotationComment = '';
+    browserAnnotationSaving = false;
     browserPendingPointerMove = null;
     browserInputQueue = Promise.resolve();
   }
@@ -1475,6 +1482,8 @@
         browserUrl = '';
       }
       browserAnnotation = null;
+      browserAnnotationDraft = null;
+      browserAnnotationComment = '';
     } catch (caught) {
       browserError = caught instanceof Error ? caught.message : String(caught);
     } finally {
@@ -1500,6 +1509,8 @@
       syncBrowserSnapshot(snapshot, true, true);
       browserStreamPageId = '';
       browserAnnotation = null;
+      browserAnnotationDraft = null;
+      browserAnnotationComment = '';
     } catch (caught) {
       browserError = caught instanceof Error ? caught.message : String(caught);
     } finally {
@@ -1533,6 +1544,8 @@
         browserUrl = '';
       }
       browserAnnotation = null;
+      browserAnnotationDraft = null;
+      browserAnnotationComment = '';
     } catch (caught) {
       browserError = caught instanceof Error ? caught.message : String(caught);
     } finally {
@@ -1686,13 +1699,33 @@
   async function handleBrowserAnnotation(point: { x: number; y: number }) {
     if (!selectedSessionId || !activeBrowserPage) return;
     browserError = null;
+    browserAnnotation = null;
+    browserAnnotationDraft = { page_id: activeBrowserPage.id, ...point };
+    browserAnnotationComment = '';
+  }
+
+  async function saveBrowserAnnotation() {
+    if (!selectedSessionId || !browserAnnotationDraft || browserAnnotationSaving) return;
+    browserAnnotationSaving = true;
+    browserError = null;
     try {
       browserAnnotation = await requestBrowserAnnotation(selectedSessionId, {
-        page_id: activeBrowserPage.id,
-        payload: point
+        page_id: browserAnnotationDraft.page_id,
+        payload: {
+          x: browserAnnotationDraft.x,
+          y: browserAnnotationDraft.y,
+          comment: browserAnnotationComment.trim()
+        }
       });
+      browserAnnotationDraft = null;
+      browserAnnotationComment = '';
+      if (selectedSessionId) {
+        await loadSelectedSession(selectedSessionId, true);
+      }
     } catch (caught) {
       browserError = caught instanceof Error ? caught.message : String(caught);
+    } finally {
+      browserAnnotationSaving = false;
     }
   }
 
@@ -2468,6 +2501,7 @@
           title: event.data.title || browserSnapshot?.title || '',
           content: browserSnapshot?.content || '',
           refs: browserSnapshot?.refs || [],
+          downloads: browserSnapshot?.downloads || [],
           screenshot_data_url: `data:${event.data.mime};base64,${event.data.image}`,
           captured_at: event.data.captured_at
         }, true);
@@ -3475,7 +3509,7 @@
               <div
                 bind:this={browserStageElement}
                 class={cn(
-                  'min-h-0 flex-1 overflow-hidden',
+                  'relative min-h-0 flex-1 overflow-hidden',
                   browserViewportMode === 'mobile'
                     ? 'flex justify-center bg-zinc-950'
                     : 'rounded-xl border border-zinc-800 bg-black'
@@ -3514,10 +3548,46 @@
                     {#if browserLoading}
                       <div class="absolute right-3 top-3 rounded-full border border-zinc-700 bg-zinc-950/90 px-3 py-1 text-xs text-zinc-300">Loading…</div>
                     {/if}
-                    {#if browserAnnotation}
-                      <pre class="absolute bottom-3 left-3 max-h-28 max-w-[calc(100%-1.5rem)] overflow-auto rounded border border-zinc-700 bg-zinc-950/90 p-2 text-left text-[11px] text-cyan-100 shadow-xl">{JSON.stringify(browserAnnotation, null, 2)}</pre>
-                    {/if}
                   </button>
+                  {#if browserAnnotationDraft}
+                    <div class="absolute bottom-3 left-3 right-3 z-10 max-w-md rounded-lg border border-zinc-700 bg-zinc-950/95 p-3 text-left shadow-xl">
+                      <div class="mb-2 text-xs font-medium text-zinc-200">Browser annotation</div>
+                      <Textarea
+                        bind:value={browserAnnotationComment}
+                        rows={3}
+                        class="min-h-20 resize-none border-zinc-800 bg-zinc-900 text-sm text-zinc-100"
+                        placeholder="Add a comment for this point..."
+                        disabled={browserAnnotationSaving}
+                      ></Textarea>
+                      <div class="mt-3 flex justify-end gap-2">
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          disabled={browserAnnotationSaving}
+                          onclick={() => {
+                            browserAnnotationDraft = null;
+                            browserAnnotationComment = '';
+                          }}
+                        >
+                          Cancel
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="secondary"
+                          size="sm"
+                          disabled={browserAnnotationSaving || browserAnnotationComment.trim().length === 0}
+                          onclick={() => void saveBrowserAnnotation()}
+                        >
+                          {browserAnnotationSaving ? 'Saving' : 'Save'}
+                        </Button>
+                      </div>
+                    </div>
+                  {:else if browserAnnotation}
+                    <div class="absolute bottom-3 left-3 z-10 max-w-[calc(100%-1.5rem)] rounded border border-cyan-700/50 bg-zinc-950/90 p-2 text-left text-[11px] text-cyan-100 shadow-xl">
+                      Annotation saved
+                    </div>
+                  {/if}
                 {:else if browserLoading}
                   <div class="flex h-full items-center justify-center text-sm text-zinc-500">Starting browser…</div>
                 {:else}
