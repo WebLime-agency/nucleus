@@ -453,6 +453,15 @@ fn run_release_package(args: ReleasePackageArgs) -> Result<()> {
         None => resolve_cli_binary(&repo_root).ok(),
     };
     let web_dist_dir = resolve_web_dist_dir(args.web_dist_dir.as_deref(), &repo_root)?;
+    let browser_sidecar_script = repo_root.join("scripts").join("browser-sidecar.mjs");
+    let browser_sidecar_script = browser_sidecar_script
+        .is_file()
+        .then_some(browser_sidecar_script);
+    let browser_node_module_dirs = ["playwright", "playwright-core"]
+        .into_iter()
+        .map(|module| repo_root.join("node_modules").join(module))
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
     let output_dir = args
         .output_dir
         .unwrap_or_else(|| repo_root.join("dist").join("releases"));
@@ -470,6 +479,8 @@ fn run_release_package(args: ReleasePackageArgs) -> Result<()> {
         daemon_binary,
         cli_binary,
         web_dist_dir,
+        browser_sidecar_script,
+        browser_node_module_dirs,
         output_dir,
         artifact_base_url: args
             .artifact_base_url

@@ -104,6 +104,8 @@ pub struct ReleasePackageInput {
     pub daemon_binary: PathBuf,
     pub cli_binary: Option<PathBuf>,
     pub web_dist_dir: PathBuf,
+    pub browser_sidecar_script: Option<PathBuf>,
+    pub browser_node_module_dirs: Vec<PathBuf>,
     pub output_dir: PathBuf,
     pub artifact_base_url: Option<String>,
     pub manifest_path: Option<PathBuf>,
@@ -462,6 +464,24 @@ pub fn package_release_artifact(input: ReleasePackageInput) -> Result<PackagedRe
         );
     }
 
+    if let Some(browser_sidecar_script) = &input.browser_sidecar_script {
+        if !browser_sidecar_script.is_file() {
+            bail!(
+                "browser sidecar script '{}' was not found",
+                browser_sidecar_script.display()
+            );
+        }
+    }
+
+    for module_dir in &input.browser_node_module_dirs {
+        if !module_dir.is_dir() {
+            bail!(
+                "browser sidecar Node module directory '{}' was not found",
+                module_dir.display()
+            );
+        }
+    }
+
     fs::create_dir_all(&input.output_dir)
         .with_context(|| format!("failed to create {}", input.output_dir.display()))?;
 
@@ -494,6 +514,26 @@ pub fn package_release_artifact(input: ReleasePackageInput) -> Result<PackagedRe
             .with_context(|| format!("failed to append CLI binary {}", cli_binary.display()))?;
     }
     append_directory_recursive(&mut builder, &input.web_dist_dir, &PathBuf::from("web"))?;
+    if let Some(browser_sidecar_script) = &input.browser_sidecar_script {
+        builder
+            .append_path_with_name(browser_sidecar_script, "scripts/browser-sidecar.mjs")
+            .with_context(|| {
+                format!(
+                    "failed to append browser sidecar script {}",
+                    browser_sidecar_script.display()
+                )
+            })?;
+    }
+    for module_dir in &input.browser_node_module_dirs {
+        let module_name = module_dir
+            .file_name()
+            .context("browser sidecar Node module directory has no name")?;
+        append_directory_recursive(
+            &mut builder,
+            module_dir,
+            &PathBuf::from("node_modules").join(module_name),
+        )?;
+    }
     let minimum_client_version = input
         .minimum_client_version
         .clone()
@@ -774,6 +814,8 @@ mod tests {
             daemon_binary: bin_dir.join("nucleus-daemon"),
             cli_binary: Some(bin_dir.join("nucleus")),
             web_dist_dir: web_dir,
+            browser_sidecar_script: None,
+            browser_node_module_dirs: Vec::new(),
             output_dir: output_dir.clone(),
             artifact_base_url: None,
             manifest_path: None,
@@ -900,6 +942,8 @@ mod tests {
             daemon_binary: bin_dir.join("nucleus-daemon"),
             cli_binary: None,
             web_dist_dir: web_dir,
+            browser_sidecar_script: None,
+            browser_node_module_dirs: Vec::new(),
             output_dir,
             artifact_base_url: None,
             manifest_path: Some(manifest_path),
@@ -935,6 +979,8 @@ mod tests {
             daemon_binary: bin_dir.join("nucleus-daemon"),
             cli_binary: Some(bin_dir.join("nucleus")),
             web_dist_dir: web_dir,
+            browser_sidecar_script: None,
+            browser_node_module_dirs: Vec::new(),
             output_dir,
             artifact_base_url: None,
             manifest_path: None,
@@ -997,6 +1043,8 @@ mod tests {
                 daemon_binary: bin_dir.join("nucleus-daemon"),
                 cli_binary: None,
                 web_dist_dir: web_dir,
+                browser_sidecar_script: None,
+                browser_node_module_dirs: Vec::new(),
                 output_dir: output_dir.clone(),
                 artifact_base_url: None,
                 manifest_path: None,
