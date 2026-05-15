@@ -12,6 +12,8 @@ import {
   browserSnapshotSchema,
   createPlaybookRequestSchema,
   createSessionRequestSchema,
+  instanceLogCategoriesResponseSchema,
+  instanceLogListResponseSchema,
   jobDetailSchema,
   jobSummarySchema,
   mcpServerRecordSchema,
@@ -737,6 +739,34 @@ export async function fetchAuditEvents(limit = 20, fetchImpl: FetchLike = fetch)
       headers: { accept: 'application/json' }
     }),
     z.array(auditEventSchema)
+  );
+}
+
+export async function fetchInstanceLogs(
+  options: { category?: string; level?: string; before?: number; limit?: number } = {},
+  fetchImpl: FetchLike = fetch
+) {
+  const params = new URLSearchParams();
+  if (options.category) params.set('category', options.category);
+  if (options.level) params.set('level', options.level);
+  if (options.before) params.set('before', String(options.before));
+  if (options.limit) params.set('limit', String(options.limit));
+  const query = params.toString();
+
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/logs${query ? `?${query}` : ''}`, {
+      headers: { accept: 'application/json' }
+    }),
+    instanceLogListResponseSchema
+  );
+}
+
+export async function fetchInstanceLogCategories(fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/logs/categories', {
+      headers: { accept: 'application/json' }
+    }),
+    instanceLogCategoriesResponseSchema
   );
 }
 

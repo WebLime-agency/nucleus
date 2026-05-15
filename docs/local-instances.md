@@ -12,6 +12,28 @@ This host intentionally keeps stable managed installs separate from source-check
 
 Ports `5201`, `5202`, and `5203` are not source-development ports. Do not run Vite, scratch daemons, or browser experiments on them.
 
+## Instance logs
+
+Each daemon writes first-class product logs under its active state directory:
+
+```text
+<state-dir>/logs/events.jsonl
+```
+
+For the managed instances on this host, that means:
+
+```text
+/home/eba/.nucleus/logs/events.jsonl
+/home/eba/.nucleus-dev-projects/logs/events.jsonl
+/home/eba/.nucleus-wbl-dga/logs/events.jsonl
+```
+
+The Workspace -> Logs page reads the daemon-owned SQLite log index through authenticated `/api/logs` APIs and also shows the filesystem log directory. Logs are instance-scoped because both the SQLite database and JSONL files are derived from that instance's state directory.
+
+Retention defaults are intentionally bounded: SQLite keeps 30 days and at most 5,000 recent records, while `events.jsonl` rotates at about 1 MiB and keeps 3 rotated history files. Instance logs are redacted before persistence and must not contain Vault plaintext, provider API keys, bearer tokens, cookies, passphrases, raw model prompts/responses, or unshaped stdout/stderr streams.
+
+Instance logs are not prompt-visible. They are local support/debugging artifacts, separate from Memory, transcripts, prompt includes, and audit history.
+
 ## Source-checkout and browser development
 
 Source-checkout work should be disposable:

@@ -753,6 +753,34 @@ export const auditEventSchema = z.object({
   created_at: z.number().int()
 });
 
+export const instanceLogEntrySchema = z.object({
+  id: z.number().int().nonnegative(),
+  timestamp: z.number().int(),
+  level: z.string(),
+  category: z.string(),
+  source: z.string(),
+  event: z.string(),
+  message: z.string(),
+  related_ids: z.unknown().default({}),
+  metadata: z.unknown().default({})
+});
+
+export const instanceLogCategorySummarySchema = z.object({
+  category: z.string(),
+  count: z.number().int().nonnegative()
+});
+
+export const instanceLogListResponseSchema = z.object({
+  records: z.array(instanceLogEntrySchema),
+  categories: z.array(instanceLogCategorySummarySchema),
+  logs_dir: z.string(),
+  retention: z.string()
+});
+
+export const instanceLogCategoriesResponseSchema = z.object({
+  categories: z.array(instanceLogCategorySummarySchema)
+});
+
 export const hostStatusSchema = z.object({
   hostname: z.string(),
   cpu_usage_percent: z.number(),
@@ -765,6 +793,7 @@ export const storageSummarySchema = z.object({
   state_dir: z.string(),
   database_path: z.string(),
   artifacts_dir: z.string(),
+  logs_dir: z.string().default(''),
   memory_dir: z.string(),
   transcripts_dir: z.string(),
   playbooks_dir: z.string(),
@@ -1166,6 +1195,9 @@ export type UpdatePlaybookRequest = z.infer<typeof updatePlaybookRequestSchema>;
 export type ActionSummary = z.infer<typeof actionSummarySchema>;
 export type ActionRunResponse = z.infer<typeof actionRunResponseSchema>;
 export type AuditEvent = z.infer<typeof auditEventSchema>;
+export type InstanceLogEntry = z.infer<typeof instanceLogEntrySchema>;
+export type InstanceLogListResponse = z.infer<typeof instanceLogListResponseSchema>;
+export type InstanceLogCategorySummary = z.infer<typeof instanceLogCategorySummarySchema>;
 export type ProjectSummary = z.infer<typeof projectSummarySchema>;
 export type WorkspaceSummary = z.infer<typeof workspaceSummarySchema>;
 export type WorkspaceModelConfig = z.infer<typeof workspaceModelConfigSchema>;
