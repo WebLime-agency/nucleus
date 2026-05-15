@@ -238,6 +238,13 @@
     if (error) return 'Degraded';
     return 'Live';
   });
+  let activeBrowserPage = $derived.by(() => {
+    if (!browserContext || browserContext.session_id !== selectedSessionId) {
+      return null;
+    }
+
+    return browserContext.pages.find((page) => page.id === browserContext?.active_page_id) ?? null;
+  });
   let activePromptProgress = $derived(promptProgress[promptProgress.length - 1] ?? null);
   let composerActivityJobSummary = $derived.by(
     () => jobSummaries.find((job) => jobIsActive(job.state)) ?? jobSummaries[0] ?? null
@@ -653,8 +660,12 @@
   }
 
   function syncSession(next: SessionDetail) {
+    const previousId = selectedSessionId;
     detail = next;
     selectedSessionId = next.session.id;
+    if (previousId && previousId !== next.session.id) {
+      resetBrowserState();
+    }
     setSessionDrafts(next.session);
     upsertSession(next.session);
 
@@ -707,6 +718,13 @@
     if (fileInputElement) {
       fileInputElement.value = '';
     }
+  }
+
+  function resetBrowserState() {
+    browserContext = null;
+    browserSnapshot = null;
+    browserError = null;
+    browserLoading = false;
   }
 
   function stagePromptProgress(update: PromptProgressUpdate) {
@@ -936,6 +954,7 @@
       if (selectedSessionId || detail) {
         selectedSessionId = '';
         detail = null;
+        resetBrowserState();
         jobSummaries = [];
         jobDetail = null;
         selectedJobId = '';
@@ -1011,6 +1030,7 @@
       composerActivityExpanded = false;
       selectedJobId = '';
       setSessionDrafts(null);
+      resetBrowserState();
       return;
     }
 
@@ -1020,6 +1040,7 @@
 
     if (previousId !== sessionId) {
       clearComposerState();
+      resetBrowserState();
       promptProgress = [];
       activityJobDetail = null;
       activityJobRequestInFlight = '';
@@ -1303,10 +1324,10 @@
     try {
       browserContext = await navigateBrowser(selectedSessionId, {
         url: browserUrl,
-        page_id: browserContext?.active_page_id ?? undefined
+        page_id: browserContext?.session_id === selectedSessionId ? browserContext.active_page_id ?? undefined : undefined
       });
       browserSnapshot = await captureBrowserSnapshot(selectedSessionId, {
-        page_id: browserContext.active_page_id ?? undefined
+        page_id: browserContext.session_id === selectedSessionId ? browserContext.active_page_id ?? undefined : undefined
       });
     } catch (caught) {
       browserError = caught instanceof Error ? caught.message : String(caught);
@@ -1321,7 +1342,7 @@
     browserError = null;
     try {
       browserSnapshot = await captureBrowserSnapshot(selectedSessionId, {
-        page_id: browserContext?.active_page_id ?? undefined
+        page_id: browserContext?.session_id === selectedSessionId ? browserContext.active_page_id ?? undefined : undefined
       });
     } catch (caught) {
       browserError = caught instanceof Error ? caught.message : String(caught);
@@ -2831,14 +2852,14 @@
               <form class="flex gap-2" onsubmit={(event) => { event.preventDefault(); void handleBrowserNavigate(); }}>
                 <Input bind:value={browserUrl} aria-label="Browser URL" placeholder="https://example.com" />
                 <Button type="submit" disabled={browserLoading}>Go</Button>
-                <Button type="button" variant="outline" onclick={handleBrowserSnapshot} disabled={browserLoading || !browserContext?.active_page_id}>Read</Button>
+                <Button type="button" variant="outline" onclick={handleBrowserSnapshot} disabled={browserLoading || !activeBrowserPage}>Read</Button>
               </form>
               {#if browserError}
                 <div class="rounded-lg border border-red-900/60 bg-red-950/30 p-3 text-xs text-red-200">{browserError}</div>
               {/if}
               <div class="rounded-xl border border-zinc-800 bg-zinc-950 p-3 text-xs text-zinc-400">
-                <div class="font-medium text-zinc-200">{browserSnapshot?.title || browserContext?.pages.find((page) => page.id === browserContext?.active_page_id)?.title || 'No page loaded'}</div>
-                <div class="mt-1 break-all text-zinc-500">{browserSnapshot?.url || browserContext?.pages.find((page) => page.id === browserContext?.active_page_id)?.url || 'Navigate to a URL to create a session browser page.'}</div>
+                <div class="font-medium text-zinc-200">{browserSnapshot?.title || activeBrowserPage?.title || 'No page loaded'}</div>
+                <div class="mt-1 break-all text-zinc-500">{browserSnapshot?.url || activeBrowserPage?.url || 'Navigate to a URL to create a session browser page.'}</div>
               </div>
               <div class="min-h-0 flex-1 overflow-auto rounded-xl border border-zinc-800 bg-zinc-950 p-4">
                 {#if browserLoading}
