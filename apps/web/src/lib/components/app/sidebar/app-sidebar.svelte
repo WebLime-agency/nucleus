@@ -1,40 +1,28 @@
 <script lang="ts">
+  import { FolderKanban, MessageSquarePlus, PencilLine, X } from 'lucide-svelte';
+
+  import type { ProjectSummary, RuntimeOverview, SessionSummary } from '$lib/nucleus/schemas';
   import { cn } from '$lib/utils';
+
   import { Button } from '$lib/components/ui/button';
-  import { Label } from '$lib/components/ui/label';
-  import { Select } from '$lib/components/ui/select';
-  import type {
-    ProjectSummary,
-    RuntimeOverview,
-    SettingsSummary,
-    SessionSummary
-  } from '$lib/nucleus/schemas';
-  import type { StreamStatus } from '$lib/nucleus/realtime';
-  import { MessageSquarePlus, X } from '@lucide/svelte';
+  import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
+
   import SidebarFooter from './sidebar-footer.svelte';
-  import SidebarProjectList from './sidebar-project-list.svelte';
   import SidebarSessionList from './sidebar-session-list.svelte';
 
-  type NavItem = {
-    href: string;
-    label: string;
-    icon: any;
-  };
+  type WorkspaceMode = 'isolated_worktree' | 'shared_project_root' | 'scratch_only';
 
   type Props = {
     open: boolean;
     pathname: string;
-    overview: RuntimeOverview | null;
-    settings?: SettingsSummary | null;
-    loading?: boolean;
-    streamStatus?: StreamStatus;
-    navigation: NavItem[];
+    overview?: RuntimeOverview | null;
+    navigation: { href: string; label: string; icon: typeof import('lucide-svelte').Icon }[];
     activeSidebarSessionId?: string;
     creating?: boolean;
     compatibilityBlocked?: boolean;
     createSessionTitle?: string;
     createProjectId?: string;
-    createWorkspaceMode?: 'isolated_worktree' | 'shared_project_root' | 'scratch_only';
+    createWorkspaceMode?: WorkspaceMode;
     projects?: ProjectSummary[];
     hasUpdateAvailable?: boolean;
     restartRequired?: boolean;
@@ -48,7 +36,7 @@
     openNavigation: (href: string) => void | Promise<void>;
     handleCreateSession: () => void | Promise<void>;
     onSelectCreateProject?: (projectId: string) => void;
-    onSelectCreateWorkspaceMode?: (mode: 'isolated_worktree' | 'shared_project_root' | 'scratch_only') => void;
+    onSelectCreateWorkspaceMode?: (mode: WorkspaceMode) => void;
     closeSidebar: () => void;
   };
 
@@ -80,41 +68,37 @@
     closeSidebar
   }: Props = $props();
 
+  const WORKSPACE_MODE_OPTIONS: { value: WorkspaceMode; label: string; description: string }[] = [
+    {
+      value: 'isolated_worktree',
+      label: 'New worktree',
+      description: 'Create a separate worktree for this session.'
+    },
+    {
+      value: 'shared_project_root',
+      label: 'Use project root',
+      description: 'Work directly in the main project checkout.'
+    },
+    {
+      value: 'scratch_only',
+      label: 'No project',
+      description: 'Start in workspace scratch without a linked checkout.'
+    }
+  ];
+
   let sessions = $derived(overview?.sessions ?? []);
   let selectedCreateProject = $derived(
     projects.find((project) => project.id === createProjectId) ?? null
   );
-  let activeSession = $derived(
-    sessions.find((session: SessionSummary) => session.id === activeSidebarSessionId) ?? null
+  let currentModeOption = $derived(
+    WORKSPACE_MODE_OPTIONS.find((option) => option.value === createWorkspaceMode) ??
+      WORKSPACE_MODE_OPTIONS[0]
   );
-  let headerContext = $derived.by(() => {
-    if (selectedCreateProject || createProjectId === '') {
-      return {
-        label: selectedCreateProject ? selectedCreateProject.title : 'Workspace scratch',
-        hasProject: Boolean(selectedCreateProject),
-        projectId: createProjectId
-      };
-    }
-
-    if (activeSession) {
-      return {
-        label: projectLabel(activeSession.project_count, activeSession.project_title),
-        hasProject: activeSession.project_count > 0,
-        projectId: activeSession.project_count > 0 ? activeSession.project_id : ''
-      };
-    }
-
-    return {
-      label: 'Workspace scratch',
-      hasProject: false,
-      projectId: ''
-    };
-  });
-  let projectListOpen = $state(false);
+  let projectMenuOpen = $state(false);
 
   function handleSelectProject(projectId: string) {
     onSelectCreateProject(projectId);
-    projectListOpen = false;
+    projectMenuOpen = false;
   }
 </script>
 
@@ -133,80 +117,160 @@
     open ? 'translate-x-0' : '-translate-x-full'
   )}
 >
-  <div class="border-b border-zinc-900 px-3 py-3">
-    <div class="flex items-center justify-between gap-2">
-      <div class="min-w-0 flex-1">
-        <div class="truncate text-sm font-semibold text-zinc-100">Nucleus</div>
-        <button
-          type="button"
-          class={cn(
-            'mt-0.5 block max-w-full truncate text-left text-[11px] transition-colors hover:text-zinc-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-700 disabled:pointer-events-none disabled:opacity-50',
-            headerContext.hasProject ? 'font-medium text-lime-300' : 'text-zinc-600',
-            projectListOpen && 'text-zinc-200'
-          )}
-          aria-expanded={projectListOpen}
-          aria-label="Choose project for new session"
-          title="Choose project for new session"
-          disabled={creating || compatibilityBlocked}
-          onclick={() => {
-            projectListOpen = !projectListOpen;
-          }}
-        >
-          {headerContext.label}
-        </button>
-      </div>
-        <div class="mt-2 grid gap-1.5">
-          <Label for="create-workspace-mode">Mode</Label>
-          <Select
-            id="create-workspace-mode"
-            class="h-8 text-xs"
-            value={createWorkspaceMode}
+  <div class="relative border-b border-zinc-900 px-3 py-3">
+    <div class="space-y-2">
+      <div class="flex items-center justify-between gap-2">
+        <div class="truncate text-[1.875rem] font-semibold tracking-tight text-zinc-50" title="Nucleus">Nucleus</div>
+
+        <div class="flex shrink-0 items-center gap-1">
+          <div class="relative shrink-0">
+            <DropdownMenu.Root bind:open={projectMenuOpen}>
+              <DropdownMenu.Trigger
+                class="relative inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-zinc-800 bg-black text-zinc-300 transition-colors hover:border-zinc-700 hover:bg-zinc-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-700 disabled:pointer-events-none disabled:opacity-50"
+                aria-label={selectedCreateProject ? `Project: ${selectedCreateProject.title}` : 'Choose project for new session'}
+                title={selectedCreateProject ? `Project: ${selectedCreateProject.title}` : 'Choose project for new session'}
+                disabled={creating || compatibilityBlocked}
+              >
+                <FolderKanban class="size-4" />
+                {#if selectedCreateProject}
+                  <span class="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-lime-400"></span>
+                {/if}
+              </DropdownMenu.Trigger>
+              <DropdownMenu.Content
+                side="bottom"
+                align="start"
+                sideOffset={8}
+                class="z-50 w-[calc(100vw-2rem)] min-w-[18rem] max-w-[calc(20rem-1.5rem)]"
+              >
+                <div class="max-h-[min(24rem,calc(100vh-9rem))] overflow-y-auto">
+                  <button
+                    type="button"
+                    class="flex w-full items-start gap-3 rounded-md px-3 py-2 text-left transition-colors hover:bg-zinc-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-700"
+                    onclick={() => handleSelectProject('')}
+                  >
+                    <div class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center text-zinc-400">
+                      <MessageSquarePlus class="size-4" />
+                    </div>
+                    <div class="min-w-0 flex-1">
+                      <div class="flex items-center justify-between gap-3">
+                        <span class="truncate text-sm font-medium text-zinc-100">Workspace scratch</span>
+                        {#if !selectedCreateProject}
+                          <span class="rounded-full bg-lime-400/15 px-2 py-0.5 text-[11px] font-medium text-lime-300">Selected</span>
+                        {/if}
+                      </div>
+                      <div class="mt-0.5 text-xs leading-5 text-zinc-500">Start without an attached project.</div>
+                    </div>
+                  </button>
+
+                  {#each projects as project}
+                    <button
+                      type="button"
+                      class="flex w-full items-start gap-3 rounded-md px-3 py-2 text-left transition-colors hover:bg-zinc-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-700"
+                      onclick={() => handleSelectProject(project.id)}
+                    >
+                      <div class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center text-zinc-400">
+                        <FolderKanban class="size-4" />
+                      </div>
+                      <div class="min-w-0 flex-1">
+                        <div class="flex items-center justify-between gap-3">
+                          <span class="truncate text-sm font-medium text-zinc-100">{project.title}</span>
+                          {#if project.id === createProjectId}
+                            <span class="rounded-full bg-lime-400/15 px-2 py-0.5 text-[11px] font-medium text-lime-300">Selected</span>
+                          {/if}
+                        </div>
+                        <div class="mt-0.5 truncate text-xs leading-5 text-zinc-500">{project.relative_path}</div>
+                      </div>
+                    </button>
+                  {/each}
+                </div>
+              </DropdownMenu.Content>
+            </DropdownMenu.Root>
+          </div>
+
+          <div class="relative shrink-0">
+            <DropdownMenu.Root>
+              <DropdownMenu.Trigger
+                class="relative inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-zinc-800 bg-black text-zinc-300 transition-colors hover:border-zinc-700 hover:bg-zinc-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-700 disabled:pointer-events-none disabled:opacity-50"
+                aria-label={`Session setup: ${currentModeOption.label}`}
+                title={`Session setup: ${currentModeOption.label}`}
+                disabled={creating || compatibilityBlocked}
+              >
+                {#if createWorkspaceMode === 'isolated_worktree'}
+                  <FolderKanban class="size-4" />
+                {:else if createWorkspaceMode === 'shared_project_root'}
+                  <PencilLine class="size-4" />
+                {:else}
+                  <MessageSquarePlus class="size-4" />
+                {/if}
+                {#if createWorkspaceMode !== 'scratch_only'}
+                  <span class="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-lime-400"></span>
+                {/if}
+              </DropdownMenu.Trigger>
+              <DropdownMenu.Content
+                side="bottom"
+                align="start"
+                sideOffset={8}
+                class="z-50 w-[calc(100vw-2rem)] min-w-[18rem] max-w-[calc(20rem-1.5rem)]"
+              >
+                <DropdownMenu.RadioGroup
+                value={createWorkspaceMode}
+                onValueChange={(value) => {
+                  if (
+                    value === 'isolated_worktree' ||
+                    value === 'shared_project_root' ||
+                    value === 'scratch_only'
+                  ) {
+                    onSelectCreateWorkspaceMode(value);
+                  }
+                }}
+              >
+                {#each WORKSPACE_MODE_OPTIONS as option}
+                  <DropdownMenu.RadioItem value={option.value} class="items-start gap-3 py-2 pl-2 pr-8">
+                    <div class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center text-zinc-400">
+                      {#if option.value === 'isolated_worktree'}
+                        <FolderKanban class="size-4" />
+                      {:else if option.value === 'shared_project_root'}
+                        <PencilLine class="size-4" />
+                      {:else}
+                        <MessageSquarePlus class="size-4" />
+                      {/if}
+                    </div>
+                    <div class="min-w-0">
+                      <div class="text-sm font-medium text-zinc-100">{option.label}</div>
+                      <div class="mt-0.5 text-xs leading-5 text-zinc-500">{option.description}</div>
+                    </div>
+                  </DropdownMenu.RadioItem>
+                {/each}
+              </DropdownMenu.RadioGroup>
+              </DropdownMenu.Content>
+            </DropdownMenu.Root>
+          </div>
+
+          <Button
+            size="icon"
+            class="h-9 w-9"
             disabled={creating || compatibilityBlocked}
-            onchange={(event) =>
-              onSelectCreateWorkspaceMode(
-                (event.currentTarget as HTMLSelectElement).value as
-                  | 'isolated_worktree'
-                  | 'shared_project_root'
-                  | 'scratch_only'
-              )}
+            title={createSessionTitle}
+            aria-label={createSessionTitle || 'New session'}
+            onclick={handleCreateSession}
           >
-            <option value="isolated_worktree">Isolated worktree</option>
-            <option value="shared_project_root">Shared project root</option>
-            <option value="scratch_only">Scratch only</option>
-          </Select>
+            <MessageSquarePlus class={creating ? 'size-4 animate-spin' : 'size-4'} />
+          </Button>
+
+          <Button variant="ghost" size="icon" class="h-9 w-9 lg:hidden" aria-label="Close sidebar" onclick={closeSidebar}>
+            <X class="size-4" />
+          </Button>
         </div>
-
-      <div class="flex shrink-0 items-center gap-1">
-        <Button
-          size="icon"
-          class="h-9 w-9"
-          disabled={creating || compatibilityBlocked}
-          title={createSessionTitle}
-          aria-label={createSessionTitle || 'New session'}
-          onclick={handleCreateSession}
-        >
-          <MessageSquarePlus class={creating ? 'size-4 animate-spin' : 'size-4'} />
-        </Button>
-
-        <Button variant="ghost" size="icon" class="h-9 w-9 lg:hidden" aria-label="Close sidebar" onclick={closeSidebar}>
-          <X class="size-4" />
-        </Button>
       </div>
+
     </div>
   </div>
 
   <div class="flex min-h-0 flex-1 flex-col">
     <div class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
       <div class="px-3 pt-3 text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-600">
-        {projectListOpen ? 'Projects' : 'Sessions'}
+        Sessions
       </div>
-      {#if projectListOpen}
-        <SidebarProjectList
-          {projects}
-          selectedProjectId={createProjectId}
-          onSelect={handleSelectProject}
-        />
-      {:else}
         <SidebarSessionList
           sessions={sessions.map((session: SessionSummary) => ({
             id: session.id,
@@ -220,7 +284,6 @@
           activeSessionId={activeSidebarSessionId}
           onOpen={(sessionId) => openNavigation(`/?session=${sessionId}`)}
         />
-      {/if}
     </div>
 
     <SidebarFooter
