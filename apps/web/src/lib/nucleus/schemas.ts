@@ -1190,3 +1190,39 @@ export type CompatibilitySummary = z.infer<typeof compatibilitySummarySchema>;
 export type UpdateStatus = z.infer<typeof updateStatusSchema>;
 export type UpdateConfigRequest = z.infer<typeof updateConfigRequestSchema>;
 export type DaemonEvent = z.infer<typeof daemonEventSchema>;
+
+export const browserPageSummarySchema = z.object({
+  id: z.string(),
+  url: z.string(),
+  title: z.string(),
+  loading: z.boolean(),
+  error: z.string(),
+  updated_at: z.number().int()
+});
+
+export const browserContextSummarySchema = z.object({
+  session_id: z.string(),
+  active_page_id: z.string().nullable(),
+  pages: z.array(browserPageSummarySchema)
+});
+
+export const browserSnapshotRefSchema = z.object({
+  id: z.string(),
+  kind: z.string(),
+  label: z.string(),
+  selector: z.string()
+});
+
+export const browserSnapshotSchema = z.object({
+  session_id: z.string(),
+  page_id: z.string(),
+  url: z.string(),
+  title: z.string(),
+  content: z.string(),
+  refs: z.array(browserSnapshotRefSchema),
+  captured_at: z.number().int()
+});
+export type BrowserPageSummary = z.infer<typeof browserPageSummarySchema>;
+export type BrowserContextSummary = z.infer<typeof browserContextSummarySchema>;
+export type BrowserSnapshotRef = z.infer<typeof browserSnapshotRefSchema>;
+export type BrowserSnapshot = z.infer<typeof browserSnapshotSchema>;
