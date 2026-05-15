@@ -2153,40 +2153,42 @@
                 </div>
               </div>
 
-              <div class="flex shrink-0 items-center gap-2 self-start">
+              <div class="flex shrink-0 items-start gap-2 self-start">
                 {#if sessionLoading}
                   <div class="inline-flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-900/70 px-3 py-1 text-xs text-zinc-500">
                     <RotateCcw class="size-3.5 animate-spin" />
                     Loading
                   </div>
                 {/if}
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  aria-label={browserPanelOpen ? 'Close browser' : 'Open browser'}
-                  onclick={() => {
-                    browserPanelOpen = !browserPanelOpen;
-                    if (browserPanelOpen) {
-                      void loadBrowserContext();
-                    }
-                  }}
-                >
-                  <Compass class="size-4" />
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  aria-label={detailPanelOpen ? 'Close session details' : 'Open session details'}
-                  onclick={() => {
-                    detailPanelOpen = !detailPanelOpen;
-                  }}
-                >
-                  {#if detailPanelOpen}
-                    <PanelRightClose class="size-4" />
-                  {:else}
-                    <PanelRightOpen class="size-4" />
-                  {/if}
-                </Button>
+                <div class="flex flex-col items-center gap-1">
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    aria-label={detailPanelOpen ? 'Close session details' : 'Open session details'}
+                    onclick={() => {
+                      detailPanelOpen = !detailPanelOpen;
+                    }}
+                  >
+                    {#if detailPanelOpen}
+                      <PanelRightClose class="size-4" />
+                    {:else}
+                      <PanelRightOpen class="size-4" />
+                    {/if}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    aria-label={browserPanelOpen ? 'Close browser' : 'Open browser'}
+                    onclick={() => {
+                      browserPanelOpen = !browserPanelOpen;
+                      if (browserPanelOpen) {
+                        void loadBrowserContext();
+                      }
+                    }}
+                  >
+                    <Compass class="size-4" />
+                  </Button>
+                </div>
               </div>
             </div>
 
