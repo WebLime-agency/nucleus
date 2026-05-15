@@ -6,6 +6,7 @@
   import {
     Archive,
     Bot,
+    Compass,
     ChevronDown,
     ChevronUp,
     Clock3,
@@ -40,7 +41,9 @@
     createSession,
     deleteSession,
     denyRequest,
+    captureBrowserSnapshot,
     fetchActions,
+    fetchBrowserContext,
     fetchAuditEvents,
     fetchJobDetail,
     fetchOverview,
@@ -49,6 +52,7 @@
     resumeJob,
     runAction,
     sendSessionPrompt,
+    navigateBrowser,
     updateSession
   } from '$lib/nucleus/client';
   import { compactPath, formatDateTime, formatState } from '$lib/nucleus/format';
@@ -57,6 +61,8 @@
     ActionSummary,
     ApprovalRequestSummary,
     ArtifactSummary,
+    BrowserContextSummary,
+    BrowserSnapshot,
     AuditEvent,
     CommandSessionSummary,
     DaemonEvent,
@@ -128,6 +134,12 @@
   let approvalActioningId = $state<string | null>(null);
   let actionFormValues = $state<Record<string, Record<string, string>>>({});
   let detailPanelOpen = $state(false);
+  let browserPanelOpen = $state(false);
+  let browserUrl = $state('http://mini-server:5201');
+  let browserLoading = $state(false);
+  let browserError = $state<string | null>(null);
+  let browserContext = $state<BrowserContextSummary | null>(null);
+  let browserSnapshot = $state<BrowserSnapshot | null>(null);
   let dragOver = $state(false);
   let promptImages = $state<ComposerImage[]>([]);
   let promptProgress = $state<PromptProgressUpdate[]>([]);
@@ -1274,6 +1286,50 @@
     }
   }
 
+  async function loadBrowserContext() {
+    if (!selectedSessionId) return;
+    browserError = null;
+    try {
+      browserContext = await fetchBrowserContext(selectedSessionId);
+    } catch (caught) {
+      browserError = caught instanceof Error ? caught.message : String(caught);
+    }
+  }
+
+  async function handleBrowserNavigate() {
+    if (!selectedSessionId || !browserUrl.trim()) return;
+    browserLoading = true;
+    browserError = null;
+    try {
+      browserContext = await navigateBrowser(selectedSessionId, {
+        url: browserUrl,
+        page_id: browserContext?.active_page_id ?? undefined
+      });
+      browserSnapshot = await captureBrowserSnapshot(selectedSessionId, {
+        page_id: browserContext.active_page_id ?? undefined
+      });
+    } catch (caught) {
+      browserError = caught instanceof Error ? caught.message : String(caught);
+    } finally {
+      browserLoading = false;
+    }
+  }
+
+  async function handleBrowserSnapshot() {
+    if (!selectedSessionId) return;
+    browserLoading = true;
+    browserError = null;
+    try {
+      browserSnapshot = await captureBrowserSnapshot(selectedSessionId, {
+        page_id: browserContext?.active_page_id ?? undefined
+      });
+    } catch (caught) {
+      browserError = caught instanceof Error ? caught.message : String(caught);
+    } finally {
+      browserLoading = false;
+    }
+  }
+
   async function handlePromptSubmit() {
     if (!promptReady || selectedSession?.state === 'running' || selectedSession?.state === 'paused') {
       return;
@@ -2086,6 +2142,19 @@
                 <Button
                   variant="ghost"
                   size="icon"
+                  aria-label={browserPanelOpen ? 'Close browser' : 'Open browser'}
+                  onclick={() => {
+                    browserPanelOpen = !browserPanelOpen;
+                    if (browserPanelOpen) {
+                      void loadBrowserContext();
+                    }
+                  }}
+                >
+                  <Compass class="size-4" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
                   aria-label={detailPanelOpen ? 'Close session details' : 'Open session details'}
                   onclick={() => {
                     detailPanelOpen = !detailPanelOpen;
@@ -2740,6 +2809,64 @@
             </div>
           </div>
         </div>
+
+        <Sheet bind:open={browserPanelOpen}>
+          <SheetContent
+            portalDisabled
+            trapFocus={false}
+            preventScroll={false}
+            overlayClass="lg:hidden"
+            class="z-20 max-w-2xl overflow-hidden border-zinc-900 lg:static lg:z-auto lg:w-[34rem] lg:max-w-[34rem] lg:shrink-0 lg:shadow-none"
+          >
+            <SheetHeader class="items-center border-zinc-900 px-5 py-4">
+              <div>
+                <SheetTitle class="text-sm">Browser</SheetTitle>
+                <SheetDescription class="mt-1 text-xs">Session-scoped browser companion for navigation and agent verification.</SheetDescription>
+              </div>
+              <Button variant="ghost" size="icon" aria-label="Close browser" onclick={() => (browserPanelOpen = false)}>
+                <X class="size-4" />
+              </Button>
+            </SheetHeader>
+            <div class="flex h-full min-h-0 flex-col gap-3 px-5 py-5">
+              <form class="flex gap-2" onsubmit={(event) => { event.preventDefault(); void handleBrowserNavigate(); }}>
+                <Input bind:value={browserUrl} aria-label="Browser URL" placeholder="https://example.com" />
+                <Button type="submit" disabled={browserLoading}>Go</Button>
+                <Button type="button" variant="outline" onclick={handleBrowserSnapshot} disabled={browserLoading || !browserContext?.active_page_id}>Read</Button>
+              </form>
+              {#if browserError}
+                <div class="rounded-lg border border-red-900/60 bg-red-950/30 p-3 text-xs text-red-200">{browserError}</div>
+              {/if}
+              <div class="rounded-xl border border-zinc-800 bg-zinc-950 p-3 text-xs text-zinc-400">
+                <div class="font-medium text-zinc-200">{browserSnapshot?.title || browserContext?.pages.find((page) => page.id === browserContext?.active_page_id)?.title || 'No page loaded'}</div>
+                <div class="mt-1 break-all text-zinc-500">{browserSnapshot?.url || browserContext?.pages.find((page) => page.id === browserContext?.active_page_id)?.url || 'Navigate to a URL to create a session browser page.'}</div>
+              </div>
+              <div class="min-h-0 flex-1 overflow-auto rounded-xl border border-zinc-800 bg-zinc-950 p-4">
+                {#if browserLoading}
+                  <div class="text-sm text-zinc-500">Loading browser page…</div>
+                {:else if browserSnapshot}
+                  <div class="space-y-4">
+                    <section>
+                      <div class="mb-2 text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Readable page</div>
+                      <pre class="whitespace-pre-wrap text-xs leading-5 text-zinc-300">{browserSnapshot.content}</pre>
+                    </section>
+                    {#if browserSnapshot.refs.length > 0}
+                      <section>
+                        <div class="mb-2 text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Agent refs</div>
+                        <div class="space-y-1">
+                          {#each browserSnapshot.refs as ref}
+                            <div class="rounded border border-zinc-800 px-2 py-1 text-xs text-zinc-300">[{ref.id}] {ref.label}</div>
+                          {/each}
+                        </div>
+                      </section>
+                    {/if}
+                  </div>
+                {:else}
+                  <div class="text-sm text-zinc-500">The first version exposes daemon-owned navigation and readable snapshots. Playwright viewport streaming can attach behind this contract next.</div>
+                {/if}
+              </div>
+            </div>
+          </SheetContent>
+        </Sheet>
 
         <Sheet bind:open={detailPanelOpen}>
           <SheetContent
