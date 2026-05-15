@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -254,9 +255,7 @@ impl BrowserRuntime {
             return Ok(sidecar.base_url.clone());
         }
 
-        let script = std::env::current_dir()
-            .context("failed to resolve current directory")?
-            .join("scripts/browser-sidecar.mjs");
+        let script = browser_sidecar_script_path()?;
         let mut child = Command::new("node")
             .arg("--experimental-websocket")
             .arg(script)
@@ -699,6 +698,47 @@ fn normalize_url(input: &str) -> anyhow::Result<String> {
         "http" | "https" => Ok(parsed.to_string()),
         scheme => bail!("unsupported browser URL scheme: {scheme}"),
     }
+}
+
+fn browser_sidecar_script_path() -> anyhow::Result<PathBuf> {
+    if let Ok(path) = std::env::var("NUCLEUS_BROWSER_SIDECAR_PATH") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+
+    let mut candidates = Vec::new();
+    if let Ok(current_dir) = std::env::current_dir() {
+        candidates.push(current_dir.join("scripts/browser-sidecar.mjs"));
+    }
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(release_root) = current_exe.parent().and_then(|bin_dir| bin_dir.parent()) {
+            candidates.push(release_root.join("scripts/browser-sidecar.mjs"));
+        }
+    }
+    if let Ok(install_root) = std::env::var("NUCLEUS_INSTALL_ROOT") {
+        candidates.push(
+            PathBuf::from(install_root)
+                .join("current")
+                .join("scripts/browser-sidecar.mjs"),
+        );
+    }
+
+    for candidate in &candidates {
+        if candidate.is_file() {
+            return Ok(candidate.clone());
+        }
+    }
+
+    bail!(
+        "browser sidecar script was not found; checked {}",
+        candidates
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 fn now_ts() -> i64 {
