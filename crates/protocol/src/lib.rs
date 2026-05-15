@@ -1645,6 +1645,16 @@ pub struct BrowserSnapshotRef {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserDownload {
+    pub id: String,
+    pub page_id: String,
+    pub url: String,
+    pub suggested_filename: String,
+    pub path: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrowserSnapshot {
     pub session_id: String,
     pub page_id: String,
@@ -1652,6 +1662,8 @@ pub struct BrowserSnapshot {
     pub title: String,
     pub content: String,
     pub refs: Vec<BrowserSnapshotRef>,
+    #[serde(default)]
+    pub downloads: Vec<BrowserDownload>,
     pub screenshot_data_url: String,
     pub captured_at: i64,
 }
