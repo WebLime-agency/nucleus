@@ -294,9 +294,11 @@ fn attr(snippet: &str, name: &str) -> Option<String> {
 }
 
 fn html_to_text(html: &str) -> String {
+    let visible_html = strip_invisible_html_blocks(html);
     let mut out = String::new();
     let mut in_tag = false;
-    for ch in html.chars() {
+
+    for ch in visible_html.chars() {
         match ch {
             '<' => {
                 in_tag = true;
@@ -307,10 +309,76 @@ fn html_to_text(html: &str) -> String {
             _ => {}
         }
     }
-    out.split_whitespace()
+
+    decode_basic_entities(&out)
+        .split_whitespace()
         .take(1200)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn strip_invisible_html_blocks(html: &str) -> String {
+    let mut output = String::with_capacity(html.len());
+    let mut cursor = 0;
+
+    while cursor < html.len() {
+        let rest = &html[cursor..];
+        let Some(relative_start) = find_next_invisible_block_start(rest) else {
+            output.push_str(rest);
+            break;
+        };
+
+        let start = cursor + relative_start;
+        output.push_str(&html[cursor..start]);
+
+        let tag_name = invisible_block_tag_name(&html[start..]).unwrap_or("script");
+        let close_tag = format!("</{tag_name}>");
+        let after_open = html[start..]
+            .find('>')
+            .map(|index| start + index + 1)
+            .unwrap_or(html.len());
+
+        if let Some(relative_end) = find_ignore_ascii_case(&html[after_open..], &close_tag) {
+            cursor = after_open + relative_end + close_tag.len();
+        } else {
+            break;
+        }
+    }
+
+    output
+}
+
+fn find_next_invisible_block_start(value: &str) -> Option<usize> {
+    ["<script", "<style", "<noscript", "<svg", "<template"]
+        .into_iter()
+        .filter_map(|needle| find_ignore_ascii_case(value, needle))
+        .min()
+}
+
+fn invisible_block_tag_name(value: &str) -> Option<&'static str> {
+    if starts_with_ignore_ascii_case(value, "<script") {
+        Some("script")
+    } else if starts_with_ignore_ascii_case(value, "<style") {
+        Some("style")
+    } else if starts_with_ignore_ascii_case(value, "<noscript") {
+        Some("noscript")
+    } else if starts_with_ignore_ascii_case(value, "<svg") {
+        Some("svg")
+    } else if starts_with_ignore_ascii_case(value, "<template") {
+        Some("template")
+    } else {
+        None
+    }
+}
+
+fn decode_basic_entities(value: &str) -> String {
+    value
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
 }
 
 fn now_ts() -> i64 {
