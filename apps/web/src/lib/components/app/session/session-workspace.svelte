@@ -6,6 +6,8 @@
   import {
     Archive,
     Bot,
+    ArrowLeft,
+    ArrowRight,
     Compass,
     ChevronDown,
     ChevronUp,
@@ -13,8 +15,10 @@
     FolderTree,
     ImagePlus,
     MessageSquare,
-    PanelRightClose,
+    MonitorSmartphone,
+    NotebookPen,
     PanelRightOpen,
+    Plus,
     RotateCcw,
     Router,
     Save,
@@ -53,6 +57,13 @@
     runAction,
     sendSessionPrompt,
     navigateBrowser,
+    openBrowserTab,
+    requestBrowserAnnotation,
+    selectBrowserPage,
+    sendBrowserAction,
+    sendBrowserCommand,
+    startBrowserStream,
+    stopBrowserStream,
     updateSession
   } from '$lib/nucleus/client';
   import { compactPath, formatDateTime, formatState } from '$lib/nucleus/format';
@@ -92,6 +103,8 @@
 
   type SessionComposerMode = 'plan' | 'ask' | 'trusted';
   type SessionRunBudgetMode = 'inherit' | 'standard' | 'extended' | 'marathon' | 'unbounded';
+  type SessionDrawerMode = 'details' | 'browser';
+  type BrowserViewportMode = 'fit' | 'mobile' | 'desktop' | 'wide';
 
   const COMPOSER_MODES: SessionComposerMode[] = ['plan', 'ask', 'trusted'];
   const RUN_BUDGET_MODES: SessionRunBudgetMode[] = [
@@ -101,6 +114,7 @@
     'marathon',
     'unbounded'
   ];
+  const BROWSER_VIEWPORT_MODES: BrowserViewportMode[] = ['fit', 'mobile', 'desktop', 'wide'];
 
   let overview = $state<RuntimeOverview | null>(null);
   let actions = $state<ActionSummary[]>([]);
@@ -133,13 +147,30 @@
   let jobActioning = $state(false);
   let approvalActioningId = $state<string | null>(null);
   let actionFormValues = $state<Record<string, Record<string, string>>>({});
-  let detailPanelOpen = $state(false);
-  let browserPanelOpen = $state(false);
-  let browserUrl = $state('http://mini-server:5201');
+  let sideDrawerOpen = $state(false);
+  let sideDrawerMode = $state<SessionDrawerMode>('details');
+  let detailPanelOpen = $derived(sideDrawerOpen && sideDrawerMode === 'details');
+  let browserPanelOpen = $derived(sideDrawerOpen && sideDrawerMode === 'browser');
+  let browserUrl = $state('');
+  let browserUrlEditing = $state(false);
   let browserLoading = $state(false);
   let browserError = $state<string | null>(null);
   let browserContext = $state<BrowserContextSummary | null>(null);
   let browserSnapshot = $state<BrowserSnapshot | null>(null);
+  let browserViewportElement = $state<HTMLImageElement | null>(null);
+  let browserStageElement = $state<HTMLDivElement | null>(null);
+  let browserFrameTicking = false;
+  let browserStreamPageId = $state('');
+  let browserStreamStarting = false;
+  let browserAnnotating = $state(false);
+  let browserAnnotation = $state<unknown>(null);
+  let browserStarting = $state(false);
+  let browserTabChanging = $state(false);
+  let browserViewportMode = $state<BrowserViewportMode>('fit');
+  let browserReadyRequestKey = '';
+  let browserInputQueue: Promise<void> = Promise.resolve();
+  let browserPointerMoveFrame = 0;
+  let browserPendingPointerMove: string | null = null;
   let dragOver = $state(false);
   let promptImages = $state<ComposerImage[]>([]);
   let promptProgress = $state<PromptProgressUpdate[]>([]);
@@ -503,6 +534,42 @@
     return 'secondary';
   }
 
+  function browserLocationLabel(value?: string | null) {
+    const raw = value?.trim();
+    if (!raw) return 'No page loaded';
+    if (raw === 'about:blank') return 'New tab';
+    try {
+      const parsed = new URL(raw);
+      return parsed.hostname || parsed.pathname || raw;
+    } catch {
+      return raw;
+    }
+  }
+
+  function browserTabLabel(page: { title: string; url: string }) {
+    if (page.title.trim()) return page.title;
+    return browserLocationLabel(page.url);
+  }
+
+  function browserAddressValue(value?: string | null) {
+    const raw = value?.trim() ?? '';
+    return raw === 'about:blank' ? '' : raw;
+  }
+
+  function browserViewportLabel(mode: BrowserViewportMode) {
+    if (mode === 'mobile') return 'Mobile';
+    if (mode === 'desktop') return 'Desktop';
+    if (mode === 'wide') return 'Wide';
+    return 'Fit';
+  }
+
+  function browserViewportDescription(mode: BrowserViewportMode) {
+    if (mode === 'mobile') return 'Mobile CSS width, scaled into the drawer.';
+    if (mode === 'desktop') return 'Desktop CSS width, scaled into the drawer.';
+    if (mode === 'wide') return 'Wide desktop CSS width, scaled into the drawer.';
+    return 'Match the drawer size exactly.';
+  }
+
   function badgeVariantForActivityState(
     state: string
   ): 'default' | 'secondary' | 'warning' | 'destructive' {
@@ -721,10 +788,33 @@
   }
 
   function resetBrowserState() {
+    if (browserPointerMoveFrame && browser) {
+      cancelAnimationFrame(browserPointerMoveFrame);
+      browserPointerMoveFrame = 0;
+    }
     browserContext = null;
     browserSnapshot = null;
     browserError = null;
     browserLoading = false;
+    browserUrl = '';
+    browserUrlEditing = false;
+    browserStarting = false;
+    browserTabChanging = false;
+    browserReadyRequestKey = '';
+    browserStreamPageId = '';
+    browserPendingPointerMove = null;
+    browserInputQueue = Promise.resolve();
+  }
+
+  function openDetailDrawer() {
+    sideDrawerMode = 'details';
+    sideDrawerOpen = true;
+  }
+
+  function openBrowserDrawer() {
+    sideDrawerMode = 'browser';
+    sideDrawerOpen = true;
+    void ensureBrowserReady();
   }
 
   function stagePromptProgress(update: PromptProgressUpdate) {
@@ -1317,18 +1407,45 @@
     }
   }
 
+  async function ensureBrowserReady() {
+    if (!selectedSessionId || browserStarting) return;
+    browserStarting = true;
+    browserError = null;
+    try {
+      let nextContext = await fetchBrowserContext(selectedSessionId);
+      if (nextContext.pages.length === 0) {
+        browserLoading = true;
+        nextContext = await navigateBrowser(selectedSessionId, { url: 'about:blank' });
+      }
+      browserContext = nextContext;
+      const activePageId = nextContext.active_page_id ?? nextContext.pages[0]?.id ?? '';
+      if (activePageId && (!browserSnapshot || browserSnapshot.page_id !== activePageId)) {
+        const snapshot = await captureBrowserSnapshot(selectedSessionId, { page_id: activePageId });
+        syncBrowserSnapshot(snapshot, true);
+      }
+    } catch (caught) {
+      browserError = caught instanceof Error ? caught.message : String(caught);
+    } finally {
+      browserStarting = false;
+      browserLoading = false;
+    }
+  }
+
   async function handleBrowserNavigate() {
-    if (!selectedSessionId || !browserUrl.trim()) return;
+    const targetUrl = browserUrl.trim();
+    if (!selectedSessionId || !targetUrl) return;
+    browserUrlEditing = false;
     browserLoading = true;
     browserError = null;
     try {
       browserContext = await navigateBrowser(selectedSessionId, {
-        url: browserUrl,
+        url: targetUrl,
         page_id: browserContext?.session_id === selectedSessionId ? browserContext.active_page_id ?? undefined : undefined
       });
-      browserSnapshot = await captureBrowserSnapshot(selectedSessionId, {
+      const snapshot = await captureBrowserSnapshot(selectedSessionId, {
         page_id: browserContext.session_id === selectedSessionId ? browserContext.active_page_id ?? undefined : undefined
       });
+      syncBrowserSnapshot(snapshot, true, true);
     } catch (caught) {
       browserError = caught instanceof Error ? caught.message : String(caught);
     } finally {
@@ -1336,20 +1453,398 @@
     }
   }
 
-  async function handleBrowserSnapshot() {
+
+  async function handleBrowserOpenTab() {
     if (!selectedSessionId) return;
+    browserError = null;
+    browserUrlEditing = false;
+    browserTabChanging = true;
     browserLoading = true;
+    try {
+      if (browserStreamPageId) {
+        await stopBrowserStream(selectedSessionId, { page_id: browserStreamPageId }).catch(() => null);
+        browserStreamPageId = '';
+      }
+      browserContext = await openBrowserTab(selectedSessionId);
+      const activePageId = browserContext.active_page_id ?? browserContext.pages[0]?.id ?? '';
+      if (activePageId) {
+        const snapshot = await captureBrowserSnapshot(selectedSessionId, { page_id: activePageId });
+        syncBrowserSnapshot(snapshot, true, true);
+      } else {
+        browserSnapshot = null;
+        browserUrl = '';
+      }
+      browserAnnotation = null;
+    } catch (caught) {
+      browserError = caught instanceof Error ? caught.message : String(caught);
+    } finally {
+      browserTabChanging = false;
+      browserLoading = false;
+    }
+  }
+
+  async function handleBrowserSelectPage(pageId: string) {
+    if (!selectedSessionId) return;
+    if (pageId === browserContext?.active_page_id && browserSnapshot?.page_id === pageId) return;
+    browserError = null;
+    browserUrlEditing = false;
+    browserTabChanging = true;
+    browserLoading = true;
+    try {
+      if (browserStreamPageId && browserStreamPageId !== pageId) {
+        await stopBrowserStream(selectedSessionId, { page_id: browserStreamPageId }).catch(() => null);
+        browserStreamPageId = '';
+      }
+      browserContext = await selectBrowserPage(selectedSessionId, { page_id: pageId });
+      const snapshot = await captureBrowserSnapshot(selectedSessionId, { page_id: pageId });
+      syncBrowserSnapshot(snapshot, true, true);
+      browserStreamPageId = '';
+      browserAnnotation = null;
+    } catch (caught) {
+      browserError = caught instanceof Error ? caught.message : String(caught);
+    } finally {
+      browserTabChanging = false;
+      browserLoading = false;
+    }
+  }
+
+  async function handleBrowserClosePage(pageId: string, event?: MouseEvent) {
+    event?.stopPropagation();
+    if (!selectedSessionId) return;
+    browserError = null;
+    browserUrlEditing = false;
+    browserTabChanging = true;
+    browserLoading = true;
+    try {
+      if (browserStreamPageId === pageId) {
+        await stopBrowserStream(selectedSessionId, { page_id: browserStreamPageId }).catch(() => null);
+        browserStreamPageId = '';
+      }
+      browserContext = await sendBrowserCommand(selectedSessionId, {
+        page_id: pageId,
+        command: 'close'
+      });
+      const activePageId = browserContext.active_page_id ?? browserContext.pages[0]?.id ?? '';
+      if (activePageId) {
+        const snapshot = await captureBrowserSnapshot(selectedSessionId, { page_id: activePageId });
+        syncBrowserSnapshot(snapshot, true, true);
+      } else {
+        browserSnapshot = null;
+        browserUrl = '';
+      }
+      browserAnnotation = null;
+    } catch (caught) {
+      browserError = caught instanceof Error ? caught.message : String(caught);
+    } finally {
+      browserTabChanging = false;
+      browserLoading = false;
+    }
+  }
+
+  async function handleBrowserCommand(command: string) {
+    if (!selectedSessionId || !activeBrowserPage) return;
+    browserError = null;
+    try {
+      browserContext = await sendBrowserCommand(selectedSessionId, {
+        page_id: activeBrowserPage.id,
+        command
+      });
+    } catch (caught) {
+      browserError = caught instanceof Error ? caught.message : String(caught);
+    }
+  }
+
+  async function handleBrowserSnapshot(showLoading = true) {
+    if (!selectedSessionId) return;
+    if (browserFrameTicking) return;
+    browserFrameTicking = true;
+    if (showLoading) browserLoading = true;
     browserError = null;
     try {
       browserSnapshot = await captureBrowserSnapshot(selectedSessionId, {
         page_id: browserContext?.session_id === selectedSessionId ? browserContext.active_page_id ?? undefined : undefined
       });
+      browserUrl = browserAddressValue(browserSnapshot.url) || browserUrl;
     } catch (caught) {
       browserError = caught instanceof Error ? caught.message : String(caught);
     } finally {
-      browserLoading = false;
+      browserFrameTicking = false;
+      if (showLoading) browserLoading = false;
     }
   }
+
+
+  function syncBrowserContextPage(snapshot: BrowserSnapshot) {
+    if (!browserContext || browserContext.session_id !== snapshot.session_id) return;
+    let found = false;
+    const pages = browserContext.pages.map((page) => {
+      if (page.id !== snapshot.page_id) return page;
+      found = true;
+      return {
+        ...page,
+        url: snapshot.url || page.url,
+        title: snapshot.title || page.title,
+        loading: false,
+        error: '',
+        updated_at: snapshot.captured_at
+      };
+    });
+    if (!found) {
+      pages.push({
+        id: snapshot.page_id,
+        url: snapshot.url,
+        title: snapshot.title,
+        loading: false,
+        error: '',
+        updated_at: snapshot.captured_at
+      });
+    }
+
+    browserContext = {
+      ...browserContext,
+      active_page_id: snapshot.page_id,
+      pages
+    };
+  }
+
+  function syncBrowserSnapshot(snapshot: BrowserSnapshot, replaceImage = false, forceAddress = false) {
+    if (snapshot.session_id !== selectedSessionId) return;
+    browserSnapshot = {
+      ...snapshot,
+      screenshot_data_url:
+        replaceImage && snapshot.screenshot_data_url
+          ? snapshot.screenshot_data_url
+          : snapshot.screenshot_data_url || browserSnapshot?.screenshot_data_url || ''
+    };
+    syncBrowserContextPage(browserSnapshot);
+    if (forceAddress || !browserUrlEditing) {
+      browserUrl = browserAddressValue(browserSnapshot.url);
+    }
+  }
+
+  function enqueueBrowserInput(action: string, value?: string | null, snapshot = false) {
+    if (!selectedSessionId || !activeBrowserPage) return;
+    const sessionId = selectedSessionId;
+    const pageId = activeBrowserPage.id;
+    browserError = null;
+    browserInputQueue = browserInputQueue
+      .catch(() => undefined)
+      .then(async () => {
+        const result = await sendBrowserAction(sessionId, {
+          action,
+          page_id: pageId,
+          value,
+          snapshot
+        });
+        syncBrowserSnapshot(result, snapshot);
+      })
+      .catch((caught) => {
+        browserError = caught instanceof Error ? caught.message : String(caught);
+      });
+  }
+
+  function browserCoordinates(event: MouseEvent) {
+    if (!browserViewportElement) return null;
+    const rect = browserViewportElement.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+
+    const imageWidth = browserViewportElement.naturalWidth || 1280;
+    const imageHeight = browserViewportElement.naturalHeight || 900;
+    const relativeX = (event.clientX - rect.left) / rect.width;
+    const relativeY = (event.clientY - rect.top) / rect.height;
+    if (relativeX < 0 || relativeX > 1 || relativeY < 0 || relativeY > 1) return null;
+    return {
+      x: Math.round(relativeX * imageWidth),
+      y: Math.round(relativeY * imageHeight)
+    };
+  }
+
+  function sendBrowserPointer(action: string, event: MouseEvent) {
+    event.preventDefault();
+    const point = browserCoordinates(event);
+    if (!point) return;
+    if (browserAnnotating && action === 'pointer_down') {
+      void handleBrowserAnnotation(point);
+      return;
+    }
+    const value = JSON.stringify({ ...point, button: event.button === 2 ? 'right' : 'left' });
+    if (action === 'pointer_move') {
+      browserPendingPointerMove = value;
+      if (browserPointerMoveFrame === 0) {
+        browserPointerMoveFrame = requestAnimationFrame(() => {
+          browserPointerMoveFrame = 0;
+          const next = browserPendingPointerMove;
+          browserPendingPointerMove = null;
+          if (next) enqueueBrowserInput('pointer_move', next, false);
+        });
+      }
+      return;
+    }
+    enqueueBrowserInput(action, value, false);
+  }
+
+  async function handleBrowserAnnotation(point: { x: number; y: number }) {
+    if (!selectedSessionId || !activeBrowserPage) return;
+    browserError = null;
+    try {
+      browserAnnotation = await requestBrowserAnnotation(selectedSessionId, {
+        page_id: activeBrowserPage.id,
+        payload: point
+      });
+    } catch (caught) {
+      browserError = caught instanceof Error ? caught.message : String(caught);
+    }
+  }
+
+  function handleBrowserKeydown(event: KeyboardEvent) {
+    if (!activeBrowserPage) return;
+    const pressName = browserKeyPressName(event);
+    if (pressName) {
+      event.preventDefault();
+      enqueueBrowserInput('press', pressName, false);
+      return;
+    }
+    if (event.key.length === 1 && !event.metaKey && !event.ctrlKey && !event.altKey) {
+      event.preventDefault();
+      enqueueBrowserInput('type', event.key, false);
+    }
+  }
+
+  function handleBrowserPaste(event: ClipboardEvent) {
+    if (!activeBrowserPage) return;
+    const text = event.clipboardData?.getData('text/plain') ?? '';
+    if (!text) return;
+    event.preventDefault();
+    enqueueBrowserInput('type', text, false);
+  }
+
+  function browserKeyPressName(event: KeyboardEvent) {
+    const keyMap: Record<string, string> = {
+      Enter: 'Enter',
+      Backspace: 'Backspace',
+      Tab: 'Tab',
+      Escape: 'Escape',
+      Delete: 'Delete',
+      ArrowUp: 'ArrowUp',
+      ArrowDown: 'ArrowDown',
+      ArrowLeft: 'ArrowLeft',
+      ArrowRight: 'ArrowRight',
+      Home: 'Home',
+      End: 'End',
+      PageUp: 'PageUp',
+      PageDown: 'PageDown'
+    };
+    for (let index = 1; index <= 12; index += 1) {
+      keyMap[`F${index}`] = `F${index}`;
+    }
+
+    const key = keyMap[event.key] ?? (event.key.length === 1 ? event.key.toUpperCase() : '');
+    if (!key) return '';
+    const modifiers = [];
+    if (event.ctrlKey) modifiers.push('Control');
+    if (event.metaKey) modifiers.push('Meta');
+    if (event.altKey) modifiers.push('Alt');
+    if (event.shiftKey && (modifiers.length > 0 || event.key.length !== 1)) modifiers.push('Shift');
+    if (modifiers.length === 0 && event.key.length === 1) return '';
+    return [...modifiers, key].join('+');
+  }
+
+  function handleBrowserWheel(event: WheelEvent) {
+    if (!activeBrowserPage) return;
+    event.preventDefault();
+    const point = browserCoordinates(event as unknown as MouseEvent) ?? { x: 640, y: 450 };
+    enqueueBrowserInput('scroll', JSON.stringify({ x: point.x, y: point.y, delta_y: Math.round(event.deltaY), delta_x: Math.round(event.deltaX) }), false);
+  }
+
+
+
+
+  function browserViewportSize() {
+    const rect = browserStageElement?.getBoundingClientRect();
+    if (!rect || rect.width < 80 || rect.height < 80) return null;
+    const drawerWidth = Math.round(rect.width);
+    const drawerHeight = Math.round(rect.height);
+    if (browserViewportMode !== 'fit') {
+      const width =
+        browserViewportMode === 'mobile' ? 390 : browserViewportMode === 'wide' ? 1440 : 1280;
+      const minHeight = browserViewportMode === 'mobile' ? 640 : 480;
+      const height = Math.max(minHeight, Math.round(width * (drawerHeight / drawerWidth)));
+      return { width, height };
+    }
+    return {
+      width: drawerWidth,
+      height: drawerHeight
+    };
+  }
+
+  async function handleBrowserViewportMode(mode: BrowserViewportMode) {
+    if (browserViewportMode === mode) return;
+    browserViewportMode = mode;
+    if (!selectedSessionId || !activeBrowserPage) return;
+    try {
+      if (browserStreamPageId) {
+        await stopBrowserStream(selectedSessionId, { page_id: browserStreamPageId }).catch(() => null);
+        browserStreamPageId = '';
+      }
+      const viewport = browserViewportSize();
+      if (viewport) {
+        browserContext = await sendBrowserCommand(selectedSessionId, {
+          page_id: activeBrowserPage.id,
+          command: 'set_viewport',
+          args: viewport
+        });
+      }
+      await handleBrowserSnapshot(false);
+      await ensureBrowserStream();
+    } catch (caught) {
+      browserError = caught instanceof Error ? caught.message : String(caught);
+    }
+  }
+
+  async function ensureBrowserStream() {
+    if (!selectedSessionId || !activeBrowserPage || browserStreamStarting || browserTabChanging) return;
+    if (browserStreamPageId === activeBrowserPage.id) return;
+    browserStreamStarting = true;
+    try {
+      if (browserStreamPageId) {
+        await stopBrowserStream(selectedSessionId, { page_id: browserStreamPageId }).catch(() => null);
+      }
+      const viewport = browserViewportSize();
+      if (viewport) {
+        browserContext = await sendBrowserCommand(selectedSessionId, {
+          page_id: activeBrowserPage.id,
+          command: 'set_viewport',
+          args: viewport
+        });
+      }
+      await startBrowserStream(selectedSessionId, { page_id: activeBrowserPage.id });
+      browserStreamPageId = activeBrowserPage.id;
+    } catch (caught) {
+      browserError = caught instanceof Error ? caught.message : String(caught);
+    } finally {
+      browserStreamStarting = false;
+    }
+  }
+
+  $effect(() => {
+    const requestKey = browserPanelOpen && selectedSessionId ? selectedSessionId : '';
+    if (!requestKey || browserReadyRequestKey === requestKey) return;
+    browserReadyRequestKey = requestKey;
+    void Promise.resolve().then(() => ensureBrowserReady());
+  });
+
+  $effect(() => {
+    if (!browserPanelOpen || !selectedSessionId || !activeBrowserPage) return;
+    void ensureBrowserStream();
+    return () => {
+      const pageId = browserStreamPageId;
+      const sessionId = selectedSessionId;
+      if (pageId && sessionId) {
+        void stopBrowserStream(sessionId, { page_id: pageId }).catch(() => null);
+      }
+      browserStreamPageId = '';
+    };
+  });
 
   async function handlePromptSubmit() {
     if (!promptReady || selectedSession?.state === 'running' || selectedSession?.state === 'paused') {
@@ -1960,6 +2455,26 @@
   }
 
   function applyStreamEvent(event: DaemonEvent) {
+    if (event.event === 'browser.frame') {
+      if (event.data.session_id === selectedSessionId) {
+        const activePageId = browserContext?.active_page_id ?? browserStreamPageId;
+        if (activePageId && event.data.page_id !== activePageId) {
+          return;
+        }
+        syncBrowserSnapshot({
+          session_id: event.data.session_id,
+          page_id: event.data.page_id,
+          url: event.data.url || browserSnapshot?.url || '',
+          title: event.data.title || browserSnapshot?.title || '',
+          content: browserSnapshot?.content || '',
+          refs: browserSnapshot?.refs || [],
+          screenshot_data_url: `data:${event.data.mime};base64,${event.data.image}`,
+          captured_at: event.data.captured_at
+        }, true);
+      }
+      return;
+    }
+
     if (event.event === 'overview.updated') {
       syncOverview(event.data);
       loading = false;
@@ -2162,29 +2677,22 @@
                 {/if}
                 <div class="flex flex-col items-center gap-1">
                   <Button
-                    variant="ghost"
+                    variant={detailPanelOpen ? 'secondary' : 'ghost'}
                     size="icon"
-                    aria-label={detailPanelOpen ? 'Close session details' : 'Open session details'}
-                    onclick={() => {
-                      detailPanelOpen = !detailPanelOpen;
-                    }}
+                    aria-label="Show session details"
+                    aria-pressed={detailPanelOpen}
+                    title="Session details"
+                    onclick={openDetailDrawer}
                   >
-                    {#if detailPanelOpen}
-                      <PanelRightClose class="size-4" />
-                    {:else}
-                      <PanelRightOpen class="size-4" />
-                    {/if}
+                    <PanelRightOpen class="size-4" />
                   </Button>
                   <Button
-                    variant="ghost"
+                    variant={browserPanelOpen ? 'secondary' : 'ghost'}
                     size="icon"
-                    aria-label={browserPanelOpen ? 'Close browser' : 'Open browser'}
-                    onclick={() => {
-                      browserPanelOpen = !browserPanelOpen;
-                      if (browserPanelOpen) {
-                        void loadBrowserContext();
-                      }
-                    }}
+                    aria-label="Show browser"
+                    aria-pressed={browserPanelOpen}
+                    title="Browser"
+                    onclick={openBrowserDrawer}
                   >
                     <Compass class="size-4" />
                   </Button>
@@ -2565,7 +3073,7 @@
                           variant="ghost"
                           size="sm"
                           onclick={() => {
-                            detailPanelOpen = true;
+                            openDetailDrawer();
                             void loadJob(composerActivityJobSummary.id, true);
                           }}
                         >
@@ -2624,7 +3132,7 @@
                         variant="ghost"
                         size="sm"
                         onclick={() => {
-                          detailPanelOpen = true;
+                          openDetailDrawer();
                           void loadJob(composerActivityJobSummary.id, true);
                         }}
                       >
@@ -2833,90 +3341,192 @@
           </div>
         </div>
 
-        <Sheet bind:open={browserPanelOpen}>
+        <Sheet bind:open={sideDrawerOpen}>
           <SheetContent
             portalDisabled
             trapFocus={false}
             preventScroll={false}
+            interactOutsideBehavior="ignore"
             overlayClass="lg:hidden"
-            class="z-20 max-w-2xl overflow-hidden border-zinc-900 lg:static lg:z-auto lg:w-[34rem] lg:max-w-[34rem] lg:shrink-0 lg:shadow-none"
+            class={cn(
+              'z-20 border-zinc-900 lg:static lg:z-auto lg:shrink-0 lg:shadow-none',
+              sideDrawerMode === 'browser'
+                ? 'max-w-2xl overflow-hidden lg:w-[34rem] lg:max-w-[34rem]'
+                : 'max-w-md overflow-y-auto overflow-x-hidden lg:w-96 lg:max-w-96'
+            )}
           >
             <SheetHeader class="items-center border-zinc-900 px-5 py-4">
               <div>
-                <SheetTitle class="text-sm">Browser</SheetTitle>
-                <SheetDescription class="mt-1 text-xs">Session-scoped browser companion for navigation and agent verification.</SheetDescription>
+                <SheetTitle class="text-sm">
+                  {sideDrawerMode === 'browser' ? 'Browser' : 'Session Details'}
+                </SheetTitle>
+                <SheetDescription class="mt-1 text-xs">
+                  {sideDrawerMode === 'browser'
+                    ? 'Session-scoped browser companion for navigation and agent verification.'
+                    : 'Secondary controls live here so the chat stays clear.'}
+                </SheetDescription>
               </div>
-              <Button variant="ghost" size="icon" aria-label="Close browser" onclick={() => (browserPanelOpen = false)}>
+              <Button variant="ghost" size="icon" aria-label="Close drawer" onclick={() => (sideDrawerOpen = false)}>
                 <X class="size-4" />
               </Button>
             </SheetHeader>
-            <div class="flex h-full min-h-0 flex-col gap-3 px-5 py-5">
+            {#if sideDrawerMode === 'browser'}
+              <div class="flex h-full min-h-0 flex-col gap-3 px-5 py-5">
+              <div class="flex h-10 min-w-0 shrink-0 items-end gap-1 overflow-x-auto border-b border-zinc-800 pt-1">
+                {#if (browserContext?.pages.length ?? 0) === 0}
+                  <div class="flex h-9 max-w-40 shrink-0 items-center rounded-t-md border border-b-0 border-zinc-800 bg-zinc-950 px-3 text-xs text-zinc-500">
+                    {browserStarting || browserLoading ? 'Starting...' : 'New Tab'}
+                  </div>
+                {:else}
+                  {#each browserContext?.pages ?? [] as page (page.id)}
+                    <div
+                      class={cn('group flex h-9 max-w-44 shrink-0 items-center overflow-hidden rounded-t-md border border-b-0 text-xs', page.id === activeBrowserPage?.id ? 'border-zinc-700 bg-zinc-950 text-zinc-100' : 'border-zinc-800 bg-zinc-900/60 text-zinc-400 hover:bg-zinc-900 hover:text-zinc-200')}
+                    >
+                    <button
+                      type="button"
+                        class="min-w-0 flex-1 truncate px-3 text-left"
+                      onclick={() => void handleBrowserSelectPage(page.id)}
+                      title={page.title || page.url}
+                    >
+                        {browserTabLabel(page)}
+                    </button>
+                      <button
+                        type="button"
+                        class="mr-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-zinc-500 opacity-70 hover:bg-zinc-800 hover:text-zinc-100 group-hover:opacity-100"
+                        aria-label={`Close ${browserTabLabel(page)}`}
+                        onclick={(event) => void handleBrowserClosePage(page.id, event)}
+                      >
+                        <X class="size-3.5" />
+                      </button>
+                    </div>
+                  {/each}
+                {/if}
+                <Button type="button" variant="ghost" size="icon" class="mb-0.5 h-8 w-8 shrink-0 rounded-md" onclick={handleBrowserOpenTab} aria-label="New browser tab">
+                  <Plus class="size-4" />
+                </Button>
+                <div class="sticky right-0 ml-auto flex shrink-0 items-center gap-1 self-stretch bg-zinc-950 pl-2">
+                  <DropdownMenu.Root>
+                    <DropdownMenu.Trigger
+                      class="mb-0.5 inline-flex h-8 w-8 items-center justify-center rounded-md text-zinc-400 transition-colors hover:bg-zinc-900 hover:text-zinc-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-700 disabled:pointer-events-none disabled:opacity-50"
+                      aria-label={`Viewport: ${browserViewportLabel(browserViewportMode)}`}
+                      title={`Viewport: ${browserViewportLabel(browserViewportMode)}`}
+                      disabled={!activeBrowserPage}
+                    >
+                      <MonitorSmartphone class="size-4" />
+                    </DropdownMenu.Trigger>
+                    <DropdownMenu.Content side="bottom" align="end" sideOffset={8} class="w-64">
+                      <DropdownMenu.RadioGroup
+                        value={browserViewportMode}
+                        onValueChange={(value) => {
+                          if (value === 'fit' || value === 'mobile' || value === 'desktop' || value === 'wide') {
+                            void handleBrowserViewportMode(value);
+                          }
+                        }}
+                      >
+                        {#each BROWSER_VIEWPORT_MODES as mode}
+                          <DropdownMenu.RadioItem value={mode} class="items-start gap-3 py-2 pl-2 pr-8">
+                            <div class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center text-zinc-400">
+                              <MonitorSmartphone class="size-4" />
+                            </div>
+                            <div class="min-w-0">
+                              <div class="text-sm font-medium text-zinc-100">{browserViewportLabel(mode)}</div>
+                              <div class="mt-0.5 text-xs leading-5 text-zinc-500">{browserViewportDescription(mode)}</div>
+                            </div>
+                          </DropdownMenu.RadioItem>
+                        {/each}
+                      </DropdownMenu.RadioGroup>
+                    </DropdownMenu.Content>
+                  </DropdownMenu.Root>
+                  <Button
+                    type="button"
+                    variant={browserAnnotating ? 'default' : 'ghost'}
+                    size="icon"
+                    class="mb-0.5 h-8 w-8 rounded-md"
+                    aria-label={browserAnnotating ? 'Stop annotating' : 'Annotate page'}
+                    title={browserAnnotating ? 'Stop annotating' : 'Annotate page'}
+                    onclick={() => (browserAnnotating = !browserAnnotating)}
+                    disabled={!activeBrowserPage}
+                  >
+                    <NotebookPen class="size-4" />
+                  </Button>
+                </div>
+              </div>
               <form class="flex gap-2" onsubmit={(event) => { event.preventDefault(); void handleBrowserNavigate(); }}>
-                <Input bind:value={browserUrl} aria-label="Browser URL" placeholder="https://example.com" />
-                <Button type="submit" disabled={browserLoading}>Go</Button>
-                <Button type="button" variant="outline" onclick={handleBrowserSnapshot} disabled={browserLoading || !activeBrowserPage}>Read</Button>
+                <Button type="button" variant="outline" size="icon" onclick={() => void handleBrowserCommand('back')} disabled={!activeBrowserPage}><ArrowLeft class="size-4" /></Button>
+                <Button type="button" variant="outline" size="icon" onclick={() => void handleBrowserCommand('forward')} disabled={!activeBrowserPage}><ArrowRight class="size-4" /></Button>
+                <Button type="button" variant="outline" size="icon" onclick={() => void handleBrowserCommand('reload')} disabled={!activeBrowserPage}><RotateCcw class="size-4" /></Button>
+                <Input
+                  bind:value={browserUrl}
+                  aria-label="Browser URL"
+                  placeholder="Search or enter address"
+                  onfocus={() => {
+                    browserUrlEditing = true;
+                    if (browserUrl.trim() === 'about:blank') browserUrl = '';
+                  }}
+                  onblur={() => {
+                    browserUrlEditing = false;
+                    browserUrl = browserAddressValue(browserUrl);
+                  }}
+                />
               </form>
               {#if browserError}
                 <div class="rounded-lg border border-red-900/60 bg-red-950/30 p-3 text-xs text-red-200">{browserError}</div>
               {/if}
-              <div class="rounded-xl border border-zinc-800 bg-zinc-950 p-3 text-xs text-zinc-400">
-                <div class="font-medium text-zinc-200">{browserSnapshot?.title || activeBrowserPage?.title || 'No page loaded'}</div>
-                <div class="mt-1 break-all text-zinc-500">{browserSnapshot?.url || activeBrowserPage?.url || 'Navigate to a URL to create a session browser page.'}</div>
-              </div>
-              <div class="min-h-0 flex-1 overflow-auto rounded-xl border border-zinc-800 bg-zinc-950 p-4">
-                {#if browserLoading}
-                  <div class="text-sm text-zinc-500">Loading browser page…</div>
-                {:else if browserSnapshot}
-                  <div class="space-y-4">
-                    <section>
-                      <div class="mb-2 text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Readable page</div>
-                      <pre class="whitespace-pre-wrap text-xs leading-5 text-zinc-300">{browserSnapshot.content}</pre>
-                    </section>
-                    {#if browserSnapshot.refs.length > 0}
-                      <section>
-                        <div class="mb-2 text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Agent refs</div>
-                        <div class="space-y-1">
-                          {#each browserSnapshot.refs as ref}
-                            <div class="rounded border border-zinc-800 px-2 py-1 text-xs text-zinc-300">[{ref.id}] {ref.label}</div>
-                          {/each}
-                        </div>
-                      </section>
+              <div
+                bind:this={browserStageElement}
+                class={cn(
+                  'min-h-0 flex-1 overflow-hidden',
+                  browserViewportMode === 'mobile'
+                    ? 'flex justify-center bg-zinc-950'
+                    : 'rounded-xl border border-zinc-800 bg-black'
+                )}
+              >
+                {#if browserSnapshot?.screenshot_data_url}
+                  <button
+                    type="button"
+                    class={cn(
+                      'relative overflow-hidden bg-black p-0 text-left focus:outline-none focus:ring-2 focus:ring-cyan-500',
+                      browserViewportMode === 'mobile'
+                        ? 'mx-auto flex h-full max-w-full rounded-xl border border-zinc-800'
+                        : 'block h-full w-full',
+                      browserAnnotating ? 'cursor-crosshair' : 'cursor-default'
+                    )}
+                    aria-label="Interactive browser viewport"
+                    onmousedown={(event) => { event.currentTarget.focus(); sendBrowserPointer('pointer_down', event); }}
+                    onmouseup={(event) => sendBrowserPointer('pointer_up', event)}
+                    onmousemove={(event) => { if (event.buttons > 0) sendBrowserPointer('pointer_move', event); }}
+                    onkeydown={handleBrowserKeydown}
+                    onpaste={handleBrowserPaste}
+                    onwheel={handleBrowserWheel}
+                    oncontextmenu={(event) => event.preventDefault()}
+                  >
+                    <img
+                      bind:this={browserViewportElement}
+                      src={browserSnapshot.screenshot_data_url}
+                      alt="Interactive browser viewport"
+                      class={cn(
+                        browserViewportMode === 'mobile'
+                          ? 'h-full w-auto max-w-full object-contain'
+                          : 'h-full w-full object-fill'
+                      )}
+                      draggable="false"
+                    />
+                    {#if browserLoading}
+                      <div class="absolute right-3 top-3 rounded-full border border-zinc-700 bg-zinc-950/90 px-3 py-1 text-xs text-zinc-300">Loading…</div>
                     {/if}
-                  </div>
+                    {#if browserAnnotation}
+                      <pre class="absolute bottom-3 left-3 max-h-28 max-w-[calc(100%-1.5rem)] overflow-auto rounded border border-zinc-700 bg-zinc-950/90 p-2 text-left text-[11px] text-cyan-100 shadow-xl">{JSON.stringify(browserAnnotation, null, 2)}</pre>
+                    {/if}
+                  </button>
+                {:else if browserLoading}
+                  <div class="flex h-full items-center justify-center text-sm text-zinc-500">Starting browser…</div>
                 {:else}
-                  <div class="text-sm text-zinc-500">The first version exposes daemon-owned navigation and readable snapshots. Playwright viewport streaming can attach behind this contract next.</div>
+                  <div class="flex h-full items-center justify-center p-6 text-center text-sm text-zinc-500">Enter a URL and press Enter to open the session browser. Click, type, and scroll directly in this viewport.</div>
                 {/if}
               </div>
-            </div>
-          </SheetContent>
-        </Sheet>
-
-        <Sheet bind:open={detailPanelOpen}>
-          <SheetContent
-            portalDisabled
-            trapFocus={false}
-            preventScroll={false}
-            overlayClass="lg:hidden"
-            class="z-20 max-w-md overflow-y-auto overflow-x-hidden border-zinc-900 lg:static lg:z-auto lg:w-96 lg:max-w-96 lg:shrink-0 lg:shadow-none"
-          >
-            <SheetHeader class="items-center border-zinc-900 px-5 py-4">
-              <div>
-                <SheetTitle class="text-sm">Session Details</SheetTitle>
-                <SheetDescription class="mt-1 text-xs">Secondary controls live here so the chat stays clear.</SheetDescription>
               </div>
-              <Button
-                variant="ghost"
-                size="icon"
-                aria-label="Close details"
-                onclick={() => {
-                  detailPanelOpen = false;
-                }}
-              >
-                <X class="size-4" />
-              </Button>
-            </SheetHeader>
-
-            <div class="min-w-0 space-y-6 px-5 py-5">
+            {:else}
+              <div class="min-w-0 space-y-6 px-5 py-5">
               <section class="min-w-0 space-y-4">
                 <div class="space-y-1">
                   <div class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Session</div>
@@ -3631,6 +4241,7 @@
                 </div>
               </section>
             </div>
+            {/if}
           </SheetContent>
         </Sheet>
       </div>
