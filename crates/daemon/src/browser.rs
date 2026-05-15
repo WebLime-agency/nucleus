@@ -1,14 +1,16 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, bail};
 use nucleus_protocol::{
-    BrowserActionRequest, BrowserContextSummary, BrowserFrameEvent, BrowserNavigateRequest,
-    BrowserPageSummary, BrowserSnapshot, BrowserSnapshotRef, DaemonEvent,
+    BrowserActionRequest, BrowserContextSummary, BrowserDownload, BrowserFrameEvent,
+    BrowserNavigateRequest, BrowserPageSummary, BrowserSnapshot, BrowserSnapshotRef, DaemonEvent,
 };
+use serde::de::DeserializeOwned;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::{Child, Command},
@@ -21,7 +23,7 @@ pub struct BrowserRuntime {
     contexts: Mutex<HashMap<String, BrowserContextState>>,
     client: reqwest::Client,
     sidecar: Mutex<Option<BrowserSidecar>>,
-    streams: Mutex<HashMap<String, BrowserStreamHandle>>,
+    streams: Arc<Mutex<HashMap<String, BrowserStreamHandle>>>,
 }
 
 struct BrowserStreamHandle {
@@ -51,6 +53,8 @@ struct SidecarPage {
     refs: Vec<BrowserSnapshotRef>,
     #[serde(default)]
     screenshot_data_url: String,
+    #[serde(default)]
+    downloads: Vec<BrowserDownload>,
 }
 
 #[derive(serde::Deserialize)]
@@ -217,6 +221,10 @@ impl BrowserRuntime {
                 .as_ref()
                 .map(|page| page.refs.clone())
                 .unwrap_or_else(|| page.refs.clone()),
+            downloads: sidecar_page
+                .as_ref()
+                .map(|page| page.downloads.clone())
+                .unwrap_or_default(),
             screenshot_data_url: sidecar_page
                 .map(|page| page.screenshot_data_url)
                 .unwrap_or_default(),
@@ -241,6 +249,7 @@ impl BrowserRuntime {
                     title: sidecar_page.title,
                     content: sidecar_page.content,
                     refs: sidecar_page.refs,
+                    downloads: sidecar_page.downloads,
                     screenshot_data_url: sidecar_page.screenshot_data_url,
                     captured_at: now_ts(),
                 });
@@ -291,15 +300,14 @@ impl BrowserRuntime {
         url: &str,
     ) -> anyhow::Result<SidecarPage> {
         let base_url = self.sidecar_url().await?;
-        Ok(self
+        let response = self
             .client
             .post(format!("{base_url}/navigate"))
             .json(&serde_json::json!({ "session_id": session_id, "page_id": page_id, "url": url }))
             .send()
-            .await?
-            .error_for_status()?
-            .json::<SidecarPage>()
-            .await?)
+            .await
+            .context("browser sidecar navigate request failed")?;
+        sidecar_response_json::<SidecarPage>(response).await
     }
 
     async fn snapshot_sidecar(
@@ -308,15 +316,14 @@ impl BrowserRuntime {
         page_id: &str,
     ) -> anyhow::Result<SidecarPage> {
         let base_url = self.sidecar_url().await?;
-        Ok(self
+        let response = self
             .client
             .post(format!("{base_url}/snapshot"))
             .json(&serde_json::json!({ "session_id": session_id, "page_id": page_id }))
             .send()
-            .await?
-            .error_for_status()?
-            .json::<SidecarPage>()
-            .await?)
+            .await
+            .context("browser sidecar snapshot request failed")?;
+        sidecar_response_json::<SidecarPage>(response).await
     }
 
     async fn input_sidecar(
@@ -331,6 +338,7 @@ impl BrowserRuntime {
             "page_id": page_id,
             "action": request.action,
             "value": request.value,
+            "target_ref": request.target_ref,
         });
         if let Some(args) = request
             .value
@@ -345,15 +353,14 @@ impl BrowserRuntime {
                 }
             }
         }
-        Ok(self
+        let response = self
             .client
             .post(format!("{base_url}/input"))
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?
-            .json::<SidecarPage>()
-            .await?)
+            .await
+            .context("browser sidecar input request failed")?;
+        sidecar_response_json::<SidecarPage>(response).await
     }
 
     pub async fn open_tab(&self, session_id: &str) -> anyhow::Result<BrowserContextSummary> {
@@ -565,11 +572,19 @@ impl BrowserRuntime {
         let task_session_id = session_id.clone();
         let task_page_id = page.id.clone();
         let task_stream_id = stream_id.clone();
+        let task_key = key.clone();
+        let streams = self.streams.clone();
         let task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(33));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let cleanup_client = client.clone();
+            let cleanup_base_url = base_url.clone();
+            let cleanup_stream_id = task_stream_id.clone();
             loop {
                 interval.tick().await;
+                if events.receiver_count() == 0 {
+                    break;
+                }
                 let response = client
                     .post(format!("{base_url}/pop_frame"))
                     .json(&serde_json::json!({ "stream_id": task_stream_id }))
@@ -586,18 +601,35 @@ impl BrowserRuntime {
                     continue;
                 };
                 let state = frame.state.as_ref();
-                let _ = events.send(DaemonEvent::BrowserFrame(BrowserFrameEvent {
-                    session_id: task_session_id.clone(),
-                    page_id: frame.page_id.clone(),
-                    mime: frame.mime,
-                    image: frame.image,
-                    url: state.map(|state| state.url.clone()).unwrap_or_default(),
-                    title: state.map(|state| state.title.clone()).unwrap_or_default(),
-                    captured_at: now_ts(),
-                }));
+                if events
+                    .send(DaemonEvent::BrowserFrame(BrowserFrameEvent {
+                        session_id: task_session_id.clone(),
+                        page_id: frame.page_id.clone(),
+                        mime: frame.mime,
+                        image: frame.image,
+                        url: state.map(|state| state.url.clone()).unwrap_or_default(),
+                        title: state.map(|state| state.title.clone()).unwrap_or_default(),
+                        captured_at: now_ts(),
+                    }))
+                    .is_err()
+                {
+                    break;
+                }
                 if frame.page_id != task_page_id {
                     break;
                 }
+            }
+            let _ = cleanup_client
+                .post(format!("{cleanup_base_url}/stop_screencast"))
+                .json(&serde_json::json!({ "stream_id": cleanup_stream_id }))
+                .send()
+                .await;
+            let mut handles = streams.lock().await;
+            if handles
+                .get(&task_key)
+                .is_some_and(|handle| handle.stream_id == task_stream_id)
+            {
+                handles.remove(&task_key);
             }
         });
         self.streams.lock().await.insert(
@@ -739,6 +771,36 @@ fn browser_sidecar_script_path() -> anyhow::Result<PathBuf> {
             .collect::<Vec<_>>()
             .join(", ")
     )
+}
+
+async fn sidecar_response_json<T: DeserializeOwned>(
+    response: reqwest::Response,
+) -> anyhow::Result<T> {
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        let message = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(|error| error.as_str())
+                    .map(ToOwned::to_owned)
+            })
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                if text.trim().is_empty() {
+                    format!("browser sidecar returned HTTP {status}")
+                } else {
+                    text
+                }
+            });
+        bail!("{message}");
+    }
+    response
+        .json::<T>()
+        .await
+        .context("failed to decode browser sidecar response")
 }
 
 fn now_ts() -> i64 {

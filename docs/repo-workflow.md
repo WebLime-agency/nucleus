@@ -39,6 +39,7 @@ Feature branch runtime rule:
 - Use scratch state for branch testing. Do not reuse managed instance state directories.
 - Treat managed product instances as consumers of released artifacts, not as feature-branch test targets.
 - Browser feature work is especially strict because browser profiles, cookies, tabs, downloads, and sidecar state are daemon-owned and may persist under the active state directory.
+- UI changes should strongly prefer Browser verification before completion: run the matched source daemon and web client, navigate to the changed surface, inspect snapshot/refs or screenshots, interact with the workflow where practical, and keep the resulting artifacts as evidence.
 
 CI expectations:
 
@@ -88,3 +89,4 @@ Managed release channel publishing:
 - channel release tags are `nucleus-channel-stable`, `nucleus-channel-beta`, and `nucleus-channel-nightly`
 - channel manifests are release assets named `manifest-stable.json`, `manifest-beta.json`, and `manifest-nightly.json`
 - official channel artifacts include `bin/nucleus-daemon`, `bin/nucleus`, and the matching embedded web bundle
+- official channel artifacts also include Browser sidecar assets when Browser is enabled: `scripts/browser-sidecar.mjs`, `node_modules/playwright`, and `node_modules/playwright-core`

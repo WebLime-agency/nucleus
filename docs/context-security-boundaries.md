@@ -24,6 +24,7 @@ The core rule:
 - **Prompt include**: deterministic file-based context from `include/`, `.nucleus/include/`, or legacy promptinclude files.
 - **Skill**: procedural capability and activation instructions. Skills may reference tools and concepts but must not contain secrets.
 - **MCP record**: tool/resource server configuration and metadata. MCP records may contain non-secret Vault references.
+- **Browser artifact**: daemon-owned session/job evidence captured from the Browser runtime, such as readable snapshots, screenshots, download metadata, downloaded files, and annotation metadata.
 - **Vault secret**: confidential execution-time material such as API tokens, provider API keys, cookies, private keys, passwords, bearer credentials, recovery phrases, database URLs with credentials, or `.env` values. Existing provider credentials are secret material even before they are migrated into Vault.
 - **Vault reference**: a non-secret pointer to a Vault secret, scoped and policy-gated by the daemon, such as `vault://workspace/SUPABASE_ACCESS_TOKEN`.
 - **Secret resolution**: daemon-only operation that decrypts or retrieves a secret for an approved consumer.
@@ -87,6 +88,25 @@ Forbidden:
 - Decrypted Vault values.
 - Request/response bodies containing credentials unless redacted before storage.
 - Authorization headers, cookies, or private keys.
+
+### Browser artifacts
+
+Allowed:
+
+- Persist readable page text, screenshots, daemon-generated refs, download metadata, downloaded files, and annotation metadata as session/job artifacts.
+- Include local artifact paths, page URLs, page titles, suggested download filenames, capture timestamps, and ref counts in artifact metadata.
+- Use Browser artifacts as evidence for UI verification and task completion.
+
+Forbidden:
+
+- Promote Browser artifacts into Memory automatically.
+- Treat Browser screenshots, snapshots, annotations, downloads, or cookies as Vault storage.
+- Persist decrypted Vault values into Browser pages, Browser downloads, Browser artifact metadata, transcripts, logs, or model-visible tool results.
+- Use Browser artifacts to bypass local/private URL or Vault safe-origin rules.
+
+Browser artifacts may capture local/private URLs and private UI content because the daemon Browser can reach the operator's local network from the host. These artifacts stay under the active Nucleus state directory and inherit that instance's retention and backup posture. Operators should use scratch state for source-checkout Browser testing and remove it after verification.
+
+Downloads are saved under the active state directory and may contain sensitive page output. The daemon may expose download metadata to the UI or model-visible tool result, but should avoid exposing file contents unless the user or an approved tool explicitly requests that content.
 
 ## Scope model
 
@@ -179,6 +199,8 @@ Nucleus should surface current network posture in Settings and guide users towar
 - Custom/public
 
 Vault operations should be held to a stricter standard than ordinary page rendering.
+
+The Browser runtime may navigate to localhost, LAN, VPN, or other private URLs when the operator approves navigation. That reachability does not make those origins safe for Vault plaintext operations. Vault unlock/create/update must still require loopback HTTP or HTTPS unless an explicit development override is implemented.
 
 ## Audit event rules
 

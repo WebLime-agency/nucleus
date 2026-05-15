@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import http from 'node:http';
 import { mkdir } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { chromium } from 'playwright';
 
@@ -48,7 +48,7 @@ async function contextFor(sessionId) {
     delete launch.channel;
     context = await chromium.launchPersistentContext(profileDir, launch);
   }
-  const state = { id: key, context, activePageId: '', pageIds: new WeakMap() };
+  const state = { id: key, context, activePageId: '', pageIds: new WeakMap(), refsByPage: new Map(), downloads: [] };
   for (const page of context.pages()) registerPage(state, page);
   if (!context.pages().length) registerPage(state, await context.newPage());
   contexts.set(key, state);
@@ -62,9 +62,28 @@ function registerPage(state, page, wantedId = '') {
     page.on('close', () => {
       if (state.activePageId === state.pageIds.get(page)) state.activePageId = firstPage(state)?.id || '';
     });
+    page.on('download', async (download) => {
+      const suggested = safeFileName(download.suggestedFilename() || 'download');
+      const downloadId = `download-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const fileName = `${downloadId}-${suggested}`;
+      const filePath = join(stateRoot, 'browser', state.id, 'downloads', fileName);
+      await download.saveAs(filePath).catch(() => null);
+      state.downloads.push({
+        id: downloadId,
+        page_id: state.pageIds.get(page),
+        url: download.url(),
+        suggested_filename: suggested,
+        path: filePath,
+        created_at: Math.floor(Date.now() / 1000)
+      });
+    });
   }
   state.activePageId ||= state.pageIds.get(page);
   return state.pageIds.get(page);
+}
+
+function safeFileName(value) {
+  return basename(String(value || 'download')).replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 160) || 'download';
 }
 
 function pagesFor(state) {
@@ -104,17 +123,78 @@ async function pageState(state, entry, includeScreenshot = false) {
   let refs = [];
   try {
     const data = await page.evaluate(() => {
+      function cssEscape(value) {
+        if (globalThis.CSS?.escape) return CSS.escape(value);
+        return String(value).replace(/["\\]/g, '\\$&');
+      }
+
+      function cssPath(el) {
+        const parts = [];
+        let node = el;
+        while (node && node.nodeType === Node.ELEMENT_NODE && parts.length < 5) {
+          const tag = node.tagName.toLowerCase();
+          if (node.id) {
+            parts.unshift(`${tag}#${cssEscape(node.id)}`);
+            break;
+          }
+          const parent = node.parentElement;
+          if (!parent) {
+            parts.unshift(tag);
+            break;
+          }
+          const siblings = [...parent.children].filter((child) => child.tagName === node.tagName);
+          const index = siblings.indexOf(node) + 1;
+          parts.unshift(siblings.length > 1 ? `${tag}:nth-of-type(${index})` : tag);
+          node = parent;
+        }
+        return parts.join(' > ');
+      }
+
+      function bestSelector(el) {
+        const tag = el.tagName.toLowerCase();
+        const testId = el.getAttribute('data-testid') || el.getAttribute('data-test') || el.getAttribute('data-cy');
+        if (testId) return `[data-testid="${cssEscape(testId)}"], [data-test="${cssEscape(testId)}"], [data-cy="${cssEscape(testId)}"]`;
+        if (el.id) return `${tag}#${cssEscape(el.id)}`;
+        const name = el.getAttribute('name');
+        if (name) return `${tag}[name="${cssEscape(name)}"]`;
+        const aria = el.getAttribute('aria-label');
+        if (aria) return `${tag}[aria-label="${cssEscape(aria)}"]`;
+        const placeholder = el.getAttribute('placeholder');
+        if (placeholder) return `${tag}[placeholder="${cssEscape(placeholder)}"]`;
+        const href = el.getAttribute('href');
+        if (tag === 'a' && href) return `a[href="${cssEscape(href)}"]`;
+        return cssPath(el);
+      }
+
+      function isActionable(el) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 1 || rect.height < 1) return false;
+        const style = window.getComputedStyle(el);
+        if (style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity || '1') === 0) return false;
+        if (el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+        const x = Math.min(window.innerWidth - 1, Math.max(0, rect.left + rect.width / 2));
+        const y = Math.min(window.innerHeight - 1, Math.max(0, rect.top + rect.height / 2));
+        const top = document.elementFromPoint(x, y);
+        return top === el || el.contains(top);
+      }
+
       const text = document.body?.innerText || '';
-      const elements = [...document.querySelectorAll('a,button,input,textarea,select,[role="button"],[contenteditable="true"]')].slice(0, 80);
+      const elements = [...document.querySelectorAll('a,button,input,textarea,select,[role="button"],[contenteditable="true"]')]
+        .filter(isActionable)
+        .slice(0, 80);
       return { text, refs: elements.map((el, index) => {
         const tag = el.tagName.toLowerCase();
         const id = `ref-${index + 1}`;
-        const selector = el.id ? `${tag}#${CSS.escape(el.id)}` : `${tag}:nth-of-type(${index + 1})`;
-        return { id, label: (el.getAttribute('aria-label') || el.getAttribute('title') || el.innerText || el.value || el.placeholder || el.tagName || '').trim().slice(0, 120), kind: tag, selector };
+        const role = el.getAttribute('role') || '';
+        const type = el.getAttribute('type') || '';
+        const kind = role || (tag === 'input' && type ? `input:${type}` : tag);
+        const selector = bestSelector(el);
+        return { id, label: (el.getAttribute('aria-label') || el.getAttribute('title') || el.innerText || el.placeholder || el.tagName || '').trim().slice(0, 120), kind, selector };
       }) };
     });
     content = String(data.text || '').split(/\s+/).slice(0, 1200).join(' ');
     refs = data.refs || [];
+    state.refsByPage.set(id, refs);
   } catch {}
   let screenshot_data_url = '';
   if (includeScreenshot) {
@@ -123,7 +203,7 @@ async function pageState(state, entry, includeScreenshot = false) {
       screenshot_data_url = `data:image/jpeg;base64,${shot.toString('base64')}`;
     } catch {}
   }
-  return { page_id: id, url: page.url(), title: await page.title().catch(() => page.url() || 'New Tab'), loading: false, content, refs, screenshot_data_url };
+  return { page_id: id, url: page.url(), title: await page.title().catch(() => page.url() || 'New Tab'), loading: false, content, refs, screenshot_data_url, downloads: state.downloads.filter((download) => download.page_id === id) };
 }
 
 async function contextResult(state, activeEntry = null) {
@@ -147,15 +227,18 @@ async function handle(body) {
     }
     case 'navigate': {
       const entry = await pageFor(state, body.page_id || '', true);
-      await entry.page.goto(normalizeUrl(body.url), { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-      await entry.page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {});
+      await entry.page.goto(normalizeUrl(body.url), { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await entry.page.waitForLoadState('networkidle', { timeout: 3000 }).catch((err) => {
+        if (String(err?.message || err).includes('Timeout')) return;
+        throw err;
+      });
       return pageState(state, entry, false);
     }
     case 'snapshot': return pageState(state, await pageFor(state, body.page_id || '', false), true);
     case 'select': return contextResult(state, await pageFor(state, body.page_id || '', false));
     case 'input': {
       const entry = await pageFor(state, body.page_id || '', false);
-      await applyInput(entry.page, body);
+      await applyInput(state, entry, body);
       return pageState(state, entry, false);
     }
     case 'command': return command(state, body);
@@ -167,15 +250,44 @@ async function handle(body) {
   }
 }
 
-async function applyInput(page, body) {
+async function applyInput(state, entry, body) {
+  const page = entry.page;
   const action = body.action || body.type;
-  if (action === 'click') await page.mouse.click(Number(body.x || 0), Number(body.y || 0), { button: body.button || 'left' });
+  const target = await targetLocator(state, entry, body);
+  if (target && action === 'click') await target.click({ button: body.button || 'left' });
+  else if (target && (action === 'fill' || action === 'type')) await target.fill(String(body.text ?? body.value ?? ''));
+  else if (target && action === 'press') await target.press(String(body.key || body.value || 'Enter'));
+  else if (target && action === 'scroll') await target.scrollIntoViewIfNeeded();
+  else if (target && action === 'submit') {
+    const submitted = await target.evaluate((el) => {
+      const form = el.closest?.('form');
+      if (!form) return false;
+      if (typeof form.requestSubmit === 'function') form.requestSubmit();
+      else form.submit();
+      return true;
+    }).catch(() => false);
+    if (!submitted) await target.press('Enter');
+  }
+  else if (action === 'click') await page.mouse.click(Number(body.x || 0), Number(body.y || 0), { button: body.button || 'left' });
   else if (action === 'pointer_down') { await page.mouse.move(Number(body.x || 0), Number(body.y || 0)); await page.mouse.down({ button: body.button || 'left' }); }
   else if (action === 'pointer_up') { await page.mouse.move(Number(body.x || 0), Number(body.y || 0)); await page.mouse.up({ button: body.button || 'left' }); }
   else if (action === 'pointer_move') await page.mouse.move(Number(body.x || 0), Number(body.y || 0));
   else if (action === 'wheel' || action === 'scroll') await page.mouse.wheel(Number(body.delta_x || body.deltaX || 0), Number(body.delta_y || body.deltaY || 0));
   else if (action === 'type') await page.keyboard.type(String(body.text ?? body.value ?? ''), { delay: 5 });
   else if (action === 'key' || action === 'press') await page.keyboard.press(String(body.key || body.value || 'Enter'));
+}
+
+async function targetLocator(state, entry, body) {
+  const targetRef = String(body.target_ref || body.ref || '').trim();
+  if (!targetRef) return null;
+  const refs = state.refsByPage.get(entry.id) || [];
+  const ref = refs.find((candidate) => candidate.id === targetRef);
+  if (!ref) throw new Error(`browser ref '${targetRef}' is stale or no longer actionable`);
+  const locator = entry.page.locator(ref.selector).first();
+  if (await locator.count().catch(() => 0) < 1) {
+    throw new Error(`browser ref '${targetRef}' is stale or no longer actionable`);
+  }
+  return locator;
 }
 
 
@@ -202,12 +314,13 @@ async function command(state, body) {
 
 async function annotation(page, payload) {
   const x = Number(payload.x || 0), y = Number(payload.y || 0);
-  return page.evaluate(({ x, y }) => {
+  const result = await page.evaluate(({ x, y }) => {
     const el = document.elementFromPoint(x, y);
     if (!el) return null;
     const r = el.getBoundingClientRect();
-    return { tag: el.tagName.toLowerCase(), text: (el.innerText || el.value || '').trim().slice(0, 500), aria: el.getAttribute('aria-label'), title: el.getAttribute('title'), href: el.href || null, bounds: { x: r.x, y: r.y, width: r.width, height: r.height } };
+    return { tag: el.tagName.toLowerCase(), text: (el.innerText || '').trim().slice(0, 500), aria: el.getAttribute('aria-label'), title: el.getAttribute('title'), href: el.href || null, bounds: { x: r.x, y: r.y, width: r.width, height: r.height } };
   }, { x, y });
+  return { point: { x, y }, comment: String(payload.comment || '').trim(), element: result, created_at: Math.floor(Date.now() / 1000) };
 }
 
 async function startScreencast(state, entry, quality) {

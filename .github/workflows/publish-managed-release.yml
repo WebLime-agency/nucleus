@@ -246,6 +246,9 @@ jobs:
           test -x "${install_root}/current/bin/nucleus-daemon"
           test -x "${install_root}/current/bin/nucleus"
           test -f "${install_root}/current/web/index.html"
+          test -f "${install_root}/current/scripts/browser-sidecar.mjs"
+          test -d "${install_root}/current/node_modules/playwright"
+          test -d "${install_root}/current/node_modules/playwright-core"
 
       - name: Publish channel release
         env:
@@ -344,6 +347,9 @@ jobs:
           test -x "${install_root}/current/bin/nucleus-daemon"
           test -x "${install_root}/current/bin/nucleus"
           test -f "${install_root}/current/web/index.html"
+          test -f "${install_root}/current/scripts/browser-sidecar.mjs"
+          test -d "${install_root}/current/node_modules/playwright"
+          test -d "${install_root}/current/node_modules/playwright-core"
 
       - name: Summarize release
         env:

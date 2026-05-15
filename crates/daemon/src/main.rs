@@ -30,6 +30,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use base64::Engine as _;
 use flate2::read::GzDecoder;
 use futures_util::SinkExt;
 use host::{DEFAULT_PROCESS_LIMIT, HostEngine, ProcessSort, resolve_process_limit};
@@ -468,12 +469,52 @@ async fn browser_annotation(
         payload: serde_json::Value,
     }
     let payload = decode_json::<AnnotationRequest>(&body)?;
-    Ok(Json(
-        state
-            .browser
-            .annotation(&session_id, &payload.page_id, payload.payload)
-            .await?,
-    ))
+    let annotation = state
+        .browser
+        .annotation(&session_id, &payload.page_id, payload.payload.clone())
+        .await?;
+    let snapshot = state
+        .browser
+        .snapshot(&session_id, Some(payload.page_id.clone()))
+        .await?;
+    let artifact_paths = persist_browser_session_artifacts(
+        &state,
+        &session_id,
+        "browser-annotation",
+        &snapshot,
+        Some(&annotation),
+    )?;
+    if let Some(comment) = annotation
+        .get("comment")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let turn_id = Uuid::new_v4().to_string();
+        let element = annotation.get("element").cloned().unwrap_or(Value::Null);
+        state.store.append_session_turn(
+            &session_id,
+            &turn_id,
+            "user",
+            &format!(
+                "Browser annotation on {} ({})\n\nComment: {}\n\nPoint/element metadata:\n{}",
+                snapshot.title,
+                snapshot.url,
+                comment,
+                serde_json::to_string_pretty(&element).unwrap_or_else(|_| element.to_string())
+            ),
+            &[],
+        )?;
+        if let Ok(updated) = state.store.get_session(&session_id) {
+            let _ = publish_session_event(&state, updated).await;
+        }
+    }
+    let mut response = annotation;
+    if let Some(object) = response.as_object_mut() {
+        object.insert("artifact_paths".to_string(), json!(artifact_paths));
+        object.insert("screenshot_captured".to_string(), json!(true));
+    }
+    Ok(Json(response))
 }
 
 async fn browser_snapshot(
@@ -491,9 +532,15 @@ async fn browser_snapshot(
     } else {
         decode_json::<SnapshotRequest>(&body)?
     };
-    Ok(Json(
-        state.browser.snapshot(&session_id, payload.page_id).await?,
-    ))
+    let snapshot = state.browser.snapshot(&session_id, payload.page_id).await?;
+    let _ = persist_browser_session_artifacts(
+        &state,
+        &session_id,
+        "browser-snapshot",
+        &snapshot,
+        None,
+    )?;
+    Ok(Json(snapshot))
 }
 
 async fn browser_action(
@@ -544,6 +591,82 @@ async fn browser_stream_stop(
         .stop_stream(&session_id, &payload.page_id)
         .await;
     Ok(Json(state.browser.context(&session_id).await))
+}
+
+fn persist_browser_session_artifacts(
+    state: &AppState,
+    session_id: &str,
+    kind: &str,
+    snapshot: &BrowserSnapshot,
+    annotation: Option<&Value>,
+) -> Result<Vec<String>, ApiError> {
+    let artifact_id = Uuid::new_v4().to_string();
+    let artifact_dir = state
+        .store
+        .artifacts_dir_path()
+        .join("sessions")
+        .join(session_id)
+        .join("browser");
+    fs::create_dir_all(&artifact_dir)
+        .with_context(|| format!("failed to create '{}'", artifact_dir.display()))?;
+    let metadata = json!({
+        "artifact_id": artifact_id,
+        "kind": kind,
+        "session_id": session_id,
+        "page_id": snapshot.page_id,
+        "url": snapshot.url,
+        "title": snapshot.title,
+        "viewport": null,
+        "captured_at": snapshot.captured_at,
+        "ref_count": snapshot.refs.len(),
+        "downloads": snapshot.downloads,
+        "annotation": annotation,
+        "storage": "session_artifact",
+        "memory": "not_promoted",
+    });
+    let json_path = artifact_dir.join(format!("{artifact_id}.json"));
+    fs::write(
+        &json_path,
+        serde_json::to_vec_pretty(&json!({
+            "metadata": metadata,
+            "content": snapshot.content,
+            "refs": &snapshot.refs,
+            "downloads": &snapshot.downloads,
+        }))
+        .context("failed to encode browser session artifact")?,
+    )
+    .with_context(|| format!("failed to write '{}'", json_path.display()))?;
+    let mut paths = vec![json_path.display().to_string()];
+    if let Some((extension, bytes)) = decode_browser_data_url(&snapshot.screenshot_data_url)? {
+        let image_path = artifact_dir.join(format!("{artifact_id}.{extension}"));
+        fs::write(&image_path, bytes)
+            .with_context(|| format!("failed to write '{}'", image_path.display()))?;
+        paths.push(image_path.display().to_string());
+    }
+    Ok(paths)
+}
+
+fn decode_browser_data_url(value: &str) -> Result<Option<(String, Vec<u8>)>, ApiError> {
+    let Some(rest) = value.strip_prefix("data:") else {
+        return Ok(None);
+    };
+    let Some((metadata, encoded)) = rest.split_once(',') else {
+        return Ok(None);
+    };
+    if !metadata.ends_with(";base64") {
+        return Ok(None);
+    }
+    let mime_type = metadata.trim_end_matches(";base64");
+    let extension = match mime_type {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        _ => "bin",
+    }
+    .to_string();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .context("failed to decode browser screenshot data URL")?;
+    Ok(Some((extension, bytes)))
 }
 
 fn ensure_session_exists(state: &AppState, session_id: &str) -> Result<(), ApiError> {
