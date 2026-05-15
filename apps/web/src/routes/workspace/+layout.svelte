@@ -19,10 +19,10 @@
   let pathname = $derived(page.url.pathname);
 </script>
 
-<div class="flex flex-col gap-5 lg:flex-row lg:items-start lg:gap-6">
+<div class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden lg:flex-row">
   <WorkspaceSectionNav items={tabs} {pathname} />
 
-  <div class="min-w-0 flex-1">
+  <div class="min-h-0 min-w-0 flex-1 overflow-y-auto px-4 py-4 pb-8 sm:px-6 lg:px-8 lg:py-6">
     {@render children()}
   </div>
 </div>
