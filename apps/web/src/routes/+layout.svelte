@@ -104,7 +104,7 @@
   let requestedSessionId = $derived.by(() =>
     browser ? page.url.searchParams.get('session') ?? '' : ''
   );
-  let usesFullHeightContent = $derived(pathname === '/');
+  let usesFullHeightContent = $derived(pathname === '/' || pathname.startsWith('/workspace'));
   let activeSidebarSessionId = $derived(requestedSessionId || sessions[0]?.id || '');
   let compatibility = $derived(
     evaluateCompatibility(daemonCompatibility ?? settings?.compatibility ?? null)
