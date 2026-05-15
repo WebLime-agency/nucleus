@@ -1014,6 +1014,85 @@ mod tests {
     }
 
     #[test]
+    fn package_includes_browser_sidecar_assets() {
+        let root = std::env::temp_dir().join(format!("nucleus-release-browser-{}", Uuid::new_v4()));
+        let bin_dir = root.join("bin");
+        let web_dir = root.join("web");
+        let scripts_dir = root.join("scripts");
+        let playwright_dir = root.join("node_modules/playwright");
+        let playwright_core_dir = root.join("node_modules/playwright-core");
+        let output_dir = root.join("dist");
+        fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+        fs::create_dir_all(&web_dir).expect("web dir should exist");
+        fs::create_dir_all(&scripts_dir).expect("scripts dir should exist");
+        fs::create_dir_all(&playwright_dir).expect("playwright dir should exist");
+        fs::create_dir_all(&playwright_core_dir).expect("playwright-core dir should exist");
+        fs::write(bin_dir.join("nucleus-daemon"), "daemon").expect("daemon file should exist");
+        fs::write(web_dir.join("index.html"), "<html></html>").expect("web build should exist");
+        fs::write(
+            scripts_dir.join("browser-sidecar.mjs"),
+            "console.log('sidecar');",
+        )
+        .expect("sidecar should exist");
+        fs::write(playwright_dir.join("index.js"), "module.exports = {};")
+            .expect("playwright module should exist");
+        fs::write(playwright_core_dir.join("index.js"), "module.exports = {};")
+            .expect("playwright-core module should exist");
+
+        let packaged = package_release_artifact(ReleasePackageInput {
+            release_id: "rel_browser".to_string(),
+            version: "0.1.0".to_string(),
+            channel: DEFAULT_RELEASE_CHANNEL.to_string(),
+            daemon_binary: bin_dir.join("nucleus-daemon"),
+            cli_binary: None,
+            web_dist_dir: web_dir,
+            browser_sidecar_script: Some(scripts_dir.join("browser-sidecar.mjs")),
+            browser_node_module_dirs: vec![playwright_dir, playwright_core_dir],
+            output_dir,
+            artifact_base_url: None,
+            manifest_path: None,
+            target: Some("x86_64-linux".to_string()),
+            minimum_client_version: None,
+            minimum_server_version: None,
+            capability_flags: Vec::new(),
+        })
+        .expect("package should succeed");
+
+        let file = File::open(&packaged.archive_path).expect("archive should open");
+        let decoder = GzDecoder::new(file);
+        let mut archive = Archive::new(decoder);
+        let mut paths = Vec::new();
+        for entry in archive.entries().expect("archive entries should read") {
+            let entry = entry.expect("archive entry should read");
+            paths.push(
+                entry
+                    .path()
+                    .expect("entry path should decode")
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        }
+
+        assert!(
+            paths
+                .iter()
+                .any(|path| path == "scripts/browser-sidecar.mjs")
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path == "node_modules/playwright/index.js")
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path == "node_modules/playwright-core/index.js")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn activation_tracks_previous_release_after_second_activation() {
         let root =
             std::env::temp_dir().join(format!("nucleus-release-previous-{}", Uuid::new_v4()));

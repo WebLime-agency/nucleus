@@ -7,12 +7,14 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine as _;
 use nucleus_protocol::{
-    ApprovalRequestSummary, ArtifactSummary, CommandSessionSummary, CreatePlaybookRequest,
-    DaemonEvent, JobDetail, JobSummary, McpServerRecord, McpToolRecord, PlaybookDetail,
-    PlaybookSummary, PromptProgressUpdate, RunBudgetSummary, SessionDetail, SessionPromptRequest,
-    SessionSummary, SessionTurn, SessionTurnImage, UpdatePlaybookRequest, WorkerSummary,
-    WorkspaceProfileSummary, WorkspaceSummary,
+    ApprovalRequestSummary, ArtifactSummary, BrowserActionRequest, BrowserNavigateRequest,
+    BrowserSnapshot, CommandSessionSummary, CreatePlaybookRequest, DaemonEvent, JobDetail,
+    JobSummary, McpServerRecord, McpToolRecord, PlaybookDetail, PlaybookSummary,
+    PromptProgressUpdate, RunBudgetSummary, SessionDetail, SessionPromptRequest, SessionSummary,
+    SessionTurn, SessionTurnImage, UpdatePlaybookRequest, WorkerSummary, WorkspaceProfileSummary,
+    WorkspaceSummary,
 };
 use nucleus_storage::{
     ApprovalRequestRecord, AuditEventRecord, CommandSessionPatch, CommandSessionRecord,
@@ -289,6 +291,79 @@ struct McpToolCallArgs {
     params: Value,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct BrowserNavigateArgs {
+    url: String,
+    #[serde(default)]
+    page_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct BrowserPageArgs {
+    #[serde(default)]
+    page_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct BrowserClickArgs {
+    #[serde(default)]
+    page_id: Option<String>,
+    #[serde(default)]
+    target_ref: Option<String>,
+    #[serde(default)]
+    x: Option<i64>,
+    #[serde(default)]
+    y: Option<i64>,
+    #[serde(default)]
+    button: Option<String>,
+    #[serde(default)]
+    snapshot: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BrowserTextArgs {
+    #[serde(default)]
+    page_id: Option<String>,
+    target_ref: String,
+    text: String,
+    #[serde(default)]
+    snapshot: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct BrowserScrollArgs {
+    #[serde(default)]
+    page_id: Option<String>,
+    #[serde(default)]
+    target_ref: Option<String>,
+    #[serde(default)]
+    delta_x: Option<i64>,
+    #[serde(default)]
+    delta_y: Option<i64>,
+    #[serde(default)]
+    snapshot: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BrowserPressArgs {
+    #[serde(default)]
+    page_id: Option<String>,
+    #[serde(default)]
+    target_ref: Option<String>,
+    key: String,
+    #[serde(default)]
+    snapshot: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BrowserSubmitArgs {
+    #[serde(default)]
+    page_id: Option<String>,
+    target_ref: String,
+    #[serde(default)]
+    snapshot: Option<bool>,
+}
+
 #[derive(Debug, Clone)]
 struct MutationPreview {
     detail: String,
@@ -381,6 +456,16 @@ struct ArtifactDraft {
     mime_type: String,
     extension: String,
     content: String,
+    preview_text: String,
+}
+
+#[derive(Debug, Clone)]
+struct ArtifactBytesDraft {
+    kind: String,
+    title: String,
+    mime_type: String,
+    extension: String,
+    bytes: Vec<u8>,
     preview_text: String,
 }
 
@@ -3704,6 +3789,50 @@ async fn execute_granted_tool(
             )
             .await
         }
+        "browser.context" => execute_browser_context_tool(state, session).await,
+        "browser.navigate" => {
+            let args = serde_json::from_value::<BrowserNavigateArgs>(args)
+                .context("invalid args for browser.navigate")?;
+            execute_browser_navigate_tool(state, session, args).await
+        }
+        "browser.snapshot" => {
+            let args = serde_json::from_value::<BrowserPageArgs>(args)
+                .context("invalid args for browser.snapshot")?;
+            execute_browser_snapshot_tool(state, session, job_id, worker, tool_call_id, args, false)
+                .await
+        }
+        "browser.screenshot" => {
+            let args = serde_json::from_value::<BrowserPageArgs>(args)
+                .context("invalid args for browser.screenshot")?;
+            execute_browser_snapshot_tool(state, session, job_id, worker, tool_call_id, args, true)
+                .await
+        }
+        "browser.click" => {
+            let args = serde_json::from_value::<BrowserClickArgs>(args)
+                .context("invalid args for browser.click")?;
+            execute_browser_click_tool(state, session, job_id, worker, tool_call_id, args).await
+        }
+        "browser.type" | "browser.fill" => {
+            let args = serde_json::from_value::<BrowserTextArgs>(args)
+                .with_context(|| format!("invalid args for {tool}"))?;
+            execute_browser_text_tool(state, session, job_id, worker, tool_call_id, tool, args)
+                .await
+        }
+        "browser.scroll" => {
+            let args = serde_json::from_value::<BrowserScrollArgs>(args)
+                .context("invalid args for browser.scroll")?;
+            execute_browser_scroll_tool(state, session, job_id, worker, tool_call_id, args).await
+        }
+        "browser.press" => {
+            let args = serde_json::from_value::<BrowserPressArgs>(args)
+                .context("invalid args for browser.press")?;
+            execute_browser_press_tool(state, session, job_id, worker, tool_call_id, args).await
+        }
+        "browser.submit" => {
+            let args = serde_json::from_value::<BrowserSubmitArgs>(args)
+                .context("invalid args for browser.submit")?;
+            execute_browser_submit_tool(state, session, job_id, worker, tool_call_id, args).await
+        }
         other if other.starts_with("mcp.") => {
             let args = serde_json::from_value::<McpToolCallArgs>(args.clone())
                 .unwrap_or(McpToolCallArgs { params: args });
@@ -3771,6 +3900,7 @@ fn preview_approval_tool(
                 .context("invalid args for tests.run")?;
             preview_tests_run(worker, args)
         }
+        other if other.starts_with("browser.") => Ok(preview_browser_tool(other, args)),
         other if other.starts_with("mcp.") => Ok(MutationPreview {
             detail: format!(
                 "Invoke MCP tool {} through the Nucleus action bridge.",
@@ -3780,6 +3910,21 @@ fn preview_approval_tool(
             artifact: None,
         }),
         other => bail!("'{}' does not support approval previews", other),
+    }
+}
+
+fn preview_browser_tool(tool: &str, args: &Value) -> MutationPreview {
+    MutationPreview {
+        detail: format!(
+            "Run {} against the session-scoped daemon Browser runtime.",
+            tool
+        ),
+        diff_preview: serde_json::to_string_pretty(args)
+            .unwrap_or_else(|_| args.to_string())
+            .chars()
+            .take(DIFF_PREVIEW_CHAR_LIMIT)
+            .collect(),
+        artifact: None,
     }
 }
 
@@ -4602,6 +4747,409 @@ async fn execute_mcp_tool_call(
         bail!("MCP server '{}' is disabled", server.id);
     }
     invoke_mcp_stdio_tool(state, &server, &tool, params, project_context).await
+}
+
+async fn execute_browser_context_tool(state: &AppState, session: &SessionDetail) -> Result<Value> {
+    let context = state.browser.context(&session.session.id).await;
+    Ok(json!({
+        "session_id": context.session_id,
+        "active_page_id": context.active_page_id,
+        "pages": context.pages,
+    }))
+}
+
+async fn execute_browser_navigate_tool(
+    state: &AppState,
+    session: &SessionDetail,
+    args: BrowserNavigateArgs,
+) -> Result<Value> {
+    let context = state
+        .browser
+        .navigate(
+            &session.session.id,
+            BrowserNavigateRequest {
+                url: args.url,
+                page_id: args.page_id,
+            },
+        )
+        .await?;
+    let active_page = context
+        .active_page_id
+        .as_deref()
+        .and_then(|id| context.pages.iter().find(|page| page.id == id));
+    if let Some(page) = active_page {
+        if !page.error.trim().is_empty() {
+            bail!("browser navigation failed: {}", page.error);
+        }
+    }
+    Ok(json!({
+        "session_id": context.session_id,
+        "active_page_id": context.active_page_id,
+        "pages": context.pages,
+    }))
+}
+
+async fn execute_browser_snapshot_tool(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &WorkerSummary,
+    tool_call_id: &str,
+    args: BrowserPageArgs,
+    screenshot_only: bool,
+) -> Result<Value> {
+    let snapshot = state
+        .browser
+        .snapshot(&session.session.id, args.page_id)
+        .await?;
+    let artifact_ids = persist_browser_snapshot_job_artifacts(
+        state,
+        job_id,
+        worker,
+        tool_call_id,
+        if screenshot_only {
+            "browser-screenshot"
+        } else {
+            "browser-snapshot"
+        },
+        &snapshot,
+    )
+    .await?;
+    Ok(browser_snapshot_result_json(
+        &snapshot,
+        &artifact_ids,
+        screenshot_only,
+    ))
+}
+
+async fn execute_browser_click_tool(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &WorkerSummary,
+    tool_call_id: &str,
+    args: BrowserClickArgs,
+) -> Result<Value> {
+    let page_id = resolve_browser_page_id(state, session, args.page_id).await?;
+    let mut payload = serde_json::Map::new();
+    if let Some(x) = args.x {
+        payload.insert("x".to_string(), json!(x));
+    }
+    if let Some(y) = args.y {
+        payload.insert("y".to_string(), json!(y));
+    }
+    if let Some(button) = args.button {
+        payload.insert("button".to_string(), json!(button));
+    }
+    let snapshot = state
+        .browser
+        .action(
+            &session.session.id,
+            BrowserActionRequest {
+                action: "click".to_string(),
+                page_id: Some(page_id),
+                target_ref: args.target_ref,
+                value: if payload.is_empty() {
+                    None
+                } else {
+                    Some(Value::Object(payload).to_string())
+                },
+                snapshot: args.snapshot.or(Some(true)),
+            },
+        )
+        .await?;
+    persist_browser_action_result(
+        state,
+        job_id,
+        worker,
+        tool_call_id,
+        "browser-click",
+        &snapshot,
+    )
+    .await
+}
+
+async fn execute_browser_text_tool(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &WorkerSummary,
+    tool_call_id: &str,
+    tool: &str,
+    args: BrowserTextArgs,
+) -> Result<Value> {
+    let page_id = resolve_browser_page_id(state, session, args.page_id).await?;
+    let action = if tool == "browser.fill" {
+        "fill"
+    } else {
+        "type"
+    };
+    let snapshot = state
+        .browser
+        .action(
+            &session.session.id,
+            BrowserActionRequest {
+                action: action.to_string(),
+                page_id: Some(page_id),
+                target_ref: Some(args.target_ref),
+                value: Some(args.text),
+                snapshot: args.snapshot.or(Some(true)),
+            },
+        )
+        .await?;
+    persist_browser_action_result(state, job_id, worker, tool_call_id, tool, &snapshot).await
+}
+
+async fn execute_browser_scroll_tool(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &WorkerSummary,
+    tool_call_id: &str,
+    args: BrowserScrollArgs,
+) -> Result<Value> {
+    let page_id = resolve_browser_page_id(state, session, args.page_id).await?;
+    let value = json!({
+        "delta_x": args.delta_x.unwrap_or(0),
+        "delta_y": args.delta_y.unwrap_or(600),
+    });
+    let snapshot = state
+        .browser
+        .action(
+            &session.session.id,
+            BrowserActionRequest {
+                action: "scroll".to_string(),
+                page_id: Some(page_id),
+                target_ref: args.target_ref,
+                value: Some(value.to_string()),
+                snapshot: args.snapshot.or(Some(true)),
+            },
+        )
+        .await?;
+    persist_browser_action_result(
+        state,
+        job_id,
+        worker,
+        tool_call_id,
+        "browser-scroll",
+        &snapshot,
+    )
+    .await
+}
+
+async fn execute_browser_press_tool(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &WorkerSummary,
+    tool_call_id: &str,
+    args: BrowserPressArgs,
+) -> Result<Value> {
+    let page_id = resolve_browser_page_id(state, session, args.page_id).await?;
+    let snapshot = state
+        .browser
+        .action(
+            &session.session.id,
+            BrowserActionRequest {
+                action: "press".to_string(),
+                page_id: Some(page_id),
+                target_ref: args.target_ref,
+                value: Some(args.key),
+                snapshot: args.snapshot.or(Some(true)),
+            },
+        )
+        .await?;
+    persist_browser_action_result(
+        state,
+        job_id,
+        worker,
+        tool_call_id,
+        "browser-press",
+        &snapshot,
+    )
+    .await
+}
+
+async fn execute_browser_submit_tool(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &WorkerSummary,
+    tool_call_id: &str,
+    args: BrowserSubmitArgs,
+) -> Result<Value> {
+    let page_id = resolve_browser_page_id(state, session, args.page_id).await?;
+    let snapshot = state
+        .browser
+        .action(
+            &session.session.id,
+            BrowserActionRequest {
+                action: "submit".to_string(),
+                page_id: Some(page_id),
+                target_ref: Some(args.target_ref),
+                value: None,
+                snapshot: args.snapshot.or(Some(true)),
+            },
+        )
+        .await?;
+    persist_browser_action_result(
+        state,
+        job_id,
+        worker,
+        tool_call_id,
+        "browser-submit",
+        &snapshot,
+    )
+    .await
+}
+
+async fn resolve_browser_page_id(
+    state: &AppState,
+    session: &SessionDetail,
+    page_id: Option<String>,
+) -> Result<String> {
+    if let Some(page_id) = page_id.filter(|value| !value.trim().is_empty()) {
+        return Ok(page_id);
+    }
+    let context = state.browser.context(&session.session.id).await;
+    context
+        .active_page_id
+        .or_else(|| context.pages.first().map(|page| page.id.clone()))
+        .context("no active browser page; call browser.navigate first")
+}
+
+async fn persist_browser_action_result(
+    state: &AppState,
+    job_id: &str,
+    worker: &WorkerSummary,
+    tool_call_id: &str,
+    kind: &str,
+    snapshot: &BrowserSnapshot,
+) -> Result<Value> {
+    let artifact_ids =
+        persist_browser_snapshot_job_artifacts(state, job_id, worker, tool_call_id, kind, snapshot)
+            .await?;
+    Ok(browser_snapshot_result_json(snapshot, &artifact_ids, false))
+}
+
+fn browser_snapshot_result_json(
+    snapshot: &BrowserSnapshot,
+    artifact_ids: &[String],
+    screenshot_only: bool,
+) -> Value {
+    json!({
+        "session_id": snapshot.session_id,
+        "page_id": snapshot.page_id,
+        "url": snapshot.url,
+        "title": snapshot.title,
+        "content": if screenshot_only {
+            String::new()
+        } else {
+            excerpt(&snapshot.content, TOOL_OUTPUT_CHAR_LIMIT)
+        },
+        "refs": if screenshot_only { Vec::<Value>::new() } else {
+            snapshot.refs.iter().map(|item| json!({
+                "id": item.id,
+                "kind": item.kind,
+                "label": item.label,
+            })).collect::<Vec<_>>()
+        },
+        "downloads": snapshot.downloads.iter().map(|download| json!({
+            "id": download.id,
+            "url": download.url,
+            "suggested_filename": download.suggested_filename,
+            "created_at": download.created_at,
+        })).collect::<Vec<_>>(),
+        "artifact_ids": artifact_ids,
+        "captured_at": snapshot.captured_at,
+    })
+}
+
+async fn persist_browser_snapshot_job_artifacts(
+    state: &AppState,
+    job_id: &str,
+    worker: &WorkerSummary,
+    tool_call_id: &str,
+    kind: &str,
+    snapshot: &BrowserSnapshot,
+) -> Result<Vec<String>> {
+    let mut artifact_ids = Vec::new();
+    let metadata = json!({
+        "session_id": snapshot.session_id,
+        "job_id": job_id,
+        "worker_id": worker.id,
+        "tool_call_id": tool_call_id,
+        "page_id": snapshot.page_id,
+        "url": snapshot.url,
+        "title": snapshot.title,
+        "ref_count": snapshot.refs.len(),
+        "downloads": snapshot.downloads.iter().map(|download| json!({
+            "id": download.id,
+            "url": download.url,
+            "suggested_filename": download.suggested_filename,
+            "path": download.path,
+            "created_at": download.created_at,
+        })).collect::<Vec<_>>(),
+        "captured_at": snapshot.captured_at,
+        "kind": kind,
+    });
+    let snapshot_artifact = write_job_artifact(
+        state,
+        job_id,
+        Some(&worker.id),
+        Some(tool_call_id),
+        text_artifact(
+            "browser-snapshot",
+            format!("Browser snapshot {}", snapshot.title_or_url()),
+            "json",
+            "application/json",
+            serde_json::to_string_pretty(&json!({
+                "metadata": metadata,
+                "content": snapshot.content,
+                "refs": &snapshot.refs,
+                "downloads": &snapshot.downloads,
+            }))?,
+        ),
+    )?;
+    publish_artifact_added(state, &snapshot_artifact).await;
+    artifact_ids.push(snapshot_artifact.id.clone());
+
+    if let Some((mime_type, bytes)) = decode_data_url(&snapshot.screenshot_data_url)? {
+        let screenshot_artifact = write_job_artifact_bytes(
+            state,
+            job_id,
+            Some(&worker.id),
+            Some(tool_call_id),
+            ArtifactBytesDraft {
+                kind: "browser-screenshot".to_string(),
+                title: format!("Browser screenshot {}", snapshot.title_or_url()),
+                mime_type,
+                extension: "jpg".to_string(),
+                bytes,
+                preview_text: serde_json::to_string(&metadata)?,
+            },
+        )?;
+        publish_artifact_added(state, &screenshot_artifact).await;
+        artifact_ids.push(screenshot_artifact.id.clone());
+    }
+
+    append_tool_call_artifact_ids(state, job_id, tool_call_id, &artifact_ids)?;
+    Ok(artifact_ids)
+}
+
+trait BrowserSnapshotTitle {
+    fn title_or_url(&self) -> String;
+}
+
+impl BrowserSnapshotTitle for BrowserSnapshot {
+    fn title_or_url(&self) -> String {
+        let value = self.title.trim();
+        if value.is_empty() {
+            excerpt(&self.url, 80)
+        } else {
+            excerpt(value, 80)
+        }
+    }
 }
 
 async fn invoke_mcp_stdio_tool(
@@ -6237,6 +6785,84 @@ fn write_job_artifact(
     })
 }
 
+fn write_job_artifact_bytes(
+    state: &AppState,
+    job_id: &str,
+    worker_id: Option<&str>,
+    tool_call_id: Option<&str>,
+    draft: ArtifactBytesDraft,
+) -> Result<ArtifactSummary> {
+    let artifact_id = Uuid::new_v4().to_string();
+    let artifact_dir = state.store.artifacts_dir_path().join(job_id);
+    fs::create_dir_all(&artifact_dir)
+        .with_context(|| format!("failed to create '{}'", artifact_dir.display()))?;
+    let artifact_path = artifact_dir.join(format!("{}.{}", artifact_id, draft.extension));
+    fs::write(&artifact_path, &draft.bytes)
+        .with_context(|| format!("failed to write '{}'", artifact_path.display()))?;
+    state.store.create_job_artifact(JobArtifactRecord {
+        id: artifact_id,
+        job_id: job_id.to_string(),
+        worker_id: worker_id.map(ToOwned::to_owned),
+        tool_call_id: tool_call_id.map(ToOwned::to_owned),
+        command_session_id: None,
+        kind: draft.kind,
+        title: draft.title,
+        path: artifact_path.display().to_string(),
+        mime_type: draft.mime_type,
+        size_bytes: draft.bytes.len() as u64,
+        preview_text: excerpt(&draft.preview_text, DIFF_PREVIEW_CHAR_LIMIT),
+    })
+}
+
+fn append_tool_call_artifact_ids(
+    state: &AppState,
+    job_id: &str,
+    tool_call_id: &str,
+    artifact_ids: &[String],
+) -> Result<()> {
+    if artifact_ids.is_empty() {
+        return Ok(());
+    }
+    let mut current = state
+        .store
+        .get_job(job_id)?
+        .tool_calls
+        .into_iter()
+        .find(|tool_call| tool_call.id == tool_call_id)
+        .map(|tool_call| tool_call.artifact_ids)
+        .unwrap_or_default();
+    for artifact_id in artifact_ids {
+        if !current.iter().any(|candidate| candidate == artifact_id) {
+            current.push(artifact_id.clone());
+        }
+    }
+    let _ = state.store.update_tool_call(
+        tool_call_id,
+        ToolCallPatch {
+            artifact_ids: Some(current),
+            ..ToolCallPatch::default()
+        },
+    )?;
+    Ok(())
+}
+
+fn decode_data_url(value: &str) -> Result<Option<(String, Vec<u8>)>> {
+    let Some(rest) = value.strip_prefix("data:") else {
+        return Ok(None);
+    };
+    let Some((metadata, encoded)) = rest.split_once(',') else {
+        return Ok(None);
+    };
+    if !metadata.ends_with(";base64") {
+        return Ok(None);
+    }
+    let mime_type = metadata.trim_end_matches(";base64").to_string();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .context("failed to decode browser screenshot data URL")?;
+    Ok(Some((mime_type, bytes)))
+}
+
 fn resolve_scoped_path(
     worker: &WorkerSummary,
     input: &str,
@@ -6303,13 +6929,15 @@ fn policy_for_tool_with_mode(tool: &str, approval_mode: &str) -> PolicyDecisionR
             decision: "allow".to_string(),
             reason: "session allows Nucleus to run actions without per-step approval".to_string(),
             matched_rule: format!("session-trusted-actions:{tool}"),
-            scope_kind: if is_mutating_tool(tool) {
+            scope_kind: if is_browser_tool(tool) {
+                "browser"
+            } else if is_mutating_tool(tool) {
                 "path"
             } else {
                 "process"
             }
             .to_string(),
-            risk_level: if is_mutating_tool(tool) {
+            risk_level: if is_browser_tool(tool) || is_mutating_tool(tool) {
                 "medium".to_string()
             } else {
                 "high".to_string()
@@ -6320,23 +6948,30 @@ fn policy_for_tool_with_mode(tool: &str, approval_mode: &str) -> PolicyDecisionR
     if requires_approval_for_tool(tool) {
         PolicyDecisionRecord {
             decision: "require_approval".to_string(),
-            reason: if is_mutating_tool(tool) {
+            reason: if is_browser_tool(tool) {
+                "browser navigation and page interaction require explicit operator approval"
+                    .to_string()
+            } else if is_mutating_tool(tool) {
                 "repo mutations require explicit operator approval".to_string()
             } else {
                 "Nucleus-owned command launches require explicit operator approval".to_string()
             },
-            matched_rule: if is_mutating_tool(tool) {
+            matched_rule: if is_browser_tool(tool) {
+                format!("approval:browser:{tool}")
+            } else if is_mutating_tool(tool) {
                 format!("approval:mutation:{tool}")
             } else {
                 format!("approval:command:{tool}")
             },
-            scope_kind: if is_mutating_tool(tool) {
+            scope_kind: if is_browser_tool(tool) {
+                "browser"
+            } else if is_mutating_tool(tool) {
                 "path"
             } else {
                 "process"
             }
             .to_string(),
-            risk_level: if is_mutating_tool(tool) {
+            risk_level: if is_browser_tool(tool) || is_mutating_tool(tool) {
                 "medium".to_string()
             } else {
                 "high".to_string()
@@ -6347,16 +6982,22 @@ fn policy_for_tool_with_mode(tool: &str, approval_mode: &str) -> PolicyDecisionR
             decision: "allow".to_string(),
             reason: if is_command_follow_up_tool(tool) {
                 "continuing an already-approved Nucleus command session".to_string()
+            } else if is_browser_read_tool(tool) {
+                "read-only browser inspection inside the session scope".to_string()
             } else {
                 "read-only tool inside the session scope".to_string()
             },
             matched_rule: if is_command_follow_up_tool(tool) {
                 format!("auto-command-follow-up:{tool}")
+            } else if is_browser_read_tool(tool) {
+                format!("auto-browser-read:{tool}")
             } else {
                 format!("auto-readonly:{tool}")
             },
             scope_kind: if is_command_follow_up_tool(tool) {
                 "process"
+            } else if is_browser_read_tool(tool) {
+                "browser"
             } else {
                 "path"
             }
@@ -6371,7 +7012,9 @@ fn policy_for_tool_with_mode(tool: &str, approval_mode: &str) -> PolicyDecisionR
 }
 
 fn requires_approval_for_tool(tool: &str) -> bool {
-    is_mutating_tool(tool) || matches!(tool, "command.run" | "command.session.open" | "tests.run")
+    is_mutating_tool(tool)
+        || is_browser_action_tool(tool)
+        || matches!(tool, "command.run" | "command.session.open" | "tests.run")
 }
 
 fn is_mutating_tool(tool: &str) -> bool {
@@ -6383,6 +7026,30 @@ fn is_mutating_tool(tool: &str) -> bool {
 
 fn is_command_follow_up_tool(tool: &str) -> bool {
     matches!(tool, "command.session.write" | "command.session.close")
+}
+
+fn is_browser_read_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "browser.context" | "browser.snapshot" | "browser.screenshot"
+    )
+}
+
+fn is_browser_action_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "browser.navigate"
+            | "browser.click"
+            | "browser.type"
+            | "browser.fill"
+            | "browser.scroll"
+            | "browser.press"
+            | "browser.submit"
+    )
+}
+
+fn is_browser_tool(tool: &str) -> bool {
+    is_browser_read_tool(tool) || is_browser_action_tool(tool)
 }
 
 fn requires_write_lock(tool: &str) -> bool {
@@ -7006,12 +7673,14 @@ fn capabilities_for_policy_bundle(bundle: &str) -> Vec<ToolCapabilityGrantRecord
         "command_runner" => {
             let mut capabilities = read_only_capabilities();
             capabilities.extend(execution_capabilities());
+            capabilities.extend(browser_capabilities());
             capabilities
         }
         _ => {
             let mut capabilities = read_only_capabilities();
             capabilities.extend(mutating_capabilities());
             capabilities.extend(execution_capabilities());
+            capabilities.extend(browser_capabilities());
             capabilities
         }
     }
@@ -7362,6 +8031,133 @@ fn execution_capabilities() -> Vec<ToolCapabilityGrantRecord> {
     ]
 }
 
+fn browser_capabilities() -> Vec<ToolCapabilityGrantRecord> {
+    vec![
+        ToolCapabilityGrantRecord {
+            tool_id: "browser.context".to_string(),
+            summary: "List session Browser pages, active URL, titles, and page ids.".to_string(),
+            approval_mode: "auto".to_string(),
+            risk_level: "low".to_string(),
+            side_effect_level: "none".to_string(),
+            timeout_secs: 20,
+            max_output_bytes: 32_768,
+            supports_streaming: false,
+            concurrency_group: "browser".to_string(),
+            scope_kind: "browser".to_string(),
+        },
+        ToolCapabilityGrantRecord {
+            tool_id: "browser.navigate".to_string(),
+            summary: "Navigate the session Browser to a URL.".to_string(),
+            approval_mode: "explicit".to_string(),
+            risk_level: "medium".to_string(),
+            side_effect_level: "network".to_string(),
+            timeout_secs: 45,
+            max_output_bytes: 32_768,
+            supports_streaming: false,
+            concurrency_group: "browser".to_string(),
+            scope_kind: "browser".to_string(),
+        },
+        ToolCapabilityGrantRecord {
+            tool_id: "browser.snapshot".to_string(),
+            summary:
+                "Read page text and Nucleus-generated actionable refs; stores snapshot evidence."
+                    .to_string(),
+            approval_mode: "auto".to_string(),
+            risk_level: "low".to_string(),
+            side_effect_level: "artifact".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: 32_768,
+            supports_streaming: false,
+            concurrency_group: "browser".to_string(),
+            scope_kind: "browser".to_string(),
+        },
+        ToolCapabilityGrantRecord {
+            tool_id: "browser.screenshot".to_string(),
+            summary: "Capture a Browser screenshot as a session/job artifact.".to_string(),
+            approval_mode: "auto".to_string(),
+            risk_level: "low".to_string(),
+            side_effect_level: "artifact".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: 16_384,
+            supports_streaming: false,
+            concurrency_group: "browser".to_string(),
+            scope_kind: "browser".to_string(),
+        },
+        ToolCapabilityGrantRecord {
+            tool_id: "browser.click".to_string(),
+            summary: "Click a Browser element by ref or coordinate.".to_string(),
+            approval_mode: "explicit".to_string(),
+            risk_level: "medium".to_string(),
+            side_effect_level: "browser".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: 32_768,
+            supports_streaming: false,
+            concurrency_group: "browser".to_string(),
+            scope_kind: "browser".to_string(),
+        },
+        ToolCapabilityGrantRecord {
+            tool_id: "browser.type".to_string(),
+            summary: "Type text into a Browser field by ref.".to_string(),
+            approval_mode: "explicit".to_string(),
+            risk_level: "medium".to_string(),
+            side_effect_level: "browser".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: 32_768,
+            supports_streaming: false,
+            concurrency_group: "browser".to_string(),
+            scope_kind: "browser".to_string(),
+        },
+        ToolCapabilityGrantRecord {
+            tool_id: "browser.fill".to_string(),
+            summary: "Fill a Browser input by ref.".to_string(),
+            approval_mode: "explicit".to_string(),
+            risk_level: "medium".to_string(),
+            side_effect_level: "browser".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: 32_768,
+            supports_streaming: false,
+            concurrency_group: "browser".to_string(),
+            scope_kind: "browser".to_string(),
+        },
+        ToolCapabilityGrantRecord {
+            tool_id: "browser.scroll".to_string(),
+            summary: "Scroll the Browser page or scroll an element ref into view.".to_string(),
+            approval_mode: "explicit".to_string(),
+            risk_level: "medium".to_string(),
+            side_effect_level: "browser".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: 32_768,
+            supports_streaming: false,
+            concurrency_group: "browser".to_string(),
+            scope_kind: "browser".to_string(),
+        },
+        ToolCapabilityGrantRecord {
+            tool_id: "browser.press".to_string(),
+            summary: "Press a key in the Browser, optionally targeted at a ref.".to_string(),
+            approval_mode: "explicit".to_string(),
+            risk_level: "medium".to_string(),
+            side_effect_level: "browser".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: 32_768,
+            supports_streaming: false,
+            concurrency_group: "browser".to_string(),
+            scope_kind: "browser".to_string(),
+        },
+        ToolCapabilityGrantRecord {
+            tool_id: "browser.submit".to_string(),
+            summary: "Submit a Browser form or input by ref.".to_string(),
+            approval_mode: "explicit".to_string(),
+            risk_level: "medium".to_string(),
+            side_effect_level: "browser".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: 32_768,
+            supports_streaming: false,
+            concurrency_group: "browser".to_string(),
+            scope_kind: "browser".to_string(),
+        },
+    ]
+}
+
 fn mcp_tool_capabilities(state: &AppState) -> Vec<ToolCapabilityGrantRecord> {
     let Ok(servers) = state.store.list_mcp_servers() else {
         return Vec::new();
@@ -7431,6 +8227,9 @@ Working directory: {}\n",
         "{\"kind\":\"tool_call\",\"summary\":\"inspect the active project\",\"tool\":\"project.inspect\",\"args\":{}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"list likely project directories\",\"tool\":\"fs.list\",\"args\":{\"path\":\".\",\"recursive\":false,\"limit\":100}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"check running dev processes\",\"tool\":\"command.run\",\"args\":{\"command\":\"sh\",\"args\":[\"-lc\",\"ps -ef | grep -iE 'stfr|vite|next|webpack|dev server' | grep -v grep\"],\"cwd\":\".\",\"timeout_secs\":20}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"verify the UI in Browser\",\"tool\":\"browser.navigate\",\"args\":{\"url\":\"http://127.0.0.1:5299\"}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"read Browser refs\",\"tool\":\"browser.snapshot\",\"args\":{}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"click a Browser control by ref\",\"tool\":\"browser.click\",\"args\":{\"target_ref\":\"ref-1\"}}\n\
 {\"kind\":\"spawn_child_jobs\",\"summary\":\"why parallel exploration helps\",\"jobs\":[{\"title\":\"focused subtask\",\"prompt\":\"precise child prompt\",\"working_dir\":\"optional/path/inside/scope\"}]}\n\
 {\"kind\":\"progress_update\",\"summary\":\"durable checkpoint, not done\",\"detail\":\"completed evidence and exact continuation point\"}\n\
 {\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\"}"
@@ -7472,6 +8271,8 @@ Rules:\n\
 - Never invent tool output.\n\
 - Stay inside the granted repo scope.\n\
 {}\
+- For UI or visual changes, strongly prefer Browser verification before final_answer when Browser tools are available: navigate to the matched local app, inspect refs/snapshot or screenshot, interact as needed, and cite artifact/result evidence.\n\
+- Prefer daemon-generated Browser refs for browser.click/browser.type/browser.fill/browser.scroll/browser.press/browser.submit. Do not invent selectors when a ref is available.\n\
 - The visible chat will only receive final_answer, not your intermediate reasoning.\n\
 - progress_update records a non-terminal checkpoint for Nucleus; it does not complete the job.\n\
 - Do not put plans, next-step instructions, progress updates, partial completion notes, or descriptions of future actions in final_answer.\n\
@@ -7675,6 +8476,24 @@ mod tests {
     }
 
     #[test]
+    fn browser_tools_have_session_scoped_policy() {
+        let read_policy = policy_for_tool("browser.snapshot");
+        assert_eq!(read_policy.decision, "allow");
+        assert_eq!(
+            read_policy.matched_rule,
+            "auto-browser-read:browser.snapshot"
+        );
+        assert_eq!(read_policy.scope_kind, "browser");
+        assert_eq!(read_policy.risk_level, "low");
+
+        let action_policy = policy_for_tool("browser.click");
+        assert_eq!(action_policy.decision, "require_approval");
+        assert_eq!(action_policy.matched_rule, "approval:browser:browser.click");
+        assert_eq!(action_policy.scope_kind, "browser");
+        assert_eq!(action_policy.risk_level, "medium");
+    }
+
+    #[test]
     fn trusted_session_approval_mode_allows_action_tools() {
         let command_policy = policy_for_tool_with_mode("command.run", "trusted");
         assert_eq!(command_policy.decision, "allow");
@@ -7795,6 +8614,11 @@ mod tests {
                 .iter()
                 .any(|grant| grant.tool_id == "command.run")
         );
+        assert!(
+            command_runner
+                .iter()
+                .any(|grant| grant.tool_id == "browser.navigate")
+        );
 
         let full_agent = capabilities_for_policy_bundle("full_agent");
         assert!(
@@ -7807,6 +8631,52 @@ mod tests {
                 .iter()
                 .any(|grant| grant.tool_id == "command.run")
         );
+        assert!(
+            full_agent
+                .iter()
+                .any(|grant| grant.tool_id == "browser.click")
+        );
+    }
+
+    #[test]
+    fn browser_capabilities_cover_ref_based_actions() {
+        let ids = browser_capabilities()
+            .into_iter()
+            .map(|grant| {
+                assert_eq!(grant.concurrency_group, "browser");
+                assert_eq!(grant.scope_kind, "browser");
+                (grant.tool_id, grant.approval_mode, grant.risk_level)
+            })
+            .collect::<BTreeSet<_>>();
+
+        assert!(ids.contains(&(
+            "browser.context".to_string(),
+            "auto".to_string(),
+            "low".to_string()
+        )));
+        assert!(ids.contains(&(
+            "browser.snapshot".to_string(),
+            "auto".to_string(),
+            "low".to_string()
+        )));
+        for tool in [
+            "browser.navigate",
+            "browser.click",
+            "browser.type",
+            "browser.fill",
+            "browser.scroll",
+            "browser.press",
+            "browser.submit",
+        ] {
+            assert!(
+                ids.contains(&(
+                    tool.to_string(),
+                    "explicit".to_string(),
+                    "medium".to_string()
+                )),
+                "missing browser capability for {tool}"
+            );
+        }
     }
 
     #[test]

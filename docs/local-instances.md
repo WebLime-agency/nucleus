@@ -39,7 +39,18 @@ npm run dev:web
 rm -rf "$state_dir"
 ```
 
-The browser runtime is daemon-owned and may create browser profiles under the active daemon state directory. This is another reason browser work should use scratch state until it is promoted to managed release.
+The browser runtime is daemon-owned and may create browser profiles, screenshots, readable snapshots, downloads, and annotation artifacts under the active daemon state directory. This is another reason browser work should use scratch state until it is promoted to managed release.
+
+Managed-release-style Browser verification should check the installed layout, not the source checkout:
+
+```text
+current/bin/nucleus-daemon
+current/scripts/browser-sidecar.mjs
+current/node_modules/playwright
+current/node_modules/playwright-core
+```
+
+The sidecar must be resolvable from the managed release `current` tree when the daemon is started by systemd with `NUCLEUS_INSTALL_KIND=managed_release` and `NUCLEUS_INSTALL_ROOT` set.
 
 ## Verification
 

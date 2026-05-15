@@ -1229,6 +1229,15 @@ export const browserSnapshotRefSchema = z.object({
   selector: z.string()
 });
 
+export const browserDownloadSchema = z.object({
+  id: z.string(),
+  page_id: z.string(),
+  url: z.string(),
+  suggested_filename: z.string(),
+  path: z.string(),
+  created_at: z.number().int()
+});
+
 export const browserSnapshotSchema = z.object({
   session_id: z.string(),
   page_id: z.string(),
@@ -1236,10 +1245,12 @@ export const browserSnapshotSchema = z.object({
   title: z.string(),
   content: z.string(),
   refs: z.array(browserSnapshotRefSchema),
+  downloads: z.array(browserDownloadSchema).default([]),
   screenshot_data_url: z.string().default(''),
   captured_at: z.number().int()
 });
 export type BrowserPageSummary = z.infer<typeof browserPageSummarySchema>;
 export type BrowserContextSummary = z.infer<typeof browserContextSummarySchema>;
 export type BrowserSnapshotRef = z.infer<typeof browserSnapshotRefSchema>;
+export type BrowserDownload = z.infer<typeof browserDownloadSchema>;
 export type BrowserSnapshot = z.infer<typeof browserSnapshotSchema>;
