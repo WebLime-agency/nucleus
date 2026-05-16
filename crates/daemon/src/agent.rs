@@ -651,7 +651,7 @@ fn collect_job_subtree_ids(state: &AppState, root_job_id: &str) -> Result<Vec<St
 pub async fn cancel_job(state: AppState, job_id: String) -> Result<JobDetail, ApiError> {
     let detail = state.store.get_job(&job_id)?;
     match detail.job.state.as_str() {
-        "completed" | "failed" | "canceled" => {
+        "completed" | "canceled" => {
             return Ok(detail);
         }
         _ => {}
@@ -660,6 +660,7 @@ pub async fn cancel_job(state: AppState, job_id: String) -> Result<JobDetail, Ap
     let subtree = collect_job_subtree_ids(&state, &job_id)?;
     for child_job_id in subtree.iter().rev() {
         let child_detail = state.store.get_job(child_job_id)?;
+        let previous_state = child_detail.job.state.clone();
         if let Some(sender) = state
             .agent
             .cancel_tokens
@@ -684,6 +685,7 @@ pub async fn cancel_job(state: AppState, job_id: String) -> Result<JobDetail, Ap
                 &worker.id,
                 WorkerPatch {
                     state: Some("canceled".to_string()),
+                    last_error: Some(String::new()),
                     ..WorkerPatch::default()
                 },
             );
@@ -713,8 +715,12 @@ pub async fn cancel_job(state: AppState, job_id: String) -> Result<JobDetail, Ap
             event_type: "job.canceled".to_string(),
             status: "canceled".to_string(),
             summary: "Canceled Utility Worker job.".to_string(),
-            detail: "Nucleus stopped the job before it finished.".to_string(),
-            data_json: json!({}),
+            detail: if previous_state == "failed" {
+                "Nucleus dismissed the failed job and unblocked the session.".to_string()
+            } else {
+                "Nucleus stopped the job before it finished.".to_string()
+            },
+            data_json: json!({ "previous_state": previous_state }),
         });
         publish_job_updated(&state, &state.store.get_job(child_job_id)?.job).await;
         if let Some(parent_job_id) = child_detail.job.parent_job_id.as_deref() {
@@ -728,6 +734,7 @@ pub async fn cancel_job(state: AppState, job_id: String) -> Result<JobDetail, Ap
                 session_id,
                 SessionPatch {
                     state: Some("active".to_string()),
+                    last_error: Some(String::new()),
                     ..SessionPatch::default()
                 },
             );
@@ -2643,14 +2650,21 @@ async fn complete_job_with_final_answer(
             ..WorkerPatch::default()
         },
     )?;
+    let terminal_metadata =
+        final_answer_terminal_metadata(summary, final_answer, step_count, tool_call_count);
+    let terminal_status = terminal_metadata
+        .get("terminal_status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed")
+        .to_string();
     let _ = state.store.append_job_event(JobEventRecord {
         job_id: job_id.to_string(),
         worker_id: Some(worker.id.clone()),
         event_type: "job.completed".to_string(),
-        status: "completed".to_string(),
+        status: terminal_status,
         summary: summary.to_string(),
         detail: excerpt(final_answer, 320),
-        data_json: json!({ "step_count": step_count, "tool_call_count": tool_call_count }),
+        data_json: terminal_metadata,
     });
     let _ = try_record_audit_event(
         state,
@@ -2959,6 +2973,10 @@ fn contains_incomplete_work_language(text: &str) -> bool {
 
 fn contains_blocked_or_waiting_language(text: &str) -> bool {
     [
+        "status: blocked",
+        "blocked_without",
+        "blocked without",
+        "blocked, not browser",
         "blocked by",
         "blocked on",
         "cannot continue",
@@ -2977,6 +2995,61 @@ fn contains_blocked_or_waiting_language(text: &str) -> bool {
     ]
     .iter()
     .any(|needle| text.contains(needle))
+}
+
+fn final_answer_terminal_metadata(
+    summary: &str,
+    final_answer: &str,
+    step_count: usize,
+    tool_call_count: usize,
+) -> Value {
+    let text = normalize_action_item_text(&format!("{summary}\n{final_answer}"));
+    let blocked = contains_blocked_terminal_result_language(&text);
+    let mut metadata = json!({
+        "step_count": step_count,
+        "tool_call_count": tool_call_count,
+        "terminal_status": if blocked { "blocked" } else { "completed" },
+        "blocked": blocked,
+    });
+
+    if let Some(status) = infer_browser_verification_status(&text) {
+        metadata["browser_verification_status"] = Value::String(status.to_string());
+    }
+
+    metadata
+}
+
+fn contains_blocked_terminal_result_language(text: &str) -> bool {
+    [
+        "status: blocked",
+        "publication status: blocked",
+        "blocked_without",
+        "blocked without browser",
+        "blocked, not browser",
+        "cannot honestly open the pr",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn infer_browser_verification_status(text: &str) -> Option<&'static str> {
+    if text.contains("browser verification status: unavailable")
+        || text.contains("browser verification: unavailable")
+        || text.contains("verification unavailable")
+    {
+        return Some("unavailable");
+    }
+
+    if text.contains("browser verification status: not_performed")
+        || text.contains("browser verification status: not performed")
+        || text.contains("browser verification: not performed")
+        || text.contains("not browser-verified")
+        || text.contains("not browser verified")
+    {
+        return Some("not_performed");
+    }
+
+    None
 }
 
 fn normalize_action_item_text(value: &str) -> String {
@@ -9091,6 +9164,42 @@ mod tests {
     }
 
     #[test]
+    fn blocked_without_browser_verification_final_answer_is_terminal() {
+        let worker = test_worker_summary("blocked-browser-verification", 100, 100);
+        let final_answer = "Status: blocked_without_browser_verification\n\
+Summary: Code validation passed but browser verification was unavailable.\n\
+Validation:\n\
+- cargo test -p nucleus-daemon worker_action passed\n\
+Remaining:\n\
+- Verify the UI through the daemon-owned Browser runtime";
+
+        assert!(!should_retry_incomplete_progress_final_answer(
+            "Code validation passed but browser verification was unavailable.",
+            final_answer,
+            "act",
+            &worker,
+            10,
+            5,
+        ));
+    }
+
+    #[test]
+    fn final_answer_terminal_metadata_marks_blocked_browser_outcome() {
+        let metadata = final_answer_terminal_metadata(
+            "Code validation passed but browser verification was unavailable.",
+            "Status: blocked_without_browser_verification\nBrowser verification status: unavailable",
+            12,
+            7,
+        );
+
+        assert_eq!(metadata["terminal_status"], "blocked");
+        assert_eq!(metadata["blocked"], true);
+        assert_eq!(metadata["browser_verification_status"], "unavailable");
+        assert_eq!(metadata["step_count"], 12);
+        assert_eq!(metadata["tool_call_count"], 7);
+    }
+
+    #[test]
     fn incomplete_progress_retry_prompt_requires_continuation() {
         let prompt = build_incomplete_progress_retry_prompt(
             "Phase 4 is not complete yet",
@@ -9773,6 +9882,116 @@ mod tests {
         let _ = fs::remove_dir_all(&state_dir);
     }
 
+    #[tokio::test]
+    async fn cancel_failed_root_job_unblocks_session() {
+        let state_dir = test_state_dir("cancel-failed-job");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let session_id = "session-cancel-failed-job";
+        let job_id = "job-cancel-failed";
+        let worker_id = "worker-cancel-failed";
+        let parser_error =
+            "worker returned valid JSON that does not match the Nucleus action contract";
+
+        state
+            .store
+            .create_session(test_session_record(
+                session_id,
+                "Cancel failed job",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+        state
+            .store
+            .update_session(
+                session_id,
+                SessionPatch {
+                    state: Some("error".to_string()),
+                    last_error: Some(parser_error.to_string()),
+                    ..SessionPatch::default()
+                },
+            )
+            .expect("session should enter error state");
+        state
+            .store
+            .create_job(JobRecord {
+                id: job_id.to_string(),
+                session_id: Some(session_id.to_string()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Open PR".to_string(),
+                purpose: "open a PR to merge to dev".to_string(),
+                trigger_kind: "manual".to_string(),
+                state: "failed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "open a PR to merge to dev".to_string(),
+            })
+            .expect("job should persist");
+        state
+            .store
+            .create_worker(WorkerRecord {
+                id: worker_id.to_string(),
+                job_id: job_id.to_string(),
+                parent_worker_id: None,
+                title: "Root utility worker".to_string(),
+                lane: "utility".to_string(),
+                state: "failed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "test-model".to_string(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: workspace_root.display().to_string(),
+                read_roots: vec![workspace_root.display().to_string()],
+                write_roots: vec![workspace_root.display().to_string()],
+                max_steps: 10,
+                max_tool_calls: 10,
+                max_wall_clock_secs: 30,
+            })
+            .expect("worker should persist");
+        state
+            .store
+            .update_job(
+                job_id,
+                JobPatch {
+                    root_worker_id: Some(worker_id.to_string()),
+                    last_error: Some(parser_error.to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("job should point at root worker");
+
+        let detail = cancel_job(state.clone(), job_id.to_string())
+            .await
+            .expect("failed root job should be dismissible");
+        let session = state
+            .store
+            .get_session(session_id)
+            .expect("session should reload");
+
+        assert_eq!(detail.job.state, "canceled");
+        assert_eq!(detail.job.last_error, "");
+        assert_eq!(detail.workers[0].state, "canceled");
+        assert_eq!(detail.workers[0].last_error, "");
+        assert_eq!(session.session.state, "active");
+        assert_eq!(session.session.last_error, "");
+        let canceled_event = detail
+            .events
+            .iter()
+            .find(|event| event.event_type == "job.canceled")
+            .expect("cancel event should be recorded");
+        assert_eq!(canceled_event.data_json["previous_state"], "failed");
+        assert!(canceled_event.detail.contains("unblocked the session"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
     #[test]
     fn image_main_worker_prefers_vision_capable_route_target() {
         let targets = vec![
@@ -10310,6 +10529,42 @@ for line in sys.stdin:
             display_name: display_name.to_string(),
             mime_type: "image/png".to_string(),
             data_url: "data:image/png;base64,iVBORw0KGgo=".to_string(),
+        }
+    }
+
+    fn test_session_record(id: &str, title: &str, working_dir: &Path) -> SessionRecord {
+        SessionRecord {
+            id: id.to_string(),
+            title: title.to_string(),
+            profile_id: String::new(),
+            profile_title: String::new(),
+            route_id: String::new(),
+            route_title: String::new(),
+            scope: "ad_hoc".to_string(),
+            project_id: String::new(),
+            project_title: String::new(),
+            project_path: String::new(),
+            project_ids: Vec::new(),
+            provider: "openai_compatible".to_string(),
+            model: "test-model".to_string(),
+            provider_base_url: String::new(),
+            provider_api_key: String::new(),
+            working_dir: working_dir.display().to_string(),
+            working_dir_kind: "workspace_scratch".to_string(),
+            workspace_mode: "scratch_only".to_string(),
+            source_project_path: String::new(),
+            git_root: String::new(),
+            worktree_path: String::new(),
+            git_branch: String::new(),
+            git_base_ref: String::new(),
+            git_head: String::new(),
+            git_dirty: false,
+            git_untracked_count: 0,
+            git_remote_tracking_branch: String::new(),
+            workspace_warnings: Vec::new(),
+            approval_mode: "ask".to_string(),
+            execution_mode: "act".to_string(),
+            run_budget_mode: "inherit".to_string(),
         }
     }
 
