@@ -4346,11 +4346,27 @@ fn publication_requested_for_job(title: &str, purpose: &str, prompt_excerpt: &st
 }
 
 fn publication_segment_requests_publication(text: &str) -> bool {
-    publication_segment_has_publication_phrase(text) && !publication_segment_is_informational(text)
+    publication_segment_has_unnegated_publication_phrase(text)
+        && !publication_segment_is_informational(text)
 }
 
 fn publication_segment_has_publication_phrase(text: &str) -> bool {
-    [
+    publication_phrases()
+        .iter()
+        .any(|needle| contains_phrase_with_boundaries(text, needle))
+}
+
+fn publication_segment_has_unnegated_publication_phrase(text: &str) -> bool {
+    publication_phrases().iter().copied().any(|phrase| {
+        text.match_indices(phrase).any(|(index, _)| {
+            phrase_match_has_boundaries(text, phrase, index)
+                && !publication_phrase_is_negated(text, index)
+        })
+    })
+}
+
+fn publication_phrases() -> &'static [&'static str] {
+    &[
         "open a pr",
         "open pr",
         "open a pull request",
@@ -4365,8 +4381,20 @@ fn publication_segment_has_publication_phrase(text: &str) -> bool {
         "pr to merge",
         "pull request to merge",
     ]
+}
+
+fn publication_phrase_is_negated(text: &str, phrase_index: usize) -> bool {
+    let prefix = text[..phrase_index].trim_end_matches(|character: char| {
+        character.is_ascii_whitespace()
+            || matches!(character, ':' | '-' | ',' | ';' | '(' | '[' | '"' | '\'')
+    });
+    let normalized_prefix = prefix.replace('\u{2018}', "'").replace('\u{2019}', "'");
+
+    [
+        "do not", "don't", "dont", "never", "no", "not", "not to", "without",
+    ]
     .iter()
-    .any(|needle| contains_phrase_with_boundaries(text, needle))
+    .any(|negation| text_ends_with_phrase_with_boundaries(&normalized_prefix, negation))
 }
 
 fn publication_segment_is_informational(text: &str) -> bool {
@@ -4414,11 +4442,19 @@ fn publication_segment_has_actionable_suffix(text: &str) -> bool {
 }
 
 fn contains_phrase_with_boundaries(text: &str, phrase: &str) -> bool {
-    text.match_indices(phrase).any(|(index, _)| {
-        let before = text[..index].chars().next_back();
-        let after = text[index + phrase.len()..].chars().next();
-        !is_word_character(before) && !is_word_character(after)
-    })
+    text.match_indices(phrase)
+        .any(|(index, _)| phrase_match_has_boundaries(text, phrase, index))
+}
+
+fn phrase_match_has_boundaries(text: &str, phrase: &str, index: usize) -> bool {
+    let before = text[..index].chars().next_back();
+    let after = text[index + phrase.len()..].chars().next();
+    !is_word_character(before) && !is_word_character(after)
+}
+
+fn text_ends_with_phrase_with_boundaries(text: &str, phrase: &str) -> bool {
+    text.strip_suffix(phrase)
+        .is_some_and(|before| !is_word_character(before.chars().next_back()))
 }
 
 fn is_word_character(character: Option<char>) -> bool {
@@ -8726,6 +8762,31 @@ and open a pull request to dev when it is ready."
             "Explain publication",
             "Session prompt",
             "Can you explain how to publish this branch?"
+        ));
+        assert!(!publication_requested_for_job(
+            "No PR",
+            "Session prompt",
+            "do not open a PR"
+        ));
+        assert!(!publication_requested_for_job(
+            "No publication",
+            "Session prompt",
+            "don't publish this branch"
+        ));
+        assert!(!publication_requested_for_job(
+            "No publication",
+            "Session prompt",
+            "don\u{2019}t publish this branch"
+        ));
+        assert!(!publication_requested_for_job(
+            "No pull request",
+            "Session prompt",
+            "please do not create a pull request"
+        ));
+        assert!(!publication_requested_for_job(
+            "Open PR",
+            "Session prompt",
+            "do not open a PR"
         ));
         assert!(publication_requested_for_job(
             "Explain then publish",
