@@ -439,19 +439,15 @@ fn format_progress_value(value: &Value) -> String {
 fn normalize_worker_final_answer_value(
     object: &serde_json::Map<String, Value>,
 ) -> Result<WorkerAction, WorkerActionParseError> {
-    let final_answer = object
-        .get("final_answer")
-        .or_else(|| object.get("content"))
-        .or_else(|| object.get("answer"))
-        .or_else(|| object.get("text"))
-        .or_else(|| object.get("message"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or(WorkerActionParseError::InvalidActionShape)?
-        .to_string();
+    let final_answer = ["final_answer", "content", "answer", "text", "message"]
+        .iter()
+        .find_map(|key| object.get(*key).and_then(format_final_answer_value))
+        .ok_or(WorkerActionParseError::InvalidActionShape)?;
+    let nested_final_answer = object.get("final_answer").and_then(Value::as_object);
     let summary = object
         .get("summary")
+        .or_else(|| nested_final_answer.and_then(|value| value.get("summary")))
+        .or_else(|| nested_final_answer.and_then(|value| value.get("status")))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -462,6 +458,170 @@ fn normalize_worker_final_answer_value(
         summary,
         final_answer,
     })
+}
+
+fn format_final_answer_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => non_empty_trimmed(value),
+        Value::Object(object) => format_structured_final_answer_object(object),
+        _ => None,
+    }
+}
+
+fn non_empty_trimmed(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn format_structured_final_answer_object(
+    object: &serde_json::Map<String, Value>,
+) -> Option<String> {
+    let mut lines = Vec::new();
+    let ordered_keys = [
+        "status",
+        "summary",
+        "message",
+        "validation",
+        "browser_verification_status",
+        "browser_verification",
+        "publication_status",
+        "publication_summary",
+        "pr_url",
+        "source_branch",
+        "target_branch",
+        "cleanup_status",
+        "cleanup",
+        "remaining",
+        "blockers",
+        "next",
+    ];
+
+    for key in ordered_keys {
+        if let Some(value) = object.get(key) {
+            if let Some(line) = format_structured_final_answer_field(key, value) {
+                lines.push(line);
+            }
+        }
+    }
+
+    for (key, value) in object {
+        if ordered_keys.contains(&key.as_str()) {
+            continue;
+        }
+        if let Some(line) = format_structured_final_answer_field(key, value) {
+            lines.push(line);
+        }
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+fn format_structured_final_answer_field(key: &str, value: &Value) -> Option<String> {
+    if is_empty_json_value(value) {
+        return None;
+    }
+
+    let label = final_answer_field_label(key);
+    match value {
+        Value::String(value) => non_empty_trimmed(value).map(|value| format!("{label}: {value}")),
+        Value::Array(items) => {
+            let items = items
+                .iter()
+                .filter_map(format_final_answer_list_item)
+                .collect::<Vec<_>>();
+            if items.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "{label}:\n{}",
+                    items
+                        .into_iter()
+                        .map(|item| format!("- {item}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ))
+            }
+        }
+        Value::Object(object) => {
+            let items = object
+                .iter()
+                .filter_map(|(nested_key, nested_value)| {
+                    if is_empty_json_value(nested_value) {
+                        return None;
+                    }
+                    Some(format!(
+                        "- {}: {}",
+                        final_answer_field_label(nested_key),
+                        format_inline_final_answer_value(nested_value)
+                    ))
+                })
+                .collect::<Vec<_>>();
+            if items.is_empty() {
+                None
+            } else {
+                Some(format!("{label}:\n{}", items.join("\n")))
+            }
+        }
+        Value::Bool(_) | Value::Number(_) => Some(format!(
+            "{label}: {}",
+            format_inline_final_answer_value(value)
+        )),
+        Value::Null => None,
+    }
+}
+
+fn format_final_answer_list_item(value: &Value) -> Option<String> {
+    if is_empty_json_value(value) {
+        None
+    } else {
+        Some(format_inline_final_answer_value(value))
+    }
+}
+
+fn format_inline_final_answer_value(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.trim().to_string(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(format_final_answer_list_item)
+            .collect::<Vec<_>>()
+            .join(", "),
+        value => serde_json::to_string(value).unwrap_or_else(|_| value.to_string()),
+    }
+}
+
+fn is_empty_json_value(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(value) => value.trim().is_empty(),
+        Value::Array(items) => items.iter().all(is_empty_json_value),
+        Value::Object(object) => object.values().all(is_empty_json_value),
+        Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+fn final_answer_field_label(key: &str) -> String {
+    match key {
+        "pr_url" => return "PR URL".to_string(),
+        "browser_verification_status" => return "Browser verification status".to_string(),
+        "browser_verification" => return "Browser verification".to_string(),
+        _ => {}
+    }
+
+    let label = key.replace('_', " ");
+    let mut chars = label.chars();
+    match chars.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => key.to_string(),
+    }
 }
 
 fn normalize_worker_tool_call_value(value: &Value) -> Result<WorkerAction, WorkerActionParseError> {
@@ -827,6 +987,64 @@ mod tests {
 
         assert_eq!(summary, "The work is done.");
         assert_eq!(final_answer, "Completed and released.");
+    }
+
+    #[test]
+    fn accepts_nested_structured_final_answer_object() {
+        let action = parse_worker_action(
+            r#"{"final_answer":{"status":"blocked_without_browser_verification","summary":"Code validation passed but browser verification was unavailable.","message":"PR publication is blocked until rendered UI behavior is verified.","validation":["cargo test -p nucleus-daemon worker_action passed","cargo fmt --all --check passed"],"browser_verification_status":"unavailable","remaining":["Verify the UI through the daemon-owned Browser runtime"],"cleanup_status":"clean"}}"#,
+        )
+        .expect("nested final_answer object should normalize");
+
+        let WorkerAction::FinalAnswer {
+            summary,
+            final_answer,
+        } = action
+        else {
+            panic!("expected final answer");
+        };
+
+        assert_eq!(
+            summary,
+            "Code validation passed but browser verification was unavailable."
+        );
+        assert!(final_answer.contains("Status: blocked_without_browser_verification"));
+        assert!(
+            final_answer.contains(
+                "Summary: Code validation passed but browser verification was unavailable."
+            )
+        );
+        assert!(final_answer.contains(
+            "Message: PR publication is blocked until rendered UI behavior is verified."
+        ));
+        assert!(
+            final_answer
+                .contains("Validation:\n- cargo test -p nucleus-daemon worker_action passed")
+        );
+        assert!(final_answer.contains("Browser verification status: unavailable"));
+        assert!(final_answer.contains("Cleanup status: clean"));
+    }
+
+    #[test]
+    fn accepts_kind_final_answer_with_nested_message_object() {
+        let action = parse_worker_action(
+            r#"{"kind":"final_answer","final_answer":{"status":"blocked","message":"I cannot honestly open the PR yet because Browser verification did not run.","pr_url":"","publication_status":"blocked","browser_verification_status":"not_performed"}}"#,
+        )
+        .expect("kind/final_answer object should normalize");
+
+        let WorkerAction::FinalAnswer {
+            summary,
+            final_answer,
+        } = action
+        else {
+            panic!("expected final answer");
+        };
+
+        assert_eq!(summary, "blocked");
+        assert!(final_answer.contains("Status: blocked"));
+        assert!(final_answer.contains("Publication status: blocked"));
+        assert!(final_answer.contains("Browser verification status: not_performed"));
+        assert!(!final_answer.contains("PR URL:"));
     }
 
     #[test]
