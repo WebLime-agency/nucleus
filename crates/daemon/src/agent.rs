@@ -4007,7 +4007,7 @@ fn collect_repo_temp_paths(working_dir: &str) -> Vec<String> {
         return Vec::new();
     }
 
-    let mut paths = collect_git_untracked_temp_paths(root);
+    let mut paths = collect_git_temp_paths(root);
     if paths.is_empty() {
         paths = collect_top_level_temp_paths(root);
     }
@@ -4016,7 +4016,13 @@ fn collect_repo_temp_paths(working_dir: &str) -> Vec<String> {
     paths
 }
 
-fn collect_git_untracked_temp_paths(root: &Path) -> Vec<String> {
+fn collect_git_temp_paths(root: &Path) -> Vec<String> {
+    let mut paths = collect_git_status_temp_paths(root);
+    paths.extend(collect_git_tracked_temp_paths(root));
+    paths
+}
+
+fn collect_git_status_temp_paths(root: &Path) -> Vec<String> {
     let Ok(output) = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
@@ -4043,11 +4049,34 @@ fn collect_git_untracked_temp_paths(root: &Path) -> Vec<String> {
                 return None;
             }
             let status = &entry[..2];
-            if status != b"??" && status != b"!!" {
+            if status[0] == b'D' || status[1] == b'D' {
                 return None;
             }
             std::str::from_utf8(&entry[3..]).ok()
         })
+        .filter(|path| root.join(path).exists())
+        .filter_map(publication_temp_root_path)
+        .collect()
+}
+
+fn collect_git_tracked_temp_paths(root: &Path) -> Vec<String> {
+    let Ok(output) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .filter(|path| root.join(path).exists())
         .filter_map(publication_temp_root_path)
         .collect()
 }
@@ -10920,6 +10949,45 @@ Cleanup status: clean";
 
         assert!(paths.iter().any(|path| path == "apps/web/.tmp-playwright"));
         assert!(paths.iter().any(|path| path == "ignored/.tmp-check"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collect_repo_temp_paths_includes_staged_and_tracked_paths() {
+        let root = test_state_dir("publication-temp-path-tracked-collection");
+        fs::create_dir_all(root.join("apps/web/.tmp-playwright"))
+            .expect("nested temp dir should exist");
+        fs::write(root.join("apps/web/.tmp-playwright/probe.txt"), "temp")
+            .expect("nested temp file should exist");
+        fs::create_dir_all(root.join("pkg/.tmp-check")).expect("tracked temp dir should exist");
+        fs::write(root.join("pkg/.tmp-check/probe.txt"), "temp")
+            .expect("tracked temp file should exist");
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "-q"])
+            .status()
+            .expect("git init should run");
+        assert!(status.success());
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args([
+                "add",
+                "apps/web/.tmp-playwright/probe.txt",
+                "pkg/.tmp-check/probe.txt",
+            ])
+            .status()
+            .expect("git add should run");
+        assert!(status.success());
+
+        let paths = collect_repo_temp_paths(&root.display().to_string());
+
+        assert!(paths.iter().any(|path| path == "apps/web/.tmp-playwright"));
+        assert!(paths.iter().any(|path| path == "pkg/.tmp-check"));
 
         let _ = fs::remove_dir_all(root);
     }
