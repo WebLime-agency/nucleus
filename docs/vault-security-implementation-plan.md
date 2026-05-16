@@ -64,7 +64,7 @@ The first Vault implementation must include:
 14. Audit events for Vault lifecycle and secret resolution.
 15. Workspace Vault UI.
 16. MCP `vault_bearer` integration.
-17. Legacy `bearer_env` fallback retained for operators but not the preferred UI path.
+17. MCP bearer credentials require Vault; legacy `bearer_env` / `env_bearer` records fail closed with migration guidance.
 
 ## Storage model
 

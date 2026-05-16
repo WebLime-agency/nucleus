@@ -401,7 +401,7 @@ Backend tasks:
 - Add Vault reference parser for `vault://workspace/...` and `vault://project/<project_id>/...`.
 - Implement daemon-only secret resolution for MCP discovery/invocation.
 - Inject bearer token into outbound MCP request without exposing it to UI/model/logs/audit.
-- Keep `bearer_env` as advanced/operator fallback.
+- Remove `bearer_env` / `env_bearer` as executable auth paths; legacy records must fail closed with migration guidance.
 - Add status states such as `vault_locked`, `vault_secret_missing`, `vault_policy_denied` as needed.
 
 Web tasks:
@@ -433,7 +433,7 @@ Completion notes:
 - Safely deferred `vault://project/...` behavior until Phase 7.
 - Enforced Vault allowed-consumer policy for MCP read access.
 - Injected resolved bearer token only into outbound MCP HTTP auth.
-- Preserved `bearer_env` / `env_bearer` fallback as the advanced/operator path.
+- Follow-up PR for issue #158 removed executable `bearer_env` / `env_bearer`; legacy records now require migration to `vault_bearer`.
 - Added safe failure states: `vault_locked`, `vault_secret_missing`, and `vault_policy_denied`.
 - Updated MCP UI guidance and status handling for Vault-backed auth.
 - Added metadata-only Vault usage recording.

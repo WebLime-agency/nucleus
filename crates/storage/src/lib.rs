@@ -4049,20 +4049,20 @@ fn migrate_mcp_remote_bridge_records(connection: &Connection) -> Result<()> {
         (
             "cloudflare-api",
             "https://mcp.cloudflare.com/mcp",
-            "bearer_env",
-            "CLOUDFLARE_API_TOKEN",
+            "vault_bearer",
+            "vault://workspace/CLOUDFLARE_API_TOKEN",
         ),
         (
             "cloudflare-bindings",
             "https://bindings.mcp.cloudflare.com/mcp",
-            "bearer_env",
-            "CLOUDFLARE_API_TOKEN",
+            "vault_bearer",
+            "vault://workspace/CLOUDFLARE_API_TOKEN",
         ),
         (
             "cloudflare-builds",
             "https://builds.mcp.cloudflare.com/mcp",
-            "bearer_env",
-            "CLOUDFLARE_API_TOKEN",
+            "vault_bearer",
+            "vault://workspace/CLOUDFLARE_API_TOKEN",
         ),
         (
             "cloudflare-docs",
@@ -4073,22 +4073,22 @@ fn migrate_mcp_remote_bridge_records(connection: &Connection) -> Result<()> {
         (
             "cloudflare-observability",
             "https://observability.mcp.cloudflare.com/mcp",
-            "bearer_env",
-            "CLOUDFLARE_API_TOKEN",
+            "vault_bearer",
+            "vault://workspace/CLOUDFLARE_API_TOKEN",
         ),
         ("context7", "https://mcp.context7.com/mcp", "none", ""),
         ("emdash-docs", "https://docs.emdashcms.com/mcp", "none", ""),
         (
             "supabase",
             "https://mcp.supabase.com/mcp",
-            "bearer_env",
-            "SUPABASE_ACCESS_TOKEN",
+            "vault_bearer",
+            "vault://workspace/SUPABASE_ACCESS_TOKEN",
         ),
         (
             "vercel",
             "https://mcp.vercel.com",
-            "bearer_env",
-            "VERCEL_TOKEN",
+            "vault_bearer",
+            "vault://workspace/VERCEL_TOKEN",
         ),
     ];
     for (id, url, auth_kind, auth_ref) in known {
@@ -4102,8 +4102,8 @@ fn migrate_mcp_remote_bridge_records(connection: &Connection) -> Result<()> {
                 auth_kind = ?3,
                 auth_ref = ?4,
                 headers_json = COALESCE(NULLIF(headers_json, ''), '{}'),
-                sync_status = CASE WHEN ?3 = 'none' THEN 'pending' ELSE 'missing_credentials' END,
-                last_error = CASE WHEN ?3 = 'none' THEN '' ELSE 'missing_credentials: configure native MCP credentials' END,
+                sync_status = CASE WHEN ?3 = 'none' THEN 'pending' ELSE 'vault_secret_missing' END,
+                last_error = CASE WHEN ?3 = 'none' THEN '' ELSE 'vault_secret_missing: create the suggested Vault secret and allow this MCP server to read it' END,
                 updated_at = unixepoch()
             WHERE id = ?1
               AND transport = 'stdio'

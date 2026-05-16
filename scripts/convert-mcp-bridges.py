@@ -7,11 +7,11 @@ def auth_for(id_, url):
     if id_ in unauth:
         return "none", ""
     if id_.startswith("cloudflare"):
-        return "bearer_env", "CLOUDFLARE_API_TOKEN"
+        return "vault_bearer", "vault://workspace/CLOUDFLARE_API_TOKEN"
     if id_ == "supabase":
-        return "bearer_env", "SUPABASE_ACCESS_TOKEN"
+        return "vault_bearer", "vault://workspace/SUPABASE_ACCESS_TOKEN"
     if id_ == "vercel":
-        return "bearer_env", "VERCEL_TOKEN"
+        return "vault_bearer", "vault://workspace/VERCEL_TOKEN"
     return "oauth", ""
 
 def main():
