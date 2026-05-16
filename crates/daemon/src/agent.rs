@@ -3122,6 +3122,7 @@ async fn complete_job_with_final_answer(
     }
 
     let completion_job = state.store.get_job(job_id)?.job;
+    reconcile_publication_browser_status_with_completion(&completion_job, &mut publication_patch);
     let final_answer =
         decorate_final_answer_with_browser_verification(&completion_job, final_answer);
 
@@ -3916,6 +3917,26 @@ fn apply_publication_temp_hygiene(
         }
     }
     patch.cleanup_paths = Some(cleanup_paths);
+}
+
+fn reconcile_publication_browser_status_with_completion(
+    completion_job: &JobSummary,
+    patch: &mut PublicationOutcomePatch,
+) {
+    if !patch.publication_requested.unwrap_or(false) {
+        return;
+    }
+    if !matches!(
+        patch.browser_verification_status.as_deref(),
+        None | Some("pending")
+    ) {
+        return;
+    }
+    if completion_job.browser_verification_status == "pending" {
+        return;
+    }
+
+    patch.browser_verification_status = Some(completion_job.browser_verification_status.clone());
 }
 
 fn publication_temp_baseline_paths(detail: &JobDetail) -> Vec<String> {
@@ -10723,6 +10744,31 @@ Cleanup status: clean";
         assert_eq!(
             infer_cleanup_status("Cleanup status: cleanup_required"),
             Some("cleanup_required".to_string())
+        );
+    }
+
+    #[test]
+    fn publication_browser_status_reconciliation_preserves_terminal_fallback() {
+        let mut job = test_publication_job_summary("publication-browser-terminal");
+        job.browser_verification_status = "not_performed".to_string();
+        let mut patch = PublicationOutcomePatch {
+            publication_requested: Some(true),
+            browser_verification_status: Some("pending".to_string()),
+            ..PublicationOutcomePatch::default()
+        };
+
+        reconcile_publication_browser_status_with_completion(&job, &mut patch);
+
+        assert_eq!(
+            patch.browser_verification_status.as_deref(),
+            Some("not_performed")
+        );
+
+        patch.browser_verification_status = Some("unavailable".to_string());
+        reconcile_publication_browser_status_with_completion(&job, &mut patch);
+        assert_eq!(
+            patch.browser_verification_status.as_deref(),
+            Some("unavailable")
         );
     }
 

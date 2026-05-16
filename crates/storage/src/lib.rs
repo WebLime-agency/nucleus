@@ -2066,11 +2066,7 @@ impl StateStore {
         }
         let publication_requested =
             publication_requested_for_job(&record.title, &record.purpose, &record.prompt_excerpt);
-        let publication_status = if publication_requested {
-            "not_opened"
-        } else {
-            "not_requested"
-        };
+        let publication_status = "not_requested";
         let browser_verification_status = if publication_requested {
             "not_performed"
         } else {
@@ -8603,7 +8599,7 @@ mod tests {
             .expect("job should persist");
 
         assert!(created.publication_requested);
-        assert_eq!(created.publication_status, "not_opened");
+        assert_eq!(created.publication_status, "not_requested");
         assert_eq!(created.validation_status, "not_performed");
         assert_eq!(created.browser_verification_status, "not_performed");
         assert_eq!(created.cleanup_status, "unknown");
