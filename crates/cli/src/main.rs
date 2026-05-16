@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
@@ -38,6 +39,7 @@ struct CliArgs {
 #[derive(Debug, Subcommand)]
 enum Command {
     Health(HealthArgs),
+    Instances(InstancesArgs),
     Auth(AuthArgs),
     Setup(SetupArgs),
     InstallService(InstallServiceArgs),
@@ -51,6 +53,9 @@ struct HealthArgs {
 }
 
 #[derive(Debug, Args)]
+struct InstancesArgs {}
+
+#[derive(Debug, Args)]
 struct AuthArgs {
     #[command(subcommand)]
     command: AuthCommand,
@@ -58,7 +63,17 @@ struct AuthArgs {
 
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
-    LocalToken,
+    LocalToken(AuthSelectorArgs),
+    RotateToken(AuthSelectorArgs),
+}
+
+#[derive(Debug, Clone, Args, Default)]
+struct AuthSelectorArgs {
+    #[arg(long)]
+    instance: Option<String>,
+
+    #[arg(long)]
+    url: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -253,12 +268,25 @@ struct ConnectionHints {
     tailscale_url: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalInstance {
+    name: String,
+    service_name: Option<String>,
+    unit_path: Option<PathBuf>,
+    state_dir: PathBuf,
+    bind: Option<String>,
+    url: Option<String>,
+    install_kind: Option<String>,
+    install_root: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = CliArgs::parse();
 
     match args.command {
         Command::Health(command) => run_health(command).await?,
+        Command::Instances(command) => run_instances(command)?,
         Command::Auth(command) => run_auth(command, args.state_dir)?,
         Command::Setup(command) => run_setup(command, args.state_dir).await?,
         Command::InstallService(command) => run_install_service(command, args.state_dir)?,
@@ -287,11 +315,28 @@ async fn run_health(command: HealthArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_instances(_command: InstancesArgs) -> Result<()> {
+    let instances = discover_local_instances()?;
+    print_instances(&instances);
+    Ok(())
+}
+
 fn run_auth(command: AuthArgs, state_dir: Option<PathBuf>) -> Result<()> {
     match command.command {
-        AuthCommand::LocalToken => {
-            let store = open_store(state_dir.as_deref())?;
+        AuthCommand::LocalToken(selector) => {
+            let state_dir = resolve_auth_state_dir(state_dir, &selector)?;
+            let store = open_store(Some(&state_dir))?;
             println!("{}", store.read_local_auth_token()?);
+        }
+        AuthCommand::RotateToken(selector) => {
+            let state_dir = resolve_auth_state_dir(state_dir, &selector)?;
+            let store = open_store(Some(&state_dir))?;
+            let token = store.rotate_local_auth_token()?;
+            eprintln!(
+                "Rotated the local auth token for {}. Existing browser and client sessions using the old token must reconnect or re-authenticate.",
+                state_dir.display()
+            );
+            println!("{token}");
         }
     }
 
@@ -658,6 +703,49 @@ fn state_dir_path(explicit_state_dir: Option<&Path>) -> Result<PathBuf> {
     }
 }
 
+fn resolve_auth_state_dir(
+    explicit_state_dir: Option<PathBuf>,
+    selector: &AuthSelectorArgs,
+) -> Result<PathBuf> {
+    if let Some(path) = explicit_state_dir {
+        return Ok(path);
+    }
+
+    if selector.instance.is_some() && selector.url.is_some() {
+        bail!("select either --instance or --url, not both");
+    }
+
+    let instances = discover_local_instances()?;
+    if let Some(instance) = selector.instance.as_deref() {
+        return select_instance_by_name(&instances, instance).map(|value| value.state_dir.clone());
+    }
+    if let Some(url) = selector.url.as_deref() {
+        return select_instance_by_url(&instances, url).map(|value| value.state_dir.clone());
+    }
+
+    match instances.len() {
+        0 => state_dir_path(None),
+        1 => {
+            let instance = &instances[0];
+            eprintln!(
+                "Using discovered Nucleus instance '{}' at {}.",
+                instance.name,
+                instance
+                    .url
+                    .as_deref()
+                    .unwrap_or_else(|| instance.state_dir.to_str().unwrap_or("selected state dir"))
+            );
+            Ok(instance.state_dir.clone())
+        }
+        _ => {
+            let mut message =
+                "multiple Nucleus instances were found; select one explicitly".to_string();
+            message.push_str(&format_instance_suggestions(&instances));
+            bail!(message)
+        }
+    }
+}
+
 fn default_state_dir() -> Result<PathBuf> {
     let home_dir = home_dir()?;
     Ok(home_dir.join(".nucleus"))
@@ -675,6 +763,273 @@ fn resolve_install_root(explicit_install_root: Option<&Path>) -> Result<PathBuf>
 
 fn home_dir() -> Result<PathBuf> {
     dirs::home_dir().ok_or_else(|| anyhow!("failed to resolve the home directory"))
+}
+
+fn discover_local_instances() -> Result<Vec<LocalInstance>> {
+    let systemd_dir = home_dir()?.join(".config/systemd/user");
+    discover_local_instances_from_systemd_dir(&systemd_dir)
+}
+
+fn discover_local_instances_from_systemd_dir(systemd_dir: &Path) -> Result<Vec<LocalInstance>> {
+    if !systemd_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut instances = Vec::new();
+    for entry in fs::read_dir(systemd_dir).with_context(|| {
+        format!(
+            "failed to read user systemd directory '{}'",
+            systemd_dir.display()
+        )
+    })? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("service") {
+            continue;
+        }
+
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(_) => continue,
+        };
+
+        if let Some(instance) = parse_local_instance_unit(Some(&path), &contents) {
+            instances.push(instance);
+        }
+    }
+
+    Ok(dedupe_instances(instances))
+}
+
+fn dedupe_instances(instances: Vec<LocalInstance>) -> Vec<LocalInstance> {
+    let mut keyed = BTreeMap::new();
+    for instance in instances {
+        let service_key = instance.service_name.clone().unwrap_or_default();
+        let key = format!("{}|{}", instance.state_dir.display(), service_key);
+        keyed.entry(key).or_insert(instance);
+    }
+    keyed.into_values().collect()
+}
+
+fn parse_local_instance_unit(unit_path: Option<&Path>, contents: &str) -> Option<LocalInstance> {
+    let env_values = parse_systemd_environment_values(contents);
+    let state_dir = env_values.get("NUCLEUS_STATE_DIR")?;
+    let service_name = unit_path
+        .and_then(|path| path.file_name())
+        .and_then(|value| value.to_str())
+        .map(ToOwned::to_owned);
+    let name = env_values
+        .get("NUCLEUS_INSTANCE_NAME")
+        .cloned()
+        .or_else(|| {
+            service_name
+                .as_ref()
+                .map(|value| value.trim_end_matches(".service").to_string())
+        })
+        .unwrap_or_else(|| PRODUCT_NAME.to_string());
+    let bind = env_values.get("NUCLEUS_BIND").cloned();
+    let url = bind
+        .as_deref()
+        .map(|value| connection_hints(value).local_url);
+    let install_root = env_values.get("NUCLEUS_INSTALL_ROOT").map(PathBuf::from);
+
+    Some(LocalInstance {
+        name,
+        service_name,
+        unit_path: unit_path.map(Path::to_path_buf),
+        state_dir: PathBuf::from(state_dir),
+        bind,
+        url,
+        install_kind: env_values.get("NUCLEUS_INSTALL_KIND").cloned(),
+        install_root,
+    })
+}
+
+fn parse_systemd_environment_values(contents: &str) -> BTreeMap<String, String> {
+    let mut values = BTreeMap::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        let Some(assignments) = trimmed.strip_prefix("Environment=") else {
+            continue;
+        };
+
+        for assignment in assignments.split_whitespace() {
+            let assignment = assignment.trim_matches('"').trim_matches('\'');
+            let Some((key, value)) = assignment.split_once('=') else {
+                continue;
+            };
+            values.insert(
+                key.to_string(),
+                value.trim_matches('"').trim_matches('\'').to_string(),
+            );
+        }
+    }
+    values
+}
+
+fn select_instance_by_name<'a>(
+    instances: &'a [LocalInstance],
+    instance_name: &str,
+) -> Result<&'a LocalInstance> {
+    let matches = instances
+        .iter()
+        .filter(|instance| {
+            instance.name == instance_name
+                || instance.service_name.as_deref() == Some(instance_name)
+                || instance
+                    .service_name
+                    .as_deref()
+                    .map(|value| value.trim_end_matches(".service") == instance_name)
+                    .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [instance] => Ok(instance),
+        [] => {
+            let mut message = format!("no Nucleus instance matched --instance '{instance_name}'");
+            message.push_str(&format_instance_suggestions(instances));
+            bail!(message)
+        }
+        _ => {
+            let mut message =
+                format!("multiple Nucleus instances matched --instance '{instance_name}'");
+            message.push_str(&format_instance_suggestions(instances));
+            bail!(message)
+        }
+    }
+}
+
+fn select_instance_by_url<'a>(
+    instances: &'a [LocalInstance],
+    instance_url: &str,
+) -> Result<&'a LocalInstance> {
+    let normalized = normalize_instance_url(instance_url);
+    let local_selector_port = local_url_selector_port(instance_url);
+    let matches = instances
+        .iter()
+        .filter(|instance| {
+            instance.url.as_deref().map(normalize_instance_url).as_ref() == Some(&normalized)
+                || local_selector_port
+                    .and_then(|selector_port| {
+                        instance
+                            .bind
+                            .as_deref()
+                            .and_then(bind_port)
+                            .map(|port| selector_port == port)
+                    })
+                    .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [instance] => Ok(instance),
+        [] => {
+            let mut message = format!("no Nucleus instance matched --url '{instance_url}'");
+            message.push_str(&format_instance_suggestions(instances));
+            bail!(message)
+        }
+        _ => {
+            let mut message = format!("multiple Nucleus instances matched --url '{instance_url}'");
+            message.push_str(&format_instance_suggestions(instances));
+            bail!(message)
+        }
+    }
+}
+
+fn normalize_instance_url(value: &str) -> String {
+    value.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+fn local_url_selector_port(value: &str) -> Option<u16> {
+    let url = reqwest::Url::parse(value.trim()).ok()?;
+    let host = url.host_str()?;
+    if !matches!(host, "localhost" | "127.0.0.1" | "::1") {
+        return None;
+    }
+    url.port_or_known_default()
+}
+
+fn print_instances(instances: &[LocalInstance]) {
+    if instances.is_empty() {
+        println!("No installed local Nucleus instances found.");
+        return;
+    }
+
+    print_table(
+        &["NAME", "URL", "SERVICE", "STATE DIR"],
+        &instances
+            .iter()
+            .map(|instance| {
+                vec![
+                    instance.name.clone(),
+                    instance.url.clone().unwrap_or_else(|| "-".to_string()),
+                    instance
+                        .service_name
+                        .clone()
+                        .unwrap_or_else(|| "-".to_string()),
+                    instance.state_dir.display().to_string(),
+                ]
+            })
+            .collect::<Vec<_>>(),
+    );
+}
+
+fn format_instance_suggestions(instances: &[LocalInstance]) -> String {
+    if instances.is_empty() {
+        return "\nNo installed local Nucleus instances were discovered. Use `nucleus --state-dir <state-dir> auth local-token`.".to_string();
+    }
+
+    let mut message = String::from("\n\nDiscovered instances:\n");
+    for instance in instances {
+        let service = instance
+            .service_name
+            .as_deref()
+            .unwrap_or("unknown service");
+        let url = instance.url.as_deref().unwrap_or("unknown URL");
+        message.push_str(&format!(
+            "- {} ({service}, {url}) state dir: {}\n",
+            instance.name,
+            instance.state_dir.display()
+        ));
+    }
+    message.push_str("\nNext commands:\n");
+    for instance in instances {
+        message.push_str(&format!(
+            "  nucleus auth local-token --instance {}\n",
+            instance.name
+        ));
+    }
+    message
+}
+
+fn print_table(headers: &[&str], rows: &[Vec<String>]) {
+    let mut widths = headers.iter().map(|value| value.len()).collect::<Vec<_>>();
+    for row in rows {
+        for (index, value) in row.iter().enumerate() {
+            if let Some(width) = widths.get_mut(index) {
+                *width = (*width).max(value.len());
+            }
+        }
+    }
+
+    for (index, header) in headers.iter().enumerate() {
+        if index > 0 {
+            print!("  ");
+        }
+        print!("{header:<width$}", width = widths[index]);
+    }
+    println!();
+
+    for row in rows {
+        for (index, value) in row.iter().enumerate() {
+            if index > 0 {
+                print!("  ");
+            }
+            print!("{value:<width$}", width = widths[index]);
+        }
+        println!();
+    }
 }
 
 fn resolve_repo_root(explicit_repo_root: Option<&Path>) -> Result<PathBuf> {
@@ -1088,11 +1443,17 @@ fn unix_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        InstallPlan, ManagedReleaseInstallPlan, managed_release_archive_name,
-        normalized_capability_flags, render_dev_service_unit, render_managed_release_service_unit,
-        require_explicit_remote_bind,
+        AuthSelectorArgs, InstallPlan, LocalInstance, ManagedReleaseInstallPlan,
+        discover_local_instances_from_systemd_dir, format_instance_suggestions,
+        managed_release_archive_name, normalized_capability_flags, parse_local_instance_unit,
+        render_dev_service_unit, render_managed_release_service_unit, require_explicit_remote_bind,
+        resolve_auth_state_dir, select_instance_by_name, select_instance_by_url,
     };
-    use std::path::PathBuf;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn renders_dev_checkout_service_unit_with_explicit_install_kind() {
@@ -1130,6 +1491,153 @@ mod tests {
         assert!(unit.contains(
             "Environment=NUCLEUS_RELEASE_MANIFEST_URL=https://example.com/manifest-stable.json"
         ));
+    }
+
+    #[test]
+    fn parses_nucleus_service_unit_as_local_instance() {
+        let unit = render_managed_release_service_unit(&ManagedReleaseInstallPlan {
+            service_name: "nucleus-dev-projects".to_string(),
+            bind: "127.0.0.1:5202".to_string(),
+            install_root: PathBuf::from("/home/eba/tools/nucleus-dev-projects"),
+            instance_name: "nucleus-dev-projects".to_string(),
+            state_dir: PathBuf::from("/home/eba/.nucleus-dev-projects"),
+            daemon_binary: PathBuf::from(
+                "/home/eba/tools/nucleus-dev-projects/current/bin/nucleus-daemon",
+            ),
+            web_dist_dir: PathBuf::from("/home/eba/tools/nucleus-dev-projects/current/web"),
+            home_dir: PathBuf::from("/home/eba"),
+            manifest_url: "https://example.com/manifest-beta.json".to_string(),
+        });
+
+        let instance =
+            parse_local_instance_unit(Some(&PathBuf::from("nucleus-dev-projects.service")), &unit)
+                .expect("unit should parse");
+
+        assert_eq!(instance.name, "nucleus-dev-projects");
+        assert_eq!(
+            instance.service_name.as_deref(),
+            Some("nucleus-dev-projects.service")
+        );
+        assert_eq!(instance.url.as_deref(), Some("http://127.0.0.1:5202"));
+        assert_eq!(
+            instance.state_dir,
+            PathBuf::from("/home/eba/.nucleus-dev-projects")
+        );
+        assert_eq!(instance.install_kind.as_deref(), Some("managed_release"));
+        assert_eq!(
+            instance.install_root,
+            Some(PathBuf::from("/home/eba/tools/nucleus-dev-projects"))
+        );
+    }
+
+    #[test]
+    fn discovers_instances_from_systemd_user_dir() {
+        let systemd_dir = test_dir("nucleus-cli-systemd");
+        fs::create_dir_all(&systemd_dir).expect("systemd dir should be created");
+        fs::write(
+            systemd_dir.join("nucleus-a.service"),
+            "Environment=NUCLEUS_INSTANCE_NAME=nucleus-a\nEnvironment=NUCLEUS_STATE_DIR=/tmp/a\nEnvironment=NUCLEUS_BIND=127.0.0.1:5202\n",
+        )
+        .expect("service unit should be written");
+        fs::write(
+            systemd_dir.join("not-nucleus.service"),
+            "Environment=OTHER=value\n",
+        )
+        .expect("non-nucleus service should be written");
+
+        let instances = discover_local_instances_from_systemd_dir(&systemd_dir)
+            .expect("instances should be discovered");
+
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].name, "nucleus-a");
+        assert_eq!(
+            instances[0].service_name.as_deref(),
+            Some("nucleus-a.service")
+        );
+        assert_eq!(instances[0].url.as_deref(), Some("http://127.0.0.1:5202"));
+
+        let _ = fs::remove_dir_all(&systemd_dir);
+    }
+
+    #[test]
+    fn selects_instance_by_name_service_or_url() {
+        let instances = vec![
+            LocalInstance {
+                name: "nucleus-dev-projects".to_string(),
+                service_name: Some("nucleus-dev-projects.service".to_string()),
+                unit_path: None,
+                state_dir: PathBuf::from("/tmp/dev-projects"),
+                bind: Some("127.0.0.1:5202".to_string()),
+                url: Some("http://127.0.0.1:5202".to_string()),
+                install_kind: Some("managed_release".to_string()),
+                install_root: None,
+            },
+            LocalInstance {
+                name: "nucleus-wbl-dga".to_string(),
+                service_name: Some("nucleus-wbl-dga.service".to_string()),
+                unit_path: None,
+                state_dir: PathBuf::from("/tmp/wbl-dga"),
+                bind: Some("127.0.0.1:5203".to_string()),
+                url: Some("http://127.0.0.1:5203".to_string()),
+                install_kind: Some("managed_release".to_string()),
+                install_root: None,
+            },
+        ];
+
+        assert_eq!(
+            select_instance_by_name(&instances, "nucleus-dev-projects")
+                .expect("name should match")
+                .state_dir,
+            PathBuf::from("/tmp/dev-projects")
+        );
+        assert_eq!(
+            select_instance_by_name(&instances, "nucleus-wbl-dga.service")
+                .expect("service should match")
+                .state_dir,
+            PathBuf::from("/tmp/wbl-dga")
+        );
+        assert_eq!(
+            select_instance_by_url(&instances, "http://localhost:5203/")
+                .expect("url port should match")
+                .state_dir,
+            PathBuf::from("/tmp/wbl-dga")
+        );
+        assert!(
+            select_instance_by_url(&instances, "http://prod-host:5203").is_err(),
+            "non-local URLs must not match local instances by port alone"
+        );
+    }
+
+    #[test]
+    fn explicit_state_dir_precedes_discovery_selectors() {
+        let state_dir = PathBuf::from("/tmp/explicit-state");
+        let selected = resolve_auth_state_dir(
+            Some(state_dir.clone()),
+            &AuthSelectorArgs {
+                instance: Some("missing".to_string()),
+                url: None,
+            },
+        )
+        .expect("explicit state dir should win");
+
+        assert_eq!(selected, state_dir);
+    }
+
+    #[test]
+    fn instance_suggestions_do_not_include_tokens() {
+        let suggestions = format_instance_suggestions(&[LocalInstance {
+            name: "nucleus-dev-projects".to_string(),
+            service_name: Some("nucleus-dev-projects.service".to_string()),
+            unit_path: None,
+            state_dir: PathBuf::from("/tmp/dev-projects"),
+            bind: Some("127.0.0.1:5202".to_string()),
+            url: Some("http://127.0.0.1:5202".to_string()),
+            install_kind: Some("managed_release".to_string()),
+            install_root: None,
+        }]);
+
+        assert!(suggestions.contains("nucleus auth local-token --instance nucleus-dev-projects"));
+        assert!(!suggestions.contains("nuctk_"));
     }
 
     #[test]
@@ -1171,5 +1679,13 @@ mod tests {
             managed_release_archive_name("rel_123", "x86_64-linux"),
             "nucleus-rel_123-x86_64-linux.tar.gz"
         );
+    }
+
+    fn test_dir(label: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        std::env::temp_dir().join(format!("nucleus-{label}-{}-{suffix}", std::process::id()))
     }
 }

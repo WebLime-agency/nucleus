@@ -635,6 +635,21 @@ impl StateStore {
             .map(|value| value.trim().to_string())
     }
 
+    pub fn rotate_local_auth_token(&self) -> Result<String> {
+        let next = generate_local_auth_token();
+        let token_path = self.plan.state_dir.join(LOCAL_AUTH_TOKEN_FILE_NAME);
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+
+        write_token_file(&token_path, &next)?;
+        set_setting_value(
+            &connection,
+            LOCAL_AUTH_TOKEN_HASH_KEY,
+            &hash_auth_token(&next),
+        )?;
+
+        Ok(next)
+    }
+
     pub fn validate_access_token(&self, token: &str) -> Result<bool> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         let Some(expected_hash) = setting_value_optional(&connection, LOCAL_AUTH_TOKEN_HASH_KEY)?
@@ -8097,6 +8112,58 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn rotates_local_auth_token_for_selected_state_dir() {
+        let state_dir = test_state_dir("rotate-local-auth-token");
+        let other_state_dir = test_state_dir("rotate-local-auth-token-other");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let other_store =
+            StateStore::initialize_at(&other_state_dir).expect("other store should initialize");
+        let original = store
+            .read_local_auth_token()
+            .expect("local auth token should exist");
+        let other_original = other_store
+            .read_local_auth_token()
+            .expect("other local auth token should exist");
+
+        let rotated = store
+            .rotate_local_auth_token()
+            .expect("token rotation should succeed");
+
+        assert_ne!(original, rotated);
+        assert!(rotated.starts_with("nuctk_"));
+        assert!(
+            !store
+                .validate_access_token(&original)
+                .expect("old token validation should succeed")
+        );
+        assert!(
+            store
+                .validate_access_token(&rotated)
+                .expect("new token validation should succeed")
+        );
+        assert_eq!(
+            store
+                .read_local_auth_token()
+                .expect("rotated token file should be readable"),
+            rotated
+        );
+        assert_eq!(
+            other_store
+                .read_local_auth_token()
+                .expect("other token file should be readable"),
+            other_original
+        );
+        assert!(
+            other_store
+                .validate_access_token(&other_original)
+                .expect("other token validation should succeed")
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+        let _ = fs::remove_dir_all(&other_state_dir);
     }
 
     #[test]

@@ -60,3 +60,28 @@ curl -sS http://127.0.0.1:5201/health
 curl -sS http://127.0.0.1:5202/health
 curl -sS http://127.0.0.1:5203/health
 ```
+
+## Token discovery
+
+The CLI discovers installed local instances from user systemd unit metadata:
+
+```bash
+nucleus instances
+```
+
+Retrieve a token only for the intended instance:
+
+```bash
+nucleus auth local-token --instance nucleus-dev-projects
+nucleus auth local-token --url http://127.0.0.1:5202
+```
+
+Rotate a token for one instance:
+
+```bash
+nucleus auth rotate-token --instance nucleus-dev-projects
+```
+
+Do not run broad discovery commands that print tokens. `nucleus instances` intentionally shows
+names, URLs, services, and state directories only. If multiple instances are discovered and no
+selector is provided, auth commands fail with a list of exact selector commands.
