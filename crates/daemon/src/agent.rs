@@ -904,7 +904,7 @@ pub async fn start_prompt_job(
         &payload.images,
     )?;
 
-    let job = state.store.create_job(JobRecord {
+    state.store.create_job(JobRecord {
         id: job_id.clone(),
         session_id: Some(session_id.clone()),
         parent_job_id: None,
@@ -925,7 +925,7 @@ pub async fn start_prompt_job(
         ),
     )?;
     if job.publication_requested {
-        record_publication_git_hygiene_baseline(state, &job, &current.session)?;
+        record_publication_git_hygiene_baseline(&state, &job, &current.session)?;
     }
     if patch_loop_guardrail_triggered {
         let _ = state.store.append_job_event(JobEventRecord {
@@ -3196,7 +3196,7 @@ async fn complete_job_with_final_answer(
     )?;
     let terminal_metadata = final_answer_terminal_metadata(
         summary,
-        final_answer,
+        &final_answer,
         step_count,
         tool_call_count,
         &publication_patch,
@@ -3231,7 +3231,7 @@ async fn complete_job_with_final_answer(
                     .publication_summary
                     .clone()
                     .unwrap_or_else(|| summary.to_string()),
-                detail: excerpt(final_answer, 320),
+                detail: excerpt(&final_answer, 320),
                 data_json: json!({
                     "publication_requested": publication_patch.publication_requested.unwrap_or(true),
                     "publication_status": publication_status,
@@ -4022,7 +4022,7 @@ fn normalize_browser_verification_status(value: &str) -> Option<String> {
 }
 
 fn normalize_cleanup_status(value: &str) -> Option<String> {
-    normalize_enum_value(value, &["clean", "cleaned", "cleanup_required", "unknown"])
+    normalize_enum_value(value, &["cleanup_required", "cleaned", "clean", "unknown"])
 }
 
 fn normalize_enum_value(value: &str, allowed: &[&str]) -> Option<String> {
