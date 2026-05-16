@@ -23,7 +23,7 @@ pub(crate) fn classify_user_error(detail: &str) -> Option<UserFacingErrorSummary
         return Some(model_credentials_invalid(detail));
     }
 
-    if contains_auth_failure(&lower) {
+    if contains_auth_failure(&lower) && contains_model_provider_context(&lower) {
         return Some(model_provider_auth_failed(detail));
     }
 
@@ -195,6 +195,17 @@ fn contains_auth_failure(lower: &str) -> bool {
         || lower.contains("status 403")
 }
 
+fn contains_model_provider_context(lower: &str) -> bool {
+    lower.contains("openai-compatible")
+        || lower.contains("model provider")
+        || lower.contains("model endpoint")
+        || lower.contains("model credential")
+        || lower.contains("base model")
+        || lower.contains("utility model")
+        || lower.contains("endpoint failed")
+        || lower.contains("api key")
+}
+
 fn contains_auth_context(lower: &str) -> bool {
     lower.contains("auth")
         || lower.contains("credential")
@@ -290,6 +301,20 @@ mod tests {
 
         assert_eq!(summary.code, "model_provider_auth_failed");
         assert!(summary.actions.iter().any(|action| action == CANCEL_JOB));
+    }
+
+    #[test]
+    fn does_not_classify_unrelated_http_forbidden_as_model_credentials() {
+        let raw = "GitHub API request failed: HTTP 403 forbidden";
+
+        assert!(classify_user_error(raw).is_none());
+    }
+
+    #[test]
+    fn does_not_classify_unrelated_unauthorized_tool_failure_as_model_credentials() {
+        let raw = "tool call failed: unauthorized to read the requested resource";
+
+        assert!(classify_user_error(raw).is_none());
     }
 
     #[test]
