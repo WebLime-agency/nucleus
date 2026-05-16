@@ -62,7 +62,8 @@ import {
   vaultSecretSummarySchema,
   vaultSecretUpdateRequestSchema,
   vaultSecretUpsertRequestSchema,
-  vaultStatusSummarySchema
+  vaultStatusSummarySchema,
+  writableMcpAuthKindSchema
 } from './schemas';
 
 type FetchLike = typeof fetch;
@@ -569,6 +570,10 @@ export async function upsertMcpServer(
   fetchImpl: FetchLike = fetch
 ) {
   const payload = mcpServerRecordSchema.parse(input);
+  if (payload.auth_kind === 'bearer_env' || payload.auth_kind === 'env_bearer') {
+    throw new Error('Bearer env auth is no longer supported. Move the token into Vault and select bearer from Vault.');
+  }
+  writableMcpAuthKindSchema.parse(payload.auth_kind || 'none');
 
   return parseJson(
     await daemonFetch(fetchImpl, '/api/mcps', {

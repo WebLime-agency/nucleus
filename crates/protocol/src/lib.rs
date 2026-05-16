@@ -71,6 +71,17 @@ pub struct SessionProjectSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserFacingErrorSummary {
+    pub code: String,
+    pub title: String,
+    pub message: String,
+    #[serde(default)]
+    pub actions: Vec<String>,
+    #[serde(default)]
+    pub technical_detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionSummary {
     pub id: String,
     pub title: String,
@@ -127,6 +138,8 @@ pub struct SessionSummary {
     pub state: String,
     pub provider_session_id: String,
     pub last_error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_error: Option<UserFacingErrorSummary>,
     pub last_message_excerpt: String,
     pub turn_count: usize,
     pub created_at: i64,
@@ -196,6 +209,13 @@ pub struct JobSummary {
     pub visible_turn_id: Option<String>,
     pub result_summary: String,
     pub last_error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_error: Option<UserFacingErrorSummary>,
+    pub ui_renderable: String,
+    pub browser_verification_required: bool,
+    pub browser_verification_status: String,
+    pub browser_verification_summary: String,
+    pub browser_verification_artifact_ids: Vec<String>,
     pub worker_count: usize,
     pub pending_approval_count: usize,
     pub artifact_count: usize,
@@ -231,6 +251,8 @@ pub struct WorkerSummary {
     pub tool_call_count: usize,
     #[serde(default)]
     pub last_error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_error: Option<UserFacingErrorSummary>,
     #[serde(default)]
     pub capabilities: Vec<ToolCapabilitySummary>,
     pub created_at: i64,
@@ -1702,4 +1724,128 @@ pub struct BrowserSnapshot {
     pub downloads: Vec<BrowserDownload>,
     pub screenshot_data_url: String,
     pub captured_at: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn job_summary_serializes_browser_verification_fields() {
+        let summary = JobSummary {
+            id: "job-1".to_string(),
+            session_id: Some("session-1".to_string()),
+            parent_job_id: None,
+            template_id: None,
+            title: "UI job".to_string(),
+            purpose: "test".to_string(),
+            trigger_kind: "session_prompt".to_string(),
+            state: "completed".to_string(),
+            requested_by: "user".to_string(),
+            prompt_excerpt: "fix layout".to_string(),
+            root_worker_id: Some("worker-1".to_string()),
+            visible_turn_id: Some("turn-1".to_string()),
+            result_summary: "done".to_string(),
+            last_error: String::new(),
+            user_error: None,
+            ui_renderable: "true".to_string(),
+            browser_verification_required: true,
+            browser_verification_status: "passed".to_string(),
+            browser_verification_summary: "Verified dropdown clickability.".to_string(),
+            browser_verification_artifact_ids: vec!["artifact-1".to_string()],
+            worker_count: 1,
+            pending_approval_count: 0,
+            artifact_count: 1,
+            created_at: 1,
+            updated_at: 2,
+        };
+
+        let value = serde_json::to_value(&summary).expect("summary should serialize");
+        assert_eq!(value["ui_renderable"], "true");
+        assert_eq!(value["browser_verification_required"], true);
+        assert_eq!(value["browser_verification_status"], "passed");
+        assert_eq!(value["browser_verification_artifact_ids"][0], "artifact-1");
+    }
+
+    #[test]
+    fn job_summary_accepts_missing_user_error() {
+        let value = json!({
+            "id": "job-1",
+            "session_id": "session-1",
+            "parent_job_id": null,
+            "template_id": null,
+            "title": "Utility job",
+            "purpose": "Test",
+            "trigger_kind": "manual",
+            "state": "failed",
+            "requested_by": "test",
+            "prompt_excerpt": "prompt",
+            "root_worker_id": null,
+            "visible_turn_id": null,
+            "result_summary": "",
+            "last_error": "raw error",
+            "ui_renderable": "unknown",
+            "browser_verification_required": false,
+            "browser_verification_status": "not_required",
+            "browser_verification_summary": "",
+            "browser_verification_artifact_ids": [],
+            "worker_count": 1,
+            "pending_approval_count": 0,
+            "artifact_count": 0,
+            "created_at": 1,
+            "updated_at": 1
+        });
+
+        let summary: JobSummary = serde_json::from_value(value).expect("summary should parse");
+        assert_eq!(summary.last_error, "raw error");
+        assert!(summary.user_error.is_none());
+    }
+
+    #[test]
+    fn job_summary_accepts_user_error_metadata() {
+        let value = json!({
+            "id": "job-1",
+            "session_id": "session-1",
+            "parent_job_id": null,
+            "template_id": null,
+            "title": "Utility job",
+            "purpose": "Test",
+            "trigger_kind": "manual",
+            "state": "failed",
+            "requested_by": "test",
+            "prompt_excerpt": "prompt",
+            "root_worker_id": null,
+            "visible_turn_id": null,
+            "result_summary": "",
+            "last_error": "raw error",
+            "user_error": {
+                "code": "model_credentials_missing",
+                "title": "Nucleus needs model credentials",
+                "message": "Set up your Base model and Utility model in Profiles, then retry this job.",
+                "actions": ["open_profiles", "retry_job"],
+                "technical_detail": "raw error"
+            },
+            "ui_renderable": "unknown",
+            "browser_verification_required": false,
+            "browser_verification_status": "not_required",
+            "browser_verification_summary": "",
+            "browser_verification_artifact_ids": [],
+            "worker_count": 1,
+            "pending_approval_count": 0,
+            "artifact_count": 0,
+            "created_at": 1,
+            "updated_at": 1
+        });
+
+        let summary: JobSummary = serde_json::from_value(value).expect("summary should parse");
+        let user_error = summary.user_error.expect("friendly error should parse");
+        assert_eq!(user_error.code, "model_credentials_missing");
+        assert!(
+            user_error
+                .actions
+                .iter()
+                .any(|action| action == "open_profiles")
+        );
+    }
 }

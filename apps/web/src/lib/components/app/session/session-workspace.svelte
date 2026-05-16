@@ -30,6 +30,7 @@
     XCircle
   } from 'lucide-svelte';
 
+  import FriendlyErrorNotice from '$lib/components/app/session/friendly-error-notice.svelte';
   import MarkdownContent from '$lib/components/session/markdown-content.svelte';
   import { Badge } from '$lib/components/ui/badge';
   import { Button } from '$lib/components/ui/button';
@@ -213,6 +214,7 @@
   let selectedJobHasPendingApprovals = $derived(
     jobDetail?.approvals.some((approval) => approval.state === 'pending') ?? false
   );
+  let selectedSessionUserError = $derived(selectedSession?.user_error ?? null);
   let attachedProjects = $derived(selectedSession?.projects ?? []);
   let selectedProject = $derived(attachedProjects.find((project) => project.is_primary) ?? null);
   let selectedProjectTitle = $derived(
@@ -283,6 +285,9 @@
   let activePromptProgress = $derived(promptProgress[promptProgress.length - 1] ?? null);
   let composerActivityJobSummary = $derived.by(
     () => jobSummaries.find((job) => jobIsActive(job.state)) ?? jobSummaries[0] ?? null
+  );
+  let composerActivityUserError = $derived(
+    composerActivityJobSummary?.user_error ?? activityJobDetail?.job.user_error ?? selectedSessionUserError
   );
   let composerActivityJobId = $derived(composerActivityJobSummary?.id ?? '');
   let composerActivityPendingApproval = $derived.by(() =>
@@ -432,6 +437,39 @@
     }
     if (state === 'canceled') return 'secondary';
     return 'destructive';
+  }
+
+  function jobCompletionLabel(job: JobSummary): string {
+    if (job.state !== 'completed' || !job.browser_verification_required) {
+      return formatState(job.state);
+    }
+
+    if (job.browser_verification_status === 'passed') return 'Completed, browser-verified';
+    if (job.browser_verification_status === 'failed') {
+      return 'Completed, browser verification failed';
+    }
+    if (job.browser_verification_status === 'unavailable') {
+      return 'Completed, verification unavailable';
+    }
+    return 'Completed, not browser-verified';
+  }
+
+  function badgeVariantForVerification(
+    status: string
+  ): 'default' | 'secondary' | 'warning' | 'destructive' {
+    if (status === 'passed') return 'default';
+    if (status === 'failed') return 'destructive';
+    if (status === 'pending') return 'warning';
+    return 'secondary';
+  }
+
+  function formatVerificationStatus(status: string): string {
+    if (status === 'passed') return 'Browser-verified';
+    if (status === 'failed') return 'Browser verification failed';
+    if (status === 'unavailable') return 'Verification unavailable';
+    if (status === 'not_performed') return 'Not browser-verified';
+    if (status === 'pending') return 'Verification pending';
+    return 'Not required';
   }
 
   function badgeVariantForToolCall(
@@ -818,6 +856,14 @@
     sideDrawerOpen = true;
   }
 
+  function openJobDetails(jobId?: string) {
+    const targetJobId = jobId ?? jobDetail?.job.id ?? selectedJobSummary?.id ?? '';
+    openDetailDrawer();
+    if (targetJobId) {
+      void loadJob(targetJobId, true);
+    }
+  }
+
   function openBrowserDrawer() {
     sideDrawerMode = 'browser';
     sideDrawerOpen = true;
@@ -850,6 +896,7 @@
           ...detail.session,
           state: 'running',
           last_error: '',
+          user_error: null,
           turn_count: detail.session.turn_count + 1,
           updated_at: now,
           last_message_excerpt: prompt.trim()
@@ -862,6 +909,7 @@
       ...session,
       state: 'running',
       last_error: '',
+      user_error: null,
       turn_count: session.turn_count + 1,
       updated_at: now,
       last_message_excerpt: prompt.trim()
@@ -2756,7 +2804,7 @@
             </div>
           </header>
 
-          {#if error || actionResultMessage || selectedSession.last_error}
+          {#if error || actionResultMessage || selectedSessionUserError || selectedSession.last_error}
             <div class="sticky top-[89px] z-10 shrink-0 border-b border-zinc-900 bg-zinc-950/75 px-4 py-3 backdrop-blur supports-[backdrop-filter]:bg-zinc-950/65 sm:top-[105px] sm:px-6">
               {#if error}
                 <div class="rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-2 text-sm text-red-200">
@@ -2770,7 +2818,16 @@
                 </div>
               {/if}
 
-              {#if !error && !actionResultMessage && selectedSession.last_error}
+              {#if !error && !actionResultMessage && selectedSessionUserError}
+                <FriendlyErrorNotice
+                  userError={selectedSessionUserError}
+                  onRetryJob={() => void handleResumeJob(composerActivityJobSummary?.id)}
+                  onCancelJob={() => void handleCancelJob(composerActivityJobSummary?.id)}
+                  onOpenJobDetails={() => openJobDetails(composerActivityJobSummary?.id)}
+                  retryDisabled={jobActioning}
+                  cancelDisabled={jobActioning}
+                />
+              {:else if !error && !actionResultMessage && selectedSession.last_error}
                 <div class="rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-2 text-sm text-red-200">
                   {selectedSession.last_error}
                 </div>
@@ -2954,6 +3011,21 @@
                         </div>
                       {/if}
 
+                      {#if activityJobDetail?.job.user_error}
+                        <FriendlyErrorNotice
+                          userError={activityJobDetail.job.user_error}
+                          onRetryJob={() => void handleResumeJob(activityJobDetail?.job.id)}
+                          onCancelJob={() => void handleCancelJob(activityJobDetail?.job.id)}
+                          onOpenJobDetails={() => openJobDetails(activityJobDetail?.job.id)}
+                          retryDisabled={jobActioning}
+                          cancelDisabled={jobActioning}
+                        />
+                      {:else if activityJobDetail?.job.last_error}
+                        <div class="rounded-xl border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs leading-5 text-red-200">
+                          {activityJobDetail.job.last_error}
+                        </div>
+                      {/if}
+
                       {#if activityJobDetail?.workers.length}
                         <div>
                           <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Utility Workers</div>
@@ -2971,6 +3043,11 @@
                                     {formatState(worker.state)}
                                   </Badge>
                                 </div>
+                                {#if worker.user_error}
+                                  <FriendlyErrorNotice userError={worker.user_error} class="mt-2" />
+                                {:else if worker.last_error}
+                                  <div class="mt-2 text-xs leading-5 text-red-200">{worker.last_error}</div>
+                                {/if}
                               </div>
                             {/each}
                           </div>
@@ -3129,52 +3206,61 @@
                     : 'border-red-500/30 bg-red-500/10 text-red-100'
                 )}
               >
-                <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                  <div class="min-w-0">
-                    <div class="font-medium">
-                      {selectedSession.state === 'paused' ? 'This session is paused.' : 'This session has a recoverable job error.'}
+                {#if selectedSession.state === 'error' && composerActivityUserError}
+                  <FriendlyErrorNotice
+                    userError={composerActivityUserError}
+                    class="border-0 bg-transparent p-0"
+                    onRetryJob={() => void handleResumeJob(composerActivityJobSummary?.id)}
+                    onCancelJob={() => void handleCancelJob(composerActivityJobSummary?.id)}
+                    onOpenJobDetails={() => openJobDetails(composerActivityJobSummary?.id)}
+                    retryDisabled={jobActioning}
+                    cancelDisabled={jobActioning}
+                  />
+                {:else}
+                  <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div class="min-w-0">
+                      <div class="font-medium">
+                        {selectedSession.state === 'paused' ? 'This session is paused.' : 'This session has a recoverable job error.'}
+                      </div>
+                      <div class="mt-1 text-xs leading-5 opacity-75">
+                        {selectedSession.state === 'paused'
+                          ? 'Resume or cancel the paused Utility Worker job before sending another prompt.'
+                          : 'Retry the checkpointed Utility Worker job or cancel it before continuing this session.'}
+                      </div>
                     </div>
-                    <div class="mt-1 text-xs leading-5 opacity-75">
-                      {selectedSession.state === 'paused'
-                        ? 'Resume or cancel the paused Utility Worker job before sending another prompt.'
-                        : 'Retry the checkpointed Utility Worker job or cancel it before continuing this session.'}
+                    <div class="flex shrink-0 flex-wrap gap-2">
+                      {#if composerActivityJobSummary?.state === 'paused' || composerActivityJobSummary?.state === 'failed'}
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          disabled={jobActioning}
+                          onclick={() => handleResumeJob(composerActivityJobSummary?.id)}
+                        >
+                          <RotateCcw class={cn('size-4', jobActioning && 'animate-spin')} />
+                          <span>{jobActioning ? 'Retrying' : composerActivityJobSummary?.state === 'failed' ? 'Retry Job' : 'Resume Job'}</span>
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={jobActioning}
+                          onclick={() => handleCancelJob(composerActivityJobSummary?.id)}
+                        >
+                          <XCircle class="size-4" />
+                          <span>Cancel Job</span>
+                        </Button>
+                      {/if}
+                      {#if composerActivityJobSummary}
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onclick={() => openJobDetails(composerActivityJobSummary.id)}
+                        >
+                          Open Job Details
+                        </Button>
+                      {/if}
                     </div>
                   </div>
-                  <div class="flex shrink-0 flex-wrap gap-2">
-                    {#if composerActivityJobSummary?.state === 'paused' || composerActivityJobSummary?.state === 'failed'}
-                      <Button
-                        variant="secondary"
-                        size="sm"
-                        disabled={jobActioning}
-                        onclick={() => handleResumeJob(composerActivityJobSummary?.id)}
-                      >
-                        <RotateCcw class={cn('size-4', jobActioning && 'animate-spin')} />
-                        <span>{jobActioning ? 'Retrying' : composerActivityJobSummary?.state === 'failed' ? 'Retry Job' : 'Resume Job'}</span>
-                      </Button>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        disabled={jobActioning}
-                        onclick={() => handleCancelJob(composerActivityJobSummary?.id)}
-                      >
-                        <XCircle class="size-4" />
-                        <span>Cancel Job</span>
-                      </Button>
-                    {/if}
-                    {#if composerActivityJobSummary}
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onclick={() => {
-                          openDetailDrawer();
-                          void loadJob(composerActivityJobSummary.id, true);
-                        }}
-                      >
-                        Open Job Details
-                      </Button>
-                    {/if}
-                  </div>
-                </div>
+                {/if}
               </section>
             {/if}
 
@@ -3886,7 +3972,7 @@
                             <div class="mt-1 text-xs text-zinc-500">{job.prompt_excerpt || job.purpose}</div>
                           </div>
                           <Badge variant={badgeVariantForJobState(job.state)}>
-                            {formatState(job.state)}
+                            {jobCompletionLabel(job)}
                           </Badge>
                         </div>
                         <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-zinc-600">
@@ -3909,13 +3995,50 @@
                           </div>
                         </div>
                         <Badge variant={badgeVariantForJobState(jobDetail.job.state)}>
-                          {formatState(jobDetail.job.state)}
+                          {jobCompletionLabel(jobDetail.job)}
                         </Badge>
                       </div>
 
-                      {#if jobDetail.job.last_error}
+                      {#if jobDetail.job.user_error}
+                        <FriendlyErrorNotice
+                          userError={jobDetail.job.user_error}
+                          class="mt-3"
+                          onRetryJob={() => void handleResumeJob(jobDetail?.job.id)}
+                          onCancelJob={() => void handleCancelJob(jobDetail?.job.id)}
+                          retryDisabled={jobActioning}
+                          cancelDisabled={jobActioning}
+                        />
+                      {:else if jobDetail.job.last_error}
                         <div class="mt-3 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-200">
                           {jobDetail.job.last_error}
+                        </div>
+                      {/if}
+
+                      {#if jobDetail.job.browser_verification_required || jobDetail.job.browser_verification_status !== 'not_required'}
+                        <div class="mt-3 rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-3">
+                          <div class="flex items-start justify-between gap-3">
+                            <div class="min-w-0">
+                              <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Browser Verification</div>
+                              <div class="mt-1 text-sm text-zinc-100">
+                                {formatVerificationStatus(jobDetail.job.browser_verification_status)}
+                              </div>
+                              {#if jobDetail.job.browser_verification_summary}
+                                <div class="mt-1 text-xs leading-5 text-zinc-500">
+                                  {jobDetail.job.browser_verification_summary}
+                                </div>
+                              {/if}
+                            </div>
+                            <Badge variant={badgeVariantForVerification(jobDetail.job.browser_verification_status)}>
+                              {jobDetail.job.browser_verification_required ? 'Required' : 'Optional'}
+                            </Badge>
+                          </div>
+                          {#if jobDetail.job.browser_verification_artifact_ids.length > 0}
+                            <div class="mt-3 flex flex-wrap gap-1.5">
+                              {#each jobDetail.job.browser_verification_artifact_ids as artifactId}
+                                <span class="rounded border border-zinc-800 bg-zinc-900 px-2 py-1 text-[11px] text-zinc-500">{artifactId}</span>
+                              {/each}
+                            </div>
+                          {/if}
                         </div>
                       {/if}
 
@@ -3975,7 +4098,9 @@
                                       <span>Updated {formatDateTime(childJob.updated_at)}</span>
                                     {/if}
                                   </div>
-                                  {#if childJob.last_error}
+                                  {#if childJob.user_error}
+                                    <FriendlyErrorNotice userError={childJob.user_error} class="mt-2" />
+                                  {:else if childJob.last_error}
                                     <div class="mt-2 text-xs leading-5 text-red-200">{childJob.last_error}</div>
                                   {/if}
                                 </div>
@@ -4005,6 +4130,11 @@
                                   <span>{worker.tool_call_count}/{worker.max_tool_calls} actions</span>
                                   <span>{compactPath(worker.working_dir)}</span>
                                 </div>
+                                {#if worker.user_error}
+                                  <FriendlyErrorNotice userError={worker.user_error} class="mt-2" />
+                                {:else if worker.last_error}
+                                  <div class="mt-2 text-xs leading-5 text-red-200">{worker.last_error}</div>
+                                {/if}
                               </div>
                             {/each}
                           </div>

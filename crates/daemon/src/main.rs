@@ -1,5 +1,6 @@
 mod agent;
 mod browser;
+mod error_display;
 mod host;
 mod runtime;
 mod security;
@@ -57,11 +58,11 @@ use nucleus_protocol::{
     SkillManifest, SkillPackageRecord, SkillPackageUpsertRequest, SkillReconcileCandidate,
     SkillReconcileRequest, SkillReconcileScanResponse, StreamConnected, SystemStats,
     UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
-    VaultInitRequest, VaultSecretListResponse, VaultSecretPolicyListResponse,
-    VaultSecretPolicySummary, VaultSecretPolicyUpsertRequest, VaultSecretSummary,
-    VaultSecretUpdateRequest, VaultSecretUpsertRequest, VaultStatusSummary, VaultUnlockRequest,
-    WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceProfileWriteRequest, WorkspaceSummary,
-    WorkspaceUpdateRequest,
+    UserFacingErrorSummary, VaultInitRequest, VaultSecretListResponse,
+    VaultSecretPolicyListResponse, VaultSecretPolicySummary, VaultSecretPolicyUpsertRequest,
+    VaultSecretSummary, VaultSecretUpdateRequest, VaultSecretUpsertRequest, VaultStatusSummary,
+    VaultUnlockRequest, WorkspaceModelConfig, WorkspaceProfileSummary,
+    WorkspaceProfileWriteRequest, WorkspaceSummary, WorkspaceUpdateRequest,
 };
 use nucleus_release::read_installed_release_metadata;
 use nucleus_storage::{
@@ -2916,13 +2917,7 @@ async fn mcp_http_request(
     match record.auth_kind.as_str() {
         "none" | "" => {}
         "bearer_env" | "env_bearer" => {
-            if record.auth_ref.trim().is_empty() {
-                bail!("missing_credentials: bearer token environment variable is not configured");
-            }
-            let token = std::env::var(record.auth_ref.trim()).map_err(|_| {
-                anyhow::anyhow!("missing_credentials: bearer token environment variable is not set")
-            })?;
-            req = req.bearer_auth(token);
+            bail!(MCP_ENV_BEARER_MIGRATION_MESSAGE);
         }
         "vault_bearer" => {
             let token = resolve_mcp_vault_bearer_token(state, record, project_context).await?;
@@ -2975,7 +2970,9 @@ async fn mcp_http_request(
 
 fn mcp_sync_status_for_error(message: &str) -> &'static str {
     let lower = message.to_ascii_lowercase();
-    if lower.contains("vault_locked") {
+    if lower.contains("auth_migration_required") {
+        "auth_migration_required"
+    } else if lower.contains("vault_locked") {
         "vault_locked"
     } else if lower.contains("vault_secret_missing") {
         "vault_secret_missing"
@@ -2995,6 +2992,8 @@ fn mcp_sync_status_for_error(message: &str) -> &'static str {
         "error"
     }
 }
+
+pub(crate) const MCP_ENV_BEARER_MIGRATION_MESSAGE: &str = "auth_migration_required: bearer env auth is no longer supported; move the token into Vault and select bearer from Vault";
 
 pub(crate) async fn resolve_mcp_vault_bearer_token(
     state: &AppState,
@@ -3127,7 +3126,9 @@ async fn playbook_detail(
     State(state): State<AppState>,
     Path(playbook_id): Path<String>,
 ) -> Result<Json<PlaybookDetail>, ApiError> {
-    Ok(Json(agent::get_playbook(state, playbook_id).await?))
+    Ok(Json(redact_playbook_detail(
+        agent::get_playbook(state, playbook_id).await?,
+    )))
 }
 
 async fn create_playbook(
@@ -3135,7 +3136,9 @@ async fn create_playbook(
     body: Bytes,
 ) -> Result<Json<PlaybookDetail>, ApiError> {
     let payload = decode_json::<CreatePlaybookRequest>(&body)?;
-    Ok(Json(agent::create_playbook(state, payload).await?))
+    Ok(Json(redact_playbook_detail(
+        agent::create_playbook(state, payload).await?,
+    )))
 }
 
 async fn update_playbook(
@@ -3144,16 +3147,18 @@ async fn update_playbook(
     body: Bytes,
 ) -> Result<Json<PlaybookDetail>, ApiError> {
     let payload = decode_json::<UpdatePlaybookRequest>(&body)?;
-    Ok(Json(
+    Ok(Json(redact_playbook_detail(
         agent::update_playbook(state, playbook_id, payload).await?,
-    ))
+    )))
 }
 
 async fn delete_playbook(
     State(state): State<AppState>,
     Path(playbook_id): Path<String>,
 ) -> Result<Json<PlaybookDetail>, ApiError> {
-    Ok(Json(agent::delete_playbook(state, playbook_id).await?))
+    Ok(Json(redact_playbook_detail(
+        agent::delete_playbook(state, playbook_id).await?,
+    )))
 }
 
 async fn run_playbook(
@@ -3574,7 +3579,9 @@ async fn session_jobs(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<Vec<JobSummary>>, ApiError> {
-    Ok(Json(state.store.list_jobs_for_session(&session_id)?))
+    Ok(Json(redact_job_summaries(
+        state.store.list_jobs_for_session(&session_id)?,
+    )))
 }
 
 async fn job_detail(
@@ -4123,16 +4130,41 @@ fn redact_session_detail(mut detail: SessionDetail) -> SessionDetail {
 }
 
 fn redact_session_summary(mut session: SessionSummary) -> SessionSummary {
+    let redactor = security::RedactionSet::new().with_secret(session.provider_api_key.clone());
+    session.last_error = redactor.redact_text(&session.last_error);
+    session.user_error = classify_redacted_user_error(&session.last_error);
     session.provider_api_key.clear();
     session
 }
 
+fn redact_job_summaries(jobs: Vec<JobSummary>) -> Vec<JobSummary> {
+    jobs.into_iter().map(redact_job_summary).collect()
+}
+
+fn redact_job_summary(mut job: JobSummary) -> JobSummary {
+    let redactor = security::RedactionSet::new();
+    job.last_error = redactor.redact_text(&job.last_error);
+    job.user_error = classify_redacted_user_error(&job.last_error);
+    job
+}
+
 fn redact_job_detail(mut detail: JobDetail) -> JobDetail {
+    let mut redactor = security::RedactionSet::new();
     for worker in &mut detail.workers {
+        redactor.register_secret(worker.provider_api_key.clone());
         worker.provider_api_key.clear();
     }
 
-    let redactor = security::RedactionSet::new();
+    detail.job.last_error = redactor.redact_text(&detail.job.last_error);
+    detail.job.user_error = classify_redacted_user_error(&detail.job.last_error);
+    for child_job in &mut detail.child_jobs {
+        child_job.last_error = redactor.redact_text(&child_job.last_error);
+        child_job.user_error = classify_redacted_user_error(&child_job.last_error);
+    }
+    for worker in &mut detail.workers {
+        worker.last_error = redactor.redact_text(&worker.last_error);
+        worker.user_error = classify_redacted_user_error(&worker.last_error);
+    }
     for call in &mut detail.tool_calls {
         call.args_json = redactor.redact_json(&call.args_json);
         call.result_json = call
@@ -4146,6 +4178,16 @@ fn redact_job_detail(mut detail: JobDetail) -> JobDetail {
         event.data_json = redactor.redact_json(&event.data_json);
     }
     detail
+}
+
+fn redact_playbook_detail(mut detail: PlaybookDetail) -> PlaybookDetail {
+    detail.session = redact_session_summary(detail.session);
+    detail.recent_jobs = redact_job_summaries(detail.recent_jobs);
+    detail
+}
+
+fn classify_redacted_user_error(detail: &str) -> Option<UserFacingErrorSummary> {
+    error_display::classify_user_error(detail)
 }
 
 fn redact_workspace_summary(mut workspace: WorkspaceSummary) -> WorkspaceSummary {
@@ -5342,6 +5384,8 @@ fn sanitize_skill_manifest(mut manifest: SkillManifest) -> Result<SkillManifest,
 fn sanitize_mcp_server(mut server: McpServerSummary) -> Result<McpServerSummary, ApiError> {
     server.id = sanitize_registry_id(&server.id, "MCP server id")?;
     server.title = required_trimmed(server.title, "MCP server title")?;
+    server.auth_kind = normalize_mcp_auth_kind_for_write(&server.auth_kind)?;
+    server.auth_ref = normalize_mcp_auth_ref_for_write(&server.auth_kind, &server.auth_ref)?;
     server.resources = sanitize_string_list(server.resources);
     server.tools = server
         .tools
@@ -5349,6 +5393,33 @@ fn sanitize_mcp_server(mut server: McpServerSummary) -> Result<McpServerSummary,
         .map(sanitize_tool_descriptor)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(server)
+}
+
+fn normalize_mcp_auth_kind_for_write(value: &str) -> Result<String, ApiError> {
+    let value = value.trim();
+    match value {
+        "" | "none" => Ok("none".to_string()),
+        "vault_bearer" | "static_headers" | "oauth" | "device" => Ok(value.to_string()),
+        "bearer_env" | "env_bearer" => Err(ApiError::bad_request(
+            "auth_migration_required: bearer env auth is no longer supported; move the token into Vault and select bearer from Vault",
+        )),
+        _ => Err(ApiError::bad_request(
+            "MCP auth_kind must be none, vault_bearer, static_headers, oauth, or device",
+        )),
+    }
+}
+
+fn normalize_mcp_auth_ref_for_write(auth_kind: &str, value: &str) -> Result<String, ApiError> {
+    let value = value.trim();
+    if auth_kind != "vault_bearer" || value.is_empty() {
+        return Ok(value.to_string());
+    }
+    if value.starts_with("vault://") {
+        parse_vault_reference(value).map_err(|error| ApiError::bad_request(error.to_string()))?;
+        return Ok(value.to_string());
+    }
+    let name = sanitize_registry_id(value, "vault secret name")?;
+    Ok(format!("vault://workspace/{name}"))
 }
 
 fn build_skill_package_record(
@@ -8108,6 +8179,7 @@ mod tests {
     fn api_session_response_redacts_provider_api_key() {
         let mut session = test_session(Path::new("/tmp/nucleus-redaction-test"));
         session.provider_api_key = "nuctk_super_secret".to_string();
+        session.last_error = r#"OpenAI-compatible endpoint failed: {"error":{"message":"Missing API key","type":"authentication_error","code":"invalid_api_key"}}"#.to_string();
         let detail = SessionDetail {
             session,
             turns: Vec::new(),
@@ -8116,6 +8188,18 @@ mod tests {
         let redacted = redact_session_detail(detail);
 
         assert_eq!(redacted.session.provider_api_key, "");
+        assert_eq!(
+            redacted.session.last_error,
+            r#"OpenAI-compatible endpoint failed: {"error":{"message":"Missing API key","type":"authentication_error","code":"invalid_api_key"}}"#
+        );
+        let user_error = redacted
+            .session
+            .user_error
+            .expect("friendly error should be included");
+        assert_eq!(user_error.code, "model_credentials_missing");
+        assert!(user_error.message.contains("Profiles"));
+        assert!(!user_error.message.contains("invalid_api_key"));
+        assert_eq!(user_error.technical_detail, redacted.session.last_error);
     }
 
     #[test]
@@ -8446,6 +8530,7 @@ mod tests {
             state: "active".to_string(),
             provider_session_id: String::new(),
             last_error: String::new(),
+            user_error: None,
             last_message_excerpt: String::new(),
             turn_count: 0,
             created_at: 0,
@@ -8631,6 +8716,7 @@ mod tests {
             state: "active".to_string(),
             provider_session_id: String::new(),
             last_error: String::new(),
+            user_error: None,
             last_message_excerpt: String::new(),
             turn_count: 0,
             created_at: 0,
@@ -8741,6 +8827,7 @@ mod tests {
             state: "active".to_string(),
             provider_session_id: String::new(),
             last_error: String::new(),
+            user_error: None,
             last_message_excerpt: String::new(),
             turn_count: 0,
             created_at: 0,
@@ -9134,6 +9221,7 @@ mod tests {
             state: "active".to_string(),
             provider_session_id: String::new(),
             last_error: String::new(),
+            user_error: None,
             last_message_excerpt: String::new(),
             turn_count: 0,
             created_at: 0,
@@ -9215,6 +9303,7 @@ mod tests {
             state: "active".to_string(),
             provider_session_id: String::new(),
             last_error: String::new(),
+            user_error: None,
             last_message_excerpt: String::new(),
             turn_count: 0,
             created_at: 0,
@@ -11005,6 +11094,7 @@ mod tests {
             state: "active".to_string(),
             provider_session_id: String::new(),
             last_error: String::new(),
+            user_error: None,
             last_message_excerpt: String::new(),
             turn_count: 0,
             created_at: 0,
@@ -11296,25 +11386,85 @@ for line in sys.stdin:
         let records_serialized = serde_json::to_string(&records).expect("records serialize");
         assert!(!records_serialized.contains("phase6-vault-token"));
 
+        let mut env_record = record.clone();
+        env_record.id = "mcp.env-legacy".to_string();
+        env_record.auth_kind = "bearer_env".to_string();
+        env_record.auth_ref = "NUCLEUS_TEST_PHASE6_MCP_TOKEN".to_string();
+        state
+            .store
+            .upsert_mcp_server_record(&env_record, &[], &[])
+            .expect("legacy env mcp record persists");
         unsafe {
             env::set_var("NUCLEUS_TEST_PHASE6_MCP_TOKEN", "phase6-vault-token");
         }
+        let env_discovery =
+            discover_mcp_server_tools(State(state.clone()), Path(env_record.id.clone()))
+                .await
+                .expect_err("env bearer discovery fails closed even when env var exists");
+        assert_eq!(env_discovery.status, StatusCode::BAD_REQUEST);
+        assert!(env_discovery.message.contains("auth_migration_required"));
+        let stored_env_record = state
+            .store
+            .list_mcp_server_records()
+            .expect("records load")
+            .into_iter()
+            .find(|row| row.id == env_record.id)
+            .expect("legacy env record exists");
+        assert_eq!(stored_env_record.sync_status, "auth_migration_required");
+
         let env_result = mcp_http_request(
             &state,
-            &McpServerRecord {
-                auth_kind: "bearer_env".to_string(),
-                auth_ref: "NUCLEUS_TEST_PHASE6_MCP_TOKEN".to_string(),
-                ..record.clone()
-            },
+            &env_record,
             json!({"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}),
             None,
         )
         .await
-        .expect("bearer_env fallback still works");
-        assert_eq!(env_result["tools"][0]["name"], "lookup");
+        .expect_err("env bearer request fails closed even when env var exists");
+        assert!(env_result.to_string().contains("auth_migration_required"));
         unsafe {
             env::remove_var("NUCLEUS_TEST_PHASE6_MCP_TOKEN");
         }
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn mcp_api_rejects_env_bearer_and_normalizes_simple_vault_refs() {
+        let (state_dir, state) = test_named_app_state("mcp-auth-validation");
+
+        let rejected = upsert_mcp_server(
+            State(state.clone()),
+            Bytes::from(
+                r#"{"id":"mcp.env","title":"Env MCP","enabled":true,"transport":"streamable-http","url":"https://example.test/mcp","auth_kind":"env_bearer","auth_ref":"MCP_TOKEN"}"#,
+            ),
+        )
+        .await
+        .expect_err("env bearer writes are rejected");
+        assert_eq!(rejected.status, StatusCode::BAD_REQUEST);
+        assert!(rejected.message.contains("auth_migration_required"));
+
+        let saved = upsert_mcp_server(
+            State(state.clone()),
+            Bytes::from(
+                r#"{"id":"mcp.vault","title":"Vault MCP","enabled":true,"transport":"streamable-http","url":"https://example.test/mcp","auth_kind":"vault_bearer","auth_ref":"MCP_TOKEN"}"#,
+            ),
+        )
+        .await
+        .expect("simple Vault auth ref writes")
+        .0;
+        assert_eq!(saved.auth_kind, "vault_bearer");
+        assert_eq!(saved.auth_ref, "vault://workspace/MCP_TOKEN");
+
+        let malformed_ref = upsert_mcp_server(
+            State(state.clone()),
+            Bytes::from(
+                r#"{"id":"mcp.bad-vault-ref","title":"Bad Vault MCP","enabled":true,"transport":"streamable-http","url":"https://example.test/mcp","auth_kind":"vault_bearer","auth_ref":"vault://project//MCP_TOKEN"}"#,
+            ),
+        )
+        .await
+        .expect_err("malformed Vault refs are rejected");
+        assert_eq!(malformed_ref.status, StatusCode::BAD_REQUEST);
+        assert!(malformed_ref.message.contains("vault secret name"));
+
         let _ = fs::remove_dir_all(&state_dir);
     }
 

@@ -244,6 +244,11 @@ pub struct JobPatch {
     pub visible_turn_id: Option<String>,
     pub result_summary: Option<String>,
     pub last_error: Option<String>,
+    pub ui_renderable: Option<String>,
+    pub browser_verification_required: Option<bool>,
+    pub browser_verification_status: Option<String>,
+    pub browser_verification_summary: Option<String>,
+    pub browser_verification_artifact_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2087,6 +2092,12 @@ impl StateStore {
     pub fn update_job(&self, job_id: &str, patch: JobPatch) -> Result<JobSummary> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         let current = load_job_summary(&connection, job_id)?;
+        let next_browser_verification_artifact_ids_json = serde_json::to_string(
+            &patch
+                .browser_verification_artifact_ids
+                .unwrap_or(current.browser_verification_artifact_ids),
+        )
+        .context("failed to serialize browser verification artifact ids")?;
         connection.execute(
             "
             UPDATE jobs
@@ -2096,6 +2107,11 @@ impl StateStore {
                 visible_turn_id = ?4,
                 result_summary = ?5,
                 last_error = ?6,
+                ui_renderable = ?7,
+                browser_verification_required = ?8,
+                browser_verification_status = ?9,
+                browser_verification_summary = ?10,
+                browser_verification_artifact_ids_json = ?11,
                 updated_at = unixepoch()
             WHERE id = ?1
             ",
@@ -2106,6 +2122,17 @@ impl StateStore {
                 patch.visible_turn_id.or(current.visible_turn_id),
                 patch.result_summary.unwrap_or(current.result_summary),
                 patch.last_error.unwrap_or(current.last_error),
+                patch.ui_renderable.unwrap_or(current.ui_renderable),
+                patch
+                    .browser_verification_required
+                    .unwrap_or(current.browser_verification_required),
+                patch
+                    .browser_verification_status
+                    .unwrap_or(current.browser_verification_status),
+                patch
+                    .browser_verification_summary
+                    .unwrap_or(current.browser_verification_summary),
+                next_browser_verification_artifact_ids_json,
             ],
         )?;
 
@@ -2826,6 +2853,11 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             visible_turn_id TEXT,
             result_summary TEXT NOT NULL DEFAULT '',
             last_error TEXT NOT NULL DEFAULT '',
+            ui_renderable TEXT NOT NULL DEFAULT 'unknown',
+            browser_verification_required INTEGER NOT NULL DEFAULT 0,
+            browser_verification_status TEXT NOT NULL DEFAULT 'not_required',
+            browser_verification_summary TEXT NOT NULL DEFAULT '',
+            browser_verification_artifact_ids_json TEXT NOT NULL DEFAULT '[]',
             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
@@ -3658,6 +3690,36 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "command_session_id",
         "TEXT REFERENCES command_sessions(id) ON DELETE SET NULL",
     )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "ui_renderable",
+        "TEXT NOT NULL DEFAULT 'unknown'",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "browser_verification_required",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "browser_verification_status",
+        "TEXT NOT NULL DEFAULT 'not_required'",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "browser_verification_summary",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "browser_verification_artifact_ids_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
 
     for (column, definition) in [
         ("source_kind", "TEXT NOT NULL DEFAULT 'manual'"),
@@ -4049,20 +4111,20 @@ fn migrate_mcp_remote_bridge_records(connection: &Connection) -> Result<()> {
         (
             "cloudflare-api",
             "https://mcp.cloudflare.com/mcp",
-            "bearer_env",
-            "CLOUDFLARE_API_TOKEN",
+            "vault_bearer",
+            "vault://workspace/CLOUDFLARE_API_TOKEN",
         ),
         (
             "cloudflare-bindings",
             "https://bindings.mcp.cloudflare.com/mcp",
-            "bearer_env",
-            "CLOUDFLARE_API_TOKEN",
+            "vault_bearer",
+            "vault://workspace/CLOUDFLARE_API_TOKEN",
         ),
         (
             "cloudflare-builds",
             "https://builds.mcp.cloudflare.com/mcp",
-            "bearer_env",
-            "CLOUDFLARE_API_TOKEN",
+            "vault_bearer",
+            "vault://workspace/CLOUDFLARE_API_TOKEN",
         ),
         (
             "cloudflare-docs",
@@ -4073,22 +4135,22 @@ fn migrate_mcp_remote_bridge_records(connection: &Connection) -> Result<()> {
         (
             "cloudflare-observability",
             "https://observability.mcp.cloudflare.com/mcp",
-            "bearer_env",
-            "CLOUDFLARE_API_TOKEN",
+            "vault_bearer",
+            "vault://workspace/CLOUDFLARE_API_TOKEN",
         ),
         ("context7", "https://mcp.context7.com/mcp", "none", ""),
         ("emdash-docs", "https://docs.emdashcms.com/mcp", "none", ""),
         (
             "supabase",
             "https://mcp.supabase.com/mcp",
-            "bearer_env",
-            "SUPABASE_ACCESS_TOKEN",
+            "vault_bearer",
+            "vault://workspace/SUPABASE_ACCESS_TOKEN",
         ),
         (
             "vercel",
             "https://mcp.vercel.com",
-            "bearer_env",
-            "VERCEL_TOKEN",
+            "vault_bearer",
+            "vault://workspace/VERCEL_TOKEN",
         ),
     ];
     for (id, url, auth_kind, auth_ref) in known {
@@ -4102,8 +4164,8 @@ fn migrate_mcp_remote_bridge_records(connection: &Connection) -> Result<()> {
                 auth_kind = ?3,
                 auth_ref = ?4,
                 headers_json = COALESCE(NULLIF(headers_json, ''), '{}'),
-                sync_status = CASE WHEN ?3 = 'none' THEN 'pending' ELSE 'missing_credentials' END,
-                last_error = CASE WHEN ?3 = 'none' THEN '' ELSE 'missing_credentials: configure native MCP credentials' END,
+                sync_status = CASE WHEN ?3 = 'none' THEN 'pending' ELSE 'vault_secret_missing' END,
+                last_error = CASE WHEN ?3 = 'none' THEN '' ELSE 'vault_secret_missing: create the suggested Vault secret and allow this MCP server to read it' END,
                 updated_at = unixepoch()
             WHERE id = ?1
               AND transport = 'stdio'
@@ -5945,6 +6007,7 @@ fn map_session_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionS
         state: row.get(30)?,
         provider_session_id: row.get(31)?,
         last_error: row.get(32)?,
+        user_error: None,
         last_message_excerpt: row.get(33)?,
         turn_count: row.get(34)?,
         created_at: row.get(35)?,
@@ -6436,6 +6499,11 @@ fn load_job_summary(connection: &Connection, job_id: &str) -> Result<JobSummary>
                 visible_turn_id,
                 result_summary,
                 last_error,
+                ui_renderable,
+                browser_verification_required,
+                browser_verification_status,
+                browser_verification_summary,
+                browser_verification_artifact_ids_json,
                 created_at,
                 updated_at
             FROM jobs
@@ -6480,11 +6548,17 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         visible_turn_id: row.get(11)?,
         result_summary: row.get(12)?,
         last_error: row.get(13)?,
+        user_error: None,
+        ui_renderable: row.get(14)?,
+        browser_verification_required: row.get(15)?,
+        browser_verification_status: row.get(16)?,
+        browser_verification_summary: row.get(17)?,
+        browser_verification_artifact_ids: decode_string_list(row.get::<_, String>(18)?)?,
         worker_count: 0,
         pending_approval_count: 0,
         artifact_count: 0,
-        created_at: row.get(14)?,
-        updated_at: row.get(15)?,
+        created_at: row.get(19)?,
+        updated_at: row.get(20)?,
     })
 }
 
@@ -6619,6 +6693,7 @@ fn load_worker_summary(connection: &Connection, worker_id: &str) -> Result<Worke
                     step_count: row.get::<_, i64>(17)?.max(0) as usize,
                     tool_call_count: row.get::<_, i64>(18)?.max(0) as usize,
                     last_error: row.get(19)?,
+                    user_error: None,
                     capabilities: Vec::new(),
                     created_at: row.get(20)?,
                     updated_at: row.get(21)?,
@@ -8313,6 +8388,11 @@ mod tests {
 
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].id, "root-job");
+        assert_eq!(jobs[0].ui_renderable, "unknown");
+        assert!(!jobs[0].browser_verification_required);
+        assert_eq!(jobs[0].browser_verification_status, "not_required");
+        assert!(jobs[0].browser_verification_summary.is_empty());
+        assert!(jobs[0].browser_verification_artifact_ids.is_empty());
 
         let _ = fs::remove_dir_all(&state_dir);
     }

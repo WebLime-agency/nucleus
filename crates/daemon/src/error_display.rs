@@ -1,0 +1,437 @@
+use nucleus_protocol::UserFacingErrorSummary;
+use serde_json::Value;
+
+const OPEN_PROFILES: &str = "open_profiles";
+const RETRY_JOB: &str = "retry_job";
+const CANCEL_JOB: &str = "cancel_job";
+const OPEN_JOB_DETAILS: &str = "open_job_details";
+
+pub(crate) fn classify_user_error(detail: &str) -> Option<UserFacingErrorSummary> {
+    let detail = detail.trim();
+    if detail.is_empty() {
+        return None;
+    }
+
+    let signal = ErrorSignal::from_detail(detail);
+    let lower = signal.combined_lowercase();
+
+    if contains_missing_credential(&lower) && contains_model_provider_context(&lower) {
+        return Some(model_credentials_missing(detail));
+    }
+
+    if contains_invalid_credential(&lower) && contains_model_provider_context(&lower) {
+        return Some(model_credentials_invalid(detail));
+    }
+
+    if contains_auth_failure(&lower) && contains_model_provider_context(&lower) {
+        return Some(model_provider_auth_failed(detail));
+    }
+
+    if lower.contains("openai-compatible sessions require a base url")
+        || lower.contains("model base url is required for openai-compatible adapters")
+    {
+        return Some(model_config_incomplete(
+            detail,
+            "Nucleus needs an OpenAI-compatible base URL before it can run this session.",
+        ));
+    }
+
+    if lower.contains("openai-compatible sessions require a model name")
+        || lower.contains("model name is required for openai-compatible adapters")
+    {
+        return Some(model_config_incomplete(
+            detail,
+            "Nucleus needs a model name before it can run this session.",
+        ));
+    }
+
+    if lower.contains("unknown workspace profile")
+        || lower.contains("workspace profile") && lower.contains("was not found")
+    {
+        return Some(model_profile_missing(detail));
+    }
+
+    if lower.contains("failed to reach the openai-compatible endpoint")
+        || (contains_endpoint_unreachable(&lower) && contains_model_provider_context(&lower))
+    {
+        return Some(model_endpoint_unreachable(detail));
+    }
+
+    None
+}
+
+fn model_credentials_missing(detail: &str) -> UserFacingErrorSummary {
+    UserFacingErrorSummary {
+        code: "model_credentials_missing".to_string(),
+        title: "Nucleus needs model credentials".to_string(),
+        message:
+            "Set up your Base model and Utility model credentials in Profiles, then retry this job."
+                .to_string(),
+        actions: model_setup_actions(),
+        technical_detail: redact_likely_secret_tokens(detail),
+    }
+}
+
+fn model_credentials_invalid(detail: &str) -> UserFacingErrorSummary {
+    UserFacingErrorSummary {
+        code: "model_credentials_invalid".to_string(),
+        title: "Model credentials were rejected".to_string(),
+        message:
+            "Check the Base model and Utility model credentials in Profiles, then retry this job."
+                .to_string(),
+        actions: model_setup_actions(),
+        technical_detail: redact_likely_secret_tokens(detail),
+    }
+}
+
+fn model_provider_auth_failed(detail: &str) -> UserFacingErrorSummary {
+    UserFacingErrorSummary {
+        code: "model_provider_auth_failed".to_string(),
+        title: "The model provider rejected the request".to_string(),
+        message:
+            "Check the selected profile credentials for the Base model and Utility model, then retry this job."
+                .to_string(),
+        actions: model_setup_actions(),
+        technical_detail: redact_likely_secret_tokens(detail),
+    }
+}
+
+fn model_profile_missing(detail: &str) -> UserFacingErrorSummary {
+    UserFacingErrorSummary {
+        code: "model_profile_missing".to_string(),
+        title: "The selected model profile is missing".to_string(),
+        message:
+            "Choose or recreate the Base and Utility model profile in Profiles, then retry this job."
+                .to_string(),
+        actions: model_setup_actions(),
+        technical_detail: redact_likely_secret_tokens(detail),
+    }
+}
+
+fn model_config_incomplete(detail: &str, lead: &str) -> UserFacingErrorSummary {
+    UserFacingErrorSummary {
+        code: "model_config_incomplete".to_string(),
+        title: "Model profile setup is incomplete".to_string(),
+        message: format!(
+            "{lead} Update your Base model and Utility model in Profiles, then retry this job."
+        ),
+        actions: model_setup_actions(),
+        technical_detail: redact_likely_secret_tokens(detail),
+    }
+}
+
+fn model_endpoint_unreachable(detail: &str) -> UserFacingErrorSummary {
+    UserFacingErrorSummary {
+        code: "model_endpoint_unreachable".to_string(),
+        title: "Nucleus could not reach the model endpoint".to_string(),
+        message:
+            "Check the profile base URL for the Base model and Utility model, then retry this job."
+                .to_string(),
+        actions: model_setup_actions(),
+        technical_detail: redact_likely_secret_tokens(detail),
+    }
+}
+
+fn model_setup_actions() -> Vec<String> {
+    [OPEN_PROFILES, RETRY_JOB, CANCEL_JOB, OPEN_JOB_DETAILS]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn redact_likely_secret_tokens(detail: &str) -> String {
+    map_non_whitespace_runs(detail, |token| {
+        let trimmed = token.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '"' | '\'' | ',' | ':' | ';' | ')' | '(' | ']' | '[' | '}' | '{'
+            )
+        });
+        if is_likely_secret_token(trimmed) {
+            token.replace(trimmed, "[REDACTED_SECRET]")
+        } else {
+            token.to_string()
+        }
+    })
+}
+
+fn map_non_whitespace_runs<F>(input: &str, mut mapper: F) -> String
+where
+    F: FnMut(&str) -> String,
+{
+    let mut output = String::with_capacity(input.len());
+    let mut token_start = None;
+    for (index, character) in input.char_indices() {
+        if character.is_whitespace() {
+            if let Some(start) = token_start.take() {
+                output.push_str(&mapper(&input[start..index]));
+            }
+            output.push(character);
+        } else if token_start.is_none() {
+            token_start = Some(index);
+        }
+    }
+    if let Some(start) = token_start {
+        output.push_str(&mapper(&input[start..]));
+    }
+    output
+}
+
+fn is_likely_secret_token(token: &str) -> bool {
+    let lower = token.to_lowercase();
+    token.len() >= 10
+        && (lower.starts_with("sk-")
+            || lower.starts_with("sk_")
+            || lower.starts_with("xox")
+            || lower.starts_with("ghp_")
+            || lower.starts_with("github_pat_"))
+}
+
+fn contains_missing_credential(lower: &str) -> bool {
+    lower.contains("missing api key")
+        || lower.contains("api key missing")
+        || lower.contains("no api key")
+}
+
+fn contains_invalid_credential(lower: &str) -> bool {
+    lower.contains("invalid_api_key")
+        || lower.contains("invalid api key")
+        || lower.contains("incorrect api key")
+        || lower.contains("api key is invalid")
+}
+
+fn contains_auth_failure(lower: &str) -> bool {
+    lower.contains("authentication_error")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("http 401")
+        || lower.contains("http 403")
+        || lower.contains("status 401")
+        || lower.contains("status 403")
+}
+
+fn contains_endpoint_unreachable(lower: &str) -> bool {
+    lower.contains("connection refused")
+        || lower.contains("dns error")
+        || lower.contains("timed out")
+}
+
+fn contains_model_provider_context(lower: &str) -> bool {
+    lower.contains("openai-compatible")
+        || lower.contains("model provider")
+        || lower.contains("model endpoint")
+        || lower.contains("model credential")
+        || lower.contains("base model")
+        || lower.contains("utility model")
+}
+
+#[derive(Debug)]
+struct ErrorSignal {
+    detail: String,
+    json_text: String,
+}
+
+impl ErrorSignal {
+    fn from_detail(detail: &str) -> Self {
+        let json_text = extract_json_value(detail)
+            .map(|value| flatten_json_strings(&value).join(" "))
+            .unwrap_or_default();
+        Self {
+            detail: detail.to_string(),
+            json_text,
+        }
+    }
+
+    fn combined_lowercase(&self) -> String {
+        format!("{} {}", self.detail, self.json_text).to_lowercase()
+    }
+}
+
+fn extract_json_value(detail: &str) -> Option<Value> {
+    let start = detail
+        .char_indices()
+        .find_map(|(index, character)| matches!(character, '{' | '[').then_some(index))?;
+    serde_json::from_str(&detail[start..]).ok()
+}
+
+fn flatten_json_strings(value: &Value) -> Vec<String> {
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .flat_map(|(key, value)| {
+                let mut values = vec![key.clone()];
+                values.extend(flatten_json_strings(value));
+                values
+            })
+            .collect(),
+        Value::Array(items) => items.iter().flat_map(flatten_json_strings).collect(),
+        Value::String(value) => vec![value.clone()],
+        Value::Number(value) => vec![value.to_string()],
+        Value::Bool(value) => vec![value.to_string()],
+        Value::Null => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_exact_missing_api_key_issue_example() {
+        let raw = r#"OpenAI-compatible endpoint failed: {"error":{"message":"Missing API key","type":"authentication_error","code":"invalid_api_key"}}"#;
+
+        let summary = classify_user_error(raw).expect("error should classify");
+
+        assert_eq!(summary.code, "model_credentials_missing");
+        assert!(summary.title.contains("model credentials"));
+        assert!(summary.message.contains("Base model"));
+        assert!(summary.message.contains("Utility model"));
+        assert!(summary.actions.iter().any(|action| action == OPEN_PROFILES));
+        assert!(summary.actions.iter().any(|action| action == RETRY_JOB));
+        assert_eq!(summary.technical_detail, raw);
+        assert!(!summary.title.contains('{'));
+        assert!(!summary.message.contains("invalid_api_key"));
+    }
+
+    #[test]
+    fn classifies_401_auth_json() {
+        let raw = r#"OpenAI-compatible endpoint failed (HTTP 401): {"error":{"message":"Authentication failed","type":"authentication_error"}}"#;
+
+        let summary = classify_user_error(raw).expect("error should classify");
+
+        assert_eq!(summary.code, "model_provider_auth_failed");
+        assert!(summary.message.contains("profile"));
+        assert_eq!(summary.technical_detail, raw);
+    }
+
+    #[test]
+    fn classifies_403_auth_json() {
+        let raw =
+            r#"OpenAI-compatible endpoint failed (HTTP 403): {"error":{"message":"Forbidden"}}"#;
+
+        let summary = classify_user_error(raw).expect("error should classify");
+
+        assert_eq!(summary.code, "model_provider_auth_failed");
+        assert!(summary.actions.iter().any(|action| action == CANCEL_JOB));
+    }
+
+    #[test]
+    fn does_not_classify_unrelated_http_forbidden_as_model_credentials() {
+        let raw = "GitHub API request failed: HTTP 403 forbidden";
+
+        assert!(classify_user_error(raw).is_none());
+    }
+
+    #[test]
+    fn does_not_classify_unrelated_unauthorized_tool_failure_as_model_credentials() {
+        let raw = "tool call failed: unauthorized to read the requested resource";
+
+        assert!(classify_user_error(raw).is_none());
+    }
+
+    #[test]
+    fn does_not_classify_unrelated_missing_api_key_service_failure_as_model_credentials() {
+        let raw = "GitHub API request failed: missing API key";
+
+        assert!(classify_user_error(raw).is_none());
+    }
+
+    #[test]
+    fn does_not_classify_unrelated_invalid_api_key_service_failure_as_model_credentials() {
+        let raw = r#"tool call failed: {"error":"invalid_api_key"}"#;
+
+        assert!(classify_user_error(raw).is_none());
+    }
+
+    #[test]
+    fn does_not_classify_unrelated_timed_out_tool_failure_as_model_endpoint() {
+        let raw = "HTTP tool call timed out after 30 seconds";
+
+        assert!(classify_user_error(raw).is_none());
+    }
+
+    #[test]
+    fn does_not_classify_unrelated_connection_refused_tool_failure_as_model_endpoint() {
+        let raw = "tool call failed: connection refused";
+
+        assert!(classify_user_error(raw).is_none());
+    }
+
+    #[test]
+    fn does_not_classify_unrelated_endpoint_failed_transport_error_as_model_endpoint() {
+        let raw = "HTTP endpoint failed: connection refused";
+
+        assert!(classify_user_error(raw).is_none());
+    }
+
+    #[test]
+    fn classifies_model_endpoint_timeout_with_provider_context() {
+        let raw = "OpenAI-compatible endpoint failed: request timed out";
+
+        let summary = classify_user_error(raw).expect("error should classify");
+
+        assert_eq!(summary.code, "model_endpoint_unreachable");
+        assert!(summary.message.contains("base URL"));
+    }
+
+    #[test]
+    fn classifies_missing_openai_base_url() {
+        let raw = "OpenAI-compatible sessions require a base URL";
+
+        let summary = classify_user_error(raw).expect("error should classify");
+
+        assert_eq!(summary.code, "model_config_incomplete");
+        assert!(summary.message.contains("base URL"));
+        assert!(summary.message.contains("Profiles"));
+    }
+
+    #[test]
+    fn classifies_missing_openai_model_name() {
+        let raw = "OpenAI-compatible sessions require a model name";
+
+        let summary = classify_user_error(raw).expect("error should classify");
+
+        assert_eq!(summary.code, "model_config_incomplete");
+        assert!(summary.message.contains("model name"));
+        assert!(summary.message.contains("Profiles"));
+    }
+
+    #[test]
+    fn friendly_copy_does_not_include_raw_json_or_secret_values() {
+        let raw = r#"OpenAI-compatible endpoint failed (HTTP 401): {"error":{"message":"invalid_api_key sk-test-secret","type":"authentication_error","code":"invalid_api_key"}}"#;
+
+        let summary = classify_user_error(raw).expect("error should classify");
+
+        assert_eq!(summary.code, "model_credentials_invalid");
+        assert!(!summary.title.contains("sk-test-secret"));
+        assert!(!summary.message.contains("sk-test-secret"));
+        assert!(!summary.title.contains('{'));
+        assert!(!summary.message.contains('{'));
+        assert!(!summary.technical_detail.contains("sk-test-secret"));
+        assert!(summary.technical_detail.contains("[REDACTED_SECRET]"));
+    }
+
+    #[test]
+    fn technical_detail_redaction_preserves_original_whitespace_without_secrets() {
+        let raw = "failed to reach the OpenAI-compatible endpoint:\n  first line\n\n  second  line";
+
+        let summary = classify_user_error(raw).expect("error should classify");
+
+        assert_eq!(summary.code, "model_endpoint_unreachable");
+        assert_eq!(summary.technical_detail, raw);
+    }
+
+    #[test]
+    fn technical_detail_redaction_preserves_original_whitespace_around_secret_tokens() {
+        let raw =
+            "OpenAI-compatible endpoint failed:\n  invalid_api_key sk-test-secret\n\ttry again";
+
+        let summary = classify_user_error(raw).expect("error should classify");
+
+        assert_eq!(summary.code, "model_credentials_invalid");
+        assert_eq!(
+            summary.technical_detail,
+            "OpenAI-compatible endpoint failed:\n  invalid_api_key [REDACTED_SECRET]\n\ttry again"
+        );
+    }
+}
