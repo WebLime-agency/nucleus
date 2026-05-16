@@ -100,6 +100,45 @@ From Settings:
 
 For managed releases, the apply path downloads the selected channel artifact, verifies checksum and size, stages the release, atomically moves `current`, records `previous`, and restarts onto `current/bin/nucleus-daemon`.
 
+## Local Tokens
+
+Installed users should not need to inspect systemd units to find the state directory for a token.
+List local Nucleus instances:
+
+```bash
+nucleus instances
+```
+
+Then retrieve the token for the intended instance:
+
+```bash
+nucleus auth local-token --instance nucleus-dev-projects
+```
+
+The selector can also be a local URL:
+
+```bash
+nucleus auth local-token --url http://127.0.0.1:5202
+```
+
+Token discovery commands never print tokens from broad instance listing. If multiple instances are
+installed and no selector is provided, the CLI prints the matching instances and exact selector
+commands instead of guessing.
+
+To rotate one instance token:
+
+```bash
+nucleus auth rotate-token --instance nucleus-dev-projects
+```
+
+The new token is printed once. Existing browser and client sessions using the old token must
+reconnect or re-authenticate. The explicit state-dir form remains supported for operator workflows:
+
+```bash
+nucleus --state-dir <state-dir> auth local-token
+nucleus --state-dir <state-dir> auth rotate-token
+```
+
 ## Recovery
 
 If an update staged successfully but the new Nucleus process does not come back:
