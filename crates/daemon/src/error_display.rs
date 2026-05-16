@@ -205,7 +205,6 @@ fn contains_model_provider_context(lower: &str) -> bool {
         || lower.contains("model credential")
         || lower.contains("base model")
         || lower.contains("utility model")
-        || lower.contains("endpoint failed")
 }
 
 #[derive(Debug)]
@@ -336,6 +335,13 @@ mod tests {
     #[test]
     fn does_not_classify_unrelated_connection_refused_tool_failure_as_model_endpoint() {
         let raw = "tool call failed: connection refused";
+
+        assert!(classify_user_error(raw).is_none());
+    }
+
+    #[test]
+    fn does_not_classify_unrelated_endpoint_failed_transport_error_as_model_endpoint() {
+        let raw = "HTTP endpoint failed: connection refused";
 
         assert!(classify_user_error(raw).is_none());
     }
