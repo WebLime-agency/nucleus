@@ -31,6 +31,7 @@
   let error = $state<string | null>(null);
   let category = $state('all');
   let severity = $state<SeverityFilter>('all');
+  let loadRequestId = 0;
 
   let records = $derived(response?.records ?? []);
   let categories = $derived(response?.categories ?? []);
@@ -49,6 +50,10 @@
   });
 
   async function loadLogs(silent = false) {
+    const requestId = ++loadRequestId;
+    const nextCategory = category === 'all' ? undefined : category;
+    const nextLevel = severity === 'all' ? undefined : severity;
+
     if (!silent) {
       loading = response === null;
     }
@@ -56,15 +61,19 @@
     refreshing = silent;
 
     try {
-      response = await fetchInstanceLogs({
-        category: category === 'all' ? undefined : category,
-        level: severity === 'all' ? undefined : severity,
+      const nextResponse = await fetchInstanceLogs({
+        category: nextCategory,
+        level: nextLevel,
         limit: 150
       });
+      if (requestId !== loadRequestId) return;
+      response = nextResponse;
       error = null;
     } catch (cause) {
+      if (requestId !== loadRequestId) return;
       error = cause instanceof Error ? cause.message : 'Failed to read instance logs.';
     } finally {
+      if (requestId !== loadRequestId) return;
       loading = false;
       refreshing = false;
     }

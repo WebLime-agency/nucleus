@@ -594,6 +594,7 @@ impl StoragePlan {
 pub struct StateStore {
     plan: StoragePlan,
     connection: Mutex<Connection>,
+    instance_log_jsonl: Mutex<()>,
 }
 
 impl StateStore {
@@ -630,6 +631,7 @@ impl StateStore {
         Ok(Self {
             plan,
             connection: Mutex::new(connection),
+            instance_log_jsonl: Mutex::new(()),
         })
     }
 
@@ -1935,6 +1937,10 @@ impl StateStore {
         )?;
         drop(connection);
 
+        let _jsonl_guard = self
+            .instance_log_jsonl
+            .lock()
+            .expect("instance log JSONL mutex poisoned");
         append_instance_log_jsonl(&self.plan.logs_dir, &entry)?;
         Ok(entry)
     }
@@ -7259,7 +7265,7 @@ mod tests {
     use rusqlite::Connection;
     use std::{
         env, fs,
-        sync::Mutex,
+        sync::{Arc, Mutex},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -7397,6 +7403,55 @@ mod tests {
             .expect("second page should list");
         assert_eq!(second_page.len(), 1);
         assert_eq!(second_page[0].event, "event.0");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn concurrent_instance_log_writes_keep_jsonl_parseable() {
+        let state_dir = test_state_dir("instance-logs-concurrent-jsonl");
+        let store =
+            Arc::new(StateStore::initialize_at(&state_dir).expect("store should initialize"));
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_secs() as i64;
+        let thread_count = 8;
+        let logs_per_thread = 12;
+
+        let handles = (0..thread_count)
+            .map(|thread_index| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    for log_index in 0..logs_per_thread {
+                        store
+                            .append_instance_log(InstanceLogRecord {
+                                timestamp,
+                                level: "info".to_string(),
+                                category: "system".to_string(),
+                                source: "test".to_string(),
+                                event: format!("event.{thread_index}.{log_index}"),
+                                message: "concurrent write".to_string(),
+                                related_ids: serde_json::json!({}),
+                                metadata: serde_json::json!({}),
+                            })
+                            .expect("log should persist");
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().expect("writer thread should finish");
+        }
+
+        let jsonl = fs::read_to_string(state_dir.join("logs/events.jsonl"))
+            .expect("JSONL log file should read");
+        let lines = jsonl.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), thread_count * logs_per_thread);
+        for line in lines {
+            serde_json::from_str::<InstanceLogEntry>(line).expect("JSONL line should parse");
+        }
 
         let _ = fs::remove_dir_all(&state_dir);
     }
