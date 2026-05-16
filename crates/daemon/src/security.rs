@@ -54,6 +54,7 @@ impl RedactionSet {
     pub fn redact_text(&self, input: &str) -> String {
         let mut redacted = redact_pem_blocks(input);
         redacted = redact_urls_with_credentials(&redacted);
+        redacted = redact_likely_secret_tokens(&redacted);
         for secret in &self.exact_values {
             redacted = redacted.replace(secret, REDACTED);
         }
@@ -403,6 +404,42 @@ fn redact_url_token(token: &str) -> String {
     format!("{prefix}{url}{suffix}")
 }
 
+fn redact_likely_secret_tokens(input: &str) -> String {
+    input
+        .split_whitespace()
+        .map(|token| {
+            let trimmed = token.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    '"' | '\'' | ',' | ':' | ';' | ')' | '(' | ']' | '[' | '}' | '{'
+                )
+            });
+            if contains_likely_secret_token(trimmed) {
+                token.replace(trimmed, REDACTED)
+            } else {
+                token.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn contains_likely_secret_token(token: &str) -> bool {
+    token
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+        .any(is_likely_secret_token)
+}
+
+fn is_likely_secret_token(token: &str) -> bool {
+    let lower = token.to_lowercase();
+    token.len() >= 10
+        && (lower.starts_with("sk-")
+            || lower.starts_with("sk_")
+            || lower.starts_with("xox")
+            || lower.starts_with("ghp_")
+            || lower.starts_with("github_pat_"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,5 +553,17 @@ mod tests {
         assert!(!redacted.contains("user:pass"));
         assert!(!redacted.contains("abc"));
         assert!(redacted.contains(REDACTED));
+    }
+
+    #[test]
+    fn redacts_likely_secret_tokens_in_text() {
+        let redactor = RedactionSet::new();
+        let text = r#"provider rejected key sk-test-secret in {"api_key":"ghp_exampletoken"}"#;
+
+        let redacted = redactor.redact_text(text);
+
+        assert!(!redacted.contains("sk-test-secret"));
+        assert!(!redacted.contains("ghp_exampletoken"));
+        assert!(redacted.matches(REDACTED).count() >= 2);
     }
 }
