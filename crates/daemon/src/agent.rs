@@ -3824,6 +3824,8 @@ fn publication_outcome_patch(
             .or_else(|| {
                 if pr_url.is_some() {
                     Some("opened".to_string())
+                } else if publication_text_says_opened(&normalized) {
+                    Some("opened".to_string())
                 } else if normalized.contains("publication failed")
                     || normalized.contains("pr failed")
                 {
@@ -3994,6 +3996,17 @@ fn is_publication_temp_path(path: &str) -> bool {
     first_component == ".tmp-playwright"
         || first_component.starts_with(".tmp-")
         || first_component.starts_with(".playwright-")
+}
+
+fn publication_text_says_opened(text: &str) -> bool {
+    [
+        "pull request opened",
+        "opened pull request",
+        "pr opened",
+        "opened pr",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 fn normalize_publication_status(value: &str) -> Option<String> {
@@ -4222,7 +4235,7 @@ fn publication_final_answer_has_required_facts(summary: &str, final_answer: &str
     .is_some()
         || normalized.contains("blocked_without_browser_verification")
         || normalized.contains("pr not opened")
-        || normalized.contains("pull request opened");
+        || publication_text_says_opened(&normalized);
     let has_validation =
         extract_labeled_value(&text, &["validation_status", "validation status"]).is_some();
     let has_browser = extract_labeled_value(
@@ -10668,6 +10681,22 @@ Cleanup paths: .tmp-playwright.",
 Validation status: passed\n\
 Browser verification status: not_performed\n\
 Cleanup status: clean"
+        ));
+    }
+
+    #[test]
+    fn publication_outcome_patch_treats_explicit_opened_text_as_opened() {
+        let job = test_publication_job_summary("publication-opened-text");
+        let final_answer = "Pull request opened.\n\
+Validation status: passed\n\
+Browser verification status: not_performed\n\
+Cleanup status: clean";
+        let patch = publication_outcome_patch(&job, "Pull request opened", final_answer, 6, 3);
+
+        assert_eq!(patch.publication_status.as_deref(), Some("opened"));
+        assert!(publication_final_answer_has_required_facts(
+            "Pull request opened",
+            final_answer
         ));
     }
 
