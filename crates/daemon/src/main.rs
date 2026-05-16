@@ -5367,7 +5367,11 @@ fn normalize_mcp_auth_kind_for_write(value: &str) -> Result<String, ApiError> {
 
 fn normalize_mcp_auth_ref_for_write(auth_kind: &str, value: &str) -> Result<String, ApiError> {
     let value = value.trim();
-    if auth_kind != "vault_bearer" || value.is_empty() || value.starts_with("vault://") {
+    if auth_kind != "vault_bearer" || value.is_empty() {
+        return Ok(value.to_string());
+    }
+    if value.starts_with("vault://") {
+        parse_vault_reference(value).map_err(|error| ApiError::bad_request(error.to_string()))?;
         return Ok(value.to_string());
     }
     let name = sanitize_registry_id(value, "vault secret name")?;
@@ -11386,6 +11390,17 @@ for line in sys.stdin:
         .0;
         assert_eq!(saved.auth_kind, "vault_bearer");
         assert_eq!(saved.auth_ref, "vault://workspace/MCP_TOKEN");
+
+        let malformed_ref = upsert_mcp_server(
+            State(state.clone()),
+            Bytes::from(
+                r#"{"id":"mcp.bad-vault-ref","title":"Bad Vault MCP","enabled":true,"transport":"streamable-http","url":"https://example.test/mcp","auth_kind":"vault_bearer","auth_ref":"vault://project//MCP_TOKEN"}"#,
+            ),
+        )
+        .await
+        .expect_err("malformed Vault refs are rejected");
+        assert_eq!(malformed_ref.status, StatusCode::BAD_REQUEST);
+        assert!(malformed_ref.message.contains("vault secret name"));
 
         let _ = fs::remove_dir_all(&state_dir);
     }

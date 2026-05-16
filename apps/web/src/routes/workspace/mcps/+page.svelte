@@ -142,6 +142,10 @@
       form.auth_ref = '';
       return;
     }
+    if (vaultScopeKind === 'project' && !vaultProjectId) {
+      form.auth_ref = '';
+      return;
+    }
     form.auth_ref = vaultScopeKind === 'project'
       ? `vault://project/${vaultProjectId}/${name}`
       : `vault://workspace/${name}`;
@@ -201,6 +205,9 @@
         throw new Error('This MCP uses legacy env bearer auth. Select bearer from Vault and choose a Vault secret before saving.');
       }
       normalizeVaultAuthRef();
+      if (form.auth_kind === 'vault_bearer' && vaultScopeKind === 'project' && vaultSecretName.trim() && !vaultProjectId) {
+        throw new Error('Select a project before saving a project-scoped Vault bearer secret.');
+      }
       await upsertMcpServer({ ...form, env_json: parseEnv(JSON.stringify(form.env_json)) });
       success = `Saved MCP server ${form.id}.`;
       resetForm();
