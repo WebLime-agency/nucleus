@@ -2916,13 +2916,7 @@ async fn mcp_http_request(
     match record.auth_kind.as_str() {
         "none" | "" => {}
         "bearer_env" | "env_bearer" => {
-            if record.auth_ref.trim().is_empty() {
-                bail!("missing_credentials: bearer token environment variable is not configured");
-            }
-            let token = std::env::var(record.auth_ref.trim()).map_err(|_| {
-                anyhow::anyhow!("missing_credentials: bearer token environment variable is not set")
-            })?;
-            req = req.bearer_auth(token);
+            bail!(MCP_ENV_BEARER_MIGRATION_MESSAGE);
         }
         "vault_bearer" => {
             let token = resolve_mcp_vault_bearer_token(state, record, project_context).await?;
@@ -2975,7 +2969,9 @@ async fn mcp_http_request(
 
 fn mcp_sync_status_for_error(message: &str) -> &'static str {
     let lower = message.to_ascii_lowercase();
-    if lower.contains("vault_locked") {
+    if lower.contains("auth_migration_required") {
+        "auth_migration_required"
+    } else if lower.contains("vault_locked") {
         "vault_locked"
     } else if lower.contains("vault_secret_missing") {
         "vault_secret_missing"
@@ -2995,6 +2991,8 @@ fn mcp_sync_status_for_error(message: &str) -> &'static str {
         "error"
     }
 }
+
+pub(crate) const MCP_ENV_BEARER_MIGRATION_MESSAGE: &str = "auth_migration_required: bearer env auth is no longer supported; move the token into Vault and select bearer from Vault";
 
 pub(crate) async fn resolve_mcp_vault_bearer_token(
     state: &AppState,
@@ -5342,6 +5340,8 @@ fn sanitize_skill_manifest(mut manifest: SkillManifest) -> Result<SkillManifest,
 fn sanitize_mcp_server(mut server: McpServerSummary) -> Result<McpServerSummary, ApiError> {
     server.id = sanitize_registry_id(&server.id, "MCP server id")?;
     server.title = required_trimmed(server.title, "MCP server title")?;
+    server.auth_kind = normalize_mcp_auth_kind_for_write(&server.auth_kind)?;
+    server.auth_ref = normalize_mcp_auth_ref_for_write(&server.auth_kind, &server.auth_ref)?;
     server.resources = sanitize_string_list(server.resources);
     server.tools = server
         .tools
@@ -5349,6 +5349,29 @@ fn sanitize_mcp_server(mut server: McpServerSummary) -> Result<McpServerSummary,
         .map(sanitize_tool_descriptor)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(server)
+}
+
+fn normalize_mcp_auth_kind_for_write(value: &str) -> Result<String, ApiError> {
+    let value = value.trim();
+    match value {
+        "" | "none" => Ok("none".to_string()),
+        "vault_bearer" | "static_headers" | "oauth" | "device" => Ok(value.to_string()),
+        "bearer_env" | "env_bearer" => Err(ApiError::bad_request(
+            "auth_migration_required: bearer env auth is no longer supported; move the token into Vault and select bearer from Vault",
+        )),
+        _ => Err(ApiError::bad_request(
+            "MCP auth_kind must be none, vault_bearer, static_headers, oauth, or device",
+        )),
+    }
+}
+
+fn normalize_mcp_auth_ref_for_write(auth_kind: &str, value: &str) -> Result<String, ApiError> {
+    let value = value.trim();
+    if auth_kind != "vault_bearer" || value.is_empty() || value.starts_with("vault://") {
+        return Ok(value.to_string());
+    }
+    let name = sanitize_registry_id(value, "vault secret name")?;
+    Ok(format!("vault://workspace/{name}"))
 }
 
 fn build_skill_package_record(
@@ -11296,25 +11319,74 @@ for line in sys.stdin:
         let records_serialized = serde_json::to_string(&records).expect("records serialize");
         assert!(!records_serialized.contains("phase6-vault-token"));
 
+        let mut env_record = record.clone();
+        env_record.id = "mcp.env-legacy".to_string();
+        env_record.auth_kind = "bearer_env".to_string();
+        env_record.auth_ref = "NUCLEUS_TEST_PHASE6_MCP_TOKEN".to_string();
+        state
+            .store
+            .upsert_mcp_server_record(&env_record, &[], &[])
+            .expect("legacy env mcp record persists");
         unsafe {
             env::set_var("NUCLEUS_TEST_PHASE6_MCP_TOKEN", "phase6-vault-token");
         }
+        let env_discovery =
+            discover_mcp_server_tools(State(state.clone()), Path(env_record.id.clone()))
+                .await
+                .expect_err("env bearer discovery fails closed even when env var exists");
+        assert_eq!(env_discovery.status, StatusCode::BAD_REQUEST);
+        assert!(env_discovery.message.contains("auth_migration_required"));
+        let stored_env_record = state
+            .store
+            .list_mcp_server_records()
+            .expect("records load")
+            .into_iter()
+            .find(|row| row.id == env_record.id)
+            .expect("legacy env record exists");
+        assert_eq!(stored_env_record.sync_status, "auth_migration_required");
+
         let env_result = mcp_http_request(
             &state,
-            &McpServerRecord {
-                auth_kind: "bearer_env".to_string(),
-                auth_ref: "NUCLEUS_TEST_PHASE6_MCP_TOKEN".to_string(),
-                ..record.clone()
-            },
+            &env_record,
             json!({"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}),
             None,
         )
         .await
-        .expect("bearer_env fallback still works");
-        assert_eq!(env_result["tools"][0]["name"], "lookup");
+        .expect_err("env bearer request fails closed even when env var exists");
+        assert!(env_result.to_string().contains("auth_migration_required"));
         unsafe {
             env::remove_var("NUCLEUS_TEST_PHASE6_MCP_TOKEN");
         }
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn mcp_api_rejects_env_bearer_and_normalizes_simple_vault_refs() {
+        let (state_dir, state) = test_named_app_state("mcp-auth-validation");
+
+        let rejected = upsert_mcp_server(
+            State(state.clone()),
+            Bytes::from(
+                r#"{"id":"mcp.env","title":"Env MCP","enabled":true,"transport":"streamable-http","url":"https://example.test/mcp","auth_kind":"env_bearer","auth_ref":"MCP_TOKEN"}"#,
+            ),
+        )
+        .await
+        .expect_err("env bearer writes are rejected");
+        assert_eq!(rejected.status, StatusCode::BAD_REQUEST);
+        assert!(rejected.message.contains("auth_migration_required"));
+
+        let saved = upsert_mcp_server(
+            State(state.clone()),
+            Bytes::from(
+                r#"{"id":"mcp.vault","title":"Vault MCP","enabled":true,"transport":"streamable-http","url":"https://example.test/mcp","auth_kind":"vault_bearer","auth_ref":"MCP_TOKEN"}"#,
+            ),
+        )
+        .await
+        .expect("simple Vault auth ref writes")
+        .0;
+        assert_eq!(saved.auth_kind, "vault_bearer");
+        assert_eq!(saved.auth_ref, "vault://workspace/MCP_TOKEN");
+
         let _ = fs::remove_dir_all(&state_dir);
     }
 
