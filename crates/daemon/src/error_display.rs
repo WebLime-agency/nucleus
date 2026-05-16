@@ -15,11 +15,11 @@ pub(crate) fn classify_user_error(detail: &str) -> Option<UserFacingErrorSummary
     let signal = ErrorSignal::from_detail(detail);
     let lower = signal.combined_lowercase();
 
-    if contains_missing_credential(&lower) {
+    if contains_missing_credential(&lower) && contains_model_provider_context(&lower) {
         return Some(model_credentials_missing(detail));
     }
 
-    if contains_invalid_credential(&lower) {
+    if contains_invalid_credential(&lower) && contains_model_provider_context(&lower) {
         return Some(model_credentials_invalid(detail));
     }
 
@@ -172,10 +172,9 @@ fn is_likely_secret_token(token: &str) -> bool {
 }
 
 fn contains_missing_credential(lower: &str) -> bool {
-    (lower.contains("missing api key")
+    lower.contains("missing api key")
         || lower.contains("api key missing")
-        || lower.contains("no api key"))
-        && contains_auth_context(lower)
+        || lower.contains("no api key")
 }
 
 fn contains_invalid_credential(lower: &str) -> bool {
@@ -203,14 +202,6 @@ fn contains_model_provider_context(lower: &str) -> bool {
         || lower.contains("base model")
         || lower.contains("utility model")
         || lower.contains("endpoint failed")
-        || lower.contains("api key")
-}
-
-fn contains_auth_context(lower: &str) -> bool {
-    lower.contains("auth")
-        || lower.contains("credential")
-        || lower.contains("api key")
-        || lower.contains("openai-compatible")
 }
 
 #[derive(Debug)]
@@ -313,6 +304,20 @@ mod tests {
     #[test]
     fn does_not_classify_unrelated_unauthorized_tool_failure_as_model_credentials() {
         let raw = "tool call failed: unauthorized to read the requested resource";
+
+        assert!(classify_user_error(raw).is_none());
+    }
+
+    #[test]
+    fn does_not_classify_unrelated_missing_api_key_service_failure_as_model_credentials() {
+        let raw = "GitHub API request failed: missing API key";
+
+        assert!(classify_user_error(raw).is_none());
+    }
+
+    #[test]
+    fn does_not_classify_unrelated_invalid_api_key_service_failure_as_model_credentials() {
+        let raw = r#"tool call failed: {"error":"invalid_api_key"}"#;
 
         assert!(classify_user_error(raw).is_none());
     }
