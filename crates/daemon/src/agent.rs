@@ -915,6 +915,7 @@ pub async fn start_prompt_job(
         state: "queued".to_string(),
         requested_by: "user".to_string(),
         prompt_excerpt: prompt_excerpt.clone(),
+        publication_intent_text: Some(visible_prompt.clone()),
     })?;
     let job = state.store.update_job(
         &job_id,
@@ -2923,6 +2924,7 @@ async fn create_child_job(
         state: "queued".to_string(),
         requested_by: "agent".to_string(),
         prompt_excerpt: excerpt(prompt, 160),
+        publication_intent_text: Some(prompt.to_string()),
     })?;
     let child_working_dir = working_dir.display().to_string();
     if child_job.publication_requested {
@@ -9289,6 +9291,7 @@ async fn queue_playbook_job(
         state: "queued".to_string(),
         requested_by: requested_by.to_string(),
         prompt_excerpt: prompt_excerpt.clone(),
+        publication_intent_text: Some(playbook.prompt.clone()),
     })?;
     let job = state.store.update_job(
         &job_id,
@@ -12011,6 +12014,7 @@ Cleanup status: clean";
                 state: "failed".to_string(),
                 requested_by: "user".to_string(),
                 prompt_excerpt: "open a PR to merge to dev".to_string(),
+                publication_intent_text: None,
             })
             .expect("job should persist");
         state
@@ -12542,6 +12546,7 @@ for line in sys.stdin:
                 state: "running".to_string(),
                 requested_by: "test".to_string(),
                 prompt_excerpt: String::new(),
+                publication_intent_text: None,
             })
             .expect("job should persist");
 

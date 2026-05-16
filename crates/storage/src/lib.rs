@@ -235,6 +235,7 @@ pub struct JobRecord {
     pub state: String,
     pub requested_by: String,
     pub prompt_excerpt: String,
+    pub publication_intent_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2064,8 +2065,12 @@ impl StateStore {
         if let Some(parent_job_id) = record.parent_job_id.as_deref() {
             ensure_job_exists(&connection, parent_job_id)?;
         }
+        let publication_prompt = record
+            .publication_intent_text
+            .as_deref()
+            .unwrap_or(&record.prompt_excerpt);
         let publication_requested =
-            publication_requested_for_job(&record.title, &record.purpose, &record.prompt_excerpt);
+            publication_requested_for_job(&record.title, &record.purpose, publication_prompt);
         let publication_status = "not_requested";
         let browser_verification_status = if publication_requested {
             "not_performed"
@@ -4345,9 +4350,11 @@ fn publication_segment_has_publication_phrase(text: &str) -> bool {
     [
         "open a pr",
         "open pr",
+        "open a pull request",
         "open pull request",
         "create a pr",
         "create pr",
+        "create a pull request",
         "create pull request",
         "publish this branch",
         "publish the branch",
@@ -8590,6 +8597,7 @@ mod tests {
                 state: "completed".to_string(),
                 requested_by: "user".to_string(),
                 prompt_excerpt: "root".to_string(),
+                publication_intent_text: None,
             })
             .expect("root job should persist");
         store
@@ -8604,6 +8612,7 @@ mod tests {
                 state: "completed".to_string(),
                 requested_by: "agent".to_string(),
                 prompt_excerpt: "child".to_string(),
+                publication_intent_text: None,
             })
             .expect("child job should persist");
 
@@ -8650,6 +8659,7 @@ mod tests {
                 state: "queued".to_string(),
                 requested_by: "user".to_string(),
                 prompt_excerpt: "open a pr to merge to dev".to_string(),
+                publication_intent_text: None,
             })
             .expect("job should persist");
 
@@ -8658,6 +8668,27 @@ mod tests {
         assert_eq!(created.validation_status, "not_performed");
         assert_eq!(created.browser_verification_status, "not_performed");
         assert_eq!(created.cleanup_status, "unknown");
+        let created_from_full_prompt = store
+            .create_job(JobRecord {
+                id: "publication-long-prompt-job".to_string(),
+                session_id: Some("publication-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Prompt prep work".to_string(),
+                purpose: "Session prompt".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "queued".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "review the current issue and inspect the branch".to_string(),
+                publication_intent_text: Some(
+                    "Review the current issue, inspect the branch, run the focused tests, \
+and open a pull request to dev when it is ready."
+                        .to_string(),
+                ),
+            })
+            .expect("job should persist");
+
+        assert!(created_from_full_prompt.publication_requested);
         assert!(!publication_requested_for_job(
             "Open project notes",
             "Session prompt",
@@ -8679,6 +8710,11 @@ mod tests {
             "how do I open a PR?"
         ));
         assert!(!publication_requested_for_job(
+            "How do I open a pull request?",
+            "Session prompt",
+            "how do I open a pull request?"
+        ));
+        assert!(!publication_requested_for_job(
             "Explain publication",
             "Session prompt",
             "Can you explain how to publish this branch?"
@@ -8697,6 +8733,16 @@ mod tests {
             "Open PR",
             "Session prompt",
             "open a pr to merge to dev"
+        ));
+        assert!(publication_requested_for_job(
+            "Open pull request",
+            "Session prompt",
+            "open a pull request to merge to dev"
+        ));
+        assert!(publication_requested_for_job(
+            "Create pull request",
+            "Session prompt",
+            "create a pull request for dev"
         ));
 
         let updated = store
@@ -8866,6 +8912,7 @@ mod tests {
                 state: "running".to_string(),
                 requested_by: "system".to_string(),
                 prompt_excerpt: "summary".to_string(),
+                publication_intent_text: None,
             })
             .expect("root playbook job should persist");
         store
@@ -8880,6 +8927,7 @@ mod tests {
                 state: "completed".to_string(),
                 requested_by: "user".to_string(),
                 prompt_excerpt: "summary".to_string(),
+                publication_intent_text: None,
             })
             .expect("second root playbook job should persist");
         store
@@ -8894,6 +8942,7 @@ mod tests {
                 state: "completed".to_string(),
                 requested_by: "agent".to_string(),
                 prompt_excerpt: "child".to_string(),
+                publication_intent_text: None,
             })
             .expect("child job should persist");
 
