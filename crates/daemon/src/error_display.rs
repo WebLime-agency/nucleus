@@ -140,23 +140,41 @@ fn model_setup_actions() -> Vec<String> {
 }
 
 fn redact_likely_secret_tokens(detail: &str) -> String {
-    detail
-        .split_whitespace()
-        .map(|token| {
-            let trimmed = token.trim_matches(|ch: char| {
-                matches!(
-                    ch,
-                    '"' | '\'' | ',' | ':' | ';' | ')' | '(' | ']' | '[' | '}' | '{'
-                )
-            });
-            if is_likely_secret_token(trimmed) {
-                token.replace(trimmed, "[REDACTED_SECRET]")
-            } else {
-                token.to_string()
+    map_non_whitespace_runs(detail, |token| {
+        let trimmed = token.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '"' | '\'' | ',' | ':' | ';' | ')' | '(' | ']' | '[' | '}' | '{'
+            )
+        });
+        if is_likely_secret_token(trimmed) {
+            token.replace(trimmed, "[REDACTED_SECRET]")
+        } else {
+            token.to_string()
+        }
+    })
+}
+
+fn map_non_whitespace_runs<F>(input: &str, mut mapper: F) -> String
+where
+    F: FnMut(&str) -> String,
+{
+    let mut output = String::with_capacity(input.len());
+    let mut token_start = None;
+    for (index, character) in input.char_indices() {
+        if character.is_whitespace() {
+            if let Some(start) = token_start.take() {
+                output.push_str(&mapper(&input[start..index]));
             }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+            output.push(character);
+        } else if token_start.is_none() {
+            token_start = Some(index);
+        }
+    }
+    if let Some(start) = token_start {
+        output.push_str(&mapper(&input[start..]));
+    }
+    output
 }
 
 fn is_likely_secret_token(token: &str) -> bool {
@@ -391,5 +409,29 @@ mod tests {
         assert!(!summary.message.contains('{'));
         assert!(!summary.technical_detail.contains("sk-test-secret"));
         assert!(summary.technical_detail.contains("[REDACTED_SECRET]"));
+    }
+
+    #[test]
+    fn technical_detail_redaction_preserves_original_whitespace_without_secrets() {
+        let raw = "failed to reach the OpenAI-compatible endpoint:\n  first line\n\n  second  line";
+
+        let summary = classify_user_error(raw).expect("error should classify");
+
+        assert_eq!(summary.code, "model_endpoint_unreachable");
+        assert_eq!(summary.technical_detail, raw);
+    }
+
+    #[test]
+    fn technical_detail_redaction_preserves_original_whitespace_around_secret_tokens() {
+        let raw =
+            "OpenAI-compatible endpoint failed:\n  invalid_api_key sk-test-secret\n\ttry again";
+
+        let summary = classify_user_error(raw).expect("error should classify");
+
+        assert_eq!(summary.code, "model_credentials_invalid");
+        assert_eq!(
+            summary.technical_detail,
+            "OpenAI-compatible endpoint failed:\n  invalid_api_key [REDACTED_SECRET]\n\ttry again"
+        );
     }
 }
