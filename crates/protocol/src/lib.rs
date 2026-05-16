@@ -1298,6 +1298,40 @@ pub struct AuditEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InstanceLogEntry {
+    pub id: i64,
+    pub timestamp: i64,
+    pub level: String,
+    pub category: String,
+    pub source: String,
+    pub event: String,
+    pub message: String,
+    pub related_ids: Value,
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstanceLogCategorySummary {
+    pub category: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InstanceLogListResponse {
+    pub records: Vec<InstanceLogEntry>,
+    pub categories: Vec<InstanceLogCategorySummary>,
+    pub logs_dir: String,
+    pub retention: String,
+    pub next_before: Option<i64>,
+    pub next_before_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstanceLogCategoriesResponse {
+    pub categories: Vec<InstanceLogCategorySummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HostStatus {
     pub hostname: String,
     pub cpu_usage_percent: f32,
@@ -1418,6 +1452,8 @@ pub struct StorageSummary {
     pub state_dir: String,
     pub database_path: String,
     pub artifacts_dir: String,
+    #[serde(default)]
+    pub logs_dir: String,
     pub memory_dir: String,
     pub transcripts_dir: String,
     pub playbooks_dir: String,
