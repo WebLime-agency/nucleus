@@ -508,12 +508,23 @@
       { label: 'Cleanup', value: formatState(job.cleanup_status) }
     ];
 
-    if (job.pr_url) rows.push({ label: 'PR', value: job.pr_url, href: job.pr_url });
+    if (job.pr_url) rows.push({ label: 'PR', value: job.pr_url, href: safeExternalHref(job.pr_url) });
     if (job.source_branch) rows.push({ label: 'Source', value: job.source_branch });
     if (job.target_branch) rows.push({ label: 'Target', value: job.target_branch });
     if (job.cleanup_paths.length) rows.push({ label: 'Cleanup paths', value: job.cleanup_paths.join(', ') });
     if (job.publication_summary) rows.push({ label: 'Summary', value: job.publication_summary });
     return rows;
+  }
+
+  function safeExternalHref(value: string) {
+    try {
+      const url = new URL(value);
+      if (url.protocol === 'http:' || url.protocol === 'https:') return url.toString();
+    } catch {
+      return undefined;
+    }
+
+    return undefined;
   }
 
   function badgeVariantForToolCall(

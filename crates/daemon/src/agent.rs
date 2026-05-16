@@ -4017,12 +4017,35 @@ fn collect_repo_temp_paths(working_dir: &str) -> Vec<String> {
 }
 
 fn collect_git_temp_paths(root: &Path) -> Vec<String> {
-    let mut paths = collect_git_status_temp_paths(root);
-    paths.extend(collect_git_tracked_temp_paths(root));
+    let Some(repo_root) = git_worktree_root(root) else {
+        return Vec::new();
+    };
+
+    let mut paths = collect_git_status_temp_paths(root, &repo_root);
+    paths.extend(collect_git_tracked_temp_paths(root, &repo_root));
     paths
 }
 
-fn collect_git_status_temp_paths(root: &Path) -> Vec<String> {
+fn git_worktree_root(root: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let path = String::from_utf8(output.stdout).ok()?;
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(path))
+}
+
+fn collect_git_status_temp_paths(root: &Path, repo_root: &Path) -> Vec<String> {
     let Ok(output) = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
@@ -4057,13 +4080,13 @@ fn collect_git_status_temp_paths(root: &Path) -> Vec<String> {
 
         let status = &entry[..2];
         if status[0] != b'D' && status[1] != b'D' {
-            collect_existing_temp_path(root, &entry[3..], &mut paths);
+            collect_existing_temp_path(repo_root, &entry[3..], &mut paths);
         }
 
         if (status[0] == b'R' || status[1] == b'R' || status[0] == b'C' || status[1] == b'C')
             && index < entries.len()
         {
-            collect_existing_temp_path(root, entries[index], &mut paths);
+            collect_existing_temp_path(repo_root, entries[index], &mut paths);
             index += 1;
         }
     }
@@ -4071,7 +4094,7 @@ fn collect_git_status_temp_paths(root: &Path) -> Vec<String> {
     paths
 }
 
-fn collect_git_tracked_temp_paths(root: &Path) -> Vec<String> {
+fn collect_git_tracked_temp_paths(root: &Path, repo_root: &Path) -> Vec<String> {
     let Ok(output) = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
@@ -4088,7 +4111,7 @@ fn collect_git_tracked_temp_paths(root: &Path) -> Vec<String> {
         .stdout
         .split(|byte| *byte == 0)
         .filter_map(|entry| std::str::from_utf8(entry).ok())
-        .filter(|path| root.join(path).exists())
+        .filter(|path| repo_root.join(path).exists())
         .filter_map(publication_temp_root_path)
         .collect()
 }
@@ -11061,6 +11084,30 @@ Cleanup status: clean";
         assert!(status.success());
 
         let paths = collect_repo_temp_paths(&root.display().to_string());
+
+        assert!(paths.iter().any(|path| path == "apps/web/.tmp-playwright"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collect_repo_temp_paths_resolves_git_paths_from_repo_root() {
+        let root = test_state_dir("publication-temp-path-scoped-workdir");
+        let scoped_root = root.join("apps/web");
+        fs::create_dir_all(scoped_root.join(".tmp-playwright"))
+            .expect("scoped temp dir should exist");
+        fs::write(scoped_root.join(".tmp-playwright/probe.txt"), "temp")
+            .expect("scoped temp file should exist");
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "-q"])
+            .status()
+            .expect("git init should run");
+        assert!(status.success());
+
+        let paths = collect_repo_temp_paths(&scoped_root.display().to_string());
 
         assert!(paths.iter().any(|path| path == "apps/web/.tmp-playwright"));
 
