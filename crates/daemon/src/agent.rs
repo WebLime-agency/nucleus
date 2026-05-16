@@ -3772,18 +3772,22 @@ fn contains_blocked_terminal_result_language(text: &str) -> bool {
 fn infer_browser_verification_status(text: &str) -> Option<&'static str> {
     if text.contains("browser verification status: not_required")
         || text.contains("browser verification status: not required")
+        || text.contains("browser verification: status: not_required")
+        || text.contains("browser verification: status: not required")
         || text.contains("browser verification: not required")
     {
         return Some("not_required");
     }
 
     if text.contains("browser verification status: pending")
+        || text.contains("browser verification: status: pending")
         || text.contains("browser verification: pending")
     {
         return Some("pending");
     }
 
     if text.contains("browser verification status: unavailable")
+        || text.contains("browser verification: status: unavailable")
         || text.contains("browser verification: unavailable")
         || text.contains("verification unavailable")
     {
@@ -3792,6 +3796,8 @@ fn infer_browser_verification_status(text: &str) -> Option<&'static str> {
 
     if text.contains("browser verification status: not_performed")
         || text.contains("browser verification status: not performed")
+        || text.contains("browser verification: status: not_performed")
+        || text.contains("browser verification: status: not performed")
         || text.contains("browser verification: not performed")
         || text.contains("not browser-verified")
         || text.contains("not browser verified")
@@ -3800,6 +3806,7 @@ fn infer_browser_verification_status(text: &str) -> Option<&'static str> {
     }
 
     if text.contains("browser verification status: failed")
+        || text.contains("browser verification: status: failed")
         || text.contains("browser verification: failed")
         || text.contains("browser verification failed")
     {
@@ -3807,6 +3814,7 @@ fn infer_browser_verification_status(text: &str) -> Option<&'static str> {
     }
 
     if text.contains("browser verification status: passed")
+        || text.contains("browser verification: status: passed")
         || text.contains("browser verification: passed")
         || text.contains("browser-verified")
         || text.contains("browser verified")
@@ -10794,6 +10802,13 @@ Cleanup paths: .tmp-playwright.",
             "Publication status: opened\n\
 Validation status: passed\n\
 Browser verification status: not_performed\n\
+Cleanup status: clean"
+        ));
+        assert!(publication_final_answer_has_required_facts(
+            "Opened PR",
+            "Publication status: opened\n\
+Validation status: passed\n\
+Browser verification: status: passed, summary: clicked through the changed flow\n\
 Cleanup status: clean"
         ));
     }

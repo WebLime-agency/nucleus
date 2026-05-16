@@ -4328,7 +4328,30 @@ fn bool_to_i64(value: bool) -> i64 {
 }
 
 fn publication_requested_for_job(title: &str, purpose: &str, prompt_excerpt: &str) -> bool {
-    let text = format!("{title}\n{purpose}\n{prompt_excerpt}").to_ascii_lowercase();
+    let prompt_excerpt = prompt_excerpt.to_ascii_lowercase();
+    if publication_segment_requests_publication(&prompt_excerpt) {
+        return true;
+    }
+    if publication_segment_has_publication_phrase(&prompt_excerpt) {
+        return false;
+    }
+
+    let title = title.to_ascii_lowercase();
+    if publication_segment_requests_publication(&title) {
+        return true;
+    }
+    if publication_segment_has_publication_phrase(&title) {
+        return false;
+    }
+
+    publication_segment_requests_publication(&purpose.to_ascii_lowercase())
+}
+
+fn publication_segment_requests_publication(text: &str) -> bool {
+    publication_segment_has_publication_phrase(text) && !publication_segment_is_informational(text)
+}
+
+fn publication_segment_has_publication_phrase(text: &str) -> bool {
     [
         "open a pr",
         "open pr",
@@ -4343,7 +4366,27 @@ fn publication_requested_for_job(title: &str, purpose: &str, prompt_excerpt: &st
         "pull request to merge",
     ]
     .iter()
-    .any(|needle| contains_phrase_with_boundaries(&text, needle))
+    .any(|needle| contains_phrase_with_boundaries(text, needle))
+}
+
+fn publication_segment_is_informational(text: &str) -> bool {
+    let text = text.trim_start();
+    [
+        "how do i ",
+        "how can i ",
+        "how should i ",
+        "how to ",
+        "what is ",
+        "what's ",
+        "can you explain",
+        "could you explain",
+        "please explain",
+        "explain how",
+        "guide me through",
+        "instructions for",
+    ]
+    .iter()
+    .any(|prefix| text.starts_with(prefix))
 }
 
 fn contains_phrase_with_boundaries(text: &str, phrase: &str) -> bool {
@@ -8615,6 +8658,16 @@ mod tests {
             "Dry run merge",
             "Session prompt",
             "merge into dev and report conflicts"
+        ));
+        assert!(!publication_requested_for_job(
+            "How do I open a PR?",
+            "Session prompt",
+            "how do I open a PR?"
+        ));
+        assert!(!publication_requested_for_job(
+            "Explain publication",
+            "Session prompt",
+            "Can you explain how to publish this branch?"
         ));
         assert!(publication_requested_for_job(
             "Publish branch",
