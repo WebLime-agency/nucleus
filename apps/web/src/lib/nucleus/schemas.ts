@@ -734,6 +734,8 @@ export const mcpServerRecordSchema = z.object({
   updated_at: z.number().int().default(0)
 });
 
+export const writableMcpAuthKindSchema = z.enum(['none', 'vault_bearer', 'static_headers', 'oauth', 'device']);
+
 export const routerProfileSummarySchema = z.object({
   id: z.string(),
   title: z.string(),
