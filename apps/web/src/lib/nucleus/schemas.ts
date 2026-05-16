@@ -139,6 +139,13 @@ export const jobSummarySchema = z.object({
   visible_turn_id: z.string().nullable(),
   result_summary: z.string(),
   last_error: z.string(),
+  ui_renderable: z.enum(['unknown', 'true', 'false']).default('unknown'),
+  browser_verification_required: z.boolean().default(false),
+  browser_verification_status: z
+    .enum(['not_required', 'pending', 'passed', 'failed', 'not_performed', 'unavailable'])
+    .default('not_required'),
+  browser_verification_summary: z.string().default(''),
+  browser_verification_artifact_ids: z.array(z.string()).default([]),
   worker_count: z.number().int().nonnegative(),
   pending_approval_count: z.number().int().nonnegative(),
   artifact_count: z.number().int().nonnegative(),
