@@ -23,6 +23,8 @@ pub enum WorkerAction {
     FinalAnswer {
         summary: String,
         final_answer: String,
+        #[serde(default)]
+        browser_verification: Option<BrowserVerificationClaim>,
     },
 }
 
@@ -31,6 +33,15 @@ pub struct ChildJobProposal {
     pub title: String,
     pub prompt: String,
     pub working_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BrowserVerificationClaim {
+    pub status: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub artifact_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -453,10 +464,14 @@ fn normalize_worker_final_answer_value(
         .filter(|value| !value.is_empty())
         .unwrap_or("The work is done.")
         .to_string();
+    let browser_verification = object
+        .get("browser_verification")
+        .and_then(|value| serde_json::from_value::<BrowserVerificationClaim>(value.clone()).ok());
 
     Ok(WorkerAction::FinalAnswer {
         summary,
         final_answer,
+        browser_verification,
     })
 }
 
@@ -888,6 +903,7 @@ mod tests {
         let WorkerAction::FinalAnswer {
             summary,
             final_answer,
+            ..
         } = action
         else {
             panic!("expected final answer");
@@ -910,6 +926,7 @@ mod tests {
         let WorkerAction::FinalAnswer {
             summary,
             final_answer,
+            ..
         } = action
         else {
             panic!("expected final answer");
@@ -929,6 +946,7 @@ mod tests {
         let WorkerAction::FinalAnswer {
             summary,
             final_answer,
+            ..
         } = action
         else {
             panic!("expected final answer");
@@ -962,6 +980,7 @@ mod tests {
         let WorkerAction::FinalAnswer {
             summary,
             final_answer,
+            ..
         } = action
         else {
             panic!("expected final answer");
@@ -980,6 +999,7 @@ mod tests {
         let WorkerAction::FinalAnswer {
             summary,
             final_answer,
+            ..
         } = action
         else {
             panic!("expected final answer");
@@ -999,6 +1019,7 @@ mod tests {
         let WorkerAction::FinalAnswer {
             summary,
             final_answer,
+            ..
         } = action
         else {
             panic!("expected final answer");
@@ -1035,6 +1056,7 @@ mod tests {
         let WorkerAction::FinalAnswer {
             summary,
             final_answer,
+            ..
         } = action
         else {
             panic!("expected final answer");
@@ -1045,6 +1067,26 @@ mod tests {
         assert!(final_answer.contains("Publication status: blocked"));
         assert!(final_answer.contains("Browser verification status: not_performed"));
         assert!(!final_answer.contains("PR URL:"));
+    }
+
+    #[test]
+    fn parses_final_answer_browser_verification_claim() {
+        let action = parse_worker_action(
+            r#"{"kind":"final_answer","summary":"verified UI","final_answer":"Done.","browser_verification":{"status":"passed","summary":"Clicked the dropdown.","artifact_ids":["artifact-1"]}}"#,
+        )
+        .expect("browser verification claim should parse");
+
+        let WorkerAction::FinalAnswer {
+            browser_verification: Some(claim),
+            ..
+        } = action
+        else {
+            panic!("expected final answer with browser verification");
+        };
+
+        assert_eq!(claim.status, "passed");
+        assert_eq!(claim.summary, "Clicked the dropdown.");
+        assert_eq!(claim.artifact_ids, vec!["artifact-1".to_string()]);
     }
 
     #[test]

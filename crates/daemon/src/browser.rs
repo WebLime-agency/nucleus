@@ -109,6 +109,23 @@ struct BrowserPageState {
 }
 
 impl BrowserRuntime {
+    pub fn availability_error() -> Option<String> {
+        if let Err(error) = browser_sidecar_script_path() {
+            return Some(error.to_string());
+        }
+
+        match std::process::Command::new("node").arg("--version").output() {
+            Ok(output) if output.status.success() => None,
+            Ok(output) => Some(format!(
+                "node --version exited with status {}",
+                output.status
+            )),
+            Err(error) => Some(format!(
+                "node is required for Browser verification: {error}"
+            )),
+        }
+    }
+
     pub async fn context(&self, session_id: &str) -> BrowserContextSummary {
         let mut contexts = self.contexts.lock().await;
         let state = contexts
