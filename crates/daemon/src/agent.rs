@@ -3895,9 +3895,10 @@ fn apply_publication_temp_hygiene(
         return;
     }
 
-    let baseline = publication_temp_baseline_paths(detail)
-        .into_iter()
-        .collect::<BTreeSet<_>>();
+    let Some(baseline_paths) = publication_temp_baseline_paths(detail) else {
+        return;
+    };
+    let baseline = baseline_paths.into_iter().collect::<BTreeSet<_>>();
     let current = collect_repo_temp_paths(working_dir)
         .into_iter()
         .collect::<BTreeSet<_>>();
@@ -3939,22 +3940,26 @@ fn reconcile_publication_browser_status_with_completion(
     patch.browser_verification_status = Some(completion_job.browser_verification_status.clone());
 }
 
-fn publication_temp_baseline_paths(detail: &JobDetail) -> Vec<String> {
+fn publication_temp_baseline_paths(detail: &JobDetail) -> Option<Vec<String>> {
     detail
         .events
         .iter()
         .rev()
         .find(|event| event.event_type == "job.publication.git_baseline")
-        .and_then(|event| event.data_json.get("temp_paths"))
-        .and_then(Value::as_array)
         .map(|items| {
             items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
+                .data_json
+                .get("temp_paths")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
         })
-        .unwrap_or_default()
 }
 
 fn collect_repo_temp_paths(working_dir: &str) -> Vec<String> {
@@ -10812,6 +10817,36 @@ Cleanup status: clean";
             patch.cleanup_paths,
             Some(vec![".tmp-playwright".to_string()])
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publication_temp_hygiene_skips_without_baseline_event() {
+        let root = test_state_dir("publication-temp-hygiene-no-baseline");
+        fs::create_dir_all(root.join(".tmp-playwright")).expect("existing temp dir should exist");
+
+        let detail = JobDetail {
+            job: test_publication_job_summary("publication-temp-hygiene-no-baseline"),
+            workers: Vec::new(),
+            child_jobs: Vec::new(),
+            tool_calls: Vec::new(),
+            approvals: Vec::new(),
+            artifacts: Vec::new(),
+            command_sessions: Vec::new(),
+            events: Vec::new(),
+        };
+        let mut patch = PublicationOutcomePatch {
+            publication_requested: Some(true),
+            cleanup_status: Some("clean".to_string()),
+            cleanup_paths: Some(Vec::new()),
+            ..PublicationOutcomePatch::default()
+        };
+
+        apply_publication_temp_hygiene(&detail, &root.display().to_string(), &mut patch);
+
+        assert_eq!(patch.cleanup_status.as_deref(), Some("clean"));
+        assert_eq!(patch.cleanup_paths, Some(Vec::new()));
 
         let _ = fs::remove_dir_all(root);
     }
