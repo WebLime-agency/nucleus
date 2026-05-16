@@ -36,9 +36,10 @@ use uuid::Uuid;
 use super::{
     ApiError, AppState, assemble_prompt_input, ensure_prompting_runtime, excerpt,
     extract_memory_candidates_after_successful_turn, load_router_profiles, publish_overview_event,
-    publish_prompt_progress_event, publish_session_event, resolve_mcp_vault_bearer_token,
-    resolve_profile_targets, resolve_session_projects, resolve_workspace_profile,
-    resolve_workspace_profile_target, try_record_audit_event, unix_timestamp,
+    publish_prompt_progress_event, publish_session_event, record_instance_log,
+    resolve_mcp_vault_bearer_token, resolve_profile_targets, resolve_session_projects,
+    resolve_workspace_profile, resolve_workspace_profile_target, try_record_audit_event,
+    unix_timestamp,
 };
 use crate::runtime::{PromptStreamEvent, ProviderTurnResult};
 use crate::worker_action::{ChildJobProposal, WorkerAction, parse_worker_action};
@@ -8339,6 +8340,7 @@ fn command_path_env() -> Option<std::ffi::OsString> {
 
 async fn publish_job_created(state: &AppState, summary: &JobSummary) {
     let _ = state.events.send(DaemonEvent::JobCreated(summary.clone()));
+    let _ = record_job_log(state, "info", "job.created", summary).await;
 }
 
 async fn publish_job_updated(state: &AppState, summary: &JobSummary) {
@@ -8347,12 +8349,40 @@ async fn publish_job_updated(state: &AppState, summary: &JobSummary) {
 
 async fn publish_job_failed(state: &AppState, summary: &JobSummary) {
     let _ = state.events.send(DaemonEvent::JobFailed(summary.clone()));
+    let _ = record_job_log(state, "error", "job.failed", summary).await;
 }
 
 async fn publish_job_completed(state: &AppState, summary: &JobSummary) {
     let _ = state
         .events
         .send(DaemonEvent::JobCompleted(summary.clone()));
+    let _ = record_job_log(state, "info", "job.completed", summary).await;
+}
+
+async fn record_job_log(
+    state: &AppState,
+    level: &str,
+    event: &str,
+    summary: &JobSummary,
+) -> Option<nucleus_protocol::InstanceLogEntry> {
+    record_instance_log(
+        state,
+        level,
+        "job",
+        "agent",
+        event,
+        format!("{}: {}", summary.title, summary.state),
+        json!({
+            "job_id": summary.id,
+            "session_id": summary.session_id,
+            "parent_job_id": summary.parent_job_id,
+        }),
+        json!({
+            "trigger_kind": summary.trigger_kind,
+            "requested_by": summary.requested_by,
+        }),
+    )
+    .await
 }
 
 async fn publish_worker_updated(state: &AppState, summary: &WorkerSummary) {

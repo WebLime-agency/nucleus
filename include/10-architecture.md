@@ -8,4 +8,6 @@ Installed Nucleus should run as one local service process that serves the built 
 
 Prompt execution should enter the Nucleus-owned Utility Worker/job path for text and image turns alike. Uploaded images remain scoped turn attachments, not repo files. If the selected runtime cannot support vision with workspace actions, Nucleus should degrade explicitly instead of silently dropping workspace access.
 
+Instance logs are daemon-owned local support artifacts under `<state-dir>/logs/`, indexed in SQLite for Workspace -> Logs, redacted before persistence, and not prompt-visible.
+
 User-facing activity should use product language: Nucleus, Utility Worker, Utility Subworker, and Action or concrete action labels. Lower-level daemon/tool-call terms belong only in architecture and developer docs when they are technically necessary.

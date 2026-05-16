@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     env, fs,
+    io::Write,
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -11,13 +12,14 @@ use nucleus_core::{
 };
 use nucleus_protocol::{
     ApprovalRequestSummary, ArtifactSummary, AuditEvent, CommandSessionSummary,
-    DEFAULT_JOB_MAX_STEPS, DEFAULT_JOB_MAX_TOOL_CALLS, DEFAULT_JOB_MAX_WALL_CLOCK_SECS, JobDetail,
-    JobEvent, JobSummary, McpServerRecord, McpServerSummary, MemoryCandidate, MemoryEntry,
-    MemorySearchResult, PlaybookDetail, PlaybookSummary, PolicyDecisionSummary, ProjectSummary,
-    RouteTarget, RouterProfileSummary, RunBudgetSummary, RuntimeSummary, SessionDetail,
-    SessionProjectSummary, SessionSummary, SessionTurn, SessionTurnImage, SkillManifest,
-    StorageSummary, ToolCallSummary, ToolCapabilitySummary, WorkerSummary, WorkspaceModelConfig,
-    WorkspaceProfileSummary, WorkspaceSummary,
+    DEFAULT_JOB_MAX_STEPS, DEFAULT_JOB_MAX_TOOL_CALLS, DEFAULT_JOB_MAX_WALL_CLOCK_SECS,
+    InstanceLogCategorySummary, InstanceLogEntry, JobDetail, JobEvent, JobSummary, McpServerRecord,
+    McpServerSummary, MemoryCandidate, MemoryEntry, MemorySearchResult, PlaybookDetail,
+    PlaybookSummary, PolicyDecisionSummary, ProjectSummary, RouteTarget, RouterProfileSummary,
+    RunBudgetSummary, RuntimeSummary, SessionDetail, SessionProjectSummary, SessionSummary,
+    SessionTurn, SessionTurnImage, SkillManifest, StorageSummary, ToolCallSummary,
+    ToolCapabilitySummary, WorkerSummary, WorkspaceModelConfig, WorkspaceProfileSummary,
+    WorkspaceSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -29,6 +31,11 @@ const LOCAL_AUTH_TOKEN_HASH_KEY: &str = "auth.local_token_hash";
 const LOCAL_AUTH_TOKEN_FILE_NAME: &str = "local-auth-token";
 const UPDATE_STATE_KEY: &str = "updates.state.v1";
 const PLAYBOOK_RECENT_JOB_LIMIT: usize = 12;
+pub const INSTANCE_LOG_RETENTION_DAYS: i64 = 30;
+pub const INSTANCE_LOG_MAX_ROWS: usize = 5_000;
+const INSTANCE_LOG_JSONL_FILE_NAME: &str = "events.jsonl";
+const INSTANCE_LOG_JSONL_MAX_BYTES: u64 = 1_048_576;
+const INSTANCE_LOG_JSONL_ROTATED_FILES: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct VaultStateRecord {
@@ -94,6 +101,7 @@ pub struct StoragePlan {
     pub state_dir: PathBuf,
     pub database_path: PathBuf,
     pub artifacts_dir: PathBuf,
+    pub logs_dir: PathBuf,
     pub memory_dir: PathBuf,
     pub transcripts_dir: PathBuf,
     pub playbooks_dir: PathBuf,
@@ -192,6 +200,18 @@ pub struct AuditEventRecord {
     pub status: String,
     pub summary: String,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstanceLogRecord {
+    pub timestamp: i64,
+    pub level: String,
+    pub category: String,
+    pub source: String,
+    pub event: String,
+    pub message: String,
+    pub related_ids: serde_json::Value,
+    pub metadata: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -522,6 +542,7 @@ impl StoragePlan {
         let state_dir = state_dir.into();
         let database_path = state_dir.join(format!("{PRODUCT_SLUG}.db"));
         let artifacts_dir = state_dir.join("artifacts");
+        let logs_dir = state_dir.join("logs");
         let memory_dir = state_dir.join("memory");
         let transcripts_dir = state_dir.join("transcripts");
         let playbooks_dir = state_dir.join("playbooks");
@@ -531,6 +552,7 @@ impl StoragePlan {
             state_dir,
             database_path,
             artifacts_dir,
+            logs_dir,
             memory_dir,
             transcripts_dir,
             playbooks_dir,
@@ -542,6 +564,7 @@ impl StoragePlan {
         for path in [
             &self.state_dir,
             &self.artifacts_dir,
+            &self.logs_dir,
             &self.memory_dir,
             &self.transcripts_dir,
             &self.playbooks_dir,
@@ -559,6 +582,7 @@ impl StoragePlan {
             state_dir: display(&self.state_dir),
             database_path: display(&self.database_path),
             artifacts_dir: display(&self.artifacts_dir),
+            logs_dir: display(&self.logs_dir),
             memory_dir: display(&self.memory_dir),
             transcripts_dir: display(&self.transcripts_dir),
             playbooks_dir: display(&self.playbooks_dir),
@@ -570,6 +594,7 @@ impl StoragePlan {
 pub struct StateStore {
     plan: StoragePlan,
     connection: Mutex<Connection>,
+    instance_log_jsonl: Mutex<()>,
 }
 
 impl StateStore {
@@ -606,6 +631,7 @@ impl StateStore {
         Ok(Self {
             plan,
             connection: Mutex::new(connection),
+            instance_log_jsonl: Mutex::new(()),
         })
     }
 
@@ -619,6 +645,10 @@ impl StateStore {
 
     pub fn artifacts_dir_path(&self) -> PathBuf {
         self.plan.artifacts_dir.clone()
+    }
+
+    pub fn logs_dir_path(&self) -> PathBuf {
+        self.plan.logs_dir.clone()
     }
 
     pub fn playbooks_dir_path(&self) -> PathBuf {
@@ -1885,6 +1915,70 @@ impl StateStore {
 
         let event_id = connection.last_insert_rowid();
         load_audit_event(&connection, event_id)
+    }
+
+    pub fn append_instance_log(&self, record: InstanceLogRecord) -> Result<InstanceLogEntry> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let related_ids_json =
+            serde_json::to_string(&record.related_ids).context("failed to encode related IDs")?;
+        let metadata_json =
+            serde_json::to_string(&record.metadata).context("failed to encode log metadata")?;
+
+        connection.execute(
+            "
+            INSERT INTO instance_logs (
+                timestamp, level, category, source, event, message, related_ids_json, metadata_json
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ",
+            params![
+                record.timestamp,
+                record.level,
+                record.category,
+                record.source,
+                record.event,
+                record.message,
+                related_ids_json,
+                metadata_json
+            ],
+        )?;
+
+        let log_id = connection.last_insert_rowid();
+        let entry = load_instance_log(&connection, log_id)?;
+        prune_instance_logs_with_connection(
+            &connection,
+            INSTANCE_LOG_RETENTION_DAYS * 24 * 60 * 60,
+            INSTANCE_LOG_MAX_ROWS,
+        )?;
+        drop(connection);
+
+        let _jsonl_guard = self
+            .instance_log_jsonl
+            .lock()
+            .expect("instance log JSONL mutex poisoned");
+        append_instance_log_jsonl(&self.plan.logs_dir, &entry)?;
+        Ok(entry)
+    }
+
+    pub fn list_instance_logs(
+        &self,
+        category: Option<&str>,
+        level: Option<&str>,
+        before: Option<(i64, i64)>,
+        limit: usize,
+    ) -> Result<Vec<InstanceLogEntry>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_instance_logs_with_connection(&connection, category, level, before, limit)
+    }
+
+    pub fn list_instance_log_categories(&self) -> Result<Vec<InstanceLogCategorySummary>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_instance_log_categories_with_connection(&connection)
+    }
+
+    pub fn prune_instance_logs(&self, max_age_secs: i64, max_rows: usize) -> Result<usize> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        prune_instance_logs_with_connection(&connection, max_age_secs, max_rows)
     }
 
     pub fn list_jobs_for_session(&self, session_id: &str) -> Result<Vec<JobSummary>> {
@@ -3162,6 +3256,26 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             detail TEXT NOT NULL,
             created_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
+
+        CREATE TABLE IF NOT EXISTS instance_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp INTEGER NOT NULL DEFAULT (unixepoch()),
+            level TEXT NOT NULL,
+            category TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT '',
+            event TEXT NOT NULL,
+            message TEXT NOT NULL DEFAULT '',
+            related_ids_json TEXT NOT NULL DEFAULT '{}',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_instance_logs_timestamp_id
+            ON instance_logs(timestamp DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_instance_logs_category_timestamp
+            ON instance_logs(category, timestamp DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_instance_logs_level_timestamp
+            ON instance_logs(level, timestamp DESC, id DESC);
 
         CREATE TABLE IF NOT EXISTS app_settings (
             key TEXT PRIMARY KEY,
@@ -5999,6 +6113,181 @@ fn map_audit_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEvent> {
     })
 }
 
+fn load_instance_log(connection: &Connection, log_id: i64) -> Result<InstanceLogEntry> {
+    connection
+        .query_row(
+            "
+            SELECT id, timestamp, level, category, source, event, message, related_ids_json, metadata_json
+            FROM instance_logs
+            WHERE id = ?1
+            ",
+            params![log_id],
+            map_instance_log,
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("instance log '{log_id}' was not found"))
+}
+
+fn list_instance_logs_with_connection(
+    connection: &Connection,
+    category: Option<&str>,
+    level: Option<&str>,
+    before: Option<(i64, i64)>,
+    limit: usize,
+) -> Result<Vec<InstanceLogEntry>> {
+    let mut sql = String::from(
+        "
+        SELECT id, timestamp, level, category, source, event, message, related_ids_json, metadata_json
+        FROM instance_logs
+        WHERE 1 = 1
+        ",
+    );
+    let mut values: Vec<rusqlite::types::Value> = Vec::new();
+
+    if let Some(category) = category.filter(|value| !value.trim().is_empty()) {
+        sql.push_str(" AND category = ? ");
+        values.push(category.trim().to_string().into());
+    }
+
+    if let Some(level) = level.filter(|value| !value.trim().is_empty()) {
+        sql.push_str(" AND level = ? ");
+        values.push(level.trim().to_string().into());
+    }
+
+    if let Some((before_timestamp, before_id)) = before {
+        sql.push_str(" AND (timestamp < ? OR (timestamp = ? AND id < ?)) ");
+        values.push(before_timestamp.into());
+        values.push(before_timestamp.into());
+        values.push(before_id.into());
+    }
+
+    sql.push_str(" ORDER BY timestamp DESC, id DESC LIMIT ? ");
+    values.push((limit as i64).into());
+
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(rusqlite::params_from_iter(values), map_instance_log)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load instance logs")
+}
+
+fn list_instance_log_categories_with_connection(
+    connection: &Connection,
+) -> Result<Vec<InstanceLogCategorySummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT category, COUNT(*)
+        FROM instance_logs
+        GROUP BY category
+        ORDER BY category ASC
+        ",
+    )?;
+    let rows = statement.query_map([], |row| {
+        let count: i64 = row.get(1)?;
+        Ok(InstanceLogCategorySummary {
+            category: row.get(0)?,
+            count: usize::try_from(count).unwrap_or(0),
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load instance log categories")
+}
+
+fn prune_instance_logs_with_connection(
+    connection: &Connection,
+    max_age_secs: i64,
+    max_rows: usize,
+) -> Result<usize> {
+    let mut removed = 0;
+
+    if max_age_secs > 0 {
+        removed += connection.execute(
+            "DELETE FROM instance_logs WHERE timestamp < unixepoch() - ?1",
+            params![max_age_secs],
+        )?;
+    }
+
+    if max_rows > 0 {
+        removed += connection.execute(
+            "
+            DELETE FROM instance_logs
+            WHERE id NOT IN (
+                SELECT id FROM instance_logs
+                ORDER BY timestamp DESC, id DESC
+                LIMIT ?1
+            )
+            ",
+            params![max_rows as i64],
+        )?;
+    }
+
+    Ok(removed)
+}
+
+fn map_instance_log(row: &rusqlite::Row<'_>) -> rusqlite::Result<InstanceLogEntry> {
+    Ok(InstanceLogEntry {
+        id: row.get(0)?,
+        timestamp: row.get(1)?,
+        level: row.get(2)?,
+        category: row.get(3)?,
+        source: row.get(4)?,
+        event: row.get(5)?,
+        message: row.get(6)?,
+        related_ids: decode_json_value(row.get(7)?)?,
+        metadata: decode_json_value(row.get(8)?)?,
+    })
+}
+
+fn append_instance_log_jsonl(logs_dir: &Path, entry: &InstanceLogEntry) -> Result<()> {
+    fs::create_dir_all(logs_dir)
+        .with_context(|| format!("failed to create logs directory '{}'", logs_dir.display()))?;
+    let path = logs_dir.join(INSTANCE_LOG_JSONL_FILE_NAME);
+    rotate_instance_log_jsonl(&path)?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("failed to open log file '{}'", path.display()))?;
+    serde_json::to_writer(&mut file, entry).context("failed to encode JSONL instance log")?;
+    file.write_all(b"\n")
+        .context("failed to write JSONL instance log")?;
+    Ok(())
+}
+
+fn rotate_instance_log_jsonl(path: &Path) -> Result<()> {
+    let Ok(metadata) = fs::metadata(path) else {
+        return Ok(());
+    };
+    if metadata.len() < INSTANCE_LOG_JSONL_MAX_BYTES {
+        return Ok(());
+    }
+
+    for index in (1..=INSTANCE_LOG_JSONL_ROTATED_FILES).rev() {
+        let rotated = rotated_instance_log_path(path, index);
+        if index == INSTANCE_LOG_JSONL_ROTATED_FILES {
+            let _ = fs::remove_file(rotated);
+        } else {
+            let next = rotated_instance_log_path(path, index + 1);
+            if rotated.exists() {
+                fs::rename(&rotated, &next).with_context(|| {
+                    format!(
+                        "failed to rotate log file '{}' to '{}'",
+                        rotated.display(),
+                        next.display()
+                    )
+                })?;
+            }
+        }
+    }
+
+    fs::rename(path, rotated_instance_log_path(path, 1))
+        .with_context(|| format!("failed to rotate log file '{}'", path.display()))?;
+    Ok(())
+}
+
+fn rotated_instance_log_path(path: &Path, index: usize) -> PathBuf {
+    PathBuf::from(format!("{}.{}", path.display(), index))
+}
+
 fn list_jobs_for_session_with_connection(
     connection: &Connection,
     session_id: &str,
@@ -6991,7 +7280,7 @@ mod tests {
     use rusqlite::Connection;
     use std::{
         env, fs,
-        sync::Mutex,
+        sync::{Arc, Mutex},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -7030,6 +7319,154 @@ mod tests {
         assert_eq!(recent[0].summary, "Refreshed runtime health.");
         assert_eq!(recent[1].id, first.id);
         assert_eq!(recent[1].target, "session:test-1");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn persists_lists_and_prunes_instance_logs() {
+        let state_dir = test_state_dir("instance-logs");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_secs() as i64;
+
+        let first = store
+            .append_instance_log(InstanceLogRecord {
+                timestamp: now - 1,
+                level: "info".to_string(),
+                category: "system".to_string(),
+                source: "test".to_string(),
+                event: "daemon.started".to_string(),
+                message: "Started".to_string(),
+                related_ids: serde_json::json!({"session_id": "session-1"}),
+                metadata: serde_json::json!({"safe": true}),
+            })
+            .expect("first log should persist");
+        let second = store
+            .append_instance_log(InstanceLogRecord {
+                timestamp: now,
+                level: "error".to_string(),
+                category: "job".to_string(),
+                source: "test".to_string(),
+                event: "job.failed".to_string(),
+                message: "Failed".to_string(),
+                related_ids: serde_json::json!({"job_id": "job-1"}),
+                metadata: serde_json::json!({}),
+            })
+            .expect("second log should persist");
+
+        assert!(first.id < second.id);
+        assert!(state_dir.join("logs/events.jsonl").is_file());
+
+        let job_logs = store
+            .list_instance_logs(Some("job"), None, None, 10)
+            .expect("job logs should list");
+        assert_eq!(job_logs.len(), 1);
+        assert_eq!(job_logs[0].event, "job.failed");
+
+        let categories = store
+            .list_instance_log_categories()
+            .expect("categories should list");
+        assert_eq!(categories.len(), 2);
+
+        let removed = store.prune_instance_logs(0, 1).expect("logs should prune");
+        assert!(removed >= 1);
+        let remaining = store
+            .list_instance_logs(None, None, None, 10)
+            .expect("remaining logs should list");
+        assert_eq!(remaining.len(), 1);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn paginates_instance_logs_with_same_second_tiebreaker() {
+        let state_dir = test_state_dir("instance-logs-pagination");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_secs() as i64;
+
+        for index in 0..3 {
+            store
+                .append_instance_log(InstanceLogRecord {
+                    timestamp,
+                    level: "info".to_string(),
+                    category: "system".to_string(),
+                    source: "test".to_string(),
+                    event: format!("event.{index}"),
+                    message: "same second".to_string(),
+                    related_ids: serde_json::json!({}),
+                    metadata: serde_json::json!({}),
+                })
+                .expect("log should persist");
+        }
+
+        let first_page = store
+            .list_instance_logs(None, None, None, 2)
+            .expect("first page should list");
+        assert_eq!(first_page.len(), 2);
+        assert_eq!(first_page[0].event, "event.2");
+        assert_eq!(first_page[1].event, "event.1");
+
+        let cursor = first_page.last().expect("cursor record should exist");
+        let second_page = store
+            .list_instance_logs(None, None, Some((cursor.timestamp, cursor.id)), 2)
+            .expect("second page should list");
+        assert_eq!(second_page.len(), 1);
+        assert_eq!(second_page[0].event, "event.0");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn concurrent_instance_log_writes_keep_jsonl_parseable() {
+        let state_dir = test_state_dir("instance-logs-concurrent-jsonl");
+        let store =
+            Arc::new(StateStore::initialize_at(&state_dir).expect("store should initialize"));
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_secs() as i64;
+        let thread_count = 8;
+        let logs_per_thread = 12;
+
+        let handles = (0..thread_count)
+            .map(|thread_index| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    for log_index in 0..logs_per_thread {
+                        store
+                            .append_instance_log(InstanceLogRecord {
+                                timestamp,
+                                level: "info".to_string(),
+                                category: "system".to_string(),
+                                source: "test".to_string(),
+                                event: format!("event.{thread_index}.{log_index}"),
+                                message: "concurrent write".to_string(),
+                                related_ids: serde_json::json!({}),
+                                metadata: serde_json::json!({}),
+                            })
+                            .expect("log should persist");
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().expect("writer thread should finish");
+        }
+
+        let jsonl = fs::read_to_string(state_dir.join("logs/events.jsonl"))
+            .expect("JSONL log file should read");
+        let lines = jsonl.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), thread_count * logs_per_thread);
+        for line in lines {
+            serde_json::from_str::<InstanceLogEntry>(line).expect("JSONL line should parse");
+        }
 
         let _ = fs::remove_dir_all(&state_dir);
     }

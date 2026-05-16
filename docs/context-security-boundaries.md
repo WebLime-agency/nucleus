@@ -82,12 +82,16 @@ Allowed:
 - Non-secret evidence and event metadata.
 - Redacted placeholders such as `[REDACTED_SECRET]`.
 - Secret names/references when useful and non-sensitive.
+- Instance-local product log records with timestamp, level, category, source, event name, safe message, and safe related IDs or metadata.
 
 Forbidden:
 
 - Decrypted Vault values.
 - Request/response bodies containing credentials unless redacted before storage.
 - Authorization headers, cookies, or private keys.
+- Raw model prompts/responses, full command output, provider request/response payloads, or stdout/stderr streams in generic instance logs unless a future feature shapes and redacts them explicitly before persistence.
+
+Instance logs are local support/debugging artifacts. They live under the active daemon state directory and are queryable through authenticated daemon APIs and Workspace -> Logs. They are not Memory, prompt includes, transcripts, or agent-visible prompt context.
 
 ### Browser artifacts
 
@@ -226,6 +230,12 @@ Relevant event families:
 - `mcp.auth.resolved_from_vault`
 
 Never include decrypted secret values in audit payloads.
+
+Audit events and instance logs are related but distinct:
+
+- Audit events are the security and lifecycle trail for sensitive or privileged operations.
+- Instance logs are the broader support/debugging surface for safe product events.
+- A safe audit summary may also create an instance log entry, but this must not weaken audit redaction rules.
 
 ## Implementation references
 

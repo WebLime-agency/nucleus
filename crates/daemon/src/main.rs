@@ -43,19 +43,20 @@ use nucleus_protocol::{
     ApprovalResolutionRequest, AuditEvent, AuthSummary, BrowserActionRequest,
     BrowserContextSummary, BrowserNavigateRequest, BrowserSnapshot, CompatibilitySummary,
     CompiledPromptLayer, CompiledTurn, ConnectionSummary, CreatePlaybookRequest,
-    CreateSessionRequest, DaemonEvent, HealthResponse, HostStatus, JobDetail, JobSummary,
-    MAX_CONFIGURED_JOB_STEPS, MAX_CONFIGURED_JOB_TOOL_CALLS, MAX_CONFIGURED_JOB_WALL_CLOCK_SECS,
-    McpServerRecord, McpServerSummary, McpToolRecord, MemoryCandidate,
-    MemoryCandidateAcceptRequest, MemoryCandidateListResponse, MemoryCandidateUpsertRequest,
-    MemoryEntry, MemoryEntryUpsertRequest, MemorySearchResponse, MemorySummary,
-    NucleusToolDescriptor, PlaybookDetail, PlaybookSummary, ProcessKillRequest,
-    ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate, ProjectUpdateRequest,
-    PromptProgressUpdate, RouterProfileSummary, RunBudgetSummary, RuntimeOverview, RuntimeSummary,
-    SessionDetail, SessionPromptRequest, SessionSummary, SettingsSummary, SkillImportRequest,
-    SkillImportResponse, SkillInstallResult, SkillInstallVerification, SkillInstallationRecord,
-    SkillInstallationUpsertRequest, SkillManifest, SkillPackageRecord, SkillPackageUpsertRequest,
-    SkillReconcileCandidate, SkillReconcileRequest, SkillReconcileScanResponse, StreamConnected,
-    SystemStats, UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
+    CreateSessionRequest, DaemonEvent, HealthResponse, HostStatus, InstanceLogCategoriesResponse,
+    InstanceLogListResponse, JobDetail, JobSummary, MAX_CONFIGURED_JOB_STEPS,
+    MAX_CONFIGURED_JOB_TOOL_CALLS, MAX_CONFIGURED_JOB_WALL_CLOCK_SECS, McpServerRecord,
+    McpServerSummary, McpToolRecord, MemoryCandidate, MemoryCandidateAcceptRequest,
+    MemoryCandidateListResponse, MemoryCandidateUpsertRequest, MemoryEntry,
+    MemoryEntryUpsertRequest, MemorySearchResponse, MemorySummary, NucleusToolDescriptor,
+    PlaybookDetail, PlaybookSummary, ProcessKillRequest, ProcessKillResponse, ProcessListResponse,
+    ProcessStreamUpdate, ProjectUpdateRequest, PromptProgressUpdate, RouterProfileSummary,
+    RunBudgetSummary, RuntimeOverview, RuntimeSummary, SessionDetail, SessionPromptRequest,
+    SessionSummary, SettingsSummary, SkillImportRequest, SkillImportResponse, SkillInstallResult,
+    SkillInstallVerification, SkillInstallationRecord, SkillInstallationUpsertRequest,
+    SkillManifest, SkillPackageRecord, SkillPackageUpsertRequest, SkillReconcileCandidate,
+    SkillReconcileRequest, SkillReconcileScanResponse, StreamConnected, SystemStats,
+    UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
     VaultInitRequest, VaultSecretListResponse, VaultSecretPolicyListResponse,
     VaultSecretPolicySummary, VaultSecretPolicyUpsertRequest, VaultSecretSummary,
     VaultSecretUpdateRequest, VaultSecretUpsertRequest, VaultStatusSummary, VaultUnlockRequest,
@@ -64,8 +65,9 @@ use nucleus_protocol::{
 };
 use nucleus_release::read_installed_release_metadata;
 use nucleus_storage::{
-    AuditEventRecord, ProjectPatch, SessionPatch, SessionRecord, StateStore,
-    VaultSecretPolicyRecord, VaultSecretRecord, WorkspaceProfilePatch,
+    AuditEventRecord, INSTANCE_LOG_MAX_ROWS, INSTANCE_LOG_RETENTION_DAYS, InstanceLogRecord,
+    ProjectPatch, SessionPatch, SessionRecord, StateStore, VaultSecretPolicyRecord,
+    VaultSecretRecord, WorkspaceProfilePatch,
 };
 use runtime::RuntimeManager;
 use serde::{Deserialize, de::DeserializeOwned};
@@ -90,6 +92,12 @@ const STREAM_PROCESS_LIMIT: usize = DEFAULT_PROCESS_LIMIT;
 const STREAM_INTERVAL: Duration = Duration::from_secs(2);
 const DEFAULT_AUDIT_LIMIT: usize = 20;
 const MAX_AUDIT_LIMIT: usize = 100;
+const DEFAULT_LOG_LIMIT: usize = 100;
+const MAX_LOG_LIMIT: usize = 500;
+const INSTANCE_LOG_MESSAGE_LIMIT: usize = 500;
+const INSTANCE_LOG_METADATA_STRING_LIMIT: usize = 240;
+const INSTANCE_LOG_METADATA_KEYS_LIMIT: usize = 24;
+const INSTANCE_LOG_REDACTED: &str = "[REDACTED_SECRET]";
 const MAX_PROMPT_INCLUDE_FILES: usize = 24;
 const MAX_PROMPT_INCLUDE_FILE_CHARS: usize = 6_000;
 const MAX_PROMPT_INCLUDE_TOTAL_CHARS: usize = 24_000;
@@ -139,6 +147,20 @@ async fn main() -> anyhow::Result<()> {
         tailscale_dns_name: detect_tailscale_dns_name(),
         events,
     };
+    let _ = record_instance_log(
+        &state,
+        "info",
+        "system",
+        "daemon",
+        "daemon.started",
+        format!("Nucleus daemon started on {bind}."),
+        json!({}),
+        json!({
+            "install_kind": state.updates.instance_summary().install_kind,
+            "version": state.version,
+        }),
+    )
+    .await;
     agent::recover_interrupted_jobs(&state).await?;
     spawn_event_publisher(state.clone());
     spawn_update_monitor(state.clone());
@@ -285,6 +307,8 @@ fn app(state: AppState) -> Router {
         .route("/actions/{action_id}", get(action_detail))
         .route("/actions/{action_id}/run", axum::routing::post(run_action))
         .route("/audit", get(audit_events))
+        .route("/logs", get(instance_logs))
+        .route("/logs/categories", get(instance_log_categories))
         .route("/approvals", get(pending_approvals))
         .route(
             "/approvals/{approval_id}/approve",
@@ -3702,6 +3726,50 @@ async fn audit_events(
 ) -> Result<Json<Vec<AuditEvent>>, ApiError> {
     let limit = resolve_audit_limit(query.limit)?;
     Ok(Json(state.store.list_audit_events(limit)?))
+}
+
+#[derive(Debug, Deserialize)]
+struct InstanceLogQuery {
+    category: Option<String>,
+    level: Option<String>,
+    before: Option<i64>,
+    before_id: Option<i64>,
+    limit: Option<usize>,
+}
+
+async fn instance_logs(
+    State(state): State<AppState>,
+    Query(query): Query<InstanceLogQuery>,
+) -> Result<Json<InstanceLogListResponse>, ApiError> {
+    let limit = resolve_log_limit(query.limit)?;
+    let category = normalize_log_filter(query.category);
+    let level = normalize_log_filter(query.level).map(|value| value.to_lowercase());
+    let before = resolve_log_cursor(query.before, query.before_id)?;
+    let records =
+        state
+            .store
+            .list_instance_logs(category.as_deref(), level.as_deref(), before, limit)?;
+    let categories = state.store.list_instance_log_categories()?;
+    let next_cursor = records.last().map(|record| (record.timestamp, record.id));
+
+    Ok(Json(InstanceLogListResponse {
+        records,
+        categories,
+        logs_dir: state.store.logs_dir_path().display().to_string(),
+        retention: format!(
+            "{INSTANCE_LOG_RETENTION_DAYS} days, {INSTANCE_LOG_MAX_ROWS} recent records, JSONL rotated around 1 MiB with 3 history files"
+        ),
+        next_before: next_cursor.map(|(timestamp, _)| timestamp),
+        next_before_id: next_cursor.map(|(_, id)| id),
+    }))
+}
+
+async fn instance_log_categories(
+    State(state): State<AppState>,
+) -> Result<Json<InstanceLogCategoriesResponse>, ApiError> {
+    Ok(Json(InstanceLogCategoriesResponse {
+        categories: state.store.list_instance_log_categories()?,
+    }))
 }
 
 async fn run_action(
@@ -7226,6 +7294,231 @@ fn resolve_audit_limit(limit: Option<usize>) -> Result<usize, ApiError> {
     Ok(limit)
 }
 
+fn resolve_log_limit(limit: Option<usize>) -> Result<usize, ApiError> {
+    let limit = limit.unwrap_or(DEFAULT_LOG_LIMIT);
+
+    if limit == 0 {
+        return Err(ApiError::bad_request(
+            "log limit must be greater than zero".to_string(),
+        ));
+    }
+
+    if limit > MAX_LOG_LIMIT {
+        return Err(ApiError::bad_request(format!(
+            "log limit must be {MAX_LOG_LIMIT} or lower"
+        )));
+    }
+
+    Ok(limit)
+}
+
+fn resolve_log_cursor(
+    before: Option<i64>,
+    before_id: Option<i64>,
+) -> Result<Option<(i64, i64)>, ApiError> {
+    match (before, before_id) {
+        (Some(timestamp), Some(id)) => Ok(Some((timestamp, id))),
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(ApiError::bad_request(
+            "before_id is required when before is provided",
+        )),
+        (None, Some(_)) => Err(ApiError::bad_request("before_id requires before")),
+    }
+}
+
+fn normalize_log_filter(value: Option<String>) -> Option<String> {
+    value
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+}
+
+fn audit_status_to_log_level(status: &str) -> &'static str {
+    match status {
+        "error" | "failed" | "denied" => "error",
+        "warning" | "warn" => "warn",
+        "success" | "ok" | "info" => "info",
+        _ => "info",
+    }
+}
+
+fn category_for_event(event: &str) -> &'static str {
+    match event.split('.').next().unwrap_or_default() {
+        "vault" => "vault",
+        "memory" => "memory",
+        "mcp" => "mcp",
+        "update" | "settings" => "update",
+        "job" | "worker" | "approval" | "playbook" => "job",
+        "session" => "session",
+        "automation" => "automation",
+        _ => "system",
+    }
+}
+
+fn normalize_log_level(value: &str) -> String {
+    match value.trim().to_lowercase().as_str() {
+        "trace" => "debug".to_string(),
+        "debug" => "debug".to_string(),
+        "warn" | "warning" => "warn".to_string(),
+        "error" | "failed" => "error".to_string(),
+        _ => "info".to_string(),
+    }
+}
+
+fn normalize_log_category(value: &str) -> String {
+    match value.trim() {
+        "system" | "session" | "job" | "automation" | "mcp" | "memory" | "vault" | "update" => {
+            value.trim().to_string()
+        }
+        _ => "system".to_string(),
+    }
+}
+
+fn normalize_log_event(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "event".to_string();
+    }
+
+    excerpt(trimmed, 100)
+}
+
+fn sanitize_log_json(redactor: &security::RedactionSet, value: &Value) -> Value {
+    sanitize_log_json_depth(redactor, &redactor.redact_json(value), 0)
+}
+
+fn sanitize_log_json_depth(
+    redactor: &security::RedactionSet,
+    value: &Value,
+    depth: usize,
+) -> Value {
+    if depth >= 3 {
+        return json!("[TRUNCATED]");
+    }
+
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .take(INSTANCE_LOG_METADATA_KEYS_LIMIT)
+                .map(|(key, value)| {
+                    (
+                        excerpt(&redact_instance_log_text(&redactor.redact_text(key)), 80),
+                        sanitize_log_json_depth(redactor, value, depth + 1),
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .take(INSTANCE_LOG_METADATA_KEYS_LIMIT)
+                .map(|value| sanitize_log_json_depth(redactor, value, depth + 1))
+                .collect(),
+        ),
+        Value::String(value) => json!(excerpt(
+            &redact_instance_log_text(&redactor.redact_text(value)),
+            INSTANCE_LOG_METADATA_STRING_LIMIT
+        )),
+        other => other.clone(),
+    }
+}
+
+fn redact_instance_log_text(input: &str) -> String {
+    input
+        .lines()
+        .map(|line| {
+            redact_instance_log_assignments(&redact_instance_log_bearer_values(
+                &redact_instance_log_sk_tokens(line),
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn redact_instance_log_bearer_values(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut remaining = input;
+
+    while let Some(index) = remaining.to_ascii_lowercase().find("bearer ") {
+        out.push_str(&remaining[..index + "bearer ".len()]);
+        out.push_str(INSTANCE_LOG_REDACTED);
+        remaining = &remaining[index + "bearer ".len()..];
+        let consumed = remaining
+            .char_indices()
+            .find_map(|(position, character)| character.is_whitespace().then_some(position))
+            .unwrap_or(remaining.len());
+        remaining = &remaining[consumed..];
+    }
+
+    out.push_str(remaining);
+    out
+}
+
+fn redact_instance_log_sk_tokens(input: &str) -> String {
+    input
+        .split_inclusive(char::is_whitespace)
+        .map(|part| {
+            let trimmed = part.trim_end();
+            let suffix = &part[trimmed.len()..];
+            let token = trimmed.trim_matches(|character: char| {
+                matches!(character, '"' | '\'' | ',' | ';' | ')' | ']' | '}')
+            });
+            if token.starts_with("sk-") && token.len() >= 12 {
+                format!("{INSTANCE_LOG_REDACTED}{suffix}")
+            } else {
+                part.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn redact_instance_log_assignments(input: &str) -> String {
+    let mut output = input.to_string();
+    for marker in [
+        "api_key",
+        "access_token",
+        "refresh_token",
+        "password",
+        "passphrase",
+        "client_secret",
+        "cookie",
+        "authorization",
+    ] {
+        output = redact_instance_log_assignment_for_marker(&output, marker);
+    }
+    output
+}
+
+fn redact_instance_log_assignment_for_marker(input: &str, marker: &str) -> String {
+    let lower = input.to_ascii_lowercase();
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+
+    while let Some(relative_index) = lower[cursor..].find(marker) {
+        let index = cursor + relative_index;
+        let after_marker = index + marker.len();
+        let Some(separator_offset) =
+            input[after_marker..].find(|character: char| matches!(character, '=' | ':'))
+        else {
+            break;
+        };
+        let value_start = after_marker + separator_offset + 1;
+        let value_end = input[value_start..]
+            .char_indices()
+            .find_map(|(position, character)| {
+                matches!(character, ',' | ';' | '&' | ' ' | '\t').then_some(value_start + position)
+            })
+            .unwrap_or(input.len());
+
+        output.push_str(&input[cursor..value_start]);
+        output.push_str(INSTANCE_LOG_REDACTED);
+        cursor = value_end;
+    }
+
+    output.push_str(&input[cursor..]);
+    output
+}
+
 async fn execute_action(
     state: &AppState,
     action_id: &str,
@@ -7346,13 +7639,84 @@ fn read_action_pid(payload: &ActionRunRequest, name: &str) -> Result<u32, ApiErr
 }
 
 async fn try_record_audit_event(state: &AppState, record: AuditEventRecord) -> Option<AuditEvent> {
+    let log_level = audit_status_to_log_level(&record.status);
+    let log_category = category_for_event(&record.kind);
+    let log_event = record.kind.clone();
+    let log_message = if record.summary.trim().is_empty() {
+        record.detail.clone()
+    } else {
+        record.summary.clone()
+    };
+    let log_target = record.target.clone();
+
     match state.store.append_audit_event(record) {
         Ok(event) => {
             let _ = publish_audit_event(state).await;
+            let _ = record_instance_log(
+                state,
+                log_level,
+                log_category,
+                "audit",
+                log_event,
+                log_message,
+                json!({
+                    "audit_event_id": event.id,
+                    "target": log_target,
+                }),
+                json!({ "audit_status": event.status }),
+            )
+            .await;
             Some(event)
         }
         Err(error) => {
             warn!(error = %error, "failed to persist audit event");
+            None
+        }
+    }
+}
+
+pub(crate) async fn record_instance_log(
+    state: &AppState,
+    level: impl AsRef<str>,
+    category: impl AsRef<str>,
+    source: impl AsRef<str>,
+    event: impl AsRef<str>,
+    message: impl AsRef<str>,
+    related_ids: Value,
+    metadata: Value,
+) -> Option<nucleus_protocol::InstanceLogEntry> {
+    let mut redactor = security::RedactionSet::new();
+    if let Ok(token) = state.store.read_local_auth_token() {
+        redactor.register_secret(token);
+    }
+
+    let level = normalize_log_level(level.as_ref());
+    let category = normalize_log_category(category.as_ref());
+    let event = normalize_log_event(event.as_ref());
+    let source = excerpt(
+        &redact_instance_log_text(&redactor.redact_text(source.as_ref().trim())),
+        80,
+    );
+    let message = excerpt(
+        &redact_instance_log_text(&redactor.redact_text(message.as_ref().trim())),
+        INSTANCE_LOG_MESSAGE_LIMIT,
+    );
+    let related_ids = sanitize_log_json(&redactor, &related_ids);
+    let metadata = sanitize_log_json(&redactor, &metadata);
+
+    match state.store.append_instance_log(InstanceLogRecord {
+        timestamp: unix_timestamp(),
+        level,
+        category,
+        source,
+        event,
+        message,
+        related_ids,
+        metadata,
+    }) {
+        Ok(entry) => Some(entry),
+        Err(error) => {
+            warn!(error = %error, "failed to persist instance log");
             None
         }
     }
@@ -7800,6 +8164,74 @@ mod tests {
         );
         assert_eq!(server.env_json["SAFE"], "ok");
         assert_eq!(server.headers_json["Authorization"], "[REDACTED_SECRET]");
+    }
+
+    #[test]
+    fn rejects_invalid_instance_log_limits() {
+        assert!(resolve_log_limit(Some(1)).is_ok());
+        assert!(resolve_log_limit(Some(0)).is_err());
+        assert!(resolve_log_limit(Some(MAX_LOG_LIMIT + 1)).is_err());
+    }
+
+    #[test]
+    fn rejects_partial_instance_log_cursors() {
+        assert_eq!(resolve_log_cursor(None, None).unwrap(), None);
+        assert_eq!(
+            resolve_log_cursor(Some(10), Some(5)).unwrap(),
+            Some((10, 5))
+        );
+        assert!(resolve_log_cursor(Some(10), None).is_err());
+        assert!(resolve_log_cursor(None, Some(5)).is_err());
+    }
+
+    #[tokio::test]
+    async fn instance_log_write_path_redacts_secret_like_values() {
+        let (state_dir, state) = test_named_app_state("instance-log-redaction");
+        let secret = state
+            .store
+            .read_local_auth_token()
+            .expect("test token should exist");
+
+        record_instance_log(
+            &state,
+            "info",
+            "vault",
+            "test",
+            "vault.secret.checked",
+            format!(
+                "token={secret} api_key=first-leaked-key&api_key=second-leaked-key bearer phase6-vault-token sk-supersecretvalue"
+            ),
+            json!({
+                "vault_secret_id": "secret-meta-id",
+                "api_key": "plain-api-key-value",
+                "safe_url": "https://example.test/path?api_key=third-leaked-key&api_key=fourth-leaked-key"
+            }),
+            json!({
+                "Authorization": "Bearer another-secret",
+                "safe": "metadata"
+            }),
+        )
+        .await
+        .expect("log should persist");
+
+        let logs = state
+            .store
+            .list_instance_logs(Some("vault"), None, None, 10)
+            .expect("logs should list");
+        let serialized = serde_json::to_string(&logs).expect("logs serialize");
+        assert!(serialized.contains("[REDACTED_SECRET]"));
+        assert!(!serialized.contains(&secret));
+        assert!(!serialized.contains("phase6-vault-token"));
+        assert!(!serialized.contains("sk-supersecretvalue"));
+        assert!(!serialized.contains("first-leaked-key"));
+        assert!(!serialized.contains("second-leaked-key"));
+        assert!(!serialized.contains("third-leaked-key"));
+        assert!(!serialized.contains("fourth-leaked-key"));
+        assert!(!serialized.contains("plain-api-key-value"));
+        assert!(!serialized.contains("another-secret"));
+        assert!(state_dir.join("logs/events.jsonl").is_file());
+
+        let _ = fs::remove_dir_all(&state_dir);
     }
 
     #[test]
