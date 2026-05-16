@@ -45,6 +45,7 @@ use crate::runtime::{PromptStreamEvent, ProviderTurnResult};
 use crate::worker_action::{
     BrowserVerificationClaim, ChildJobProposal, WorkerAction, parse_worker_action,
 };
+use crate::{error_display, security};
 
 const DEFAULT_JOB_MAX_WALL_CLOCK_SECS: u64 = 7_200;
 const MAX_CONFIGURED_JOB_STEPS: usize = 1_000;
@@ -3949,6 +3950,7 @@ fn build_execution_session(worker: &WorkerSummary) -> SessionSummary {
         state: worker.state.clone(),
         provider_session_id: worker.provider_session_id.clone(),
         last_error: worker.last_error.clone(),
+        user_error: worker.user_error.clone(),
         last_message_excerpt: String::new(),
         turn_count: 0,
         created_at: worker.created_at,
@@ -9059,23 +9061,29 @@ fn command_path_env() -> Option<std::ffi::OsString> {
 }
 
 async fn publish_job_created(state: &AppState, summary: &JobSummary) {
-    let _ = state.events.send(DaemonEvent::JobCreated(summary.clone()));
+    let _ = state
+        .events
+        .send(DaemonEvent::JobCreated(publishable_job_summary(summary)));
     let _ = record_job_log(state, "info", "job.created", summary).await;
 }
 
 async fn publish_job_updated(state: &AppState, summary: &JobSummary) {
-    let _ = state.events.send(DaemonEvent::JobUpdated(summary.clone()));
+    let _ = state
+        .events
+        .send(DaemonEvent::JobUpdated(publishable_job_summary(summary)));
 }
 
 async fn publish_job_failed(state: &AppState, summary: &JobSummary) {
-    let _ = state.events.send(DaemonEvent::JobFailed(summary.clone()));
+    let _ = state
+        .events
+        .send(DaemonEvent::JobFailed(publishable_job_summary(summary)));
     let _ = record_job_log(state, "error", "job.failed", summary).await;
 }
 
 async fn publish_job_completed(state: &AppState, summary: &JobSummary) {
     let _ = state
         .events
-        .send(DaemonEvent::JobCompleted(summary.clone()));
+        .send(DaemonEvent::JobCompleted(publishable_job_summary(summary)));
     let _ = record_job_log(state, "info", "job.completed", summary).await;
 }
 
@@ -9108,7 +9116,26 @@ async fn record_job_log(
 async fn publish_worker_updated(state: &AppState, summary: &WorkerSummary) {
     let _ = state
         .events
-        .send(DaemonEvent::WorkerUpdated(summary.clone()));
+        .send(DaemonEvent::WorkerUpdated(publishable_worker_summary(
+            summary,
+        )));
+}
+
+fn publishable_job_summary(summary: &JobSummary) -> JobSummary {
+    let mut summary = summary.clone();
+    let redactor = security::RedactionSet::new();
+    summary.last_error = redactor.redact_text(&summary.last_error);
+    summary.user_error = error_display::classify_user_error(&summary.last_error);
+    summary
+}
+
+fn publishable_worker_summary(summary: &WorkerSummary) -> WorkerSummary {
+    let mut summary = summary.clone();
+    let redactor = security::RedactionSet::new().with_secret(summary.provider_api_key.clone());
+    summary.provider_api_key.clear();
+    summary.last_error = redactor.redact_text(&summary.last_error);
+    summary.user_error = error_display::classify_user_error(&summary.last_error);
+    summary
 }
 
 async fn publish_approval_requested(state: &AppState, summary: &ApprovalRequestSummary) {
@@ -9340,6 +9367,7 @@ mod tests {
             state: "active".to_string(),
             provider_session_id: String::new(),
             last_error: String::new(),
+            user_error: None,
             last_message_excerpt: String::new(),
             turn_count: 0,
             created_at: 0,
@@ -9664,6 +9692,7 @@ mod tests {
             step_count: 0,
             tool_call_count: 0,
             last_error: String::new(),
+            user_error: None,
             capabilities: Vec::new(),
             created_at: 0,
             updated_at: 0,
@@ -9723,6 +9752,7 @@ mod tests {
             step_count: 0,
             tool_call_count: 0,
             last_error: String::new(),
+            user_error: None,
             capabilities: Vec::new(),
             created_at: 0,
             updated_at: 0,
@@ -10183,6 +10213,7 @@ Remaining:\n\
             step_count: 0,
             tool_call_count: 0,
             last_error: String::new(),
+            user_error: None,
             capabilities: Vec::new(),
             created_at: 0,
             updated_at: 0,
@@ -10239,6 +10270,7 @@ Remaining:\n\
             step_count: 0,
             tool_call_count: 0,
             last_error: String::new(),
+            user_error: None,
             capabilities: Vec::new(),
             created_at: 0,
             updated_at: 0,
@@ -10368,6 +10400,7 @@ Remaining:\n\
             visible_turn_id: None,
             result_summary: String::new(),
             last_error: String::new(),
+            user_error: None,
             ui_renderable: "true".to_string(),
             browser_verification_required: true,
             browser_verification_status: "not_performed".to_string(),
@@ -10410,6 +10443,7 @@ Remaining:\n\
             visible_turn_id: None,
             result_summary: String::new(),
             last_error: String::new(),
+            user_error: None,
             ui_renderable: "true".to_string(),
             browser_verification_required: true,
             browser_verification_status: "pending".to_string(),
@@ -10512,6 +10546,7 @@ Remaining:\n\
             step_count: 0,
             tool_call_count: 0,
             last_error: String::new(),
+            user_error: None,
             capabilities: Vec::new(),
             created_at: 0,
             updated_at: 0,
@@ -10583,6 +10618,7 @@ Remaining:\n\
             state: "active".to_string(),
             provider_session_id: String::new(),
             last_error: String::new(),
+            user_error: None,
             last_message_excerpt: String::new(),
             turn_count: 0,
             created_at: 0,
@@ -10609,6 +10645,7 @@ Remaining:\n\
             step_count: 0,
             tool_call_count: 0,
             last_error: String::new(),
+            user_error: None,
             capabilities: Vec::new(),
             created_at: 0,
             updated_at: 0,
@@ -10672,6 +10709,7 @@ Remaining:\n\
             state: "active".to_string(),
             provider_session_id: String::new(),
             last_error: String::new(),
+            user_error: None,
             last_message_excerpt: String::new(),
             turn_count: 0,
             created_at: 0,
@@ -10738,6 +10776,7 @@ Remaining:\n\
             state: "active".to_string(),
             provider_session_id: String::new(),
             last_error: String::new(),
+            user_error: None,
             last_message_excerpt: String::new(),
             turn_count: 0,
             created_at: 0,
@@ -11462,6 +11501,7 @@ for line in sys.stdin:
             step_count: 0,
             tool_call_count: 0,
             last_error: String::new(),
+            user_error: None,
             capabilities: Vec::new(),
             created_at: 0,
             updated_at: 0,

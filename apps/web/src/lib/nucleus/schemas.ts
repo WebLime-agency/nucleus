@@ -35,6 +35,14 @@ export const runBudgetSummarySchema = z.object({
   max_wall_clock_secs: z.number().int().nonnegative()
 });
 
+export const userFacingErrorSummarySchema = z.object({
+  code: z.string(),
+  title: z.string(),
+  message: z.string(),
+  actions: z.array(z.string()).default([]),
+  technical_detail: z.string().default('')
+});
+
 export const sessionSummarySchema = z.object({
   id: z.string(),
   title: z.string(),
@@ -77,6 +85,7 @@ export const sessionSummarySchema = z.object({
   state: z.string(),
   provider_session_id: z.string(),
   last_error: z.string(),
+  user_error: userFacingErrorSummarySchema.nullable().default(null),
   last_message_excerpt: z.string(),
   turn_count: z.number().int().nonnegative(),
   created_at: z.number().int(),
@@ -139,6 +148,7 @@ export const jobSummarySchema = z.object({
   visible_turn_id: z.string().nullable(),
   result_summary: z.string(),
   last_error: z.string(),
+  user_error: userFacingErrorSummarySchema.nullable().default(null),
   ui_renderable: z.enum(['unknown', 'true', 'false']).default('unknown'),
   browser_verification_required: z.boolean().default(false),
   browser_verification_status: z
@@ -174,6 +184,7 @@ export const workerSummarySchema = z.object({
   step_count: z.number().int().nonnegative(),
   tool_call_count: z.number().int().nonnegative(),
   last_error: z.string(),
+  user_error: userFacingErrorSummarySchema.nullable().default(null),
   capabilities: z.array(toolCapabilitySummarySchema).default([]),
   created_at: z.number().int(),
   updated_at: z.number().int()
@@ -1182,6 +1193,7 @@ export const apiErrorSchema = z.object({
 
 export type RuntimeOverview = z.infer<typeof runtimeOverviewSchema>;
 export type RuntimeSummary = z.infer<typeof runtimeSummarySchema>;
+export type UserFacingErrorSummary = z.infer<typeof userFacingErrorSummarySchema>;
 export type SessionSummary = z.infer<typeof sessionSummarySchema>;
 export type SessionProjectSummary = z.infer<typeof sessionProjectSummarySchema>;
 export type SessionTurnImage = z.infer<typeof sessionTurnImageSchema>;
