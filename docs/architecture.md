@@ -69,14 +69,18 @@ SQLite stores structured operational truth such as:
 - router profiles
 - auth token hashes
 - audit events
+- recent instance log index
 
 The state directory stores larger or local-only artifacts such as:
 
 - plaintext local auth tokens
+- instance log files under `logs/`
 - transcripts
 - memory documents
 - scratch outputs
 - future attachments and playbooks
+
+Instance logs are product support/debugging events owned by the daemon. They are written as structured JSONL under `<state-dir>/logs/events.jsonl`, indexed in SQLite for authenticated Workspace -> Logs APIs, redacted before persistence, and kept out of prompt context.
 
 ## Context Model
 

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { page } from '$app/state';
-  import { Bot, Cpu, KeyRound, MemoryStick, PlugZap, Settings2, Wrench } from 'lucide-svelte';
+  import { Bot, Cpu, KeyRound, MemoryStick, PlugZap, ScrollText, Settings2, Wrench } from 'lucide-svelte';
 
   import WorkspaceSectionNav from '$lib/components/app/workspace/workspace-section-nav.svelte';
 
@@ -10,6 +10,7 @@
     { href: '/workspace/mcps', label: 'MCPs', icon: PlugZap, exact: false },
     { href: '/workspace/memory', label: 'Memory', icon: MemoryStick, exact: false },
     { href: '/workspace/vault', label: 'Vault', icon: KeyRound, exact: false },
+    { href: '/workspace/logs', label: 'Logs', icon: ScrollText, exact: false },
     { href: '/workspace/diagnostics', label: 'Diagnostics', icon: Cpu, exact: false },
     { href: '/workspace/settings', label: 'Settings', icon: Settings2, exact: false }
   ];
