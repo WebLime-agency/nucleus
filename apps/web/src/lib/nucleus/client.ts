@@ -743,13 +743,14 @@ export async function fetchAuditEvents(limit = 20, fetchImpl: FetchLike = fetch)
 }
 
 export async function fetchInstanceLogs(
-  options: { category?: string; level?: string; before?: number; limit?: number } = {},
+  options: { category?: string; level?: string; before?: number; beforeId?: number; limit?: number } = {},
   fetchImpl: FetchLike = fetch
 ) {
   const params = new URLSearchParams();
   if (options.category) params.set('category', options.category);
   if (options.level) params.set('level', options.level);
-  if (options.before) params.set('before', String(options.before));
+  if (options.before !== undefined) params.set('before', String(options.before));
+  if (options.beforeId !== undefined) params.set('before_id', String(options.beforeId));
   if (options.limit) params.set('limit', String(options.limit));
   const query = params.toString();
 

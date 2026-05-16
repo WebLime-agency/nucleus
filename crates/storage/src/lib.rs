@@ -1943,7 +1943,7 @@ impl StateStore {
         &self,
         category: Option<&str>,
         level: Option<&str>,
-        before: Option<i64>,
+        before: Option<(i64, i64)>,
         limit: usize,
     ) -> Result<Vec<InstanceLogEntry>> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
@@ -6111,7 +6111,7 @@ fn list_instance_logs_with_connection(
     connection: &Connection,
     category: Option<&str>,
     level: Option<&str>,
-    before: Option<i64>,
+    before: Option<(i64, i64)>,
     limit: usize,
 ) -> Result<Vec<InstanceLogEntry>> {
     let mut sql = String::from(
@@ -6133,9 +6133,11 @@ fn list_instance_logs_with_connection(
         values.push(level.trim().to_string().into());
     }
 
-    if let Some(before) = before {
-        sql.push_str(" AND timestamp < ? ");
-        values.push(before.into());
+    if let Some((before_timestamp, before_id)) = before {
+        sql.push_str(" AND (timestamp < ? OR (timestamp = ? AND id < ?)) ");
+        values.push(before_timestamp.into());
+        values.push(before_timestamp.into());
+        values.push(before_id.into());
     }
 
     sql.push_str(" ORDER BY timestamp DESC, id DESC LIMIT ? ");
@@ -7354,6 +7356,47 @@ mod tests {
             .list_instance_logs(None, None, None, 10)
             .expect("remaining logs should list");
         assert_eq!(remaining.len(), 1);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn paginates_instance_logs_with_same_second_tiebreaker() {
+        let state_dir = test_state_dir("instance-logs-pagination");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_secs() as i64;
+
+        for index in 0..3 {
+            store
+                .append_instance_log(InstanceLogRecord {
+                    timestamp,
+                    level: "info".to_string(),
+                    category: "system".to_string(),
+                    source: "test".to_string(),
+                    event: format!("event.{index}"),
+                    message: "same second".to_string(),
+                    related_ids: serde_json::json!({}),
+                    metadata: serde_json::json!({}),
+                })
+                .expect("log should persist");
+        }
+
+        let first_page = store
+            .list_instance_logs(None, None, None, 2)
+            .expect("first page should list");
+        assert_eq!(first_page.len(), 2);
+        assert_eq!(first_page[0].event, "event.2");
+        assert_eq!(first_page[1].event, "event.1");
+
+        let cursor = first_page.last().expect("cursor record should exist");
+        let second_page = store
+            .list_instance_logs(None, None, Some((cursor.timestamp, cursor.id)), 2)
+            .expect("second page should list");
+        assert_eq!(second_page.len(), 1);
+        assert_eq!(second_page[0].event, "event.0");
 
         let _ = fs::remove_dir_all(&state_dir);
     }

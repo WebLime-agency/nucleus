@@ -774,7 +774,9 @@ export const instanceLogListResponseSchema = z.object({
   records: z.array(instanceLogEntrySchema),
   categories: z.array(instanceLogCategorySummarySchema),
   logs_dir: z.string(),
-  retention: z.string()
+  retention: z.string(),
+  next_before: z.number().int().nullable().default(null),
+  next_before_id: z.number().int().nullable().default(null)
 });
 
 export const instanceLogCategoriesResponseSchema = z.object({

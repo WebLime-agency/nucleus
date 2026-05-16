@@ -3733,6 +3733,7 @@ struct InstanceLogQuery {
     category: Option<String>,
     level: Option<String>,
     before: Option<i64>,
+    before_id: Option<i64>,
     limit: Option<usize>,
 }
 
@@ -3743,13 +3744,13 @@ async fn instance_logs(
     let limit = resolve_log_limit(query.limit)?;
     let category = normalize_log_filter(query.category);
     let level = normalize_log_filter(query.level).map(|value| value.to_lowercase());
-    let records = state.store.list_instance_logs(
-        category.as_deref(),
-        level.as_deref(),
-        query.before,
-        limit,
-    )?;
+    let before = resolve_log_cursor(query.before, query.before_id)?;
+    let records =
+        state
+            .store
+            .list_instance_logs(category.as_deref(), level.as_deref(), before, limit)?;
     let categories = state.store.list_instance_log_categories()?;
+    let next_cursor = records.last().map(|record| (record.timestamp, record.id));
 
     Ok(Json(InstanceLogListResponse {
         records,
@@ -3758,6 +3759,8 @@ async fn instance_logs(
         retention: format!(
             "{INSTANCE_LOG_RETENTION_DAYS} days, {INSTANCE_LOG_MAX_ROWS} recent records, JSONL rotated around 1 MiB with 3 history files"
         ),
+        next_before: next_cursor.map(|(timestamp, _)| timestamp),
+        next_before_id: next_cursor.map(|(_, id)| id),
     }))
 }
 
@@ -7309,6 +7312,20 @@ fn resolve_log_limit(limit: Option<usize>) -> Result<usize, ApiError> {
     Ok(limit)
 }
 
+fn resolve_log_cursor(
+    before: Option<i64>,
+    before_id: Option<i64>,
+) -> Result<Option<(i64, i64)>, ApiError> {
+    match (before, before_id) {
+        (Some(timestamp), Some(id)) => Ok(Some((timestamp, id))),
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(ApiError::bad_request(
+            "before_id is required when before is provided",
+        )),
+        (None, Some(_)) => Err(ApiError::bad_request("before_id requires before")),
+    }
+}
+
 fn normalize_log_filter(value: Option<String>) -> Option<String> {
     value
         .map(|item| item.trim().to_string())
@@ -7474,28 +7491,32 @@ fn redact_instance_log_assignments(input: &str) -> String {
 
 fn redact_instance_log_assignment_for_marker(input: &str, marker: &str) -> String {
     let lower = input.to_ascii_lowercase();
-    let Some(index) = lower.find(marker) else {
-        return input.to_string();
-    };
-    let after_marker = index + marker.len();
-    let Some(separator_offset) =
-        input[after_marker..].find(|character: char| matches!(character, '=' | ':'))
-    else {
-        return input.to_string();
-    };
-    let value_start = after_marker + separator_offset + 1;
-    let value_end = input[value_start..]
-        .char_indices()
-        .find_map(|(position, character)| {
-            matches!(character, ',' | ';' | '&' | ' ' | '\t').then_some(value_start + position)
-        })
-        .unwrap_or(input.len());
-    format!(
-        "{}{}{}",
-        &input[..value_start],
-        INSTANCE_LOG_REDACTED,
-        &input[value_end..]
-    )
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+
+    while let Some(relative_index) = lower[cursor..].find(marker) {
+        let index = cursor + relative_index;
+        let after_marker = index + marker.len();
+        let Some(separator_offset) =
+            input[after_marker..].find(|character: char| matches!(character, '=' | ':'))
+        else {
+            break;
+        };
+        let value_start = after_marker + separator_offset + 1;
+        let value_end = input[value_start..]
+            .char_indices()
+            .find_map(|(position, character)| {
+                matches!(character, ',' | ';' | '&' | ' ' | '\t').then_some(value_start + position)
+            })
+            .unwrap_or(input.len());
+
+        output.push_str(&input[cursor..value_start]);
+        output.push_str(INSTANCE_LOG_REDACTED);
+        cursor = value_end;
+    }
+
+    output.push_str(&input[cursor..]);
+    output
 }
 
 async fn execute_action(
@@ -8152,6 +8173,17 @@ mod tests {
         assert!(resolve_log_limit(Some(MAX_LOG_LIMIT + 1)).is_err());
     }
 
+    #[test]
+    fn rejects_partial_instance_log_cursors() {
+        assert_eq!(resolve_log_cursor(None, None).unwrap(), None);
+        assert_eq!(
+            resolve_log_cursor(Some(10), Some(5)).unwrap(),
+            Some((10, 5))
+        );
+        assert!(resolve_log_cursor(Some(10), None).is_err());
+        assert!(resolve_log_cursor(None, Some(5)).is_err());
+    }
+
     #[tokio::test]
     async fn instance_log_write_path_redacts_secret_like_values() {
         let (state_dir, state) = test_named_app_state("instance-log-redaction");
@@ -8166,10 +8198,13 @@ mod tests {
             "vault",
             "test",
             "vault.secret.checked",
-            format!("token={secret} bearer phase6-vault-token sk-supersecretvalue"),
+            format!(
+                "token={secret} api_key=first-leaked-key&api_key=second-leaked-key bearer phase6-vault-token sk-supersecretvalue"
+            ),
             json!({
                 "vault_secret_id": "secret-meta-id",
-                "api_key": "plain-api-key-value"
+                "api_key": "plain-api-key-value",
+                "safe_url": "https://example.test/path?api_key=third-leaked-key&api_key=fourth-leaked-key"
             }),
             json!({
                 "Authorization": "Bearer another-secret",
@@ -8188,6 +8223,10 @@ mod tests {
         assert!(!serialized.contains(&secret));
         assert!(!serialized.contains("phase6-vault-token"));
         assert!(!serialized.contains("sk-supersecretvalue"));
+        assert!(!serialized.contains("first-leaked-key"));
+        assert!(!serialized.contains("second-leaked-key"));
+        assert!(!serialized.contains("third-leaked-key"));
+        assert!(!serialized.contains("fourth-leaked-key"));
         assert!(!serialized.contains("plain-api-key-value"));
         assert!(!serialized.contains("another-secret"));
         assert!(state_dir.join("logs/events.jsonl").is_file());

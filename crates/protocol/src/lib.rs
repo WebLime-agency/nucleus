@@ -1322,6 +1322,8 @@ pub struct InstanceLogListResponse {
     pub categories: Vec<InstanceLogCategorySummary>,
     pub logs_dir: String,
     pub retention: String,
+    pub next_before: Option<i64>,
+    pub next_before_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
