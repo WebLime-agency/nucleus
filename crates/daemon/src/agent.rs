@@ -904,7 +904,7 @@ pub async fn start_prompt_job(
         &payload.images,
     )?;
 
-    let _job = state.store.create_job(JobRecord {
+    let job = state.store.create_job(JobRecord {
         id: job_id.clone(),
         session_id: Some(session_id.clone()),
         parent_job_id: None,
@@ -916,7 +916,7 @@ pub async fn start_prompt_job(
         requested_by: "user".to_string(),
         prompt_excerpt: prompt_excerpt.clone(),
     })?;
-    state.store.update_job(
+    let job = state.store.update_job(
         &job_id,
         browser_verification_initial_patch(
             &ui_renderable,
@@ -924,6 +924,9 @@ pub async fn start_prompt_job(
             browser_tools_granted,
         ),
     )?;
+    if job.publication_requested {
+        record_publication_git_hygiene_baseline(state, &job, &current.session)?;
+    }
     if patch_loop_guardrail_triggered {
         let _ = state.store.append_job_event(JobEventRecord {
             job_id: job_id.clone(),
@@ -3066,12 +3069,17 @@ async fn complete_job_with_final_answer(
     final_answer: &str,
 ) -> Result<()> {
     let detail = state.store.get_job(job_id)?;
-    let publication_patch = publication_outcome_patch(
+    let mut publication_patch = publication_outcome_patch(
         &detail.job,
         summary,
         final_answer,
         step_count,
         tool_call_count,
+    );
+    apply_publication_temp_hygiene(
+        &detail,
+        &session.session.working_dir,
+        &mut publication_patch,
     );
     state
         .agent
@@ -3236,6 +3244,28 @@ async fn complete_job_with_final_answer(
                     "cleanup_paths": publication_patch.cleanup_paths.clone().unwrap_or_default(),
                 }),
             });
+            if publication_patch.cleanup_status.as_deref() == Some("cleanup_required") {
+                let cleanup_paths = publication_patch.cleanup_paths.clone().unwrap_or_default();
+                let _ = state.store.append_job_event(JobEventRecord {
+                    job_id: job_id.to_string(),
+                    worker_id: Some(worker.id.clone()),
+                    event_type: "job.publication.cleanup_required".to_string(),
+                    status: "cleanup_required".to_string(),
+                    summary: "Publication job left repo-local temp artifacts".to_string(),
+                    detail: if cleanup_paths.is_empty() {
+                        "Nucleus marked cleanup as required for this publication job.".to_string()
+                    } else {
+                        format!(
+                            "New repo-local temp paths were detected after job start: {}",
+                            cleanup_paths.join(", ")
+                        )
+                    },
+                    data_json: json!({
+                        "cleanup_status": "cleanup_required",
+                        "cleanup_paths": cleanup_paths,
+                    }),
+                });
+            }
         }
     }
     let _ = try_record_audit_event(
@@ -3444,6 +3474,47 @@ fn add_publication_initial_prompt_guidance(
         prompt,
         job_tmp_dir.display()
     )
+}
+
+fn publication_job_temp_dir(state: &AppState, job_id: &str) -> PathBuf {
+    state
+        .store
+        .state_dir_path()
+        .join("jobs")
+        .join(job_id)
+        .join("tmp")
+}
+
+fn record_publication_git_hygiene_baseline(
+    state: &AppState,
+    job: &JobSummary,
+    session: &SessionSummary,
+) -> Result<()> {
+    let job_tmp_dir = publication_job_temp_dir(state, &job.id);
+    fs::create_dir_all(&job_tmp_dir)
+        .with_context(|| format!("failed to create job temp dir '{}'", job_tmp_dir.display()))?;
+    let temp_paths = collect_repo_temp_paths(&session.working_dir);
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: job.id.clone(),
+        worker_id: None,
+        event_type: "job.publication.git_baseline".to_string(),
+        status: "captured".to_string(),
+        summary: "Captured publication git hygiene baseline".to_string(),
+        detail: if temp_paths.is_empty() {
+            "No repo-local .tmp-* leftovers were present at job start.".to_string()
+        } else {
+            format!(
+                "Repo-local temp paths present at job start: {}",
+                temp_paths.join(", ")
+            )
+        },
+        data_json: json!({
+            "working_dir": session.working_dir.clone(),
+            "job_tmp_dir": job_tmp_dir.display().to_string(),
+            "temp_paths": temp_paths,
+        }),
+    });
+    Ok(())
 }
 
 fn add_budget_guidance(
@@ -3810,6 +3881,119 @@ fn publication_outcome_patch(
         cleanup_status: Some(cleanup_status),
         cleanup_paths: Some(cleanup_paths),
     }
+}
+
+fn apply_publication_temp_hygiene(
+    detail: &JobDetail,
+    working_dir: &str,
+    patch: &mut PublicationOutcomePatch,
+) {
+    if !detail.job.publication_requested {
+        return;
+    }
+
+    let baseline = publication_temp_baseline_paths(detail)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let current = collect_repo_temp_paths(working_dir)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let new_paths = current
+        .difference(&baseline)
+        .cloned()
+        .collect::<Vec<String>>();
+    if new_paths.is_empty() {
+        return;
+    }
+
+    patch.cleanup_status = Some("cleanup_required".to_string());
+    let mut cleanup_paths = patch.cleanup_paths.clone().unwrap_or_default();
+    for path in new_paths {
+        if !cleanup_paths.iter().any(|existing| existing == &path) {
+            cleanup_paths.push(path);
+        }
+    }
+    patch.cleanup_paths = Some(cleanup_paths);
+}
+
+fn publication_temp_baseline_paths(detail: &JobDetail) -> Vec<String> {
+    detail
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.event_type == "job.publication.git_baseline")
+        .and_then(|event| event.data_json.get("temp_paths"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn collect_repo_temp_paths(working_dir: &str) -> Vec<String> {
+    let root = Path::new(working_dir);
+    if working_dir.trim().is_empty() || !root.is_dir() {
+        return Vec::new();
+    }
+
+    let mut paths = collect_git_untracked_temp_paths(root);
+    if paths.is_empty() {
+        paths = collect_top_level_temp_paths(root);
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn collect_git_untracked_temp_paths(root: &Path) -> Vec<String> {
+    let Ok(output) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| {
+            if entry.len() <= 3 || !entry.starts_with(b"?? ") {
+                return None;
+            }
+            std::str::from_utf8(&entry[3..]).ok()
+        })
+        .filter(|path| is_publication_temp_path(path))
+        .map(str::to_string)
+        .collect()
+}
+
+fn collect_top_level_temp_paths(root: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|path| is_publication_temp_path(path))
+        .collect()
+}
+
+fn is_publication_temp_path(path: &str) -> bool {
+    let normalized = path.trim_start_matches("./");
+    let first_component = normalized.split('/').next().unwrap_or(normalized);
+    first_component == ".tmp-playwright"
+        || first_component.starts_with(".tmp-")
+        || first_component.starts_with(".playwright-")
 }
 
 fn normalize_publication_status(value: &str) -> Option<String> {
@@ -10485,6 +10669,50 @@ Validation status: passed\n\
 Browser verification status: not_performed\n\
 Cleanup status: clean"
         ));
+    }
+
+    #[test]
+    fn publication_temp_hygiene_marks_new_repo_tmp_leftovers() {
+        let root = test_state_dir("publication-temp-hygiene");
+        fs::create_dir_all(root.join(".tmp-before")).expect("baseline temp dir should exist");
+        fs::create_dir_all(root.join(".tmp-playwright")).expect("new temp dir should exist");
+
+        let detail = JobDetail {
+            job: test_publication_job_summary("publication-temp-hygiene"),
+            workers: Vec::new(),
+            child_jobs: Vec::new(),
+            tool_calls: Vec::new(),
+            approvals: Vec::new(),
+            artifacts: Vec::new(),
+            command_sessions: Vec::new(),
+            events: vec![nucleus_protocol::JobEvent {
+                id: 1,
+                job_id: "publication-temp-hygiene".to_string(),
+                worker_id: None,
+                event_type: "job.publication.git_baseline".to_string(),
+                status: "captured".to_string(),
+                summary: "Captured baseline".to_string(),
+                detail: String::new(),
+                data_json: json!({ "temp_paths": [".tmp-before"] }),
+                created_at: 0,
+            }],
+        };
+        let mut patch = PublicationOutcomePatch {
+            publication_requested: Some(true),
+            cleanup_status: Some("clean".to_string()),
+            cleanup_paths: Some(Vec::new()),
+            ..PublicationOutcomePatch::default()
+        };
+
+        apply_publication_temp_hygiene(&detail, &root.display().to_string(), &mut patch);
+
+        assert_eq!(patch.cleanup_status.as_deref(), Some("cleanup_required"));
+        assert_eq!(
+            patch.cleanup_paths,
+            Some(vec![".tmp-playwright".to_string()])
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
