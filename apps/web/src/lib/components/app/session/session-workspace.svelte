@@ -896,6 +896,7 @@
           ...detail.session,
           state: 'running',
           last_error: '',
+          user_error: null,
           turn_count: detail.session.turn_count + 1,
           updated_at: now,
           last_message_excerpt: prompt.trim()
@@ -908,6 +909,7 @@
       ...session,
       state: 'running',
       last_error: '',
+      user_error: null,
       turn_count: session.turn_count + 1,
       updated_at: now,
       last_message_excerpt: prompt.trim()
