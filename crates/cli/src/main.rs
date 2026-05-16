@@ -905,15 +905,19 @@ fn select_instance_by_url<'a>(
     instance_url: &str,
 ) -> Result<&'a LocalInstance> {
     let normalized = normalize_instance_url(instance_url);
+    let local_selector_port = local_url_selector_port(instance_url);
     let matches = instances
         .iter()
         .filter(|instance| {
             instance.url.as_deref().map(normalize_instance_url).as_ref() == Some(&normalized)
-                || instance
-                    .bind
-                    .as_deref()
-                    .and_then(bind_port)
-                    .map(|port| normalized.ends_with(&format!(":{port}")))
+                || local_selector_port
+                    .and_then(|selector_port| {
+                        instance
+                            .bind
+                            .as_deref()
+                            .and_then(bind_port)
+                            .map(|port| selector_port == port)
+                    })
                     .unwrap_or(false)
         })
         .collect::<Vec<_>>();
@@ -935,6 +939,15 @@ fn select_instance_by_url<'a>(
 
 fn normalize_instance_url(value: &str) -> String {
     value.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+fn local_url_selector_port(value: &str) -> Option<u16> {
+    let url = reqwest::Url::parse(value.trim()).ok()?;
+    let host = url.host_str()?;
+    if !matches!(host, "localhost" | "127.0.0.1" | "::1") {
+        return None;
+    }
+    url.port_or_known_default()
 }
 
 fn print_instances(instances: &[LocalInstance]) {
@@ -1588,6 +1601,10 @@ mod tests {
                 .expect("url port should match")
                 .state_dir,
             PathBuf::from("/tmp/wbl-dga")
+        );
+        assert!(
+            select_instance_by_url(&instances, "http://prod-host:5203").is_err(),
+            "non-local URLs must not match local instances by port alone"
         );
     }
 
