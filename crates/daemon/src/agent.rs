@@ -4072,11 +4072,14 @@ fn infer_validation_status(text: &str) -> Option<String> {
 }
 
 fn infer_cleanup_status(text: &str) -> Option<String> {
-    if text.contains("cleanup status: cleanup_required")
-        || text.contains("cleanup required")
-        || text.contains(".tmp-playwright")
-        || text.contains(".tmp-")
-    {
+    let normalized;
+    let text = if text.chars().any(char::is_uppercase) {
+        normalized = text.to_ascii_lowercase();
+        normalized.as_str()
+    } else {
+        text
+    };
+    if text.contains("cleanup status: cleanup_required") || text.contains("cleanup required") {
         return Some("cleanup_required".to_string());
     }
     if text.contains("cleanup status: cleaned") || text.contains("cleaned up") {
@@ -4084,6 +4087,9 @@ fn infer_cleanup_status(text: &str) -> Option<String> {
     }
     if text.contains("cleanup status: clean") || text.contains("branch clean") {
         return Some("clean".to_string());
+    }
+    if text.contains(".tmp-playwright") || text.contains(".tmp-") {
+        return Some("cleanup_required".to_string());
     }
     None
 }
@@ -10698,6 +10704,26 @@ Cleanup status: clean";
             "Pull request opened",
             final_answer
         ));
+    }
+
+    #[test]
+    fn cleanup_inference_prefers_success_signal_over_temp_path_keyword() {
+        assert_eq!(
+            infer_cleanup_status("Cleaned up .tmp-playwright after browser verification."),
+            Some("cleaned".to_string())
+        );
+        assert_eq!(
+            infer_cleanup_status("Cleanup status: clean; branch clean after removing .tmp-check."),
+            Some("clean".to_string())
+        );
+        assert_eq!(
+            infer_cleanup_status("Cleanup required: .tmp-playwright remains."),
+            Some("cleanup_required".to_string())
+        );
+        assert_eq!(
+            infer_cleanup_status("Cleanup status: cleanup_required"),
+            Some("cleanup_required".to_string())
+        );
     }
 
     #[test]
