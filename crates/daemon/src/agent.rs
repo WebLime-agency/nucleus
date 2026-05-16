@@ -4041,22 +4041,34 @@ fn collect_git_status_temp_paths(root: &Path) -> Vec<String> {
         return Vec::new();
     }
 
-    output
+    let entries = output
         .stdout
         .split(|byte| *byte == 0)
-        .filter_map(|entry| {
-            if entry.len() <= 3 || entry[2] != b' ' {
-                return None;
-            }
-            let status = &entry[..2];
-            if status[0] == b'D' || status[1] == b'D' {
-                return None;
-            }
-            std::str::from_utf8(&entry[3..]).ok()
-        })
-        .filter(|path| root.join(path).exists())
-        .filter_map(publication_temp_root_path)
-        .collect()
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>();
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while index < entries.len() {
+        let entry = entries[index];
+        index += 1;
+        if entry.len() <= 3 || entry[2] != b' ' {
+            continue;
+        }
+
+        let status = &entry[..2];
+        if status[0] != b'D' && status[1] != b'D' {
+            collect_existing_temp_path(root, &entry[3..], &mut paths);
+        }
+
+        if (status[0] == b'R' || status[1] == b'R' || status[0] == b'C' || status[1] == b'C')
+            && index < entries.len()
+        {
+            collect_existing_temp_path(root, entries[index], &mut paths);
+            index += 1;
+        }
+    }
+
+    paths
 }
 
 fn collect_git_tracked_temp_paths(root: &Path) -> Vec<String> {
@@ -4079,6 +4091,18 @@ fn collect_git_tracked_temp_paths(root: &Path) -> Vec<String> {
         .filter(|path| root.join(path).exists())
         .filter_map(publication_temp_root_path)
         .collect()
+}
+
+fn collect_existing_temp_path(root: &Path, path: &[u8], paths: &mut Vec<String>) {
+    let Ok(path) = std::str::from_utf8(path) else {
+        return;
+    };
+    if !root.join(path).exists() {
+        return;
+    }
+    if let Some(path) = publication_temp_root_path(path) {
+        paths.push(path);
+    }
 }
 
 fn collect_top_level_temp_paths(root: &Path) -> Vec<String> {
@@ -10988,6 +11012,57 @@ Cleanup status: clean";
 
         assert!(paths.iter().any(|path| path == "apps/web/.tmp-playwright"));
         assert!(paths.iter().any(|path| path == "pkg/.tmp-check"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collect_repo_temp_paths_includes_renamed_temp_destinations() {
+        let root = test_state_dir("publication-temp-path-renamed-collection");
+        fs::create_dir_all(root.join("src")).expect("src dir should exist");
+        fs::create_dir_all(root.join("apps/web/.tmp-playwright"))
+            .expect("nested temp dir should exist");
+        fs::write(root.join("src/probe.txt"), "temp").expect("tracked file should exist");
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "-q"])
+            .status()
+            .expect("git init should run");
+        assert!(status.success());
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["add", "src/probe.txt"])
+            .status()
+            .expect("git add should run");
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.local",
+            ])
+            .args(["commit", "-qm", "seed"])
+            .status()
+            .expect("git commit should run");
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["mv", "src/probe.txt", "apps/web/.tmp-playwright/probe.txt"])
+            .status()
+            .expect("git mv should run");
+        assert!(status.success());
+
+        let paths = collect_repo_temp_paths(&root.display().to_string());
+
+        assert!(paths.iter().any(|path| path == "apps/web/.tmp-playwright"));
 
         let _ = fs::remove_dir_all(root);
     }
