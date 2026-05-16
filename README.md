@@ -77,7 +77,10 @@ Current commands:
 
 ```bash
 nucleus health
+nucleus instances
 nucleus auth local-token
+nucleus auth local-token --instance nucleus-dev-projects
+nucleus auth rotate-token --instance nucleus-dev-projects
 nucleus setup local
 nucleus setup server
 nucleus setup client --server-url http://mini-server:5201 --token <TOKEN>
@@ -88,6 +91,9 @@ nucleus release install --channel stable --enable
 What they do:
 
 - `auth local-token` prints the current local bearer token
+- `instances` lists installed local systemd instances without printing tokens
+- `auth local-token --instance <name>` prints the token for a discovered instance
+- `auth rotate-token --instance <name>` rotates one instance token and prints the new token once
 - `setup local` prepares a same-machine instance
 - `setup server` prepares a remotely reachable instance and prints the local, host, and Tailscale URLs when available
 - `setup client` validates a server URL and token
@@ -153,6 +159,23 @@ Retrieve the access token:
 ```bash
 cargo run -p nucleus-cli --bin nucleus -- auth local-token
 ```
+
+For installed local services, discover the available instances first:
+
+```bash
+nucleus instances
+nucleus auth local-token --instance nucleus-dev-projects
+```
+
+If more than one local instance is installed, `nucleus auth local-token` asks for an explicit
+`--instance` or `--url` selector instead of guessing. To rotate one instance token:
+
+```bash
+nucleus auth rotate-token --instance nucleus-dev-projects
+```
+
+The new token is printed once. Existing browser and client sessions using the old token must
+reconnect or re-authenticate.
 
 ## Service Install
 
