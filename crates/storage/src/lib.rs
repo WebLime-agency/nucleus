@@ -4334,11 +4334,14 @@ fn bool_to_i64(value: bool) -> i64 {
 
 fn publication_requested_for_job(title: &str, purpose: &str, prompt_excerpt: &str) -> bool {
     let prompt_excerpt = prompt_excerpt.to_ascii_lowercase();
+    if publication_segment_has_publication_phrase(&prompt_excerpt) {
+        return publication_segment_requests_publication(&prompt_excerpt);
+    }
+
     let title = title.to_ascii_lowercase();
     let purpose = purpose.to_ascii_lowercase();
 
-    publication_segment_requests_publication(&prompt_excerpt)
-        || publication_segment_requests_publication(&title)
+    publication_segment_requests_publication(&title)
         || publication_segment_requests_publication(&purpose)
 }
 
@@ -8706,6 +8709,11 @@ and open a pull request to dev when it is ready."
         ));
         assert!(!publication_requested_for_job(
             "How do I open a PR?",
+            "Session prompt",
+            "how do I open a PR?"
+        ));
+        assert!(!publication_requested_for_job(
+            "Prompt how do I open a PR?",
             "Session prompt",
             "how do I open a PR?"
         ));
