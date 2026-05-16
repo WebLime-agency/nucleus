@@ -107,6 +107,7 @@
   type SessionDrawerMode = 'details' | 'browser';
   type BrowserViewportMode = 'fit' | 'mobile' | 'desktop' | 'wide';
   type BrowserAnnotationDraft = { page_id: string; x: number; y: number };
+  type JobOutcomeRow = { label: string; value: string; href?: string };
 
   const COMPOSER_MODES: SessionComposerMode[] = ['plan', 'ask', 'trusted'];
   const RUN_BUDGET_MODES: SessionRunBudgetMode[] = [
@@ -470,6 +471,60 @@
     if (status === 'not_performed') return 'Not browser-verified';
     if (status === 'pending') return 'Verification pending';
     return 'Not required';
+  }
+
+  function publicationOutcomeLabel(job: JobSummary) {
+    if (!job.publication_requested) return '';
+
+    if (job.publication_status === 'opened') {
+      return job.browser_verification_status === 'passed'
+        ? 'PR opened, browser-verified'
+        : 'PR opened, not browser-verified';
+    }
+
+    if (job.publication_status === 'blocked') {
+      if (job.validation_status === 'failed') return 'Blocked, validation failed';
+      if (
+        job.browser_verification_status === 'unavailable' ||
+        job.browser_verification_status === 'not_performed'
+      ) {
+        return 'Blocked, not browser-verified';
+      }
+      return 'PR publication blocked';
+    }
+
+    if (job.publication_status === 'failed') return 'PR publication failed';
+    if (job.publication_status === 'not_opened') return 'PR not opened';
+    return 'Publication requested';
+  }
+
+  function publicationOutcomeRows(job: JobSummary): JobOutcomeRow[] {
+    if (!job.publication_requested) return [];
+
+    const rows: JobOutcomeRow[] = [
+      { label: 'Publication', value: formatState(job.publication_status) },
+      { label: 'Validation', value: formatState(job.validation_status) },
+      { label: 'Browser', value: formatState(job.browser_verification_status) },
+      { label: 'Cleanup', value: formatState(job.cleanup_status) }
+    ];
+
+    if (job.pr_url) rows.push({ label: 'PR', value: job.pr_url, href: safeExternalHref(job.pr_url) });
+    if (job.source_branch) rows.push({ label: 'Source', value: job.source_branch });
+    if (job.target_branch) rows.push({ label: 'Target', value: job.target_branch });
+    if (job.cleanup_paths.length) rows.push({ label: 'Cleanup paths', value: job.cleanup_paths.join(', ') });
+    if (job.publication_summary) rows.push({ label: 'Summary', value: job.publication_summary });
+    return rows;
+  }
+
+  function safeExternalHref(value: string) {
+    try {
+      const url = new URL(value);
+      if (url.protocol === 'http:' || url.protocol === 'https:') return url.toString();
+    } catch {
+      return undefined;
+    }
+
+    return undefined;
   }
 
   function badgeVariantForToolCall(
@@ -3981,6 +4036,11 @@
                           <span>{job.artifact_count} artifacts</span>
                           <span>{formatDateTime(job.updated_at)}</span>
                         </div>
+                        {#if publicationOutcomeLabel(job)}
+                          <div class="mt-2 text-xs text-zinc-400">
+                            {publicationOutcomeLabel(job)}
+                          </div>
+                        {/if}
                       </button>
                     {/each}
                   </div>
@@ -4039,6 +4099,36 @@
                               {/each}
                             </div>
                           {/if}
+                        </div>
+                      {/if}
+
+                      {#if jobDetail.job.publication_requested}
+                        <div class="mt-3 rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-3">
+                          <div class="flex flex-wrap items-center justify-between gap-2">
+                            <div class="text-xs font-medium uppercase tracking-[0.14em] text-zinc-500">Publication Outcome</div>
+                            <Badge variant={badgeVariantForJobState(jobDetail.job.publication_status === 'opened' ? 'completed' : jobDetail.job.publication_status === 'failed' ? 'failed' : 'paused')}>
+                              {publicationOutcomeLabel(jobDetail.job)}
+                            </Badge>
+                          </div>
+                          <div class="mt-3 grid gap-2 text-xs sm:grid-cols-2">
+                            {#each publicationOutcomeRows(jobDetail.job) as row}
+                              <div class="min-w-0">
+                                <div class="text-[11px] uppercase tracking-[0.12em] text-zinc-600">{row.label}</div>
+                                {#if row.href}
+                                  <a
+                                    href={row.href}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    class="mt-0.5 block truncate text-lime-200 hover:text-lime-100"
+                                  >
+                                    {row.value}
+                                  </a>
+                                {:else}
+                                  <div class="mt-0.5 truncate text-zinc-300">{row.value}</div>
+                                {/if}
+                              </div>
+                            {/each}
+                          </div>
                         </div>
                       {/if}
 

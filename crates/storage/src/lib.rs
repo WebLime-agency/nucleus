@@ -235,6 +235,7 @@ pub struct JobRecord {
     pub state: String,
     pub requested_by: String,
     pub prompt_excerpt: String,
+    pub publication_intent_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -249,6 +250,15 @@ pub struct JobPatch {
     pub browser_verification_status: Option<String>,
     pub browser_verification_summary: Option<String>,
     pub browser_verification_artifact_ids: Option<Vec<String>>,
+    pub publication_requested: Option<bool>,
+    pub publication_status: Option<String>,
+    pub publication_summary: Option<String>,
+    pub pr_url: Option<String>,
+    pub source_branch: Option<String>,
+    pub target_branch: Option<String>,
+    pub validation_status: Option<String>,
+    pub cleanup_status: Option<String>,
+    pub cleanup_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2055,6 +2065,18 @@ impl StateStore {
         if let Some(parent_job_id) = record.parent_job_id.as_deref() {
             ensure_job_exists(&connection, parent_job_id)?;
         }
+        let publication_prompt = record
+            .publication_intent_text
+            .as_deref()
+            .unwrap_or(&record.prompt_excerpt);
+        let publication_requested =
+            publication_requested_for_job(&record.title, &record.purpose, publication_prompt);
+        let publication_status = "not_requested";
+        let browser_verification_status = if publication_requested {
+            "not_performed"
+        } else {
+            "not_required"
+        };
 
         connection.execute(
             "
@@ -2068,9 +2090,15 @@ impl StateStore {
                 trigger_kind,
                 state,
                 requested_by,
-                prompt_excerpt
+                prompt_excerpt,
+                publication_requested,
+                publication_status,
+                validation_status,
+                browser_verification_status,
+                cleanup_status,
+                cleanup_paths_json
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'not_performed', ?13, 'unknown', '[]')
             ",
             params![
                 record.id,
@@ -2083,6 +2111,9 @@ impl StateStore {
                 record.state,
                 record.requested_by,
                 record.prompt_excerpt,
+                bool_to_i64(publication_requested),
+                publication_status,
+                browser_verification_status,
             ],
         )?;
 
@@ -2095,9 +2126,14 @@ impl StateStore {
         let next_browser_verification_artifact_ids_json = serde_json::to_string(
             &patch
                 .browser_verification_artifact_ids
-                .unwrap_or(current.browser_verification_artifact_ids),
+                .unwrap_or_else(|| current.browser_verification_artifact_ids.clone()),
         )
         .context("failed to serialize browser verification artifact ids")?;
+        let cleanup_paths = patch
+            .cleanup_paths
+            .unwrap_or_else(|| current.cleanup_paths.clone());
+        let cleanup_paths_json =
+            serde_json::to_string(&cleanup_paths).context("failed to serialize cleanup paths")?;
         connection.execute(
             "
             UPDATE jobs
@@ -2112,6 +2148,15 @@ impl StateStore {
                 browser_verification_status = ?9,
                 browser_verification_summary = ?10,
                 browser_verification_artifact_ids_json = ?11,
+                publication_requested = ?12,
+                publication_status = ?13,
+                publication_summary = ?14,
+                pr_url = ?15,
+                source_branch = ?16,
+                target_branch = ?17,
+                validation_status = ?18,
+                cleanup_status = ?19,
+                cleanup_paths_json = ?20,
                 updated_at = unixepoch()
             WHERE id = ?1
             ",
@@ -2133,6 +2178,23 @@ impl StateStore {
                     .browser_verification_summary
                     .unwrap_or(current.browser_verification_summary),
                 next_browser_verification_artifact_ids_json,
+                bool_to_i64(
+                    patch
+                        .publication_requested
+                        .unwrap_or(current.publication_requested),
+                ),
+                patch
+                    .publication_status
+                    .unwrap_or(current.publication_status),
+                patch
+                    .publication_summary
+                    .unwrap_or(current.publication_summary),
+                patch.pr_url.unwrap_or(current.pr_url),
+                patch.source_branch.unwrap_or(current.source_branch),
+                patch.target_branch.unwrap_or(current.target_branch),
+                patch.validation_status.unwrap_or(current.validation_status),
+                patch.cleanup_status.unwrap_or(current.cleanup_status),
+                cleanup_paths_json,
             ],
         )?;
 
@@ -2858,6 +2920,15 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             browser_verification_status TEXT NOT NULL DEFAULT 'not_required',
             browser_verification_summary TEXT NOT NULL DEFAULT '',
             browser_verification_artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+            publication_requested INTEGER NOT NULL DEFAULT 0,
+            publication_status TEXT NOT NULL DEFAULT 'not_requested',
+            publication_summary TEXT NOT NULL DEFAULT '',
+            pr_url TEXT NOT NULL DEFAULT '',
+            source_branch TEXT NOT NULL DEFAULT '',
+            target_branch TEXT NOT NULL DEFAULT '',
+            validation_status TEXT NOT NULL DEFAULT 'not_performed',
+            cleanup_status TEXT NOT NULL DEFAULT 'unknown',
+            cleanup_paths_json TEXT NOT NULL DEFAULT '[]',
             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
@@ -3720,6 +3791,55 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "browser_verification_artifact_ids_json",
         "TEXT NOT NULL DEFAULT '[]'",
     )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "publication_requested",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "publication_status",
+        "TEXT NOT NULL DEFAULT 'not_requested'",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "publication_summary",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(connection, "jobs", "pr_url", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(
+        connection,
+        "jobs",
+        "source_branch",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "target_branch",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "validation_status",
+        "TEXT NOT NULL DEFAULT 'not_performed'",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "cleanup_status",
+        "TEXT NOT NULL DEFAULT 'unknown'",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "cleanup_paths_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
 
     for (column, definition) in [
         ("source_kind", "TEXT NOT NULL DEFAULT 'manual'"),
@@ -4206,6 +4326,139 @@ fn table_columns(connection: &Connection, table: &str) -> Result<HashSet<String>
         .context("failed to inspect table columns")?;
 
     Ok(columns.into_iter().collect())
+}
+
+fn bool_to_i64(value: bool) -> i64 {
+    if value { 1 } else { 0 }
+}
+
+fn publication_requested_for_job(title: &str, purpose: &str, prompt_excerpt: &str) -> bool {
+    let prompt_excerpt = prompt_excerpt.to_ascii_lowercase();
+    if publication_segment_has_publication_phrase(&prompt_excerpt) {
+        return publication_segment_requests_publication(&prompt_excerpt);
+    }
+
+    let title = title.to_ascii_lowercase();
+    let purpose = purpose.to_ascii_lowercase();
+
+    publication_segment_requests_publication(&title)
+        || publication_segment_requests_publication(&purpose)
+}
+
+fn publication_segment_requests_publication(text: &str) -> bool {
+    publication_segment_has_unnegated_publication_phrase(text)
+        && !publication_segment_is_informational(text)
+}
+
+fn publication_segment_has_publication_phrase(text: &str) -> bool {
+    publication_phrases()
+        .iter()
+        .any(|needle| contains_phrase_with_boundaries(text, needle))
+}
+
+fn publication_segment_has_unnegated_publication_phrase(text: &str) -> bool {
+    publication_phrases().iter().copied().any(|phrase| {
+        text.match_indices(phrase).any(|(index, _)| {
+            phrase_match_has_boundaries(text, phrase, index)
+                && !publication_phrase_is_negated(text, index)
+        })
+    })
+}
+
+fn publication_phrases() -> &'static [&'static str] {
+    &[
+        "open a pr",
+        "open pr",
+        "open a pull request",
+        "open pull request",
+        "create a pr",
+        "create pr",
+        "create a pull request",
+        "create pull request",
+        "publish this branch",
+        "publish the branch",
+        "publish branch",
+        "pr to merge",
+        "pull request to merge",
+    ]
+}
+
+fn publication_phrase_is_negated(text: &str, phrase_index: usize) -> bool {
+    let prefix = text[..phrase_index].trim_end_matches(|character: char| {
+        character.is_ascii_whitespace()
+            || matches!(character, ':' | '-' | ',' | ';' | '(' | '[' | '"' | '\'')
+    });
+    let normalized_prefix = prefix.replace('\u{2018}', "'").replace('\u{2019}', "'");
+
+    [
+        "do not", "don't", "dont", "never", "no", "not", "not to", "without",
+    ]
+    .iter()
+    .any(|negation| text_ends_with_phrase_with_boundaries(&normalized_prefix, negation))
+}
+
+fn publication_segment_is_informational(text: &str) -> bool {
+    let text = text.trim_start();
+    if publication_segment_has_actionable_suffix(text) {
+        return false;
+    }
+
+    [
+        "how do i ",
+        "how can i ",
+        "how should i ",
+        "how to ",
+        "what is ",
+        "what's ",
+        "can you explain",
+        "could you explain",
+        "please explain",
+        "explain how",
+        "guide me through",
+        "instructions for",
+    ]
+    .iter()
+    .any(|prefix| text.starts_with(prefix))
+}
+
+fn publication_segment_has_actionable_suffix(text: &str) -> bool {
+    [
+        ", then ",
+        "; then ",
+        ". then ",
+        " and then ",
+        " then ",
+        ", ",
+        "; ",
+        ". ",
+    ]
+    .iter()
+    .any(|separator| {
+        text.split(separator)
+            .skip(1)
+            .map(str::trim_start)
+            .any(publication_segment_requests_publication)
+    })
+}
+
+fn contains_phrase_with_boundaries(text: &str, phrase: &str) -> bool {
+    text.match_indices(phrase)
+        .any(|(index, _)| phrase_match_has_boundaries(text, phrase, index))
+}
+
+fn phrase_match_has_boundaries(text: &str, phrase: &str, index: usize) -> bool {
+    let before = text[..index].chars().next_back();
+    let after = text[index + phrase.len()..].chars().next();
+    !is_word_character(before) && !is_word_character(after)
+}
+
+fn text_ends_with_phrase_with_boundaries(text: &str, phrase: &str) -> bool {
+    text.strip_suffix(phrase)
+        .is_some_and(|before| !is_word_character(before.chars().next_back()))
+}
+
+fn is_word_character(character: Option<char>) -> bool {
+    character.is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
 fn playbook_file_path(playbooks_dir: &Path, playbook_id: &str) -> PathBuf {
@@ -6504,6 +6757,15 @@ fn load_job_summary(connection: &Connection, job_id: &str) -> Result<JobSummary>
                 browser_verification_status,
                 browser_verification_summary,
                 browser_verification_artifact_ids_json,
+                publication_requested,
+                publication_status,
+                publication_summary,
+                pr_url,
+                source_branch,
+                target_branch,
+                validation_status,
+                cleanup_status,
+                cleanup_paths_json,
                 created_at,
                 updated_at
             FROM jobs
@@ -6554,11 +6816,20 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         browser_verification_status: row.get(16)?,
         browser_verification_summary: row.get(17)?,
         browser_verification_artifact_ids: decode_string_list(row.get::<_, String>(18)?)?,
+        publication_requested: row.get::<_, i64>(19)? != 0,
+        publication_status: row.get(20)?,
+        publication_summary: row.get(21)?,
+        pr_url: row.get(22)?,
+        source_branch: row.get(23)?,
+        target_branch: row.get(24)?,
+        validation_status: row.get(25)?,
+        cleanup_status: row.get(26)?,
+        cleanup_paths: decode_string_vec_column(row, 27)?,
         worker_count: 0,
         pending_approval_count: 0,
         artifact_count: 0,
-        created_at: row.get(19)?,
-        updated_at: row.get(20)?,
+        created_at: row.get(28)?,
+        updated_at: row.get(29)?,
     })
 }
 
@@ -8365,6 +8636,7 @@ mod tests {
                 state: "completed".to_string(),
                 requested_by: "user".to_string(),
                 prompt_excerpt: "root".to_string(),
+                publication_intent_text: None,
             })
             .expect("root job should persist");
         store
@@ -8379,6 +8651,7 @@ mod tests {
                 state: "completed".to_string(),
                 requested_by: "agent".to_string(),
                 prompt_excerpt: "child".to_string(),
+                publication_intent_text: None,
             })
             .expect("child job should persist");
 
@@ -8393,6 +8666,180 @@ mod tests {
         assert_eq!(jobs[0].browser_verification_status, "not_required");
         assert!(jobs[0].browser_verification_summary.is_empty());
         assert!(jobs[0].browser_verification_artifact_ids.is_empty());
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn publication_jobs_are_detected_and_persist_outcome_fields() {
+        let state_dir = test_state_dir("publication-job-outcome");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let scratch_dir = store
+            .scratch_dir_for_session("publication-session")
+            .expect("scratch dir should resolve");
+
+        store
+            .create_session(test_session_record(
+                "publication-session",
+                "Publication session",
+                "ad_hoc",
+                scratch_dir,
+            ))
+            .expect("session should persist");
+        let created = store
+            .create_job(JobRecord {
+                id: "publication-job".to_string(),
+                session_id: Some("publication-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Prompt open a PR".to_string(),
+                purpose: "Session prompt".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "queued".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "open a pr to merge to dev".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("job should persist");
+
+        assert!(created.publication_requested);
+        assert_eq!(created.publication_status, "not_requested");
+        assert_eq!(created.validation_status, "not_performed");
+        assert_eq!(created.browser_verification_status, "not_performed");
+        assert_eq!(created.cleanup_status, "unknown");
+        let created_from_full_prompt = store
+            .create_job(JobRecord {
+                id: "publication-long-prompt-job".to_string(),
+                session_id: Some("publication-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Prompt prep work".to_string(),
+                purpose: "Session prompt".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "queued".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "review the current issue and inspect the branch".to_string(),
+                publication_intent_text: Some(
+                    "Review the current issue, inspect the branch, run the focused tests, \
+and open a pull request to dev when it is ready."
+                        .to_string(),
+                ),
+            })
+            .expect("job should persist");
+
+        assert!(created_from_full_prompt.publication_requested);
+        assert!(!publication_requested_for_job(
+            "Open project notes",
+            "Session prompt",
+            "open project workspace"
+        ));
+        assert!(!publication_requested_for_job(
+            "Resolve merge conflicts",
+            "Session prompt",
+            "merge to dev locally without opening a PR"
+        ));
+        assert!(!publication_requested_for_job(
+            "Dry run merge",
+            "Session prompt",
+            "merge into dev and report conflicts"
+        ));
+        assert!(!publication_requested_for_job(
+            "How do I open a PR?",
+            "Session prompt",
+            "how do I open a PR?"
+        ));
+        assert!(!publication_requested_for_job(
+            "Prompt how do I open a PR?",
+            "Session prompt",
+            "how do I open a PR?"
+        ));
+        assert!(!publication_requested_for_job(
+            "How do I open a pull request?",
+            "Session prompt",
+            "how do I open a pull request?"
+        ));
+        assert!(!publication_requested_for_job(
+            "Explain publication",
+            "Session prompt",
+            "Can you explain how to publish this branch?"
+        ));
+        assert!(!publication_requested_for_job(
+            "No PR",
+            "Session prompt",
+            "do not open a PR"
+        ));
+        assert!(!publication_requested_for_job(
+            "No publication",
+            "Session prompt",
+            "don't publish this branch"
+        ));
+        assert!(!publication_requested_for_job(
+            "No publication",
+            "Session prompt",
+            "don\u{2019}t publish this branch"
+        ));
+        assert!(!publication_requested_for_job(
+            "No pull request",
+            "Session prompt",
+            "please do not create a pull request"
+        ));
+        assert!(!publication_requested_for_job(
+            "Open PR",
+            "Session prompt",
+            "do not open a PR"
+        ));
+        assert!(publication_requested_for_job(
+            "Explain then publish",
+            "Session prompt",
+            "Please explain quickly, then open a PR to dev"
+        ));
+        assert!(publication_requested_for_job(
+            "Publish branch",
+            "Session prompt",
+            "publish this branch"
+        ));
+        assert!(publication_requested_for_job(
+            "Open PR",
+            "Session prompt",
+            "open a pr to merge to dev"
+        ));
+        assert!(publication_requested_for_job(
+            "Open pull request",
+            "Session prompt",
+            "open a pull request to merge to dev"
+        ));
+        assert!(publication_requested_for_job(
+            "Create pull request",
+            "Session prompt",
+            "create a pull request for dev"
+        ));
+
+        let updated = store
+            .update_job(
+                "publication-job",
+                JobPatch {
+                    publication_status: Some("opened".to_string()),
+                    publication_summary: Some("Opened PR after validation.".to_string()),
+                    pr_url: Some("https://github.com/example/repo/pull/1".to_string()),
+                    source_branch: Some("feat/example".to_string()),
+                    target_branch: Some("dev".to_string()),
+                    validation_status: Some("passed".to_string()),
+                    browser_verification_status: Some("unavailable".to_string()),
+                    cleanup_status: Some("clean".to_string()),
+                    cleanup_paths: Some(vec![".tmp-playwright".to_string()]),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("job should update");
+
+        assert_eq!(updated.publication_status, "opened");
+        assert_eq!(updated.pr_url, "https://github.com/example/repo/pull/1");
+        assert_eq!(updated.source_branch, "feat/example");
+        assert_eq!(updated.target_branch, "dev");
+        assert_eq!(updated.validation_status, "passed");
+        assert_eq!(updated.browser_verification_status, "unavailable");
+        assert_eq!(updated.cleanup_status, "clean");
+        assert_eq!(updated.cleanup_paths, vec![".tmp-playwright".to_string()]);
 
         let _ = fs::remove_dir_all(&state_dir);
     }
@@ -8534,6 +8981,7 @@ mod tests {
                 state: "running".to_string(),
                 requested_by: "system".to_string(),
                 prompt_excerpt: "summary".to_string(),
+                publication_intent_text: None,
             })
             .expect("root playbook job should persist");
         store
@@ -8548,6 +8996,7 @@ mod tests {
                 state: "completed".to_string(),
                 requested_by: "user".to_string(),
                 prompt_excerpt: "summary".to_string(),
+                publication_intent_text: None,
             })
             .expect("second root playbook job should persist");
         store
@@ -8562,6 +9011,7 @@ mod tests {
                 state: "completed".to_string(),
                 requested_by: "agent".to_string(),
                 prompt_excerpt: "child".to_string(),
+                publication_intent_text: None,
             })
             .expect("child job should persist");
 

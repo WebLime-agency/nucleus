@@ -904,7 +904,7 @@ pub async fn start_prompt_job(
         &payload.images,
     )?;
 
-    let _job = state.store.create_job(JobRecord {
+    state.store.create_job(JobRecord {
         id: job_id.clone(),
         session_id: Some(session_id.clone()),
         parent_job_id: None,
@@ -915,8 +915,9 @@ pub async fn start_prompt_job(
         state: "queued".to_string(),
         requested_by: "user".to_string(),
         prompt_excerpt: prompt_excerpt.clone(),
+        publication_intent_text: Some(visible_prompt.clone()),
     })?;
-    state.store.update_job(
+    let job = state.store.update_job(
         &job_id,
         browser_verification_initial_patch(
             &ui_renderable,
@@ -924,6 +925,9 @@ pub async fn start_prompt_job(
             browser_tools_granted,
         ),
     )?;
+    if job.publication_requested {
+        record_publication_git_hygiene_baseline(&state, &job, &current.session.working_dir)?;
+    }
     if patch_loop_guardrail_triggered {
         let _ = state.store.append_job_event(JobEventRecord {
             job_id: job_id.clone(),
@@ -1869,10 +1873,14 @@ async fn run_job_loop(
         let prompt = checkpoint.next_prompt.take().unwrap_or_else(|| {
             let initial =
                 build_initial_step_prompt(&session.session, &assembled_prompt.prompt, &worker);
-            if checkpoint.patch_loop_guardrail_triggered {
+            let prompt = if checkpoint.patch_loop_guardrail_triggered {
                 build_patch_loop_guardrail_prompt(initial)
             } else {
                 initial
+            };
+            match state.store.get_job(job_id) {
+                Ok(detail) => add_publication_initial_prompt_guidance(state, &detail.job, prompt),
+                Err(_) => prompt,
             }
         });
         let prompt = add_budget_guidance(prompt, &worker, step, tool_calls);
@@ -2023,6 +2031,31 @@ async fn run_job_loop(
                         "Rejected final answer without Browser verification outcome.",
                         "browser_verification_required",
                         &build_browser_verification_retry_prompt(&current_job, &final_answer),
+                        &final_answer,
+                    )
+                    .await?;
+                    continue;
+                }
+
+                let detail = state.store.get_job(job_id)?;
+                if should_retry_missing_publication_outcome(
+                    &detail,
+                    &summary,
+                    &final_answer,
+                    &worker,
+                    step,
+                    tool_calls,
+                ) {
+                    retry_worker_final_answer(
+                        state,
+                        job_id,
+                        &mut worker,
+                        &mut checkpoint,
+                        &mut step,
+                        tool_calls,
+                        "Requested explicit publication outcome metadata.",
+                        "publication_outcome_missing",
+                        &build_publication_outcome_retry_prompt(&summary, &final_answer),
                         &final_answer,
                     )
                     .await?;
@@ -2891,7 +2924,12 @@ async fn create_child_job(
         state: "queued".to_string(),
         requested_by: "agent".to_string(),
         prompt_excerpt: excerpt(prompt, 160),
+        publication_intent_text: Some(prompt.to_string()),
     })?;
+    let child_working_dir = working_dir.display().to_string();
+    if child_job.publication_requested {
+        record_publication_git_hygiene_baseline(state, &child_job, &child_working_dir)?;
+    }
     state.store.create_worker(WorkerRecord {
         id: child_worker_id.clone(),
         job_id: child_job_id.clone(),
@@ -2904,7 +2942,7 @@ async fn create_child_job(
         provider_base_url: parent_worker.provider_base_url.clone(),
         provider_api_key: parent_worker.provider_api_key.clone(),
         provider_session_id: String::new(),
-        working_dir: working_dir.display().to_string(),
+        working_dir: child_working_dir,
         read_roots,
         write_roots: Vec::new(),
         max_steps: configured_child_job_max_steps(),
@@ -3037,6 +3075,18 @@ async fn complete_job_with_final_answer(
     final_answer: &str,
 ) -> Result<()> {
     let detail = state.store.get_job(job_id)?;
+    let mut publication_patch = publication_outcome_patch(
+        &detail.job,
+        summary,
+        final_answer,
+        step_count,
+        tool_call_count,
+    );
+    apply_publication_temp_hygiene(
+        &detail,
+        &session.session.working_dir,
+        &mut publication_patch,
+    );
     state
         .agent
         .terminate_job_command_sessions(
@@ -3078,6 +3128,7 @@ async fn complete_job_with_final_answer(
     }
 
     let completion_job = state.store.get_job(job_id)?.job;
+    reconcile_publication_browser_status_with_completion(&completion_job, &mut publication_patch);
     let final_answer =
         decorate_final_answer_with_browser_verification(&completion_job, final_answer);
 
@@ -3127,6 +3178,16 @@ async fn complete_job_with_final_answer(
             visible_turn_id,
             result_summary: Some(summary.to_string()),
             last_error: Some(String::new()),
+            publication_requested: publication_patch.publication_requested,
+            publication_status: publication_patch.publication_status.clone(),
+            publication_summary: publication_patch.publication_summary.clone(),
+            pr_url: publication_patch.pr_url.clone(),
+            source_branch: publication_patch.source_branch.clone(),
+            target_branch: publication_patch.target_branch.clone(),
+            validation_status: publication_patch.validation_status.clone(),
+            browser_verification_status: publication_patch.browser_verification_status.clone(),
+            cleanup_status: publication_patch.cleanup_status.clone(),
+            cleanup_paths: publication_patch.cleanup_paths.clone(),
             ..JobPatch::default()
         },
     )?;
@@ -3140,8 +3201,13 @@ async fn complete_job_with_final_answer(
             ..WorkerPatch::default()
         },
     )?;
-    let terminal_metadata =
-        final_answer_terminal_metadata(summary, &final_answer, step_count, tool_call_count);
+    let terminal_metadata = final_answer_terminal_metadata(
+        summary,
+        &final_answer,
+        step_count,
+        tool_call_count,
+        &publication_patch,
+    );
     let terminal_status = terminal_metadata
         .get("terminal_status")
         .and_then(Value::as_str)
@@ -3156,6 +3222,59 @@ async fn complete_job_with_final_answer(
         detail: excerpt(&final_answer, 320),
         data_json: terminal_metadata,
     });
+    if let Some(publication_status) = publication_patch.publication_status.as_deref() {
+        if publication_patch.publication_requested.unwrap_or(false) {
+            let blocked = matches!(publication_status, "blocked" | "not_opened" | "failed");
+            let _ = state.store.append_job_event(JobEventRecord {
+                job_id: job_id.to_string(),
+                worker_id: Some(worker.id.clone()),
+                event_type: if blocked {
+                    "job.publication.blocked".to_string()
+                } else {
+                    "job.publication.completed".to_string()
+                },
+                status: publication_status.to_string(),
+                summary: publication_patch
+                    .publication_summary
+                    .clone()
+                    .unwrap_or_else(|| summary.to_string()),
+                detail: excerpt(&final_answer, 320),
+                data_json: json!({
+                    "publication_requested": publication_patch.publication_requested.unwrap_or(true),
+                    "publication_status": publication_status,
+                    "pr_url": publication_patch.pr_url.clone().unwrap_or_default(),
+                    "source_branch": publication_patch.source_branch.clone().unwrap_or_default(),
+                    "target_branch": publication_patch.target_branch.clone().unwrap_or_default(),
+                    "validation_status": publication_patch.validation_status.clone().unwrap_or_default(),
+                    "browser_verification_status": publication_patch.browser_verification_status.clone().unwrap_or_default(),
+                    "cleanup_status": publication_patch.cleanup_status.clone().unwrap_or_default(),
+                    "cleanup_paths": publication_patch.cleanup_paths.clone().unwrap_or_default(),
+                }),
+            });
+            if publication_patch.cleanup_status.as_deref() == Some("cleanup_required") {
+                let cleanup_paths = publication_patch.cleanup_paths.clone().unwrap_or_default();
+                let _ = state.store.append_job_event(JobEventRecord {
+                    job_id: job_id.to_string(),
+                    worker_id: Some(worker.id.clone()),
+                    event_type: "job.publication.cleanup_required".to_string(),
+                    status: "cleanup_required".to_string(),
+                    summary: "Publication job left repo-local temp artifacts".to_string(),
+                    detail: if cleanup_paths.is_empty() {
+                        "Nucleus marked cleanup as required for this publication job.".to_string()
+                    } else {
+                        format!(
+                            "New repo-local temp paths were detected after job start: {}",
+                            cleanup_paths.join(", ")
+                        )
+                    },
+                    data_json: json!({
+                        "cleanup_status": "cleanup_required",
+                        "cleanup_paths": cleanup_paths,
+                    }),
+                });
+            }
+        }
+    }
     let _ = try_record_audit_event(
         state,
         AuditEventRecord {
@@ -3331,6 +3450,80 @@ If the current user request corrects, refines, or challenges the previous answer
     )
 }
 
+fn add_publication_initial_prompt_guidance(
+    state: &AppState,
+    job: &JobSummary,
+    prompt: String,
+) -> String {
+    if !job.publication_requested {
+        return prompt;
+    }
+
+    let job_tmp_dir = state
+        .store
+        .state_dir_path()
+        .join("jobs")
+        .join(&job.id)
+        .join("tmp");
+    let _ = fs::create_dir_all(&job_tmp_dir);
+    format!(
+        "{}\n\nPublication job requirements:\n\
+- The user request is publication-oriented, so final_answer must include explicit terminal facts for publication_status, validation_status, browser_verification_status, and cleanup_status.\n\
+- Allowed publication_status values: not_requested, opened, not_opened, blocked, failed.\n\
+- Allowed validation_status values: passed, failed, not_performed, unavailable.\n\
+- Allowed browser_verification_status values: not_required, pending, passed, failed, not_performed, unavailable.\n\
+- Allowed cleanup_status values: clean, cleaned, cleanup_required, unknown.\n\
+- Include pr_url, source_branch, and target_branch when known.\n\
+- Use the daemon-owned Browser tools for rendered verification when possible. Do not create repo-local Playwright projects, .tmp-playwright, or ad-hoc .tmp-* verification folders.\n\
+- Missing Browser or Playwright tooling is not a generic job failure. Record browser_verification_status=unavailable or not_performed with the concrete reason.\n\
+- Put scratch verification scripts outside the git worktree when you need them. Preferred job temp directory: {}\n\
+- Before terminal final_answer, check for job-created .tmp-* leftovers in the repo. Clean only files this job created, or set cleanup_status=cleanup_required and list the paths.",
+        prompt,
+        job_tmp_dir.display()
+    )
+}
+
+fn publication_job_temp_dir(state: &AppState, job_id: &str) -> PathBuf {
+    state
+        .store
+        .state_dir_path()
+        .join("jobs")
+        .join(job_id)
+        .join("tmp")
+}
+
+fn record_publication_git_hygiene_baseline(
+    state: &AppState,
+    job: &JobSummary,
+    working_dir: &str,
+) -> Result<()> {
+    let job_tmp_dir = publication_job_temp_dir(state, &job.id);
+    fs::create_dir_all(&job_tmp_dir)
+        .with_context(|| format!("failed to create job temp dir '{}'", job_tmp_dir.display()))?;
+    let temp_paths = collect_repo_temp_paths(working_dir);
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: job.id.clone(),
+        worker_id: None,
+        event_type: "job.publication.git_baseline".to_string(),
+        status: "captured".to_string(),
+        summary: "Captured publication git hygiene baseline".to_string(),
+        detail: if temp_paths.is_empty() {
+            "No repo-local .tmp-* leftovers were present at job start.".to_string()
+        } else {
+            format!(
+                "Repo-local temp paths present at job start: {}",
+                temp_paths.join(", ")
+            )
+        },
+        data_json: json!({
+            "working_dir": working_dir,
+            "job_tmp_dir": job_tmp_dir.display().to_string(),
+            "temp_paths": temp_paths,
+        }),
+    });
+    Ok(())
+}
+
 fn add_budget_guidance(
     prompt: String,
     worker: &WorkerSummary,
@@ -3481,10 +3674,32 @@ fn contains_blocked_or_waiting_language(text: &str) -> bool {
         "permission denied",
         "access denied",
         "budget exhausted",
-        "reached the current",
+        "reached the current step budget",
+        "reached the current action budget",
+        "reached the current run budget",
     ]
     .iter()
     .any(|needle| text.contains(needle))
+}
+
+#[derive(Debug, Clone, Default)]
+struct PublicationOutcomePatch {
+    publication_requested: Option<bool>,
+    publication_status: Option<String>,
+    publication_summary: Option<String>,
+    pr_url: Option<String>,
+    source_branch: Option<String>,
+    target_branch: Option<String>,
+    validation_status: Option<String>,
+    browser_verification_status: Option<String>,
+    cleanup_status: Option<String>,
+    cleanup_paths: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PublicationTempBaseline {
+    working_dir: String,
+    temp_paths: Vec<String>,
 }
 
 fn final_answer_terminal_metadata(
@@ -3492,6 +3707,7 @@ fn final_answer_terminal_metadata(
     final_answer: &str,
     step_count: usize,
     tool_call_count: usize,
+    publication_patch: &PublicationOutcomePatch,
 ) -> Value {
     let text = normalize_action_item_text(&format!("{summary}\n{final_answer}"));
     let blocked = contains_blocked_terminal_result_language(&text);
@@ -3505,6 +3721,36 @@ fn final_answer_terminal_metadata(
     if let Some(status) = infer_browser_verification_status(&text) {
         metadata["browser_verification_status"] = Value::String(status.to_string());
     }
+    if publication_patch.publication_requested.unwrap_or(false) {
+        metadata["publication_requested"] = Value::Bool(true);
+        if let Some(value) = publication_patch.publication_status.as_deref() {
+            metadata["publication_status"] = Value::String(value.to_string());
+        }
+        if let Some(value) = publication_patch.publication_summary.as_deref() {
+            metadata["publication_summary"] = Value::String(value.to_string());
+        }
+        if let Some(value) = publication_patch.pr_url.as_deref() {
+            metadata["pr_url"] = Value::String(value.to_string());
+        }
+        if let Some(value) = publication_patch.source_branch.as_deref() {
+            metadata["source_branch"] = Value::String(value.to_string());
+        }
+        if let Some(value) = publication_patch.target_branch.as_deref() {
+            metadata["target_branch"] = Value::String(value.to_string());
+        }
+        if let Some(value) = publication_patch.validation_status.as_deref() {
+            metadata["validation_status"] = Value::String(value.to_string());
+        }
+        if let Some(value) = publication_patch.browser_verification_status.as_deref() {
+            metadata["browser_verification_status"] = Value::String(value.to_string());
+        }
+        if let Some(value) = publication_patch.cleanup_status.as_deref() {
+            metadata["cleanup_status"] = Value::String(value.to_string());
+        }
+        if let Some(value) = publication_patch.cleanup_paths.as_ref() {
+            metadata["cleanup_paths"] = json!(value);
+        }
+    }
 
     metadata
 }
@@ -3517,13 +3763,33 @@ fn contains_blocked_terminal_result_language(text: &str) -> bool {
         "blocked without browser",
         "blocked, not browser",
         "cannot honestly open the pr",
+        "reached the current step budget",
+        "reached the current action budget",
+        "reached the current run budget",
     ]
     .iter()
     .any(|needle| text.contains(needle))
 }
 
 fn infer_browser_verification_status(text: &str) -> Option<&'static str> {
+    if text.contains("browser verification status: not_required")
+        || text.contains("browser verification status: not required")
+        || text.contains("browser verification: status: not_required")
+        || text.contains("browser verification: status: not required")
+        || text.contains("browser verification: not required")
+    {
+        return Some("not_required");
+    }
+
+    if text.contains("browser verification status: pending")
+        || text.contains("browser verification: status: pending")
+        || text.contains("browser verification: pending")
+    {
+        return Some("pending");
+    }
+
     if text.contains("browser verification status: unavailable")
+        || text.contains("browser verification: status: unavailable")
         || text.contains("browser verification: unavailable")
         || text.contains("verification unavailable")
     {
@@ -3532,6 +3798,8 @@ fn infer_browser_verification_status(text: &str) -> Option<&'static str> {
 
     if text.contains("browser verification status: not_performed")
         || text.contains("browser verification status: not performed")
+        || text.contains("browser verification: status: not_performed")
+        || text.contains("browser verification: status: not performed")
         || text.contains("browser verification: not performed")
         || text.contains("not browser-verified")
         || text.contains("not browser verified")
@@ -3539,7 +3807,498 @@ fn infer_browser_verification_status(text: &str) -> Option<&'static str> {
         return Some("not_performed");
     }
 
+    if text.contains("browser verification status: failed")
+        || text.contains("browser verification: status: failed")
+        || text.contains("browser verification: failed")
+        || text.contains("browser verification failed")
+    {
+        return Some("failed");
+    }
+
+    if text.contains("browser verification status: passed")
+        || text.contains("browser verification: status: passed")
+        || text.contains("browser verification: passed")
+        || text.contains("browser-verified")
+        || text.contains("browser verified")
+    {
+        return Some("passed");
+    }
+
     None
+}
+
+fn publication_outcome_patch(
+    current: &JobSummary,
+    summary: &str,
+    final_answer: &str,
+    _step_count: usize,
+    _tool_call_count: usize,
+) -> PublicationOutcomePatch {
+    if !current.publication_requested {
+        return PublicationOutcomePatch::default();
+    }
+
+    let raw_text = format!("{summary}\n{final_answer}");
+    let normalized = normalize_action_item_text(&raw_text);
+    let blocked = contains_blocked_terminal_result_language(&normalized);
+    let pr_url = extract_labeled_value(&raw_text, &["pr_url", "pr url", "pull request"])
+        .filter(|value| value.starts_with("http"));
+    let publication_status =
+        extract_labeled_value(&raw_text, &["publication_status", "publication status"])
+            .and_then(|value| normalize_publication_status(&value))
+            .or_else(|| {
+                if pr_url.is_some() {
+                    Some("opened".to_string())
+                } else if publication_text_says_opened(&normalized) {
+                    Some("opened".to_string())
+                } else if normalized.contains("publication failed")
+                    || normalized.contains("pr failed")
+                {
+                    Some("failed".to_string())
+                } else if blocked {
+                    Some("blocked".to_string())
+                } else if normalized.contains("pr not opened")
+                    || normalized.contains("not opened")
+                    || normalized.contains("did not open")
+                {
+                    Some("not_opened".to_string())
+                } else {
+                    Some(current.publication_status.clone())
+                }
+            });
+    let validation_status =
+        extract_labeled_value(&raw_text, &["validation_status", "validation status"])
+            .and_then(|value| normalize_validation_status(&value))
+            .or_else(|| infer_validation_status(&normalized))
+            .unwrap_or_else(|| current.validation_status.clone());
+    let browser_verification_status = extract_labeled_value(
+        &raw_text,
+        &["browser_verification_status", "browser verification status"],
+    )
+    .and_then(|value| normalize_browser_verification_status(&value))
+    .or_else(|| infer_browser_verification_status(&normalized).map(str::to_string))
+    .unwrap_or_else(|| current.browser_verification_status.clone());
+    let cleanup_status = extract_labeled_value(&raw_text, &["cleanup_status", "cleanup status"])
+        .and_then(|value| normalize_cleanup_status(&value))
+        .or_else(|| infer_cleanup_status(&normalized))
+        .unwrap_or_else(|| current.cleanup_status.clone());
+    let cleanup_paths = extract_cleanup_paths(&raw_text, &current.cleanup_paths);
+
+    PublicationOutcomePatch {
+        publication_requested: Some(true),
+        publication_status,
+        publication_summary: Some(
+            extract_labeled_value(
+                &raw_text,
+                &["publication_summary", "publication summary", "summary"],
+            )
+            .unwrap_or_else(|| summary.to_string()),
+        ),
+        pr_url: Some(pr_url.unwrap_or_else(|| current.pr_url.clone())),
+        source_branch: Some(
+            extract_labeled_value(&raw_text, &["source_branch", "source branch"])
+                .unwrap_or_else(|| current.source_branch.clone()),
+        ),
+        target_branch: Some(
+            extract_labeled_value(&raw_text, &["target_branch", "target branch"])
+                .unwrap_or_else(|| current.target_branch.clone()),
+        ),
+        validation_status: Some(validation_status),
+        browser_verification_status: Some(browser_verification_status),
+        cleanup_status: Some(cleanup_status),
+        cleanup_paths: Some(cleanup_paths),
+    }
+}
+
+fn apply_publication_temp_hygiene(
+    detail: &JobDetail,
+    working_dir: &str,
+    patch: &mut PublicationOutcomePatch,
+) {
+    if !detail.job.publication_requested {
+        return;
+    }
+
+    let Some(baseline) = publication_temp_baseline(detail) else {
+        return;
+    };
+    let working_dir = if baseline.working_dir.trim().is_empty() {
+        working_dir
+    } else {
+        baseline.working_dir.as_str()
+    };
+    let baseline_paths = baseline.temp_paths.into_iter().collect::<BTreeSet<_>>();
+    let current = collect_repo_temp_paths(working_dir)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let new_paths = current
+        .difference(&baseline_paths)
+        .cloned()
+        .collect::<Vec<String>>();
+    if new_paths.is_empty() {
+        return;
+    }
+
+    patch.cleanup_status = Some("cleanup_required".to_string());
+    let mut cleanup_paths = patch.cleanup_paths.clone().unwrap_or_default();
+    for path in new_paths {
+        if !cleanup_paths.iter().any(|existing| existing == &path) {
+            cleanup_paths.push(path);
+        }
+    }
+    patch.cleanup_paths = Some(cleanup_paths);
+}
+
+fn reconcile_publication_browser_status_with_completion(
+    completion_job: &JobSummary,
+    patch: &mut PublicationOutcomePatch,
+) {
+    if !patch.publication_requested.unwrap_or(false) {
+        return;
+    }
+    if !matches!(
+        patch.browser_verification_status.as_deref(),
+        None | Some("pending")
+    ) {
+        return;
+    }
+    if completion_job.browser_verification_status == "pending" {
+        return;
+    }
+
+    patch.browser_verification_status = Some(completion_job.browser_verification_status.clone());
+}
+
+fn publication_temp_baseline(detail: &JobDetail) -> Option<PublicationTempBaseline> {
+    detail
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.event_type == "job.publication.git_baseline")
+        .map(|event| {
+            let temp_paths = event
+                .data_json
+                .get("temp_paths")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let working_dir = event
+                .data_json
+                .get("working_dir")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            PublicationTempBaseline {
+                working_dir,
+                temp_paths,
+            }
+        })
+}
+
+fn collect_repo_temp_paths(working_dir: &str) -> Vec<String> {
+    let root = Path::new(working_dir);
+    if working_dir.trim().is_empty() || !root.is_dir() {
+        return Vec::new();
+    }
+
+    let mut paths = collect_git_temp_paths(root);
+    if paths.is_empty() {
+        paths = collect_top_level_temp_paths(root);
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn collect_git_temp_paths(root: &Path) -> Vec<String> {
+    let Some(repo_root) = git_worktree_root(root) else {
+        return Vec::new();
+    };
+
+    let mut paths = collect_git_status_temp_paths(root, &repo_root);
+    paths.extend(collect_git_tracked_temp_paths(root, &repo_root));
+    paths
+}
+
+fn git_worktree_root(root: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let path = String::from_utf8(output.stdout).ok()?;
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(path))
+}
+
+fn collect_git_status_temp_paths(root: &Path, repo_root: &Path) -> Vec<String> {
+    let Ok(output) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored",
+        ])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let entries = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>();
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while index < entries.len() {
+        let entry = entries[index];
+        index += 1;
+        if entry.len() <= 3 || entry[2] != b' ' {
+            continue;
+        }
+
+        let status = &entry[..2];
+        if status[0] != b'D' && status[1] != b'D' {
+            collect_existing_temp_path(repo_root, &entry[3..], &mut paths);
+        }
+
+        if (status[0] == b'R' || status[1] == b'R' || status[0] == b'C' || status[1] == b'C')
+            && index < entries.len()
+        {
+            collect_existing_temp_path(repo_root, entries[index], &mut paths);
+            index += 1;
+        }
+    }
+
+    paths
+}
+
+fn collect_git_tracked_temp_paths(root: &Path, repo_root: &Path) -> Vec<String> {
+    let Ok(output) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .filter(|path| repo_root.join(path).exists())
+        .filter_map(publication_temp_root_path)
+        .collect()
+}
+
+fn collect_existing_temp_path(root: &Path, path: &[u8], paths: &mut Vec<String>) {
+    let Ok(path) = std::str::from_utf8(path) else {
+        return;
+    };
+    if !root.join(path).exists() {
+        return;
+    }
+    if let Some(path) = publication_temp_root_path(path) {
+        paths.push(path);
+    }
+}
+
+fn collect_top_level_temp_paths(root: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter_map(|path| publication_temp_root_path(&path))
+        .collect()
+}
+
+fn is_publication_temp_path(path: &str) -> bool {
+    publication_temp_root_path(path).is_some()
+}
+
+fn publication_temp_root_path(path: &str) -> Option<String> {
+    let normalized = path.trim_start_matches("./").trim_end_matches('/');
+    let mut components = Vec::new();
+    for component in normalized
+        .split('/')
+        .filter(|component| !component.is_empty())
+    {
+        components.push(component);
+        if is_publication_temp_component(component) {
+            return Some(components.join("/"));
+        }
+    }
+    None
+}
+
+fn is_publication_temp_component(component: &str) -> bool {
+    component == ".tmp-playwright"
+        || component.starts_with(".tmp-")
+        || component.starts_with(".playwright-")
+}
+
+fn publication_text_says_opened(text: &str) -> bool {
+    [
+        "pull request opened",
+        "opened pull request",
+        "pr opened",
+        "opened pr",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn normalize_publication_status(value: &str) -> Option<String> {
+    normalize_enum_value(
+        value,
+        &["not_requested", "opened", "not_opened", "blocked", "failed"],
+    )
+}
+
+fn normalize_validation_status(value: &str) -> Option<String> {
+    normalize_enum_value(value, &["passed", "failed", "not_performed", "unavailable"])
+}
+
+fn normalize_browser_verification_status(value: &str) -> Option<String> {
+    normalize_enum_value(
+        value,
+        &[
+            "not_required",
+            "pending",
+            "passed",
+            "failed",
+            "not_performed",
+            "unavailable",
+        ],
+    )
+}
+
+fn normalize_cleanup_status(value: &str) -> Option<String> {
+    normalize_enum_value(value, &["cleanup_required", "cleaned", "clean", "unknown"])
+}
+
+fn normalize_enum_value(value: &str, allowed: &[&str]) -> Option<String> {
+    let normalized = value
+        .trim()
+        .trim_matches(|character: char| character == '"' || character == '\'' || character == '`')
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .replace(' ', "_");
+    allowed
+        .iter()
+        .find(|allowed_value| normalized.starts_with(**allowed_value))
+        .map(|value| (*value).to_string())
+}
+
+fn infer_validation_status(text: &str) -> Option<String> {
+    if text.contains("validation failed") || text.contains("validation status: failed") {
+        return Some("failed".to_string());
+    }
+    if text.contains("validation unavailable") || text.contains("validation status: unavailable") {
+        return Some("unavailable".to_string());
+    }
+    if text.contains("validation not performed")
+        || text.contains("validation status: not_performed")
+    {
+        return Some("not_performed".to_string());
+    }
+    if (text.contains("validation") || text.contains("tests"))
+        && (text.contains(" passed") || text.contains(" green"))
+    {
+        return Some("passed".to_string());
+    }
+    None
+}
+
+fn infer_cleanup_status(text: &str) -> Option<String> {
+    let normalized;
+    let text = if text.chars().any(char::is_uppercase) {
+        normalized = text.to_ascii_lowercase();
+        normalized.as_str()
+    } else {
+        text
+    };
+    if text.contains("cleanup status: cleanup_required") || text.contains("cleanup required") {
+        return Some("cleanup_required".to_string());
+    }
+    if text.contains("cleanup status: cleaned") || text.contains("cleaned up") {
+        return Some("cleaned".to_string());
+    }
+    if text.contains("cleanup status: clean") || text.contains("branch clean") {
+        return Some("clean".to_string());
+    }
+    if text.contains(".tmp-playwright") || text.contains(".tmp-") {
+        return Some("cleanup_required".to_string());
+    }
+    None
+}
+
+fn extract_labeled_value(text: &str, labels: &[&str]) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim().trim_start_matches('-').trim();
+        let Some((label, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let normalized_label = label.trim().to_ascii_lowercase().replace('_', " ");
+        if labels
+            .iter()
+            .any(|candidate| normalized_label == candidate.replace('_', " "))
+        {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_cleanup_paths(text: &str, existing: &[String]) -> Vec<String> {
+    let mut paths = existing.to_vec();
+    for token in text.split_whitespace() {
+        let cleaned = token
+            .trim_matches(|character: char| {
+                matches!(
+                    character,
+                    ',' | ';' | ':' | ')' | '(' | '[' | ']' | '"' | '\'' | '`'
+                )
+            })
+            .trim_end_matches('.');
+        if (cleaned.contains(".tmp-") || cleaned.contains(".tmp-playwright"))
+            && !paths.iter().any(|path| path == cleaned)
+        {
+            paths.push(cleaned.to_string());
+        }
+    }
+    paths
 }
 
 fn normalize_action_item_text(value: &str) -> String {
@@ -3601,6 +4360,83 @@ Before returning final_answer, either:\n\
 Use this final_answer shape when done:\n\
 {{\"kind\":\"final_answer\",\"summary\":\"why the work is complete or blocked\",\"final_answer\":\"user-facing answer\",\"browser_verification\":{{\"status\":\"passed|failed|not_performed|unavailable\",\"summary\":\"concise verification result\",\"artifact_ids\":[\"artifact-id\"]}}}}\n\n\
 Rejected final_answer:\n{}",
+        excerpt(final_answer, 1_200)
+    )
+}
+
+fn should_retry_missing_publication_outcome(
+    detail: &JobDetail,
+    summary: &str,
+    final_answer: &str,
+    worker: &WorkerSummary,
+    step_count: usize,
+    tool_call_count: usize,
+) -> bool {
+    if !detail.job.publication_requested
+        || !has_remaining_worker_budget(worker, step_count, tool_call_count)
+        || publication_outcome_retry_already_attempted(detail)
+    {
+        return false;
+    }
+
+    !publication_final_answer_has_required_facts(summary, final_answer)
+}
+
+fn publication_outcome_retry_already_attempted(detail: &JobDetail) -> bool {
+    detail.events.iter().any(|event| {
+        event.event_type == "worker.retry"
+            && event
+                .data_json
+                .get("reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| reason == "publication_outcome_missing")
+    })
+}
+
+fn publication_final_answer_has_required_facts(summary: &str, final_answer: &str) -> bool {
+    let text = format!("{summary}\n{final_answer}");
+    let normalized = normalize_action_item_text(&text);
+    let has_publication = extract_labeled_value(
+        &text,
+        &[
+            "publication_status",
+            "publication status",
+            "pr_url",
+            "pr url",
+        ],
+    )
+    .is_some()
+        || normalized.contains("blocked_without_browser_verification")
+        || normalized.contains("pr not opened")
+        || publication_text_says_opened(&normalized);
+    let has_validation =
+        extract_labeled_value(&text, &["validation_status", "validation status"]).is_some();
+    let has_browser = extract_labeled_value(
+        &text,
+        &["browser_verification_status", "browser verification status"],
+    )
+    .is_some()
+        || infer_browser_verification_status(&normalized).is_some();
+    let has_cleanup = extract_labeled_value(&text, &["cleanup_status", "cleanup status"]).is_some();
+
+    has_publication && has_validation && has_browser && has_cleanup
+}
+
+fn build_publication_outcome_retry_prompt(summary: &str, final_answer: &str) -> String {
+    format!(
+        "Your previous final_answer is missing explicit terminal metadata for a publication-oriented job.\n\
+Previous summary: {}\n\
+Previous final_answer: {}\n\
+Return exactly one valid Nucleus worker action JSON object using kind=\"final_answer\".\n\
+The final_answer must include these exact fields as user-facing lines or a structured final_answer object:\n\
+- publication_status: not_requested | opened | not_opened | blocked | failed\n\
+- publication_summary\n\
+- pr_url, source_branch, target_branch when known\n\
+- validation_status: passed | failed | not_performed | unavailable\n\
+- browser_verification_status: not_required | pending | passed | failed | not_performed | unavailable\n\
+- cleanup_status: clean | cleaned | cleanup_required | unknown\n\
+If Browser verification is unavailable or was not performed, say that explicitly. Do not call Playwright directly or create repo-local .tmp-playwright files.",
+        excerpt(summary, 320),
         excerpt(final_answer, 1_200)
     )
 }
@@ -4281,6 +5117,76 @@ async fn execute_pending_tool_action(
         Err(error) => {
             state.agent.release_write_lock(&pending.tool_call_id);
             if is_browser_tool(&tool) {
+                if state.store.get_job(job_id)?.job.publication_requested {
+                    let error_detail = error.to_string();
+                    let tool_result = json!({
+                        "ok": false,
+                        "tool_id": tool.clone(),
+                        "browser_verification_status": "unavailable",
+                        "error": error_detail,
+                        "guidance": "Browser verification is unavailable for this publication job. Continue without ad-hoc repo-local Playwright files and report browser_verification_status=unavailable or not_performed in the terminal publication outcome."
+                    });
+                    let _ = state.store.update_job(
+                        job_id,
+                        JobPatch {
+                            browser_verification_status: Some("unavailable".to_string()),
+                            browser_verification_summary: Some(format!(
+                                "Browser verification unavailable: {error}"
+                            )),
+                            ..JobPatch::default()
+                        },
+                    );
+                    let _ = state.store.update_tool_call(
+                        &pending.tool_call_id,
+                        ToolCallPatch {
+                            status: Some("completed".to_string()),
+                            result_json: Some(Some(tool_result.clone())),
+                            error_class: Some("browser_unavailable".to_string()),
+                            error_detail: Some(error_detail.clone()),
+                            completed_at: Some(Some(unix_timestamp())),
+                            ..ToolCallPatch::default()
+                        },
+                    );
+                    *step += 1;
+                    *worker = state.store.update_worker(
+                        &worker.id,
+                        WorkerPatch {
+                            state: Some("running".to_string()),
+                            step_count: Some(*step),
+                            tool_call_count: Some(*tool_calls),
+                            last_error: Some(String::new()),
+                            ..WorkerPatch::default()
+                        },
+                    )?;
+                    checkpoint.pending_action = None;
+                    checkpoint.next_prompt = Some(build_tool_result_prompt(
+                        &pending.tool,
+                        &pending.summary,
+                        &tool_result,
+                    ));
+                    state.store.write_worker_checkpoint(
+                        &worker.id,
+                        &serde_json::to_value(&checkpoint)
+                            .context("failed to encode worker checkpoint")?,
+                    )?;
+                    let _ = state.store.append_job_event(JobEventRecord {
+                        job_id: job_id.to_string(),
+                        worker_id: Some(worker.id.clone()),
+                        event_type: "job.publication.browser_unavailable".to_string(),
+                        status: "unavailable".to_string(),
+                        summary: "Browser verification unavailable".to_string(),
+                        detail: error_detail,
+                        data_json: json!({
+                            "tool_id": pending.tool,
+                            "tool_call_id": pending.tool_call_id,
+                            "browser_verification_status": "unavailable",
+                        }),
+                    });
+                    publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+                    publish_worker_updated(state, worker).await;
+                    return Ok(LoopDisposition::Continue);
+                }
+
                 let _ = state.store.update_job(
                     job_id,
                     JobPatch {
@@ -8461,8 +9367,9 @@ async fn queue_playbook_job(
         state: "queued".to_string(),
         requested_by: requested_by.to_string(),
         prompt_excerpt: prompt_excerpt.clone(),
+        publication_intent_text: Some(playbook.prompt.clone()),
     })?;
-    state.store.update_job(
+    let job = state.store.update_job(
         &job_id,
         browser_verification_initial_patch(
             &ui_renderable,
@@ -8470,6 +9377,9 @@ async fn queue_playbook_job(
             browser_tools_granted,
         ),
     )?;
+    if job.publication_requested {
+        record_publication_git_hygiene_baseline(state, &job, &playbook.session.working_dir)?;
+    }
 
     let _created_worker = state.store.create_worker(WorkerRecord {
         id: root_worker_id.clone(),
@@ -9875,6 +10785,7 @@ Remaining:\n\
             "Status: blocked_without_browser_verification\nBrowser verification status: unavailable",
             12,
             7,
+            &PublicationOutcomePatch::default(),
         );
 
         assert_eq!(metadata["terminal_status"], "blocked");
@@ -9882,6 +10793,30 @@ Remaining:\n\
         assert_eq!(metadata["browser_verification_status"], "unavailable");
         assert_eq!(metadata["step_count"], 12);
         assert_eq!(metadata["tool_call_count"], 7);
+    }
+
+    #[test]
+    fn terminal_metadata_does_not_treat_generic_reached_current_text_as_blocked() {
+        let metadata = final_answer_terminal_metadata(
+            "Completed the requested cleanup.",
+            "The implementation reached the current target state and validation passed.",
+            4,
+            2,
+            &PublicationOutcomePatch::default(),
+        );
+
+        assert_eq!(metadata["terminal_status"], "completed");
+        assert_eq!(metadata["blocked"], false);
+
+        let budget_metadata = final_answer_terminal_metadata(
+            "Checkpoint saved.",
+            "Nucleus reached the current step budget for this run.",
+            100,
+            20,
+            &PublicationOutcomePatch::default(),
+        );
+        assert_eq!(budget_metadata["terminal_status"], "blocked");
+        assert_eq!(budget_metadata["blocked"], true);
     }
 
     #[test]
@@ -9894,6 +10829,415 @@ Remaining:\n\
             status_from_browser_verification_text("Completed, not browser-verified."),
             Some("not_performed")
         );
+    }
+
+    #[test]
+    fn publication_outcome_patch_extracts_structured_terminal_fields() {
+        let job = test_publication_job_summary("publication-extract");
+        let patch = publication_outcome_patch(
+            &job,
+            "Opened PR",
+            "Publication status: opened\n\
+Publication summary: Ready for review.\n\
+PR URL: https://github.com/WebLime-agency/nucleus/pull/200\n\
+Source branch: feat/example\n\
+Target branch: dev\n\
+Validation status: passed\n\
+Browser verification status: unavailable\n\
+Cleanup status: cleanup_required\n\
+Cleanup paths: .tmp-playwright.",
+            8,
+            4,
+        );
+
+        assert_eq!(patch.publication_requested, Some(true));
+        assert_eq!(patch.publication_status.as_deref(), Some("opened"));
+        assert_eq!(
+            patch.pr_url.as_deref(),
+            Some("https://github.com/WebLime-agency/nucleus/pull/200")
+        );
+        assert_eq!(patch.source_branch.as_deref(), Some("feat/example"));
+        assert_eq!(patch.target_branch.as_deref(), Some("dev"));
+        assert_eq!(patch.validation_status.as_deref(), Some("passed"));
+        assert_eq!(
+            patch.browser_verification_status.as_deref(),
+            Some("unavailable")
+        );
+        assert_eq!(patch.cleanup_status.as_deref(), Some("cleanup_required"));
+        assert_eq!(
+            patch.cleanup_paths.as_deref(),
+            Some(&[".tmp-playwright".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn publication_completion_guard_requires_terminal_facts_once() {
+        assert!(!publication_final_answer_has_required_facts(
+            "Opened PR",
+            "Opened the PR and ran checks."
+        ));
+        assert!(publication_final_answer_has_required_facts(
+            "Opened PR",
+            "Publication status: opened\n\
+Validation status: passed\n\
+Browser verification status: not_performed\n\
+Cleanup status: clean"
+        ));
+        assert!(publication_final_answer_has_required_facts(
+            "Opened PR",
+            "Publication status: opened\n\
+Validation status: passed\n\
+Browser verification: status: passed, summary: clicked through the changed flow\n\
+Cleanup status: clean"
+        ));
+    }
+
+    #[test]
+    fn publication_outcome_patch_treats_explicit_opened_text_as_opened() {
+        let job = test_publication_job_summary("publication-opened-text");
+        let final_answer = "Pull request opened.\n\
+Validation status: passed\n\
+Browser verification status: not_performed\n\
+Cleanup status: clean";
+        let patch = publication_outcome_patch(&job, "Pull request opened", final_answer, 6, 3);
+
+        assert_eq!(patch.publication_status.as_deref(), Some("opened"));
+        assert!(publication_final_answer_has_required_facts(
+            "Pull request opened",
+            final_answer
+        ));
+    }
+
+    #[test]
+    fn cleanup_inference_prefers_success_signal_over_temp_path_keyword() {
+        assert_eq!(
+            infer_cleanup_status("Cleaned up .tmp-playwright after browser verification."),
+            Some("cleaned".to_string())
+        );
+        assert_eq!(
+            infer_cleanup_status("Cleanup status: clean; branch clean after removing .tmp-check."),
+            Some("clean".to_string())
+        );
+        assert_eq!(
+            infer_cleanup_status("Cleanup required: .tmp-playwright remains."),
+            Some("cleanup_required".to_string())
+        );
+        assert_eq!(
+            infer_cleanup_status("Cleanup status: cleanup_required"),
+            Some("cleanup_required".to_string())
+        );
+    }
+
+    #[test]
+    fn publication_browser_status_reconciliation_preserves_terminal_fallback() {
+        let mut job = test_publication_job_summary("publication-browser-terminal");
+        job.browser_verification_status = "not_performed".to_string();
+        let mut patch = PublicationOutcomePatch {
+            publication_requested: Some(true),
+            browser_verification_status: Some("pending".to_string()),
+            ..PublicationOutcomePatch::default()
+        };
+
+        reconcile_publication_browser_status_with_completion(&job, &mut patch);
+
+        assert_eq!(
+            patch.browser_verification_status.as_deref(),
+            Some("not_performed")
+        );
+
+        patch.browser_verification_status = Some("unavailable".to_string());
+        reconcile_publication_browser_status_with_completion(&job, &mut patch);
+        assert_eq!(
+            patch.browser_verification_status.as_deref(),
+            Some("unavailable")
+        );
+    }
+
+    #[test]
+    fn publication_temp_paths_detect_nested_components() {
+        assert!(is_publication_temp_path(
+            "apps/web/.tmp-playwright/probe.js"
+        ));
+        assert_eq!(
+            publication_temp_root_path("apps/web/.tmp-playwright/probe.js").as_deref(),
+            Some("apps/web/.tmp-playwright")
+        );
+        assert_eq!(
+            publication_temp_root_path("./pkg/.playwright-check/log.txt").as_deref(),
+            Some("pkg/.playwright-check")
+        );
+        assert!(!is_publication_temp_path(
+            "apps/web/tmp-playwright/probe.js"
+        ));
+    }
+
+    #[test]
+    fn collect_repo_temp_paths_includes_nested_and_ignored_paths() {
+        let root = test_state_dir("publication-temp-path-collection");
+        fs::create_dir_all(root.join("apps/web/.tmp-playwright"))
+            .expect("nested temp dir should exist");
+        fs::write(root.join("apps/web/.tmp-playwright/probe.txt"), "temp")
+            .expect("nested temp file should exist");
+        fs::create_dir_all(root.join("ignored/.tmp-check")).expect("ignored temp dir should exist");
+        fs::write(root.join("ignored/.tmp-check/probe.txt"), "temp")
+            .expect("ignored temp file should exist");
+        fs::write(root.join(".gitignore"), "ignored/.tmp-check/\n")
+            .expect("gitignore should exist");
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "-q"])
+            .status()
+            .expect("git init should run");
+        assert!(status.success());
+
+        let paths = collect_repo_temp_paths(&root.display().to_string());
+
+        assert!(paths.iter().any(|path| path == "apps/web/.tmp-playwright"));
+        assert!(paths.iter().any(|path| path == "ignored/.tmp-check"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collect_repo_temp_paths_includes_staged_and_tracked_paths() {
+        let root = test_state_dir("publication-temp-path-tracked-collection");
+        fs::create_dir_all(root.join("apps/web/.tmp-playwright"))
+            .expect("nested temp dir should exist");
+        fs::write(root.join("apps/web/.tmp-playwright/probe.txt"), "temp")
+            .expect("nested temp file should exist");
+        fs::create_dir_all(root.join("pkg/.tmp-check")).expect("tracked temp dir should exist");
+        fs::write(root.join("pkg/.tmp-check/probe.txt"), "temp")
+            .expect("tracked temp file should exist");
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "-q"])
+            .status()
+            .expect("git init should run");
+        assert!(status.success());
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args([
+                "add",
+                "apps/web/.tmp-playwright/probe.txt",
+                "pkg/.tmp-check/probe.txt",
+            ])
+            .status()
+            .expect("git add should run");
+        assert!(status.success());
+
+        let paths = collect_repo_temp_paths(&root.display().to_string());
+
+        assert!(paths.iter().any(|path| path == "apps/web/.tmp-playwright"));
+        assert!(paths.iter().any(|path| path == "pkg/.tmp-check"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collect_repo_temp_paths_includes_renamed_temp_destinations() {
+        let root = test_state_dir("publication-temp-path-renamed-collection");
+        fs::create_dir_all(root.join("src")).expect("src dir should exist");
+        fs::create_dir_all(root.join("apps/web/.tmp-playwright"))
+            .expect("nested temp dir should exist");
+        fs::write(root.join("src/probe.txt"), "temp").expect("tracked file should exist");
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "-q"])
+            .status()
+            .expect("git init should run");
+        assert!(status.success());
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["add", "src/probe.txt"])
+            .status()
+            .expect("git add should run");
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.local",
+            ])
+            .args(["commit", "-qm", "seed"])
+            .status()
+            .expect("git commit should run");
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["mv", "src/probe.txt", "apps/web/.tmp-playwright/probe.txt"])
+            .status()
+            .expect("git mv should run");
+        assert!(status.success());
+
+        let paths = collect_repo_temp_paths(&root.display().to_string());
+
+        assert!(paths.iter().any(|path| path == "apps/web/.tmp-playwright"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collect_repo_temp_paths_resolves_git_paths_from_repo_root() {
+        let root = test_state_dir("publication-temp-path-scoped-workdir");
+        let scoped_root = root.join("apps/web");
+        fs::create_dir_all(scoped_root.join(".tmp-playwright"))
+            .expect("scoped temp dir should exist");
+        fs::write(scoped_root.join(".tmp-playwright/probe.txt"), "temp")
+            .expect("scoped temp file should exist");
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "-q"])
+            .status()
+            .expect("git init should run");
+        assert!(status.success());
+
+        let paths = collect_repo_temp_paths(&scoped_root.display().to_string());
+
+        assert!(paths.iter().any(|path| path == "apps/web/.tmp-playwright"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publication_temp_hygiene_marks_new_repo_tmp_leftovers() {
+        let root = test_state_dir("publication-temp-hygiene");
+        fs::create_dir_all(root.join(".tmp-before")).expect("baseline temp dir should exist");
+        fs::create_dir_all(root.join(".tmp-playwright")).expect("new temp dir should exist");
+
+        let detail = JobDetail {
+            job: test_publication_job_summary("publication-temp-hygiene"),
+            workers: Vec::new(),
+            child_jobs: Vec::new(),
+            tool_calls: Vec::new(),
+            approvals: Vec::new(),
+            artifacts: Vec::new(),
+            command_sessions: Vec::new(),
+            events: vec![nucleus_protocol::JobEvent {
+                id: 1,
+                job_id: "publication-temp-hygiene".to_string(),
+                worker_id: None,
+                event_type: "job.publication.git_baseline".to_string(),
+                status: "captured".to_string(),
+                summary: "Captured baseline".to_string(),
+                detail: String::new(),
+                data_json: json!({ "temp_paths": [".tmp-before"] }),
+                created_at: 0,
+            }],
+        };
+        let mut patch = PublicationOutcomePatch {
+            publication_requested: Some(true),
+            cleanup_status: Some("clean".to_string()),
+            cleanup_paths: Some(Vec::new()),
+            ..PublicationOutcomePatch::default()
+        };
+
+        apply_publication_temp_hygiene(&detail, &root.display().to_string(), &mut patch);
+
+        assert_eq!(patch.cleanup_status.as_deref(), Some("cleanup_required"));
+        assert_eq!(
+            patch.cleanup_paths,
+            Some(vec![".tmp-playwright".to_string()])
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publication_temp_hygiene_uses_baseline_working_dir() {
+        let root = test_state_dir("publication-temp-hygiene-working-dir");
+        let baseline_root = root.join("baseline-root");
+        let completion_root = root.join("completion-root");
+        fs::create_dir_all(baseline_root.join(".tmp-before"))
+            .expect("baseline temp dir should exist");
+        fs::create_dir_all(baseline_root.join(".tmp-playwright"))
+            .expect("new temp dir should exist");
+        fs::create_dir_all(&completion_root).expect("completion root should exist");
+
+        let detail = JobDetail {
+            job: test_publication_job_summary("publication-temp-hygiene-working-dir"),
+            workers: Vec::new(),
+            child_jobs: Vec::new(),
+            tool_calls: Vec::new(),
+            approvals: Vec::new(),
+            artifacts: Vec::new(),
+            command_sessions: Vec::new(),
+            events: vec![nucleus_protocol::JobEvent {
+                id: 1,
+                job_id: "publication-temp-hygiene-working-dir".to_string(),
+                worker_id: None,
+                event_type: "job.publication.git_baseline".to_string(),
+                status: "captured".to_string(),
+                summary: "Captured baseline".to_string(),
+                detail: String::new(),
+                data_json: json!({
+                    "working_dir": baseline_root.display().to_string(),
+                    "temp_paths": [".tmp-before"],
+                }),
+                created_at: 0,
+            }],
+        };
+        let mut patch = PublicationOutcomePatch {
+            publication_requested: Some(true),
+            cleanup_status: Some("clean".to_string()),
+            cleanup_paths: Some(Vec::new()),
+            ..PublicationOutcomePatch::default()
+        };
+
+        apply_publication_temp_hygiene(&detail, &completion_root.display().to_string(), &mut patch);
+
+        assert_eq!(patch.cleanup_status.as_deref(), Some("cleanup_required"));
+        assert_eq!(
+            patch.cleanup_paths,
+            Some(vec![".tmp-playwright".to_string()])
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publication_temp_hygiene_skips_without_baseline_event() {
+        let root = test_state_dir("publication-temp-hygiene-no-baseline");
+        fs::create_dir_all(root.join(".tmp-playwright")).expect("existing temp dir should exist");
+
+        let detail = JobDetail {
+            job: test_publication_job_summary("publication-temp-hygiene-no-baseline"),
+            workers: Vec::new(),
+            child_jobs: Vec::new(),
+            tool_calls: Vec::new(),
+            approvals: Vec::new(),
+            artifacts: Vec::new(),
+            command_sessions: Vec::new(),
+            events: Vec::new(),
+        };
+        let mut patch = PublicationOutcomePatch {
+            publication_requested: Some(true),
+            cleanup_status: Some("clean".to_string()),
+            cleanup_paths: Some(Vec::new()),
+            ..PublicationOutcomePatch::default()
+        };
+
+        apply_publication_temp_hygiene(&detail, &root.display().to_string(), &mut patch);
+
+        assert_eq!(patch.cleanup_status.as_deref(), Some("clean"));
+        assert_eq!(patch.cleanup_paths, Some(Vec::new()));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -10406,6 +11750,15 @@ Remaining:\n\
             browser_verification_status: "not_performed".to_string(),
             browser_verification_summary: String::new(),
             browser_verification_artifact_ids: Vec::new(),
+            publication_requested: false,
+            publication_status: "not_requested".to_string(),
+            publication_summary: String::new(),
+            pr_url: String::new(),
+            source_branch: String::new(),
+            target_branch: String::new(),
+            validation_status: "not_performed".to_string(),
+            cleanup_status: "unknown".to_string(),
+            cleanup_paths: Vec::new(),
             worker_count: 0,
             pending_approval_count: 0,
             artifact_count: 0,
@@ -10449,6 +11802,15 @@ Remaining:\n\
             browser_verification_status: "pending".to_string(),
             browser_verification_summary: String::new(),
             browser_verification_artifact_ids: Vec::new(),
+            publication_requested: false,
+            publication_status: "not_requested".to_string(),
+            publication_summary: String::new(),
+            pr_url: String::new(),
+            source_branch: String::new(),
+            target_branch: String::new(),
+            validation_status: "not_performed".to_string(),
+            cleanup_status: "unknown".to_string(),
+            cleanup_paths: Vec::new(),
             worker_count: 0,
             pending_approval_count: 0,
             artifact_count: 0,
@@ -10842,6 +12204,7 @@ Remaining:\n\
                 state: "failed".to_string(),
                 requested_by: "user".to_string(),
                 prompt_excerpt: "open a PR to merge to dev".to_string(),
+                publication_intent_text: None,
             })
             .expect("job should persist");
         state
@@ -11373,6 +12736,7 @@ for line in sys.stdin:
                 state: "running".to_string(),
                 requested_by: "test".to_string(),
                 prompt_excerpt: String::new(),
+                publication_intent_text: None,
             })
             .expect("job should persist");
 
@@ -11503,6 +12867,45 @@ for line in sys.stdin:
             last_error: String::new(),
             user_error: None,
             capabilities: Vec::new(),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn test_publication_job_summary(id: &str) -> JobSummary {
+        JobSummary {
+            id: id.to_string(),
+            session_id: Some(format!("{id}-session")),
+            parent_job_id: None,
+            template_id: None,
+            title: "Prompt open a PR".to_string(),
+            purpose: "Session prompt".to_string(),
+            trigger_kind: "session_prompt".to_string(),
+            state: "running".to_string(),
+            requested_by: "user".to_string(),
+            prompt_excerpt: "open a pr to merge to dev".to_string(),
+            root_worker_id: Some(format!("{id}-worker")),
+            visible_turn_id: None,
+            result_summary: String::new(),
+            last_error: String::new(),
+            user_error: None,
+            ui_renderable: "unknown".to_string(),
+            browser_verification_required: false,
+            browser_verification_summary: String::new(),
+            browser_verification_artifact_ids: Vec::new(),
+            publication_requested: true,
+            publication_status: "not_opened".to_string(),
+            publication_summary: String::new(),
+            pr_url: String::new(),
+            source_branch: String::new(),
+            target_branch: String::new(),
+            validation_status: "not_performed".to_string(),
+            browser_verification_status: "not_performed".to_string(),
+            cleanup_status: "unknown".to_string(),
+            cleanup_paths: Vec::new(),
+            worker_count: 1,
+            pending_approval_count: 0,
+            artifact_count: 0,
             created_at: 0,
             updated_at: 0,
         }
