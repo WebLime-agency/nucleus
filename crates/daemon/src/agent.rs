@@ -3672,7 +3672,9 @@ fn contains_blocked_or_waiting_language(text: &str) -> bool {
         "permission denied",
         "access denied",
         "budget exhausted",
-        "reached the current",
+        "reached the current step budget",
+        "reached the current action budget",
+        "reached the current run budget",
     ]
     .iter()
     .any(|needle| text.contains(needle))
@@ -3759,7 +3761,9 @@ fn contains_blocked_terminal_result_language(text: &str) -> bool {
         "blocked without browser",
         "blocked, not browser",
         "cannot honestly open the pr",
-        "reached the current",
+        "reached the current step budget",
+        "reached the current action budget",
+        "reached the current run budget",
     ]
     .iter()
     .any(|needle| text.contains(needle))
@@ -10702,6 +10706,30 @@ Remaining:\n\
         assert_eq!(metadata["browser_verification_status"], "unavailable");
         assert_eq!(metadata["step_count"], 12);
         assert_eq!(metadata["tool_call_count"], 7);
+    }
+
+    #[test]
+    fn terminal_metadata_does_not_treat_generic_reached_current_text_as_blocked() {
+        let metadata = final_answer_terminal_metadata(
+            "Completed the requested cleanup.",
+            "The implementation reached the current target state and validation passed.",
+            4,
+            2,
+            &PublicationOutcomePatch::default(),
+        );
+
+        assert_eq!(metadata["terminal_status"], "completed");
+        assert_eq!(metadata["blocked"], false);
+
+        let budget_metadata = final_answer_terminal_metadata(
+            "Checkpoint saved.",
+            "Nucleus reached the current step budget for this run.",
+            100,
+            20,
+            &PublicationOutcomePatch::default(),
+        );
+        assert_eq!(budget_metadata["terminal_status"], "blocked");
+        assert_eq!(budget_metadata["blocked"], true);
     }
 
     #[test]

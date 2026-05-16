@@ -4339,8 +4339,6 @@ fn publication_requested_for_job(title: &str, purpose: &str, prompt_excerpt: &st
         "publish this branch",
         "publish the branch",
         "publish branch",
-        "merge to dev",
-        "merge into dev",
         "pr to merge",
         "pull request to merge",
     ]
@@ -8607,6 +8605,26 @@ mod tests {
             "Open project notes",
             "Session prompt",
             "open project workspace"
+        ));
+        assert!(!publication_requested_for_job(
+            "Resolve merge conflicts",
+            "Session prompt",
+            "merge to dev locally without opening a PR"
+        ));
+        assert!(!publication_requested_for_job(
+            "Dry run merge",
+            "Session prompt",
+            "merge into dev and report conflicts"
+        ));
+        assert!(publication_requested_for_job(
+            "Publish branch",
+            "Session prompt",
+            "publish this branch"
+        ));
+        assert!(publication_requested_for_job(
+            "Open PR",
+            "Session prompt",
+            "open a pr to merge to dev"
         ));
 
         let updated = store
