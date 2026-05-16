@@ -216,10 +216,21 @@ fn is_ui_renderable_path(path: &Path, worker: &WorkerSummary) -> bool {
         .to_string_lossy()
         .replace('\\', "/");
     let relative = relative.trim_start_matches("./");
-    relative.starts_with("apps/web/src/routes/")
+    let web_prefixed = relative.starts_with("apps/web/src/routes/")
         || relative.starts_with("apps/web/src/lib/components/")
         || (relative.starts_with("apps/web/src/") && relative.ends_with(".svelte"))
-        || (relative.starts_with("apps/web/src/") && relative.ends_with(".css"))
+        || (relative.starts_with("apps/web/src/") && relative.ends_with(".css"));
+    if web_prefixed {
+        return true;
+    }
+
+    let worker_dir = worker.working_dir.replace('\\', "/");
+    let worker_is_web_root = worker_dir == "apps/web" || worker_dir.ends_with("/apps/web");
+    worker_is_web_root
+        && (relative.starts_with("src/routes/")
+            || relative.starts_with("src/lib/components/")
+            || (relative.starts_with("src/") && relative.ends_with(".svelte"))
+            || (relative.starts_with("src/") && relative.ends_with(".css")))
 }
 
 fn mutation_result_ui_renderable_path(tool: &str, result: &Value, worker: &WorkerSummary) -> bool {
@@ -245,9 +256,6 @@ fn mutation_result_ui_renderable_path(tool: &str, result: &Value, worker: &Worke
 
 fn status_from_browser_verification_text(text: &str) -> Option<&'static str> {
     let normalized = text.to_ascii_lowercase();
-    if !normalized.contains("browser verification") {
-        return None;
-    }
     if normalized.contains("browser verification failed")
         || normalized.contains("browser verification: failed")
         || normalized.contains("browser verification - failed")
@@ -9847,6 +9855,18 @@ Remaining:\n\
     }
 
     #[test]
+    fn browser_verification_text_accepts_browser_verified_phrase() {
+        assert_eq!(
+            status_from_browser_verification_text("Completed, browser-verified with screenshots."),
+            Some("passed")
+        );
+        assert_eq!(
+            status_from_browser_verification_text("Completed, not browser-verified."),
+            Some("not_performed")
+        );
+    }
+
+    #[test]
     fn incomplete_progress_retry_prompt_requires_continuation() {
         let prompt = build_incomplete_progress_retry_prompt(
             "Phase 4 is not complete yet",
@@ -10297,6 +10317,22 @@ Remaining:\n\
             "fs.apply_patch",
             &result,
             &worker
+        ));
+
+        let mut web_worker = worker.clone();
+        web_worker.working_dir = "/tmp/nucleus-test/apps/web".to_string();
+        let result = json!({ "path": "/tmp/nucleus-test/apps/web/src/routes/+page.svelte" });
+        assert!(mutation_result_ui_renderable_path(
+            "fs.apply_patch",
+            &result,
+            &web_worker
+        ));
+
+        let result = json!({ "path": "src/lib/components/app/Button.svelte" });
+        assert!(mutation_result_ui_renderable_path(
+            "fs.apply_patch",
+            &result,
+            &web_worker
         ));
 
         let result = json!({ "path": "/tmp/nucleus-test/crates/daemon/src/agent.rs" });
