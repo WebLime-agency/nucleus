@@ -925,7 +925,7 @@ pub async fn start_prompt_job(
         ),
     )?;
     if job.publication_requested {
-        record_publication_git_hygiene_baseline(&state, &job, &current.session)?;
+        record_publication_git_hygiene_baseline(&state, &job, &current.session.working_dir)?;
     }
     if patch_loop_guardrail_triggered {
         let _ = state.store.append_job_event(JobEventRecord {
@@ -2924,6 +2924,10 @@ async fn create_child_job(
         requested_by: "agent".to_string(),
         prompt_excerpt: excerpt(prompt, 160),
     })?;
+    let child_working_dir = working_dir.display().to_string();
+    if child_job.publication_requested {
+        record_publication_git_hygiene_baseline(state, &child_job, &child_working_dir)?;
+    }
     state.store.create_worker(WorkerRecord {
         id: child_worker_id.clone(),
         job_id: child_job_id.clone(),
@@ -2936,7 +2940,7 @@ async fn create_child_job(
         provider_base_url: parent_worker.provider_base_url.clone(),
         provider_api_key: parent_worker.provider_api_key.clone(),
         provider_session_id: String::new(),
-        working_dir: working_dir.display().to_string(),
+        working_dir: child_working_dir,
         read_roots,
         write_roots: Vec::new(),
         max_steps: configured_child_job_max_steps(),
@@ -3489,12 +3493,12 @@ fn publication_job_temp_dir(state: &AppState, job_id: &str) -> PathBuf {
 fn record_publication_git_hygiene_baseline(
     state: &AppState,
     job: &JobSummary,
-    session: &SessionSummary,
+    working_dir: &str,
 ) -> Result<()> {
     let job_tmp_dir = publication_job_temp_dir(state, &job.id);
     fs::create_dir_all(&job_tmp_dir)
         .with_context(|| format!("failed to create job temp dir '{}'", job_tmp_dir.display()))?;
-    let temp_paths = collect_repo_temp_paths(&session.working_dir);
+    let temp_paths = collect_repo_temp_paths(working_dir);
     let _ = state.store.append_job_event(JobEventRecord {
         job_id: job.id.clone(),
         worker_id: None,
@@ -3510,7 +3514,7 @@ fn record_publication_git_hygiene_baseline(
             )
         },
         data_json: json!({
-            "working_dir": session.working_dir.clone(),
+            "working_dir": working_dir,
             "job_tmp_dir": job_tmp_dir.display().to_string(),
             "temp_paths": temp_paths,
         }),
@@ -3686,6 +3690,12 @@ struct PublicationOutcomePatch {
     browser_verification_status: Option<String>,
     cleanup_status: Option<String>,
     cleanup_paths: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PublicationTempBaseline {
+    working_dir: String,
+    temp_paths: Vec<String>,
 }
 
 fn final_answer_terminal_metadata(
@@ -3895,15 +3905,20 @@ fn apply_publication_temp_hygiene(
         return;
     }
 
-    let Some(baseline_paths) = publication_temp_baseline_paths(detail) else {
+    let Some(baseline) = publication_temp_baseline(detail) else {
         return;
     };
-    let baseline = baseline_paths.into_iter().collect::<BTreeSet<_>>();
+    let working_dir = if baseline.working_dir.trim().is_empty() {
+        working_dir
+    } else {
+        baseline.working_dir.as_str()
+    };
+    let baseline_paths = baseline.temp_paths.into_iter().collect::<BTreeSet<_>>();
     let current = collect_repo_temp_paths(working_dir)
         .into_iter()
         .collect::<BTreeSet<_>>();
     let new_paths = current
-        .difference(&baseline)
+        .difference(&baseline_paths)
         .cloned()
         .collect::<Vec<String>>();
     if new_paths.is_empty() {
@@ -3940,14 +3955,14 @@ fn reconcile_publication_browser_status_with_completion(
     patch.browser_verification_status = Some(completion_job.browser_verification_status.clone());
 }
 
-fn publication_temp_baseline_paths(detail: &JobDetail) -> Option<Vec<String>> {
+fn publication_temp_baseline(detail: &JobDetail) -> Option<PublicationTempBaseline> {
     detail
         .events
         .iter()
         .rev()
         .find(|event| event.event_type == "job.publication.git_baseline")
-        .map(|items| {
-            items
+        .map(|event| {
+            let temp_paths = event
                 .data_json
                 .get("temp_paths")
                 .and_then(Value::as_array)
@@ -3958,7 +3973,17 @@ fn publication_temp_baseline_paths(detail: &JobDetail) -> Option<Vec<String>> {
                         .map(str::to_string)
                         .collect()
                 })
+                .unwrap_or_default();
+            let working_dir = event
+                .data_json
+                .get("working_dir")
+                .and_then(Value::as_str)
                 .unwrap_or_default()
+                .to_string();
+            PublicationTempBaseline {
+                working_dir,
+                temp_paths,
+            }
         })
 }
 
@@ -9227,7 +9252,7 @@ async fn queue_playbook_job(
         requested_by: requested_by.to_string(),
         prompt_excerpt: prompt_excerpt.clone(),
     })?;
-    state.store.update_job(
+    let job = state.store.update_job(
         &job_id,
         browser_verification_initial_patch(
             &ui_renderable,
@@ -9235,6 +9260,9 @@ async fn queue_playbook_job(
             browser_tools_granted,
         ),
     )?;
+    if job.publication_requested {
+        record_publication_git_hygiene_baseline(state, &job, &playbook.session.working_dir)?;
+    }
 
     let _created_worker = state.store.create_worker(WorkerRecord {
         id: root_worker_id.clone(),
@@ -10811,6 +10839,58 @@ Cleanup status: clean";
         };
 
         apply_publication_temp_hygiene(&detail, &root.display().to_string(), &mut patch);
+
+        assert_eq!(patch.cleanup_status.as_deref(), Some("cleanup_required"));
+        assert_eq!(
+            patch.cleanup_paths,
+            Some(vec![".tmp-playwright".to_string()])
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publication_temp_hygiene_uses_baseline_working_dir() {
+        let root = test_state_dir("publication-temp-hygiene-working-dir");
+        let baseline_root = root.join("baseline-root");
+        let completion_root = root.join("completion-root");
+        fs::create_dir_all(baseline_root.join(".tmp-before"))
+            .expect("baseline temp dir should exist");
+        fs::create_dir_all(baseline_root.join(".tmp-playwright"))
+            .expect("new temp dir should exist");
+        fs::create_dir_all(&completion_root).expect("completion root should exist");
+
+        let detail = JobDetail {
+            job: test_publication_job_summary("publication-temp-hygiene-working-dir"),
+            workers: Vec::new(),
+            child_jobs: Vec::new(),
+            tool_calls: Vec::new(),
+            approvals: Vec::new(),
+            artifacts: Vec::new(),
+            command_sessions: Vec::new(),
+            events: vec![nucleus_protocol::JobEvent {
+                id: 1,
+                job_id: "publication-temp-hygiene-working-dir".to_string(),
+                worker_id: None,
+                event_type: "job.publication.git_baseline".to_string(),
+                status: "captured".to_string(),
+                summary: "Captured baseline".to_string(),
+                detail: String::new(),
+                data_json: json!({
+                    "working_dir": baseline_root.display().to_string(),
+                    "temp_paths": [".tmp-before"],
+                }),
+                created_at: 0,
+            }],
+        };
+        let mut patch = PublicationOutcomePatch {
+            publication_requested: Some(true),
+            cleanup_status: Some("clean".to_string()),
+            cleanup_paths: Some(Vec::new()),
+            ..PublicationOutcomePatch::default()
+        };
+
+        apply_publication_temp_hygiene(&detail, &completion_root.display().to_string(), &mut patch);
 
         assert_eq!(patch.cleanup_status.as_deref(), Some("cleanup_required"));
         assert_eq!(
@@ -12497,6 +12577,7 @@ for line in sys.stdin:
             visible_turn_id: None,
             result_summary: String::new(),
             last_error: String::new(),
+            user_error: None,
             ui_renderable: "unknown".to_string(),
             browser_verification_required: false,
             browser_verification_summary: String::new(),
