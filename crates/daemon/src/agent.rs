@@ -34,12 +34,12 @@ use tracing::warn;
 use uuid::Uuid;
 
 use super::{
-    ApiError, AppState, assemble_prompt_input, ensure_prompting_runtime, excerpt,
-    extract_memory_candidates_after_successful_turn, load_router_profiles, publish_overview_event,
-    publish_prompt_progress_event, publish_session_event, record_instance_log,
-    resolve_mcp_vault_bearer_token, resolve_profile_targets, resolve_session_projects,
-    resolve_workspace_profile, resolve_workspace_profile_target, try_record_audit_event,
-    unix_timestamp,
+    ApiError, AppState, MCP_ENV_BEARER_MIGRATION_MESSAGE, assemble_prompt_input,
+    ensure_prompting_runtime, excerpt, extract_memory_candidates_after_successful_turn,
+    load_router_profiles, publish_overview_event, publish_prompt_progress_event,
+    publish_session_event, record_instance_log, resolve_mcp_vault_bearer_token,
+    resolve_profile_targets, resolve_session_projects, resolve_workspace_profile,
+    resolve_workspace_profile_target, try_record_audit_event, unix_timestamp,
 };
 use crate::runtime::{PromptStreamEvent, ProviderTurnResult};
 use crate::worker_action::{ChildJobProposal, WorkerAction, parse_worker_action};
@@ -5279,13 +5279,7 @@ async fn mcp_http_request_for_tool(
     match record.auth_kind.as_str() {
         "none" | "" => {}
         "bearer_env" | "env_bearer" => {
-            if record.auth_ref.trim().is_empty() {
-                bail!("missing_credentials: bearer token environment variable is not configured");
-            }
-            let token = std::env::var(record.auth_ref.trim()).map_err(|_| {
-                anyhow!("missing_credentials: bearer token environment variable is not set")
-            })?;
-            req = req.bearer_auth(token);
+            bail!(MCP_ENV_BEARER_MIGRATION_MESSAGE);
         }
         "vault_bearer" => {
             let token = resolve_mcp_vault_bearer_token(state, record, project_context).await?;
@@ -10129,6 +10123,55 @@ for line in sys.stdin:
         .expect("mcp tool call should succeed");
 
         assert_eq!(result["content"][0]["text"], "result:nucleus");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn env_bearer_mcp_tool_invocation_fails_closed() {
+        let state_dir = test_state_dir("mcp-env-bearer-tool-call");
+        let state = initialize_test_state(&state_dir);
+        let server = McpServerRecord {
+            id: "mcp.env".to_string(),
+            workspace_id: "workspace".to_string(),
+            title: "Env MCP".to_string(),
+            transport: "streamable-http".to_string(),
+            command: String::new(),
+            args: Vec::new(),
+            env_json: json!({}),
+            url: "http://127.0.0.1:9/mcp".to_string(),
+            headers_json: json!({}),
+            auth_kind: "env_bearer".to_string(),
+            auth_ref: "NUCLEUS_TEST_MCP_ENV_TOKEN".to_string(),
+            enabled: true,
+            sync_status: "ready".to_string(),
+            last_error: String::new(),
+            last_synced_at: Some(1),
+            created_at: 1,
+            updated_at: 1,
+        };
+        let tool = McpToolRecord {
+            id: "mcp.env.lookup".to_string(),
+            server_id: server.id.clone(),
+            name: "lookup".to_string(),
+            description: "Lookup".to_string(),
+            input_schema: json!({"type":"object"}),
+            source: server.id.clone(),
+            discovered_at: 1,
+            created_at: 1,
+            updated_at: 1,
+        };
+
+        unsafe {
+            env::set_var("NUCLEUS_TEST_MCP_ENV_TOKEN", "would-not-be-used");
+        }
+        let result = invoke_mcp_http_tool(&state, &server, &tool, json!({}), None)
+            .await
+            .expect_err("env bearer invocation fails closed even when env var exists");
+        assert!(result.to_string().contains("auth_migration_required"));
+        unsafe {
+            env::remove_var("NUCLEUS_TEST_MCP_ENV_TOKEN");
+        }
 
         let _ = fs::remove_dir_all(&state_dir);
     }
