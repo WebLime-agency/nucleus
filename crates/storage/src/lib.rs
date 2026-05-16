@@ -4329,22 +4329,12 @@ fn bool_to_i64(value: bool) -> i64 {
 
 fn publication_requested_for_job(title: &str, purpose: &str, prompt_excerpt: &str) -> bool {
     let prompt_excerpt = prompt_excerpt.to_ascii_lowercase();
-    if publication_segment_requests_publication(&prompt_excerpt) {
-        return true;
-    }
-    if publication_segment_has_publication_phrase(&prompt_excerpt) {
-        return false;
-    }
-
     let title = title.to_ascii_lowercase();
-    if publication_segment_requests_publication(&title) {
-        return true;
-    }
-    if publication_segment_has_publication_phrase(&title) {
-        return false;
-    }
+    let purpose = purpose.to_ascii_lowercase();
 
-    publication_segment_requests_publication(&purpose.to_ascii_lowercase())
+    publication_segment_requests_publication(&prompt_excerpt)
+        || publication_segment_requests_publication(&title)
+        || publication_segment_requests_publication(&purpose)
 }
 
 fn publication_segment_requests_publication(text: &str) -> bool {
@@ -4371,6 +4361,10 @@ fn publication_segment_has_publication_phrase(text: &str) -> bool {
 
 fn publication_segment_is_informational(text: &str) -> bool {
     let text = text.trim_start();
+    if publication_segment_has_actionable_suffix(text) {
+        return false;
+    }
+
     [
         "how do i ",
         "how can i ",
@@ -4387,6 +4381,26 @@ fn publication_segment_is_informational(text: &str) -> bool {
     ]
     .iter()
     .any(|prefix| text.starts_with(prefix))
+}
+
+fn publication_segment_has_actionable_suffix(text: &str) -> bool {
+    [
+        ", then ",
+        "; then ",
+        ". then ",
+        " and then ",
+        " then ",
+        ", ",
+        "; ",
+        ". ",
+    ]
+    .iter()
+    .any(|separator| {
+        text.split(separator)
+            .skip(1)
+            .map(str::trim_start)
+            .any(publication_segment_requests_publication)
+    })
 }
 
 fn contains_phrase_with_boundaries(text: &str, phrase: &str) -> bool {
@@ -8668,6 +8682,11 @@ mod tests {
             "Explain publication",
             "Session prompt",
             "Can you explain how to publish this branch?"
+        ));
+        assert!(publication_requested_for_job(
+            "Explain then publish",
+            "Session prompt",
+            "Please explain quickly, then open a PR to dev"
         ));
         assert!(publication_requested_for_job(
             "Publish branch",
