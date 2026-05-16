@@ -196,6 +196,11 @@ pub struct JobSummary {
     pub visible_turn_id: Option<String>,
     pub result_summary: String,
     pub last_error: String,
+    pub ui_renderable: String,
+    pub browser_verification_required: bool,
+    pub browser_verification_status: String,
+    pub browser_verification_summary: String,
+    pub browser_verification_artifact_ids: Vec<String>,
     pub worker_count: usize,
     pub pending_approval_count: usize,
     pub artifact_count: usize,
@@ -1702,4 +1707,45 @@ pub struct BrowserSnapshot {
     pub downloads: Vec<BrowserDownload>,
     pub screenshot_data_url: String,
     pub captured_at: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn job_summary_serializes_browser_verification_fields() {
+        let summary = JobSummary {
+            id: "job-1".to_string(),
+            session_id: Some("session-1".to_string()),
+            parent_job_id: None,
+            template_id: None,
+            title: "UI job".to_string(),
+            purpose: "test".to_string(),
+            trigger_kind: "session_prompt".to_string(),
+            state: "completed".to_string(),
+            requested_by: "user".to_string(),
+            prompt_excerpt: "fix layout".to_string(),
+            root_worker_id: Some("worker-1".to_string()),
+            visible_turn_id: Some("turn-1".to_string()),
+            result_summary: "done".to_string(),
+            last_error: String::new(),
+            ui_renderable: "true".to_string(),
+            browser_verification_required: true,
+            browser_verification_status: "passed".to_string(),
+            browser_verification_summary: "Verified dropdown clickability.".to_string(),
+            browser_verification_artifact_ids: vec!["artifact-1".to_string()],
+            worker_count: 1,
+            pending_approval_count: 0,
+            artifact_count: 1,
+            created_at: 1,
+            updated_at: 2,
+        };
+
+        let value = serde_json::to_value(&summary).expect("summary should serialize");
+        assert_eq!(value["ui_renderable"], "true");
+        assert_eq!(value["browser_verification_required"], true);
+        assert_eq!(value["browser_verification_status"], "passed");
+        assert_eq!(value["browser_verification_artifact_ids"][0], "artifact-1");
+    }
 }

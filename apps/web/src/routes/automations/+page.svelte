@@ -179,6 +179,29 @@
     return 'destructive';
   }
 
+  function jobCompletionLabel(job: JobSummary): string {
+    if (job.state !== 'completed' || !job.browser_verification_required) {
+      return formatState(job.state);
+    }
+    if (job.browser_verification_status === 'passed') return 'Completed, browser-verified';
+    if (job.browser_verification_status === 'failed') {
+      return 'Completed, browser verification failed';
+    }
+    if (job.browser_verification_status === 'unavailable') {
+      return 'Completed, verification unavailable';
+    }
+    return 'Completed, not browser-verified';
+  }
+
+  function formatVerificationStatus(status: string): string {
+    if (status === 'passed') return 'Browser-verified';
+    if (status === 'failed') return 'Browser verification failed';
+    if (status === 'unavailable') return 'Verification unavailable';
+    if (status === 'not_performed') return 'Not browser-verified';
+    if (status === 'pending') return 'Verification pending';
+    return 'Not required';
+  }
+
   function hydrateDraft(detail: PlaybookDetail) {
     draftTitle = detail.playbook.title;
     draftDescription = detail.playbook.description;
@@ -726,7 +749,7 @@
                         <div class="mt-1 text-xs text-zinc-500">{job.prompt_excerpt}</div>
                       </div>
                       <Badge variant={badgeVariantForJobState(job.state)}>
-                        {formatState(job.state)}
+                        {jobCompletionLabel(job)}
                       </Badge>
                     </div>
                     <div class="mt-3 flex flex-wrap gap-2 text-[11px] text-zinc-500">
@@ -761,7 +784,7 @@
                     <div class="text-xs uppercase tracking-[0.18em] text-zinc-500">State</div>
                     <div class="mt-2">
                       <Badge variant={badgeVariantForJobState(selectedJobDetail.job.state)}>
-                        {formatState(selectedJobDetail.job.state)}
+                        {jobCompletionLabel(selectedJobDetail.job)}
                       </Badge>
                     </div>
                   </div>
@@ -778,6 +801,27 @@
                     </div>
                   </div>
                 </div>
+
+                {#if selectedJobDetail.job.browser_verification_required || selectedJobDetail.job.browser_verification_status !== 'not_required'}
+                  <div class="rounded-xl border border-zinc-800 bg-zinc-950/60 px-4 py-3">
+                    <div class="text-xs uppercase tracking-[0.18em] text-zinc-500">Browser Verification</div>
+                    <div class="mt-2 text-sm font-medium text-zinc-100">
+                      {formatVerificationStatus(selectedJobDetail.job.browser_verification_status)}
+                    </div>
+                    {#if selectedJobDetail.job.browser_verification_summary}
+                      <div class="mt-1 text-xs leading-5 text-zinc-500">
+                        {selectedJobDetail.job.browser_verification_summary}
+                      </div>
+                    {/if}
+                    {#if selectedJobDetail.job.browser_verification_artifact_ids.length > 0}
+                      <div class="mt-3 flex flex-wrap gap-1.5">
+                        {#each selectedJobDetail.job.browser_verification_artifact_ids as artifactId}
+                          <span class="rounded border border-zinc-800 bg-zinc-900 px-2 py-1 text-[11px] text-zinc-500">{artifactId}</span>
+                        {/each}
+                      </div>
+                    {/if}
+                  </div>
+                {/if}
 
                 <div class="space-y-3">
                   <div class="flex items-center gap-2 text-sm font-medium text-zinc-200">

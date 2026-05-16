@@ -42,7 +42,9 @@ use super::{
     resolve_workspace_profile_target, try_record_audit_event, unix_timestamp,
 };
 use crate::runtime::{PromptStreamEvent, ProviderTurnResult};
-use crate::worker_action::{ChildJobProposal, WorkerAction, parse_worker_action};
+use crate::worker_action::{
+    BrowserVerificationClaim, ChildJobProposal, WorkerAction, parse_worker_action,
+};
 
 const DEFAULT_JOB_MAX_WALL_CLOCK_SECS: u64 = 7_200;
 const MAX_CONFIGURED_JOB_STEPS: usize = 1_000;
@@ -72,6 +74,40 @@ const PLAYBOOK_SCHEDULER_INTERVAL_SECS: u64 = 30;
 const PLAYBOOK_MIN_INTERVAL_SECS: u64 = 60;
 const PLAYBOOK_MAX_INTERVAL_SECS: u64 = 86_400;
 const COMMAND_TRUNCATED_NOTE: &str = "[output truncated by the Nucleus budget]";
+const UI_RENDERABLE_TERMS: &[&str] = &[
+    "ui",
+    "visual",
+    "layout",
+    "responsive",
+    "interaction",
+    "browser",
+    "screenshot",
+    "sidebar",
+    "drawer",
+    "dropdown",
+    "modal",
+    "clickable",
+    "mobile",
+    "shadcn",
+    "css",
+    "page",
+];
+const PATCH_LOOP_CORRECTION_PHRASES: &[&str] = &[
+    "still wrong",
+    "not clickable",
+    "looks horrible",
+    "for the millionth time",
+    "completely broken",
+    "going in circles",
+];
+const BROWSER_VERIFICATION_STATUSES: &[&str] = &[
+    "not_required",
+    "pending",
+    "passed",
+    "failed",
+    "not_performed",
+    "unavailable",
+];
 
 fn configured_job_max_wall_clock_secs() -> u64 {
     configured_u64_env(
@@ -80,6 +116,335 @@ fn configured_job_max_wall_clock_secs() -> u64 {
         60,
         MAX_CONFIGURED_JOB_WALL_CLOCK_SECS,
     )
+}
+
+fn classify_prompt_ui_renderable(prompt: &str, image_count: usize) -> String {
+    let normalized = prompt.to_ascii_lowercase();
+    if image_count > 0 {
+        if mentions_non_ui_image_context(&normalized) {
+            return "false".to_string();
+        }
+        return "true".to_string();
+    }
+    if UI_RENDERABLE_TERMS
+        .iter()
+        .any(|term| normalized_contains_term(&normalized, term))
+    {
+        return "true".to_string();
+    }
+    "false".to_string()
+}
+
+fn mentions_non_ui_image_context(prompt: &str) -> bool {
+    [
+        "not ui",
+        "not a ui",
+        "unrelated to ui",
+        "not related to ui",
+        "unrelated screenshot",
+        "receipt",
+        "document scan",
+    ]
+    .iter()
+    .any(|term| prompt.contains(term))
+}
+
+fn normalized_contains_term(text: &str, term: &str) -> bool {
+    if term.len() <= 3 {
+        text.split(|ch: char| !ch.is_ascii_alphanumeric())
+            .any(|word| word == term)
+    } else {
+        text.contains(term)
+    }
+}
+
+fn browser_verification_initial_patch(
+    ui_renderable: &str,
+    browser_available_error: Option<String>,
+    browser_tools_granted: bool,
+) -> JobPatch {
+    if ui_renderable == "true" {
+        if !browser_tools_granted {
+            return JobPatch {
+                ui_renderable: Some("true".to_string()),
+                browser_verification_required: Some(true),
+                browser_verification_status: Some("unavailable".to_string()),
+                browser_verification_summary: Some(
+                    "Browser verification is required for this UI-renderable job, but Browser tools are not granted in this session mode."
+                        .to_string(),
+                ),
+                ..JobPatch::default()
+            };
+        }
+        if let Some(error) = browser_available_error {
+            return JobPatch {
+                ui_renderable: Some("true".to_string()),
+                browser_verification_required: Some(true),
+                browser_verification_status: Some("unavailable".to_string()),
+                browser_verification_summary: Some(format!(
+                    "Browser verification is required for this UI-renderable job, but Browser runtime is unavailable: {error}"
+                )),
+                ..JobPatch::default()
+            };
+        }
+        return JobPatch {
+            ui_renderable: Some("true".to_string()),
+            browser_verification_required: Some(true),
+            browser_verification_status: Some("pending".to_string()),
+            browser_verification_summary: Some(
+                "Browser verification is required for this UI-renderable job.".to_string(),
+            ),
+            ..JobPatch::default()
+        };
+    }
+
+    JobPatch {
+        ui_renderable: Some(ui_renderable.to_string()),
+        browser_verification_required: Some(false),
+        browser_verification_status: Some("not_required".to_string()),
+        browser_verification_summary: Some(String::new()),
+        browser_verification_artifact_ids: Some(Vec::new()),
+        ..JobPatch::default()
+    }
+}
+
+fn is_ui_renderable_path(path: &Path, worker: &WorkerSummary) -> bool {
+    let relative = path
+        .strip_prefix(Path::new(&worker.working_dir))
+        .ok()
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let relative = relative.trim_start_matches("./");
+    relative.starts_with("apps/web/src/routes/")
+        || relative.starts_with("apps/web/src/lib/components/")
+        || (relative.starts_with("apps/web/src/") && relative.ends_with(".svelte"))
+        || (relative.starts_with("apps/web/src/") && relative.ends_with(".css"))
+}
+
+fn mutation_result_ui_renderable_path(tool: &str, result: &Value, worker: &WorkerSummary) -> bool {
+    if !matches!(tool, "fs.apply_patch" | "fs.write_text" | "fs.move") {
+        return false;
+    }
+    let paths = match tool {
+        "fs.move" => ["from_path", "to_path"]
+            .iter()
+            .filter_map(|key| result.get(key).and_then(Value::as_str))
+            .collect::<Vec<_>>(),
+        _ => result
+            .get("path")
+            .and_then(Value::as_str)
+            .into_iter()
+            .collect::<Vec<_>>(),
+    };
+    paths
+        .iter()
+        .map(PathBuf::from)
+        .any(|path| is_ui_renderable_path(&path, worker))
+}
+
+fn status_from_browser_verification_text(text: &str) -> Option<&'static str> {
+    let normalized = text.to_ascii_lowercase();
+    if !normalized.contains("browser verification") {
+        return None;
+    }
+    if normalized.contains("browser verification failed")
+        || normalized.contains("browser verification: failed")
+        || normalized.contains("browser verification - failed")
+    {
+        return Some("failed");
+    }
+    if normalized.contains("verification unavailable")
+        || normalized.contains("browser verification unavailable")
+        || normalized.contains("browser verification: unavailable")
+    {
+        return Some("unavailable");
+    }
+    if normalized.contains("not browser-verified")
+        || normalized.contains("not browser verified")
+        || normalized.contains("browser verification not performed")
+        || normalized.contains("browser verification: not performed")
+    {
+        return Some("not_performed");
+    }
+    if normalized.contains("browser-verified")
+        || normalized.contains("browser verified")
+        || normalized.contains("browser verification passed")
+        || normalized.contains("browser verification: passed")
+    {
+        return Some("passed");
+    }
+    None
+}
+
+fn normalize_browser_verification_claim_status(status: &str) -> Option<&'static str> {
+    let normalized = status.trim().to_ascii_lowercase().replace('-', "_");
+    BROWSER_VERIFICATION_STATUSES
+        .iter()
+        .copied()
+        .find(|candidate| *candidate == normalized)
+        .filter(|status| *status != "not_required" && *status != "pending")
+}
+
+fn browser_verification_completion_label(status: &str) -> &'static str {
+    match status {
+        "passed" => "Completed, browser-verified",
+        "failed" => "Completed, browser verification failed",
+        "unavailable" => "Completed, verification unavailable",
+        "not_performed" | "pending" => "Completed, not browser-verified",
+        _ => "Completed, not browser-verified",
+    }
+}
+
+fn decorate_final_answer_with_browser_verification(job: &JobSummary, final_answer: &str) -> String {
+    if !job.browser_verification_required {
+        return final_answer.to_string();
+    }
+
+    let label = browser_verification_completion_label(&job.browser_verification_status);
+    let mut verification = format!("Result: {label}\n\nBrowser verification: ");
+    verification.push_str(match job.browser_verification_status.as_str() {
+        "passed" => "passed",
+        "failed" => "failed",
+        "unavailable" => "unavailable",
+        "not_performed" | "pending" => "not performed",
+        other => other,
+    });
+    if !job.browser_verification_summary.trim().is_empty() {
+        verification.push_str(" - ");
+        verification.push_str(job.browser_verification_summary.trim());
+    }
+    if !job.browser_verification_artifact_ids.is_empty() {
+        verification.push_str(&format!(
+            "\nBrowser artifacts: {}",
+            job.browser_verification_artifact_ids.join(", ")
+        ));
+    }
+    verification.push_str("\n\n");
+    verification.push_str(final_answer.trim_start());
+    verification
+}
+
+fn detects_patch_loop_correction(text: &str) -> bool {
+    let normalized = text.to_ascii_lowercase();
+    PATCH_LOOP_CORRECTION_PHRASES
+        .iter()
+        .any(|phrase| normalized.contains(phrase))
+}
+
+fn should_trigger_patch_loop_guardrail(
+    prompt: &str,
+    prior_turns: &[SessionTurn],
+    recent_jobs: &[JobSummary],
+) -> bool {
+    if !detects_patch_loop_correction(prompt) {
+        return false;
+    }
+    let recent_correction = prior_turns
+        .iter()
+        .rev()
+        .filter(|turn| turn.role == "user")
+        .take(6)
+        .any(|turn| detects_patch_loop_correction(&turn.content));
+    let recent_ui_job = recent_jobs.iter().take(3).any(|job| {
+        job.ui_renderable == "true"
+            || matches!(
+                job.browser_verification_status.as_str(),
+                "failed" | "not_performed" | "unavailable"
+            )
+    });
+    recent_correction || recent_ui_job
+}
+
+async fn mark_job_ui_renderable_from_mutation(
+    state: &AppState,
+    job_id: &str,
+    reason: &str,
+) -> Result<()> {
+    let detail = state.store.get_job(job_id)?;
+    if detail.job.ui_renderable == "true" {
+        return Ok(());
+    }
+
+    let browser_error = crate::browser::BrowserRuntime::availability_error();
+    let browser_tools_granted = detail.workers.iter().any(|worker| {
+        worker
+            .capabilities
+            .iter()
+            .any(|capability| capability.tool_id.starts_with("browser."))
+    });
+    let patch = browser_verification_initial_patch("true", browser_error, browser_tools_granted);
+    state.store.update_job(job_id, patch)?;
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: job_id.to_string(),
+        worker_id: None,
+        event_type: "job.browser_verification.required".to_string(),
+        status: "pending".to_string(),
+        summary: "Marked job UI-renderable from file mutation.".to_string(),
+        detail: reason.to_string(),
+        data_json: json!({ "reason": reason }),
+    });
+    publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+    Ok(())
+}
+
+fn append_unique_ids(mut current: Vec<String>, next: &[String]) -> Vec<String> {
+    for id in next {
+        if !current.iter().any(|candidate| candidate == id) {
+            current.push(id.clone());
+        }
+    }
+    current
+}
+
+async fn attach_browser_verification_artifacts(
+    state: &AppState,
+    job_id: &str,
+    artifact_ids: &[String],
+) -> Result<()> {
+    if artifact_ids.is_empty() {
+        return Ok(());
+    }
+    let job = state.store.get_job(job_id)?.job;
+    let next_ids = append_unique_ids(job.browser_verification_artifact_ids.clone(), artifact_ids);
+    let summary = if job.browser_verification_summary.trim().is_empty()
+        || job.browser_verification_summary
+            == "Browser verification is required for this UI-renderable job."
+    {
+        "Browser evidence was captured; a verification outcome still needs to be asserted."
+            .to_string()
+    } else {
+        job.browser_verification_summary
+    };
+    state.store.update_job(
+        job_id,
+        JobPatch {
+            browser_verification_artifact_ids: Some(next_ids.clone()),
+            browser_verification_summary: Some(summary),
+            ..JobPatch::default()
+        },
+    )?;
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: job_id.to_string(),
+        worker_id: None,
+        event_type: "job.browser_verification.evidence".to_string(),
+        status: "running".to_string(),
+        summary: format!("Attached {} Browser artifact(s).", artifact_ids.len()),
+        detail: artifact_ids.join(", "),
+        data_json: json!({ "artifact_ids": artifact_ids }),
+    });
+    publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+    Ok(())
+}
+
+fn remaining_budget_for_browser_verification(
+    worker: &WorkerSummary,
+    step_count_after_rejection: usize,
+    tool_calls: usize,
+) -> bool {
+    let has_step_room = worker.max_steps == 0 || step_count_after_rejection < worker.max_steps;
+    let has_action_room = worker.max_tool_calls == 0 || tool_calls < worker.max_tool_calls;
+    has_step_room && has_action_room
 }
 
 fn configured_child_job_max_steps() -> usize {
@@ -143,6 +508,10 @@ struct WorkerCheckpoint {
     conversation: Vec<CheckpointMessage>,
     next_prompt: Option<String>,
     pending_action: Option<PendingToolAction>,
+    #[serde(default)]
+    browser_verification_final_answer_rejected: bool,
+    #[serde(default)]
+    patch_loop_guardrail_triggered: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -492,6 +861,23 @@ pub async fn start_prompt_job(
     let target =
         resolve_hidden_worker_target(&state, &current.session, &compiler_role, needs_vision_tools)
             .await?;
+    let root_capabilities = if current.session.execution_mode == "plan" {
+        Vec::new()
+    } else {
+        let mut capabilities = root_worker_capabilities();
+        capabilities.extend(mcp_tool_capabilities(&state));
+        capabilities
+    };
+    let browser_tools_granted = root_capabilities
+        .iter()
+        .any(|capability| capability.tool_id.starts_with("browser."));
+    let ui_renderable = classify_prompt_ui_renderable(&visible_prompt, payload.images.len());
+    let recent_jobs = state
+        .store
+        .list_jobs_for_session(&session_id)
+        .unwrap_or_default();
+    let patch_loop_guardrail_triggered =
+        should_trigger_patch_loop_guardrail(&visible_prompt, &current.turns, &recent_jobs);
 
     state.store.update_session(
         &session_id,
@@ -509,7 +895,7 @@ pub async fn start_prompt_job(
         &payload.images,
     )?;
 
-    let job = state.store.create_job(JobRecord {
+    let _job = state.store.create_job(JobRecord {
         id: job_id.clone(),
         session_id: Some(session_id.clone()),
         parent_job_id: None,
@@ -521,6 +907,27 @@ pub async fn start_prompt_job(
         requested_by: "user".to_string(),
         prompt_excerpt: prompt_excerpt.clone(),
     })?;
+    state.store.update_job(
+        &job_id,
+        browser_verification_initial_patch(
+            &ui_renderable,
+            crate::browser::BrowserRuntime::availability_error(),
+            browser_tools_granted,
+        ),
+    )?;
+    if patch_loop_guardrail_triggered {
+        let _ = state.store.append_job_event(JobEventRecord {
+            job_id: job_id.clone(),
+            worker_id: None,
+            event_type: "job.guardrail.patch_loop".to_string(),
+            status: "warning".to_string(),
+            summary: "Patch-loop guardrail triggered.".to_string(),
+            detail:
+                "Recent correction phrasing indicates UI patch chasing; worker prompt includes reset/reassess guidance."
+                    .to_string(),
+            data_json: json!({ "prompt_excerpt": excerpt(&visible_prompt, 240) }),
+        });
+    }
 
     let _created_worker = state.store.create_worker(WorkerRecord {
         id: root_worker_id.clone(),
@@ -548,13 +955,6 @@ pub async fn start_prompt_job(
             ..JobPatch::default()
         },
     )?;
-    let root_capabilities = if current.session.execution_mode == "plan" {
-        Vec::new()
-    } else {
-        let mut capabilities = root_worker_capabilities();
-        capabilities.extend(mcp_tool_capabilities(&state));
-        capabilities
-    };
     state
         .store
         .replace_tool_capability_grants(&root_worker_id, &root_capabilities)?;
@@ -588,6 +988,8 @@ pub async fn start_prompt_job(
         ),
         next_prompt: None,
         pending_action: None,
+        browser_verification_final_answer_rejected: false,
+        patch_loop_guardrail_triggered,
     };
     state
         .store
@@ -595,7 +997,7 @@ pub async fn start_prompt_job(
 
     let started = state.store.get_session(&session_id)?;
     let _ = publish_session_event(&state, started).await;
-    publish_job_created(&state, &job).await;
+    publish_job_created(&state, &state.store.get_job(&job_id)?.job).await;
     publish_worker_updated(&state, &worker).await;
     publish_prompt_status(
         &state,
@@ -1456,7 +1858,13 @@ async fn run_job_loop(
 
         let attach_initial_images = should_attach_initial_worker_images(&checkpoint);
         let prompt = checkpoint.next_prompt.take().unwrap_or_else(|| {
-            build_initial_step_prompt(&session.session, &assembled_prompt.prompt, &worker)
+            let initial =
+                build_initial_step_prompt(&session.session, &assembled_prompt.prompt, &worker);
+            if checkpoint.patch_loop_guardrail_triggered {
+                build_patch_loop_guardrail_prompt(initial)
+            } else {
+                initial
+            }
         });
         let prompt = add_budget_guidance(prompt, &worker, step, tool_calls);
         let prompt_images = if attach_initial_images {
@@ -1542,6 +1950,7 @@ async fn run_job_loop(
             WorkerAction::FinalAnswer {
                 summary,
                 final_answer,
+                browser_verification,
             } => {
                 if should_retry_internal_action_item_final_answer(&final_answer, tool_calls) {
                     retry_worker_final_answer(
@@ -1583,6 +1992,41 @@ async fn run_job_loop(
                     .await?;
                     continue;
                 }
+
+                let current_job = state.store.get_job(job_id)?.job;
+                if should_retry_browser_verification_final_answer(
+                    &current_job,
+                    browser_verification.as_ref(),
+                    &final_answer,
+                    &checkpoint,
+                    &worker,
+                    step + 1,
+                    tool_calls,
+                ) {
+                    checkpoint.browser_verification_final_answer_rejected = true;
+                    retry_worker_final_answer(
+                        state,
+                        job_id,
+                        &mut worker,
+                        &mut checkpoint,
+                        &mut step,
+                        tool_calls,
+                        "Rejected final answer without Browser verification outcome.",
+                        "browser_verification_required",
+                        &build_browser_verification_retry_prompt(&current_job, &final_answer),
+                        &final_answer,
+                    )
+                    .await?;
+                    continue;
+                }
+
+                let final_answer = apply_browser_verification_final_state(
+                    state,
+                    job_id,
+                    browser_verification,
+                    &final_answer,
+                )
+                .await?;
 
                 complete_job_with_final_answer(
                     state,
@@ -2492,6 +2936,8 @@ async fn create_child_job(
         }],
         next_prompt: None,
         pending_action: None,
+        browser_verification_final_answer_rejected: false,
+        patch_loop_guardrail_triggered: false,
     };
     state.store.write_worker_checkpoint(
         &child_worker.id,
@@ -2591,6 +3037,41 @@ async fn complete_job_with_final_answer(
         )
         .await;
 
+    if detail.job.browser_verification_required
+        && matches!(
+            detail.job.browser_verification_status.as_str(),
+            "pending" | "not_performed"
+        )
+    {
+        let summary = if detail.job.browser_verification_artifact_ids.is_empty() {
+            "Browser verification was not performed before completion.".to_string()
+        } else {
+            "Browser evidence was captured, but no verification outcome was asserted before completion."
+                .to_string()
+        };
+        let _ = state.store.update_job(
+            job_id,
+            JobPatch {
+                browser_verification_status: Some("not_performed".to_string()),
+                browser_verification_summary: Some(summary.clone()),
+                ..JobPatch::default()
+            },
+        );
+        let _ = state.store.append_job_event(JobEventRecord {
+            job_id: job_id.to_string(),
+            worker_id: Some(worker.id.clone()),
+            event_type: "job.browser_verification.completed".to_string(),
+            status: "not_performed".to_string(),
+            summary: "Completed, not browser-verified".to_string(),
+            detail: summary,
+            data_json: json!({ "reason": "completion_without_verification" }),
+        });
+    }
+
+    let completion_job = state.store.get_job(job_id)?.job;
+    let final_answer =
+        decorate_final_answer_with_browser_verification(&completion_job, final_answer);
+
     let mut visible_turn_id = None;
     let mut report_artifact = None;
     if detail.job.parent_job_id.is_none() {
@@ -2599,7 +3080,7 @@ async fn complete_job_with_final_answer(
             &session.session.id,
             &final_turn_id,
             "assistant",
-            final_answer,
+            &final_answer,
             &[],
         )?;
         extract_memory_candidates_after_successful_turn(state, &session.session.id, &final_turn_id)
@@ -2624,7 +3105,7 @@ async fn complete_job_with_final_answer(
                 format!("{} report", detail.job.title),
                 "md",
                 "text/markdown",
-                final_answer.to_string(),
+                final_answer.clone(),
             ),
         )?;
         report_artifact = Some(artifact);
@@ -2651,7 +3132,7 @@ async fn complete_job_with_final_answer(
         },
     )?;
     let terminal_metadata =
-        final_answer_terminal_metadata(summary, final_answer, step_count, tool_call_count);
+        final_answer_terminal_metadata(summary, &final_answer, step_count, tool_call_count);
     let terminal_status = terminal_metadata
         .get("terminal_status")
         .and_then(Value::as_str)
@@ -2663,7 +3144,7 @@ async fn complete_job_with_final_answer(
         event_type: "job.completed".to_string(),
         status: terminal_status,
         summary: summary.to_string(),
-        detail: excerpt(final_answer, 320),
+        detail: excerpt(&final_answer, 320),
         data_json: terminal_metadata,
     });
     let _ = try_record_audit_event(
@@ -3090,6 +3571,133 @@ Return exactly one valid Nucleus worker action JSON object.\n\
         excerpt(summary, 320),
         excerpt(final_answer, 1_200)
     )
+}
+
+fn build_browser_verification_retry_prompt(job: &JobSummary, final_answer: &str) -> String {
+    let artifact_note = if job.browser_verification_artifact_ids.is_empty() {
+        "No Browser evidence artifacts are currently attached to this job.".to_string()
+    } else {
+        format!(
+            "Current Browser evidence artifact ids: {}.",
+            job.browser_verification_artifact_ids.join(", ")
+        )
+    };
+    format!(
+        "Your previous final_answer tried to complete a UI-renderable job while Browser verification was still pending.\n\
+Nucleus cannot treat typecheck/build success as sufficient rendered-UI evidence.\n\
+{artifact_note}\n\n\
+Before returning final_answer, either:\n\
+- verify through Browser tools, capture snapshot/screenshot or interaction evidence, and return final_answer with browser_verification status \"passed\" or \"failed\"; or\n\
+- explicitly return final_answer with browser_verification status \"unavailable\" or \"not_performed\" and explain why rendered Browser verification cannot be done.\n\n\
+Use this final_answer shape when done:\n\
+{{\"kind\":\"final_answer\",\"summary\":\"why the work is complete or blocked\",\"final_answer\":\"user-facing answer\",\"browser_verification\":{{\"status\":\"passed|failed|not_performed|unavailable\",\"summary\":\"concise verification result\",\"artifact_ids\":[\"artifact-id\"]}}}}\n\n\
+Rejected final_answer:\n{}",
+        excerpt(final_answer, 1_200)
+    )
+}
+
+fn build_patch_loop_guardrail_prompt(initial_prompt: String) -> String {
+    format!(
+        "{initial_prompt}\n\nPatch-loop guardrail:\n\
+Recent user feedback indicates repeated UI correction loops. Before patching further, inspect the current diff, restate the acceptance criteria, identify fragile patch-chasing changes, simplify or partially revert risky changes where appropriate, and browser-verify before final completion."
+    )
+}
+
+fn should_retry_browser_verification_final_answer(
+    job: &JobSummary,
+    claim: Option<&BrowserVerificationClaim>,
+    final_answer: &str,
+    checkpoint: &WorkerCheckpoint,
+    worker: &WorkerSummary,
+    step_after_rejection: usize,
+    tool_calls: usize,
+) -> bool {
+    job.browser_verification_required
+        && matches!(
+            job.browser_verification_status.as_str(),
+            "pending" | "not_performed"
+        )
+        && claim.is_none()
+        && status_from_browser_verification_text(final_answer).is_none()
+        && !checkpoint.browser_verification_final_answer_rejected
+        && remaining_budget_for_browser_verification(worker, step_after_rejection, tool_calls)
+}
+
+async fn apply_browser_verification_final_state(
+    state: &AppState,
+    job_id: &str,
+    claim: Option<BrowserVerificationClaim>,
+    final_answer: &str,
+) -> Result<String> {
+    let job = state.store.get_job(job_id)?.job;
+    if !job.browser_verification_required {
+        return Ok(final_answer.to_string());
+    }
+
+    let claimed_status = claim
+        .as_ref()
+        .and_then(|claim| normalize_browser_verification_claim_status(&claim.status))
+        .or_else(|| status_from_browser_verification_text(final_answer));
+    let next_status = claimed_status.unwrap_or(match job.browser_verification_status.as_str() {
+        "failed" => "failed",
+        "unavailable" => "unavailable",
+        _ => "not_performed",
+    });
+    let claim_summary = claim
+        .as_ref()
+        .map(|claim| claim.summary.trim())
+        .filter(|value| !value.is_empty());
+    let summary = claim_summary
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            if !job.browser_verification_summary.trim().is_empty() {
+                Some(job.browser_verification_summary.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| match next_status {
+            "passed" => {
+                "Browser verification passed according to the worker's final assertion.".to_string()
+            }
+            "failed" => "Browser verification failed or reported rendered-UI problems.".to_string(),
+            "unavailable" => "Browser verification was unavailable for this job.".to_string(),
+            "not_performed" => {
+                "Browser verification was not performed before completion.".to_string()
+            }
+            _ => String::new(),
+        });
+    let claim_artifact_ids = claim
+        .as_ref()
+        .map(|claim| claim.artifact_ids.as_slice())
+        .unwrap_or(&[]);
+    let artifact_ids = append_unique_ids(
+        job.browser_verification_artifact_ids.clone(),
+        claim_artifact_ids,
+    );
+
+    state.store.update_job(
+        job_id,
+        JobPatch {
+            browser_verification_status: Some(next_status.to_string()),
+            browser_verification_summary: Some(summary.clone()),
+            browser_verification_artifact_ids: Some(artifact_ids.clone()),
+            ..JobPatch::default()
+        },
+    )?;
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: job_id.to_string(),
+        worker_id: None,
+        event_type: "job.browser_verification.completed".to_string(),
+        status: next_status.to_string(),
+        summary: browser_verification_completion_label(next_status).to_string(),
+        detail: summary,
+        data_json: json!({
+            "status": next_status,
+            "artifact_ids": artifact_ids,
+        }),
+    });
+    Ok(final_answer.to_string())
 }
 
 fn build_progress_update_continuation_prompt(summary: &str, detail: &str) -> String {
@@ -3662,6 +4270,18 @@ async fn execute_pending_tool_action(
         Ok(result) => result,
         Err(error) => {
             state.agent.release_write_lock(&pending.tool_call_id);
+            if is_browser_tool(&tool) {
+                let _ = state.store.update_job(
+                    job_id,
+                    JobPatch {
+                        browser_verification_status: Some("failed".to_string()),
+                        browser_verification_summary: Some(format!(
+                            "Browser verification action failed: {error}"
+                        )),
+                        ..JobPatch::default()
+                    },
+                );
+            }
             let _ = state.store.update_tool_call(
                 &pending.tool_call_id,
                 ToolCallPatch {
@@ -3677,6 +4297,15 @@ async fn execute_pending_tool_action(
     };
 
     state.agent.release_write_lock(&pending.tool_call_id);
+
+    if mutation_result_ui_renderable_path(&tool, &tool_result, worker) {
+        mark_job_ui_renderable_from_mutation(
+            state,
+            job_id,
+            &format!("{} touched a UI-renderable path.", tool),
+        )
+        .await?;
+    }
 
     if *cancel_rx.borrow()
         || matches!(
@@ -5208,6 +5837,7 @@ async fn persist_browser_snapshot_job_artifacts(
     }
 
     append_tool_call_artifact_ids(state, job_id, tool_call_id, &artifact_ids)?;
+    attach_browser_verification_artifacts(state, job_id, &artifact_ids).await?;
     Ok(artifact_ids)
 }
 
@@ -7784,6 +8414,11 @@ async fn queue_playbook_job(
     let job_id = Uuid::new_v4().to_string();
     let root_worker_id = Uuid::new_v4().to_string();
     let target = resolve_hidden_worker_target(state, &playbook.session, "utility", false).await?;
+    let worker_capabilities = capabilities_for_policy_bundle(&playbook.playbook.policy_bundle);
+    let browser_tools_granted = worker_capabilities
+        .iter()
+        .any(|capability| capability.tool_id.starts_with("browser."));
+    let ui_renderable = classify_prompt_ui_renderable(&playbook.prompt, 0);
 
     state.store.update_session(
         &session_id,
@@ -7801,7 +8436,7 @@ async fn queue_playbook_job(
         &[],
     )?;
 
-    let job = state.store.create_job(JobRecord {
+    let _job = state.store.create_job(JobRecord {
         id: job_id.clone(),
         session_id: Some(session_id.clone()),
         parent_job_id: None,
@@ -7817,6 +8452,14 @@ async fn queue_playbook_job(
         requested_by: requested_by.to_string(),
         prompt_excerpt: prompt_excerpt.clone(),
     })?;
+    state.store.update_job(
+        &job_id,
+        browser_verification_initial_patch(
+            &ui_renderable,
+            crate::browser::BrowserRuntime::availability_error(),
+            browser_tools_granted,
+        ),
+    )?;
 
     let _created_worker = state.store.create_worker(WorkerRecord {
         id: root_worker_id.clone(),
@@ -7844,10 +8487,9 @@ async fn queue_playbook_job(
             ..JobPatch::default()
         },
     )?;
-    state.store.replace_tool_capability_grants(
-        &root_worker_id,
-        &capabilities_for_policy_bundle(&playbook.playbook.policy_bundle),
-    )?;
+    state
+        .store
+        .replace_tool_capability_grants(&root_worker_id, &worker_capabilities)?;
     let worker = state
         .store
         .get_job(&job_id)?
@@ -7867,6 +8509,8 @@ async fn queue_playbook_job(
         }],
         next_prompt: None,
         pending_action: None,
+        browser_verification_final_answer_rejected: false,
+        patch_loop_guardrail_triggered: false,
     };
     state
         .store
@@ -7875,7 +8519,7 @@ async fn queue_playbook_job(
     if let Ok(updated) = state.store.get_session(&session_id) {
         let _ = publish_session_event(state, updated).await;
     }
-    publish_job_created(state, &job).await;
+    publish_job_created(state, &state.store.get_job(&job_id)?.job).await;
     publish_worker_updated(state, &worker).await;
     let _ = publish_overview_event(state).await;
     let _ = try_record_audit_event(
@@ -8316,7 +8960,7 @@ Working directory: {}\n",
 {\"kind\":\"tool_call\",\"summary\":\"click a Browser control by ref\",\"tool\":\"browser.click\",\"args\":{\"target_ref\":\"ref-1\"}}\n\
 {\"kind\":\"spawn_child_jobs\",\"summary\":\"why parallel exploration helps\",\"jobs\":[{\"title\":\"focused subtask\",\"prompt\":\"precise child prompt\",\"working_dir\":\"optional/path/inside/scope\"}]}\n\
 {\"kind\":\"progress_update\",\"summary\":\"durable checkpoint, not done\",\"detail\":\"completed evidence and exact continuation point\"}\n\
-{\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\"}"
+{\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\",\"browser_verification\":{\"status\":\"passed|failed|not_performed|unavailable\",\"summary\":\"concise Browser verification result\",\"artifact_ids\":[\"artifact-id\"]}}"
     } else {
         "{\"kind\":\"tool_call\",\"summary\":\"inspect the active project\",\"tool\":\"project.inspect\",\"args\":{}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"list likely project directories\",\"tool\":\"fs.list\",\"args\":{\"path\":\".\",\"recursive\":false,\"limit\":100}}\n\
@@ -8356,6 +9000,7 @@ Rules:\n\
 - Stay inside the granted repo scope.\n\
 {}\
 - For UI or visual changes, strongly prefer Browser verification before final_answer when Browser tools are available: navigate to the matched local app, inspect refs/snapshot or screenshot, interact as needed, and cite artifact/result evidence.\n\
+- For UI-renderable work, include browser_verification in final_answer with status passed, failed, not_performed, or unavailable. Typecheck/build success alone is not rendered-UI verification.\n\
 - Prefer daemon-generated Browser refs for browser.click/browser.type/browser.fill/browser.scroll/browser.press/browser.submit. Do not invent selectors when a ref is available.\n\
 - The visible chat will only receive final_answer, not your intermediate reasoning.\n\
 - progress_update records a non-terminal checkpoint for Nucleus; it does not complete the job.\n\
@@ -8779,6 +9424,8 @@ mod tests {
                 "Tool result: seed completed; sqlite3 command was missing.".to_string(),
             ),
             pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
         };
 
         let answer = build_budget_checkpoint_answer(&session, &worker, &checkpoint, 10, 8, "step");
@@ -9601,6 +10248,8 @@ Remaining:\n\
             }],
             next_prompt: None,
             pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
         };
 
         assert!(should_attach_initial_worker_images(&checkpoint));
@@ -9615,6 +10264,193 @@ Remaining:\n\
         assert!(!should_attach_initial_worker_images(&checkpoint));
         let history = checkpoint_history(&checkpoint.conversation, "job-image");
         assert_eq!(history[1].images, vec![image]);
+    }
+
+    #[test]
+    fn classifies_ui_renderable_prompts_and_images() {
+        assert_eq!(
+            classify_prompt_ui_renderable("Fix the mobile sidebar dropdown layout", 0),
+            "true"
+        );
+        assert_eq!(
+            classify_prompt_ui_renderable("Refactor the Rust parser", 0),
+            "false"
+        );
+        assert_eq!(
+            classify_prompt_ui_renderable("Match this screenshot", 1),
+            "true"
+        );
+        assert_eq!(
+            classify_prompt_ui_renderable("This receipt photo is unrelated to UI", 1),
+            "false"
+        );
+    }
+
+    #[test]
+    fn classifies_ui_renderable_mutation_paths() {
+        let worker = test_worker_summary("path-worker", 10, 10);
+        let result = json!({
+            "path": "/tmp/nucleus-test/apps/web/src/routes/+page.svelte",
+            "changed": true,
+        });
+        assert!(mutation_result_ui_renderable_path(
+            "fs.apply_patch",
+            &result,
+            &worker
+        ));
+
+        let result = json!({ "path": "/tmp/nucleus-test/crates/daemon/src/agent.rs" });
+        assert!(!mutation_result_ui_renderable_path(
+            "fs.apply_patch",
+            &result,
+            &worker
+        ));
+    }
+
+    #[test]
+    fn detects_patch_loop_after_recent_ui_feedback() {
+        let turns = vec![SessionTurn {
+            id: "turn-1".to_string(),
+            session_id: "session-1".to_string(),
+            role: "user".to_string(),
+            content: "still wrong, the dropdown is not clickable".to_string(),
+            images: Vec::new(),
+            created_at: 1,
+        }];
+        let jobs = vec![JobSummary {
+            id: "job-1".to_string(),
+            session_id: Some("session-1".to_string()),
+            parent_job_id: None,
+            template_id: None,
+            title: "UI job".to_string(),
+            purpose: String::new(),
+            trigger_kind: "session_prompt".to_string(),
+            state: "completed".to_string(),
+            requested_by: "user".to_string(),
+            prompt_excerpt: String::new(),
+            root_worker_id: None,
+            visible_turn_id: None,
+            result_summary: String::new(),
+            last_error: String::new(),
+            ui_renderable: "true".to_string(),
+            browser_verification_required: true,
+            browser_verification_status: "not_performed".to_string(),
+            browser_verification_summary: String::new(),
+            browser_verification_artifact_ids: Vec::new(),
+            worker_count: 0,
+            pending_approval_count: 0,
+            artifact_count: 0,
+            created_at: 1,
+            updated_at: 1,
+        }];
+
+        assert!(should_trigger_patch_loop_guardrail(
+            "for the millionth time it is still wrong",
+            &turns,
+            &jobs
+        ));
+        assert!(!should_trigger_patch_loop_guardrail(
+            "please add a parser test",
+            &turns,
+            &jobs
+        ));
+    }
+
+    #[test]
+    fn completion_guard_rejects_pending_browser_verification_once() {
+        let worker = test_worker_summary("guard-worker", 10, 10);
+        let job = JobSummary {
+            id: "job-guard".to_string(),
+            session_id: Some("session-guard".to_string()),
+            parent_job_id: None,
+            template_id: None,
+            title: "Guard job".to_string(),
+            purpose: String::new(),
+            trigger_kind: "session_prompt".to_string(),
+            state: "running".to_string(),
+            requested_by: "user".to_string(),
+            prompt_excerpt: String::new(),
+            root_worker_id: None,
+            visible_turn_id: None,
+            result_summary: String::new(),
+            last_error: String::new(),
+            ui_renderable: "true".to_string(),
+            browser_verification_required: true,
+            browser_verification_status: "pending".to_string(),
+            browser_verification_summary: String::new(),
+            browser_verification_artifact_ids: Vec::new(),
+            worker_count: 0,
+            pending_approval_count: 0,
+            artifact_count: 0,
+            created_at: 1,
+            updated_at: 1,
+        };
+        let checkpoint = WorkerCheckpoint {
+            session_id: "session-guard".to_string(),
+            prompt_text: "fix UI".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+
+        assert!(should_retry_browser_verification_final_answer(
+            &job,
+            None,
+            "Checks passed.",
+            &checkpoint,
+            &worker,
+            1,
+            0,
+        ));
+
+        let mut rejected = checkpoint.clone();
+        rejected.browser_verification_final_answer_rejected = true;
+        assert!(!should_retry_browser_verification_final_answer(
+            &job,
+            None,
+            "Checks passed.",
+            &rejected,
+            &worker,
+            2,
+            0,
+        ));
+    }
+
+    #[tokio::test]
+    async fn attaches_browser_artifact_ids_to_verification_state() {
+        let state_dir = test_state_dir("browser-verification-artifacts");
+        let state = initialize_test_state(&state_dir);
+        let (job_id, _worker, _tool_call_id) = create_command_test_context(&state, "browser-ids");
+        state
+            .store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    ui_renderable: Some("true".to_string()),
+                    browser_verification_required: Some(true),
+                    browser_verification_status: Some("pending".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("job verification state should update");
+
+        attach_browser_verification_artifacts(
+            &state,
+            &job_id,
+            &["artifact-a".to_string(), "artifact-b".to_string()],
+        )
+        .await
+        .expect("artifact ids should attach");
+        let job = state.store.get_job(&job_id).expect("job should reload").job;
+        assert_eq!(
+            job.browser_verification_artifact_ids,
+            vec!["artifact-a".to_string(), "artifact-b".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
     }
 
     #[test]
