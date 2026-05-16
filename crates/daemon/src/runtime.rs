@@ -281,7 +281,10 @@ async fn execute_openai_compatible_prompt(
         } else {
             truncate(body, 200)
         };
-        bail!("OpenAI-compatible endpoint failed: {detail}");
+        bail!(
+            "OpenAI-compatible endpoint failed (HTTP {}): {detail}",
+            status.as_u16()
+        );
     }
 
     read_openai_compatible_stream(response, events).await

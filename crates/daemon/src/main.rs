@@ -1,5 +1,6 @@
 mod agent;
 mod browser;
+mod error_display;
 mod host;
 mod runtime;
 mod security;
@@ -57,11 +58,11 @@ use nucleus_protocol::{
     SkillManifest, SkillPackageRecord, SkillPackageUpsertRequest, SkillReconcileCandidate,
     SkillReconcileRequest, SkillReconcileScanResponse, StreamConnected, SystemStats,
     UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
-    VaultInitRequest, VaultSecretListResponse, VaultSecretPolicyListResponse,
-    VaultSecretPolicySummary, VaultSecretPolicyUpsertRequest, VaultSecretSummary,
-    VaultSecretUpdateRequest, VaultSecretUpsertRequest, VaultStatusSummary, VaultUnlockRequest,
-    WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceProfileWriteRequest, WorkspaceSummary,
-    WorkspaceUpdateRequest,
+    UserFacingErrorSummary, VaultInitRequest, VaultSecretListResponse,
+    VaultSecretPolicyListResponse, VaultSecretPolicySummary, VaultSecretPolicyUpsertRequest,
+    VaultSecretSummary, VaultSecretUpdateRequest, VaultSecretUpsertRequest, VaultStatusSummary,
+    VaultUnlockRequest, WorkspaceModelConfig, WorkspaceProfileSummary,
+    WorkspaceProfileWriteRequest, WorkspaceSummary, WorkspaceUpdateRequest,
 };
 use nucleus_release::read_installed_release_metadata;
 use nucleus_storage::{
@@ -3125,7 +3126,9 @@ async fn playbook_detail(
     State(state): State<AppState>,
     Path(playbook_id): Path<String>,
 ) -> Result<Json<PlaybookDetail>, ApiError> {
-    Ok(Json(agent::get_playbook(state, playbook_id).await?))
+    Ok(Json(redact_playbook_detail(
+        agent::get_playbook(state, playbook_id).await?,
+    )))
 }
 
 async fn create_playbook(
@@ -3133,7 +3136,9 @@ async fn create_playbook(
     body: Bytes,
 ) -> Result<Json<PlaybookDetail>, ApiError> {
     let payload = decode_json::<CreatePlaybookRequest>(&body)?;
-    Ok(Json(agent::create_playbook(state, payload).await?))
+    Ok(Json(redact_playbook_detail(
+        agent::create_playbook(state, payload).await?,
+    )))
 }
 
 async fn update_playbook(
@@ -3142,16 +3147,18 @@ async fn update_playbook(
     body: Bytes,
 ) -> Result<Json<PlaybookDetail>, ApiError> {
     let payload = decode_json::<UpdatePlaybookRequest>(&body)?;
-    Ok(Json(
+    Ok(Json(redact_playbook_detail(
         agent::update_playbook(state, playbook_id, payload).await?,
-    ))
+    )))
 }
 
 async fn delete_playbook(
     State(state): State<AppState>,
     Path(playbook_id): Path<String>,
 ) -> Result<Json<PlaybookDetail>, ApiError> {
-    Ok(Json(agent::delete_playbook(state, playbook_id).await?))
+    Ok(Json(redact_playbook_detail(
+        agent::delete_playbook(state, playbook_id).await?,
+    )))
 }
 
 async fn run_playbook(
@@ -3572,7 +3579,9 @@ async fn session_jobs(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<Vec<JobSummary>>, ApiError> {
-    Ok(Json(state.store.list_jobs_for_session(&session_id)?))
+    Ok(Json(redact_job_summaries(
+        state.store.list_jobs_for_session(&session_id)?,
+    )))
 }
 
 async fn job_detail(
@@ -4121,16 +4130,41 @@ fn redact_session_detail(mut detail: SessionDetail) -> SessionDetail {
 }
 
 fn redact_session_summary(mut session: SessionSummary) -> SessionSummary {
+    let redactor = security::RedactionSet::new().with_secret(session.provider_api_key.clone());
+    session.last_error = redactor.redact_text(&session.last_error);
+    session.user_error = classify_redacted_user_error(&session.last_error);
     session.provider_api_key.clear();
     session
 }
 
+fn redact_job_summaries(jobs: Vec<JobSummary>) -> Vec<JobSummary> {
+    jobs.into_iter().map(redact_job_summary).collect()
+}
+
+fn redact_job_summary(mut job: JobSummary) -> JobSummary {
+    let redactor = security::RedactionSet::new();
+    job.last_error = redactor.redact_text(&job.last_error);
+    job.user_error = classify_redacted_user_error(&job.last_error);
+    job
+}
+
 fn redact_job_detail(mut detail: JobDetail) -> JobDetail {
+    let mut redactor = security::RedactionSet::new();
     for worker in &mut detail.workers {
+        redactor.register_secret(worker.provider_api_key.clone());
         worker.provider_api_key.clear();
     }
 
-    let redactor = security::RedactionSet::new();
+    detail.job.last_error = redactor.redact_text(&detail.job.last_error);
+    detail.job.user_error = classify_redacted_user_error(&detail.job.last_error);
+    for child_job in &mut detail.child_jobs {
+        child_job.last_error = redactor.redact_text(&child_job.last_error);
+        child_job.user_error = classify_redacted_user_error(&child_job.last_error);
+    }
+    for worker in &mut detail.workers {
+        worker.last_error = redactor.redact_text(&worker.last_error);
+        worker.user_error = classify_redacted_user_error(&worker.last_error);
+    }
     for call in &mut detail.tool_calls {
         call.args_json = redactor.redact_json(&call.args_json);
         call.result_json = call
@@ -4144,6 +4178,16 @@ fn redact_job_detail(mut detail: JobDetail) -> JobDetail {
         event.data_json = redactor.redact_json(&event.data_json);
     }
     detail
+}
+
+fn redact_playbook_detail(mut detail: PlaybookDetail) -> PlaybookDetail {
+    detail.session = redact_session_summary(detail.session);
+    detail.recent_jobs = redact_job_summaries(detail.recent_jobs);
+    detail
+}
+
+fn classify_redacted_user_error(detail: &str) -> Option<UserFacingErrorSummary> {
+    error_display::classify_user_error(detail)
 }
 
 fn redact_workspace_summary(mut workspace: WorkspaceSummary) -> WorkspaceSummary {
@@ -8135,6 +8179,7 @@ mod tests {
     fn api_session_response_redacts_provider_api_key() {
         let mut session = test_session(Path::new("/tmp/nucleus-redaction-test"));
         session.provider_api_key = "nuctk_super_secret".to_string();
+        session.last_error = r#"OpenAI-compatible endpoint failed: {"error":{"message":"Missing API key","type":"authentication_error","code":"invalid_api_key"}}"#.to_string();
         let detail = SessionDetail {
             session,
             turns: Vec::new(),
@@ -8143,6 +8188,18 @@ mod tests {
         let redacted = redact_session_detail(detail);
 
         assert_eq!(redacted.session.provider_api_key, "");
+        assert_eq!(
+            redacted.session.last_error,
+            r#"OpenAI-compatible endpoint failed: {"error":{"message":"Missing API key","type":"authentication_error","code":"invalid_api_key"}}"#
+        );
+        let user_error = redacted
+            .session
+            .user_error
+            .expect("friendly error should be included");
+        assert_eq!(user_error.code, "model_credentials_missing");
+        assert!(user_error.message.contains("Profiles"));
+        assert!(!user_error.message.contains("invalid_api_key"));
+        assert_eq!(user_error.technical_detail, redacted.session.last_error);
     }
 
     #[test]
@@ -8473,6 +8530,7 @@ mod tests {
             state: "active".to_string(),
             provider_session_id: String::new(),
             last_error: String::new(),
+            user_error: None,
             last_message_excerpt: String::new(),
             turn_count: 0,
             created_at: 0,
@@ -8658,6 +8716,7 @@ mod tests {
             state: "active".to_string(),
             provider_session_id: String::new(),
             last_error: String::new(),
+            user_error: None,
             last_message_excerpt: String::new(),
             turn_count: 0,
             created_at: 0,
@@ -8768,6 +8827,7 @@ mod tests {
             state: "active".to_string(),
             provider_session_id: String::new(),
             last_error: String::new(),
+            user_error: None,
             last_message_excerpt: String::new(),
             turn_count: 0,
             created_at: 0,
@@ -9161,6 +9221,7 @@ mod tests {
             state: "active".to_string(),
             provider_session_id: String::new(),
             last_error: String::new(),
+            user_error: None,
             last_message_excerpt: String::new(),
             turn_count: 0,
             created_at: 0,
@@ -9242,6 +9303,7 @@ mod tests {
             state: "active".to_string(),
             provider_session_id: String::new(),
             last_error: String::new(),
+            user_error: None,
             last_message_excerpt: String::new(),
             turn_count: 0,
             created_at: 0,
@@ -11032,6 +11094,7 @@ mod tests {
             state: "active".to_string(),
             provider_session_id: String::new(),
             last_error: String::new(),
+            user_error: None,
             last_message_excerpt: String::new(),
             turn_count: 0,
             created_at: 0,

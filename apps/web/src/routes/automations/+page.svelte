@@ -11,6 +11,7 @@
     Workflow
   } from 'lucide-svelte';
 
+  import FriendlyErrorNotice from '$lib/components/app/session/friendly-error-notice.svelte';
   import { Badge } from '$lib/components/ui/badge';
   import { Button } from '$lib/components/ui/button';
   import {
@@ -820,6 +821,14 @@
                         {/each}
                       </div>
                     {/if}
+                  </div>
+                {/if}
+
+                {#if selectedJobDetail.job.user_error}
+                  <FriendlyErrorNotice userError={selectedJobDetail.job.user_error} />
+                {:else if selectedJobDetail.job.last_error}
+                  <div class="rounded-lg border border-red-500/25 bg-red-500/10 px-4 py-3 text-sm text-red-200">
+                    {selectedJobDetail.job.last_error}
                   </div>
                 {/if}
 

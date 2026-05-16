@@ -54,6 +54,7 @@ impl RedactionSet {
     pub fn redact_text(&self, input: &str) -> String {
         let mut redacted = redact_pem_blocks(input);
         redacted = redact_urls_with_credentials(&redacted);
+        redacted = redact_likely_secret_tokens(&redacted);
         for secret in &self.exact_values {
             redacted = redacted.replace(secret, REDACTED);
         }
@@ -379,11 +380,7 @@ fn redact_pem_blocks(input: &str) -> String {
 }
 
 fn redact_urls_with_credentials(input: &str) -> String {
-    input
-        .split_whitespace()
-        .map(redact_url_token)
-        .collect::<Vec<_>>()
-        .join(" ")
+    map_non_whitespace_runs(input, redact_url_token)
 }
 
 fn redact_url_token(token: &str) -> String {
@@ -401,6 +398,60 @@ fn redact_url_token(token: &str) -> String {
     let _ = url.set_username(REDACTED);
     let _ = url.set_password(Some(REDACTED));
     format!("{prefix}{url}{suffix}")
+}
+
+fn redact_likely_secret_tokens(input: &str) -> String {
+    map_non_whitespace_runs(input, |token| {
+        let trimmed = token.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '"' | '\'' | ',' | ':' | ';' | ')' | '(' | ']' | '[' | '}' | '{'
+            )
+        });
+        if contains_likely_secret_token(trimmed) {
+            token.replace(trimmed, REDACTED)
+        } else {
+            token.to_string()
+        }
+    })
+}
+
+fn map_non_whitespace_runs<F>(input: &str, mut mapper: F) -> String
+where
+    F: FnMut(&str) -> String,
+{
+    let mut output = String::with_capacity(input.len());
+    let mut token_start = None;
+    for (index, character) in input.char_indices() {
+        if character.is_whitespace() {
+            if let Some(start) = token_start.take() {
+                output.push_str(&mapper(&input[start..index]));
+            }
+            output.push(character);
+        } else if token_start.is_none() {
+            token_start = Some(index);
+        }
+    }
+    if let Some(start) = token_start {
+        output.push_str(&mapper(&input[start..]));
+    }
+    output
+}
+
+fn contains_likely_secret_token(token: &str) -> bool {
+    token
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+        .any(is_likely_secret_token)
+}
+
+fn is_likely_secret_token(token: &str) -> bool {
+    let lower = token.to_lowercase();
+    token.len() >= 10
+        && (lower.starts_with("sk-")
+            || lower.starts_with("sk_")
+            || lower.starts_with("xox")
+            || lower.starts_with("ghp_")
+            || lower.starts_with("github_pat_"))
 }
 
 #[cfg(test)]
@@ -516,5 +567,47 @@ mod tests {
         assert!(!redacted.contains("user:pass"));
         assert!(!redacted.contains("abc"));
         assert!(redacted.contains(REDACTED));
+    }
+
+    #[test]
+    fn redacts_likely_secret_tokens_in_text() {
+        let redactor = RedactionSet::new();
+        let text = r#"provider rejected key sk-test-secret in {"api_key":"ghp_exampletoken"}"#;
+
+        let redacted = redactor.redact_text(text);
+
+        assert!(!redacted.contains("sk-test-secret"));
+        assert!(!redacted.contains("ghp_exampletoken"));
+        assert!(redacted.matches(REDACTED).count() >= 2);
+    }
+
+    #[test]
+    fn redaction_preserves_original_whitespace_without_secrets() {
+        let redactor = RedactionSet::new();
+        let text = "first line\n\nsecond  line\twith spaces";
+
+        assert_eq!(redactor.redact_text(text), text);
+    }
+
+    #[test]
+    fn redaction_preserves_original_whitespace_around_secret_tokens() {
+        let redactor = RedactionSet::new();
+        let text = "first  sk-test-secret\n\tsecond";
+
+        assert_eq!(
+            redactor.redact_text(text),
+            format!("first  {REDACTED}\n\tsecond")
+        );
+    }
+
+    #[test]
+    fn url_credential_redaction_preserves_original_whitespace() {
+        let redactor = RedactionSet::new();
+        let text = "before\npostgres://user:pass@example.test/db  after";
+        let redacted = redactor.redact_text(text);
+
+        assert!(redacted.starts_with("before\n"));
+        assert!(redacted.ends_with("  after"));
+        assert!(!redacted.contains("user:pass"));
     }
 }
