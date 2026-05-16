@@ -249,6 +249,15 @@ pub struct JobPatch {
     pub browser_verification_status: Option<String>,
     pub browser_verification_summary: Option<String>,
     pub browser_verification_artifact_ids: Option<Vec<String>>,
+    pub publication_requested: Option<bool>,
+    pub publication_status: Option<String>,
+    pub publication_summary: Option<String>,
+    pub pr_url: Option<String>,
+    pub source_branch: Option<String>,
+    pub target_branch: Option<String>,
+    pub validation_status: Option<String>,
+    pub cleanup_status: Option<String>,
+    pub cleanup_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2055,6 +2064,18 @@ impl StateStore {
         if let Some(parent_job_id) = record.parent_job_id.as_deref() {
             ensure_job_exists(&connection, parent_job_id)?;
         }
+        let publication_requested =
+            publication_requested_for_job(&record.title, &record.purpose, &record.prompt_excerpt);
+        let publication_status = if publication_requested {
+            "not_opened"
+        } else {
+            "not_requested"
+        };
+        let browser_verification_status = if publication_requested {
+            "not_performed"
+        } else {
+            "not_required"
+        };
 
         connection.execute(
             "
@@ -2068,9 +2089,15 @@ impl StateStore {
                 trigger_kind,
                 state,
                 requested_by,
-                prompt_excerpt
+                prompt_excerpt,
+                publication_requested,
+                publication_status,
+                validation_status,
+                browser_verification_status,
+                cleanup_status,
+                cleanup_paths_json
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'not_performed', ?13, 'unknown', '[]')
             ",
             params![
                 record.id,
@@ -2083,6 +2110,9 @@ impl StateStore {
                 record.state,
                 record.requested_by,
                 record.prompt_excerpt,
+                bool_to_i64(publication_requested),
+                publication_status,
+                browser_verification_status,
             ],
         )?;
 
@@ -2095,9 +2125,14 @@ impl StateStore {
         let next_browser_verification_artifact_ids_json = serde_json::to_string(
             &patch
                 .browser_verification_artifact_ids
-                .unwrap_or(current.browser_verification_artifact_ids),
+                .unwrap_or_else(|| current.browser_verification_artifact_ids.clone()),
         )
         .context("failed to serialize browser verification artifact ids")?;
+        let cleanup_paths = patch
+            .cleanup_paths
+            .unwrap_or_else(|| current.cleanup_paths.clone());
+        let cleanup_paths_json =
+            serde_json::to_string(&cleanup_paths).context("failed to serialize cleanup paths")?;
         connection.execute(
             "
             UPDATE jobs
@@ -2112,6 +2147,15 @@ impl StateStore {
                 browser_verification_status = ?9,
                 browser_verification_summary = ?10,
                 browser_verification_artifact_ids_json = ?11,
+                publication_requested = ?12,
+                publication_status = ?13,
+                publication_summary = ?14,
+                pr_url = ?15,
+                source_branch = ?16,
+                target_branch = ?17,
+                validation_status = ?18,
+                cleanup_status = ?19,
+                cleanup_paths_json = ?20,
                 updated_at = unixepoch()
             WHERE id = ?1
             ",
@@ -2133,6 +2177,23 @@ impl StateStore {
                     .browser_verification_summary
                     .unwrap_or(current.browser_verification_summary),
                 next_browser_verification_artifact_ids_json,
+                bool_to_i64(
+                    patch
+                        .publication_requested
+                        .unwrap_or(current.publication_requested),
+                ),
+                patch
+                    .publication_status
+                    .unwrap_or(current.publication_status),
+                patch
+                    .publication_summary
+                    .unwrap_or(current.publication_summary),
+                patch.pr_url.unwrap_or(current.pr_url),
+                patch.source_branch.unwrap_or(current.source_branch),
+                patch.target_branch.unwrap_or(current.target_branch),
+                patch.validation_status.unwrap_or(current.validation_status),
+                patch.cleanup_status.unwrap_or(current.cleanup_status),
+                cleanup_paths_json,
             ],
         )?;
 
@@ -2858,6 +2919,15 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             browser_verification_status TEXT NOT NULL DEFAULT 'not_required',
             browser_verification_summary TEXT NOT NULL DEFAULT '',
             browser_verification_artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+            publication_requested INTEGER NOT NULL DEFAULT 0,
+            publication_status TEXT NOT NULL DEFAULT 'not_requested',
+            publication_summary TEXT NOT NULL DEFAULT '',
+            pr_url TEXT NOT NULL DEFAULT '',
+            source_branch TEXT NOT NULL DEFAULT '',
+            target_branch TEXT NOT NULL DEFAULT '',
+            validation_status TEXT NOT NULL DEFAULT 'not_performed',
+            cleanup_status TEXT NOT NULL DEFAULT 'unknown',
+            cleanup_paths_json TEXT NOT NULL DEFAULT '[]',
             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
@@ -3720,6 +3790,55 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "browser_verification_artifact_ids_json",
         "TEXT NOT NULL DEFAULT '[]'",
     )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "publication_requested",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "publication_status",
+        "TEXT NOT NULL DEFAULT 'not_requested'",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "publication_summary",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(connection, "jobs", "pr_url", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(
+        connection,
+        "jobs",
+        "source_branch",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "target_branch",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "validation_status",
+        "TEXT NOT NULL DEFAULT 'not_performed'",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "cleanup_status",
+        "TEXT NOT NULL DEFAULT 'unknown'",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "cleanup_paths_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
 
     for (column, definition) in [
         ("source_kind", "TEXT NOT NULL DEFAULT 'manual'"),
@@ -4206,6 +4325,43 @@ fn table_columns(connection: &Connection, table: &str) -> Result<HashSet<String>
         .context("failed to inspect table columns")?;
 
     Ok(columns.into_iter().collect())
+}
+
+fn bool_to_i64(value: bool) -> i64 {
+    if value { 1 } else { 0 }
+}
+
+fn publication_requested_for_job(title: &str, purpose: &str, prompt_excerpt: &str) -> bool {
+    let text = format!("{title}\n{purpose}\n{prompt_excerpt}").to_ascii_lowercase();
+    [
+        "open a pr",
+        "open pr",
+        "open pull request",
+        "create a pr",
+        "create pr",
+        "create pull request",
+        "publish this branch",
+        "publish the branch",
+        "publish branch",
+        "merge to dev",
+        "merge into dev",
+        "pr to merge",
+        "pull request to merge",
+    ]
+    .iter()
+    .any(|needle| contains_phrase_with_boundaries(&text, needle))
+}
+
+fn contains_phrase_with_boundaries(text: &str, phrase: &str) -> bool {
+    text.match_indices(phrase).any(|(index, _)| {
+        let before = text[..index].chars().next_back();
+        let after = text[index + phrase.len()..].chars().next();
+        !is_word_character(before) && !is_word_character(after)
+    })
+}
+
+fn is_word_character(character: Option<char>) -> bool {
+    character.is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
 fn playbook_file_path(playbooks_dir: &Path, playbook_id: &str) -> PathBuf {
@@ -6504,6 +6660,15 @@ fn load_job_summary(connection: &Connection, job_id: &str) -> Result<JobSummary>
                 browser_verification_status,
                 browser_verification_summary,
                 browser_verification_artifact_ids_json,
+                publication_requested,
+                publication_status,
+                publication_summary,
+                pr_url,
+                source_branch,
+                target_branch,
+                validation_status,
+                cleanup_status,
+                cleanup_paths_json,
                 created_at,
                 updated_at
             FROM jobs
@@ -6554,11 +6719,20 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         browser_verification_status: row.get(16)?,
         browser_verification_summary: row.get(17)?,
         browser_verification_artifact_ids: decode_string_list(row.get::<_, String>(18)?)?,
+        publication_requested: row.get::<_, i64>(19)? != 0,
+        publication_status: row.get(20)?,
+        publication_summary: row.get(21)?,
+        pr_url: row.get(22)?,
+        source_branch: row.get(23)?,
+        target_branch: row.get(24)?,
+        validation_status: row.get(25)?,
+        cleanup_status: row.get(26)?,
+        cleanup_paths: decode_string_vec_column(row, 27)?,
         worker_count: 0,
         pending_approval_count: 0,
         artifact_count: 0,
-        created_at: row.get(19)?,
-        updated_at: row.get(20)?,
+        created_at: row.get(28)?,
+        updated_at: row.get(29)?,
     })
 }
 
@@ -8393,6 +8567,78 @@ mod tests {
         assert_eq!(jobs[0].browser_verification_status, "not_required");
         assert!(jobs[0].browser_verification_summary.is_empty());
         assert!(jobs[0].browser_verification_artifact_ids.is_empty());
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn publication_jobs_are_detected_and_persist_outcome_fields() {
+        let state_dir = test_state_dir("publication-job-outcome");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let scratch_dir = store
+            .scratch_dir_for_session("publication-session")
+            .expect("scratch dir should resolve");
+
+        store
+            .create_session(test_session_record(
+                "publication-session",
+                "Publication session",
+                "ad_hoc",
+                scratch_dir,
+            ))
+            .expect("session should persist");
+        let created = store
+            .create_job(JobRecord {
+                id: "publication-job".to_string(),
+                session_id: Some("publication-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Prompt open a PR".to_string(),
+                purpose: "Session prompt".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "queued".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "open a pr to merge to dev".to_string(),
+            })
+            .expect("job should persist");
+
+        assert!(created.publication_requested);
+        assert_eq!(created.publication_status, "not_opened");
+        assert_eq!(created.validation_status, "not_performed");
+        assert_eq!(created.browser_verification_status, "not_performed");
+        assert_eq!(created.cleanup_status, "unknown");
+        assert!(!publication_requested_for_job(
+            "Open project notes",
+            "Session prompt",
+            "open project workspace"
+        ));
+
+        let updated = store
+            .update_job(
+                "publication-job",
+                JobPatch {
+                    publication_status: Some("opened".to_string()),
+                    publication_summary: Some("Opened PR after validation.".to_string()),
+                    pr_url: Some("https://github.com/example/repo/pull/1".to_string()),
+                    source_branch: Some("feat/example".to_string()),
+                    target_branch: Some("dev".to_string()),
+                    validation_status: Some("passed".to_string()),
+                    browser_verification_status: Some("unavailable".to_string()),
+                    cleanup_status: Some("clean".to_string()),
+                    cleanup_paths: Some(vec![".tmp-playwright".to_string()]),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("job should update");
+
+        assert_eq!(updated.publication_status, "opened");
+        assert_eq!(updated.pr_url, "https://github.com/example/repo/pull/1");
+        assert_eq!(updated.source_branch, "feat/example");
+        assert_eq!(updated.target_branch, "dev");
+        assert_eq!(updated.validation_status, "passed");
+        assert_eq!(updated.browser_verification_status, "unavailable");
+        assert_eq!(updated.cleanup_status, "clean");
+        assert_eq!(updated.cleanup_paths, vec![".tmp-playwright".to_string()]);
 
         let _ = fs::remove_dir_all(&state_dir);
     }

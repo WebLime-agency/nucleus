@@ -213,14 +213,49 @@ pub struct JobSummary {
     pub user_error: Option<UserFacingErrorSummary>,
     pub ui_renderable: String,
     pub browser_verification_required: bool,
+    #[serde(default = "default_browser_verification_status")]
     pub browser_verification_status: String,
     pub browser_verification_summary: String,
     pub browser_verification_artifact_ids: Vec<String>,
+    #[serde(default)]
+    pub publication_requested: bool,
+    #[serde(default = "default_publication_status")]
+    pub publication_status: String,
+    #[serde(default)]
+    pub publication_summary: String,
+    #[serde(default)]
+    pub pr_url: String,
+    #[serde(default)]
+    pub source_branch: String,
+    #[serde(default)]
+    pub target_branch: String,
+    #[serde(default = "default_validation_status")]
+    pub validation_status: String,
+    #[serde(default = "default_cleanup_status")]
+    pub cleanup_status: String,
+    #[serde(default)]
+    pub cleanup_paths: Vec<String>,
     pub worker_count: usize,
     pub pending_approval_count: usize,
     pub artifact_count: usize,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+fn default_publication_status() -> String {
+    "not_requested".to_string()
+}
+
+fn default_validation_status() -> String {
+    "not_performed".to_string()
+}
+
+fn default_browser_verification_status() -> String {
+    "not_required".to_string()
+}
+
+fn default_cleanup_status() -> String {
+    "unknown".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1754,6 +1789,15 @@ mod tests {
             browser_verification_status: "passed".to_string(),
             browser_verification_summary: "Verified dropdown clickability.".to_string(),
             browser_verification_artifact_ids: vec!["artifact-1".to_string()],
+            publication_requested: false,
+            publication_status: "not_requested".to_string(),
+            publication_summary: String::new(),
+            pr_url: String::new(),
+            source_branch: String::new(),
+            target_branch: String::new(),
+            validation_status: "not_performed".to_string(),
+            cleanup_status: "unknown".to_string(),
+            cleanup_paths: Vec::new(),
             worker_count: 1,
             pending_approval_count: 0,
             artifact_count: 1,

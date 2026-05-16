@@ -1869,10 +1869,14 @@ async fn run_job_loop(
         let prompt = checkpoint.next_prompt.take().unwrap_or_else(|| {
             let initial =
                 build_initial_step_prompt(&session.session, &assembled_prompt.prompt, &worker);
-            if checkpoint.patch_loop_guardrail_triggered {
+            let prompt = if checkpoint.patch_loop_guardrail_triggered {
                 build_patch_loop_guardrail_prompt(initial)
             } else {
                 initial
+            };
+            match state.store.get_job(job_id) {
+                Ok(detail) => add_publication_initial_prompt_guidance(state, &detail.job, prompt),
+                Err(_) => prompt,
             }
         });
         let prompt = add_budget_guidance(prompt, &worker, step, tool_calls);
@@ -2023,6 +2027,31 @@ async fn run_job_loop(
                         "Rejected final answer without Browser verification outcome.",
                         "browser_verification_required",
                         &build_browser_verification_retry_prompt(&current_job, &final_answer),
+                        &final_answer,
+                    )
+                    .await?;
+                    continue;
+                }
+
+                let detail = state.store.get_job(job_id)?;
+                if should_retry_missing_publication_outcome(
+                    &detail,
+                    &summary,
+                    &final_answer,
+                    &worker,
+                    step,
+                    tool_calls,
+                ) {
+                    retry_worker_final_answer(
+                        state,
+                        job_id,
+                        &mut worker,
+                        &mut checkpoint,
+                        &mut step,
+                        tool_calls,
+                        "Requested explicit publication outcome metadata.",
+                        "publication_outcome_missing",
+                        &build_publication_outcome_retry_prompt(&summary, &final_answer),
                         &final_answer,
                     )
                     .await?;
@@ -3037,6 +3066,13 @@ async fn complete_job_with_final_answer(
     final_answer: &str,
 ) -> Result<()> {
     let detail = state.store.get_job(job_id)?;
+    let publication_patch = publication_outcome_patch(
+        &detail.job,
+        summary,
+        final_answer,
+        step_count,
+        tool_call_count,
+    );
     state
         .agent
         .terminate_job_command_sessions(
@@ -3127,6 +3163,16 @@ async fn complete_job_with_final_answer(
             visible_turn_id,
             result_summary: Some(summary.to_string()),
             last_error: Some(String::new()),
+            publication_requested: publication_patch.publication_requested,
+            publication_status: publication_patch.publication_status.clone(),
+            publication_summary: publication_patch.publication_summary.clone(),
+            pr_url: publication_patch.pr_url.clone(),
+            source_branch: publication_patch.source_branch.clone(),
+            target_branch: publication_patch.target_branch.clone(),
+            validation_status: publication_patch.validation_status.clone(),
+            browser_verification_status: publication_patch.browser_verification_status.clone(),
+            cleanup_status: publication_patch.cleanup_status.clone(),
+            cleanup_paths: publication_patch.cleanup_paths.clone(),
             ..JobPatch::default()
         },
     )?;
@@ -3140,8 +3186,13 @@ async fn complete_job_with_final_answer(
             ..WorkerPatch::default()
         },
     )?;
-    let terminal_metadata =
-        final_answer_terminal_metadata(summary, &final_answer, step_count, tool_call_count);
+    let terminal_metadata = final_answer_terminal_metadata(
+        summary,
+        final_answer,
+        step_count,
+        tool_call_count,
+        &publication_patch,
+    );
     let terminal_status = terminal_metadata
         .get("terminal_status")
         .and_then(Value::as_str)
@@ -3156,6 +3207,37 @@ async fn complete_job_with_final_answer(
         detail: excerpt(&final_answer, 320),
         data_json: terminal_metadata,
     });
+    if let Some(publication_status) = publication_patch.publication_status.as_deref() {
+        if publication_patch.publication_requested.unwrap_or(false) {
+            let blocked = matches!(publication_status, "blocked" | "not_opened" | "failed");
+            let _ = state.store.append_job_event(JobEventRecord {
+                job_id: job_id.to_string(),
+                worker_id: Some(worker.id.clone()),
+                event_type: if blocked {
+                    "job.publication.blocked".to_string()
+                } else {
+                    "job.publication.completed".to_string()
+                },
+                status: publication_status.to_string(),
+                summary: publication_patch
+                    .publication_summary
+                    .clone()
+                    .unwrap_or_else(|| summary.to_string()),
+                detail: excerpt(final_answer, 320),
+                data_json: json!({
+                    "publication_requested": publication_patch.publication_requested.unwrap_or(true),
+                    "publication_status": publication_status,
+                    "pr_url": publication_patch.pr_url.clone().unwrap_or_default(),
+                    "source_branch": publication_patch.source_branch.clone().unwrap_or_default(),
+                    "target_branch": publication_patch.target_branch.clone().unwrap_or_default(),
+                    "validation_status": publication_patch.validation_status.clone().unwrap_or_default(),
+                    "browser_verification_status": publication_patch.browser_verification_status.clone().unwrap_or_default(),
+                    "cleanup_status": publication_patch.cleanup_status.clone().unwrap_or_default(),
+                    "cleanup_paths": publication_patch.cleanup_paths.clone().unwrap_or_default(),
+                }),
+            });
+        }
+    }
     let _ = try_record_audit_event(
         state,
         AuditEventRecord {
@@ -3331,6 +3413,39 @@ If the current user request corrects, refines, or challenges the previous answer
     )
 }
 
+fn add_publication_initial_prompt_guidance(
+    state: &AppState,
+    job: &JobSummary,
+    prompt: String,
+) -> String {
+    if !job.publication_requested {
+        return prompt;
+    }
+
+    let job_tmp_dir = state
+        .store
+        .state_dir_path()
+        .join("jobs")
+        .join(&job.id)
+        .join("tmp");
+    let _ = fs::create_dir_all(&job_tmp_dir);
+    format!(
+        "{}\n\nPublication job requirements:\n\
+- The user request is publication-oriented, so final_answer must include explicit terminal facts for publication_status, validation_status, browser_verification_status, and cleanup_status.\n\
+- Allowed publication_status values: not_requested, opened, not_opened, blocked, failed.\n\
+- Allowed validation_status values: passed, failed, not_performed, unavailable.\n\
+- Allowed browser_verification_status values: not_required, pending, passed, failed, not_performed, unavailable.\n\
+- Allowed cleanup_status values: clean, cleaned, cleanup_required, unknown.\n\
+- Include pr_url, source_branch, and target_branch when known.\n\
+- Use the daemon-owned Browser tools for rendered verification when possible. Do not create repo-local Playwright projects, .tmp-playwright, or ad-hoc .tmp-* verification folders.\n\
+- Missing Browser or Playwright tooling is not a generic job failure. Record browser_verification_status=unavailable or not_performed with the concrete reason.\n\
+- Put scratch verification scripts outside the git worktree when you need them. Preferred job temp directory: {}\n\
+- Before terminal final_answer, check for job-created .tmp-* leftovers in the repo. Clean only files this job created, or set cleanup_status=cleanup_required and list the paths.",
+        prompt,
+        job_tmp_dir.display()
+    )
+}
+
 fn add_budget_guidance(
     prompt: String,
     worker: &WorkerSummary,
@@ -3487,11 +3602,26 @@ fn contains_blocked_or_waiting_language(text: &str) -> bool {
     .any(|needle| text.contains(needle))
 }
 
+#[derive(Debug, Clone, Default)]
+struct PublicationOutcomePatch {
+    publication_requested: Option<bool>,
+    publication_status: Option<String>,
+    publication_summary: Option<String>,
+    pr_url: Option<String>,
+    source_branch: Option<String>,
+    target_branch: Option<String>,
+    validation_status: Option<String>,
+    browser_verification_status: Option<String>,
+    cleanup_status: Option<String>,
+    cleanup_paths: Option<Vec<String>>,
+}
+
 fn final_answer_terminal_metadata(
     summary: &str,
     final_answer: &str,
     step_count: usize,
     tool_call_count: usize,
+    publication_patch: &PublicationOutcomePatch,
 ) -> Value {
     let text = normalize_action_item_text(&format!("{summary}\n{final_answer}"));
     let blocked = contains_blocked_terminal_result_language(&text);
@@ -3505,6 +3635,36 @@ fn final_answer_terminal_metadata(
     if let Some(status) = infer_browser_verification_status(&text) {
         metadata["browser_verification_status"] = Value::String(status.to_string());
     }
+    if publication_patch.publication_requested.unwrap_or(false) {
+        metadata["publication_requested"] = Value::Bool(true);
+        if let Some(value) = publication_patch.publication_status.as_deref() {
+            metadata["publication_status"] = Value::String(value.to_string());
+        }
+        if let Some(value) = publication_patch.publication_summary.as_deref() {
+            metadata["publication_summary"] = Value::String(value.to_string());
+        }
+        if let Some(value) = publication_patch.pr_url.as_deref() {
+            metadata["pr_url"] = Value::String(value.to_string());
+        }
+        if let Some(value) = publication_patch.source_branch.as_deref() {
+            metadata["source_branch"] = Value::String(value.to_string());
+        }
+        if let Some(value) = publication_patch.target_branch.as_deref() {
+            metadata["target_branch"] = Value::String(value.to_string());
+        }
+        if let Some(value) = publication_patch.validation_status.as_deref() {
+            metadata["validation_status"] = Value::String(value.to_string());
+        }
+        if let Some(value) = publication_patch.browser_verification_status.as_deref() {
+            metadata["browser_verification_status"] = Value::String(value.to_string());
+        }
+        if let Some(value) = publication_patch.cleanup_status.as_deref() {
+            metadata["cleanup_status"] = Value::String(value.to_string());
+        }
+        if let Some(value) = publication_patch.cleanup_paths.as_ref() {
+            metadata["cleanup_paths"] = json!(value);
+        }
+    }
 
     metadata
 }
@@ -3517,12 +3677,26 @@ fn contains_blocked_terminal_result_language(text: &str) -> bool {
         "blocked without browser",
         "blocked, not browser",
         "cannot honestly open the pr",
+        "reached the current",
     ]
     .iter()
     .any(|needle| text.contains(needle))
 }
 
 fn infer_browser_verification_status(text: &str) -> Option<&'static str> {
+    if text.contains("browser verification status: not_required")
+        || text.contains("browser verification status: not required")
+        || text.contains("browser verification: not required")
+    {
+        return Some("not_required");
+    }
+
+    if text.contains("browser verification status: pending")
+        || text.contains("browser verification: pending")
+    {
+        return Some("pending");
+    }
+
     if text.contains("browser verification status: unavailable")
         || text.contains("browser verification: unavailable")
         || text.contains("verification unavailable")
@@ -3539,7 +3713,222 @@ fn infer_browser_verification_status(text: &str) -> Option<&'static str> {
         return Some("not_performed");
     }
 
+    if text.contains("browser verification status: failed")
+        || text.contains("browser verification: failed")
+        || text.contains("browser verification failed")
+    {
+        return Some("failed");
+    }
+
+    if text.contains("browser verification status: passed")
+        || text.contains("browser verification: passed")
+        || text.contains("browser-verified")
+        || text.contains("browser verified")
+    {
+        return Some("passed");
+    }
+
     None
+}
+
+fn publication_outcome_patch(
+    current: &JobSummary,
+    summary: &str,
+    final_answer: &str,
+    _step_count: usize,
+    _tool_call_count: usize,
+) -> PublicationOutcomePatch {
+    if !current.publication_requested {
+        return PublicationOutcomePatch::default();
+    }
+
+    let raw_text = format!("{summary}\n{final_answer}");
+    let normalized = normalize_action_item_text(&raw_text);
+    let blocked = contains_blocked_terminal_result_language(&normalized);
+    let pr_url = extract_labeled_value(&raw_text, &["pr_url", "pr url", "pull request"])
+        .filter(|value| value.starts_with("http"));
+    let publication_status =
+        extract_labeled_value(&raw_text, &["publication_status", "publication status"])
+            .and_then(|value| normalize_publication_status(&value))
+            .or_else(|| {
+                if pr_url.is_some() {
+                    Some("opened".to_string())
+                } else if normalized.contains("publication failed")
+                    || normalized.contains("pr failed")
+                {
+                    Some("failed".to_string())
+                } else if blocked {
+                    Some("blocked".to_string())
+                } else if normalized.contains("pr not opened")
+                    || normalized.contains("not opened")
+                    || normalized.contains("did not open")
+                {
+                    Some("not_opened".to_string())
+                } else {
+                    Some(current.publication_status.clone())
+                }
+            });
+    let validation_status =
+        extract_labeled_value(&raw_text, &["validation_status", "validation status"])
+            .and_then(|value| normalize_validation_status(&value))
+            .or_else(|| infer_validation_status(&normalized))
+            .unwrap_or_else(|| current.validation_status.clone());
+    let browser_verification_status = extract_labeled_value(
+        &raw_text,
+        &["browser_verification_status", "browser verification status"],
+    )
+    .and_then(|value| normalize_browser_verification_status(&value))
+    .or_else(|| infer_browser_verification_status(&normalized).map(str::to_string))
+    .unwrap_or_else(|| current.browser_verification_status.clone());
+    let cleanup_status = extract_labeled_value(&raw_text, &["cleanup_status", "cleanup status"])
+        .and_then(|value| normalize_cleanup_status(&value))
+        .or_else(|| infer_cleanup_status(&normalized))
+        .unwrap_or_else(|| current.cleanup_status.clone());
+    let cleanup_paths = extract_cleanup_paths(&raw_text, &current.cleanup_paths);
+
+    PublicationOutcomePatch {
+        publication_requested: Some(true),
+        publication_status,
+        publication_summary: Some(
+            extract_labeled_value(
+                &raw_text,
+                &["publication_summary", "publication summary", "summary"],
+            )
+            .unwrap_or_else(|| summary.to_string()),
+        ),
+        pr_url: Some(pr_url.unwrap_or_else(|| current.pr_url.clone())),
+        source_branch: Some(
+            extract_labeled_value(&raw_text, &["source_branch", "source branch"])
+                .unwrap_or_else(|| current.source_branch.clone()),
+        ),
+        target_branch: Some(
+            extract_labeled_value(&raw_text, &["target_branch", "target branch"])
+                .unwrap_or_else(|| current.target_branch.clone()),
+        ),
+        validation_status: Some(validation_status),
+        browser_verification_status: Some(browser_verification_status),
+        cleanup_status: Some(cleanup_status),
+        cleanup_paths: Some(cleanup_paths),
+    }
+}
+
+fn normalize_publication_status(value: &str) -> Option<String> {
+    normalize_enum_value(
+        value,
+        &["not_requested", "opened", "not_opened", "blocked", "failed"],
+    )
+}
+
+fn normalize_validation_status(value: &str) -> Option<String> {
+    normalize_enum_value(value, &["passed", "failed", "not_performed", "unavailable"])
+}
+
+fn normalize_browser_verification_status(value: &str) -> Option<String> {
+    normalize_enum_value(
+        value,
+        &[
+            "not_required",
+            "pending",
+            "passed",
+            "failed",
+            "not_performed",
+            "unavailable",
+        ],
+    )
+}
+
+fn normalize_cleanup_status(value: &str) -> Option<String> {
+    normalize_enum_value(value, &["clean", "cleaned", "cleanup_required", "unknown"])
+}
+
+fn normalize_enum_value(value: &str, allowed: &[&str]) -> Option<String> {
+    let normalized = value
+        .trim()
+        .trim_matches(|character: char| character == '"' || character == '\'' || character == '`')
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .replace(' ', "_");
+    allowed
+        .iter()
+        .find(|allowed_value| normalized.starts_with(**allowed_value))
+        .map(|value| (*value).to_string())
+}
+
+fn infer_validation_status(text: &str) -> Option<String> {
+    if text.contains("validation failed") || text.contains("validation status: failed") {
+        return Some("failed".to_string());
+    }
+    if text.contains("validation unavailable") || text.contains("validation status: unavailable") {
+        return Some("unavailable".to_string());
+    }
+    if text.contains("validation not performed")
+        || text.contains("validation status: not_performed")
+    {
+        return Some("not_performed".to_string());
+    }
+    if (text.contains("validation") || text.contains("tests"))
+        && (text.contains(" passed") || text.contains(" green"))
+    {
+        return Some("passed".to_string());
+    }
+    None
+}
+
+fn infer_cleanup_status(text: &str) -> Option<String> {
+    if text.contains("cleanup status: cleanup_required")
+        || text.contains("cleanup required")
+        || text.contains(".tmp-playwright")
+        || text.contains(".tmp-")
+    {
+        return Some("cleanup_required".to_string());
+    }
+    if text.contains("cleanup status: cleaned") || text.contains("cleaned up") {
+        return Some("cleaned".to_string());
+    }
+    if text.contains("cleanup status: clean") || text.contains("branch clean") {
+        return Some("clean".to_string());
+    }
+    None
+}
+
+fn extract_labeled_value(text: &str, labels: &[&str]) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim().trim_start_matches('-').trim();
+        let Some((label, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let normalized_label = label.trim().to_ascii_lowercase().replace('_', " ");
+        if labels
+            .iter()
+            .any(|candidate| normalized_label == candidate.replace('_', " "))
+        {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_cleanup_paths(text: &str, existing: &[String]) -> Vec<String> {
+    let mut paths = existing.to_vec();
+    for token in text.split_whitespace() {
+        let cleaned = token
+            .trim_matches(|character: char| {
+                matches!(
+                    character,
+                    ',' | ';' | ':' | ')' | '(' | '[' | ']' | '"' | '\'' | '`'
+                )
+            })
+            .trim_end_matches('.');
+        if (cleaned.contains(".tmp-") || cleaned.contains(".tmp-playwright"))
+            && !paths.iter().any(|path| path == cleaned)
+        {
+            paths.push(cleaned.to_string());
+        }
+    }
+    paths
 }
 
 fn normalize_action_item_text(value: &str) -> String {
@@ -3601,6 +3990,83 @@ Before returning final_answer, either:\n\
 Use this final_answer shape when done:\n\
 {{\"kind\":\"final_answer\",\"summary\":\"why the work is complete or blocked\",\"final_answer\":\"user-facing answer\",\"browser_verification\":{{\"status\":\"passed|failed|not_performed|unavailable\",\"summary\":\"concise verification result\",\"artifact_ids\":[\"artifact-id\"]}}}}\n\n\
 Rejected final_answer:\n{}",
+        excerpt(final_answer, 1_200)
+    )
+}
+
+fn should_retry_missing_publication_outcome(
+    detail: &JobDetail,
+    summary: &str,
+    final_answer: &str,
+    worker: &WorkerSummary,
+    step_count: usize,
+    tool_call_count: usize,
+) -> bool {
+    if !detail.job.publication_requested
+        || !has_remaining_worker_budget(worker, step_count, tool_call_count)
+        || publication_outcome_retry_already_attempted(detail)
+    {
+        return false;
+    }
+
+    !publication_final_answer_has_required_facts(summary, final_answer)
+}
+
+fn publication_outcome_retry_already_attempted(detail: &JobDetail) -> bool {
+    detail.events.iter().any(|event| {
+        event.event_type == "worker.retry"
+            && event
+                .data_json
+                .get("reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| reason == "publication_outcome_missing")
+    })
+}
+
+fn publication_final_answer_has_required_facts(summary: &str, final_answer: &str) -> bool {
+    let text = format!("{summary}\n{final_answer}");
+    let normalized = normalize_action_item_text(&text);
+    let has_publication = extract_labeled_value(
+        &text,
+        &[
+            "publication_status",
+            "publication status",
+            "pr_url",
+            "pr url",
+        ],
+    )
+    .is_some()
+        || normalized.contains("blocked_without_browser_verification")
+        || normalized.contains("pr not opened")
+        || normalized.contains("pull request opened");
+    let has_validation =
+        extract_labeled_value(&text, &["validation_status", "validation status"]).is_some();
+    let has_browser = extract_labeled_value(
+        &text,
+        &["browser_verification_status", "browser verification status"],
+    )
+    .is_some()
+        || infer_browser_verification_status(&normalized).is_some();
+    let has_cleanup = extract_labeled_value(&text, &["cleanup_status", "cleanup status"]).is_some();
+
+    has_publication && has_validation && has_browser && has_cleanup
+}
+
+fn build_publication_outcome_retry_prompt(summary: &str, final_answer: &str) -> String {
+    format!(
+        "Your previous final_answer is missing explicit terminal metadata for a publication-oriented job.\n\
+Previous summary: {}\n\
+Previous final_answer: {}\n\
+Return exactly one valid Nucleus worker action JSON object using kind=\"final_answer\".\n\
+The final_answer must include these exact fields as user-facing lines or a structured final_answer object:\n\
+- publication_status: not_requested | opened | not_opened | blocked | failed\n\
+- publication_summary\n\
+- pr_url, source_branch, target_branch when known\n\
+- validation_status: passed | failed | not_performed | unavailable\n\
+- browser_verification_status: not_required | pending | passed | failed | not_performed | unavailable\n\
+- cleanup_status: clean | cleaned | cleanup_required | unknown\n\
+If Browser verification is unavailable or was not performed, say that explicitly. Do not call Playwright directly or create repo-local .tmp-playwright files.",
+        excerpt(summary, 320),
         excerpt(final_answer, 1_200)
     )
 }
@@ -4281,6 +4747,76 @@ async fn execute_pending_tool_action(
         Err(error) => {
             state.agent.release_write_lock(&pending.tool_call_id);
             if is_browser_tool(&tool) {
+                if state.store.get_job(job_id)?.job.publication_requested {
+                    let error_detail = error.to_string();
+                    let tool_result = json!({
+                        "ok": false,
+                        "tool_id": tool.clone(),
+                        "browser_verification_status": "unavailable",
+                        "error": error_detail,
+                        "guidance": "Browser verification is unavailable for this publication job. Continue without ad-hoc repo-local Playwright files and report browser_verification_status=unavailable or not_performed in the terminal publication outcome."
+                    });
+                    let _ = state.store.update_job(
+                        job_id,
+                        JobPatch {
+                            browser_verification_status: Some("unavailable".to_string()),
+                            browser_verification_summary: Some(format!(
+                                "Browser verification unavailable: {error}"
+                            )),
+                            ..JobPatch::default()
+                        },
+                    );
+                    let _ = state.store.update_tool_call(
+                        &pending.tool_call_id,
+                        ToolCallPatch {
+                            status: Some("completed".to_string()),
+                            result_json: Some(Some(tool_result.clone())),
+                            error_class: Some("browser_unavailable".to_string()),
+                            error_detail: Some(error_detail.clone()),
+                            completed_at: Some(Some(unix_timestamp())),
+                            ..ToolCallPatch::default()
+                        },
+                    );
+                    *step += 1;
+                    *worker = state.store.update_worker(
+                        &worker.id,
+                        WorkerPatch {
+                            state: Some("running".to_string()),
+                            step_count: Some(*step),
+                            tool_call_count: Some(*tool_calls),
+                            last_error: Some(String::new()),
+                            ..WorkerPatch::default()
+                        },
+                    )?;
+                    checkpoint.pending_action = None;
+                    checkpoint.next_prompt = Some(build_tool_result_prompt(
+                        &pending.tool,
+                        &pending.summary,
+                        &tool_result,
+                    ));
+                    state.store.write_worker_checkpoint(
+                        &worker.id,
+                        &serde_json::to_value(&checkpoint)
+                            .context("failed to encode worker checkpoint")?,
+                    )?;
+                    let _ = state.store.append_job_event(JobEventRecord {
+                        job_id: job_id.to_string(),
+                        worker_id: Some(worker.id.clone()),
+                        event_type: "job.publication.browser_unavailable".to_string(),
+                        status: "unavailable".to_string(),
+                        summary: "Browser verification unavailable".to_string(),
+                        detail: error_detail,
+                        data_json: json!({
+                            "tool_id": pending.tool,
+                            "tool_call_id": pending.tool_call_id,
+                            "browser_verification_status": "unavailable",
+                        }),
+                    });
+                    publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+                    publish_worker_updated(state, worker).await;
+                    return Ok(LoopDisposition::Continue);
+                }
+
                 let _ = state.store.update_job(
                     job_id,
                     JobPatch {
@@ -9875,6 +10411,7 @@ Remaining:\n\
             "Status: blocked_without_browser_verification\nBrowser verification status: unavailable",
             12,
             7,
+            &PublicationOutcomePatch::default(),
         );
 
         assert_eq!(metadata["terminal_status"], "blocked");
@@ -9894,6 +10431,60 @@ Remaining:\n\
             status_from_browser_verification_text("Completed, not browser-verified."),
             Some("not_performed")
         );
+    }
+
+    #[test]
+    fn publication_outcome_patch_extracts_structured_terminal_fields() {
+        let job = test_publication_job_summary("publication-extract");
+        let patch = publication_outcome_patch(
+            &job,
+            "Opened PR",
+            "Publication status: opened\n\
+Publication summary: Ready for review.\n\
+PR URL: https://github.com/WebLime-agency/nucleus/pull/200\n\
+Source branch: feat/example\n\
+Target branch: dev\n\
+Validation status: passed\n\
+Browser verification status: unavailable\n\
+Cleanup status: cleanup_required\n\
+Cleanup paths: .tmp-playwright.",
+            8,
+            4,
+        );
+
+        assert_eq!(patch.publication_requested, Some(true));
+        assert_eq!(patch.publication_status.as_deref(), Some("opened"));
+        assert_eq!(
+            patch.pr_url.as_deref(),
+            Some("https://github.com/WebLime-agency/nucleus/pull/200")
+        );
+        assert_eq!(patch.source_branch.as_deref(), Some("feat/example"));
+        assert_eq!(patch.target_branch.as_deref(), Some("dev"));
+        assert_eq!(patch.validation_status.as_deref(), Some("passed"));
+        assert_eq!(
+            patch.browser_verification_status.as_deref(),
+            Some("unavailable")
+        );
+        assert_eq!(patch.cleanup_status.as_deref(), Some("cleanup_required"));
+        assert_eq!(
+            patch.cleanup_paths.as_deref(),
+            Some(&[".tmp-playwright".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn publication_completion_guard_requires_terminal_facts_once() {
+        assert!(!publication_final_answer_has_required_facts(
+            "Opened PR",
+            "Opened the PR and ran checks."
+        ));
+        assert!(publication_final_answer_has_required_facts(
+            "Opened PR",
+            "Publication status: opened\n\
+Validation status: passed\n\
+Browser verification status: not_performed\n\
+Cleanup status: clean"
+        ));
     }
 
     #[test]
@@ -10406,6 +10997,15 @@ Remaining:\n\
             browser_verification_status: "not_performed".to_string(),
             browser_verification_summary: String::new(),
             browser_verification_artifact_ids: Vec::new(),
+            publication_requested: false,
+            publication_status: "not_requested".to_string(),
+            publication_summary: String::new(),
+            pr_url: String::new(),
+            source_branch: String::new(),
+            target_branch: String::new(),
+            validation_status: "not_performed".to_string(),
+            cleanup_status: "unknown".to_string(),
+            cleanup_paths: Vec::new(),
             worker_count: 0,
             pending_approval_count: 0,
             artifact_count: 0,
@@ -10449,6 +11049,15 @@ Remaining:\n\
             browser_verification_status: "pending".to_string(),
             browser_verification_summary: String::new(),
             browser_verification_artifact_ids: Vec::new(),
+            publication_requested: false,
+            publication_status: "not_requested".to_string(),
+            publication_summary: String::new(),
+            pr_url: String::new(),
+            source_branch: String::new(),
+            target_branch: String::new(),
+            validation_status: "not_performed".to_string(),
+            cleanup_status: "unknown".to_string(),
+            cleanup_paths: Vec::new(),
             worker_count: 0,
             pending_approval_count: 0,
             artifact_count: 0,
@@ -11503,6 +12112,44 @@ for line in sys.stdin:
             last_error: String::new(),
             user_error: None,
             capabilities: Vec::new(),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn test_publication_job_summary(id: &str) -> JobSummary {
+        JobSummary {
+            id: id.to_string(),
+            session_id: Some(format!("{id}-session")),
+            parent_job_id: None,
+            template_id: None,
+            title: "Prompt open a PR".to_string(),
+            purpose: "Session prompt".to_string(),
+            trigger_kind: "session_prompt".to_string(),
+            state: "running".to_string(),
+            requested_by: "user".to_string(),
+            prompt_excerpt: "open a pr to merge to dev".to_string(),
+            root_worker_id: Some(format!("{id}-worker")),
+            visible_turn_id: None,
+            result_summary: String::new(),
+            last_error: String::new(),
+            ui_renderable: "unknown".to_string(),
+            browser_verification_required: false,
+            browser_verification_summary: String::new(),
+            browser_verification_artifact_ids: Vec::new(),
+            publication_requested: true,
+            publication_status: "not_opened".to_string(),
+            publication_summary: String::new(),
+            pr_url: String::new(),
+            source_branch: String::new(),
+            target_branch: String::new(),
+            validation_status: "not_performed".to_string(),
+            browser_verification_status: "not_performed".to_string(),
+            cleanup_status: "unknown".to_string(),
+            cleanup_paths: Vec::new(),
+            worker_count: 1,
+            pending_approval_count: 0,
+            artifact_count: 0,
             created_at: 0,
             updated_at: 0,
         }
