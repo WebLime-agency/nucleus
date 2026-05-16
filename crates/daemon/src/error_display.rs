@@ -52,9 +52,7 @@ pub(crate) fn classify_user_error(detail: &str) -> Option<UserFacingErrorSummary
     }
 
     if lower.contains("failed to reach the openai-compatible endpoint")
-        || lower.contains("connection refused")
-        || lower.contains("dns error")
-        || lower.contains("timed out")
+        || (contains_endpoint_unreachable(&lower) && contains_model_provider_context(&lower))
     {
         return Some(model_endpoint_unreachable(detail));
     }
@@ -194,6 +192,12 @@ fn contains_auth_failure(lower: &str) -> bool {
         || lower.contains("status 403")
 }
 
+fn contains_endpoint_unreachable(lower: &str) -> bool {
+    lower.contains("connection refused")
+        || lower.contains("dns error")
+        || lower.contains("timed out")
+}
+
 fn contains_model_provider_context(lower: &str) -> bool {
     lower.contains("openai-compatible")
         || lower.contains("model provider")
@@ -320,6 +324,30 @@ mod tests {
         let raw = r#"tool call failed: {"error":"invalid_api_key"}"#;
 
         assert!(classify_user_error(raw).is_none());
+    }
+
+    #[test]
+    fn does_not_classify_unrelated_timed_out_tool_failure_as_model_endpoint() {
+        let raw = "HTTP tool call timed out after 30 seconds";
+
+        assert!(classify_user_error(raw).is_none());
+    }
+
+    #[test]
+    fn does_not_classify_unrelated_connection_refused_tool_failure_as_model_endpoint() {
+        let raw = "tool call failed: connection refused";
+
+        assert!(classify_user_error(raw).is_none());
+    }
+
+    #[test]
+    fn classifies_model_endpoint_timeout_with_provider_context() {
+        let raw = "OpenAI-compatible endpoint failed: request timed out";
+
+        let summary = classify_user_error(raw).expect("error should classify");
+
+        assert_eq!(summary.code, "model_endpoint_unreachable");
+        assert!(summary.message.contains("base URL"));
     }
 
     #[test]
