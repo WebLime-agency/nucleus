@@ -3868,6 +3868,7 @@ fn publication_outcome_patch(
             });
     let validation_status =
         extract_labeled_value(&raw_text, &["validation_status", "validation status"])
+            .or_else(|| extract_nested_labeled_value(&raw_text, &["validation"], &["status"]))
             .and_then(|value| normalize_validation_status(&value))
             .or_else(|| infer_validation_status(&normalized))
             .unwrap_or_else(|| current.validation_status.clone());
@@ -3875,10 +3876,18 @@ fn publication_outcome_patch(
         &raw_text,
         &["browser_verification_status", "browser verification status"],
     )
+    .or_else(|| {
+        extract_nested_labeled_value(
+            &raw_text,
+            &["browser_verification", "browser verification"],
+            &["status"],
+        )
+    })
     .and_then(|value| normalize_browser_verification_status(&value))
     .or_else(|| infer_browser_verification_status(&normalized).map(str::to_string))
     .unwrap_or_else(|| current.browser_verification_status.clone());
     let cleanup_status = extract_labeled_value(&raw_text, &["cleanup_status", "cleanup status"])
+        .or_else(|| extract_nested_labeled_value(&raw_text, &["cleanup"], &["status"]))
         .and_then(|value| normalize_cleanup_status(&value))
         .or_else(|| infer_cleanup_status(&normalized))
         .unwrap_or_else(|| current.cleanup_status.clone());
@@ -4281,6 +4290,84 @@ fn extract_labeled_value(text: &str, labels: &[&str]) -> Option<String> {
     None
 }
 
+fn extract_nested_labeled_value(
+    text: &str,
+    section_labels: &[&str],
+    nested_labels: &[&str],
+) -> Option<String> {
+    let mut in_section = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let bullet = trimmed.starts_with('-') || trimmed.starts_with('*');
+        let trimmed = trimmed
+            .trim_start_matches(|character| character == '-' || character == '*')
+            .trim();
+        let Some((label, value)) = trimmed.split_once(':') else {
+            if !bullet {
+                in_section = false;
+            }
+            continue;
+        };
+
+        let normalized_label = normalize_label(label);
+        if in_section
+            && nested_labels
+                .iter()
+                .any(|candidate| normalized_label == normalize_label(candidate))
+        {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+
+        if section_labels
+            .iter()
+            .any(|candidate| normalized_label == normalize_label(candidate))
+        {
+            in_section = true;
+            if let Some(value) = extract_inline_nested_labeled_value(value, nested_labels) {
+                return Some(value);
+            }
+            continue;
+        }
+
+        if !bullet {
+            in_section = false;
+        }
+    }
+
+    None
+}
+
+fn extract_inline_nested_labeled_value(value: &str, nested_labels: &[&str]) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Some((label, nested_value)) = value.split_once(':') {
+        let normalized_label = normalize_label(label);
+        if nested_labels
+            .iter()
+            .any(|candidate| normalized_label == normalize_label(candidate))
+        {
+            let nested_value = nested_value.trim();
+            if !nested_value.is_empty() {
+                return Some(nested_value.to_string());
+            }
+        }
+    }
+
+    Some(value.to_string())
+}
+
+fn normalize_label(label: &str) -> String {
+    label.trim().to_ascii_lowercase().replace('_', " ")
+}
+
 fn extract_cleanup_paths(text: &str, existing: &[String]) -> Vec<String> {
     let mut paths = existing.to_vec();
     for token in text.split_whitespace() {
@@ -4409,15 +4496,28 @@ fn publication_final_answer_has_required_facts(summary: &str, final_answer: &str
         || normalized.contains("blocked_without_browser_verification")
         || normalized.contains("pr not opened")
         || publication_text_says_opened(&normalized);
-    let has_validation =
-        extract_labeled_value(&text, &["validation_status", "validation status"]).is_some();
+    let has_validation = extract_labeled_value(&text, &["validation_status", "validation status"])
+        .is_some()
+        || extract_nested_labeled_value(&text, &["validation"], &["status"])
+            .and_then(|value| normalize_validation_status(&value))
+            .is_some();
     let has_browser = extract_labeled_value(
         &text,
         &["browser_verification_status", "browser verification status"],
     )
     .is_some()
+        || extract_nested_labeled_value(
+            &text,
+            &["browser_verification", "browser verification"],
+            &["status"],
+        )
+        .and_then(|value| normalize_browser_verification_status(&value))
+        .is_some()
         || infer_browser_verification_status(&normalized).is_some();
-    let has_cleanup = extract_labeled_value(&text, &["cleanup_status", "cleanup status"]).is_some();
+    let has_cleanup = extract_labeled_value(&text, &["cleanup_status", "cleanup status"]).is_some()
+        || extract_nested_labeled_value(&text, &["cleanup"], &["status"])
+            .and_then(|value| normalize_cleanup_status(&value))
+            .is_some();
 
     has_publication && has_validation && has_browser && has_cleanup
 }
@@ -10868,6 +10968,32 @@ Cleanup paths: .tmp-playwright.",
             patch.cleanup_paths.as_deref(),
             Some(&[".tmp-playwright".to_string()][..])
         );
+    }
+
+    #[test]
+    fn publication_outcome_patch_extracts_nested_section_statuses() {
+        let job = test_publication_job_summary("publication-nested-statuses");
+        let final_answer = "Publication status: opened\n\
+Validation:\n\
+- Status: passed\n\
+- Summary: cargo test -p nucleus-daemon passed\n\
+Browser verification:\n\
+- Status: unavailable\n\
+- Summary: Browser runtime was unavailable\n\
+Cleanup:\n\
+- Status: clean";
+        let patch = publication_outcome_patch(&job, "Opened PR", final_answer, 8, 4);
+
+        assert_eq!(patch.validation_status.as_deref(), Some("passed"));
+        assert_eq!(
+            patch.browser_verification_status.as_deref(),
+            Some("unavailable")
+        );
+        assert_eq!(patch.cleanup_status.as_deref(), Some("clean"));
+        assert!(publication_final_answer_has_required_facts(
+            "Opened PR",
+            final_answer
+        ));
     }
 
     #[test]
