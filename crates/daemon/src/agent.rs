@@ -4098,7 +4098,7 @@ fn collect_git_tracked_temp_paths(root: &Path, repo_root: &Path) -> Vec<String> 
     let Ok(output) = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["ls-files", "-z"])
+        .args(["ls-files", "--full-name", "-z"])
         .output()
     else {
         return Vec::new();
@@ -11110,6 +11110,51 @@ Cleanup status: clean";
         let paths = collect_repo_temp_paths(&scoped_root.display().to_string());
 
         assert!(paths.iter().any(|path| path == "apps/web/.tmp-playwright"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collect_repo_temp_paths_resolves_tracked_paths_from_repo_root() {
+        let root = test_state_dir("publication-temp-path-scoped-tracked-workdir");
+        let scoped_root = root.join("apps/web");
+        fs::create_dir_all(scoped_root.join("src/.tmp-check"))
+            .expect("scoped tracked temp dir should exist");
+        fs::write(scoped_root.join("src/.tmp-check/probe.txt"), "temp")
+            .expect("scoped tracked temp file should exist");
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "-q"])
+            .status()
+            .expect("git init should run");
+        assert!(status.success());
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["add", "apps/web/src/.tmp-check/probe.txt"])
+            .status()
+            .expect("git add should run");
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.local",
+            ])
+            .args(["commit", "-qm", "seed"])
+            .status()
+            .expect("git commit should run");
+        assert!(status.success());
+
+        let paths = collect_repo_temp_paths(&scoped_root.display().to_string());
+
+        assert!(paths.iter().any(|path| path == "apps/web/src/.tmp-check"));
 
         let _ = fs::remove_dir_all(root);
     }

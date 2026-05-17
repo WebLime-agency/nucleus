@@ -4395,6 +4395,22 @@ fn publication_phrase_is_negated(text: &str, phrase_index: usize) -> bool {
     ]
     .iter()
     .any(|negation| text_ends_with_phrase_with_boundaries(&normalized_prefix, negation))
+        || [
+            "do not attempt to",
+            "do not try to",
+            "don't attempt to",
+            "don't try to",
+            "dont attempt to",
+            "dont try to",
+            "never attempt to",
+            "never try to",
+            "not attempt to",
+            "not try to",
+            "without attempting to",
+            "without trying to",
+        ]
+        .iter()
+        .any(|negation| text_ends_with_phrase_with_boundaries(&normalized_prefix, negation))
 }
 
 fn publication_segment_is_informational(text: &str) -> bool {
@@ -8782,6 +8798,16 @@ and open a pull request to dev when it is ready."
             "No pull request",
             "Session prompt",
             "please do not create a pull request"
+        ));
+        assert!(!publication_requested_for_job(
+            "No pull request",
+            "Session prompt",
+            "do not attempt to create a pull request"
+        ));
+        assert!(!publication_requested_for_job(
+            "No PR",
+            "Session prompt",
+            "don't try to open a PR"
         ));
         assert!(!publication_requested_for_job(
             "Open PR",
