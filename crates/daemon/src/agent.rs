@@ -8895,6 +8895,14 @@ async fn fail_job(state: &AppState, job_id: &str, error: &str) -> Result<()> {
         JobPatch {
             state: Some("failed".to_string()),
             last_error: Some(error.to_string()),
+            publication_status: detail
+                .job
+                .publication_requested
+                .then(|| "failed".to_string()),
+            publication_summary: detail
+                .job
+                .publication_requested
+                .then(|| excerpt(error, 320)),
             ..JobPatch::default()
         },
     )?;
@@ -8932,6 +8940,21 @@ async fn fail_job(state: &AppState, job_id: &str, error: &str) -> Result<()> {
         detail: excerpt(error, 320),
         data_json: json!({ "error": error }),
     });
+    if detail.job.publication_requested {
+        let _ = state.store.append_job_event(JobEventRecord {
+            job_id: job_id.to_string(),
+            worker_id: detail.job.root_worker_id.clone(),
+            event_type: "job.publication.blocked".to_string(),
+            status: "failed".to_string(),
+            summary: "Publication job failed.".to_string(),
+            detail: excerpt(error, 320),
+            data_json: json!({
+                "publication_requested": true,
+                "publication_status": "failed",
+                "publication_summary": excerpt(error, 320),
+            }),
+        });
+    }
     publish_job_failed(state, &state.store.get_job(job_id)?.job).await;
     if let Some(parent_job_id) = detail.job.parent_job_id.as_deref() {
         publish_job_updated(state, &state.store.get_job(parent_job_id)?.job).await;
@@ -12433,6 +12456,47 @@ Cleanup status: clean";
             .expect("cancel event should be recorded");
         assert_eq!(canceled_event.data_json["previous_state"], "failed");
         assert!(canceled_event.detail.contains("unblocked the session"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn fail_job_marks_publication_outcome_failed() {
+        let state_dir = test_state_dir("publication-failed-job");
+        let state = initialize_test_state(&state_dir);
+        let job_id = "job-publication-failed";
+        let error = "provider runtime failed before the PR could be opened";
+
+        let created = state
+            .store
+            .create_job(JobRecord {
+                id: job_id.to_string(),
+                session_id: None,
+                parent_job_id: None,
+                template_id: None,
+                title: "Open PR".to_string(),
+                purpose: "open a PR to merge to dev".to_string(),
+                trigger_kind: "manual".to_string(),
+                state: "running".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "open a PR to merge to dev".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("publication job should persist");
+        assert!(created.publication_requested);
+        assert_eq!(created.publication_status, "not_requested");
+
+        fail_job(&state, job_id, error)
+            .await
+            .expect("job failure should persist");
+
+        let detail = state.store.get_job(job_id).expect("job should load");
+        assert_eq!(detail.job.state, "failed");
+        assert_eq!(detail.job.publication_status, "failed");
+        assert_eq!(detail.job.publication_summary, error);
+        assert!(detail.events.iter().any(|event| {
+            event.event_type == "job.publication.blocked" && event.status == "failed"
+        }));
 
         let _ = fs::remove_dir_all(&state_dir);
     }
