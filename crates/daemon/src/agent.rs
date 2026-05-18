@@ -3900,11 +3900,15 @@ fn publication_outcome_patch(
         publication_requested: Some(true),
         publication_status,
         publication_summary: Some(
-            extract_labeled_value(
-                &raw_text,
-                &["publication_summary", "publication summary", "summary"],
-            )
-            .unwrap_or_else(|| summary.to_string()),
+            extract_labeled_value(&raw_text, &["publication_summary", "publication summary"])
+                .or_else(|| {
+                    extract_nested_labeled_value(
+                        &raw_text,
+                        &["publication", "publication outcome"],
+                        &["summary"],
+                    )
+                })
+                .unwrap_or_else(|| summary.to_string()),
         ),
         pr_url: Some(pr_url.unwrap_or_else(|| current.pr_url.clone())),
         source_branch: Some(
@@ -11038,6 +11042,27 @@ Cleanup status: clean";
             Some("not_performed")
         );
         assert_eq!(patch.cleanup_status.as_deref(), Some("clean"));
+    }
+
+    #[test]
+    fn publication_outcome_patch_ignores_nested_non_publication_summaries() {
+        let job = test_publication_job_summary("publication-summary");
+        let final_answer = "Publication status: opened\n\
+Validation:\n\
+- Status: passed\n\
+- Summary: cargo test passed\n\
+Browser verification:\n\
+- Status: unavailable\n\
+- Summary: browser runtime unavailable\n\
+Publication:\n\
+- Summary: PR opened for review\n\
+Cleanup status: clean";
+        let patch = publication_outcome_patch(&job, "Opened PR", final_answer, 8, 4);
+
+        assert_eq!(
+            patch.publication_summary.as_deref(),
+            Some("PR opened for review")
+        );
     }
 
     #[test]

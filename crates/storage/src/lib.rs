@@ -4444,6 +4444,8 @@ fn publication_segment_has_actionable_suffix(text: &str) -> bool {
         ". then ",
         " and then ",
         " then ",
+        "\r\n",
+        "\n",
         ", ",
         "; ",
         ". ",
@@ -4453,7 +4455,27 @@ fn publication_segment_has_actionable_suffix(text: &str) -> bool {
         text.split(separator)
             .skip(1)
             .map(str::trim_start)
-            .any(publication_segment_requests_publication)
+            .any(|suffix| {
+                publication_segment_requests_publication(suffix)
+                    || publication_segment_requests_referenced_publication(suffix)
+            })
+    })
+}
+
+fn publication_segment_requests_referenced_publication(text: &str) -> bool {
+    [
+        "open one",
+        "create one",
+        "publish it",
+        "publish that",
+        "publish this",
+    ]
+    .iter()
+    .any(|phrase| {
+        text.match_indices(phrase).any(|(index, _)| {
+            phrase_match_has_boundaries(text, phrase, index)
+                && !publication_phrase_is_negated(text, index)
+        })
     })
 }
 
@@ -8818,6 +8840,16 @@ and open a pull request to dev when it is ready."
             "Explain then publish",
             "Session prompt",
             "Please explain quickly, then open a PR to dev"
+        ));
+        assert!(publication_requested_for_job(
+            "Explain then publish",
+            "Session prompt",
+            "How do I open a PR?\nOpen one for this branch."
+        ));
+        assert!(!publication_requested_for_job(
+            "Explain but do not publish",
+            "Session prompt",
+            "How do I open a PR?\nDo not open one for this branch."
         ));
         assert!(publication_requested_for_job(
             "Publish branch",
