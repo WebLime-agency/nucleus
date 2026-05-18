@@ -57,6 +57,13 @@ pub(crate) fn classify_user_error(detail: &str) -> Option<UserFacingErrorSummary
         return Some(model_endpoint_unreachable(detail));
     }
 
+    if lower.contains("nucleus action contract")
+        || lower.contains("valid json that does not match")
+        || lower.contains("invalid nucleus action")
+    {
+        return Some(worker_action_contract_failed(detail));
+    }
+
     None
 }
 
@@ -128,6 +135,21 @@ fn model_endpoint_unreachable(detail: &str) -> UserFacingErrorSummary {
             "Check the profile base URL for the Base model and Utility model, then retry this job."
                 .to_string(),
         actions: model_setup_actions(),
+        technical_detail: redact_likely_secret_tokens(detail),
+    }
+}
+
+fn worker_action_contract_failed(detail: &str) -> UserFacingErrorSummary {
+    UserFacingErrorSummary {
+        code: "worker_action_contract_failed".to_string(),
+        title: "The Utility Worker returned an unsupported Action shape".to_string(),
+        message:
+            "Nucleus could not safely normalize the worker response. Retry this job to ask the Utility Worker for a valid Action, or cancel it to unblock the session."
+                .to_string(),
+        actions: [RETRY_JOB, CANCEL_JOB, OPEN_JOB_DETAILS]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
         technical_detail: redact_likely_secret_tokens(detail),
     }
 }
@@ -320,6 +342,21 @@ mod tests {
         let raw = "GitHub API request failed: HTTP 403 forbidden";
 
         assert!(classify_user_error(raw).is_none());
+    }
+
+    #[test]
+    fn classifies_worker_action_contract_failures() {
+        let raw = "worker returned valid JSON that does not match the Nucleus action contract; response excerpt: {\"type\":\"tool_call\"}";
+
+        let summary = classify_user_error(raw).expect("contract error should classify");
+
+        assert_eq!(summary.code, "worker_action_contract_failed");
+        assert!(summary.title.contains("Utility Worker"));
+        assert!(summary.message.contains("valid Action"));
+        assert!(summary.actions.iter().any(|action| action == RETRY_JOB));
+        assert!(summary.actions.iter().any(|action| action == CANCEL_JOB));
+        assert!(!summary.actions.iter().any(|action| action == OPEN_PROFILES));
+        assert_eq!(summary.technical_detail, raw);
     }
 
     #[test]

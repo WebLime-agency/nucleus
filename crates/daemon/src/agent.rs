@@ -4776,7 +4776,7 @@ async fn call_worker_model(
     let action = match parse_worker_action(&result.content) {
         Ok(action) => action,
         Err(error)
-            if worker.provider == "openai_compatible" && error.is_repairable_json_error() =>
+            if worker.provider == "openai_compatible" && error.is_repairable_contract_error() =>
         {
             let mut repair_conversation = conversation.to_vec();
             repair_conversation.push(CheckpointMessage {
@@ -4789,13 +4789,13 @@ async fn call_worker_model(
                 content: result.content.clone(),
                 images: Vec::new(),
             });
-            let repair_prompt = build_worker_json_repair_prompt(&result.content, &error);
+            let repair_prompt = build_worker_action_repair_prompt(&result.content, &error);
             let repaired =
                 execute_worker_model_turn(state, worker, &repair_conversation, &repair_prompt, &[])
                     .await?;
             let action = parse_worker_action(&repaired.content).with_context(|| {
                 format!(
-                    "worker returned malformed JSON action after repair retry; original response: {}; repaired response: {}",
+                    "worker returned invalid Nucleus action after repair retry; original response: {}; repaired response: {}",
                     excerpt(&result.content, 220),
                     excerpt(&repaired.content, 220)
                 )
@@ -4869,12 +4869,14 @@ async fn execute_worker_model_turn(
         .map_err(|error| anyhow!("worker model task crashed: {error}"))?
 }
 
-fn build_worker_json_repair_prompt(raw_response: &str, error: &dyn std::fmt::Display) -> String {
+fn build_worker_action_repair_prompt(raw_response: &str, error: &dyn std::fmt::Display) -> String {
     format!(
-        "Your previous Utility Worker response could not be parsed as JSON: {}.\n\
+        "Your previous Utility Worker response did not match the Nucleus action contract: {}.\n\
 Convert the previous response into exactly one valid Nucleus worker action JSON object and nothing else.\n\
 If the previous response answered the user directly, use this shape:\n\
 {{\"kind\":\"final_answer\",\"summary\":\"brief reason the work is done\",\"final_answer\":\"user-facing answer\"}}\n\
+If the previous response intended to run a command, use this shape:\n\
+{{\"kind\":\"tool_call\",\"summary\":\"why this action is needed\",\"tool\":\"command.run\",\"args\":{{\"command\":\"sh\",\"args\":[\"-lc\",\"command text\"],\"cwd\":\"/path/if/needed\"}}}}\n\
 Previous response:\n{}",
         error,
         excerpt(raw_response, 1_200)
@@ -11806,6 +11808,46 @@ Cleanup status: clean";
             args["args"][1],
             "cd /home/eba/dev-projects/dga-clients && pwd && ls -la"
         );
+    }
+
+    #[test]
+    fn parses_provider_native_type_tool_input_object_shell_call_as_command_run() {
+        let action = parse_worker_action(
+            r#"{"type":"tool_call","tool":"shell","input":{"command":["bash","-lc","rg -n \"normalize_worker_tool_call_value\" crates/daemon/src"],"workdir":"/home/eba/dev-projects/nucleus"}}"#,
+        )
+        .expect("provider-native type/tool/input shell call should normalize");
+
+        let WorkerAction::ToolCall {
+            summary,
+            tool,
+            args,
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(summary, "Run the requested Nucleus action.");
+        assert_eq!(tool, "command.run");
+        assert_eq!(args["command"], "bash");
+        assert_eq!(args["args"][0], "-lc");
+        assert_eq!(
+            args["args"][1],
+            "rg -n \"normalize_worker_tool_call_value\" crates/daemon/src"
+        );
+        assert_eq!(args["cwd"], "/home/eba/dev-projects/nucleus");
+    }
+
+    #[test]
+    fn worker_action_repair_prompt_targets_contract_shape() {
+        let prompt = build_worker_action_repair_prompt(
+            r#"{"message":"I should inspect the repo next"}"#,
+            &crate::worker_action::WorkerActionParseError::InvalidActionShape,
+        );
+
+        assert!(prompt.contains("Nucleus action contract"));
+        assert!(prompt.contains("\"kind\":\"final_answer\""));
+        assert!(prompt.contains("\"tool\":\"command.run\""));
+        assert!(prompt.contains("exactly one valid Nucleus worker action"));
     }
 
     #[test]
