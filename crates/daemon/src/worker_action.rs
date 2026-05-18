@@ -500,14 +500,15 @@ fn format_structured_final_answer_object(
         "status",
         "summary",
         "message",
-        "validation",
-        "browser_verification_status",
-        "browser_verification",
         "publication_status",
         "publication_summary",
         "pr_url",
         "source_branch",
         "target_branch",
+        "validation_status",
+        "validation",
+        "browser_verification_status",
+        "browser_verification",
         "cleanup_status",
         "cleanup",
         "remaining",
@@ -626,8 +627,14 @@ fn is_empty_json_value(value: &Value) -> bool {
 fn final_answer_field_label(key: &str) -> String {
     match key {
         "pr_url" => return "PR URL".to_string(),
+        "publication_status" => return "Publication status".to_string(),
+        "publication_summary" => return "Publication summary".to_string(),
+        "source_branch" => return "Source branch".to_string(),
+        "target_branch" => return "Target branch".to_string(),
+        "validation_status" => return "Validation status".to_string(),
         "browser_verification_status" => return "Browser verification status".to_string(),
         "browser_verification" => return "Browser verification".to_string(),
+        "cleanup_status" => return "Cleanup status".to_string(),
         _ => {}
     }
 
