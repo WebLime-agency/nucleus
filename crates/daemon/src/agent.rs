@@ -3863,7 +3863,10 @@ fn publication_outcome_patch(
                 {
                     Some("not_opened".to_string())
                 } else {
-                    Some(current.publication_status.clone())
+                    match current.publication_status.as_str() {
+                        "" | "not_requested" => Some("blocked".to_string()),
+                        _ => Some(current.publication_status.clone()),
+                    }
                 }
             });
     let validation_status =
@@ -11017,6 +11020,24 @@ Cleanup:\n\
             "Opened PR",
             final_answer
         ));
+    }
+
+    #[test]
+    fn publication_outcome_patch_blocks_missing_publication_status_for_requested_jobs() {
+        let mut job = test_publication_job_summary("publication-missing-status");
+        job.publication_status = "not_requested".to_string();
+        let final_answer = "Validation status: passed\n\
+Browser verification status: not_performed\n\
+Cleanup status: clean";
+        let patch = publication_outcome_patch(&job, "Done", final_answer, 10, 5);
+
+        assert_eq!(patch.publication_status.as_deref(), Some("blocked"));
+        assert_eq!(patch.validation_status.as_deref(), Some("passed"));
+        assert_eq!(
+            patch.browser_verification_status.as_deref(),
+            Some("not_performed")
+        );
+        assert_eq!(patch.cleanup_status.as_deref(), Some("clean"));
     }
 
     #[test]
