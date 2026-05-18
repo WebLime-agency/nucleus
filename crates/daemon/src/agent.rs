@@ -3845,6 +3845,13 @@ fn publication_outcome_patch(
         .filter(|value| value.starts_with("http"));
     let publication_status =
         extract_labeled_value(&raw_text, &["publication_status", "publication status"])
+            .or_else(|| {
+                extract_nested_labeled_value(
+                    &raw_text,
+                    &["publication", "publication outcome"],
+                    &["status"],
+                )
+            })
             .and_then(|value| normalize_publication_status(&value))
             .or_else(|| {
                 if pr_url.is_some() {
@@ -4506,6 +4513,13 @@ fn publication_final_answer_has_required_facts(summary: &str, final_answer: &str
         ],
     )
     .is_some()
+        || extract_nested_labeled_value(
+            &text,
+            &["publication", "publication outcome"],
+            &["status"],
+        )
+        .and_then(|value| normalize_publication_status(&value))
+        .is_some()
         || normalized.contains("blocked_without_browser_verification")
         || normalized.contains("pr not opened")
         || publication_text_says_opened(&normalized);
@@ -11009,7 +11023,9 @@ Cleanup paths: .tmp-playwright.",
     #[test]
     fn publication_outcome_patch_extracts_nested_section_statuses() {
         let job = test_publication_job_summary("publication-nested-statuses");
-        let final_answer = "Publication status: opened\n\
+        let final_answer = "Publication:\n\
+- Status: not_opened\n\
+- Summary: Branch remained unpublished\n\
 Validation:\n\
 - Status: passed\n\
 - Summary: cargo test -p nucleus-daemon passed\n\
@@ -11018,8 +11034,9 @@ Browser verification:\n\
 - Summary: Browser runtime was unavailable\n\
 Cleanup:\n\
 - Status: clean";
-        let patch = publication_outcome_patch(&job, "Opened PR", final_answer, 8, 4);
+        let patch = publication_outcome_patch(&job, "Done", final_answer, 8, 4);
 
+        assert_eq!(patch.publication_status.as_deref(), Some("not_opened"));
         assert_eq!(patch.validation_status.as_deref(), Some("passed"));
         assert_eq!(
             patch.browser_verification_status.as_deref(),
@@ -11089,6 +11106,14 @@ Cleanup status: clean"
             "Publication status: opened\n\
 Validation status: passed\n\
 Browser verification: status: passed, summary: clicked through the changed flow\n\
+Cleanup status: clean"
+        ));
+        assert!(publication_final_answer_has_required_facts(
+            "Done",
+            "Publication:\n\
+- Status: opened\n\
+Validation status: passed\n\
+Browser verification status: not_performed\n\
 Cleanup status: clean"
         ));
     }
