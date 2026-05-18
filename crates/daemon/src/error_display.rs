@@ -57,14 +57,20 @@ pub(crate) fn classify_user_error(detail: &str) -> Option<UserFacingErrorSummary
         return Some(model_endpoint_unreachable(detail));
     }
 
-    if lower.contains("nucleus action contract")
-        || lower.contains("valid json that does not match")
-        || lower.contains("invalid nucleus action")
-    {
+    if contains_worker_action_contract_failure(&lower) {
         return Some(worker_action_contract_failed(detail));
     }
 
     None
+}
+
+fn contains_worker_action_contract_failure(lower: &str) -> bool {
+    lower.contains("nucleus action contract")
+        || lower.contains("valid json that does not match")
+        || lower.contains("invalid nucleus action")
+        || lower.contains("worker requested unknown nucleus action")
+        || lower.contains("worker returned malformed json action")
+        || lower.contains("worker returned no json action object")
 }
 
 fn model_credentials_missing(detail: &str) -> UserFacingErrorSummary {
@@ -357,6 +363,28 @@ mod tests {
         assert!(summary.actions.iter().any(|action| action == CANCEL_JOB));
         assert!(!summary.actions.iter().any(|action| action == OPEN_PROFILES));
         assert_eq!(summary.technical_detail, raw);
+    }
+
+    #[test]
+    fn classifies_sibling_worker_action_parser_failures_as_recoverable() {
+        for raw in [
+            "worker requested unknown Nucleus action 'mystery.tool'; response excerpt: {}",
+            "worker returned malformed JSON action: expected value at line 1 column 2; response excerpt: {",
+            "worker returned no JSON action object; response excerpt: I should inspect the repo next",
+        ] {
+            let summary = classify_user_error(raw).expect("parser error should classify");
+
+            assert_eq!(summary.code, "worker_action_contract_failed");
+            assert!(summary.actions.iter().any(|action| action == RETRY_JOB));
+            assert!(summary.actions.iter().any(|action| action == CANCEL_JOB));
+            assert!(
+                summary
+                    .actions
+                    .iter()
+                    .any(|action| action == OPEN_JOB_DETAILS)
+            );
+            assert!(!summary.actions.iter().any(|action| action == OPEN_PROFILES));
+        }
     }
 
     #[test]
