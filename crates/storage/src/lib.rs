@@ -4332,17 +4332,13 @@ fn bool_to_i64(value: bool) -> i64 {
     if value { 1 } else { 0 }
 }
 
-fn publication_requested_for_job(title: &str, purpose: &str, prompt_excerpt: &str) -> bool {
+fn publication_requested_for_job(_title: &str, _purpose: &str, prompt_excerpt: &str) -> bool {
     let prompt_excerpt = prompt_excerpt.to_ascii_lowercase();
     if publication_segment_has_publication_phrase(&prompt_excerpt) {
         return publication_segment_requests_publication(&prompt_excerpt);
     }
 
-    let title = title.to_ascii_lowercase();
-    let purpose = purpose.to_ascii_lowercase();
-
-    publication_segment_requests_publication(&title)
-        || publication_segment_requests_publication(&purpose)
+    false
 }
 
 fn publication_segment_requests_publication(text: &str) -> bool {
@@ -8772,6 +8768,23 @@ and open a pull request to dev when it is ready."
             .expect("job should persist");
 
         assert!(created_from_full_prompt.publication_requested);
+        let created_from_title_only = store
+            .create_job(JobRecord {
+                id: "publication-title-only-job".to_string(),
+                session_id: Some("publication-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Open PR".to_string(),
+                purpose: "Publish branch".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "queued".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "summarize the current status".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("job should persist");
+
+        assert!(!created_from_title_only.publication_requested);
         assert!(!publication_requested_for_job(
             "Open project notes",
             "Session prompt",
