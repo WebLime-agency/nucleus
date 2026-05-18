@@ -53,10 +53,12 @@ pub enum WorkerActionParseError {
 }
 
 impl WorkerActionParseError {
-    pub fn is_repairable_json_error(&self) -> bool {
+    pub fn is_repairable_contract_error(&self) -> bool {
         matches!(
             self,
-            WorkerActionParseError::NoJsonObject | WorkerActionParseError::MalformedJson { .. }
+            WorkerActionParseError::NoJsonObject
+                | WorkerActionParseError::MalformedJson { .. }
+                | WorkerActionParseError::InvalidActionShape
         )
     }
 }
@@ -704,6 +706,7 @@ fn normalize_worker_tool_call_value(value: &Value) -> Result<WorkerAction, Worke
             let mut inline_args = object.clone();
             inline_args.remove("action");
             inline_args.remove("kind");
+            inline_args.remove("type");
             inline_args.remove("tool");
             inline_args.remove("tool_name");
             inline_args.remove("name");
@@ -889,7 +892,7 @@ mod tests {
                 tool: "nucleus_repo_search".to_string()
             }
         );
-        assert!(!error.is_repairable_json_error());
+        assert!(!error.is_repairable_contract_error());
     }
 
     #[test]
@@ -898,7 +901,7 @@ mod tests {
             .expect_err("valid JSON without Nucleus action shape should be rejected");
 
         assert_eq!(error, WorkerActionParseError::InvalidActionShape);
-        assert!(!error.is_repairable_json_error());
+        assert!(error.is_repairable_contract_error());
     }
 
     #[test]
@@ -911,7 +914,7 @@ mod tests {
             error,
             WorkerActionParseError::MalformedJson { .. }
         ));
-        assert!(error.is_repairable_json_error());
+        assert!(error.is_repairable_contract_error());
     }
 
     #[test]
