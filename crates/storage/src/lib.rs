@@ -4346,7 +4346,8 @@ fn publication_requested_for_job(title: &str, purpose: &str, prompt_excerpt: &st
 }
 
 fn publication_segment_requests_publication(text: &str) -> bool {
-    publication_segment_has_unnegated_publication_phrase(text)
+    (publication_segment_has_unnegated_publication_phrase(text)
+        || publication_segment_has_actionable_suffix(text))
         && !publication_segment_is_informational(text)
 }
 
@@ -8851,6 +8852,11 @@ and open a pull request to dev when it is ready."
             "Explain then publish",
             "Session prompt",
             "How do I open a PR?\nOpen one for this branch."
+        ));
+        assert!(publication_requested_for_job(
+            "Publish after tests",
+            "Session prompt",
+            "do not open a PR until tests pass, then open one"
         ));
         assert!(!publication_requested_for_job(
             "Explain but do not publish",

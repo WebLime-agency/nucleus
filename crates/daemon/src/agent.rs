@@ -3476,7 +3476,7 @@ fn add_publication_initial_prompt_guidance(
 - Include pr_url, source_branch, and target_branch when known.\n\
 - Use the daemon-owned Browser tools for rendered verification when possible. Do not create repo-local Playwright projects, .tmp-playwright, or ad-hoc .tmp-* verification folders.\n\
 - Missing Browser or Playwright tooling is not a generic job failure. Record browser_verification_status=unavailable or not_performed with the concrete reason.\n\
-- Put scratch verification scripts outside the git worktree when you need them. Preferred job temp directory: {}\n\
+- Put scratch verification scripts outside the git worktree when you need them. Scoped file tools can only write within worker write roots; use shell commands for daemon-owned scratch work in this job temp directory: {}\n\
 - Before terminal final_answer, check for job-created .tmp-* leftovers in the repo. Clean only files this job created, or set cleanup_status=cleanup_required and list the paths.",
         prompt,
         job_tmp_dir.display()
