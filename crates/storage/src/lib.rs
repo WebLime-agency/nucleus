@@ -4369,12 +4369,16 @@ fn publication_segment_has_unnegated_publication_phrase(text: &str) -> bool {
 fn publication_phrases() -> &'static [&'static str] {
     &[
         "open a pr",
+        "open the pr",
         "open pr",
         "open a pull request",
+        "open the pull request",
         "open pull request",
         "create a pr",
+        "create the pr",
         "create pr",
         "create a pull request",
+        "create the pull request",
         "create pull request",
         "publish this branch",
         "publish the branch",
@@ -8874,14 +8878,29 @@ and open a pull request to dev when it is ready."
             "open a pr to merge to dev"
         ));
         assert!(publication_requested_for_job(
+            "Open PR",
+            "Session prompt",
+            "open the PR to merge to dev"
+        ));
+        assert!(publication_requested_for_job(
             "Open pull request",
             "Session prompt",
             "open a pull request to merge to dev"
         ));
         assert!(publication_requested_for_job(
+            "Open pull request",
+            "Session prompt",
+            "open the pull request to merge to dev"
+        ));
+        assert!(publication_requested_for_job(
             "Create pull request",
             "Session prompt",
             "create a pull request for dev"
+        ));
+        assert!(publication_requested_for_job(
+            "Create pull request",
+            "Session prompt",
+            "create the pull request for dev"
         ));
 
         let updated = store
