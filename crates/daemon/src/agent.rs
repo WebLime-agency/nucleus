@@ -3979,6 +3979,14 @@ fn reconcile_publication_browser_status_with_completion(
     if !patch.publication_requested.unwrap_or(false) {
         return;
     }
+    if matches!(
+        completion_job.browser_verification_status.as_str(),
+        "passed" | "failed"
+    ) {
+        patch.browser_verification_status =
+            Some(completion_job.browser_verification_status.clone());
+        return;
+    }
     if !matches!(
         patch.browser_verification_status.as_deref(),
         None | Some("pending")
@@ -11181,6 +11189,10 @@ Cleanup status: clean";
             patch.browser_verification_status.as_deref(),
             Some("unavailable")
         );
+
+        job.browser_verification_status = "passed".to_string();
+        reconcile_publication_browser_status_with_completion(&job, &mut patch);
+        assert_eq!(patch.browser_verification_status.as_deref(), Some("passed"));
     }
 
     #[test]
