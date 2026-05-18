@@ -4376,7 +4376,11 @@ fn extract_inline_nested_labeled_value(value: &str, nested_labels: &[&str]) -> O
     if value.is_empty() {
         return None;
     }
-    if let Some((label, nested_value)) = value.split_once(':') {
+    let mut saw_known_inline_label = false;
+    for segment in value.split(|character| character == ',' || character == ';') {
+        let Some((label, nested_value)) = segment.trim().split_once(':') else {
+            continue;
+        };
         let normalized_label = normalize_label(label);
         if nested_labels
             .iter()
@@ -4387,9 +4391,34 @@ fn extract_inline_nested_labeled_value(value: &str, nested_labels: &[&str]) -> O
                 return Some(nested_value.to_string());
             }
         }
+        if is_known_nested_inline_label(&normalized_label) {
+            saw_known_inline_label = true;
+        }
+    }
+
+    if saw_known_inline_label {
+        return None;
     }
 
     Some(value.to_string())
+}
+
+fn is_known_nested_inline_label(label: &str) -> bool {
+    matches!(
+        label,
+        "status"
+            | "summary"
+            | "publication status"
+            | "publication summary"
+            | "pr url"
+            | "pull request"
+            | "source branch"
+            | "target branch"
+            | "validation status"
+            | "browser verification status"
+            | "cleanup status"
+            | "cleanup paths"
+    )
 }
 
 fn normalize_label(label: &str) -> String {
@@ -11094,6 +11123,28 @@ Cleanup status: clean";
             patch.publication_summary.as_deref(),
             Some("PR opened for review")
         );
+    }
+
+    #[test]
+    fn publication_outcome_patch_extracts_matching_inline_nested_labels_only() {
+        let job = test_publication_job_summary("publication-inline-labels");
+        let final_answer = "Publication: status: opened, summary: Ready for review\n\
+Validation: status: passed, summary: cargo test passed\n\
+Browser verification: status: not_performed, summary: no UI surface changed\n\
+Cleanup: status: clean";
+        let patch = publication_outcome_patch(&job, "Opened PR", final_answer, 8, 4);
+
+        assert_eq!(patch.publication_status.as_deref(), Some("opened"));
+        assert_eq!(
+            patch.publication_summary.as_deref(),
+            Some("Ready for review")
+        );
+        assert_eq!(patch.validation_status.as_deref(), Some("passed"));
+        assert_eq!(
+            patch.browser_verification_status.as_deref(),
+            Some("not_performed")
+        );
+        assert_eq!(patch.cleanup_status.as_deref(), Some("clean"));
     }
 
     #[test]
