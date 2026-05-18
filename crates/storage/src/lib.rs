@@ -4404,6 +4404,7 @@ fn publication_phrase_is_negated(text: &str, phrase_index: usize) -> bool {
             "dont try to",
             "never attempt to",
             "never try to",
+            "no need to",
             "not attempt to",
             "not try to",
             "without attempting to",
@@ -8830,6 +8831,11 @@ and open a pull request to dev when it is ready."
             "No PR",
             "Session prompt",
             "don't try to open a PR"
+        ));
+        assert!(!publication_requested_for_job(
+            "No PR",
+            "Session prompt",
+            "no need to open a PR"
         ));
         assert!(!publication_requested_for_job(
             "Open PR",

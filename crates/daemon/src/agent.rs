@@ -4265,6 +4265,12 @@ fn infer_cleanup_status(text: &str) -> Option<String> {
     if text.contains("cleanup status: cleanup_required") || text.contains("cleanup required") {
         return Some("cleanup_required".to_string());
     }
+    if text.contains("not cleaned up")
+        || text.contains("was not cleaned up")
+        || text.contains("were not cleaned up")
+    {
+        return Some("cleanup_required".to_string());
+    }
     if text.contains("cleanup status: cleaned") || text.contains("cleaned up") {
         return Some("cleaned".to_string());
     }
@@ -11115,6 +11121,10 @@ Cleanup status: clean";
         );
         assert_eq!(
             infer_cleanup_status("Cleanup required: .tmp-playwright remains."),
+            Some("cleanup_required".to_string())
+        );
+        assert_eq!(
+            infer_cleanup_status("Temp files were not cleaned up."),
             Some("cleanup_required".to_string())
         );
         assert_eq!(
