@@ -1808,6 +1808,7 @@ fn find_overlapping_memory_entry(
         .find(|entry| {
             entry.scope_kind == scope_kind
                 && entry.scope_id == scope_id
+                && entry.enabled
                 && entry.status == "accepted"
                 && normalized_memory_overlap_key(
                     &entry.scope_kind,
@@ -10778,6 +10779,68 @@ mod tests {
         assert_eq!(candidate.status, "superseded");
         assert!(!candidate.accepted_memory_id.is_empty());
         assert_eq!(state.store.list_memory_entries().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn explicit_prompt_save_recreates_disabled_overlapping_memory() {
+        let (state_dir, state) = test_named_app_state("memory-prompt-disabled-overlap");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session = create_test_persisted_session(
+            &state,
+            "memory-prompt-disabled-overlap",
+            &workspace_root,
+        );
+
+        state
+            .store
+            .upsert_memory_entry(&MemoryEntry {
+                id: "disabled-memory".to_string(),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "workspace prefers concise release notes".to_string(),
+                content: "workspace prefers concise release notes".to_string(),
+                tags: vec![],
+                enabled: false,
+                status: "accepted".to_string(),
+                memory_kind: "preference".to_string(),
+                source_kind: "manual".to_string(),
+                source_id: String::new(),
+                confidence: 1.0,
+                created_by: "user".to_string(),
+                last_used_at: None,
+                use_count: 0,
+                supersedes_id: String::new(),
+                metadata_json: json!({}),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .expect("disabled memory should persist");
+
+        let outcomes = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "remember that workspace prefers concise release notes",
+        )
+        .await
+        .expect("explicit remember should save a fresh enabled memory");
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].state, "saved");
+
+        let entries = state.store.list_memory_entries().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.id == "disabled-memory" && !entry.enabled)
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.id == outcomes[0].memory_id && entry.enabled)
+        );
         let _ = fs::remove_dir_all(&state_dir);
     }
 
