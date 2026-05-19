@@ -4776,7 +4776,8 @@ async fn call_worker_model(
     let action = match parse_worker_action(&result.content) {
         Ok(action) => action,
         Err(error)
-            if worker.provider == "openai_compatible" && error.is_repairable_json_error() =>
+            if worker_supports_action_contract_repair(worker)
+                && error.is_repairable_contract_error() =>
         {
             let mut repair_conversation = conversation.to_vec();
             repair_conversation.push(CheckpointMessage {
@@ -4789,13 +4790,13 @@ async fn call_worker_model(
                 content: result.content.clone(),
                 images: Vec::new(),
             });
-            let repair_prompt = build_worker_json_repair_prompt(&result.content, &error);
+            let repair_prompt = build_worker_action_repair_prompt(&result.content, &error);
             let repaired =
                 execute_worker_model_turn(state, worker, &repair_conversation, &repair_prompt, &[])
                     .await?;
             let action = parse_worker_action(&repaired.content).with_context(|| {
                 format!(
-                    "worker returned malformed JSON action after repair retry; original response: {}; repaired response: {}",
+                    "worker returned invalid Nucleus action after repair retry; original response: {}; repaired response: {}",
                     excerpt(&result.content, 220),
                     excerpt(&repaired.content, 220)
                 )
@@ -4824,6 +4825,12 @@ async fn call_worker_model(
         raw: result.content,
         provider_session_id: result.provider_session_id,
     })
+}
+
+fn worker_supports_action_contract_repair(worker: &WorkerSummary) -> bool {
+    // The OpenAI-compatible adapter is currently the worker path where Nucleus owns
+    // the prompt envelope and JSON-object response hint end to end.
+    worker.provider == "openai_compatible"
 }
 
 async fn execute_worker_model_turn(
@@ -4869,12 +4876,15 @@ async fn execute_worker_model_turn(
         .map_err(|error| anyhow!("worker model task crashed: {error}"))?
 }
 
-fn build_worker_json_repair_prompt(raw_response: &str, error: &dyn std::fmt::Display) -> String {
+fn build_worker_action_repair_prompt(raw_response: &str, error: &dyn std::fmt::Display) -> String {
     format!(
-        "Your previous Utility Worker response could not be parsed as JSON: {}.\n\
+        "Your previous Utility Worker response did not match the Nucleus action contract: {}.\n\
 Convert the previous response into exactly one valid Nucleus worker action JSON object and nothing else.\n\
-If the previous response answered the user directly, use this shape:\n\
-{{\"kind\":\"final_answer\",\"summary\":\"brief reason the work is done\",\"final_answer\":\"user-facing answer\"}}\n\
+Use the supported action shape that matches the previous intent:\n\
+- final_answer: {{\"kind\":\"final_answer\",\"summary\":\"brief reason the work is done\",\"final_answer\":\"user-facing answer\"}}\n\
+- tool_call: {{\"kind\":\"tool_call\",\"summary\":\"why this action is needed\",\"tool\":\"command.run\",\"args\":{{\"command\":\"sh\",\"args\":[\"-lc\",\"command text\"],\"cwd\":\"/path/if/needed\"}}}}\n\
+- progress_update: {{\"kind\":\"progress_update\",\"summary\":\"checkpoint summary\",\"detail\":\"non-terminal progress detail\"}}\n\
+- spawn_child_jobs: {{\"kind\":\"spawn_child_jobs\",\"summary\":\"why fan-out is needed\",\"jobs\":[{{\"title\":\"Focused child job\",\"prompt\":\"specific child task\",\"working_dir\":null}}]}}\n\
 Previous response:\n{}",
         error,
         excerpt(raw_response, 1_200)
@@ -10313,7 +10323,10 @@ mod tests {
     use std::{
         env, fs,
         path::{Path, PathBuf},
-        sync::Arc,
+        sync::{
+            Arc, Mutex as TestMutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
     use tokio::sync::broadcast;
@@ -11809,6 +11822,119 @@ Cleanup status: clean";
     }
 
     #[test]
+    fn parses_provider_native_type_tool_input_object_shell_call_as_command_run() {
+        let action = parse_worker_action(
+            r#"{"type":"tool_call","tool":"shell","input":{"command":["bash","-lc","rg -n \"normalize_worker_tool_call_value\" crates/daemon/src"],"workdir":"/home/eba/dev-projects/nucleus"}}"#,
+        )
+        .expect("provider-native type/tool/input shell call should normalize");
+
+        let WorkerAction::ToolCall {
+            summary,
+            tool,
+            args,
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(summary, "Run the requested Nucleus action.");
+        assert_eq!(tool, "command.run");
+        assert_eq!(args["command"], "bash");
+        assert_eq!(args["args"][0], "-lc");
+        assert_eq!(
+            args["args"][1],
+            "rg -n \"normalize_worker_tool_call_value\" crates/daemon/src"
+        );
+        assert_eq!(args["cwd"], "/home/eba/dev-projects/nucleus");
+    }
+
+    #[test]
+    fn worker_action_repair_prompt_targets_contract_shape() {
+        let prompt = build_worker_action_repair_prompt(
+            r#"{"message":"I should inspect the repo next"}"#,
+            &crate::worker_action::WorkerActionParseError::InvalidActionShape,
+        );
+
+        assert!(prompt.contains("Nucleus action contract"));
+        assert!(prompt.contains("\"kind\":\"final_answer\""));
+        assert!(prompt.contains("\"tool\":\"command.run\""));
+        assert!(prompt.contains("\"kind\":\"progress_update\""));
+        assert!(prompt.contains("\"kind\":\"spawn_child_jobs\""));
+        assert!(prompt.contains("exactly one valid Nucleus worker action"));
+    }
+
+    #[tokio::test]
+    async fn call_worker_model_repairs_invalid_action_shape_on_second_turn() {
+        let state_dir = test_state_dir("worker-action-repair-flow");
+        let state = initialize_test_state(&state_dir);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener addr should be available")
+        );
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_bodies = Arc::new(TestMutex::new(Vec::new()));
+        let server_request_count = request_count.clone();
+        let server_request_bodies = request_bodies.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .expect("test request should connect");
+                let body = read_test_http_body(&mut socket).await;
+                server_request_bodies
+                    .lock()
+                    .expect("request bodies lock should not be poisoned")
+                    .push(body);
+                let index = server_request_count.fetch_add(1, Ordering::SeqCst);
+                let content = if index == 0 {
+                    r#"{"message":"I should inspect the repo next"}"#
+                } else {
+                    r#"{"kind":"final_answer","summary":"repaired action","final_answer":"Done."}"#
+                };
+                write_test_openai_sse_response(&mut socket, &format!("turn-{index}"), content)
+                    .await;
+            }
+        });
+
+        let mut worker = test_worker_summary("repair-worker", 10, 10);
+        worker.provider_base_url = base_url;
+        worker.working_dir = state_dir.display().to_string();
+        let response = call_worker_model(&state, &worker, &[], "Inspect the repo.", &[])
+            .await
+            .expect("repair turn should produce a valid action");
+
+        let WorkerAction::FinalAnswer {
+            summary,
+            final_answer,
+            ..
+        } = response.action
+        else {
+            panic!("expected repaired final answer");
+        };
+        assert_eq!(summary, "repaired action");
+        assert_eq!(final_answer, "Done.");
+        assert_eq!(response.provider_session_id, "turn-1");
+
+        server.await.expect("test server should finish");
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        let bodies = request_bodies
+            .lock()
+            .expect("request bodies lock should not be poisoned");
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0].contains("Inspect the repo."));
+        assert!(bodies[1].contains("Nucleus action contract"));
+        assert!(bodies[1].contains("I should inspect the repo next"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
     fn preserves_provider_native_input_siblings_for_direct_tool_calls() {
         let action = parse_worker_action(
             r#"{"action":"tool_call","tool":"command.session.write","session_id":"session-1","input":"q\n"}"#,
@@ -13184,6 +13310,75 @@ for line in sys.stdin:
             mime_type: "image/png".to_string(),
             data_url: "data:image/png;base64,iVBORw0KGgo=".to_string(),
         }
+    }
+
+    async fn read_test_http_body(socket: &mut tokio::net::TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let header_end = loop {
+            let read = socket
+                .read(&mut chunk)
+                .await
+                .expect("test request should read");
+            assert!(read > 0, "test request closed before headers");
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(index) = http_header_end(&buffer) {
+                break index;
+            }
+        };
+        let content_start = header_end + 4;
+        let headers = String::from_utf8_lossy(&buffer[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+
+        while buffer.len() < content_start + content_length {
+            let read = socket
+                .read(&mut chunk)
+                .await
+                .expect("test request body should read");
+            assert!(read > 0, "test request closed before body");
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+
+        String::from_utf8_lossy(&buffer[content_start..content_start + content_length]).to_string()
+    }
+
+    fn http_header_end(buffer: &[u8]) -> Option<usize> {
+        buffer.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    async fn write_test_openai_sse_response(
+        socket: &mut tokio::net::TcpStream,
+        id: &str,
+        content: &str,
+    ) {
+        let chunk = serde_json::json!({
+            "id": id,
+            "choices": [
+                {
+                    "delta": {
+                        "content": content,
+                    },
+                },
+            ],
+        });
+        let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("test response should write");
     }
 
     fn test_session_record(id: &str, title: &str, working_dir: &Path) -> SessionRecord {
