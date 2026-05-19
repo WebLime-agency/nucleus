@@ -53,10 +53,12 @@ pub enum WorkerActionParseError {
 }
 
 impl WorkerActionParseError {
-    pub fn is_repairable_json_error(&self) -> bool {
+    pub fn is_repairable_contract_error(&self) -> bool {
         matches!(
             self,
-            WorkerActionParseError::NoJsonObject | WorkerActionParseError::MalformedJson { .. }
+            WorkerActionParseError::NoJsonObject
+                | WorkerActionParseError::MalformedJson { .. }
+                | WorkerActionParseError::InvalidActionShape
         )
     }
 }
@@ -496,10 +498,15 @@ fn format_structured_final_answer_object(
     object: &serde_json::Map<String, Value>,
 ) -> Option<String> {
     let mut lines = Vec::new();
+    if let Some(value) = object.get("message") {
+        if let Some(body) = format_structured_final_answer_body(value) {
+            lines.push(body);
+        }
+    }
+
     let ordered_keys = [
         "status",
         "summary",
-        "message",
         "publication_status",
         "publication_summary",
         "pr_url",
@@ -525,7 +532,7 @@ fn format_structured_final_answer_object(
     }
 
     for (key, value) in object {
-        if ordered_keys.contains(&key.as_str()) {
+        if key == "message" || ordered_keys.contains(&key.as_str()) {
             continue;
         }
         if let Some(line) = format_structured_final_answer_field(key, value) {
@@ -537,6 +544,36 @@ fn format_structured_final_answer_object(
         None
     } else {
         Some(lines.join("\n"))
+    }
+}
+
+fn format_structured_final_answer_body(value: &Value) -> Option<String> {
+    if is_empty_json_value(value) {
+        return None;
+    }
+
+    match value {
+        Value::String(value) => non_empty_trimmed(value),
+        Value::Array(items) => {
+            let items = items
+                .iter()
+                .filter_map(format_final_answer_list_item)
+                .collect::<Vec<_>>();
+            if items.is_empty() {
+                None
+            } else {
+                Some(
+                    items
+                        .into_iter()
+                        .map(|item| format!("- {item}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            }
+        }
+        Value::Object(object) => format_structured_final_answer_object(object),
+        Value::Bool(_) | Value::Number(_) => Some(format_inline_final_answer_value(value)),
+        Value::Null => None,
     }
 }
 
@@ -669,6 +706,9 @@ fn normalize_worker_tool_call_value(value: &Value) -> Result<WorkerAction, Worke
             let mut inline_args = object.clone();
             inline_args.remove("action");
             inline_args.remove("kind");
+            if is_provider_tool_call_type(object.get("type")) {
+                inline_args.remove("type");
+            }
             inline_args.remove("tool");
             inline_args.remove("tool_name");
             inline_args.remove("name");
@@ -696,6 +736,18 @@ fn normalize_worker_tool_call_value(value: &Value) -> Result<WorkerAction, Worke
         tool,
         args,
     })
+}
+
+fn is_provider_tool_call_type(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_str)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "tool_call" | "function_call"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn decode_worker_tool_args(args: Value) -> Value {
@@ -854,7 +906,7 @@ mod tests {
                 tool: "nucleus_repo_search".to_string()
             }
         );
-        assert!(!error.is_repairable_json_error());
+        assert!(!error.is_repairable_contract_error());
     }
 
     #[test]
@@ -863,7 +915,7 @@ mod tests {
             .expect_err("valid JSON without Nucleus action shape should be rejected");
 
         assert_eq!(error, WorkerActionParseError::InvalidActionShape);
-        assert!(!error.is_repairable_json_error());
+        assert!(error.is_repairable_contract_error());
     }
 
     #[test]
@@ -876,7 +928,7 @@ mod tests {
             error,
             WorkerActionParseError::MalformedJson { .. }
         ));
-        assert!(error.is_repairable_json_error());
+        assert!(error.is_repairable_contract_error());
     }
 
     #[test]
@@ -1017,6 +1069,78 @@ mod tests {
     }
 
     #[test]
+    fn final_answer_message_field_renders_as_primary_body() {
+        let action = parse_worker_action(r#"{"kind":"final_answer","message":"Understood."}"#)
+            .expect("kind/message final answer should normalize");
+
+        let WorkerAction::FinalAnswer { final_answer, .. } = action else {
+            panic!("expected final answer");
+        };
+
+        assert_eq!(final_answer, "Understood.");
+        assert!(!final_answer.contains("Message:"));
+    }
+
+    #[test]
+    fn nested_final_answer_message_field_renders_as_primary_body() {
+        let action = parse_worker_action(
+            r#"{"kind":"final_answer","final_answer":{"message":"Understood."}}"#,
+        )
+        .expect("nested message final answer should normalize");
+
+        let WorkerAction::FinalAnswer { final_answer, .. } = action else {
+            panic!("expected final answer");
+        };
+
+        assert_eq!(final_answer, "Understood.");
+        assert!(!final_answer.contains("Message:"));
+    }
+
+    #[test]
+    fn structured_final_answer_keeps_metadata_labels_without_labeling_body() {
+        let action = parse_worker_action(
+            r#"{"kind":"final_answer","final_answer":{"message":"Published the PR.","publication_status":"published","publication_summary":"Opened a ready PR against dev.","pr_url":"https://github.com/WebLime-agency/nucleus/pull/202","source_branch":"codex/issue-202-final-answer-normalization","target_branch":"dev","validation_status":"passed","browser_verification_status":"not_required","cleanup_status":"clean"}}"#,
+        )
+        .expect("structured final answer should normalize");
+
+        let WorkerAction::FinalAnswer { final_answer, .. } = action else {
+            panic!("expected final answer");
+        };
+
+        assert!(final_answer.starts_with("Published the PR.\n"));
+        assert!(!final_answer.contains("Message:"));
+        assert!(final_answer.contains("Publication status: published"));
+        assert!(final_answer.contains("Publication summary: Opened a ready PR against dev."));
+        assert!(
+            final_answer.contains("PR URL: https://github.com/WebLime-agency/nucleus/pull/202")
+        );
+        assert!(final_answer.contains("Source branch: codex/issue-202-final-answer-normalization"));
+        assert!(final_answer.contains("Target branch: dev"));
+        assert!(final_answer.contains("Validation status: passed"));
+        assert!(final_answer.contains("Browser verification status: not_required"));
+        assert!(final_answer.contains("Cleanup status: clean"));
+    }
+
+    #[test]
+    fn structured_final_answer_array_fields_render_as_markdown_bullets() {
+        let action = parse_worker_action(
+            r#"{"kind":"final_answer","final_answer":{"message":"Validation complete.","validation":["cargo test -p nucleus-daemon worker_action passed","cargo fmt --all --check passed"],"remaining":["Wait for CI","Do not merge"],"next":["Open review","Address feedback if needed"]}}"#,
+        )
+        .expect("structured final answer with arrays should normalize");
+
+        let WorkerAction::FinalAnswer { final_answer, .. } = action else {
+            panic!("expected final answer");
+        };
+
+        assert!(final_answer.starts_with("Validation complete.\n"));
+        assert!(final_answer.contains(
+            "Validation:\n- cargo test -p nucleus-daemon worker_action passed\n- cargo fmt --all --check passed"
+        ));
+        assert!(final_answer.contains("Remaining:\n- Wait for CI\n- Do not merge"));
+        assert!(final_answer.contains("Next:\n- Open review\n- Address feedback if needed"));
+    }
+
+    #[test]
     fn accepts_nested_structured_final_answer_object() {
         let action = parse_worker_action(
             r#"{"final_answer":{"status":"blocked_without_browser_verification","summary":"Code validation passed but browser verification was unavailable.","message":"PR publication is blocked until rendered UI behavior is verified.","validation":["cargo test -p nucleus-daemon worker_action passed","cargo fmt --all --check passed"],"browser_verification_status":"unavailable","remaining":["Verify the UI through the daemon-owned Browser runtime"],"cleanup_status":"clean"}}"#,
@@ -1042,9 +1166,11 @@ mod tests {
                 "Summary: Code validation passed but browser verification was unavailable."
             )
         );
-        assert!(final_answer.contains(
-            "Message: PR publication is blocked until rendered UI behavior is verified."
-        ));
+        assert!(
+            final_answer
+                .starts_with("PR publication is blocked until rendered UI behavior is verified.\n")
+        );
+        assert!(!final_answer.contains("Message:"));
         assert!(
             final_answer
                 .contains("Validation:\n- cargo test -p nucleus-daemon worker_action passed")
@@ -1213,5 +1339,28 @@ mod tests {
                 .as_str()
                 .is_some_and(|command| command.contains("text.replace") && command.contains("PY"))
         );
+    }
+
+    #[test]
+    fn preserves_inline_type_arg_for_mcp_direct_tool_call() {
+        let action = parse_worker_action(
+            r#"{"tool":"mcp.issue_tracker.create","type":"issue","id":"123","title":"Fix login"}"#,
+        )
+        .expect("mcp direct tool call should preserve legitimate type arg");
+
+        let WorkerAction::ToolCall {
+            summary,
+            tool,
+            args,
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(summary, "Run the requested Nucleus action.");
+        assert_eq!(tool, "mcp.issue_tracker.create");
+        assert_eq!(args["type"], "issue");
+        assert_eq!(args["id"], "123");
+        assert_eq!(args["title"], "Fix login");
     }
 }
