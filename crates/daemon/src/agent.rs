@@ -856,13 +856,13 @@ pub async fn start_prompt_job(
     execution_prompt: String,
     compiler_role: String,
 ) -> Result<SessionDetail, ApiError> {
-    let memory_outcomes =
-        crate::save_explicit_memory_from_prompt(&state, &current.session, &payload.prompt).await?;
     if current.session.state == "paused" {
         return Err(ApiError::bad_request(
             "this session has a paused job that must be resumed or canceled first",
         ));
     }
+    let memory_outcomes =
+        crate::save_explicit_memory_from_prompt(&state, &current.session, &payload.prompt).await?;
 
     let prompt_excerpt = excerpt(&execution_prompt, 160);
     let visible_prompt = payload.prompt.trim().to_string();
@@ -12950,6 +12950,96 @@ Cleanup status: clean";
             "assistant response should explicitly explain the degradation: {}",
             assistant_turn.content
         );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn paused_session_rejects_prompt_before_explicit_memory_write() {
+        let state_dir = test_state_dir("paused-session-memory-guard");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let session_id = "session-paused-memory-guard".to_string();
+        state
+            .store
+            .create_session(SessionRecord {
+                id: session_id.clone(),
+                title: "Paused memory guard".to_string(),
+                profile_id: String::new(),
+                profile_title: String::new(),
+                route_id: String::new(),
+                route_title: String::new(),
+                scope: "ad_hoc".to_string(),
+                project_id: String::new(),
+                project_title: String::new(),
+                project_path: String::new(),
+                project_ids: Vec::new(),
+                provider: "openai_compatible".to_string(),
+                model: "cx/gpt-5.4".to_string(),
+                provider_base_url: "http://127.0.0.1:1234/v1".to_string(),
+                provider_api_key: String::new(),
+                working_dir: workspace_root.display().to_string(),
+                working_dir_kind: "workspace_scratch".to_string(),
+                workspace_mode: "scratch_only".to_string(),
+                source_project_path: String::new(),
+                git_root: String::new(),
+                worktree_path: String::new(),
+                git_branch: String::new(),
+                git_base_ref: String::new(),
+                git_head: String::new(),
+                git_dirty: false,
+                git_untracked_count: 0,
+                git_remote_tracking_branch: String::new(),
+                workspace_warnings: Vec::new(),
+                approval_mode: "ask".to_string(),
+                execution_mode: "act".to_string(),
+                run_budget_mode: "inherit".to_string(),
+            })
+            .expect("session should persist");
+        state
+            .store
+            .update_session(
+                &session_id,
+                SessionPatch {
+                    state: Some("paused".to_string()),
+                    ..SessionPatch::default()
+                },
+            )
+            .expect("pause session");
+
+        let payload = SessionPromptRequest {
+            prompt: "remember that I prefer dark mode".to_string(),
+            images: Vec::new(),
+            role: "main".to_string(),
+        };
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        let err = start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            payload,
+            current,
+            "remember that I prefer dark mode".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect_err("paused session should reject prompt");
+        assert!(
+            err.message
+                .contains("paused job that must be resumed or canceled first"),
+            "unexpected error: {:?}",
+            err
+        );
+        assert!(state.store.list_memory_entries().unwrap().is_empty());
 
         let _ = fs::remove_dir_all(&state_dir);
     }
