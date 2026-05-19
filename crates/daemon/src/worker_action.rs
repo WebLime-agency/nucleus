@@ -502,6 +502,7 @@ fn normalize_worker_final_answer_value(
         .ok_or(WorkerActionParseError::InvalidActionShape)?;
     let browser_verification = object
         .get("browser_verification")
+        .or_else(|| nested_final_answer.and_then(|value| value.get("browser_verification")))
         .and_then(|value| serde_json::from_value::<BrowserVerificationClaim>(value.clone()).ok());
 
     Ok(WorkerAction::FinalAnswer {
@@ -1452,6 +1453,28 @@ mod tests {
             panic!("expected final answer with browser verification");
         };
 
+        assert_eq!(claim.status, "passed");
+        assert_eq!(claim.summary, "Clicked the dropdown.");
+        assert_eq!(claim.artifact_ids, vec!["artifact-1".to_string()]);
+    }
+
+    #[test]
+    fn parses_nested_final_answer_browser_verification_claim() {
+        let action = parse_worker_action(
+            r#"{"kind":"final_answer","summary":"verified UI","final_answer":{"message":"Done.","browser_verification":{"status":"passed","summary":"Clicked the dropdown.","artifact_ids":["artifact-1"]}}}"#,
+        )
+        .expect("nested browser verification claim should parse");
+
+        let WorkerAction::FinalAnswer {
+            final_answer,
+            browser_verification: Some(claim),
+            ..
+        } = action
+        else {
+            panic!("expected final answer with browser verification");
+        };
+
+        assert_eq!(final_answer, "Done.");
         assert_eq!(claim.status, "passed");
         assert_eq!(claim.summary, "Clicked the dropdown.");
         assert_eq!(claim.artifact_ids, vec!["artifact-1".to_string()]);
