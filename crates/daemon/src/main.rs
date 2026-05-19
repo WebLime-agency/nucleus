@@ -1248,11 +1248,13 @@ fn upsert_memory_from_request(
     let scope_kind = normalize_memory_scope_kind(&payload.scope_kind)?;
     let scope_id = payload.scope_id.trim();
     let title = payload.title.trim();
-    let content = security::RedactionSet::new().redact_text(payload.content.trim());
+    let raw_content = payload.content.trim();
+    let content = security::RedactionSet::new().redact_text(raw_content);
     if scope_id.is_empty()
         || title.is_empty()
         || content.is_empty()
-        || contains_credential_like_value(&content)
+        || contains_credential_like_value(raw_content)
+        || content.contains("[REDACTED_SECRET]")
     {
         return Err(ApiError::bad_request(
             "memory scope, title, and non-secret content are required",
@@ -10759,6 +10761,31 @@ mod tests {
                 .content
                 .contains("https://registry.npmjs.org/@types/node")
         );
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn prompt_explicit_remember_rejects_token_like_content_redacted_before_validation() {
+        let (state_dir, state) = test_named_app_state("memory-prompt-redacted-secret-reject");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session = create_test_persisted_session(
+            &state,
+            "memory-prompt-redacted-secret-reject",
+            &workspace_root,
+        );
+
+        let error =
+            save_explicit_memory_from_prompt(&state, &session, "remember that sk-super-secret")
+                .await
+                .expect_err("token-only explicit remember should fail");
+        assert!(
+            error
+                .message
+                .contains("scope, title, and content are required")
+                || error.message.contains("non-secret")
+        );
+        assert!(state.store.list_memory_entries().unwrap().is_empty());
         let _ = fs::remove_dir_all(&state_dir);
     }
 
