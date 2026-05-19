@@ -861,22 +861,6 @@ pub async fn start_prompt_job(
             "this session has a paused job that must be resumed or canceled first",
         ));
     }
-    let memory_outcomes =
-        match crate::save_explicit_memory_from_prompt(&state, &current.session, &payload.prompt)
-            .await
-        {
-            Ok(outcomes) => outcomes,
-            Err(error) => vec![MemoryOutcome {
-                kind: "explicit_save".to_string(),
-                state: "rejected".to_string(),
-                memory_id: String::new(),
-                candidate_id: String::new(),
-                dedupe_key: String::new(),
-                title: "Explicit memory not saved".to_string(),
-                detail: error.message,
-            }],
-        };
-
     let prompt_excerpt = excerpt(&execution_prompt, 160);
     let visible_prompt = payload.prompt.trim().to_string();
     let job_id = Uuid::new_v4().to_string();
@@ -1004,6 +988,22 @@ pub async fn start_prompt_job(
         &payload.images,
         &compiler_role,
     )?;
+
+    let memory_outcomes =
+        match crate::save_explicit_memory_from_prompt(&state, &current.session, &payload.prompt)
+            .await
+        {
+            Ok(outcomes) => outcomes,
+            Err(error) => vec![MemoryOutcome {
+                kind: "explicit_save".to_string(),
+                state: "rejected".to_string(),
+                memory_id: String::new(),
+                candidate_id: String::new(),
+                dedupe_key: String::new(),
+                title: "Explicit memory not saved".to_string(),
+                detail: error.message,
+            }],
+        };
 
     let checkpoint = WorkerCheckpoint {
         session_id: session_id.clone(),

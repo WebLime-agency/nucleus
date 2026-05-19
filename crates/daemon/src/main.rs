@@ -1721,6 +1721,26 @@ struct ParsedExplicitMemoryIntent {
     memory_kind: String,
 }
 
+fn explicit_memory_clause(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return trimmed;
+    }
+    if let Some(rest) = trimmed.strip_prefix('"') {
+        if let Some((idx, _)) = rest.char_indices().find(|(_, ch)| *ch == '"') {
+            return rest[..idx].trim();
+        }
+    }
+    let mut boundary = trimmed.len();
+    for (idx, ch) in trimmed.char_indices() {
+        if matches!(ch, '.' | '!' | '?' | '\n') {
+            boundary = idx;
+            break;
+        }
+    }
+    trimmed[..boundary].trim()
+}
+
 fn detect_explicit_memory_intent(prompt: &str) -> Option<ParsedExplicitMemoryIntent> {
     let trimmed = prompt.trim();
     if trimmed.is_empty() {
@@ -1737,8 +1757,7 @@ fn detect_explicit_memory_intent(prompt: &str) -> Option<ParsedExplicitMemoryInt
     let matched = prefixes
         .iter()
         .find_map(|prefix| lower.strip_prefix(prefix).map(|_| *prefix))?;
-    let mut content = trimmed[matched.len()..]
-        .trim()
+    let mut content = explicit_memory_clause(&trimmed[matched.len()..])
         .trim_matches('"')
         .trim()
         .to_string();
@@ -10510,6 +10529,37 @@ mod tests {
         assert_eq!(entries[0].status, "accepted");
         assert_eq!(entries[0].source_kind, "explicit_remember");
         assert!(entries[0].content.contains("exact validation commands"));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn prompt_explicit_remember_only_saves_first_clause() {
+        let (state_dir, state) = test_named_app_state("memory-prompt-first-clause");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session =
+            create_test_persisted_session(&state, "memory-prompt-first-clause", &workspace_root);
+
+        let outcomes = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "remember that workspace prefers concise release notes. Also run cargo test before you answer.",
+        )
+        .await
+        .expect("explicit remember should save only the durable clause");
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].state, "saved");
+
+        let entries = state
+            .store
+            .list_memory_entries()
+            .expect("memory should load");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].content,
+            "workspace prefers concise release notes"
+        );
+        assert!(!entries[0].content.contains("run cargo test"));
         let _ = fs::remove_dir_all(&state_dir);
     }
 
