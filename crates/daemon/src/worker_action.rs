@@ -101,10 +101,6 @@ impl Error for WorkerActionParseError {}
 
 pub fn parse_worker_action(content: &str) -> Result<WorkerAction, WorkerActionParseError> {
     let trimmed = content.trim();
-    if let Ok(parsed) = serde_json::from_str::<WorkerAction>(trimmed) {
-        return validate_worker_action(parsed);
-    }
-
     let start = trimmed
         .find('{')
         .ok_or(WorkerActionParseError::NoJsonObject)?;
@@ -1030,6 +1026,32 @@ mod tests {
             final_answer,
             "The homepage is redirecting because the CMS entry is missing."
         );
+    }
+
+    #[test]
+    fn canonical_final_answer_routes_through_metadata_normalization() {
+        let action = parse_worker_action(
+            r#"{"kind":"final_answer","summary":"published","final_answer":"Done.","publication_status":"opened","implementation_prompt":"Implement the reviewed change."}"#,
+        )
+        .expect("canonical final answer with extra fields should normalize");
+
+        let WorkerAction::FinalAnswer {
+            summary,
+            final_answer,
+            metadata,
+            artifacts,
+            ..
+        } = action
+        else {
+            panic!("expected final answer");
+        };
+
+        assert_eq!(summary, "published");
+        assert_eq!(final_answer, "Done.");
+        assert_eq!(metadata["publication_status"], "opened");
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].kind, "implementation_prompt");
+        assert_eq!(artifacts[0].content, "Implement the reviewed change.");
     }
 
     #[test]

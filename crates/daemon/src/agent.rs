@@ -4009,7 +4009,10 @@ fn contains_blocked_terminal_result_language(text: &str) -> bool {
         "blocked on",
         "cannot continue",
         "cannot honestly open the pr",
-        "unable to",
+        "unable to continue",
+        "unable to complete",
+        "unable to proceed",
+        "unable to perform",
         "permission denied",
         "access denied",
         "not possible",
@@ -11576,6 +11579,18 @@ Remaining:\n\
 
         assert_eq!(metadata["terminal_status"], "completed");
         assert_eq!(metadata["blocked"], false);
+
+        let unable_to_reproduce_metadata = final_answer_terminal_metadata(
+            "Validated fix.",
+            "I was unable to reproduce the issue after the fix, and validation passed.",
+            &json!({}),
+            &[],
+            5,
+            3,
+            &PublicationOutcomePatch::default(),
+        );
+        assert_eq!(unable_to_reproduce_metadata["terminal_status"], "completed");
+        assert_eq!(unable_to_reproduce_metadata["blocked"], false);
 
         let budget_metadata = final_answer_terminal_metadata(
             "Checkpoint saved.",
