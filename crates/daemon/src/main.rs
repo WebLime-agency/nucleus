@@ -1776,15 +1776,14 @@ fn infer_prompt_memory_scope(session: &SessionSummary) -> (String, String) {
 fn normalized_memory_overlap_key(
     scope_kind: &str,
     scope_id: &str,
-    title: &str,
+    _title: &str,
     content: &str,
 ) -> String {
     let mut h = Sha256::new();
     h.update(format!(
-        "{}:{}:{}:{}",
+        "{}:{}:{}",
         scope_kind,
         scope_id,
-        title.to_lowercase(),
         content.to_lowercase()
     ));
     format!("memory-overlap:{:x}", h.finalize())
@@ -10526,50 +10525,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_prompt_repeat_after_title_edit_does_not_overwrite_existing_memory() {
+        let (state_dir, state) = test_named_app_state("memory-prompt-title-edit-dedupe");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session = create_test_persisted_session(
+            &state,
+            "memory-prompt-title-edit-dedupe",
+            &workspace_root,
+        );
+
+        let first = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "remember that I prefer concise release notes",
+        )
+        .await
+        .expect("first explicit remember should save");
+        assert_eq!(first[0].state, "saved");
+
+        let mut existing = state.store.list_memory_entries().unwrap().remove(0);
+        existing.title = "Manually renamed title".to_string();
+        state
+            .store
+            .upsert_memory_entry(&existing)
+            .expect("manual rename should persist");
+
+        let second = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "remember that I prefer concise release notes",
+        )
+        .await
+        .expect("repeat explicit remember should dedupe");
+        assert_eq!(second[0].state, "ignored");
+        assert_eq!(second[0].memory_id, existing.id);
+
+        let entries = state.store.list_memory_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, existing.id);
+        assert_eq!(entries[0].title, "Manually renamed title");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
     async fn prompt_non_durable_remember_does_not_save_memory() {
-        #[tokio::test]
-        async fn explicit_prompt_repeat_after_title_edit_does_not_overwrite_existing_memory() {
-            let (state_dir, state) = test_named_app_state("memory-prompt-title-edit-dedupe");
-            let workspace_root = state_dir.join("workspace");
-            fs::create_dir_all(&workspace_root).expect("workspace should exist");
-            let session = create_test_persisted_session(
-                &state,
-                "memory-prompt-title-edit-dedupe",
-                &workspace_root,
-            );
-
-            let first = save_explicit_memory_from_prompt(
-                &state,
-                &session,
-                "remember that I prefer concise release notes",
-            )
-            .await
-            .expect("first explicit remember should save");
-            assert_eq!(first[0].state, "saved");
-
-            let mut existing = state.store.list_memory_entries().unwrap().remove(0);
-            existing.title = "Manually renamed title".to_string();
-            state
-                .store
-                .upsert_memory_entry(&existing)
-                .expect("manual rename should persist");
-
-            let second = save_explicit_memory_from_prompt(
-                &state,
-                &session,
-                "remember that I prefer concise release notes",
-            )
-            .await
-            .expect("repeat explicit remember should dedupe");
-            assert_eq!(second[0].state, "ignored");
-            assert_eq!(second[0].memory_id, existing.id);
-
-            let entries = state.store.list_memory_entries().unwrap();
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].id, existing.id);
-            assert_eq!(entries[0].title, "Manually renamed title");
-            let _ = fs::remove_dir_all(&state_dir);
-        }
         let (state_dir, state) = test_named_app_state("memory-prompt-nondurable");
         let workspace_root = state_dir.join("workspace");
         fs::create_dir_all(&workspace_root).expect("workspace should exist");
