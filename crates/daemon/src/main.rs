@@ -1733,7 +1733,15 @@ fn explicit_memory_clause(raw: &str) -> &str {
     }
     let mut boundary = trimmed.len();
     for (idx, ch) in trimmed.char_indices() {
-        if matches!(ch, '.' | '!' | '?' | '\n') {
+        let remainder = &trimmed[idx..];
+        if remainder.starts_with(". Also ")
+            || remainder.starts_with(". also ")
+            || remainder.starts_with("! Also ")
+            || remainder.starts_with("! also ")
+            || remainder.starts_with("? Also ")
+            || remainder.starts_with("? also ")
+            || ch == '\n'
+        {
             boundary = idx;
             break;
         }
