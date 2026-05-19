@@ -2090,7 +2090,21 @@ fn contains_credential_like_value(text: &str) -> bool {
         || lower.contains("api_key=")
         || lower.contains("access_token=")
         || lower.contains("refresh_token=")
-        || lower.contains("://") && lower.contains('@')
+        || contains_url_userinfo(&lower)
+}
+
+fn contains_url_userinfo(text: &str) -> bool {
+    text.split_whitespace().any(|token| {
+        let Some(scheme_idx) = token.find("://") else {
+            return false;
+        };
+        let authority = &token[scheme_idx + 3..];
+        let authority_end = authority
+            .find(|c| ['/', '?', '#'].contains(&c))
+            .unwrap_or(authority.len());
+        let host = &authority[..authority_end];
+        host.contains(':') && host.contains('@')
+    })
 }
 async fn record_memory_audit(
     state: &AppState,
@@ -10585,6 +10599,30 @@ mod tests {
         .expect("non-durable remember should not error");
         assert!(outcomes.is_empty());
         assert!(state.store.list_memory_entries().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn prompt_explicit_remember_allows_non_secret_scoped_package_url() {
+        let (state_dir, state) = test_named_app_state("memory-prompt-nonsecret-url");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session =
+            create_test_persisted_session(&state, "memory-prompt-nonsecret-url", &workspace_root);
+
+        let outcomes = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "remember that our package mirror is https://registry.npmjs.org/@types/node",
+        )
+        .await
+        .expect("non-secret package URL should save");
+        assert_eq!(outcomes[0].state, "saved");
+        let entries = state.store.list_memory_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0]
+            .content
+            .contains("https://registry.npmjs.org/@types/node"));
         let _ = fs::remove_dir_all(&state_dir);
     }
 
