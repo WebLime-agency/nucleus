@@ -862,7 +862,20 @@ pub async fn start_prompt_job(
         ));
     }
     let memory_outcomes =
-        crate::save_explicit_memory_from_prompt(&state, &current.session, &payload.prompt).await?;
+        match crate::save_explicit_memory_from_prompt(&state, &current.session, &payload.prompt)
+            .await
+        {
+            Ok(outcomes) => outcomes,
+            Err(error) => vec![MemoryOutcome {
+                kind: "explicit_save".to_string(),
+                state: "rejected".to_string(),
+                memory_id: String::new(),
+                candidate_id: String::new(),
+                dedupe_key: String::new(),
+                title: "Explicit memory not saved".to_string(),
+                detail: error.message,
+            }],
+        };
 
     let prompt_excerpt = excerpt(&execution_prompt, 160);
     let visible_prompt = payload.prompt.trim().to_string();
