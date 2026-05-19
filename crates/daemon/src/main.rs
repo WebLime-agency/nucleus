@@ -1742,6 +1742,9 @@ fn detect_explicit_memory_intent(prompt: &str) -> Option<ParsedExplicitMemoryInt
         .trim_matches('"')
         .trim()
         .to_string();
+    if let Some(rest) = content.strip_prefix("that ") {
+        content = rest.trim().to_string();
+    }
     content = content.trim_end_matches('.').trim().to_string();
     if content.len() < 8 {
         return None;
@@ -10533,6 +10536,45 @@ mod tests {
         )
         .await
         .expect("duplicate explicit remember should not fail");
+        assert_eq!(second[0].state, "ignored");
+        assert_eq!(state.store.list_memory_entries().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn prompt_moving_forward_please_remember_that_strips_optional_that() {
+        let (state_dir, state) = test_named_app_state("memory-prompt-moving-forward-that");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session = create_test_persisted_session(
+            &state,
+            "memory-prompt-moving-forward-that",
+            &workspace_root,
+        );
+
+        let first = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "moving forward please remember that workspace prefers concise release notes.",
+        )
+        .await
+        .expect("moving-forward remember with optional that should save");
+        assert_eq!(first[0].state, "saved");
+
+        let entries = state.store.list_memory_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].content,
+            "workspace prefers concise release notes"
+        );
+
+        let second = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "remember that workspace prefers concise release notes.",
+        )
+        .await
+        .expect("normalized remember phrasing should dedupe");
         assert_eq!(second[0].state, "ignored");
         assert_eq!(state.store.list_memory_entries().unwrap().len(), 1);
         let _ = fs::remove_dir_all(&state_dir);
