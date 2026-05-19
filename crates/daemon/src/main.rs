@@ -2103,7 +2103,7 @@ fn contains_url_userinfo(text: &str) -> bool {
             .find(|c| ['/', '?', '#'].contains(&c))
             .unwrap_or(authority.len());
         let host = &authority[..authority_end];
-        host.contains(':') && host.contains('@')
+        host.contains('@')
     })
 }
 async fn record_memory_audit(
@@ -10643,6 +10643,34 @@ mod tests {
         )
         .await
         .expect_err("secret-like explicit remember should fail");
+        assert!(
+            error
+                .message
+                .contains("scope, title, and content are required")
+                || error.message.contains("non-secret")
+        );
+        assert!(state.store.list_memory_entries().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn prompt_explicit_remember_rejects_token_in_url_userinfo() {
+        let (state_dir, state) = test_named_app_state("memory-prompt-userinfo-secret-reject");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session = create_test_persisted_session(
+            &state,
+            "memory-prompt-userinfo-secret-reject",
+            &workspace_root,
+        );
+
+        let error = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "remember that the repo lives at https://ghp_super_secret@github.com/org/repo.git",
+        )
+        .await
+        .expect_err("token-in-userinfo explicit remember should fail");
         assert!(
             error
                 .message
