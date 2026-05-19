@@ -3771,7 +3771,7 @@ fn job_prompt_requires_action(job: &JobSummary) -> bool {
         return false;
     }
 
-    [
+    let phrase_match = [
         "approved pr",
         "can merge",
         "merge pr",
@@ -3790,7 +3790,6 @@ fn job_prompt_requires_action(job: &JobSummary) -> bool {
         "publish the branch",
         "implement",
         "fix ",
-        "repair",
         "edit ",
         "run ",
         "validate",
@@ -3809,7 +3808,23 @@ fn job_prompt_requires_action(job: &JobSummary) -> bool {
         "release to",
     ]
     .iter()
-    .any(|needle| text.contains(needle))
+    .any(|needle| text.contains(needle));
+    phrase_match || contains_normalized_word(&text, "repair")
+}
+
+fn contains_normalized_word(text: &str, word: &str) -> bool {
+    text.match_indices(word).any(|(index, _)| {
+        let before = text[..index]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric());
+        let after_index = index + word.len();
+        let after = text[after_index..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric());
+        before && after
+    })
 }
 
 fn action_text_is_informational(text: &str) -> bool {
@@ -11439,6 +11454,8 @@ mod tests {
         let worker = test_worker_summary("zero-tool-draft", 100, 100);
         let mut job = test_publication_job_summary("zero-tool-draft");
         job.publication_requested = false;
+        job.title = "Text-only request".to_string();
+        job.purpose = "Session prompt".to_string();
         job.prompt_excerpt = "Draft a commit message and release notes for this diff.".to_string();
 
         assert!(!should_retry_zero_tool_action_final_answer(
@@ -11467,6 +11484,17 @@ mod tests {
             &job,
             "Comment ready",
             "Validation passed and the fix is ready.",
+            "act",
+            &worker,
+            1,
+            0,
+        ));
+
+        job.prompt_excerpt = "Prepare a short note for tomorrow's design review.".to_string();
+        assert!(!should_retry_zero_tool_action_final_answer(
+            &job,
+            "Prepared note",
+            "Here is a concise note for the design review.",
             "act",
             &worker,
             1,

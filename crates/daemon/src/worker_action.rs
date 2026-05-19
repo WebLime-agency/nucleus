@@ -475,8 +475,10 @@ fn normalize_worker_final_answer_value(
         collect_final_answer_metadata(nested, &mut metadata);
     }
     let mut artifacts = Vec::new();
+    collect_explicit_final_answer_artifacts(object, &mut artifacts);
     collect_final_answer_artifacts(object, &mut artifacts);
     if let Some(nested) = nested_final_answer {
+        collect_explicit_final_answer_artifacts(nested, &mut artifacts);
         collect_final_answer_artifacts(nested, &mut artifacts);
     }
     artifacts.sort_by_key(|artifact| final_answer_artifact_priority(&artifact.kind));
@@ -692,8 +694,93 @@ fn is_final_answer_control_key(key: &str) -> bool {
             | "answer"
             | "text"
             | "summary"
+            | "artifacts"
             | "browser_verification"
     )
+}
+
+fn collect_explicit_final_answer_artifacts(
+    object: &serde_json::Map<String, Value>,
+    artifacts: &mut Vec<FinalAnswerArtifact>,
+) {
+    let Some(value) = object.get("artifacts") else {
+        return;
+    };
+    push_explicit_final_answer_artifact(value, artifacts);
+}
+
+fn push_explicit_final_answer_artifact(value: &Value, artifacts: &mut Vec<FinalAnswerArtifact>) {
+    if is_empty_json_value(value) {
+        return;
+    }
+
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                push_explicit_final_answer_artifact(item, artifacts);
+            }
+        }
+        Value::Object(object) => {
+            let kind = object
+                .get("kind")
+                .and_then(Value::as_str)
+                .and_then(non_empty_trimmed)
+                .unwrap_or_else(|| "artifact".to_string());
+            let content = ["content", "body", "text", "message", "prompt", "comment"]
+                .iter()
+                .find_map(|field| object.get(*field).and_then(format_final_answer_body))
+                .unwrap_or_else(|| {
+                    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+                });
+            if content.trim().is_empty() {
+                return;
+            }
+
+            let title = object
+                .get("title")
+                .and_then(Value::as_str)
+                .and_then(non_empty_trimmed)
+                .unwrap_or_else(|| final_answer_artifact_title(&kind, "artifact"));
+            let mut metadata = Map::new();
+            if let Some(explicit) = object.get("metadata").and_then(Value::as_object) {
+                for (nested_key, nested_value) in explicit {
+                    if !is_empty_json_value(nested_value) {
+                        metadata.insert(nested_key.clone(), nested_value.clone());
+                    }
+                }
+            }
+            for (nested_key, nested_value) in object {
+                if [
+                    "kind", "title", "content", "body", "text", "message", "prompt", "comment",
+                    "metadata",
+                ]
+                .contains(&nested_key.as_str())
+                    || is_empty_json_value(nested_value)
+                {
+                    continue;
+                }
+                metadata.insert(nested_key.clone(), nested_value.clone());
+            }
+            artifacts.push(FinalAnswerArtifact {
+                kind,
+                title,
+                content,
+                metadata: Value::Object(metadata),
+            });
+        }
+        _ => {
+            let content = format_inline_final_answer_value(value);
+            if content.trim().is_empty() {
+                return;
+            }
+            artifacts.push(FinalAnswerArtifact {
+                kind: "artifact".to_string(),
+                title: "Artifact".to_string(),
+                content,
+                metadata: json!({}),
+            });
+        }
+    }
 }
 
 fn final_answer_artifact_kind(key: &str) -> Option<String> {
@@ -1052,6 +1139,34 @@ mod tests {
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].kind, "implementation_prompt");
         assert_eq!(artifacts[0].content, "Implement the reviewed change.");
+    }
+
+    #[test]
+    fn canonical_final_answer_artifacts_array_stays_artifacts() {
+        let action = parse_worker_action(
+            r#"{"kind":"final_answer","summary":"generated","final_answer":"Done.","artifacts":[{"kind":"implementation_prompt","title":"Implementation prompt","content":"Implement issue #209.","metadata":{"source":"worker"}},{"kind":"issue_comment","content":"Ready to post.","target":"issue-209"}]}"#,
+        )
+        .expect("canonical final answer artifacts should normalize");
+
+        let WorkerAction::FinalAnswer {
+            metadata,
+            artifacts,
+            ..
+        } = action
+        else {
+            panic!("expected final answer");
+        };
+
+        assert!(metadata.get("artifacts").is_none());
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts[0].kind, "implementation_prompt");
+        assert_eq!(artifacts[0].title, "Implementation prompt");
+        assert_eq!(artifacts[0].content, "Implement issue #209.");
+        assert_eq!(artifacts[0].metadata["source"], "worker");
+        assert_eq!(artifacts[1].kind, "issue_comment");
+        assert_eq!(artifacts[1].title, "Issue comment");
+        assert_eq!(artifacts[1].content, "Ready to post.");
+        assert_eq!(artifacts[1].metadata["target"], "issue-209");
     }
 
     #[test]
