@@ -1957,6 +1957,7 @@ async fn run_job_loop(
                     &worker,
                     step,
                     tool_calls,
+                    detail.child_jobs.len(),
                 ) {
                     retry_worker_final_answer(
                         state,
@@ -3746,9 +3747,11 @@ fn should_retry_zero_tool_action_final_answer(
     worker: &WorkerSummary,
     step_count: usize,
     tool_call_count: usize,
+    child_job_count: usize,
 ) -> bool {
     if execution_mode == "plan"
         || tool_call_count > 0
+        || child_job_count > 0
         || !has_remaining_worker_budget(worker, step_count, tool_call_count)
         || !job_prompt_requires_action(job)
     {
@@ -11477,6 +11480,7 @@ mod tests {
             &worker,
             1,
             0,
+            0,
         ));
         assert!(!should_retry_zero_tool_action_final_answer(
             &job,
@@ -11485,6 +11489,7 @@ mod tests {
             "act",
             &worker,
             1,
+            0,
             0,
         ));
         assert!(!should_retry_zero_tool_action_final_answer(
@@ -11495,6 +11500,17 @@ mod tests {
             &worker,
             1,
             0,
+            0,
+        ));
+        assert!(!should_retry_zero_tool_action_final_answer(
+            &job,
+            "Merged by child jobs",
+            "The approved PR was merged and the source branch was deleted.",
+            "act",
+            &worker,
+            1,
+            0,
+            2,
         ));
     }
 
@@ -11515,6 +11531,7 @@ mod tests {
             &worker,
             1,
             0,
+            0,
         ));
 
         job.prompt_excerpt = "Write an issue comment summarizing the proposed fix.".to_string();
@@ -11525,6 +11542,7 @@ mod tests {
             "act",
             &worker,
             1,
+            0,
             0,
         ));
 
@@ -11537,6 +11555,7 @@ mod tests {
             &worker,
             1,
             0,
+            0,
         ));
 
         job.prompt_excerpt = "Prepare a short note for tomorrow's design review.".to_string();
@@ -11547,6 +11566,7 @@ mod tests {
             "act",
             &worker,
             1,
+            0,
             0,
         ));
     }
