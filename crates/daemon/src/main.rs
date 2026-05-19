@@ -1726,11 +1726,6 @@ fn explicit_memory_clause(raw: &str) -> &str {
     if trimmed.is_empty() {
         return trimmed;
     }
-    if let Some(rest) = trimmed.strip_prefix('"') {
-        if let Some((idx, _)) = rest.char_indices().find(|(_, ch)| *ch == '"') {
-            return rest[..idx].trim();
-        }
-    }
     let mut boundary = trimmed.len();
     for (idx, ch) in trimmed.char_indices() {
         let remainder = &trimmed[idx..];
@@ -1765,10 +1760,23 @@ fn detect_explicit_memory_intent(prompt: &str) -> Option<ParsedExplicitMemoryInt
     let matched = prefixes
         .iter()
         .find_map(|prefix| lower.strip_prefix(prefix).map(|_| *prefix))?;
-    let mut content = explicit_memory_clause(&trimmed[matched.len()..])
-        .trim_matches('"')
-        .trim()
-        .to_string();
+    let raw_clause = explicit_memory_clause(&trimmed[matched.len()..]).trim();
+    let mut content = if let Some(rest) = raw_clause.strip_prefix('"') {
+        if let Some(closing_quote) = rest.find('"') {
+            let quoted = &rest[..closing_quote];
+            let remainder = rest[closing_quote + 1..].trim_start();
+            if remainder.is_empty() {
+                quoted.to_string()
+            } else {
+                format!("{} {}", quoted, remainder)
+            }
+        } else {
+            rest.to_string()
+        }
+    } else {
+        raw_clause.to_string()
+    };
+    content = content.trim().to_string();
     if let Some(rest) = content.strip_prefix("that ") {
         content = rest.trim().to_string();
     }
@@ -10700,6 +10708,31 @@ mod tests {
         .expect("non-durable remember should not error");
         assert!(outcomes.is_empty());
         assert!(state.store.list_memory_entries().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn prompt_explicit_remember_preserves_full_clause_after_leading_quoted_term() {
+        let (state_dir, state) = test_named_app_state("memory-prompt-leading-quoted-term");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session = create_test_persisted_session(
+            &state,
+            "memory-prompt-leading-quoted-term",
+            &workspace_root,
+        );
+
+        let outcomes = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "remember that \"Phoenix\" is the internal codename",
+        )
+        .await
+        .expect("leading quoted term should save full clause");
+        assert_eq!(outcomes[0].state, "saved");
+        let entries = state.store.list_memory_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "Phoenix is the internal codename");
         let _ = fs::remove_dir_all(&state_dir);
     }
 
