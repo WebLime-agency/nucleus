@@ -3871,6 +3871,8 @@ fn action_text_requests_text_only_artifact(text: &str) -> bool {
         "pull request comment",
         "pr description",
         "pull request description",
+        "pr summary",
+        "pull request summary",
         "pr body",
         "pull request body",
         "implementation prompt",
@@ -11548,6 +11550,18 @@ mod tests {
             &job,
             "Drafted issue comment",
             "Here is a comment body ready to post.",
+            "act",
+            &worker,
+            1,
+            0,
+            0,
+        ));
+
+        job.prompt_excerpt = "Write a PR summary for this fix.".to_string();
+        assert!(!should_retry_zero_tool_action_final_answer(
+            &job,
+            "Drafted PR summary",
+            "This PR normalizes final responses and keeps job metadata structured.",
             "act",
             &worker,
             1,
