@@ -10620,9 +10620,11 @@ mod tests {
         assert_eq!(outcomes[0].state, "saved");
         let entries = state.store.list_memory_entries().unwrap();
         assert_eq!(entries.len(), 1);
-        assert!(entries[0]
-            .content
-            .contains("https://registry.npmjs.org/@types/node"));
+        assert!(
+            entries[0]
+                .content
+                .contains("https://registry.npmjs.org/@types/node")
+        );
         let _ = fs::remove_dir_all(&state_dir);
     }
 
