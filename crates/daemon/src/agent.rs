@@ -3954,7 +3954,8 @@ fn final_answer_terminal_metadata(
     publication_patch: &PublicationOutcomePatch,
 ) -> Value {
     let text = normalize_action_item_text(&format!("{summary}\n{final_answer}"));
-    let blocked = contains_blocked_terminal_result_language(&text);
+    let blocked = contains_blocked_terminal_result_language(&text)
+        || publication_patch_terminal_status_is_blocked(publication_patch);
     let mut metadata = json!({
         "step_count": step_count,
         "tool_call_count": tool_call_count,
@@ -4019,6 +4020,14 @@ fn final_answer_terminal_metadata(
     }
 
     metadata
+}
+
+fn publication_patch_terminal_status_is_blocked(patch: &PublicationOutcomePatch) -> bool {
+    patch.publication_requested.unwrap_or(false)
+        && patch
+            .publication_status
+            .as_deref()
+            .is_some_and(|status| matches!(status, "blocked" | "not_opened" | "failed"))
 }
 
 fn contains_blocked_terminal_result_language(text: &str) -> bool {
@@ -11660,6 +11669,39 @@ Remaining:\n\
         assert_eq!(metadata["browser_verification_status"], "unavailable");
         assert_eq!(metadata["step_count"], 12);
         assert_eq!(metadata["tool_call_count"], 7);
+    }
+
+    #[test]
+    fn terminal_metadata_uses_structured_blocked_publication_outcome() {
+        let metadata = final_answer_terminal_metadata(
+            "Publication blocked",
+            "I could not open the PR yet.",
+            &json!({
+                "publication_status": "blocked",
+                "validation_status": "passed",
+                "browser_verification_status": "unavailable",
+                "cleanup_status": "clean"
+            }),
+            &[],
+            8,
+            4,
+            &PublicationOutcomePatch {
+                publication_requested: Some(true),
+                publication_status: Some("blocked".to_string()),
+                validation_status: Some("passed".to_string()),
+                browser_verification_status: Some("unavailable".to_string()),
+                cleanup_status: Some("clean".to_string()),
+                ..PublicationOutcomePatch::default()
+            },
+        );
+
+        assert_eq!(metadata["terminal_status"], "blocked");
+        assert_eq!(metadata["blocked"], true);
+        assert_eq!(metadata["publication_status"], "blocked");
+        assert_eq!(
+            metadata["final_response_metadata"]["publication_status"],
+            "blocked"
+        );
     }
 
     #[test]
