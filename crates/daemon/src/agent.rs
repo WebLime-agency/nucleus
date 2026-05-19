@@ -11,7 +11,7 @@ use base64::Engine as _;
 use nucleus_protocol::{
     ApprovalRequestSummary, ArtifactSummary, BrowserActionRequest, BrowserNavigateRequest,
     BrowserSnapshot, CommandSessionSummary, CreatePlaybookRequest, DaemonEvent, JobDetail,
-    JobSummary, McpServerRecord, McpToolRecord, PlaybookDetail, PlaybookSummary,
+    JobSummary, McpServerRecord, McpToolRecord, MemoryOutcome, PlaybookDetail, PlaybookSummary,
     PromptProgressUpdate, RunBudgetSummary, SessionDetail, SessionPromptRequest, SessionSummary,
     SessionTurn, SessionTurnImage, UpdatePlaybookRequest, WorkerSummary, WorkspaceProfileSummary,
     WorkspaceSummary,
@@ -856,6 +856,8 @@ pub async fn start_prompt_job(
     execution_prompt: String,
     compiler_role: String,
 ) -> Result<SessionDetail, ApiError> {
+    let memory_outcomes =
+        crate::save_explicit_memory_from_prompt(&state, &current.session, &payload.prompt).await?;
     if current.session.state == "paused" {
         return Err(ApiError::bad_request(
             "this session has a paused job that must be resumed or canceled first",
@@ -1023,6 +1025,7 @@ pub async fn start_prompt_job(
         } else {
             "Nucleus accepted the prompt with scoped image attachment(s) and created a Utility Worker."
         },
+        &memory_outcomes,
     )
     .await;
     let _ = publish_overview_event(&state).await;
@@ -1771,6 +1774,7 @@ async fn run_job_loop(
         "running",
         "Utility Worker running",
         "Nucleus is planning the next repo-inspection step.",
+        &[],
     )
     .await;
 
@@ -1853,6 +1857,7 @@ async fn run_job_loop(
                 "degraded",
                 "Vision unavailable for Utility Worker",
                 &detail,
+                &[],
             )
             .await;
             complete_job_with_final_answer(
@@ -1897,6 +1902,7 @@ async fn run_job_loop(
             "thinking",
             "Planning the next step",
             "The Utility Worker is deciding whether to inspect the repo or answer directly.",
+            &[],
         )
         .await;
 
@@ -2687,6 +2693,7 @@ async fn handle_tool_call_proposal(
             "paused",
             "Waiting for approval",
             &pause_reason,
+            &[],
         )
         .await;
         let _ = publish_overview_event(state).await;
@@ -2782,6 +2789,7 @@ async fn handle_child_job_proposal(
         "running",
         "Spawning Utility Subworkers",
         &summary,
+        &[],
     )
     .await;
     Ok(LoopDisposition::Continue)
@@ -2874,6 +2882,7 @@ async fn record_worker_progress_update(
         "running",
         summary,
         &excerpt(detail, 320),
+        &[],
     )
     .await;
     Ok(())
@@ -3304,6 +3313,7 @@ async fn complete_job_with_final_answer(
             "completed",
             "Utility Worker completed",
             "Nucleus persisted a clean assistant turn from the Utility Worker result.",
+            &[],
         )
         .await;
     } else {
@@ -5201,6 +5211,7 @@ async fn wait_for_write_lock(
                         "running",
                         "Waiting for write lock",
                         &detail,
+                        &[],
                     )
                     .await;
                     waiting_on = Some(conflict.owner_id);
@@ -5258,6 +5269,7 @@ async fn execute_pending_tool_action(
         "tooling",
         &format!("Running {}", tool),
         &pending.summary,
+        &[],
     )
     .await;
     if let Err(error) = state.store.update_tool_call(
@@ -10276,6 +10288,7 @@ async fn publish_prompt_status(
     status: &str,
     label: &str,
     detail: &str,
+    memory_outcomes: &[MemoryOutcome],
 ) {
     let _ = publish_prompt_progress_event(
         state,
@@ -10292,6 +10305,7 @@ async fn publish_prompt_status(
             route_title: session.route_title.clone(),
             attempt: 0,
             attempt_count: 0,
+            memory_outcomes: memory_outcomes.to_vec(),
             created_at: unix_timestamp(),
         },
     )
