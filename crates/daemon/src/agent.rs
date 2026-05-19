@@ -3034,6 +3034,21 @@ fn child_job_result_json(detail: &JobDetail) -> Result<Value> {
         "last_error": detail.job.last_error,
         "worker_count": detail.job.worker_count,
         "report": report,
+        "outcome": {
+            "publication_requested": detail.job.publication_requested,
+            "publication_status": detail.job.publication_status,
+            "publication_summary": detail.job.publication_summary,
+            "pr_url": detail.job.pr_url,
+            "source_branch": detail.job.source_branch,
+            "target_branch": detail.job.target_branch,
+            "validation_status": detail.job.validation_status,
+            "browser_verification_required": detail.job.browser_verification_required,
+            "browser_verification_status": detail.job.browser_verification_status,
+            "browser_verification_summary": detail.job.browser_verification_summary,
+            "browser_verification_artifact_ids": detail.job.browser_verification_artifact_ids,
+            "cleanup_status": detail.job.cleanup_status,
+            "cleanup_paths": detail.job.cleanup_paths,
+        },
         "artifact_count": detail.job.artifact_count,
         "command_session_count": detail.command_sessions.len(),
         "tool_call_count": detail.tool_calls.len(),
@@ -3058,6 +3073,7 @@ fn child_job_result_json(detail: &JobDetail) -> Result<Value> {
                 "status": event.status,
                 "summary": event.summary,
                 "detail": event.detail,
+                "data_json": event.data_json,
             }))
             .collect::<Vec<_>>(),
         "report_path": detail
@@ -3751,6 +3767,9 @@ fn job_prompt_requires_action(job: &JobSummary) -> bool {
     if text.is_empty() || action_text_is_informational(&text) {
         return false;
     }
+    if action_text_requests_text_only_artifact(&text) {
+        return false;
+    }
 
     [
         "approved pr",
@@ -3772,8 +3791,6 @@ fn job_prompt_requires_action(job: &JobSummary) -> bool {
         "implement",
         "fix ",
         "repair",
-        "update ",
-        "change ",
         "edit ",
         "run ",
         "validate",
@@ -3782,10 +3799,14 @@ fn job_prompt_requires_action(job: &JobSummary) -> bool {
         "create issue",
         "comment on",
         "post a comment",
-        "commit ",
+        "commit the",
+        "commit changes",
+        "make a commit",
         "push ",
         "ship ",
-        "release ",
+        "deploy ",
+        "publish release",
+        "release to",
     ]
     .iter()
     .any(|needle| text.contains(needle))
@@ -3800,6 +3821,40 @@ fn action_text_is_informational(text: &str) -> bool {
         || text.contains("how do i ")
         || text.contains("how should i ")
         || text.contains("what is ")
+}
+
+fn action_text_requests_text_only_artifact(text: &str) -> bool {
+    let text_only_verb = [
+        "draft", "write", "generate", "compose", "prepare", "suggest", "provide",
+    ]
+    .iter()
+    .any(|verb| {
+        text.starts_with(&format!("{verb} "))
+            || text.contains(&format!(" {verb} "))
+            || text.contains(&format!(" {verb} a "))
+            || text.contains(&format!(" {verb} an "))
+            || text.contains(&format!(" {verb} the "))
+    });
+    if !text_only_verb {
+        return false;
+    }
+
+    [
+        "commit message",
+        "commit title",
+        "release note",
+        "release notes",
+        "issue comment",
+        "pr comment",
+        "pull request comment",
+        "pr description",
+        "pull request description",
+        "pr body",
+        "pull request body",
+        "implementation prompt",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 fn final_answer_requests_confirmation(text: &str) -> bool {
@@ -11377,6 +11432,46 @@ mod tests {
     }
 
     #[test]
+    fn zero_tool_guard_allows_text_only_generated_artifacts() {
+        let worker = test_worker_summary("zero-tool-draft", 100, 100);
+        let mut job = test_publication_job_summary("zero-tool-draft");
+        job.publication_requested = false;
+        job.prompt_excerpt = "Draft a commit message and release notes for this diff.".to_string();
+
+        assert!(!should_retry_zero_tool_action_final_answer(
+            &job,
+            "Drafted commit text",
+            "fix: normalize daemon final responses\n\nRelease notes: final response metadata is now structured.",
+            "act",
+            &worker,
+            1,
+            0,
+        ));
+
+        job.prompt_excerpt = "Write an issue comment summarizing the proposed fix.".to_string();
+        assert!(!should_retry_zero_tool_action_final_answer(
+            &job,
+            "Drafted issue comment",
+            "Here is a comment body ready to post.",
+            "act",
+            &worker,
+            1,
+            0,
+        ));
+
+        job.prompt_excerpt = "Post a comment on issue #209 with the validation result.".to_string();
+        assert!(should_retry_zero_tool_action_final_answer(
+            &job,
+            "Comment ready",
+            "Validation passed and the fix is ready.",
+            "act",
+            &worker,
+            1,
+            0,
+        ));
+    }
+
+    #[test]
     fn incomplete_progress_final_answers_retry_when_budget_remains() {
         let worker = test_worker_summary("retry-incomplete", 100, 100);
 
@@ -11680,6 +11775,66 @@ Cleanup status: clean";
             "Pull request opened",
             final_answer
         ));
+    }
+
+    #[test]
+    fn child_job_result_preserves_structured_outcome_metadata() {
+        let mut job = test_publication_job_summary("child-publication-outcome");
+        job.state = "completed".to_string();
+        job.result_summary = "Opened PR".to_string();
+        job.publication_status = "opened".to_string();
+        job.publication_summary = "Opened a ready PR against dev.".to_string();
+        job.pr_url = "https://github.com/WebLime-agency/nucleus/pull/210".to_string();
+        job.source_branch = "fix-209-final-response-contract".to_string();
+        job.target_branch = "dev".to_string();
+        job.validation_status = "passed".to_string();
+        job.browser_verification_status = "not_performed".to_string();
+        job.cleanup_status = "clean".to_string();
+        let detail = JobDetail {
+            job,
+            workers: Vec::new(),
+            child_jobs: Vec::new(),
+            tool_calls: Vec::new(),
+            approvals: Vec::new(),
+            artifacts: Vec::new(),
+            command_sessions: Vec::new(),
+            events: vec![nucleus_protocol::JobEvent {
+                id: 1,
+                job_id: "child-publication-outcome".to_string(),
+                worker_id: Some("worker-child-publication-outcome".to_string()),
+                event_type: "job.completed".to_string(),
+                status: "completed".to_string(),
+                summary: "Opened PR".to_string(),
+                detail: "Published the PR.".to_string(),
+                data_json: json!({
+                    "publication_status": "opened",
+                    "pr_url": "https://github.com/WebLime-agency/nucleus/pull/210",
+                    "validation_status": "passed",
+                    "final_response_metadata": {
+                        "cleanup_status": "clean"
+                    }
+                }),
+                created_at: 0,
+            }],
+        };
+
+        let result = child_job_result_json(&detail).expect("child result should serialize");
+
+        assert_eq!(result["outcome"]["publication_status"], "opened");
+        assert_eq!(
+            result["outcome"]["pr_url"],
+            "https://github.com/WebLime-agency/nucleus/pull/210"
+        );
+        assert_eq!(result["outcome"]["validation_status"], "passed");
+        assert_eq!(result["outcome"]["cleanup_status"], "clean");
+        assert_eq!(
+            result["events"][0]["data_json"]["publication_status"],
+            "opened"
+        );
+        assert_eq!(
+            result["events"][0]["data_json"]["final_response_metadata"]["cleanup_status"],
+            "clean"
+        );
     }
 
     #[tokio::test]
