@@ -2021,6 +2021,7 @@ async fn run_job_loop(
                     &current_job,
                     browser_verification.as_ref(),
                     &final_answer,
+                    &metadata,
                     &checkpoint,
                     &worker,
                     step + 1,
@@ -2074,6 +2075,7 @@ async fn run_job_loop(
                     job_id,
                     browser_verification,
                     &final_answer,
+                    &metadata,
                 )
                 .await?;
 
@@ -4205,22 +4207,8 @@ fn publication_outcome_patch_with_metadata(
     .and_then(|value| normalize_validation_status(&value))
     .or_else(|| infer_validation_status(&normalized))
     .unwrap_or_else(|| current.validation_status.clone());
-    let metadata_browser_verification_status = final_response_metadata_string(
-        final_answer_metadata,
-        &[
-            "browser_verification_status",
-            "browser verification status",
-            "browser_status",
-        ],
-    )
-    .or_else(|| {
-        final_response_metadata_nested_string(
-            final_answer_metadata,
-            &["browser_verification", "browser verification"],
-            &["status"],
-        )
-    })
-    .and_then(|value| normalize_browser_verification_status(&value));
+    let metadata_browser_verification_status =
+        final_response_browser_verification_status(final_answer_metadata);
     let text_browser_verification_status = extract_labeled_value(
         &raw_text,
         &["browser_verification_status", "browser verification status"],
@@ -4235,7 +4223,8 @@ fn publication_outcome_patch_with_metadata(
     .and_then(|value| normalize_browser_verification_status(&value))
     .or_else(|| infer_browser_verification_status(&normalized).map(str::to_string));
     let browser_verification_status = if current.browser_verification_required {
-        text_browser_verification_status
+        metadata_browser_verification_status
+            .or(text_browser_verification_status)
             .or_else(|| match current.browser_verification_status.as_str() {
                 "" | "pending" => None,
                 status => Some(status.to_string()),
@@ -4753,6 +4742,25 @@ fn final_response_metadata_nested_string(
     None
 }
 
+fn final_response_browser_verification_status(metadata: &Value) -> Option<String> {
+    final_response_metadata_string(
+        metadata,
+        &[
+            "browser_verification_status",
+            "browser verification status",
+            "browser_status",
+        ],
+    )
+    .or_else(|| {
+        final_response_metadata_nested_string(
+            metadata,
+            &["browser_verification", "browser verification"],
+            &["status"],
+        )
+    })
+    .and_then(|value| normalize_browser_verification_status(&value))
+}
+
 fn final_response_metadata_value_string(value: &Value) -> Option<String> {
     match value {
         Value::String(value) => {
@@ -5000,7 +5008,6 @@ fn should_retry_missing_publication_outcome(
         summary,
         final_answer,
         final_answer_metadata,
-        detail.job.browser_verification_required,
         browser_verification_claim,
     )
 }
@@ -5021,7 +5028,6 @@ fn publication_final_answer_has_required_facts(summary: &str, final_answer: &str
         summary,
         final_answer,
         &json!({}),
-        false,
         None,
     )
 }
@@ -5030,7 +5036,6 @@ fn publication_final_answer_has_required_facts_with_metadata(
     summary: &str,
     final_answer: &str,
     final_answer_metadata: &Value,
-    browser_verification_required: bool,
     browser_verification_claim: Option<&BrowserVerificationClaim>,
 ) -> bool {
     let text = format!("{summary}\n{final_answer}");
@@ -5092,19 +5097,8 @@ fn publication_final_answer_has_required_facts_with_metadata(
     let has_browser_claim = browser_verification_claim
         .and_then(|claim| normalize_browser_verification_claim_status(&claim.status))
         .is_some();
-    let has_browser_metadata = final_response_metadata_string(
-        final_answer_metadata,
-        &["browser_verification_status", "browser verification status"],
-    )
-    .and_then(|value| normalize_browser_verification_status(&value))
-    .is_some()
-        || final_response_metadata_nested_string(
-            final_answer_metadata,
-            &["browser_verification", "browser verification"],
-            &["status"],
-        )
-        .and_then(|value| normalize_browser_verification_status(&value))
-        .is_some();
+    let has_browser_metadata =
+        final_response_browser_verification_status(final_answer_metadata).is_some();
     let has_browser_text = extract_labeled_value(
         &text,
         &["browser_verification_status", "browser verification status"],
@@ -5119,9 +5113,7 @@ fn publication_final_answer_has_required_facts_with_metadata(
         .and_then(|value| normalize_browser_verification_status(&value))
         .is_some()
         || infer_browser_verification_status(&normalized).is_some();
-    let has_browser = has_browser_claim
-        || has_browser_text
-        || (!browser_verification_required && has_browser_metadata);
+    let has_browser = has_browser_claim || has_browser_text || has_browser_metadata;
     let has_cleanup = final_response_metadata_string(
         final_answer_metadata,
         &["cleanup_status", "cleanup status"],
@@ -5169,6 +5161,7 @@ fn should_retry_browser_verification_final_answer(
     job: &JobSummary,
     claim: Option<&BrowserVerificationClaim>,
     final_answer: &str,
+    final_answer_metadata: &Value,
     checkpoint: &WorkerCheckpoint,
     worker: &WorkerSummary,
     step_after_rejection: usize,
@@ -5180,6 +5173,7 @@ fn should_retry_browser_verification_final_answer(
             "pending" | "not_performed"
         )
         && claim.is_none()
+        && final_response_browser_verification_status(final_answer_metadata).is_none()
         && status_from_browser_verification_text(final_answer).is_none()
         && !checkpoint.browser_verification_final_answer_rejected
         && remaining_budget_for_browser_verification(worker, step_after_rejection, tool_calls)
@@ -5190,6 +5184,7 @@ async fn apply_browser_verification_final_state(
     job_id: &str,
     claim: Option<BrowserVerificationClaim>,
     final_answer: &str,
+    final_answer_metadata: &Value,
 ) -> Result<String> {
     let job = state.store.get_job(job_id)?.job;
     if !job.browser_verification_required {
@@ -5199,12 +5194,17 @@ async fn apply_browser_verification_final_state(
     let claimed_status = claim
         .as_ref()
         .and_then(|claim| normalize_browser_verification_claim_status(&claim.status))
-        .or_else(|| status_from_browser_verification_text(final_answer));
-    let next_status = claimed_status.unwrap_or(match job.browser_verification_status.as_str() {
-        "failed" => "failed",
-        "unavailable" => "unavailable",
-        _ => "not_performed",
-    });
+        .map(str::to_string)
+        .or_else(|| final_response_browser_verification_status(final_answer_metadata))
+        .or_else(|| status_from_browser_verification_text(final_answer).map(str::to_string));
+    let next_status =
+        claimed_status
+            .as_deref()
+            .unwrap_or(match job.browser_verification_status.as_str() {
+                "failed" => "failed",
+                "unavailable" => "unavailable",
+                _ => "not_performed",
+            });
     let claim_summary = claim
         .as_ref()
         .map(|claim| claim.summary.trim())
@@ -11857,7 +11857,7 @@ Cleanup status: clean";
     }
 
     #[test]
-    fn required_browser_verification_ignores_metadata_only_status() {
+    fn required_browser_verification_uses_structured_metadata_status() {
         let mut job = test_publication_job_summary("publication-browser-required");
         job.browser_verification_required = true;
         job.browser_verification_status = "not_performed".to_string();
@@ -11876,15 +11876,39 @@ Cleanup status: clean";
             8,
             4,
         );
-        assert_eq!(
-            patch.browser_verification_status.as_deref(),
-            Some("not_performed")
-        );
-        assert!(!publication_final_answer_has_required_facts_with_metadata(
+        assert_eq!(patch.browser_verification_status.as_deref(), Some("passed"));
+        assert!(publication_final_answer_has_required_facts_with_metadata(
             "Opened PR",
             "Published the PR.",
             &metadata,
-            true,
+            None,
+        ));
+
+        let nested_metadata = json!({
+            "publication_status": "opened",
+            "validation_status": "passed",
+            "browser_verification": {
+                "status": "unavailable",
+                "summary": "Browser runtime was unavailable."
+            },
+            "cleanup_status": "clean"
+        });
+        let patch = publication_outcome_patch_with_metadata(
+            &job,
+            "Opened PR",
+            "Published the PR.",
+            &nested_metadata,
+            8,
+            4,
+        );
+        assert_eq!(
+            patch.browser_verification_status.as_deref(),
+            Some("unavailable")
+        );
+        assert!(publication_final_answer_has_required_facts_with_metadata(
+            "Opened PR",
+            "Published the PR.",
+            &nested_metadata,
             None,
         ));
 
@@ -11892,7 +11916,6 @@ Cleanup status: clean";
             "Opened PR",
             "Published the PR.",
             &metadata,
-            true,
             Some(&BrowserVerificationClaim {
                 status: "passed".to_string(),
                 summary: "Verified in Browser.".to_string(),
@@ -13342,6 +13365,17 @@ Cleanup status: clean";
             &job,
             None,
             "Checks passed.",
+            &json!({}),
+            &checkpoint,
+            &worker,
+            1,
+            0,
+        ));
+        assert!(!should_retry_browser_verification_final_answer(
+            &job,
+            None,
+            "Checks passed.",
+            &json!({"browser_verification_status": "unavailable"}),
             &checkpoint,
             &worker,
             1,
@@ -13354,6 +13388,7 @@ Cleanup status: clean";
             &job,
             None,
             "Checks passed.",
+            &json!({}),
             &rejected,
             &worker,
             2,
@@ -13391,6 +13426,51 @@ Cleanup status: clean";
             job.browser_verification_artifact_ids,
             vec!["artifact-a".to_string(), "artifact-b".to_string()]
         );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn browser_final_state_uses_structured_metadata_status() {
+        let state_dir = test_state_dir("browser-final-state-metadata");
+        let state = initialize_test_state(&state_dir);
+        let (job_id, _worker, _tool_call_id) =
+            create_command_test_context(&state, "browser-final-state-metadata");
+        state
+            .store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    ui_renderable: Some("true".to_string()),
+                    browser_verification_required: Some(true),
+                    browser_verification_status: Some("pending".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("job verification state should update");
+
+        let final_answer = apply_browser_verification_final_state(
+            &state,
+            &job_id,
+            None,
+            "Published the PR.",
+            &json!({
+                "browser_verification_status": "unavailable"
+            }),
+        )
+        .await
+        .expect("browser final state should apply");
+
+        assert_eq!(final_answer, "Published the PR.");
+        let detail = state.store.get_job(&job_id).expect("job should reload");
+        assert_eq!(detail.job.browser_verification_status, "unavailable");
+        let completed = detail
+            .events
+            .iter()
+            .find(|event| event.event_type == "job.browser_verification.completed")
+            .expect("browser completion event should be emitted");
+        assert_eq!(completed.status, "unavailable");
+        assert_eq!(completed.data_json["status"], "unavailable");
 
         let _ = fs::remove_dir_all(&state_dir);
     }
