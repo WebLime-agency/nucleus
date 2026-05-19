@@ -808,6 +808,7 @@ struct ArtifactDraft {
     extension: String,
     content: String,
     preview_text: String,
+    metadata_json: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -818,6 +819,7 @@ struct ArtifactBytesDraft {
     extension: String,
     bytes: Vec<u8>,
     preview_text: String,
+    metadata_json: Value,
 }
 
 pub async fn start_prompt_job(
@@ -2045,6 +2047,7 @@ async fn run_job_loop(
                     &summary,
                     &final_answer,
                     &metadata,
+                    browser_verification.as_ref(),
                     &worker,
                     step,
                     tool_calls,
@@ -3163,12 +3166,13 @@ async fn complete_job_with_final_answer(
             job_id,
             Some(&worker.id),
             None,
-            text_artifact(
+            text_artifact_with_metadata(
                 &artifact.kind,
                 artifact.title.clone(),
                 "md",
                 "text/markdown",
                 artifact.content.clone(),
+                artifact.metadata.clone(),
             ),
         )?;
         structured_artifacts.push(artifact);
@@ -3970,6 +3974,7 @@ fn final_answer_terminal_metadata(
                         "kind": artifact.kind,
                         "title": artifact.title,
                         "path": artifact.path,
+                        "metadata_json": artifact.metadata_json,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -4186,7 +4191,7 @@ fn publication_outcome_patch_with_metadata(
     .and_then(|value| normalize_validation_status(&value))
     .or_else(|| infer_validation_status(&normalized))
     .unwrap_or_else(|| current.validation_status.clone());
-    let browser_verification_status = final_response_metadata_string(
+    let metadata_browser_verification_status = final_response_metadata_string(
         final_answer_metadata,
         &[
             "browser_verification_status",
@@ -4201,12 +4206,11 @@ fn publication_outcome_patch_with_metadata(
             &["status"],
         )
     })
-    .or_else(|| {
-        extract_labeled_value(
-            &raw_text,
-            &["browser_verification_status", "browser verification status"],
-        )
-    })
+    .and_then(|value| normalize_browser_verification_status(&value));
+    let text_browser_verification_status = extract_labeled_value(
+        &raw_text,
+        &["browser_verification_status", "browser verification status"],
+    )
     .or_else(|| {
         extract_nested_labeled_value(
             &raw_text,
@@ -4215,8 +4219,19 @@ fn publication_outcome_patch_with_metadata(
         )
     })
     .and_then(|value| normalize_browser_verification_status(&value))
-    .or_else(|| infer_browser_verification_status(&normalized).map(str::to_string))
-    .unwrap_or_else(|| current.browser_verification_status.clone());
+    .or_else(|| infer_browser_verification_status(&normalized).map(str::to_string));
+    let browser_verification_status = if current.browser_verification_required {
+        text_browser_verification_status
+            .or_else(|| match current.browser_verification_status.as_str() {
+                "" | "pending" => None,
+                status => Some(status.to_string()),
+            })
+            .unwrap_or_else(|| current.browser_verification_status.clone())
+    } else {
+        metadata_browser_verification_status
+            .or(text_browser_verification_status)
+            .unwrap_or_else(|| current.browser_verification_status.clone())
+    };
     let cleanup_status = final_response_metadata_string(
         final_answer_metadata,
         &["cleanup_status", "cleanup status"],
@@ -4955,6 +4970,7 @@ fn should_retry_missing_publication_outcome(
     summary: &str,
     final_answer: &str,
     final_answer_metadata: &Value,
+    browser_verification_claim: Option<&BrowserVerificationClaim>,
     worker: &WorkerSummary,
     step_count: usize,
     tool_call_count: usize,
@@ -4970,6 +4986,8 @@ fn should_retry_missing_publication_outcome(
         summary,
         final_answer,
         final_answer_metadata,
+        detail.job.browser_verification_required,
+        browser_verification_claim,
     )
 }
 
@@ -4985,13 +5003,21 @@ fn publication_outcome_retry_already_attempted(detail: &JobDetail) -> bool {
 }
 
 fn publication_final_answer_has_required_facts(summary: &str, final_answer: &str) -> bool {
-    publication_final_answer_has_required_facts_with_metadata(summary, final_answer, &json!({}))
+    publication_final_answer_has_required_facts_with_metadata(
+        summary,
+        final_answer,
+        &json!({}),
+        false,
+        None,
+    )
 }
 
 fn publication_final_answer_has_required_facts_with_metadata(
     summary: &str,
     final_answer: &str,
     final_answer_metadata: &Value,
+    browser_verification_required: bool,
+    browser_verification_claim: Option<&BrowserVerificationClaim>,
 ) -> bool {
     let text = format!("{summary}\n{final_answer}");
     let normalized = normalize_action_item_text(&text);
@@ -5049,7 +5075,10 @@ fn publication_final_answer_has_required_facts_with_metadata(
         || extract_nested_labeled_value(&text, &["validation"], &["status"])
             .and_then(|value| normalize_validation_status(&value))
             .is_some();
-    let has_browser = final_response_metadata_string(
+    let has_browser_claim = browser_verification_claim
+        .and_then(|claim| normalize_browser_verification_claim_status(&claim.status))
+        .is_some();
+    let has_browser_metadata = final_response_metadata_string(
         final_answer_metadata,
         &["browser_verification_status", "browser verification status"],
     )
@@ -5061,12 +5090,13 @@ fn publication_final_answer_has_required_facts_with_metadata(
             &["status"],
         )
         .and_then(|value| normalize_browser_verification_status(&value))
-        .is_some()
-        || extract_labeled_value(
-            &text,
-            &["browser_verification_status", "browser verification status"],
-        )
-        .is_some()
+        .is_some();
+    let has_browser_text = extract_labeled_value(
+        &text,
+        &["browser_verification_status", "browser verification status"],
+    )
+    .and_then(|value| normalize_browser_verification_status(&value))
+    .is_some()
         || extract_nested_labeled_value(
             &text,
             &["browser_verification", "browser verification"],
@@ -5075,6 +5105,9 @@ fn publication_final_answer_has_required_facts_with_metadata(
         .and_then(|value| normalize_browser_verification_status(&value))
         .is_some()
         || infer_browser_verification_status(&normalized).is_some();
+    let has_browser = has_browser_claim
+        || has_browser_text
+        || (!browser_verification_required && has_browser_metadata);
     let has_cleanup = final_response_metadata_string(
         final_answer_metadata,
         &["cleanup_status", "cleanup status"],
@@ -7426,6 +7459,7 @@ async fn persist_browser_snapshot_job_artifacts(
                 extension: "jpg".to_string(),
                 bytes,
                 preview_text: serde_json::to_string(&metadata)?,
+                metadata_json: metadata,
             },
         )?;
         publish_artifact_added(state, &screenshot_artifact).await;
@@ -8364,6 +8398,7 @@ fn create_command_log_artifact(
         mime_type: "text/plain".to_string(),
         size_bytes: 0,
         preview_text: format!("Waiting for {stream} output."),
+        metadata_json: json!({}),
     })
 }
 
@@ -8986,6 +9021,17 @@ fn text_artifact(
     mime_type: &str,
     content: String,
 ) -> ArtifactDraft {
+    text_artifact_with_metadata(kind, title, extension, mime_type, content, json!({}))
+}
+
+fn text_artifact_with_metadata(
+    kind: &str,
+    title: String,
+    extension: &str,
+    mime_type: &str,
+    content: String,
+    metadata_json: Value,
+) -> ArtifactDraft {
     ArtifactDraft {
         kind: kind.to_string(),
         title,
@@ -8993,6 +9039,7 @@ fn text_artifact(
         extension: extension.to_string(),
         preview_text: excerpt(&content, DIFF_PREVIEW_CHAR_LIMIT),
         content,
+        metadata_json,
     }
 }
 
@@ -9076,6 +9123,7 @@ fn write_job_artifact(
         mime_type: draft.mime_type,
         size_bytes: draft.content.len() as u64,
         preview_text: draft.preview_text,
+        metadata_json: draft.metadata_json,
     })
 }
 
@@ -9105,6 +9153,7 @@ fn write_job_artifact_bytes(
         mime_type: draft.mime_type,
         size_bytes: draft.bytes.len() as u64,
         preview_text: excerpt(&draft.preview_text, DIFF_PREVIEW_CHAR_LIMIT),
+        metadata_json: draft.metadata_json,
     })
 }
 
@@ -11732,6 +11781,61 @@ Cleanup status: clean";
     }
 
     #[test]
+    fn required_browser_verification_ignores_metadata_only_status() {
+        let mut job = test_publication_job_summary("publication-browser-required");
+        job.browser_verification_required = true;
+        job.browser_verification_status = "not_performed".to_string();
+        let metadata = json!({
+            "publication_status": "opened",
+            "validation_status": "passed",
+            "browser_verification_status": "passed",
+            "cleanup_status": "clean"
+        });
+
+        let patch = publication_outcome_patch_with_metadata(
+            &job,
+            "Opened PR",
+            "Published the PR.",
+            &metadata,
+            8,
+            4,
+        );
+        assert_eq!(
+            patch.browser_verification_status.as_deref(),
+            Some("not_performed")
+        );
+        assert!(!publication_final_answer_has_required_facts_with_metadata(
+            "Opened PR",
+            "Published the PR.",
+            &metadata,
+            true,
+            None,
+        ));
+
+        assert!(publication_final_answer_has_required_facts_with_metadata(
+            "Opened PR",
+            "Published the PR.",
+            &metadata,
+            true,
+            Some(&BrowserVerificationClaim {
+                status: "passed".to_string(),
+                summary: "Verified in Browser.".to_string(),
+                artifact_ids: vec!["artifact-1".to_string()],
+            }),
+        ));
+
+        let patch = publication_outcome_patch_with_metadata(
+            &job,
+            "Opened PR",
+            "Published the PR. Browser verification: passed.",
+            &metadata,
+            8,
+            4,
+        );
+        assert_eq!(patch.browser_verification_status.as_deref(), Some("passed"));
+    }
+
+    #[test]
     fn publication_outcome_patch_ignores_nested_non_publication_summaries() {
         let job = test_publication_job_summary("publication-summary");
         let final_answer = "Publication status: opened\n\
@@ -11971,7 +12075,7 @@ Cleanup status: clean";
             kind: "implementation_prompt".to_string(),
             title: "Implementation prompt".to_string(),
             content: "Implement the daemon-owned final-response contract.".to_string(),
-            metadata: json!({}),
+            metadata: json!({"target": "issue-209"}),
         }];
 
         complete_job_with_final_answer(
@@ -12015,6 +12119,7 @@ Cleanup status: clean";
         assert_eq!(detail.job.cleanup_status, "clean");
         assert_eq!(detail.artifacts.len(), 1);
         assert_eq!(detail.artifacts[0].kind, "implementation_prompt");
+        assert_eq!(detail.artifacts[0].metadata_json["target"], "issue-209");
         let completed = detail
             .events
             .iter()
@@ -12027,6 +12132,10 @@ Cleanup status: clean";
         assert_eq!(
             completed.data_json["final_response_artifacts"][0]["kind"],
             "implementation_prompt"
+        );
+        assert_eq!(
+            completed.data_json["final_response_artifacts"][0]["metadata_json"]["target"],
+            "issue-209"
         );
 
         let _ = fs::remove_dir_all(&state_dir);
