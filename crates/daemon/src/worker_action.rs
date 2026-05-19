@@ -53,10 +53,12 @@ pub enum WorkerActionParseError {
 }
 
 impl WorkerActionParseError {
-    pub fn is_repairable_json_error(&self) -> bool {
+    pub fn is_repairable_contract_error(&self) -> bool {
         matches!(
             self,
-            WorkerActionParseError::NoJsonObject | WorkerActionParseError::MalformedJson { .. }
+            WorkerActionParseError::NoJsonObject
+                | WorkerActionParseError::MalformedJson { .. }
+                | WorkerActionParseError::InvalidActionShape
         )
     }
 }
@@ -704,6 +706,9 @@ fn normalize_worker_tool_call_value(value: &Value) -> Result<WorkerAction, Worke
             let mut inline_args = object.clone();
             inline_args.remove("action");
             inline_args.remove("kind");
+            if is_provider_tool_call_type(object.get("type")) {
+                inline_args.remove("type");
+            }
             inline_args.remove("tool");
             inline_args.remove("tool_name");
             inline_args.remove("name");
@@ -731,6 +736,18 @@ fn normalize_worker_tool_call_value(value: &Value) -> Result<WorkerAction, Worke
         tool,
         args,
     })
+}
+
+fn is_provider_tool_call_type(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_str)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "tool_call" | "function_call"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn decode_worker_tool_args(args: Value) -> Value {
@@ -889,7 +906,7 @@ mod tests {
                 tool: "nucleus_repo_search".to_string()
             }
         );
-        assert!(!error.is_repairable_json_error());
+        assert!(!error.is_repairable_contract_error());
     }
 
     #[test]
@@ -898,7 +915,7 @@ mod tests {
             .expect_err("valid JSON without Nucleus action shape should be rejected");
 
         assert_eq!(error, WorkerActionParseError::InvalidActionShape);
-        assert!(!error.is_repairable_json_error());
+        assert!(error.is_repairable_contract_error());
     }
 
     #[test]
@@ -911,7 +928,7 @@ mod tests {
             error,
             WorkerActionParseError::MalformedJson { .. }
         ));
-        assert!(error.is_repairable_json_error());
+        assert!(error.is_repairable_contract_error());
     }
 
     #[test]
@@ -1322,5 +1339,28 @@ mod tests {
                 .as_str()
                 .is_some_and(|command| command.contains("text.replace") && command.contains("PY"))
         );
+    }
+
+    #[test]
+    fn preserves_inline_type_arg_for_mcp_direct_tool_call() {
+        let action = parse_worker_action(
+            r#"{"tool":"mcp.issue_tracker.create","type":"issue","id":"123","title":"Fix login"}"#,
+        )
+        .expect("mcp direct tool call should preserve legitimate type arg");
+
+        let WorkerAction::ToolCall {
+            summary,
+            tool,
+            args,
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(summary, "Run the requested Nucleus action.");
+        assert_eq!(tool, "mcp.issue_tracker.create");
+        assert_eq!(args["type"], "issue");
+        assert_eq!(args["id"], "123");
+        assert_eq!(args["title"], "Fix login");
     }
 }
