@@ -330,10 +330,6 @@ fn normalize_worker_action_value(
         return normalize_worker_progress_update_value(object).map(Some);
     }
 
-    if object.contains_key("final_answer") {
-        return normalize_worker_final_answer_value(object).map(Some);
-    }
-
     if object
         .get("action")
         .or_else(|| object.get("kind"))
@@ -365,6 +361,21 @@ fn normalize_worker_action_value(
             || object.contains_key("name"))
     {
         return normalize_worker_tool_call_value(value).map(Some);
+    }
+
+    if object
+        .get("action")
+        .or_else(|| object.get("kind"))
+        .or_else(|| object.get("type"))
+        .and_then(Value::as_str)
+        .map(|value| value.trim().eq_ignore_ascii_case("spawn_child_jobs"))
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+
+    if object.contains_key("final_answer") {
+        return normalize_worker_final_answer_value(object).map(Some);
     }
 
     if object.contains_key("tool")
@@ -1078,6 +1089,27 @@ mod tests {
             r#"{"kind":"tool_call","summary":"search source","tool":"rg.search","args":{"pattern":"home","path":"dga-uhm","limit":20}}"#,
         )
         .expect("canonical Nucleus action should parse");
+
+        let WorkerAction::ToolCall {
+            summary,
+            tool,
+            args,
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(summary, "search source");
+        assert_eq!(tool, "rg.search");
+        assert_eq!(args["pattern"], "home");
+    }
+
+    #[test]
+    fn canonical_tool_call_with_extra_final_answer_stays_tool_call() {
+        let action = parse_worker_action(
+            r#"{"kind":"tool_call","summary":"search source","tool":"rg.search","args":{"pattern":"home","path":"dga-uhm","limit":20},"final_answer":"Search after this tool call."}"#,
+        )
+        .expect("canonical tool call should not be normalized as final answer");
 
         let WorkerAction::ToolCall {
             summary,
