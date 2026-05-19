@@ -11836,6 +11836,41 @@ Cleanup status: clean";
     }
 
     #[test]
+    fn optional_browser_verification_uses_preserved_final_answer_metadata() {
+        let mut job = test_publication_job_summary("publication-browser-optional");
+        job.browser_verification_required = false;
+        job.browser_verification_status = "not_required".to_string();
+
+        let action = parse_worker_action(
+            r#"{"kind":"final_answer","summary":"published","final_answer":"Published the PR.","publication_status":"opened","validation_status":"passed","cleanup_status":"clean","browser_verification":{"status":"passed","summary":"Clicked through the published UI.","artifact_ids":["artifact-1"]}}"#,
+        )
+        .expect("final answer with optional browser verification should parse");
+        let WorkerAction::FinalAnswer {
+            final_answer,
+            metadata,
+            browser_verification: Some(claim),
+            ..
+        } = action
+        else {
+            panic!("expected final answer with browser verification claim");
+        };
+
+        let patch = publication_outcome_patch_with_metadata(
+            &job,
+            "Opened PR",
+            &final_answer,
+            &metadata,
+            8,
+            4,
+        );
+
+        assert_eq!(claim.status, "passed");
+        assert_eq!(metadata["browser_verification"]["status"], "passed");
+        assert_eq!(metadata["browser_verification_status"], "passed");
+        assert_eq!(patch.browser_verification_status.as_deref(), Some("passed"));
+    }
+
+    #[test]
     fn publication_outcome_patch_ignores_nested_non_publication_summaries() {
         let job = test_publication_job_summary("publication-summary");
         let final_answer = "Publication status: opened\n\

@@ -511,10 +511,26 @@ fn normalize_worker_final_answer_value(
             }
         })
         .ok_or(WorkerActionParseError::InvalidActionShape)?;
-    let browser_verification = object
+    let browser_verification_value = object
         .get("browser_verification")
         .or_else(|| nested_final_answer.and_then(|value| value.get("browser_verification")))
+        .filter(|value| !is_empty_json_value(value))
+        .cloned();
+    let browser_verification = browser_verification_value
+        .as_ref()
         .and_then(|value| serde_json::from_value::<BrowserVerificationClaim>(value.clone()).ok());
+    if let Some(value) = browser_verification_value {
+        metadata
+            .entry("browser_verification".to_string())
+            .or_insert(value);
+    }
+    if let Some(claim) = browser_verification.as_ref() {
+        if let Some(status) = non_empty_trimmed(&claim.status) {
+            metadata
+                .entry("browser_verification_status".to_string())
+                .or_insert(Value::String(status));
+        }
+    }
 
     Ok(WorkerAction::FinalAnswer {
         summary,
@@ -1479,6 +1495,7 @@ mod tests {
 
         let WorkerAction::FinalAnswer {
             browser_verification: Some(claim),
+            metadata,
             ..
         } = action
         else {
@@ -1488,6 +1505,12 @@ mod tests {
         assert_eq!(claim.status, "passed");
         assert_eq!(claim.summary, "Clicked the dropdown.");
         assert_eq!(claim.artifact_ids, vec!["artifact-1".to_string()]);
+        assert_eq!(metadata["browser_verification"]["status"], "passed");
+        assert_eq!(
+            metadata["browser_verification"]["summary"],
+            "Clicked the dropdown."
+        );
+        assert_eq!(metadata["browser_verification_status"], "passed");
     }
 
     #[test]
@@ -1500,6 +1523,7 @@ mod tests {
         let WorkerAction::FinalAnswer {
             final_answer,
             browser_verification: Some(claim),
+            metadata,
             ..
         } = action
         else {
@@ -1510,6 +1534,12 @@ mod tests {
         assert_eq!(claim.status, "passed");
         assert_eq!(claim.summary, "Clicked the dropdown.");
         assert_eq!(claim.artifact_ids, vec!["artifact-1".to_string()]);
+        assert_eq!(metadata["browser_verification"]["status"], "passed");
+        assert_eq!(
+            metadata["browser_verification"]["summary"],
+            "Clicked the dropdown."
+        );
+        assert_eq!(metadata["browser_verification_status"], "passed");
     }
 
     #[test]
