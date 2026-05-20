@@ -1036,6 +1036,8 @@ fn is_supported_nucleus_tool(tool: &str) -> bool {
             | "rg.search"
             | "git.status"
             | "git.diff"
+            | "github.pr_review_threads"
+            | "github.comment"
             | "fs.apply_patch"
             | "fs.write_text"
             | "fs.move"

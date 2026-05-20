@@ -641,6 +641,22 @@ struct TestsRunArgs {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct GithubPrReviewThreadsArgs {
+    owner: Option<String>,
+    repo: Option<String>,
+    pr_number: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GithubCommentArgs {
+    owner: Option<String>,
+    repo: Option<String>,
+    target_kind: String,
+    number: u64,
+    body: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct McpToolCallArgs {
     #[serde(default)]
     params: Value,
@@ -2057,6 +2073,32 @@ async fn run_job_loop(
                         "Rejected incomplete progress report as final answer.",
                         "incomplete_progress_final_answer",
                         &build_incomplete_progress_retry_prompt(&summary, &final_answer),
+                        &final_answer,
+                    )
+                    .await?;
+                    continue;
+                }
+
+                if should_retry_unsupported_confident_negative_final_answer(
+                    &detail,
+                    &summary,
+                    &final_answer,
+                    &session.session.execution_mode,
+                    &checkpoint,
+                    &worker,
+                    step,
+                    tool_calls,
+                ) {
+                    retry_worker_final_answer(
+                        state,
+                        job_id,
+                        &mut worker,
+                        &mut checkpoint,
+                        &mut step,
+                        tool_calls,
+                        "Rejected unsupported confident negative answer.",
+                        "evidence_incomplete_confident_negative",
+                        &build_evidence_completion_retry_prompt(&summary, &final_answer),
                         &final_answer,
                     )
                     .await?;
@@ -4054,6 +4096,215 @@ fn final_answer_reports_concrete_blocker(text: &str) -> bool {
     .any(|needle| text.contains(needle))
 }
 
+fn should_retry_unsupported_confident_negative_final_answer(
+    detail: &JobDetail,
+    summary: &str,
+    final_answer: &str,
+    execution_mode: &str,
+    checkpoint: &WorkerCheckpoint,
+    worker: &WorkerSummary,
+    step_count: usize,
+    tool_call_count: usize,
+) -> bool {
+    if execution_mode == "plan"
+        || !has_remaining_worker_budget(worker, step_count, tool_call_count)
+        || !confident_negative_claim(summary, final_answer)
+    {
+        return false;
+    }
+
+    let task_text = evidence_task_text(detail, checkpoint);
+    let missing_pr_review_evidence = requires_pr_review_thread_evidence(&task_text)
+        && !has_thread_aware_pr_review_evidence(detail);
+    let missing_test_evidence =
+        requires_test_validation_evidence(&task_text) && !has_test_validation_evidence(detail);
+    let zero_test_misread = confident_test_success_claim(summary, final_answer)
+        && has_zero_test_no_match_evidence(detail);
+    let challenged_clean_answer =
+        repeated_grounding_challenge(&task_text) && !has_thread_aware_pr_review_evidence(detail);
+
+    (missing_pr_review_evidence
+        || missing_test_evidence
+        || zero_test_misread
+        || challenged_clean_answer)
+        && !final_answer_reports_concrete_blocker(&normalize_action_item_text(final_answer))
+}
+
+fn evidence_task_text(detail: &JobDetail, checkpoint: &WorkerCheckpoint) -> String {
+    let mut parts = vec![
+        detail.job.title.as_str(),
+        detail.job.purpose.as_str(),
+        detail.job.prompt_excerpt.as_str(),
+        checkpoint.prompt_text.as_str(),
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    parts.extend(
+        checkpoint
+            .conversation
+            .iter()
+            .filter(|message| message.role == "user")
+            .map(|message| message.content.clone()),
+    );
+    normalize_action_item_text(&parts.join("\n"))
+}
+
+fn requires_pr_review_thread_evidence(text: &str) -> bool {
+    let pr_context = text.contains(" pr ")
+        || text.contains("pull request")
+        || text.contains("github")
+        || text.contains("codex");
+    let review_context = [
+        "latest feedback",
+        "review feedback",
+        "review comments",
+        "requested changes",
+        "unresolved comment",
+        "unresolved review",
+        "inline comment",
+        "inline review",
+        "codex review",
+        "actionable feedback",
+        "pr feedback",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle));
+    pr_context && review_context
+}
+
+fn repeated_grounding_challenge(text: &str) -> bool {
+    [
+        "are you sure",
+        "check again",
+        "look again",
+        "recheck",
+        "double check",
+        "i can see",
+        "screenshot",
+        "you missed",
+        "still says",
+        "that's not right",
+        "that is not right",
+        "not true",
+        "you said",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn requires_test_validation_evidence(text: &str) -> bool {
+    [
+        "failed tests",
+        "failing tests",
+        "test failures",
+        "checks failed",
+        "failed checks",
+        "validation",
+        "tests pass",
+        "tests passed",
+        "run tests",
+        "check failed tests",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn confident_negative_claim(summary: &str, final_answer: &str) -> bool {
+    let text = normalize_action_item_text(&format!("{summary}\n{final_answer}"));
+    [
+        "no actionable feedback",
+        "nothing actionable",
+        "no actionable comments",
+        "no requested changes",
+        "no unresolved comments",
+        "no unresolved review",
+        "looks clean",
+        "everything looks clean",
+        "nothing to fix",
+        "no failed tests",
+        "no failed checks",
+        "tests passed",
+        "all tests passed",
+        "validation passed",
+        "checks passed",
+        "clean to merge",
+        "ready to merge",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn confident_test_success_claim(summary: &str, final_answer: &str) -> bool {
+    let text = normalize_action_item_text(&format!("{summary}\n{final_answer}"));
+    [
+        "no failed tests",
+        "no failing tests",
+        "tests passed",
+        "all tests passed",
+        "validation passed",
+        "checks passed",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn has_thread_aware_pr_review_evidence(detail: &JobDetail) -> bool {
+    detail.tool_calls.iter().any(|tool_call| {
+        tool_call.status == "completed"
+            && (tool_call.tool_id == "github.pr_review_threads"
+                || tool_call
+                    .result_json
+                    .as_ref()
+                    .is_some_and(value_has_review_threads))
+    })
+}
+
+fn has_test_validation_evidence(detail: &JobDetail) -> bool {
+    detail.tool_calls.iter().any(|tool_call| {
+        tool_call.status == "completed"
+            && (tool_call.tool_id == "tests.run"
+                || tool_call
+                    .result_json
+                    .as_ref()
+                    .is_some_and(value_has_status_check_rollup))
+    })
+}
+
+fn has_zero_test_no_match_evidence(detail: &JobDetail) -> bool {
+    detail.tool_calls.iter().any(|tool_call| {
+        tool_call.status == "completed"
+            && tool_call.result_json.as_ref().is_some_and(|value| {
+                value
+                    .pointer("/validation_interpretation/status")
+                    .and_then(Value::as_str)
+                    == Some("no_tests_matched")
+            })
+    })
+}
+
+fn value_has_review_threads(value: &Value) -> bool {
+    if value.get("review_threads").is_some() || value.get("reviewThreads").is_some() {
+        return true;
+    }
+    match value {
+        Value::Array(items) => items.iter().any(value_has_review_threads),
+        Value::Object(object) => object.values().any(value_has_review_threads),
+        _ => false,
+    }
+}
+
+fn value_has_status_check_rollup(value: &Value) -> bool {
+    if value.get("status_check_rollup").is_some() || value.get("statusCheckRollup").is_some() {
+        return true;
+    }
+    match value {
+        Value::Array(items) => items.iter().any(value_has_status_check_rollup),
+        Value::Object(object) => object.values().any(value_has_status_check_rollup),
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct PublicationOutcomePatch {
     publication_requested: Option<bool>,
@@ -5086,6 +5337,23 @@ Return exactly one valid Nucleus worker action JSON object and continue the job.
 - Do not restate the requested action as if it completed.",
         excerpt(&job.prompt_excerpt, 320),
         excerpt(summary, 320),
+        excerpt(final_answer, 1_200)
+    )
+}
+
+fn build_evidence_completion_retry_prompt(summary: &str, final_answer: &str) -> String {
+    format!(
+        "Your previous final_answer made a confident negative claim without complete required evidence.\n\
+Previous summary: {}\n\
+Previous final_answer: {}\n\
+Return exactly one valid Nucleus worker action JSON object.\n\
+Rules:\n\
+- For PR review or latest feedback tasks, fetch thread-aware review data before saying there is no actionable feedback. Prefer github.pr_review_threads for inline review threads.\n\
+- For test or validation tasks, only say tests/checks passed after a tests.run result or check-state evidence actually supports that. If zero tests matched, say no tests matched.\n\
+- If GitHub thread retrieval is unavailable or blocked, return a concise bounded final_answer that says you could not fully verify the PR feedback yet.\n\
+- If the user challenged a prior answer, use a deeper or different evidence path before repeating a clean/no-action conclusion.\n\
+- Keep the eventual user-facing final_answer short and plain.",
+        excerpt(summary, 400),
         excerpt(final_answer, 1_200)
     )
 }
@@ -6197,6 +6465,11 @@ async fn execute_granted_tool(
                 serde_json::from_value::<GitDiffArgs>(args).context("invalid args for git.diff")?;
             execute_git_diff_tool(worker, args).await
         }
+        "github.pr_review_threads" => {
+            let args = serde_json::from_value::<GithubPrReviewThreadsArgs>(args)
+                .context("invalid args for github.pr_review_threads")?;
+            execute_github_pr_review_threads_tool(worker, args).await
+        }
         "fs.apply_patch" => {
             let args = serde_json::from_value::<FsApplyPatchArgs>(args)
                 .context("invalid args for fs.apply_patch")?;
@@ -6221,6 +6494,11 @@ async fn execute_granted_tool(
             let args = serde_json::from_value::<GitStagePatchArgs>(args)
                 .context("invalid args for git.stage_patch")?;
             execute_git_stage_patch_tool(worker, args).await
+        }
+        "github.comment" => {
+            let args = serde_json::from_value::<GithubCommentArgs>(args)
+                .context("invalid args for github.comment")?;
+            execute_github_comment_tool(state, job_id, worker, args).await
         }
         "command.run" => {
             let args = serde_json::from_value::<CommandRunArgs>(args)
@@ -6366,6 +6644,11 @@ fn preview_approval_tool(
             let args = serde_json::from_value::<GitStagePatchArgs>(args.clone())
                 .context("invalid args for git.stage_patch")?;
             preview_git_stage_patch(worker, args)
+        }
+        "github.comment" => {
+            let args = serde_json::from_value::<GithubCommentArgs>(args.clone())
+                .context("invalid args for github.comment")?;
+            Ok(preview_github_comment(args))
         }
         "command.run" => {
             let args = serde_json::from_value::<CommandRunArgs>(args.clone())
@@ -6599,6 +6882,296 @@ async fn execute_git_diff_tool(worker: &WorkerSummary, args: GitDiffArgs) -> Res
         "working_dir": worker.working_dir,
         "diff": limit_text(stdout, TOOL_OUTPUT_CHAR_LIMIT),
     }))
+}
+
+async fn execute_github_pr_review_threads_tool(
+    worker: &WorkerSummary,
+    args: GithubPrReviewThreadsArgs,
+) -> Result<Value> {
+    let (owner, repo) = resolve_github_repo(worker, args.owner, args.repo).await?;
+    let query = r#"
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      number
+      url
+      title
+      state
+      reviewDecision
+      mergeStateStatus
+      comments(last: 100) {
+        nodes {
+          author { login }
+          body
+          createdAt
+          url
+        }
+      }
+      reviews(last: 100) {
+        nodes {
+          author { login }
+          state
+          body
+          submittedAt
+          url
+        }
+      }
+      reviewThreads(first: 100) {
+        nodes {
+          id
+          isResolved
+          isOutdated
+          path
+          line
+          startLine
+          comments(first: 100) {
+            nodes {
+              id
+              author { login }
+              body
+              createdAt
+              url
+              path
+              line
+              originalLine
+              position
+              originalPosition
+              diffHunk
+            }
+          }
+        }
+      }
+      commits(last: 1) {
+        nodes {
+          commit {
+            statusCheckRollup {
+              state
+              contexts(first: 100) {
+                nodes {
+                  __typename
+                  ... on CheckRun {
+                    name
+                    status
+                    conclusion
+                    detailsUrl
+                  }
+                  ... on StatusContext {
+                    context
+                    state
+                    targetUrl
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+    let number = args.pr_number.to_string();
+    let command_args = vec![
+        "api".to_string(),
+        "graphql".to_string(),
+        "-f".to_string(),
+        format!("owner={owner}"),
+        "-f".to_string(),
+        format!("repo={repo}"),
+        "-F".to_string(),
+        format!("number={number}"),
+        "-f".to_string(),
+        format!("query={query}"),
+    ];
+    let refs = command_args.iter().map(String::as_str).collect::<Vec<_>>();
+    let stdout = command_output("gh", &refs).await?;
+    let raw: Value = serde_json::from_str(&stdout).context("failed to parse gh GraphQL output")?;
+    let pull = raw
+        .pointer("/data/repository/pullRequest")
+        .cloned()
+        .unwrap_or(Value::Null);
+    if pull.is_null() {
+        bail!(
+            "GitHub pull request #{} was not found in {owner}/{repo}",
+            args.pr_number
+        );
+    }
+    let review_threads = pull
+        .pointer("/reviewThreads/nodes")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let top_level_comments = pull
+        .pointer("/comments/nodes")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let reviews = pull
+        .pointer("/reviews/nodes")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let status_check_rollup = pull
+        .pointer("/commits/nodes/0/commit/statusCheckRollup")
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    Ok(json!({
+        "evidence_kind": "github_pr_review_threads",
+        "owner": owner,
+        "repo": repo,
+        "pr_number": args.pr_number,
+        "url": pull.get("url").cloned().unwrap_or(Value::Null),
+        "title": pull.get("title").cloned().unwrap_or(Value::Null),
+        "state": pull.get("state").cloned().unwrap_or(Value::Null),
+        "review_decision": pull.get("reviewDecision").cloned().unwrap_or(Value::Null),
+        "merge_state_status": pull.get("mergeStateStatus").cloned().unwrap_or(Value::Null),
+        "top_level_comments": top_level_comments,
+        "reviews": reviews,
+        "review_threads": review_threads,
+        "status_check_rollup": status_check_rollup,
+    }))
+}
+
+fn preview_github_comment(args: GithubCommentArgs) -> MutationPreview {
+    let target = format!(
+        "{} #{}",
+        normalize_github_comment_target(&args.target_kind).unwrap_or("comment target"),
+        args.number
+    );
+    MutationPreview {
+        detail: format!("Post a GitHub comment on {target} using a body file."),
+        diff_preview: excerpt(&args.body, DIFF_PREVIEW_CHAR_LIMIT),
+        artifact: Some(text_artifact(
+            "github-comment-plan",
+            format!("GitHub comment {target}"),
+            "md",
+            "text/markdown",
+            args.body,
+        )),
+    }
+}
+
+async fn execute_github_comment_tool(
+    state: &AppState,
+    job_id: &str,
+    worker: &WorkerSummary,
+    args: GithubCommentArgs,
+) -> Result<Value> {
+    let target_kind = normalize_github_comment_target(&args.target_kind)
+        .ok_or_else(|| anyhow!("target_kind must be 'pr' or 'issue'"))?;
+    if args.number == 0 {
+        bail!("GitHub comment number must be greater than zero");
+    }
+    if args.body.trim().is_empty() {
+        bail!("GitHub comment body must not be empty");
+    }
+    let (owner, repo) = resolve_github_repo(worker, args.owner, args.repo).await?;
+    let body_dir = publication_job_temp_dir(state, job_id).join("github-comments");
+    fs::create_dir_all(&body_dir)
+        .with_context(|| format!("failed to create '{}'", body_dir.display()))?;
+    let body_path = body_dir.join(format!(
+        "{}-{}-{}.md",
+        target_kind,
+        args.number,
+        Uuid::new_v4()
+    ));
+    fs::write(&body_path, args.body.as_bytes())
+        .with_context(|| format!("failed to write '{}'", body_path.display()))?;
+    let number = args.number.to_string();
+    let repo_arg = format!("{owner}/{repo}");
+    let body_path_arg = body_path.display().to_string();
+    let command_args = vec![
+        target_kind.to_string(),
+        "comment".to_string(),
+        number.clone(),
+        "--repo".to_string(),
+        repo_arg.clone(),
+        "--body-file".to_string(),
+        body_path_arg,
+    ];
+    let refs = command_args.iter().map(String::as_str).collect::<Vec<_>>();
+    let stdout = command_output("gh", &refs).await?;
+    Ok(json!({
+        "posted": true,
+        "target_kind": target_kind,
+        "number": args.number,
+        "repo": repo_arg,
+        "body_file": body_path.display().to_string(),
+        "stdout": stdout,
+    }))
+}
+
+fn normalize_github_comment_target(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "pr" | "pull_request" | "pull request" => Some("pr"),
+        "issue" => Some("issue"),
+        _ => None,
+    }
+}
+
+async fn resolve_github_repo(
+    worker: &WorkerSummary,
+    owner: Option<String>,
+    repo: Option<String>,
+) -> Result<(String, String)> {
+    resolve_github_repo_from_optional(Some(worker), owner, repo).await
+}
+
+async fn resolve_github_repo_from_optional(
+    worker: Option<&WorkerSummary>,
+    owner: Option<String>,
+    repo: Option<String>,
+) -> Result<(String, String)> {
+    match (
+        owner.as_deref().map(str::trim),
+        repo.as_deref().map(str::trim),
+    ) {
+        (Some(owner), Some(repo)) if !owner.is_empty() && !repo.is_empty() => {
+            return Ok((owner.to_string(), repo.trim_end_matches(".git").to_string()));
+        }
+        _ => {}
+    }
+
+    let Some(worker) = worker else {
+        bail!("owner and repo are required when no worker repo context is available");
+    };
+    let remote = command_output(
+        "git",
+        &[
+            "-C",
+            worker.working_dir.as_str(),
+            "remote",
+            "get-url",
+            "origin",
+        ],
+    )
+    .await?;
+    parse_github_remote(&remote).ok_or_else(|| {
+        anyhow!(
+            "could not infer GitHub owner/repo from origin remote '{}'",
+            remote
+        )
+    })
+}
+
+fn parse_github_remote(remote: &str) -> Option<(String, String)> {
+    let trimmed = remote.trim().trim_end_matches(".git");
+    let path = if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("ssh://git@github.com/") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("https://github.com/") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("http://github.com/") {
+        rest
+    } else {
+        return None;
+    };
+    let mut parts = path.split('/');
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim();
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((owner.to_string(), repo.to_string()))
 }
 
 fn preview_fs_apply_patch(
@@ -6995,6 +7568,8 @@ fn resolve_command_spec(
             }
         });
 
+    reject_unsafe_github_comment_shell(&command, &args)?;
+
     Ok(ResolvedCommandSpec {
         mode: mode.to_string(),
         title,
@@ -7006,6 +7581,42 @@ fn resolve_command_spec(
         network_policy,
         env,
     })
+}
+
+fn reject_unsafe_github_comment_shell(command: &str, args: &[String]) -> Result<()> {
+    let executable = Path::new(command)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(command);
+    if !matches!(executable, "sh" | "bash" | "zsh") {
+        return Ok(());
+    }
+    let script = args
+        .windows(2)
+        .find_map(|window| {
+            if matches!(window[0].as_str(), "-c" | "-lc") {
+                Some(window[1].as_str())
+            } else {
+                None
+            }
+        })
+        .unwrap_or("");
+    let normalized = normalize_action_item_text(script);
+    let posts_comment = (normalized.contains("gh pr comment")
+        || normalized.contains("gh issue comment"))
+        && normalized.contains("--body");
+    let interpolation_risk = script.contains('`')
+        || script.contains("$(")
+        || script.contains("${")
+        || script.contains(';')
+        || script.contains('|')
+        || script.contains('&');
+    if posts_comment && interpolation_risk {
+        bail!(
+            "GitHub comment bodies with shell metacharacters must use github.comment or a body file/stdin path, not sh -lc --body"
+        );
+    }
+    Ok(())
 }
 
 fn validate_command_value(worker: &WorkerSummary, command: &str) -> Result<String> {
@@ -7200,7 +7811,7 @@ async fn execute_tests_run_tool(
         args.env,
         true,
     )?;
-    run_bounded_command_tool(
+    let mut result = run_bounded_command_tool(
         state,
         job_id,
         worker,
@@ -7209,7 +7820,50 @@ async fn execute_tests_run_tool(
         cancel_rx,
         spec,
     )
-    .await
+    .await?;
+    if let Some(interpretation) = interpret_test_command_result(&result) {
+        result["validation_interpretation"] = interpretation;
+    }
+    Ok(result)
+}
+
+fn interpret_test_command_result(result: &Value) -> Option<Value> {
+    let combined = normalize_action_item_text(&format!(
+        "{}\n{}",
+        result
+            .get("stdout_tail")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        result
+            .get("stderr_tail")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    ));
+    if combined.is_empty() {
+        return None;
+    }
+    if test_output_says_zero_matched(&combined) {
+        return Some(json!({
+            "status": "no_tests_matched",
+            "summary": "The command completed, but the output says zero tests matched or ran. Do not treat this as passing validation."
+        }));
+    }
+    None
+}
+
+fn test_output_says_zero_matched(text: &str) -> bool {
+    [
+        "0 tests",
+        "no tests ran",
+        "no tests collected",
+        "collected 0 items",
+        "0 matching tests",
+        "no test files found",
+        "test result: ok. 0 passed",
+        "ran 0 tests",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 async fn execute_mcp_tool_call(
@@ -9837,7 +10491,12 @@ fn requires_approval_for_tool(tool: &str) -> bool {
 fn is_mutating_tool(tool: &str) -> bool {
     matches!(
         tool,
-        "fs.apply_patch" | "fs.write_text" | "fs.move" | "fs.mkdir" | "git.stage_patch"
+        "fs.apply_patch"
+            | "fs.write_text"
+            | "fs.move"
+            | "fs.mkdir"
+            | "git.stage_patch"
+            | "github.comment"
     )
 }
 
@@ -10835,6 +11494,18 @@ fn read_only_capabilities() -> Vec<ToolCapabilityGrantRecord> {
             concurrency_group: "git-read".to_string(),
             scope_kind: "repo".to_string(),
         },
+        ToolCapabilityGrantRecord {
+            tool_id: "github.pr_review_threads".to_string(),
+            summary: "Fetch thread-aware GitHub pull request review data, including inline review threads, unresolved and outdated state, paths, lines, and comment bodies.".to_string(),
+            approval_mode: "auto".to_string(),
+            risk_level: "low".to_string(),
+            side_effect_level: "network".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: 65_536,
+            supports_streaming: false,
+            concurrency_group: "github-read".to_string(),
+            scope_kind: "repo".to_string(),
+        },
     ]
 }
 
@@ -10898,6 +11569,18 @@ fn mutating_capabilities() -> Vec<ToolCapabilityGrantRecord> {
             max_output_bytes: 16_384,
             supports_streaming: false,
             concurrency_group: "git-write".to_string(),
+            scope_kind: "repo".to_string(),
+        },
+        ToolCapabilityGrantRecord {
+            tool_id: "github.comment".to_string(),
+            summary: "Post a GitHub issue or PR comment using argv and a temporary body file so shell metacharacters in the body are not interpreted.".to_string(),
+            approval_mode: "explicit".to_string(),
+            risk_level: "medium".to_string(),
+            side_effect_level: "external".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: 16_384,
+            supports_streaming: false,
+            concurrency_group: "github-write".to_string(),
             scope_kind: "repo".to_string(),
         },
     ]
@@ -11165,6 +11848,7 @@ Working directory: {}\n",
     let action_shapes = if is_root_worker {
         "{\"kind\":\"tool_call\",\"summary\":\"inspect the active project\",\"tool\":\"project.inspect\",\"args\":{}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"list likely project directories\",\"tool\":\"fs.list\",\"args\":{\"path\":\".\",\"recursive\":false,\"limit\":100}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"fetch inline PR review threads\",\"tool\":\"github.pr_review_threads\",\"args\":{\"pr_number\":123}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"check running dev processes\",\"tool\":\"command.run\",\"args\":{\"command\":\"sh\",\"args\":[\"-lc\",\"ps -ef | grep -iE 'stfr|vite|next|webpack|dev server' | grep -v grep\"],\"cwd\":\".\",\"timeout_secs\":20}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"verify the UI in Browser\",\"tool\":\"browser.navigate\",\"args\":{\"url\":\"http://127.0.0.1:5299\"}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"read Browser refs\",\"tool\":\"browser.snapshot\",\"args\":{}}\n\
@@ -11175,6 +11859,7 @@ Working directory: {}\n",
     } else {
         "{\"kind\":\"tool_call\",\"summary\":\"inspect the active project\",\"tool\":\"project.inspect\",\"args\":{}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"list likely project directories\",\"tool\":\"fs.list\",\"args\":{\"path\":\".\",\"recursive\":false,\"limit\":100}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"fetch inline PR review threads\",\"tool\":\"github.pr_review_threads\",\"args\":{\"pr_number\":123}}\n\
 {\"kind\":\"progress_update\",\"summary\":\"durable checkpoint, not done\",\"detail\":\"completed evidence and exact continuation point\"}\n\
 {\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\"}"
     };
@@ -11217,6 +11902,10 @@ Rules:\n\
 - progress_update records a non-terminal checkpoint for Nucleus; it does not complete the job.\n\
 - Do not put plans, next-step instructions, progress updates, partial completion notes, or descriptions of future actions in final_answer.\n\
 - If the requested work is incomplete and you are not blocked or out of budget, continue with a tool_call instead of returning final_answer.\n\
+- For PR feedback, latest review, requested changes, Codex review, or unresolved comment tasks, do not rely on flat gh pr view comments alone. Fetch thread-aware inline review data with github.pr_review_threads before saying there is no actionable feedback.\n\
+- If a user challenges or repeats a prior clean/no-action answer, treat it as a grounding failure signal and use a deeper or different evidence path before repeating the conclusion.\n\
+- Treat zero matched tests as no tests matched, not validation success.\n\
+- When posting GitHub comments, use github.comment or a body file/stdin path. Do not put comment bodies with backticks or shell metacharacters inside sh -lc strings.\n\
 - Use final_answer only as the terminal completion action when the requested task is complete and validated, or when you are genuinely blocked.\n\
 - Do not use provider-native tool wrappers such as tool_call/tool_name/shell; use the exact Nucleus JSON shapes above.\n\
 - Do not wrap JSON in markdown fences.\n\
@@ -11595,6 +12284,14 @@ mod tests {
         );
         assert_eq!(policy_for_tool("command.session.write").decision, "allow");
         assert_eq!(policy_for_tool("fs.read_text").decision, "allow");
+        assert_eq!(
+            policy_for_tool("github.comment").decision,
+            "require_approval"
+        );
+        assert_eq!(
+            policy_for_tool("github.pr_review_threads").decision,
+            "allow"
+        );
     }
 
     #[test]
@@ -11709,6 +12406,11 @@ mod tests {
                 .any(|grant| grant.tool_id == "fs.read_text")
         );
         assert!(
+            read_only
+                .iter()
+                .any(|grant| grant.tool_id == "github.pr_review_threads")
+        );
+        assert!(
             !read_only
                 .iter()
                 .any(|grant| grant.tool_id == "fs.write_text")
@@ -11720,6 +12422,11 @@ mod tests {
             repo_mutation
                 .iter()
                 .any(|grant| grant.tool_id == "fs.write_text")
+        );
+        assert!(
+            repo_mutation
+                .iter()
+                .any(|grant| grant.tool_id == "github.comment")
         );
         assert!(
             !repo_mutation
@@ -12120,6 +12827,172 @@ mod tests {
             0,
             0,
         ));
+    }
+
+    #[test]
+    fn pr_review_feedback_does_not_accept_clean_answer_without_inline_thread_evidence() {
+        let worker = test_worker_summary("pr-feedback-evidence", 100, 100);
+        let detail = test_job_detail_with_prompt(
+            "Review latest PR feedback on PR #217, including Codex review comments and unresolved requested changes.",
+        );
+        let checkpoint = test_checkpoint_with_prompt(
+            "Review latest PR feedback on PR #217, including Codex review comments.",
+        );
+
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "No actionable feedback",
+            "There is no actionable feedback and the PR looks clean.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            1,
+        ));
+    }
+
+    #[test]
+    fn pr_review_feedback_accepts_clean_answer_after_thread_aware_evidence() {
+        let worker = test_worker_summary("pr-feedback-thread-aware", 100, 100);
+        let mut detail = test_job_detail_with_prompt(
+            "Check latest PR feedback on PR #217 and unresolved Codex review comments.",
+        );
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_review_threads",
+            json!({
+                "evidence_kind": "github_pr_review_threads",
+                "review_threads": [
+                    {
+                        "isResolved": true,
+                        "isOutdated": false,
+                        "path": "crates/daemon/src/agent.rs",
+                        "line": 42,
+                        "comments": {"nodes": []}
+                    }
+                ]
+            }),
+        ));
+        let checkpoint = test_checkpoint_with_prompt("Check latest PR feedback.");
+
+        assert!(has_thread_aware_pr_review_evidence(&detail));
+        assert!(!should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "No actionable feedback",
+            "There is no actionable feedback.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+    }
+
+    #[test]
+    fn repeated_user_challenge_blocks_repeated_unsupported_clean_answer() {
+        let worker = test_worker_summary("repeated-grounding-challenge", 100, 100);
+        let detail = test_job_detail_with_prompt(
+            "Are you sure? I can see a screenshot showing comments. Check again.",
+        );
+        let checkpoint = test_checkpoint_with_prompt(
+            "Are you sure? I can see a screenshot showing comments. Check again.",
+        );
+
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Still clean",
+            "There is nothing actionable.",
+            "act",
+            &checkpoint,
+            &worker,
+            4,
+            2,
+        ));
+    }
+
+    #[test]
+    fn zero_test_output_is_not_treated_as_passing_validation() {
+        let zero_result = json!({
+            "stdout_tail": "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored",
+            "stderr_tail": "",
+            "exit_code": 0,
+        });
+        let interpretation =
+            interpret_test_command_result(&zero_result).expect("zero tests should be detected");
+        assert_eq!(interpretation["status"], "no_tests_matched");
+
+        let passing_result = json!({
+            "stdout_tail": "running 1 test\n\ntest result: ok. 1 passed; 0 failed; 0 ignored",
+            "stderr_tail": "",
+            "exit_code": 0,
+        });
+        assert!(interpret_test_command_result(&passing_result).is_none());
+    }
+
+    #[test]
+    fn test_success_claim_requires_test_or_check_evidence() {
+        let worker = test_worker_summary("test-evidence", 100, 100);
+        let detail = test_job_detail_with_prompt("Check failed tests and validation for this PR.");
+        let checkpoint = test_checkpoint_with_prompt("Check failed tests and validation.");
+
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "No failed tests",
+            "No failed tests; validation passed.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            1,
+        ));
+    }
+
+    #[test]
+    fn zero_matched_test_evidence_blocks_passing_validation_claim() {
+        let worker = test_worker_summary("zero-test-evidence", 100, 100);
+        let mut detail = test_job_detail_with_prompt("Run tests and validate the fix.");
+        detail.tool_calls.push(test_tool_call_summary(
+            "tests.run",
+            json!({
+                "stdout_tail": "running 0 tests",
+                "validation_interpretation": {
+                    "status": "no_tests_matched"
+                }
+            }),
+        ));
+        let checkpoint = test_checkpoint_with_prompt("Run tests and validate the fix.");
+
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Validation passed",
+            "Tests passed.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+    }
+
+    #[test]
+    fn github_comment_shell_body_with_backticks_is_rejected() {
+        let result = reject_unsafe_github_comment_shell(
+            "sh",
+            &[
+                "-lc".to_string(),
+                "gh pr comment 218 --body \"Fixed `danger`\"".to_string(),
+            ],
+        );
+        assert!(result.is_err());
+
+        let preview = preview_github_comment(GithubCommentArgs {
+            owner: Some("WebLime-agency".to_string()),
+            repo: Some("nucleus".to_string()),
+            target_kind: "pr".to_string(),
+            number: 218,
+            body: "Fixed `danger` without shell interpolation.".to_string(),
+        });
+        assert!(preview.detail.contains("body file"));
+        assert!(preview.diff_preview.contains("`danger`"));
     }
 
     #[test]
@@ -16352,6 +17225,59 @@ for line in sys.stdin:
             artifact_count: 0,
             created_at: 0,
             updated_at: 0,
+        }
+    }
+
+    fn test_job_detail_with_prompt(prompt: &str) -> JobDetail {
+        let mut job = test_publication_job_summary("evidence-job");
+        job.title = "PR feedback".to_string();
+        job.purpose = "Session prompt".to_string();
+        job.prompt_excerpt = prompt.to_string();
+        JobDetail {
+            job,
+            workers: Vec::new(),
+            child_jobs: Vec::new(),
+            tool_calls: Vec::new(),
+            approvals: Vec::new(),
+            artifacts: Vec::new(),
+            command_sessions: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+
+    fn test_checkpoint_with_prompt(prompt: &str) -> WorkerCheckpoint {
+        WorkerCheckpoint {
+            session_id: "session-evidence".to_string(),
+            prompt_text: prompt.to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        }
+    }
+
+    fn test_tool_call_summary(
+        tool_id: &str,
+        result_json: Value,
+    ) -> nucleus_protocol::ToolCallSummary {
+        nucleus_protocol::ToolCallSummary {
+            id: format!("{tool_id}-call"),
+            job_id: "evidence-job".to_string(),
+            worker_id: "worker-evidence".to_string(),
+            tool_id: tool_id.to_string(),
+            status: "completed".to_string(),
+            summary: String::new(),
+            args_json: json!({}),
+            result_json: Some(result_json),
+            policy_decision: None,
+            artifact_ids: Vec::new(),
+            error_class: String::new(),
+            error_detail: String::new(),
+            created_at: 0,
+            started_at: Some(0),
+            completed_at: Some(1),
         }
     }
 
