@@ -4167,6 +4167,7 @@ fn evidence_task_text(detail: &JobDetail, checkpoint: &WorkerCheckpoint) -> Stri
 
 fn requires_pr_review_thread_evidence(text: &str) -> bool {
     let pr_context = text.contains(" pr ")
+        || !extract_pr_numbers(text).is_empty()
         || text.contains("pull request")
         || text.contains("github")
         || text.contains("codex");
@@ -13303,6 +13304,55 @@ mod tests {
             &detail,
             "No actionable feedback",
             "There is no actionable feedback and the PR looks clean.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            1,
+        ));
+    }
+
+    #[test]
+    fn pr_review_feedback_compact_pr_ref_requires_thread_aware_evidence() {
+        let worker = test_worker_summary("compact-pr-feedback-evidence", 100, 100);
+        let detail = test_job_detail_with_prompt(
+            "Review PR#217 latest feedback, including unresolved requested changes.",
+        );
+        let checkpoint = test_checkpoint_with_prompt("Review PR#217 latest feedback.");
+
+        assert!(requires_pr_review_thread_evidence(
+            "review pr#217 latest feedback"
+        ));
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "No actionable feedback",
+            "There is no actionable feedback.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            1,
+        ));
+    }
+
+    #[test]
+    fn pr_review_feedback_plural_pr_refs_require_thread_aware_evidence() {
+        let worker = test_worker_summary("plural-pr-feedback-evidence", 100, 100);
+        let detail = test_job_detail_with_prompt(
+            "Check PRs #217 and #219 review feedback and unresolved comments.",
+        );
+        let checkpoint = test_checkpoint_with_prompt("Check PRs #217 and #219 review feedback.");
+
+        assert!(requires_pr_review_thread_evidence(
+            "check prs #217 and #219 review feedback"
+        ));
+        assert!(!requires_pr_review_thread_evidence(
+            "review issue #218 latest feedback"
+        ));
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "No actionable feedback",
+            "There is no actionable feedback.",
             "act",
             &checkpoint,
             &worker,
