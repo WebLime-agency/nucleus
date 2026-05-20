@@ -7890,24 +7890,56 @@ fn command_session_workspace_metadata(
 }
 
 fn detect_command_port(spec: &ResolvedCommandSpec) -> Option<u16> {
-    let text = std::iter::once(spec.command.as_str())
-        .chain(spec.args.iter().map(String::as_str))
-        .collect::<Vec<_>>()
-        .join(" ");
-    for marker in ["--port", "-p", "PORT="] {
-        if let Some(index) = text.find(marker) {
-            let rest = &text[index + marker.len()..];
-            let digits = rest
-                .trim_start_matches(['=', ' ', ':'])
-                .chars()
-                .take_while(|ch| ch.is_ascii_digit())
-                .collect::<String>();
-            if let Ok(port) = digits.parse::<u16>() {
+    detect_command_port_tokens(&spec.args)
+        .or_else(|| {
+            spec.env
+                .get("PORT")
+                .and_then(|value| parse_port_value(value))
+        })
+        .or_else(|| {
+            spec.args.iter().find_map(|arg| {
+                arg.split_ascii_whitespace()
+                    .find_map(detect_port_env_assignment)
+            })
+        })
+}
+
+fn detect_command_port_tokens(args: &[String]) -> Option<u16> {
+    let mut iter = args.iter().map(String::as_str).peekable();
+    while let Some(arg) = iter.next() {
+        if matches!(arg, "--port" | "-p") {
+            if let Some(port) = iter.peek().and_then(|value| parse_port_value(value)) {
+                return Some(port);
+            }
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--port=") {
+            if let Some(port) = parse_port_value(value) {
                 return Some(port);
             }
         }
+        if let Some(value) = arg.strip_prefix("-p") {
+            if !value.is_empty() {
+                if let Some(port) = parse_port_value(value) {
+                    return Some(port);
+                }
+            }
+        }
+        if let Some(port) = detect_port_env_assignment(arg) {
+            return Some(port);
+        }
     }
     None
+}
+
+fn detect_port_env_assignment(word: &str) -> Option<u16> {
+    word.strip_prefix("PORT=").and_then(parse_port_value)
+}
+
+fn parse_port_value(value: &str) -> Option<u16> {
+    (!value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit()))
+        .then(|| value.parse::<u16>().ok())
+        .flatten()
 }
 
 fn ensure_declared_command_port_available(spec: &ResolvedCommandSpec) -> Result<()> {
@@ -13012,6 +13044,40 @@ Cleanup status: clean";
         spec.args = vec!["-lc".to_string(), "PORT=5202 npm run dev".to_string()];
         spec.command = "sh".to_string();
         assert_eq!(detect_command_port(&spec), Some(5202));
+
+        spec.args = vec![
+            "run".to_string(),
+            "dev".to_string(),
+            "--port=5174".to_string(),
+        ];
+        spec.command = "npm".to_string();
+        assert_eq!(detect_command_port(&spec), Some(5174));
+
+        spec.args = vec!["run".to_string(), "dev".to_string(), "-p5175".to_string()];
+        assert_eq!(detect_command_port(&spec), Some(5175));
+
+        spec.env.insert("PORT".to_string(), "5176".to_string());
+        spec.args = vec!["run".to_string(), "dev".to_string()];
+        assert_eq!(detect_command_port(&spec), Some(5176));
+    }
+
+    #[test]
+    fn command_port_detection_ignores_non_port_flag_substrings() {
+        let spec = ResolvedCommandSpec {
+            mode: "interactive".to_string(),
+            title: "Shell command".to_string(),
+            command: "sh".to_string(),
+            args: vec![
+                "-lc".to_string(),
+                "printf ready && grep -p 5192 package.json".to_string(),
+            ],
+            cwd: PathBuf::from("/tmp"),
+            timeout_secs: 30,
+            output_limit_bytes: 1024,
+            network_policy: "inherit".to_string(),
+            env: BTreeMap::new(),
+        };
+        assert_eq!(detect_command_port(&spec), None);
     }
 
     #[test]
