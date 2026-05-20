@@ -4470,12 +4470,12 @@ fn extract_pr_numbers(text: &str) -> BTreeSet<u64> {
                 numbers.insert(number);
                 continue;
             }
-            if *token == "and" {
+            if matches!(*token, "and" | "request" | "requests") {
                 continue;
             }
             pr_list_active = false;
         }
-        if *token == "pr" {
+        if matches!(*token, "pr" | "prs") {
             if let Some(number) = tokens
                 .get(index + 1)
                 .and_then(|next| parse_pr_reference_number(next))
@@ -4486,6 +4486,15 @@ fn extract_pr_numbers(text: &str) -> BTreeSet<u64> {
             continue;
         }
         if *token == "pull" && tokens.get(index + 1).copied() == Some("request") {
+            if let Some(number) = tokens
+                .get(index + 2)
+                .and_then(|next| parse_pr_reference_number(next))
+            {
+                numbers.insert(number);
+                pr_list_active = true;
+            }
+        }
+        if *token == "pull" && tokens.get(index + 1).copied() == Some("requests") {
             if let Some(number) = tokens
                 .get(index + 2)
                 .and_then(|next| parse_pr_reference_number(next))
@@ -7154,7 +7163,7 @@ async fn execute_github_pr_review_threads_tool(
 ) -> Result<Value> {
     let (owner, repo) = resolve_github_repo(worker, args.owner, args.repo).await?;
     let query = r#"
-query($owner: String!, $repo: String!, $number: Int!) {
+query($owner: String!, $repo: String!, $number: Int!, $threadsCursor: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       number
@@ -7183,7 +7192,11 @@ query($owner: String!, $repo: String!, $number: Int!) {
           url
         }
       }
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $threadsCursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
         nodes {
           id
           isResolved
@@ -7192,6 +7205,10 @@ query($owner: String!, $repo: String!, $number: Int!) {
           line
           startLine
           comments(first: 100) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
             nodes {
               id
               author { login }
@@ -7237,36 +7254,71 @@ query($owner: String!, $repo: String!, $number: Int!) {
   }
 }
 "#;
-    let number = args.pr_number.to_string();
-    let command_args = vec![
-        "api".to_string(),
-        "graphql".to_string(),
-        "-f".to_string(),
-        format!("owner={owner}"),
-        "-f".to_string(),
-        format!("repo={repo}"),
-        "-F".to_string(),
-        format!("number={number}"),
-        "-f".to_string(),
-        format!("query={query}"),
-    ];
-    let refs = command_args.iter().map(String::as_str).collect::<Vec<_>>();
-    let stdout = command_output("gh", &refs).await?;
-    let raw: Value = serde_json::from_str(&stdout).context("failed to parse gh GraphQL output")?;
+    let raw = github_pr_review_threads_query(&owner, &repo, args.pr_number, query, None).await?;
+    let mut raw: Value = serde_json::from_str(&raw).context("failed to parse gh GraphQL output")?;
     let pull = raw
-        .pointer("/data/repository/pullRequest")
-        .cloned()
-        .unwrap_or(Value::Null);
+        .pointer_mut("/data/repository/pullRequest")
+        .ok_or_else(|| anyhow!("failed to read GitHub pull request GraphQL response"))?;
     if pull.is_null() {
         bail!(
             "GitHub pull request #{} was not found in {owner}/{repo}",
             args.pr_number
         );
     }
-    let review_threads = pull
+
+    let mut review_threads = pull
         .pointer("/reviewThreads/nodes")
+        .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_else(|| json!([]));
+        .unwrap_or_default();
+    let mut thread_comments_truncated = review_threads
+        .iter()
+        .any(|thread| thread_comments_have_next_page(thread));
+    let mut next_cursor = pull
+        .pointer("/reviewThreads/pageInfo/endCursor")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let mut has_next_page = pull
+        .pointer("/reviewThreads/pageInfo/hasNextPage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    while has_next_page {
+        let cursor = next_cursor
+            .as_deref()
+            .ok_or_else(|| anyhow!("GitHub reviewThreads pageInfo omitted endCursor"))?;
+        let page_stdout =
+            github_pr_review_threads_query(&owner, &repo, args.pr_number, query, Some(cursor))
+                .await?;
+        let page: Value =
+            serde_json::from_str(&page_stdout).context("failed to parse gh GraphQL page output")?;
+        let page_pull = page
+            .pointer("/data/repository/pullRequest")
+            .ok_or_else(|| anyhow!("failed to read paginated GitHub pull request response"))?;
+        let page_threads = page_pull
+            .pointer("/reviewThreads/nodes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        thread_comments_truncated |= page_threads
+            .iter()
+            .any(|thread| thread_comments_have_next_page(thread));
+        review_threads.extend(page_threads);
+        has_next_page = page_pull
+            .pointer("/reviewThreads/pageInfo/hasNextPage")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        next_cursor = page_pull
+            .pointer("/reviewThreads/pageInfo/endCursor")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    pull["reviewThreads"]["nodes"] = Value::Array(review_threads.clone());
+    pull["reviewThreads"]["pageInfo"] = json!({
+        "hasNextPage": false,
+        "endCursor": next_cursor,
+    });
+    let pull = pull.clone();
+
     let top_level_comments = pull
         .pointer("/comments/nodes")
         .cloned()
@@ -7296,8 +7348,46 @@ query($owner: String!, $repo: String!, $number: Int!) {
         "top_level_comments": top_level_comments,
         "reviews": reviews,
         "review_threads": review_threads,
+        "review_threads_complete": true,
+        "thread_comments_truncated": thread_comments_truncated,
         "status_check_rollup": status_check_rollup,
     }))
+}
+
+async fn github_pr_review_threads_query(
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    query: &str,
+    threads_cursor: Option<&str>,
+) -> Result<String> {
+    let number = pr_number.to_string();
+    let command_args = vec![
+        "api".to_string(),
+        "graphql".to_string(),
+        "-f".to_string(),
+        format!("owner={owner}"),
+        "-f".to_string(),
+        format!("repo={repo}"),
+        "-F".to_string(),
+        format!("number={number}"),
+    ];
+    let mut command_args = command_args;
+    if let Some(cursor) = threads_cursor {
+        command_args.push("-f".to_string());
+        command_args.push(format!("threadsCursor={cursor}"));
+    }
+    command_args.push("-f".to_string());
+    command_args.push(format!("query={query}"));
+    let refs = command_args.iter().map(String::as_str).collect::<Vec<_>>();
+    command_output("gh", &refs).await
+}
+
+fn thread_comments_have_next_page(thread: &Value) -> bool {
+    thread
+        .pointer("/comments/pageInfo/hasNextPage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 async fn execute_github_pr_state_tool(
@@ -13447,6 +13537,18 @@ mod tests {
         );
         assert_eq!(
             extract_pr_numbers("Check PR #217 and #219, closes #218")
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![217, 219]
+        );
+        assert_eq!(
+            extract_pr_numbers("Check PRs #217 and #219, closes #218")
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![217, 219]
+        );
+        assert_eq!(
+            extract_pr_numbers("Check pull requests #217 and #219, closes #218")
                 .into_iter()
                 .collect::<Vec<_>>(),
             vec![217, 219]
