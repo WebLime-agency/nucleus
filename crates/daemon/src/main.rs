@@ -162,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
         }),
     )
     .await;
+    record_utility_worker_route_startup_validation(&state).await;
     agent::recover_interrupted_jobs(&state).await?;
     spawn_event_publisher(state.clone());
     spawn_update_monitor(state.clone());
@@ -821,6 +822,11 @@ async fn update_workspace(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
+    if let Some(profile_id) = default_profile_id.as_deref() {
+        let workspace = state.store.workspace()?;
+        let profile = resolve_workspace_profile(&workspace, profile_id)?;
+        validate_workspace_model_runtime(&state, &profile.utility, "Utility Worker").await?;
+    }
     let workspace = state.store.update_workspace(
         root_path.as_deref(),
         default_profile_id.as_deref(),
@@ -858,6 +864,7 @@ async fn create_workspace_profile(
 ) -> Result<Json<WorkspaceProfileSummary>, ApiError> {
     let payload = decode_json::<WorkspaceProfileWriteRequest>(&body)?;
     let patch = sanitize_workspace_profile_patch(&payload)?;
+    validate_workspace_model_runtime(&state, &patch.utility, "Utility Worker").await?;
     let profile = state.store.create_workspace_profile(patch)?;
     let _ = try_record_audit_event(
         &state,
@@ -884,6 +891,7 @@ async fn update_workspace_profile(
 ) -> Result<Json<WorkspaceProfileSummary>, ApiError> {
     let payload = decode_json::<WorkspaceProfileWriteRequest>(&body)?;
     let patch = sanitize_workspace_profile_patch(&payload)?;
+    validate_workspace_model_runtime(&state, &patch.utility, "Utility Worker").await?;
     let profile = state.store.update_workspace_profile(&profile_id, patch)?;
     let _ = try_record_audit_event(
         &state,
@@ -901,6 +909,53 @@ async fn update_workspace_profile(
     .await;
     let _ = publish_overview_event(&state).await;
     Ok(Json(redact_workspace_profile(profile)))
+}
+
+async fn record_utility_worker_route_startup_validation(state: &AppState) {
+    match validate_default_utility_worker_route(state).await {
+        Ok(target) => {
+            let _ = record_instance_log(
+                state,
+                "info",
+                "configuration",
+                "daemon",
+                "utility_worker.route.ready",
+                "Utility Worker route validated at startup.",
+                json!({}),
+                json!({
+                    "executor_lane": "utility",
+                    "provider": target.provider,
+                    "model": target.model,
+                    "profile_id": target.profile_id,
+                    "profile_title": target.profile_title,
+                }),
+            )
+            .await;
+        }
+        Err(error) => {
+            let _ = record_instance_log(
+                state,
+                "error",
+                "configuration",
+                "daemon",
+                "utility_worker.route.invalid",
+                "Utility Worker route is not usable. Session execution will fail closed instead of falling back to the main route.",
+                json!({}),
+                json!({ "detail": error.message }),
+            )
+            .await;
+        }
+    }
+}
+
+async fn validate_default_utility_worker_route(
+    state: &AppState,
+) -> Result<SessionTargetSelection, ApiError> {
+    let workspace = state.store.workspace()?;
+    let profile = resolve_workspace_profile(&workspace, &workspace.default_profile_id)?;
+    let target = resolve_workspace_profile_target(state, profile, "utility").await?;
+    validate_utility_worker_selection(&target)?;
+    Ok(target)
 }
 
 async fn delete_workspace_profile(
@@ -4726,6 +4781,24 @@ fn sanitize_workspace_model_config(
     })
 }
 
+async fn validate_workspace_model_runtime(
+    state: &AppState,
+    config: &WorkspaceModelConfig,
+    role_label: &str,
+) -> Result<(), ApiError> {
+    let adapter = resolve_provider(&config.adapter)?;
+    ensure_prompting_runtime(state, adapter.as_str(), false)
+        .await
+        .map_err(|error| {
+            ApiError::bad_request(format!(
+                "{role_label} adapter '{}' is not available: {}",
+                adapter.as_str(),
+                error.message
+            ))
+        })?;
+    Ok(())
+}
+
 fn hydrate_skill_instructions_from_include(skill: &mut SkillManifest) {
     if !skill.instructions.trim().is_empty() {
         return;
@@ -6346,6 +6419,27 @@ async fn resolve_workspace_profile_target(
         provider_base_url: config.base_url.trim().to_string(),
         provider_api_key: config.api_key.trim().to_string(),
     })
+}
+
+fn validate_utility_worker_selection(target: &SessionTargetSelection) -> Result<(), ApiError> {
+    if target.provider.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "Utility Worker provider is not configured",
+        ));
+    }
+    if target.model.trim().is_empty() && target.provider != AdapterKind::Codex.as_str() {
+        return Err(ApiError::bad_request(
+            "Utility Worker model is not configured",
+        ));
+    }
+    if target.provider == AdapterKind::OpenAiCompatible.as_str()
+        && target.provider_base_url.trim().is_empty()
+    {
+        return Err(ApiError::bad_request(
+            "Utility Worker OpenAI-compatible base URL is not configured",
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_session_projects(

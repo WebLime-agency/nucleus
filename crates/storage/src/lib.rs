@@ -2297,7 +2297,14 @@ impl StateStore {
         grants: &[ToolCapabilityGrantRecord],
     ) -> Result<Vec<ToolCapabilitySummary>> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
-        ensure_worker_exists(&connection, worker_id)?;
+        let worker = load_worker_summary(&connection, worker_id)?;
+        if worker.lane != "utility" && !grants.is_empty() {
+            bail!(
+                "worker '{}' is lane '{}' and cannot receive action capability grants; only utility workers may receive action grants",
+                worker_id,
+                worker.lane
+            );
+        }
         connection.execute(
             "DELETE FROM tool_capability_grants WHERE worker_id = ?1",
             params![worker_id],
@@ -6839,6 +6846,13 @@ fn load_job_summary(connection: &Connection, job_id: &str) -> Result<JobSummary>
     job.worker_count = count_for_job(connection, "job_workers", job_id)?;
     job.pending_approval_count = count_pending_approvals_for_job(connection, job_id)?;
     job.artifact_count = count_for_job(connection, "job_artifacts", job_id)?;
+    if let Some(root_worker_id) = job.root_worker_id.as_deref() {
+        if let Ok(worker) = load_worker_summary(connection, root_worker_id) {
+            job.executor_lane = worker.lane;
+            job.executor_provider = worker.provider;
+            job.executor_model = worker.model;
+        }
+    }
     Ok(job)
 }
 
@@ -6866,6 +6880,9 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         requested_by: row.get(8)?,
         prompt_excerpt: row.get(9)?,
         root_worker_id: row.get(10)?,
+        executor_lane: String::new(),
+        executor_provider: String::new(),
+        executor_model: String::new(),
         visible_turn_id: row.get(11)?,
         result_summary: row.get(12)?,
         last_error: row.get(13)?,
