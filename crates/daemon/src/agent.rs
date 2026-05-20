@@ -7988,11 +7988,63 @@ fn parse_port_value(value: &str) -> Option<u16> {
         .flatten()
 }
 
+fn command_declared_port_is_likely_listener(spec: &ResolvedCommandSpec) -> bool {
+    if is_shell_command(&spec.command) {
+        return shell_command_payloads(&spec.args)
+            .into_iter()
+            .any(shell_payload_looks_like_dev_server);
+    }
+    command_tokens_look_like_dev_server(
+        std::iter::once(spec.command.as_str())
+            .chain(spec.args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .as_slice(),
+    )
+}
+
+fn shell_payload_looks_like_dev_server(payload: &str) -> bool {
+    let words = payload.split_ascii_whitespace().collect::<Vec<_>>();
+    command_tokens_look_like_dev_server(&words)
+}
+
+fn command_tokens_look_like_dev_server(tokens: &[&str]) -> bool {
+    let names = tokens
+        .iter()
+        .map(|token| command_token_name(token))
+        .collect::<Vec<_>>();
+    names.iter().any(|name| {
+        matches!(
+            *name,
+            "vite" | "astro" | "next" | "nuxt" | "webpack-dev-server"
+        )
+    }) || package_manager_runs_dev_script(&names)
+}
+
+fn package_manager_runs_dev_script(tokens: &[&str]) -> bool {
+    tokens.windows(3).any(|window| {
+        matches!(window[0], "npm" | "pnpm" | "yarn" | "bun")
+            && window[1] == "run"
+            && window[2] == "dev"
+    }) || tokens
+        .windows(2)
+        .any(|window| matches!(window[0], "pnpm" | "yarn" | "bun") && window[1] == "dev")
+}
+
+fn command_token_name(token: &str) -> &str {
+    Path::new(token)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(token)
+}
+
 fn ensure_declared_command_port_available(spec: &ResolvedCommandSpec) -> Result<()> {
     let Some(port) = detect_command_port(spec) else {
         return Ok(());
     };
     if port == 0 {
+        return Ok(());
+    }
+    if !command_declared_port_is_likely_listener(spec) {
         return Ok(());
     }
 
@@ -13138,6 +13190,44 @@ Cleanup status: clean";
     }
 
     #[test]
+    fn declared_client_ports_do_not_trigger_listener_preflight() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("listener addr should be available")
+            .port();
+
+        let client = ResolvedCommandSpec {
+            mode: "interactive".to_string(),
+            title: "Database client".to_string(),
+            command: "psql".to_string(),
+            args: vec!["--port".to_string(), port.to_string()],
+            cwd: PathBuf::from("/tmp"),
+            timeout_secs: 30,
+            output_limit_bytes: 1024,
+            network_policy: "inherit".to_string(),
+            env: BTreeMap::new(),
+        };
+        assert_eq!(detect_command_port(&client), Some(port));
+        assert!(ensure_declared_command_port_available(&client).is_ok());
+
+        let shell_client = ResolvedCommandSpec {
+            mode: "interactive".to_string(),
+            title: "Database client".to_string(),
+            command: "sh".to_string(),
+            args: vec!["-lc".to_string(), format!("psql --port {port}")],
+            cwd: PathBuf::from("/tmp"),
+            timeout_secs: 30,
+            output_limit_bytes: 1024,
+            network_policy: "inherit".to_string(),
+            env: BTreeMap::new(),
+        };
+        assert_eq!(detect_command_port(&shell_client), Some(port));
+        assert!(ensure_declared_command_port_available(&shell_client).is_ok());
+    }
+
+    #[test]
     fn detects_risky_git_commands() {
         let mut spec = ResolvedCommandSpec {
             mode: "oneshot".to_string(),
@@ -15464,12 +15554,7 @@ Cleanup status: clean";
             "interactive",
             Some("Dev server".to_string()),
             "sh".to_string(),
-            vec![
-                "-c".to_string(),
-                "sleep 30".to_string(),
-                "--port".to_string(),
-                port.to_string(),
-            ],
+            vec!["-c".to_string(), format!("npm run dev -- --port {port}")],
             None,
             Some(30),
             Some(8_192),
