@@ -86,6 +86,7 @@ export const sessionSummarySchema = z.object({
   provider_session_id: z.string(),
   last_error: z.string(),
   user_error: userFacingErrorSummarySchema.nullable().default(null),
+  capabilities: z.array(z.lazy(() => toolCapabilitySummarySchema)).default([]),
   last_message_excerpt: z.string(),
   turn_count: z.number().int().nonnegative(),
   created_at: z.number().int(),

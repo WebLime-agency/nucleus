@@ -6267,6 +6267,7 @@ fn load_session_summary(connection: &Connection, session_id: &str) -> Result<Ses
     session.project_count = session.projects.len();
     session.scope = session_scope_from_projects(&session.projects, &session.scope);
     session.run_budget = session_run_budget(connection, &session.run_budget_mode)?;
+    session.capabilities = load_session_capabilities(connection, session_id)?;
 
     if session.project_id.is_empty() {
         if let Some(primary) = session.projects.iter().find(|project| project.is_primary) {
@@ -6318,6 +6319,7 @@ fn map_session_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionS
         provider_session_id: row.get(31)?,
         last_error: row.get(32)?,
         user_error: None,
+        capabilities: Vec::new(),
         last_message_excerpt: row.get(33)?,
         turn_count: row.get(34)?,
         created_at: row.get(35)?,
@@ -7032,6 +7034,34 @@ fn load_worker_summary(connection: &Connection, worker_id: &str) -> Result<Worke
         .ok_or_else(|| anyhow!("worker '{worker_id}' was not found"))?;
     worker.capabilities = load_worker_capabilities(connection, worker_id)?;
     Ok(worker)
+}
+
+fn load_session_capabilities(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<ToolCapabilitySummary>> {
+    let root_worker_id: Option<String> = connection
+        .query_row(
+            "
+            SELECT jw.id
+            FROM jobs j
+            JOIN job_workers jw ON jw.job_id = j.id
+            WHERE j.session_id = ?1
+              AND j.parent_job_id IS NULL
+              AND jw.parent_worker_id IS NULL
+              AND j.template_id IS NULL
+            ORDER BY j.created_at DESC, j.id DESC, jw.created_at ASC, jw.id ASC
+            LIMIT 1
+            ",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    match root_worker_id {
+        Some(worker_id) => load_worker_capabilities(connection, &worker_id),
+        None => Ok(Vec::new()),
+    }
 }
 
 fn load_worker_capabilities(
@@ -9397,6 +9427,283 @@ and open a pull request to dev when it is ready."
                 env::remove_var("HOME");
             },
         }
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn session_capabilities_ignore_playbook_root_workers() {
+        let state_dir = test_state_dir("session-capabilities-ignore-playbooks");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let working_dir = store
+            .scratch_dir_for_session("session-capabilities")
+            .expect("session scratch dir should resolve");
+
+        store
+            .create_session(test_session_record(
+                "session-capabilities",
+                "Capability session",
+                &working_dir,
+                working_dir.clone(),
+            ))
+            .expect("session should persist");
+
+        store
+            .create_job(JobRecord {
+                id: "prompt-job".to_string(),
+                session_id: Some("session-capabilities".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Prompt run".to_string(),
+                purpose: "Session prompt".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "open the browser".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("prompt job should persist");
+        store
+            .create_worker(WorkerRecord {
+                id: "prompt-worker".to_string(),
+                job_id: "prompt-job".to_string(),
+                parent_worker_id: None,
+                title: "Prompt worker".to_string(),
+                lane: "utility".to_string(),
+                state: "completed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "cx/gpt-5.4".to_string(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: working_dir.clone(),
+                read_roots: vec![working_dir.clone()],
+                write_roots: vec![working_dir.clone()],
+                max_steps: 8,
+                max_tool_calls: 8,
+                max_wall_clock_secs: 60,
+            })
+            .expect("prompt worker should persist");
+        let prompt_grants = [ToolCapabilityGrantRecord {
+            tool_id: "browser.navigate".to_string(),
+            summary: "Navigate the browser".to_string(),
+            approval_mode: "on-request".to_string(),
+            risk_level: "medium".to_string(),
+            side_effect_level: "external".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: 4096,
+            supports_streaming: false,
+            concurrency_group: "browser".to_string(),
+            scope_kind: "workspace".to_string(),
+        }];
+        store
+            .replace_tool_capability_grants("prompt-worker", &prompt_grants)
+            .expect("prompt capabilities should persist");
+
+        store
+            .create_job(JobRecord {
+                id: "playbook-job".to_string(),
+                session_id: Some("session-capabilities".to_string()),
+                parent_job_id: None,
+                template_id: Some("playbook-1".to_string()),
+                title: "Playbook run".to_string(),
+                purpose: "automation".to_string(),
+                trigger_kind: "playbook_manual".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "run checks".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("playbook job should persist");
+        store
+            .create_worker(WorkerRecord {
+                id: "playbook-worker".to_string(),
+                job_id: "playbook-job".to_string(),
+                parent_worker_id: None,
+                title: "Playbook worker".to_string(),
+                lane: "utility".to_string(),
+                state: "completed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "cx/gpt-5.4".to_string(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: working_dir.clone(),
+                read_roots: vec![working_dir.clone()],
+                write_roots: vec![working_dir.clone()],
+                max_steps: 8,
+                max_tool_calls: 8,
+                max_wall_clock_secs: 60,
+            })
+            .expect("playbook worker should persist");
+        let playbook_grants = [ToolCapabilityGrantRecord {
+            tool_id: "files.read".to_string(),
+            summary: "Read files".to_string(),
+            approval_mode: "auto".to_string(),
+            risk_level: "low".to_string(),
+            side_effect_level: "none".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: 4096,
+            supports_streaming: false,
+            concurrency_group: "fs".to_string(),
+            scope_kind: "workspace".to_string(),
+        }];
+        store
+            .replace_tool_capability_grants("playbook-worker", &playbook_grants)
+            .expect("playbook capabilities should persist");
+
+        let session = store
+            .get_session("session-capabilities")
+            .expect("session should load");
+        assert_eq!(session.session.capabilities.len(), 1);
+        assert_eq!(session.session.capabilities[0].tool_id, "browser.navigate");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn session_capabilities_prefer_latest_root_prompt_job_when_created_at_ties() {
+        let state_dir = test_state_dir("session-capabilities-same-second-root-jobs");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let working_dir = store
+            .scratch_dir_for_session("session-capabilities-tie")
+            .expect("session scratch dir should resolve");
+
+        store
+            .create_session(test_session_record(
+                "session-capabilities-tie",
+                "Capability tie session",
+                &working_dir,
+                working_dir.clone(),
+            ))
+            .expect("session should persist");
+
+        store
+            .create_job(JobRecord {
+                id: "prompt-job-1".to_string(),
+                session_id: Some("session-capabilities-tie".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Prompt run 1".to_string(),
+                purpose: "Session prompt".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "first prompt".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("first prompt job should persist");
+        store
+            .create_worker(WorkerRecord {
+                id: "prompt-worker-1".to_string(),
+                job_id: "prompt-job-1".to_string(),
+                parent_worker_id: None,
+                title: "Prompt worker 1".to_string(),
+                lane: "utility".to_string(),
+                state: "completed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "cx/gpt-5.4".to_string(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: working_dir.clone(),
+                read_roots: vec![working_dir.clone()],
+                write_roots: vec![working_dir.clone()],
+                max_steps: 8,
+                max_tool_calls: 8,
+                max_wall_clock_secs: 60,
+            })
+            .expect("first prompt worker should persist");
+        let first_grants = [ToolCapabilityGrantRecord {
+            tool_id: "fs.read".to_string(),
+            summary: "Read files".to_string(),
+            approval_mode: "on-request".to_string(),
+            risk_level: "low".to_string(),
+            side_effect_level: "none".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: 4096,
+            supports_streaming: false,
+            concurrency_group: "fs".to_string(),
+            scope_kind: "workspace".to_string(),
+        }];
+        store
+            .replace_tool_capability_grants("prompt-worker-1", &first_grants)
+            .expect("first prompt capabilities should persist");
+
+        store
+            .create_job(JobRecord {
+                id: "prompt-job-2".to_string(),
+                session_id: Some("session-capabilities-tie".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Prompt run 2".to_string(),
+                purpose: "Session prompt".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "second prompt".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("second prompt job should persist");
+        store
+            .create_worker(WorkerRecord {
+                id: "prompt-worker-2".to_string(),
+                job_id: "prompt-job-2".to_string(),
+                parent_worker_id: None,
+                title: "Prompt worker 2".to_string(),
+                lane: "utility".to_string(),
+                state: "completed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "cx/gpt-5.4".to_string(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: working_dir.clone(),
+                read_roots: vec![working_dir.clone()],
+                write_roots: vec![working_dir.clone()],
+                max_steps: 8,
+                max_tool_calls: 8,
+                max_wall_clock_secs: 60,
+            })
+            .expect("second prompt worker should persist");
+        let second_grants = [ToolCapabilityGrantRecord {
+            tool_id: "browser.navigate".to_string(),
+            summary: "Navigate the browser".to_string(),
+            approval_mode: "on-request".to_string(),
+            risk_level: "medium".to_string(),
+            side_effect_level: "external".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: 4096,
+            supports_streaming: false,
+            concurrency_group: "browser".to_string(),
+            scope_kind: "workspace".to_string(),
+        }];
+        store
+            .replace_tool_capability_grants("prompt-worker-2", &second_grants)
+            .expect("second prompt capabilities should persist");
+
+        {
+            let connection = store.connection.lock().expect("storage mutex poisoned");
+            let tied_created_at: i64 = connection
+                .query_row(
+                    "SELECT created_at FROM jobs WHERE id = ?1",
+                    params!["prompt-job-1"],
+                    |row| row.get(0),
+                )
+                .expect("first prompt job timestamp should load");
+            connection
+                .execute(
+                    "UPDATE jobs SET created_at = ?2 WHERE id = ?1",
+                    params!["prompt-job-2", tied_created_at],
+                )
+                .expect("second prompt job timestamp should be aligned");
+        }
+
+        let session = store
+            .get_session("session-capabilities-tie")
+            .expect("session should load");
+        assert_eq!(session.session.capabilities.len(), 1);
+        assert_eq!(session.session.capabilities[0].tool_id, "browser.navigate");
 
         let _ = fs::remove_dir_all(&state_dir);
     }
