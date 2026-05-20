@@ -162,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
         }),
     )
     .await;
+    record_utility_worker_route_startup_validation(&state).await;
     agent::recover_interrupted_jobs(&state).await?;
     spawn_event_publisher(state.clone());
     spawn_update_monitor(state.clone());
@@ -821,6 +822,11 @@ async fn update_workspace(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
+    if let Some(profile_id) = default_profile_id.as_deref() {
+        let workspace = state.store.workspace()?;
+        let profile = resolve_workspace_profile(&workspace, profile_id)?;
+        validate_workspace_model_runtime(&state, &profile.utility, "Utility Worker").await?;
+    }
     let workspace = state.store.update_workspace(
         root_path.as_deref(),
         default_profile_id.as_deref(),
@@ -858,6 +864,7 @@ async fn create_workspace_profile(
 ) -> Result<Json<WorkspaceProfileSummary>, ApiError> {
     let payload = decode_json::<WorkspaceProfileWriteRequest>(&body)?;
     let patch = sanitize_workspace_profile_patch(&payload)?;
+    validate_workspace_model_runtime(&state, &patch.utility, "Utility Worker").await?;
     let profile = state.store.create_workspace_profile(patch)?;
     let _ = try_record_audit_event(
         &state,
@@ -884,6 +891,7 @@ async fn update_workspace_profile(
 ) -> Result<Json<WorkspaceProfileSummary>, ApiError> {
     let payload = decode_json::<WorkspaceProfileWriteRequest>(&body)?;
     let patch = sanitize_workspace_profile_patch(&payload)?;
+    validate_workspace_model_runtime(&state, &patch.utility, "Utility Worker").await?;
     let profile = state.store.update_workspace_profile(&profile_id, patch)?;
     let _ = try_record_audit_event(
         &state,
@@ -901,6 +909,53 @@ async fn update_workspace_profile(
     .await;
     let _ = publish_overview_event(&state).await;
     Ok(Json(redact_workspace_profile(profile)))
+}
+
+async fn record_utility_worker_route_startup_validation(state: &AppState) {
+    match validate_default_utility_worker_route(state).await {
+        Ok(target) => {
+            let _ = record_instance_log(
+                state,
+                "info",
+                "configuration",
+                "daemon",
+                "utility_worker.route.ready",
+                "Utility Worker route validated at startup.",
+                json!({}),
+                json!({
+                    "executor_lane": "utility",
+                    "provider": target.provider,
+                    "model": target.model,
+                    "profile_id": target.profile_id,
+                    "profile_title": target.profile_title,
+                }),
+            )
+            .await;
+        }
+        Err(error) => {
+            let _ = record_instance_log(
+                state,
+                "error",
+                "configuration",
+                "daemon",
+                "utility_worker.route.invalid",
+                "Utility Worker route is not usable. Session execution will fail closed instead of falling back to the main route.",
+                json!({}),
+                json!({ "detail": error.message }),
+            )
+            .await;
+        }
+    }
+}
+
+async fn validate_default_utility_worker_route(
+    state: &AppState,
+) -> Result<SessionTargetSelection, ApiError> {
+    let workspace = state.store.workspace()?;
+    let profile = resolve_workspace_profile(&workspace, &workspace.default_profile_id)?;
+    let target = resolve_workspace_profile_target(state, profile, "utility").await?;
+    validate_utility_worker_selection(&target)?;
+    Ok(target)
 }
 
 async fn delete_workspace_profile(
@@ -1754,10 +1809,19 @@ fn detect_explicit_memory_intent(prompt: &str) -> Option<ParsedExplicitMemoryInt
     let lower = trimmed.to_ascii_lowercase();
     let prefixes = [
         "remember that ",
+        "can you remember that ",
+        "could you remember that ",
         "please remember that ",
+        "remember ",
+        "can you remember ",
+        "could you remember ",
+        "please remember ",
+        "for future reference, ",
+        "for future reference ",
+        "keep in mind that ",
+        "keep in mind ",
         "moving forward please remember ",
         "moving forward, please remember ",
-        "please remember ",
     ];
     let matched = prefixes
         .iter()
@@ -1782,7 +1846,10 @@ fn detect_explicit_memory_intent(prompt: &str) -> Option<ParsedExplicitMemoryInt
     if let Some(rest) = content.strip_prefix("that ") {
         content = rest.trim().to_string();
     }
-    content = content.trim_end_matches('.').trim().to_string();
+    content = content
+        .trim_end_matches(|c: char| matches!(c, '.' | '!' | '?'))
+        .trim()
+        .to_string();
     if content.len() < 8 {
         return None;
     }
@@ -2125,12 +2192,27 @@ fn memory_dedupe_key(
 }
 fn contains_credential_like_value(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
+    let normalized = lower.replace(['\n', '\r', '\t'], " ");
     lower.contains("authorization: bearer")
         || lower.contains("-----begin ")
         || lower.contains("password=")
         || lower.contains("api_key=")
         || lower.contains("access_token=")
         || lower.contains("refresh_token=")
+        || normalized.contains("password is ")
+        || normalized.contains("password: ")
+        || normalized.contains("my password is ")
+        || normalized.contains("api key is ")
+        || normalized.contains("api key: ")
+        || normalized.contains("my api key is ")
+        || normalized.contains("access token is ")
+        || normalized.contains("access token: ")
+        || normalized.contains("refresh token is ")
+        || normalized.contains("refresh token: ")
+        || normalized.contains("secret is ")
+        || normalized.contains("secret: ")
+        || normalized.contains("token is ")
+        || normalized.contains("token: ")
         || contains_url_userinfo(&lower)
 }
 
@@ -2147,6 +2229,96 @@ fn contains_url_userinfo(text: &str) -> bool {
         host.contains('@')
     })
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManualRememberRequest {
+    pub title: String,
+    pub content: String,
+    pub memory_kind: String,
+}
+
+pub(crate) fn detect_manual_remember_request(prompt: &str) -> Option<ManualRememberRequest> {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("remember to ")
+        || lower.starts_with("please remember to ")
+        || lower.starts_with("can you remember to ")
+        || lower.starts_with("could you remember to ")
+    {
+        return None;
+    }
+
+    let durable_prefixes = [
+        "remember that ",
+        "can you remember that ",
+        "could you remember that ",
+        "please remember that ",
+        "please remember ",
+        "remember ",
+        "for future reference, ",
+        "for future reference ",
+        "keep in mind that ",
+        "keep in mind ",
+    ];
+    let matched_prefix = durable_prefixes
+        .iter()
+        .find(|prefix| lower.starts_with(**prefix))?;
+
+    let mut content = trimmed[matched_prefix.len()..]
+        .trim()
+        .trim_matches(|c: char| matches!(c, '"' | '\'' | '`'))
+        .trim()
+        .trim_end_matches(|c: char| matches!(c, '.' | '!' | '?'))
+        .trim()
+        .to_string();
+    if let Some(stripped) = content
+        .strip_prefix("that ")
+        .or_else(|| content.strip_prefix("That "))
+    {
+        content = stripped.trim().to_string();
+    }
+    if content.is_empty() {
+        return None;
+    }
+
+    let content_lower = content.to_ascii_lowercase();
+    if content_lower.starts_with("to ")
+        || content_lower.contains(" this turn")
+        || content_lower.contains(" before answering")
+        || content_lower.contains(" in this response")
+        || contains_credential_like_value(&content)
+    {
+        return None;
+    }
+
+    let title = content
+        .split_whitespace()
+        .take(6)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let memory_kind = if content_lower.starts_with("i like ")
+        || content_lower.starts_with("i prefer ")
+        || content_lower.starts_with("we prefer ")
+        || content_lower.starts_with("our team prefers ")
+        || content_lower.contains(" prefer ")
+    {
+        "preference"
+    } else {
+        "fact"
+    }
+    .to_string();
+
+    Some(ManualRememberRequest {
+        title,
+        content,
+        memory_kind,
+    })
+}
+
 async fn record_memory_audit(
     state: &AppState,
     kind: &str,
@@ -4726,6 +4898,24 @@ fn sanitize_workspace_model_config(
     })
 }
 
+async fn validate_workspace_model_runtime(
+    state: &AppState,
+    config: &WorkspaceModelConfig,
+    role_label: &str,
+) -> Result<(), ApiError> {
+    let adapter = resolve_provider(&config.adapter)?;
+    ensure_prompting_runtime(state, adapter.as_str(), false)
+        .await
+        .map_err(|error| {
+            ApiError::bad_request(format!(
+                "{role_label} adapter '{}' is not available: {}",
+                adapter.as_str(),
+                error.message
+            ))
+        })?;
+    Ok(())
+}
+
 fn hydrate_skill_instructions_from_include(skill: &mut SkillManifest) {
     if !skill.instructions.trim().is_empty() {
         return;
@@ -6346,6 +6536,27 @@ async fn resolve_workspace_profile_target(
         provider_base_url: config.base_url.trim().to_string(),
         provider_api_key: config.api_key.trim().to_string(),
     })
+}
+
+fn validate_utility_worker_selection(target: &SessionTargetSelection) -> Result<(), ApiError> {
+    if target.provider.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "Utility Worker provider is not configured",
+        ));
+    }
+    if target.model.trim().is_empty() && target.provider != AdapterKind::Codex.as_str() {
+        return Err(ApiError::bad_request(
+            "Utility Worker model is not configured",
+        ));
+    }
+    if target.provider == AdapterKind::OpenAiCompatible.as_str()
+        && target.provider_base_url.trim().is_empty()
+    {
+        return Err(ApiError::bad_request(
+            "Utility Worker OpenAI-compatible base URL is not configured",
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_session_projects(
@@ -8835,6 +9046,7 @@ mod tests {
             provider_session_id: String::new(),
             last_error: String::new(),
             user_error: None,
+            capabilities: Vec::new(),
             last_message_excerpt: String::new(),
             turn_count: 0,
             created_at: 0,
@@ -9021,6 +9233,7 @@ mod tests {
             provider_session_id: String::new(),
             last_error: String::new(),
             user_error: None,
+            capabilities: Vec::new(),
             last_message_excerpt: String::new(),
             turn_count: 0,
             created_at: 0,
@@ -9132,6 +9345,7 @@ mod tests {
             provider_session_id: String::new(),
             last_error: String::new(),
             user_error: None,
+            capabilities: Vec::new(),
             last_message_excerpt: String::new(),
             turn_count: 0,
             created_at: 0,
@@ -9526,6 +9740,7 @@ mod tests {
             provider_session_id: String::new(),
             last_error: String::new(),
             user_error: None,
+            capabilities: Vec::new(),
             last_message_excerpt: String::new(),
             turn_count: 0,
             created_at: 0,
@@ -9608,6 +9823,7 @@ mod tests {
             provider_session_id: String::new(),
             last_error: String::new(),
             user_error: None,
+            capabilities: Vec::new(),
             last_message_excerpt: String::new(),
             turn_count: 0,
             created_at: 0,
@@ -10428,6 +10644,43 @@ mod tests {
         let _ = fs::remove_dir_all(&state_dir);
     }
 
+    #[test]
+    fn detect_manual_remember_request_accepts_natural_language_variants() {
+        let direct = detect_manual_remember_request("Remember that I like vanilla ice cream.")
+            .expect("direct remember should be detected");
+        assert_eq!(direct.content, "I like vanilla ice cream");
+        assert_eq!(direct.memory_kind, "preference");
+
+        let polite =
+            detect_manual_remember_request("Can you remember that I like vanilla ice cream?")
+                .expect("polite remember should be detected");
+        assert_eq!(polite.content, "I like vanilla ice cream");
+
+        let future = detect_manual_remember_request("For future reference, I use fish shell.")
+            .expect("future reference should be detected");
+        assert_eq!(future.content, "I use fish shell");
+        assert_eq!(future.memory_kind, "fact");
+
+        let keep_in_mind =
+            detect_manual_remember_request("Keep in mind that our staging host is app-staging.")
+                .expect("keep in mind should be detected");
+        assert_eq!(keep_in_mind.content, "our staging host is app-staging");
+    }
+
+    #[test]
+    fn detect_manual_remember_request_rejects_ephemeral_and_secret_like_prompts() {
+        assert!(
+            detect_manual_remember_request("remember to run tests before answering this turn")
+                .is_none()
+        );
+        assert!(
+            detect_manual_remember_request("Please remember to keep this answer short.").is_none()
+        );
+        assert!(
+            detect_manual_remember_request("Remember that authorization: bearer sk-super-secret")
+                .is_none()
+        );
+    }
     #[tokio::test]
     async fn memory_candidate_prompt_visibility_and_dedupe_guardrails() {
         let (state_dir, state) = test_named_app_state("memory-candidate-prompt");
@@ -11840,6 +12093,7 @@ mod tests {
             provider_session_id: String::new(),
             last_error: String::new(),
             user_error: None,
+            capabilities: Vec::new(),
             last_message_excerpt: String::new(),
             turn_count: 0,
             created_at: 0,

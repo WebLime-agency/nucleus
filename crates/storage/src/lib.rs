@@ -284,7 +284,13 @@ pub struct WorkerRecord {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkerPatch {
+    pub title: Option<String>,
+    pub lane: Option<String>,
     pub state: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub provider_base_url: Option<String>,
+    pub provider_api_key: Option<String>,
     pub provider_session_id: Option<String>,
     pub step_count: Option<usize>,
     pub tool_call_count: Option<usize>,
@@ -2125,6 +2131,28 @@ impl StateStore {
     pub fn update_job(&self, job_id: &str, patch: JobPatch) -> Result<JobSummary> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         let current = load_job_summary(&connection, job_id)?;
+        let next_state = patch.state.unwrap_or_else(|| current.state.clone());
+        let next_browser_verification_required = patch
+            .browser_verification_required
+            .unwrap_or(current.browser_verification_required);
+        let mut next_browser_verification_status = patch
+            .browser_verification_status
+            .unwrap_or_else(|| current.browser_verification_status.clone());
+        let mut next_browser_verification_summary = patch
+            .browser_verification_summary
+            .unwrap_or_else(|| current.browser_verification_summary.clone());
+        if next_browser_verification_required
+            && next_browser_verification_status == "pending"
+            && is_terminal_non_success_job_state(&next_state)
+        {
+            next_browser_verification_status = "unavailable".to_string();
+            if next_browser_verification_summary.trim().is_empty()
+                || is_pending_browser_verification_summary(&next_browser_verification_summary)
+            {
+                next_browser_verification_summary =
+                    terminal_browser_verification_summary(&next_state).to_string();
+            }
+        }
         let next_browser_verification_artifact_ids_json = serde_json::to_string(
             &patch
                 .browser_verification_artifact_ids
@@ -2164,21 +2192,15 @@ impl StateStore {
             ",
             params![
                 job_id,
-                patch.state.unwrap_or(current.state),
+                next_state,
                 patch.root_worker_id.or(current.root_worker_id),
                 patch.visible_turn_id.or(current.visible_turn_id),
                 patch.result_summary.unwrap_or(current.result_summary),
                 patch.last_error.unwrap_or(current.last_error),
                 patch.ui_renderable.unwrap_or(current.ui_renderable),
-                patch
-                    .browser_verification_required
-                    .unwrap_or(current.browser_verification_required),
-                patch
-                    .browser_verification_status
-                    .unwrap_or(current.browser_verification_status),
-                patch
-                    .browser_verification_summary
-                    .unwrap_or(current.browser_verification_summary),
+                next_browser_verification_required,
+                next_browser_verification_status,
+                next_browser_verification_summary,
                 next_browser_verification_artifact_ids_json,
                 bool_to_i64(
                     patch
@@ -2268,17 +2290,29 @@ impl StateStore {
             "
             UPDATE job_workers
             SET
-                state = ?2,
-                provider_session_id = ?3,
-                step_count = ?4,
-                tool_call_count = ?5,
-                last_error = ?6,
+                title = ?2,
+                lane = ?3,
+                state = ?4,
+                provider = ?5,
+                model = ?6,
+                provider_base_url = ?7,
+                provider_api_key = ?8,
+                provider_session_id = ?9,
+                step_count = ?10,
+                tool_call_count = ?11,
+                last_error = ?12,
                 updated_at = unixepoch()
             WHERE id = ?1
             ",
             params![
                 worker_id,
+                patch.title.unwrap_or(current.title),
+                patch.lane.unwrap_or(current.lane),
                 patch.state.unwrap_or(current.state),
+                patch.provider.unwrap_or(current.provider),
+                patch.model.unwrap_or(current.model),
+                patch.provider_base_url.unwrap_or(current.provider_base_url),
+                patch.provider_api_key.unwrap_or(current.provider_api_key),
                 patch
                     .provider_session_id
                     .unwrap_or(current.provider_session_id),
@@ -2297,7 +2331,14 @@ impl StateStore {
         grants: &[ToolCapabilityGrantRecord],
     ) -> Result<Vec<ToolCapabilitySummary>> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
-        ensure_worker_exists(&connection, worker_id)?;
+        let worker = load_worker_summary(&connection, worker_id)?;
+        if worker.lane != "utility" && !grants.is_empty() {
+            bail!(
+                "worker '{}' is lane '{}' and cannot receive action capability grants; only utility workers may receive action grants",
+                worker_id,
+                worker.lane
+            );
+        }
         connection.execute(
             "DELETE FROM tool_capability_grants WHERE worker_id = ?1",
             params![worker_id],
@@ -4345,6 +4386,21 @@ fn bool_to_i64(value: bool) -> i64 {
     if value { 1 } else { 0 }
 }
 
+fn is_terminal_non_success_job_state(state: &str) -> bool {
+    matches!(state, "failed" | "canceled")
+}
+
+fn terminal_browser_verification_summary(state: &str) -> &'static str {
+    match state {
+        "canceled" => "Job was canceled before browser verification completed.",
+        _ => "Job failed before browser verification completed.",
+    }
+}
+
+fn is_pending_browser_verification_summary(summary: &str) -> bool {
+    summary.trim() == "Browser verification is required for this UI-renderable job."
+}
+
 fn publication_requested_for_job(_title: &str, _purpose: &str, prompt_excerpt: &str) -> bool {
     let prompt_excerpt = prompt_excerpt.to_ascii_lowercase();
     if publication_segment_has_publication_phrase(&prompt_excerpt) {
@@ -6267,6 +6323,7 @@ fn load_session_summary(connection: &Connection, session_id: &str) -> Result<Ses
     session.project_count = session.projects.len();
     session.scope = session_scope_from_projects(&session.projects, &session.scope);
     session.run_budget = session_run_budget(connection, &session.run_budget_mode)?;
+    session.capabilities = load_session_capabilities(connection, session_id)?;
 
     if session.project_id.is_empty() {
         if let Some(primary) = session.projects.iter().find(|project| project.is_primary) {
@@ -6318,6 +6375,7 @@ fn map_session_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionS
         provider_session_id: row.get(31)?,
         last_error: row.get(32)?,
         user_error: None,
+        capabilities: Vec::new(),
         last_message_excerpt: row.get(33)?,
         turn_count: row.get(34)?,
         created_at: row.get(35)?,
@@ -6837,6 +6895,13 @@ fn load_job_summary(connection: &Connection, job_id: &str) -> Result<JobSummary>
     job.worker_count = count_for_job(connection, "job_workers", job_id)?;
     job.pending_approval_count = count_pending_approvals_for_job(connection, job_id)?;
     job.artifact_count = count_for_job(connection, "job_artifacts", job_id)?;
+    if let Some(root_worker_id) = job.root_worker_id.as_deref() {
+        if let Ok(worker) = load_worker_summary(connection, root_worker_id) {
+            job.executor_lane = worker.lane;
+            job.executor_provider = worker.provider;
+            job.executor_model = worker.model;
+        }
+    }
     Ok(job)
 }
 
@@ -6864,6 +6929,9 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         requested_by: row.get(8)?,
         prompt_excerpt: row.get(9)?,
         root_worker_id: row.get(10)?,
+        executor_lane: String::new(),
+        executor_provider: String::new(),
+        executor_model: String::new(),
         visible_turn_id: row.get(11)?,
         result_summary: row.get(12)?,
         last_error: row.get(13)?,
@@ -7032,6 +7100,34 @@ fn load_worker_summary(connection: &Connection, worker_id: &str) -> Result<Worke
         .ok_or_else(|| anyhow!("worker '{worker_id}' was not found"))?;
     worker.capabilities = load_worker_capabilities(connection, worker_id)?;
     Ok(worker)
+}
+
+fn load_session_capabilities(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<ToolCapabilitySummary>> {
+    let root_worker_id: Option<String> = connection
+        .query_row(
+            "
+            SELECT jw.id
+            FROM jobs j
+            JOIN job_workers jw ON jw.job_id = j.id
+            WHERE j.session_id = ?1
+              AND j.parent_job_id IS NULL
+              AND jw.parent_worker_id IS NULL
+              AND j.template_id IS NULL
+            ORDER BY j.created_at DESC, j.id DESC, jw.created_at ASC, jw.id ASC
+            LIMIT 1
+            ",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    match root_worker_id {
+        Some(worker_id) => load_worker_capabilities(connection, &worker_id),
+        None => Ok(Vec::new()),
+    }
 }
 
 fn load_worker_capabilities(
@@ -9031,6 +9127,121 @@ and open a pull request to dev when it is ready."
     }
 
     #[test]
+    fn failed_ui_renderable_job_terminalizes_pending_browser_verification() {
+        let state_dir = test_state_dir("failed-browser-verification-terminal");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let scratch_dir = store
+            .scratch_dir_for_session("browser-terminal-session")
+            .expect("scratch dir should resolve");
+
+        store
+            .create_session(test_session_record(
+                "browser-terminal-session",
+                "Browser terminal session",
+                "ad_hoc",
+                scratch_dir,
+            ))
+            .expect("session should persist");
+        store
+            .create_job(JobRecord {
+                id: "browser-terminal-job".to_string(),
+                session_id: Some("browser-terminal-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Fix UI".to_string(),
+                purpose: "Session prompt".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "running".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "fix the rendered UI".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("job should persist");
+        let updated = store
+            .update_job(
+                "browser-terminal-job",
+                JobPatch {
+                    state: Some("failed".to_string()),
+                    ui_renderable: Some("true".to_string()),
+                    browser_verification_required: Some(true),
+                    browser_verification_status: Some("pending".to_string()),
+                    browser_verification_summary: Some(
+                        "Browser verification is required for this UI-renderable job.".to_string(),
+                    ),
+                    last_error: Some("worker returned invalid Nucleus action".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("job should update");
+
+        assert_eq!(updated.state, "failed");
+        assert_eq!(updated.browser_verification_status, "unavailable");
+        assert_eq!(
+            updated.browser_verification_summary,
+            "Job failed before browser verification completed."
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn canceled_ui_renderable_job_uses_canceled_browser_verification_summary() {
+        let state_dir = test_state_dir("canceled-browser-verification-terminal");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let scratch_dir = store
+            .scratch_dir_for_session("browser-canceled-session")
+            .expect("scratch dir should resolve");
+
+        store
+            .create_session(test_session_record(
+                "browser-canceled-session",
+                "Browser canceled session",
+                "ad_hoc",
+                scratch_dir,
+            ))
+            .expect("session should persist");
+        store
+            .create_job(JobRecord {
+                id: "browser-canceled-job".to_string(),
+                session_id: Some("browser-canceled-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Fix UI".to_string(),
+                purpose: "Session prompt".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "running".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "fix the rendered UI".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("job should persist");
+        let updated = store
+            .update_job(
+                "browser-canceled-job",
+                JobPatch {
+                    state: Some("canceled".to_string()),
+                    ui_renderable: Some("true".to_string()),
+                    browser_verification_required: Some(true),
+                    browser_verification_status: Some("pending".to_string()),
+                    browser_verification_summary: Some(
+                        "Browser verification is required for this UI-renderable job.".to_string(),
+                    ),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("job should update");
+
+        assert_eq!(updated.state, "canceled");
+        assert_eq!(updated.browser_verification_status, "unavailable");
+        assert_eq!(
+            updated.browser_verification_summary,
+            "Job was canceled before browser verification completed."
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
     fn excludes_automation_sessions_from_session_list() {
         let state_dir = test_state_dir("automation-session-filter");
         let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
@@ -9397,6 +9608,283 @@ and open a pull request to dev when it is ready."
                 env::remove_var("HOME");
             },
         }
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn session_capabilities_ignore_playbook_root_workers() {
+        let state_dir = test_state_dir("session-capabilities-ignore-playbooks");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let working_dir = store
+            .scratch_dir_for_session("session-capabilities")
+            .expect("session scratch dir should resolve");
+
+        store
+            .create_session(test_session_record(
+                "session-capabilities",
+                "Capability session",
+                &working_dir,
+                working_dir.clone(),
+            ))
+            .expect("session should persist");
+
+        store
+            .create_job(JobRecord {
+                id: "prompt-job".to_string(),
+                session_id: Some("session-capabilities".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Prompt run".to_string(),
+                purpose: "Session prompt".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "open the browser".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("prompt job should persist");
+        store
+            .create_worker(WorkerRecord {
+                id: "prompt-worker".to_string(),
+                job_id: "prompt-job".to_string(),
+                parent_worker_id: None,
+                title: "Prompt worker".to_string(),
+                lane: "utility".to_string(),
+                state: "completed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "cx/gpt-5.4".to_string(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: working_dir.clone(),
+                read_roots: vec![working_dir.clone()],
+                write_roots: vec![working_dir.clone()],
+                max_steps: 8,
+                max_tool_calls: 8,
+                max_wall_clock_secs: 60,
+            })
+            .expect("prompt worker should persist");
+        let prompt_grants = [ToolCapabilityGrantRecord {
+            tool_id: "browser.navigate".to_string(),
+            summary: "Navigate the browser".to_string(),
+            approval_mode: "on-request".to_string(),
+            risk_level: "medium".to_string(),
+            side_effect_level: "external".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: 4096,
+            supports_streaming: false,
+            concurrency_group: "browser".to_string(),
+            scope_kind: "workspace".to_string(),
+        }];
+        store
+            .replace_tool_capability_grants("prompt-worker", &prompt_grants)
+            .expect("prompt capabilities should persist");
+
+        store
+            .create_job(JobRecord {
+                id: "playbook-job".to_string(),
+                session_id: Some("session-capabilities".to_string()),
+                parent_job_id: None,
+                template_id: Some("playbook-1".to_string()),
+                title: "Playbook run".to_string(),
+                purpose: "automation".to_string(),
+                trigger_kind: "playbook_manual".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "run checks".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("playbook job should persist");
+        store
+            .create_worker(WorkerRecord {
+                id: "playbook-worker".to_string(),
+                job_id: "playbook-job".to_string(),
+                parent_worker_id: None,
+                title: "Playbook worker".to_string(),
+                lane: "utility".to_string(),
+                state: "completed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "cx/gpt-5.4".to_string(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: working_dir.clone(),
+                read_roots: vec![working_dir.clone()],
+                write_roots: vec![working_dir.clone()],
+                max_steps: 8,
+                max_tool_calls: 8,
+                max_wall_clock_secs: 60,
+            })
+            .expect("playbook worker should persist");
+        let playbook_grants = [ToolCapabilityGrantRecord {
+            tool_id: "files.read".to_string(),
+            summary: "Read files".to_string(),
+            approval_mode: "auto".to_string(),
+            risk_level: "low".to_string(),
+            side_effect_level: "none".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: 4096,
+            supports_streaming: false,
+            concurrency_group: "fs".to_string(),
+            scope_kind: "workspace".to_string(),
+        }];
+        store
+            .replace_tool_capability_grants("playbook-worker", &playbook_grants)
+            .expect("playbook capabilities should persist");
+
+        let session = store
+            .get_session("session-capabilities")
+            .expect("session should load");
+        assert_eq!(session.session.capabilities.len(), 1);
+        assert_eq!(session.session.capabilities[0].tool_id, "browser.navigate");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn session_capabilities_prefer_latest_root_prompt_job_when_created_at_ties() {
+        let state_dir = test_state_dir("session-capabilities-same-second-root-jobs");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let working_dir = store
+            .scratch_dir_for_session("session-capabilities-tie")
+            .expect("session scratch dir should resolve");
+
+        store
+            .create_session(test_session_record(
+                "session-capabilities-tie",
+                "Capability tie session",
+                &working_dir,
+                working_dir.clone(),
+            ))
+            .expect("session should persist");
+
+        store
+            .create_job(JobRecord {
+                id: "prompt-job-1".to_string(),
+                session_id: Some("session-capabilities-tie".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Prompt run 1".to_string(),
+                purpose: "Session prompt".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "first prompt".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("first prompt job should persist");
+        store
+            .create_worker(WorkerRecord {
+                id: "prompt-worker-1".to_string(),
+                job_id: "prompt-job-1".to_string(),
+                parent_worker_id: None,
+                title: "Prompt worker 1".to_string(),
+                lane: "utility".to_string(),
+                state: "completed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "cx/gpt-5.4".to_string(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: working_dir.clone(),
+                read_roots: vec![working_dir.clone()],
+                write_roots: vec![working_dir.clone()],
+                max_steps: 8,
+                max_tool_calls: 8,
+                max_wall_clock_secs: 60,
+            })
+            .expect("first prompt worker should persist");
+        let first_grants = [ToolCapabilityGrantRecord {
+            tool_id: "fs.read".to_string(),
+            summary: "Read files".to_string(),
+            approval_mode: "on-request".to_string(),
+            risk_level: "low".to_string(),
+            side_effect_level: "none".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: 4096,
+            supports_streaming: false,
+            concurrency_group: "fs".to_string(),
+            scope_kind: "workspace".to_string(),
+        }];
+        store
+            .replace_tool_capability_grants("prompt-worker-1", &first_grants)
+            .expect("first prompt capabilities should persist");
+
+        store
+            .create_job(JobRecord {
+                id: "prompt-job-2".to_string(),
+                session_id: Some("session-capabilities-tie".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Prompt run 2".to_string(),
+                purpose: "Session prompt".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "second prompt".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("second prompt job should persist");
+        store
+            .create_worker(WorkerRecord {
+                id: "prompt-worker-2".to_string(),
+                job_id: "prompt-job-2".to_string(),
+                parent_worker_id: None,
+                title: "Prompt worker 2".to_string(),
+                lane: "utility".to_string(),
+                state: "completed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "cx/gpt-5.4".to_string(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: working_dir.clone(),
+                read_roots: vec![working_dir.clone()],
+                write_roots: vec![working_dir.clone()],
+                max_steps: 8,
+                max_tool_calls: 8,
+                max_wall_clock_secs: 60,
+            })
+            .expect("second prompt worker should persist");
+        let second_grants = [ToolCapabilityGrantRecord {
+            tool_id: "browser.navigate".to_string(),
+            summary: "Navigate the browser".to_string(),
+            approval_mode: "on-request".to_string(),
+            risk_level: "medium".to_string(),
+            side_effect_level: "external".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: 4096,
+            supports_streaming: false,
+            concurrency_group: "browser".to_string(),
+            scope_kind: "workspace".to_string(),
+        }];
+        store
+            .replace_tool_capability_grants("prompt-worker-2", &second_grants)
+            .expect("second prompt capabilities should persist");
+
+        {
+            let connection = store.connection.lock().expect("storage mutex poisoned");
+            let tied_created_at: i64 = connection
+                .query_row(
+                    "SELECT created_at FROM jobs WHERE id = ?1",
+                    params!["prompt-job-1"],
+                    |row| row.get(0),
+                )
+                .expect("first prompt job timestamp should load");
+            connection
+                .execute(
+                    "UPDATE jobs SET created_at = ?2 WHERE id = ?1",
+                    params!["prompt-job-2", tied_created_at],
+                )
+                .expect("second prompt job timestamp should be aligned");
+        }
+
+        let session = store
+            .get_session("session-capabilities-tie")
+            .expect("session should load");
+        assert_eq!(session.session.capabilities.len(), 1);
+        assert_eq!(session.session.capabilities[0].tool_id, "browser.navigate");
 
         let _ = fs::remove_dir_all(&state_dir);
     }
