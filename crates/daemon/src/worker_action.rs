@@ -1,7 +1,7 @@
 use std::{error::Error, fmt};
 
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -24,6 +24,10 @@ pub enum WorkerAction {
         summary: String,
         final_answer: String,
         #[serde(default)]
+        metadata: Value,
+        #[serde(default)]
+        artifacts: Vec<FinalAnswerArtifact>,
+        #[serde(default)]
         browser_verification: Option<BrowserVerificationClaim>,
     },
 }
@@ -42,6 +46,14 @@ pub struct BrowserVerificationClaim {
     pub summary: String,
     #[serde(default)]
     pub artifact_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct FinalAnswerArtifact {
+    pub kind: String,
+    pub title: String,
+    pub content: String,
+    pub metadata: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,10 +101,6 @@ impl Error for WorkerActionParseError {}
 
 pub fn parse_worker_action(content: &str) -> Result<WorkerAction, WorkerActionParseError> {
     let trimmed = content.trim();
-    if let Ok(parsed) = serde_json::from_str::<WorkerAction>(trimmed) {
-        return validate_worker_action(parsed);
-    }
-
     let start = trimmed
         .find('{')
         .ok_or(WorkerActionParseError::NoJsonObject)?;
@@ -322,10 +330,6 @@ fn normalize_worker_action_value(
         return normalize_worker_progress_update_value(object).map(Some);
     }
 
-    if object.contains_key("final_answer") {
-        return normalize_worker_final_answer_value(object).map(Some);
-    }
-
     if object
         .get("action")
         .or_else(|| object.get("kind"))
@@ -357,6 +361,21 @@ fn normalize_worker_action_value(
             || object.contains_key("name"))
     {
         return normalize_worker_tool_call_value(value).map(Some);
+    }
+
+    if object
+        .get("action")
+        .or_else(|| object.get("kind"))
+        .or_else(|| object.get("type"))
+        .and_then(Value::as_str)
+        .map(|value| value.trim().eq_ignore_ascii_case("spawn_child_jobs"))
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+
+    if object.contains_key("final_answer") {
+        return normalize_worker_final_answer_value(object).map(Some);
     }
 
     if object.contains_key("tool")
@@ -452,11 +471,28 @@ fn format_progress_value(value: &Value) -> String {
 fn normalize_worker_final_answer_value(
     object: &serde_json::Map<String, Value>,
 ) -> Result<WorkerAction, WorkerActionParseError> {
-    let final_answer = ["final_answer", "content", "answer", "text", "message"]
-        .iter()
-        .find_map(|key| object.get(*key).and_then(format_final_answer_value))
-        .ok_or(WorkerActionParseError::InvalidActionShape)?;
     let nested_final_answer = object.get("final_answer").and_then(Value::as_object);
+    let final_answer = normalized_final_answer_message(object)
+        .or_else(|| nested_final_answer.and_then(normalized_final_answer_message))
+        .or_else(|| {
+            object
+                .get("final_answer")
+                .and_then(Value::as_str)
+                .and_then(non_empty_trimmed)
+        });
+    let mut metadata = Map::new();
+    collect_final_answer_metadata(object, &mut metadata);
+    if let Some(nested) = nested_final_answer {
+        collect_final_answer_metadata(nested, &mut metadata);
+    }
+    let mut artifacts = Vec::new();
+    collect_explicit_final_answer_artifacts(object, &mut artifacts);
+    collect_final_answer_artifacts(object, &mut artifacts);
+    if let Some(nested) = nested_final_answer {
+        collect_explicit_final_answer_artifacts(nested, &mut artifacts);
+        collect_final_answer_artifacts(nested, &mut artifacts);
+    }
+    artifacts.sort_by_key(|artifact| final_answer_artifact_priority(&artifact.kind));
     let summary = object
         .get("summary")
         .or_else(|| nested_final_answer.and_then(|value| value.get("summary")))
@@ -466,23 +502,43 @@ fn normalize_worker_final_answer_value(
         .filter(|value| !value.is_empty())
         .unwrap_or("The work is done.")
         .to_string();
-    let browser_verification = object
+    let final_answer = final_answer
+        .or_else(|| {
+            if !artifacts.is_empty() && !summary.trim().is_empty() {
+                Some(summary.clone())
+            } else {
+                None
+            }
+        })
+        .ok_or(WorkerActionParseError::InvalidActionShape)?;
+    let browser_verification_value = object
         .get("browser_verification")
+        .or_else(|| nested_final_answer.and_then(|value| value.get("browser_verification")))
+        .filter(|value| !is_empty_json_value(value))
+        .cloned();
+    let browser_verification = browser_verification_value
+        .as_ref()
         .and_then(|value| serde_json::from_value::<BrowserVerificationClaim>(value.clone()).ok());
+    if let Some(value) = browser_verification_value {
+        metadata
+            .entry("browser_verification".to_string())
+            .or_insert(value);
+    }
+    if let Some(claim) = browser_verification.as_ref() {
+        if let Some(status) = non_empty_trimmed(&claim.status) {
+            metadata
+                .entry("browser_verification_status".to_string())
+                .or_insert(Value::String(status));
+        }
+    }
 
     Ok(WorkerAction::FinalAnswer {
         summary,
         final_answer,
+        metadata: Value::Object(metadata),
+        artifacts,
         browser_verification,
     })
-}
-
-fn format_final_answer_value(value: &Value) -> Option<String> {
-    match value {
-        Value::String(value) => non_empty_trimmed(value),
-        Value::Object(object) => format_structured_final_answer_object(object),
-        _ => None,
-    }
 }
 
 fn non_empty_trimmed(value: &str) -> Option<String> {
@@ -494,60 +550,13 @@ fn non_empty_trimmed(value: &str) -> Option<String> {
     }
 }
 
-fn format_structured_final_answer_object(
-    object: &serde_json::Map<String, Value>,
-) -> Option<String> {
-    let mut lines = Vec::new();
-    if let Some(value) = object.get("message") {
-        if let Some(body) = format_structured_final_answer_body(value) {
-            lines.push(body);
-        }
-    }
-
-    let ordered_keys = [
-        "status",
-        "summary",
-        "publication_status",
-        "publication_summary",
-        "pr_url",
-        "source_branch",
-        "target_branch",
-        "validation_status",
-        "validation",
-        "browser_verification_status",
-        "browser_verification",
-        "cleanup_status",
-        "cleanup",
-        "remaining",
-        "blockers",
-        "next",
-    ];
-
-    for key in ordered_keys {
-        if let Some(value) = object.get(key) {
-            if let Some(line) = format_structured_final_answer_field(key, value) {
-                lines.push(line);
-            }
-        }
-    }
-
-    for (key, value) in object {
-        if key == "message" || ordered_keys.contains(&key.as_str()) {
-            continue;
-        }
-        if let Some(line) = format_structured_final_answer_field(key, value) {
-            lines.push(line);
-        }
-    }
-
-    if lines.is_empty() {
-        None
-    } else {
-        Some(lines.join("\n"))
-    }
+fn normalized_final_answer_message(object: &serde_json::Map<String, Value>) -> Option<String> {
+    ["message", "content", "answer", "text"]
+        .iter()
+        .find_map(|key| object.get(*key).and_then(format_final_answer_body))
 }
 
-fn format_structured_final_answer_body(value: &Value) -> Option<String> {
+fn format_final_answer_body(value: &Value) -> Option<String> {
     if is_empty_json_value(value) {
         return None;
     }
@@ -571,63 +580,103 @@ fn format_structured_final_answer_body(value: &Value) -> Option<String> {
                 )
             }
         }
-        Value::Object(object) => format_structured_final_answer_object(object),
+        Value::Object(object) => normalized_final_answer_message(object),
         Value::Bool(_) | Value::Number(_) => Some(format_inline_final_answer_value(value)),
         Value::Null => None,
     }
 }
 
-fn format_structured_final_answer_field(key: &str, value: &Value) -> Option<String> {
-    if is_empty_json_value(value) {
-        return None;
+fn collect_final_answer_metadata(
+    object: &serde_json::Map<String, Value>,
+    metadata: &mut Map<String, Value>,
+) {
+    for (key, value) in object {
+        if is_empty_json_value(value)
+            || is_final_answer_control_key(key)
+            || final_answer_artifact_kind(key).is_some()
+        {
+            continue;
+        }
+        if key == "metadata" {
+            if let Some(explicit) = value.as_object() {
+                for (nested_key, nested_value) in explicit {
+                    if !is_empty_json_value(nested_value) {
+                        metadata.insert(nested_key.clone(), nested_value.clone());
+                    }
+                }
+            }
+            continue;
+        }
+        metadata.insert(key.clone(), value.clone());
     }
+}
 
-    let label = final_answer_field_label(key);
+fn collect_final_answer_artifacts(
+    object: &serde_json::Map<String, Value>,
+    artifacts: &mut Vec<FinalAnswerArtifact>,
+) {
+    for (key, value) in object {
+        let Some(kind) = final_answer_artifact_kind(key) else {
+            continue;
+        };
+        push_final_answer_artifact(&kind, key, value, artifacts);
+    }
+}
+
+fn push_final_answer_artifact(
+    kind: &str,
+    key: &str,
+    value: &Value,
+    artifacts: &mut Vec<FinalAnswerArtifact>,
+) {
+    if is_empty_json_value(value) {
+        return;
+    }
     match value {
-        Value::String(value) => non_empty_trimmed(value).map(|value| format!("{label}: {value}")),
         Value::Array(items) => {
-            let items = items
-                .iter()
-                .filter_map(format_final_answer_list_item)
-                .collect::<Vec<_>>();
-            if items.is_empty() {
-                None
-            } else {
-                Some(format!(
-                    "{label}:\n{}",
-                    items
-                        .into_iter()
-                        .map(|item| format!("- {item}"))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                ))
+            for item in items {
+                push_final_answer_artifact(kind, key, item, artifacts);
             }
         }
         Value::Object(object) => {
-            let items = object
+            let content = ["content", "body", "text", "message", "prompt", "comment"]
                 .iter()
-                .filter_map(|(nested_key, nested_value)| {
-                    if is_empty_json_value(nested_value) {
-                        return None;
-                    }
-                    Some(format!(
-                        "- {}: {}",
-                        final_answer_field_label(nested_key),
-                        format_inline_final_answer_value(nested_value)
-                    ))
-                })
-                .collect::<Vec<_>>();
-            if items.is_empty() {
-                None
-            } else {
-                Some(format!("{label}:\n{}", items.join("\n")))
+                .find_map(|field| object.get(*field).and_then(format_final_answer_body))
+                .unwrap_or_else(|| {
+                    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+                });
+            if content.trim().is_empty() {
+                return;
             }
+            let mut metadata = Map::new();
+            for (nested_key, nested_value) in object {
+                if ["content", "body", "text", "message", "prompt", "comment"]
+                    .contains(&nested_key.as_str())
+                    || is_empty_json_value(nested_value)
+                {
+                    continue;
+                }
+                metadata.insert(nested_key.clone(), nested_value.clone());
+            }
+            artifacts.push(FinalAnswerArtifact {
+                kind: kind.to_string(),
+                title: final_answer_artifact_title(kind, key),
+                content,
+                metadata: Value::Object(metadata),
+            });
         }
-        Value::Bool(_) | Value::Number(_) => Some(format!(
-            "{label}: {}",
-            format_inline_final_answer_value(value)
-        )),
-        Value::Null => None,
+        _ => {
+            let content = format_inline_final_answer_value(value);
+            if content.trim().is_empty() {
+                return;
+            }
+            artifacts.push(FinalAnswerArtifact {
+                kind: kind.to_string(),
+                title: final_answer_artifact_title(kind, key),
+                content,
+                metadata: json!({}),
+            });
+        }
     }
 }
 
@@ -661,25 +710,144 @@ fn is_empty_json_value(value: &Value) -> bool {
     }
 }
 
-fn final_answer_field_label(key: &str) -> String {
-    match key {
-        "pr_url" => return "PR URL".to_string(),
-        "publication_status" => return "Publication status".to_string(),
-        "publication_summary" => return "Publication summary".to_string(),
-        "source_branch" => return "Source branch".to_string(),
-        "target_branch" => return "Target branch".to_string(),
-        "validation_status" => return "Validation status".to_string(),
-        "browser_verification_status" => return "Browser verification status".to_string(),
-        "browser_verification" => return "Browser verification".to_string(),
-        "cleanup_status" => return "Cleanup status".to_string(),
-        _ => {}
+fn is_final_answer_control_key(key: &str) -> bool {
+    matches!(
+        key,
+        "action"
+            | "kind"
+            | "type"
+            | "final_answer"
+            | "message"
+            | "content"
+            | "answer"
+            | "text"
+            | "summary"
+            | "artifacts"
+            | "browser_verification"
+    )
+}
+
+fn collect_explicit_final_answer_artifacts(
+    object: &serde_json::Map<String, Value>,
+    artifacts: &mut Vec<FinalAnswerArtifact>,
+) {
+    let Some(value) = object.get("artifacts") else {
+        return;
+    };
+    push_explicit_final_answer_artifact(value, artifacts);
+}
+
+fn push_explicit_final_answer_artifact(value: &Value, artifacts: &mut Vec<FinalAnswerArtifact>) {
+    if is_empty_json_value(value) {
+        return;
     }
 
-    let label = key.replace('_', " ");
-    let mut chars = label.chars();
-    match chars.next() {
-        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
-        None => key.to_string(),
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                push_explicit_final_answer_artifact(item, artifacts);
+            }
+        }
+        Value::Object(object) => {
+            let kind = object
+                .get("kind")
+                .and_then(Value::as_str)
+                .and_then(non_empty_trimmed)
+                .unwrap_or_else(|| "artifact".to_string());
+            let content = ["content", "body", "text", "message", "prompt", "comment"]
+                .iter()
+                .find_map(|field| object.get(*field).and_then(format_final_answer_body))
+                .unwrap_or_else(|| {
+                    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+                });
+            if content.trim().is_empty() {
+                return;
+            }
+
+            let title = object
+                .get("title")
+                .and_then(Value::as_str)
+                .and_then(non_empty_trimmed)
+                .unwrap_or_else(|| final_answer_artifact_title(&kind, "artifact"));
+            let mut metadata = Map::new();
+            if let Some(explicit) = object.get("metadata").and_then(Value::as_object) {
+                for (nested_key, nested_value) in explicit {
+                    if !is_empty_json_value(nested_value) {
+                        metadata.insert(nested_key.clone(), nested_value.clone());
+                    }
+                }
+            }
+            for (nested_key, nested_value) in object {
+                if [
+                    "kind", "title", "content", "body", "text", "message", "prompt", "comment",
+                    "metadata",
+                ]
+                .contains(&nested_key.as_str())
+                    || is_empty_json_value(nested_value)
+                {
+                    continue;
+                }
+                metadata.insert(nested_key.clone(), nested_value.clone());
+            }
+            artifacts.push(FinalAnswerArtifact {
+                kind,
+                title,
+                content,
+                metadata: Value::Object(metadata),
+            });
+        }
+        _ => {
+            let content = format_inline_final_answer_value(value);
+            if content.trim().is_empty() {
+                return;
+            }
+            artifacts.push(FinalAnswerArtifact {
+                kind: "artifact".to_string(),
+                title: "Artifact".to_string(),
+                content,
+                metadata: json!({}),
+            });
+        }
+    }
+}
+
+fn final_answer_artifact_kind(key: &str) -> Option<String> {
+    let normalized = key.trim().to_ascii_lowercase();
+    let kind = match normalized.as_str() {
+        "implementation_prompt"
+        | "implementation_prompts"
+        | "generated_prompt"
+        | "generated_prompts" => "implementation_prompt",
+        "issue_comment" | "issue_comments" | "comment" | "comments" => "issue_comment",
+        "pr_summary" | "pull_request_summary" => "pr_summary",
+        "validation_report" | "validation_reports" => "validation_report",
+        "browser_verification_report" | "browser_verification_reports" => {
+            "browser_verification_report"
+        }
+        _ => return None,
+    };
+    Some(kind.to_string())
+}
+
+fn final_answer_artifact_title(kind: &str, fallback_key: &str) -> String {
+    match kind {
+        "implementation_prompt" => "Implementation prompt".to_string(),
+        "issue_comment" => "Issue comment".to_string(),
+        "pr_summary" => "PR summary".to_string(),
+        "validation_report" => "Validation report".to_string(),
+        "browser_verification_report" => "Browser verification report".to_string(),
+        _ => fallback_key.replace('_', " "),
+    }
+}
+
+fn final_answer_artifact_priority(kind: &str) -> usize {
+    match kind {
+        "implementation_prompt" => 0,
+        "issue_comment" => 1,
+        "pr_summary" => 2,
+        "validation_report" => 3,
+        "browser_verification_report" => 4,
+        _ => 5,
     }
 }
 
@@ -953,6 +1121,27 @@ mod tests {
     }
 
     #[test]
+    fn canonical_tool_call_with_extra_final_answer_stays_tool_call() {
+        let action = parse_worker_action(
+            r#"{"kind":"tool_call","summary":"search source","tool":"rg.search","args":{"pattern":"home","path":"dga-uhm","limit":20},"final_answer":"Search after this tool call."}"#,
+        )
+        .expect("canonical tool call should not be normalized as final answer");
+
+        let WorkerAction::ToolCall {
+            summary,
+            tool,
+            args,
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(summary, "search source");
+        assert_eq!(tool, "rg.search");
+        assert_eq!(args["pattern"], "home");
+    }
+
+    #[test]
     fn accepts_final_answer_without_kind_as_bounded_compatibility() {
         let action = parse_worker_action(
             r#"{"summary":"diagnosed homepage redirect","final_answer":"The homepage is redirecting because the CMS entry is missing."}"#,
@@ -973,6 +1162,60 @@ mod tests {
             final_answer,
             "The homepage is redirecting because the CMS entry is missing."
         );
+    }
+
+    #[test]
+    fn canonical_final_answer_routes_through_metadata_normalization() {
+        let action = parse_worker_action(
+            r#"{"kind":"final_answer","summary":"published","final_answer":"Done.","publication_status":"opened","implementation_prompt":"Implement the reviewed change."}"#,
+        )
+        .expect("canonical final answer with extra fields should normalize");
+
+        let WorkerAction::FinalAnswer {
+            summary,
+            final_answer,
+            metadata,
+            artifacts,
+            ..
+        } = action
+        else {
+            panic!("expected final answer");
+        };
+
+        assert_eq!(summary, "published");
+        assert_eq!(final_answer, "Done.");
+        assert_eq!(metadata["publication_status"], "opened");
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].kind, "implementation_prompt");
+        assert_eq!(artifacts[0].content, "Implement the reviewed change.");
+    }
+
+    #[test]
+    fn canonical_final_answer_artifacts_array_stays_artifacts() {
+        let action = parse_worker_action(
+            r#"{"kind":"final_answer","summary":"generated","final_answer":"Done.","artifacts":[{"kind":"implementation_prompt","title":"Implementation prompt","content":"Implement issue #209.","metadata":{"source":"worker"}},{"kind":"issue_comment","content":"Ready to post.","target":"issue-209"}]}"#,
+        )
+        .expect("canonical final answer artifacts should normalize");
+
+        let WorkerAction::FinalAnswer {
+            metadata,
+            artifacts,
+            ..
+        } = action
+        else {
+            panic!("expected final answer");
+        };
+
+        assert!(metadata.get("artifacts").is_none());
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts[0].kind, "implementation_prompt");
+        assert_eq!(artifacts[0].title, "Implementation prompt");
+        assert_eq!(artifacts[0].content, "Implement issue #209.");
+        assert_eq!(artifacts[0].metadata["source"], "worker");
+        assert_eq!(artifacts[1].kind, "issue_comment");
+        assert_eq!(artifacts[1].title, "Issue comment");
+        assert_eq!(artifacts[1].content, "Ready to post.");
+        assert_eq!(artifacts[1].metadata["target"], "issue-209");
     }
 
     #[test]
@@ -1097,47 +1340,65 @@ mod tests {
     }
 
     #[test]
-    fn structured_final_answer_keeps_metadata_labels_without_labeling_body() {
+    fn structured_final_answer_keeps_metadata_out_of_visible_body() {
         let action = parse_worker_action(
             r#"{"kind":"final_answer","final_answer":{"message":"Published the PR.","publication_status":"published","publication_summary":"Opened a ready PR against dev.","pr_url":"https://github.com/WebLime-agency/nucleus/pull/202","source_branch":"codex/issue-202-final-answer-normalization","target_branch":"dev","validation_status":"passed","browser_verification_status":"not_required","cleanup_status":"clean"}}"#,
         )
         .expect("structured final answer should normalize");
 
-        let WorkerAction::FinalAnswer { final_answer, .. } = action else {
+        let WorkerAction::FinalAnswer {
+            final_answer,
+            metadata,
+            ..
+        } = action
+        else {
             panic!("expected final answer");
         };
 
-        assert!(final_answer.starts_with("Published the PR.\n"));
+        assert_eq!(final_answer, "Published the PR.");
         assert!(!final_answer.contains("Message:"));
-        assert!(final_answer.contains("Publication status: published"));
-        assert!(final_answer.contains("Publication summary: Opened a ready PR against dev."));
-        assert!(
-            final_answer.contains("PR URL: https://github.com/WebLime-agency/nucleus/pull/202")
+        assert_eq!(metadata["publication_status"], "published");
+        assert_eq!(
+            metadata["publication_summary"],
+            "Opened a ready PR against dev."
         );
-        assert!(final_answer.contains("Source branch: codex/issue-202-final-answer-normalization"));
-        assert!(final_answer.contains("Target branch: dev"));
-        assert!(final_answer.contains("Validation status: passed"));
-        assert!(final_answer.contains("Browser verification status: not_required"));
-        assert!(final_answer.contains("Cleanup status: clean"));
+        assert_eq!(
+            metadata["pr_url"],
+            "https://github.com/WebLime-agency/nucleus/pull/202"
+        );
+        assert_eq!(
+            metadata["source_branch"],
+            "codex/issue-202-final-answer-normalization"
+        );
+        assert_eq!(metadata["target_branch"], "dev");
+        assert_eq!(metadata["validation_status"], "passed");
+        assert_eq!(metadata["browser_verification_status"], "not_required");
+        assert_eq!(metadata["cleanup_status"], "clean");
     }
 
     #[test]
-    fn structured_final_answer_array_fields_render_as_markdown_bullets() {
+    fn structured_final_answer_array_fields_become_metadata() {
         let action = parse_worker_action(
             r#"{"kind":"final_answer","final_answer":{"message":"Validation complete.","validation":["cargo test -p nucleus-daemon worker_action passed","cargo fmt --all --check passed"],"remaining":["Wait for CI","Do not merge"],"next":["Open review","Address feedback if needed"]}}"#,
         )
         .expect("structured final answer with arrays should normalize");
 
-        let WorkerAction::FinalAnswer { final_answer, .. } = action else {
+        let WorkerAction::FinalAnswer {
+            final_answer,
+            metadata,
+            ..
+        } = action
+        else {
             panic!("expected final answer");
         };
 
-        assert!(final_answer.starts_with("Validation complete.\n"));
-        assert!(final_answer.contains(
-            "Validation:\n- cargo test -p nucleus-daemon worker_action passed\n- cargo fmt --all --check passed"
-        ));
-        assert!(final_answer.contains("Remaining:\n- Wait for CI\n- Do not merge"));
-        assert!(final_answer.contains("Next:\n- Open review\n- Address feedback if needed"));
+        assert_eq!(final_answer, "Validation complete.");
+        assert_eq!(
+            metadata["validation"][0],
+            "cargo test -p nucleus-daemon worker_action passed"
+        );
+        assert_eq!(metadata["remaining"][0], "Wait for CI");
+        assert_eq!(metadata["next"][1], "Address feedback if needed");
     }
 
     #[test]
@@ -1160,23 +1421,11 @@ mod tests {
             summary,
             "Code validation passed but browser verification was unavailable."
         );
-        assert!(final_answer.contains("Status: blocked_without_browser_verification"));
-        assert!(
-            final_answer.contains(
-                "Summary: Code validation passed but browser verification was unavailable."
-            )
-        );
-        assert!(
-            final_answer
-                .starts_with("PR publication is blocked until rendered UI behavior is verified.\n")
+        assert_eq!(
+            final_answer,
+            "PR publication is blocked until rendered UI behavior is verified."
         );
         assert!(!final_answer.contains("Message:"));
-        assert!(
-            final_answer
-                .contains("Validation:\n- cargo test -p nucleus-daemon worker_action passed")
-        );
-        assert!(final_answer.contains("Browser verification status: unavailable"));
-        assert!(final_answer.contains("Cleanup status: clean"));
     }
 
     #[test]
@@ -1189,6 +1438,7 @@ mod tests {
         let WorkerAction::FinalAnswer {
             summary,
             final_answer,
+            metadata,
             ..
         } = action
         else {
@@ -1196,10 +1446,44 @@ mod tests {
         };
 
         assert_eq!(summary, "blocked");
-        assert!(final_answer.contains("Status: blocked"));
-        assert!(final_answer.contains("Publication status: blocked"));
-        assert!(final_answer.contains("Browser verification status: not_performed"));
+        assert_eq!(
+            final_answer,
+            "I cannot honestly open the PR yet because Browser verification did not run."
+        );
+        assert_eq!(metadata["status"], "blocked");
+        assert_eq!(metadata["publication_status"], "blocked");
+        assert_eq!(metadata["browser_verification_status"], "not_performed");
         assert!(!final_answer.contains("PR URL:"));
+    }
+
+    #[test]
+    fn structured_final_answer_prompts_and_comments_become_artifacts() {
+        let action = parse_worker_action(
+            r#"{"kind":"final_answer","summary":"Generated handoff text.","final_answer":{"message":"Generated the requested handoff.","implementation_prompt":"Implement issue #123 using the daemon contract.","comment":{"body":"Posted-ready issue comment.","target":"issue-123"}}}"#,
+        )
+        .expect("structured artifacts should normalize");
+
+        let WorkerAction::FinalAnswer {
+            final_answer,
+            artifacts,
+            ..
+        } = action
+        else {
+            panic!("expected final answer");
+        };
+
+        assert_eq!(final_answer, "Generated the requested handoff.");
+        assert!(!final_answer.contains("Implementation prompt:"));
+        assert!(!final_answer.contains("Comment:"));
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts[0].kind, "implementation_prompt");
+        assert_eq!(
+            artifacts[0].content,
+            "Implement issue #123 using the daemon contract."
+        );
+        assert_eq!(artifacts[1].kind, "issue_comment");
+        assert_eq!(artifacts[1].content, "Posted-ready issue comment.");
+        assert_eq!(artifacts[1].metadata["target"], "issue-123");
     }
 
     #[test]
@@ -1211,6 +1495,7 @@ mod tests {
 
         let WorkerAction::FinalAnswer {
             browser_verification: Some(claim),
+            metadata,
             ..
         } = action
         else {
@@ -1220,6 +1505,41 @@ mod tests {
         assert_eq!(claim.status, "passed");
         assert_eq!(claim.summary, "Clicked the dropdown.");
         assert_eq!(claim.artifact_ids, vec!["artifact-1".to_string()]);
+        assert_eq!(metadata["browser_verification"]["status"], "passed");
+        assert_eq!(
+            metadata["browser_verification"]["summary"],
+            "Clicked the dropdown."
+        );
+        assert_eq!(metadata["browser_verification_status"], "passed");
+    }
+
+    #[test]
+    fn parses_nested_final_answer_browser_verification_claim() {
+        let action = parse_worker_action(
+            r#"{"kind":"final_answer","summary":"verified UI","final_answer":{"message":"Done.","browser_verification":{"status":"passed","summary":"Clicked the dropdown.","artifact_ids":["artifact-1"]}}}"#,
+        )
+        .expect("nested browser verification claim should parse");
+
+        let WorkerAction::FinalAnswer {
+            final_answer,
+            browser_verification: Some(claim),
+            metadata,
+            ..
+        } = action
+        else {
+            panic!("expected final answer with browser verification");
+        };
+
+        assert_eq!(final_answer, "Done.");
+        assert_eq!(claim.status, "passed");
+        assert_eq!(claim.summary, "Clicked the dropdown.");
+        assert_eq!(claim.artifact_ids, vec!["artifact-1".to_string()]);
+        assert_eq!(metadata["browser_verification"]["status"], "passed");
+        assert_eq!(
+            metadata["browser_verification"]["summary"],
+            "Clicked the dropdown."
+        );
+        assert_eq!(metadata["browser_verification_status"], "passed");
     }
 
     #[test]
