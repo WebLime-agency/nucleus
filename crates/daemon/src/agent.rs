@@ -4456,10 +4456,6 @@ fn extract_pr_numbers(text: &str) -> BTreeSet<u64> {
         .filter(|token| !token.is_empty())
         .collect::<Vec<_>>();
     for (index, token) in tokens.iter().enumerate() {
-        if let Some(number) = token.strip_prefix('#').and_then(|value| value.parse().ok()) {
-            numbers.insert(number);
-            continue;
-        }
         if let Some(number) = token
             .strip_prefix("pr#")
             .and_then(|value| value.parse().ok())
@@ -4467,16 +4463,29 @@ fn extract_pr_numbers(text: &str) -> BTreeSet<u64> {
             numbers.insert(number);
             continue;
         }
-        if matches!(*token, "pr" | "pull" | "request") {
-            if let Some(next) = tokens.get(index + 1) {
-                let numeric = next.trim_start_matches('#');
-                if let Ok(number) = numeric.parse::<u64>() {
-                    numbers.insert(number);
-                }
+        if *token == "pr" {
+            if let Some(number) = tokens
+                .get(index + 1)
+                .and_then(|next| parse_pr_reference_number(next))
+            {
+                numbers.insert(number);
+            }
+            continue;
+        }
+        if *token == "pull" && tokens.get(index + 1).copied() == Some("request") {
+            if let Some(number) = tokens
+                .get(index + 2)
+                .and_then(|next| parse_pr_reference_number(next))
+            {
+                numbers.insert(number);
             }
         }
     }
     numbers
+}
+
+fn parse_pr_reference_number(token: &str) -> Option<u64> {
+    token.trim_start_matches('#').parse().ok()
 }
 
 fn value_has_review_threads(value: &Value) -> bool {
@@ -13387,6 +13396,45 @@ mod tests {
             &detail,
             "Already merged",
             "PR#217 is already merged into dev; nothing is left to merge.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+    }
+
+    #[test]
+    fn pr_lifecycle_claim_ignores_unqualified_issue_references() {
+        let worker = test_worker_summary("issue-reference-lifecycle-evidence", 100, 100);
+        let mut detail = test_job_detail_with_prompt(
+            "Check whether PR #217 is ready to merge. This also closes #218.",
+        );
+        detail.job.title = "PR lifecycle".to_string();
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_state",
+            json!({
+                "evidence_kind": "github_pr_state",
+                "pr_number": 217,
+                "state": "OPEN",
+                "merged_at": null,
+                "merge_state_status": "CLEAN"
+            }),
+        ));
+        let checkpoint = test_checkpoint_with_prompt(
+            "Check whether PR #217 is ready to merge. This also closes #218.",
+        );
+
+        assert_eq!(
+            extract_pr_numbers("Check PR #217 and close #218")
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![217]
+        );
+        assert!(!should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Ready to merge",
+            "PR #217 is ready to merge and closes #218.",
             "act",
             &checkpoint,
             &worker,
