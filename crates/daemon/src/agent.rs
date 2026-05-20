@@ -11,7 +11,7 @@ use base64::Engine as _;
 use nucleus_protocol::{
     ApprovalRequestSummary, ArtifactSummary, BrowserActionRequest, BrowserNavigateRequest,
     BrowserSnapshot, CommandSessionSummary, CreatePlaybookRequest, DaemonEvent, JobDetail,
-    JobSummary, McpServerRecord, McpToolRecord, PlaybookDetail, PlaybookSummary,
+    JobSummary, McpServerRecord, McpToolRecord, MemoryOutcome, PlaybookDetail, PlaybookSummary,
     PromptProgressUpdate, RunBudgetSummary, SessionDetail, SessionPromptRequest, SessionSummary,
     SessionTurn, SessionTurnImage, UpdatePlaybookRequest, WorkerSummary, WorkspaceProfileSummary,
     WorkspaceSummary,
@@ -835,7 +835,6 @@ pub async fn start_prompt_job(
             "this session has a paused job that must be resumed or canceled first",
         ));
     }
-
     let prompt_excerpt = excerpt(&execution_prompt, 160);
     let visible_prompt = payload.prompt.trim().to_string();
     let job_id = Uuid::new_v4().to_string();
@@ -964,6 +963,22 @@ pub async fn start_prompt_job(
         &compiler_role,
     )?;
 
+    let memory_outcomes =
+        match crate::save_explicit_memory_from_prompt(&state, &current.session, &payload.prompt)
+            .await
+        {
+            Ok(outcomes) => outcomes,
+            Err(error) => vec![MemoryOutcome {
+                kind: "explicit_save".to_string(),
+                state: "rejected".to_string(),
+                memory_id: String::new(),
+                candidate_id: String::new(),
+                dedupe_key: String::new(),
+                title: "Explicit memory not saved".to_string(),
+                detail: error.message,
+            }],
+        };
+
     let checkpoint = WorkerCheckpoint {
         session_id: session_id.clone(),
         prompt_text: execution_prompt.clone(),
@@ -997,6 +1012,7 @@ pub async fn start_prompt_job(
         } else {
             "Nucleus accepted the prompt with scoped image attachment(s) and created a Utility Worker."
         },
+        &memory_outcomes,
     )
     .await;
     let _ = publish_overview_event(&state).await;
@@ -1745,6 +1761,7 @@ async fn run_job_loop(
         "running",
         "Utility Worker running",
         "Nucleus is planning the next repo-inspection step.",
+        &[],
     )
     .await;
 
@@ -1827,6 +1844,7 @@ async fn run_job_loop(
                 "degraded",
                 "Vision unavailable for Utility Worker",
                 &detail,
+                &[],
             )
             .await;
             let metadata = json!({});
@@ -1874,6 +1892,7 @@ async fn run_job_loop(
             "thinking",
             "Planning the next step",
             "The Utility Worker is deciding whether to inspect the repo or answer directly.",
+            &[],
         )
         .await;
 
@@ -2698,6 +2717,7 @@ async fn handle_tool_call_proposal(
             "paused",
             "Waiting for approval",
             &pause_reason,
+            &[],
         )
         .await;
         let _ = publish_overview_event(state).await;
@@ -2793,6 +2813,7 @@ async fn handle_child_job_proposal(
         "running",
         "Spawning Utility Subworkers",
         &summary,
+        &[],
     )
     .await;
     Ok(LoopDisposition::Continue)
@@ -2885,6 +2906,7 @@ async fn record_worker_progress_update(
         "running",
         summary,
         &excerpt(detail, 320),
+        &[],
     )
     .await;
     Ok(())
@@ -3352,6 +3374,7 @@ async fn complete_job_with_final_answer(
             "completed",
             "Utility Worker completed",
             "Nucleus persisted a clean assistant turn from the Utility Worker result.",
+            &[],
         )
         .await;
     } else {
@@ -5754,6 +5777,7 @@ async fn wait_for_write_lock(
                         "running",
                         "Waiting for write lock",
                         &detail,
+                        &[],
                     )
                     .await;
                     waiting_on = Some(conflict.owner_id);
@@ -5811,6 +5835,7 @@ async fn execute_pending_tool_action(
         "tooling",
         &format!("Running {}", tool),
         &pending.summary,
+        &[],
     )
     .await;
     if let Err(error) = state.store.update_tool_call(
@@ -10845,6 +10870,7 @@ async fn publish_prompt_status(
     status: &str,
     label: &str,
     detail: &str,
+    memory_outcomes: &[MemoryOutcome],
 ) {
     let _ = publish_prompt_progress_event(
         state,
@@ -10861,6 +10887,7 @@ async fn publish_prompt_status(
             route_title: session.route_title.clone(),
             attempt: 0,
             attempt_count: 0,
+            memory_outcomes: memory_outcomes.to_vec(),
             created_at: unix_timestamp(),
         },
     )
@@ -14062,6 +14089,96 @@ Cleanup status: clean";
             "assistant response should explicitly explain the degradation: {}",
             assistant_turn.content
         );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn paused_session_rejects_prompt_before_explicit_memory_write() {
+        let state_dir = test_state_dir("paused-session-memory-guard");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let session_id = "session-paused-memory-guard".to_string();
+        state
+            .store
+            .create_session(SessionRecord {
+                id: session_id.clone(),
+                title: "Paused memory guard".to_string(),
+                profile_id: String::new(),
+                profile_title: String::new(),
+                route_id: String::new(),
+                route_title: String::new(),
+                scope: "ad_hoc".to_string(),
+                project_id: String::new(),
+                project_title: String::new(),
+                project_path: String::new(),
+                project_ids: Vec::new(),
+                provider: "openai_compatible".to_string(),
+                model: "cx/gpt-5.4".to_string(),
+                provider_base_url: "http://127.0.0.1:1234/v1".to_string(),
+                provider_api_key: String::new(),
+                working_dir: workspace_root.display().to_string(),
+                working_dir_kind: "workspace_scratch".to_string(),
+                workspace_mode: "scratch_only".to_string(),
+                source_project_path: String::new(),
+                git_root: String::new(),
+                worktree_path: String::new(),
+                git_branch: String::new(),
+                git_base_ref: String::new(),
+                git_head: String::new(),
+                git_dirty: false,
+                git_untracked_count: 0,
+                git_remote_tracking_branch: String::new(),
+                workspace_warnings: Vec::new(),
+                approval_mode: "ask".to_string(),
+                execution_mode: "act".to_string(),
+                run_budget_mode: "inherit".to_string(),
+            })
+            .expect("session should persist");
+        state
+            .store
+            .update_session(
+                &session_id,
+                SessionPatch {
+                    state: Some("paused".to_string()),
+                    ..SessionPatch::default()
+                },
+            )
+            .expect("pause session");
+
+        let payload = SessionPromptRequest {
+            prompt: "remember that I prefer dark mode".to_string(),
+            images: Vec::new(),
+            role: "main".to_string(),
+        };
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        let err = start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            payload,
+            current,
+            "remember that I prefer dark mode".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect_err("paused session should reject prompt");
+        assert!(
+            err.message
+                .contains("paused job that must be resumed or canceled first"),
+            "unexpected error: {:?}",
+            err
+        );
+        assert!(state.store.list_memory_entries().unwrap().is_empty());
 
         let _ = fs::remove_dir_all(&state_dir);
     }
