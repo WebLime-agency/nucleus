@@ -7961,13 +7961,21 @@ fn detect_host_tokens(tokens: &[&str]) -> Vec<String> {
     let mut hosts = Vec::new();
     let mut iter = tokens.iter().copied().peekable();
     while let Some(token) = iter.next() {
-        if token == "--host" {
+        if matches!(token, "--host" | "--hostname" | "-H") {
             if let Some(value) = iter.peek().copied().filter(|value| !value.starts_with('-')) {
                 hosts.push(value.trim_matches(['"', '\'']).to_string());
             }
             continue;
         }
-        if let Some(value) = token.strip_prefix("--host=") {
+        if let Some(value) = token
+            .strip_prefix("--host=")
+            .or_else(|| token.strip_prefix("--hostname="))
+        {
+            if !value.is_empty() {
+                hosts.push(value.trim_matches(['"', '\'']).to_string());
+            }
+        }
+        if let Some(value) = token.strip_prefix("-H") {
             if !value.is_empty() {
                 hosts.push(value.trim_matches(['"', '\'']).to_string());
             }
@@ -13402,6 +13410,43 @@ Cleanup status: clean";
             args: vec![
                 "-lc".to_string(),
                 format!("vite --host 127.0.0.1 --port {port}"),
+            ],
+            cwd: PathBuf::from("/tmp"),
+            timeout_secs: 30,
+            output_limit_bytes: 1024,
+            network_policy: "inherit".to_string(),
+            env: BTreeMap::new(),
+        };
+
+        assert_eq!(detect_command_port(&spec), Some(port));
+        assert_eq!(command_port_preflight_hosts(&spec), vec!["127.0.0.1"]);
+        assert!(ensure_declared_command_port_available(&spec).is_ok());
+    }
+
+    #[test]
+    fn declared_next_hostname_ignores_occupied_ipv6_loopback() {
+        let listener = match std::net::TcpListener::bind("[::1]:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == ErrorKind::AddrNotAvailable => return,
+            Err(error) => panic!("test IPv6 listener should bind or be unavailable: {error}"),
+        };
+        let port = listener
+            .local_addr()
+            .expect("listener addr should be available")
+            .port();
+        let ipv4_probe = match std::net::TcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => listener,
+            Err(_) => return,
+        };
+        drop(ipv4_probe);
+
+        let spec = ResolvedCommandSpec {
+            mode: "interactive".to_string(),
+            title: "Dev server".to_string(),
+            command: "sh".to_string(),
+            args: vec![
+                "-lc".to_string(),
+                format!("next dev -H 127.0.0.1 -p {port}"),
             ],
             cwd: PathBuf::from("/tmp"),
             timeout_secs: 30,
