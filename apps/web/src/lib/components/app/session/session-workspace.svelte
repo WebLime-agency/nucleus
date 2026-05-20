@@ -997,6 +997,7 @@
         route_title: session.route_title,
         attempt: 0,
         attempt_count: 0,
+        memory_outcomes: [],
         created_at: now
       }
     ];
