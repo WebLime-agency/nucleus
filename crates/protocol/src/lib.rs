@@ -140,6 +140,8 @@ pub struct SessionSummary {
     pub last_error: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_error: Option<UserFacingErrorSummary>,
+    #[serde(default)]
+    pub capabilities: Vec<ToolCapabilitySummary>,
     pub last_message_excerpt: String,
     pub turn_count: usize,
     pub created_at: i64,
