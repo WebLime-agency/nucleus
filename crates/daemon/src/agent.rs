@@ -4395,20 +4395,11 @@ fn has_direct_pr_state_evidence_for_claim(
                         .is_some_and(value_has_pr_state_evidence))
         });
     }
-    detail.tool_calls.iter().any(|tool_call| {
-        tool_call.status == "completed"
-            && (tool_call.tool_id == "github.pr_state"
-                || tool_call
-                    .result_json
-                    .as_ref()
-                    .is_some_and(value_has_pr_state_evidence))
-            && tool_call.result_json.as_ref().is_some_and(|value| {
-                value
-                    .get("pr_number")
-                    .or_else(|| value.get("number"))
-                    .and_then(Value::as_u64)
-                    .is_some_and(|number| pr_numbers.contains(&number))
-            })
+    pr_numbers.iter().all(|pr_number| {
+        detail
+            .tool_calls
+            .iter()
+            .any(|tool_call| completed_pr_state_tool_call_matches_number(tool_call, *pr_number))
     })
 }
 
@@ -4422,22 +4413,39 @@ fn has_direct_pr_merged_evidence_for_claim(
     if pr_numbers.is_empty() {
         return has_direct_pr_merged_evidence(detail);
     }
-    detail.tool_calls.iter().any(|tool_call| {
-        tool_call.status == "completed"
-            && (tool_call.tool_id == "github.pr_state"
-                || tool_call
+    pr_numbers.iter().all(|pr_number| {
+        detail.tool_calls.iter().any(|tool_call| {
+            completed_pr_state_tool_call_matches_number(tool_call, *pr_number)
+                && tool_call
                     .result_json
                     .as_ref()
-                    .is_some_and(value_has_pr_state_evidence))
-            && tool_call.result_json.as_ref().is_some_and(|value| {
-                value_says_pr_merged(value)
-                    && value
-                        .get("pr_number")
-                        .or_else(|| value.get("number"))
-                        .and_then(Value::as_u64)
-                        .is_some_and(|number| pr_numbers.contains(&number))
-            })
+                    .is_some_and(value_says_pr_merged)
+        })
     })
+}
+
+fn completed_pr_state_tool_call_matches_number(
+    tool_call: &nucleus_protocol::ToolCallSummary,
+    pr_number: u64,
+) -> bool {
+    tool_call.status == "completed"
+        && (tool_call.tool_id == "github.pr_state"
+            || tool_call
+                .result_json
+                .as_ref()
+                .is_some_and(value_has_pr_state_evidence))
+        && tool_call
+            .result_json
+            .as_ref()
+            .and_then(value_pr_number)
+            .is_some_and(|number| number == pr_number)
+}
+
+fn value_pr_number(value: &Value) -> Option<u64> {
+    value
+        .get("pr_number")
+        .or_else(|| value.get("number"))
+        .and_then(Value::as_u64)
 }
 
 fn extract_pr_numbers(text: &str) -> BTreeSet<u64> {
@@ -13384,6 +13392,116 @@ mod tests {
             &worker,
             3,
             2,
+        ));
+    }
+
+    #[test]
+    fn pr_lifecycle_claim_requires_state_for_every_referenced_pr() {
+        let worker = test_worker_summary("multi-pr-lifecycle-evidence", 100, 100);
+        let mut detail = test_job_detail_with_prompt("Check whether PR #217 and #219 are ready.");
+        detail.job.title = "PR lifecycle".to_string();
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_state",
+            json!({
+                "evidence_kind": "github_pr_state",
+                "pr_number": 217,
+                "state": "OPEN",
+                "merged_at": null,
+                "merge_state_status": "CLEAN"
+            }),
+        ));
+        let checkpoint = test_checkpoint_with_prompt("Check whether PR #217 and #219 are ready.");
+
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Ready to merge",
+            "PR #217 and #219 are ready to merge.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_state",
+            json!({
+                "evidence_kind": "github_pr_state",
+                "pr_number": 219,
+                "state": "OPEN",
+                "merged_at": null,
+                "merge_state_status": "CLEAN"
+            }),
+        ));
+        assert!(!should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Ready to merge",
+            "PR #217 and #219 are ready to merge.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            3,
+        ));
+    }
+
+    #[test]
+    fn pr_merged_claim_requires_merged_state_for_every_referenced_pr() {
+        let worker = test_worker_summary("multi-pr-merged-evidence", 100, 100);
+        let mut detail =
+            test_job_detail_with_prompt("Check whether PR #217 and PR #219 are already merged.");
+        detail.job.title = "PR lifecycle".to_string();
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_state",
+            json!({
+                "evidence_kind": "github_pr_state",
+                "pr_number": 217,
+                "state": "MERGED",
+                "merged_at": "2026-05-20T16:00:00Z"
+            }),
+        ));
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_state",
+            json!({
+                "evidence_kind": "github_pr_state",
+                "pr_number": 219,
+                "state": "OPEN",
+                "merged_at": null
+            }),
+        ));
+        let checkpoint =
+            test_checkpoint_with_prompt("Check whether PR #217 and PR #219 are already merged.");
+
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Already merged",
+            "PR #217 and PR #219 are already merged; nothing is left to merge.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            3,
+        ));
+
+        detail.tool_calls.pop();
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_state",
+            json!({
+                "evidence_kind": "github_pr_state",
+                "pr_number": 219,
+                "state": "MERGED",
+                "merged_at": "2026-05-20T16:05:00Z"
+            }),
+        ));
+        assert!(!should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Already merged",
+            "PR #217 and PR #219 are already merged; nothing is left to merge.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            3,
         ));
     }
 
