@@ -641,6 +641,30 @@ struct TestsRunArgs {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct GithubPrReviewThreadsArgs {
+    owner: Option<String>,
+    repo: Option<String>,
+    pr_number: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GithubPrStateArgs {
+    owner: Option<String>,
+    repo: Option<String>,
+    pr_number: Option<u64>,
+    branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GithubCommentArgs {
+    owner: Option<String>,
+    repo: Option<String>,
+    target_kind: String,
+    number: u64,
+    body: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct McpToolCallArgs {
     #[serde(default)]
     params: Value,
@@ -2057,6 +2081,32 @@ async fn run_job_loop(
                         "Rejected incomplete progress report as final answer.",
                         "incomplete_progress_final_answer",
                         &build_incomplete_progress_retry_prompt(&summary, &final_answer),
+                        &final_answer,
+                    )
+                    .await?;
+                    continue;
+                }
+
+                if should_retry_unsupported_confident_negative_final_answer(
+                    &detail,
+                    &summary,
+                    &final_answer,
+                    &session.session.execution_mode,
+                    &checkpoint,
+                    &worker,
+                    step,
+                    tool_calls,
+                ) {
+                    retry_worker_final_answer(
+                        state,
+                        job_id,
+                        &mut worker,
+                        &mut checkpoint,
+                        &mut step,
+                        tool_calls,
+                        "Rejected unsupported confident negative answer.",
+                        "evidence_incomplete_confident_negative",
+                        &build_evidence_completion_retry_prompt(&summary, &final_answer),
                         &final_answer,
                     )
                     .await?;
@@ -4054,6 +4104,565 @@ fn final_answer_reports_concrete_blocker(text: &str) -> bool {
     .any(|needle| text.contains(needle))
 }
 
+fn should_retry_unsupported_confident_negative_final_answer(
+    detail: &JobDetail,
+    summary: &str,
+    final_answer: &str,
+    execution_mode: &str,
+    checkpoint: &WorkerCheckpoint,
+    worker: &WorkerSummary,
+    step_count: usize,
+    tool_call_count: usize,
+) -> bool {
+    if execution_mode == "plan"
+        || !has_remaining_worker_budget(worker, step_count, tool_call_count)
+        || !confident_negative_claim(summary, final_answer)
+    {
+        return false;
+    }
+
+    let task_text = evidence_task_text(detail, checkpoint);
+    let missing_pr_review_evidence = requires_pr_review_thread_evidence(&task_text)
+        && !has_thread_aware_pr_review_evidence(detail, &task_text, summary, final_answer);
+    let missing_test_evidence = requires_test_validation_evidence(&task_text)
+        && !has_test_validation_evidence(detail, &task_text, summary, final_answer);
+    let zero_test_misread = confident_test_success_claim(summary, final_answer)
+        && has_zero_test_no_match_evidence(detail);
+    let missing_pr_lifecycle_state = confident_pr_lifecycle_claim(summary, final_answer)
+        && !has_direct_pr_state_evidence_for_claim(detail, &task_text, summary, final_answer);
+    let unsupported_pr_merged_claim = confident_pr_merged_claim(summary, final_answer)
+        && !has_direct_pr_merged_evidence_for_claim(detail, &task_text, summary, final_answer);
+    let challenged_clean_answer = requires_pr_review_thread_evidence(&task_text)
+        && repeated_grounding_challenge(&task_text)
+        && !has_thread_aware_pr_review_evidence(detail, &task_text, summary, final_answer);
+
+    (missing_pr_review_evidence
+        || missing_test_evidence
+        || zero_test_misread
+        || missing_pr_lifecycle_state
+        || unsupported_pr_merged_claim
+        || challenged_clean_answer)
+        && !final_answer_reports_concrete_blocker(&normalize_action_item_text(final_answer))
+}
+
+fn evidence_task_text(detail: &JobDetail, checkpoint: &WorkerCheckpoint) -> String {
+    let mut parts = vec![
+        detail.job.title.as_str(),
+        detail.job.purpose.as_str(),
+        detail.job.prompt_excerpt.as_str(),
+        checkpoint.prompt_text.as_str(),
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    parts.extend(
+        checkpoint
+            .conversation
+            .iter()
+            .filter(|message| message.role == "user")
+            .map(|message| message.content.clone()),
+    );
+    normalize_action_item_text(&parts.join("\n"))
+}
+
+fn requires_pr_review_thread_evidence(text: &str) -> bool {
+    let pr_context = text.contains(" pr ")
+        || !extract_pr_numbers(text).is_empty()
+        || text.contains("pull request")
+        || text.contains("github pr")
+        || text.contains("github pull request");
+    let review_context = [
+        "latest feedback",
+        "review feedback",
+        "review comments",
+        "requested changes",
+        "unresolved comment",
+        "unresolved review",
+        "inline comment",
+        "inline review",
+        "codex review",
+        "actionable feedback",
+        "pr feedback",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle));
+    pr_context && review_context
+}
+
+fn repeated_grounding_challenge(text: &str) -> bool {
+    [
+        "are you sure",
+        "check again",
+        "look again",
+        "recheck",
+        "double check",
+        "i can see",
+        "screenshot",
+        "you missed",
+        "still says",
+        "that's not right",
+        "that is not right",
+        "not true",
+        "you said",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn requires_test_validation_evidence(text: &str) -> bool {
+    [
+        "failed tests",
+        "failing tests",
+        "test failures",
+        "checks failed",
+        "failed checks",
+        "validation",
+        "tests pass",
+        "tests passed",
+        "run tests",
+        "check failed tests",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn confident_negative_claim(summary: &str, final_answer: &str) -> bool {
+    let text = normalize_action_item_text(&format!("{summary}\n{final_answer}"));
+    [
+        "no actionable feedback",
+        "nothing actionable",
+        "no actionable comments",
+        "no requested changes",
+        "no unresolved comments",
+        "no unresolved review",
+        "looks clean",
+        "everything looks clean",
+        "nothing to fix",
+        "no failed tests",
+        "no failed checks",
+        "tests passed",
+        "all tests passed",
+        "validation passed",
+        "checks passed",
+        "clean to merge",
+        "ready to merge",
+        "clear to merge",
+        "approved",
+        "mergeable",
+        "pr is open",
+        "pull request is open",
+        "pr is closed",
+        "pull request is closed",
+        "already merged",
+        "has already been merged",
+        "nothing left to merge",
+        "nothing to merge",
+        "no merge left",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn confident_pr_lifecycle_claim(summary: &str, final_answer: &str) -> bool {
+    let text = normalize_action_item_text(&format!("{summary}\n{final_answer}"));
+    [
+        "already merged",
+        "has already been merged",
+        "nothing left to merge",
+        "nothing to merge",
+        "ready to merge",
+        "clean to merge",
+        "clear to merge",
+        "mergeable",
+        "approved",
+        "pr is open",
+        "pull request is open",
+        "pr is closed",
+        "pull request is closed",
+        "merge state",
+        "review decision",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn confident_pr_merged_claim(summary: &str, final_answer: &str) -> bool {
+    let text = normalize_action_item_text(&format!("{summary}\n{final_answer}"));
+    [
+        "already merged",
+        "has already been merged",
+        "was already merged",
+        "it is merged",
+        "it's merged",
+        "pr is merged",
+        "pull request is merged",
+        "nothing left to merge",
+        "nothing to merge",
+        "no merge left",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn confident_test_success_claim(summary: &str, final_answer: &str) -> bool {
+    let text = normalize_action_item_text(&format!("{summary}\n{final_answer}"));
+    [
+        "no failed tests",
+        "no failing tests",
+        "tests passed",
+        "all tests passed",
+        "validation passed",
+        "checks passed",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn has_thread_aware_pr_review_evidence(
+    detail: &JobDetail,
+    task_text: &str,
+    summary: &str,
+    final_answer: &str,
+) -> bool {
+    let pr_numbers = extract_pr_numbers(&format!("{task_text}\n{summary}\n{final_answer}"));
+    if pr_numbers.is_empty() {
+        return detail.tool_calls.iter().any(|tool_call| {
+            tool_call.status == "completed"
+                && tool_call
+                    .result_json
+                    .as_ref()
+                    .is_some_and(value_has_complete_review_threads)
+        });
+    }
+    pr_numbers.iter().all(|pr_number| {
+        detail.tool_calls.iter().any(|tool_call| {
+            tool_call.status == "completed"
+                && tool_call.result_json.as_ref().is_some_and(|result| {
+                    value_pr_number(result).is_some_and(|number| number == *pr_number)
+                        && value_has_complete_review_threads(result)
+                })
+        })
+    })
+}
+
+fn has_test_validation_evidence(
+    detail: &JobDetail,
+    task_text: &str,
+    summary: &str,
+    final_answer: &str,
+) -> bool {
+    let combined_text =
+        normalize_action_item_text(&format!("{task_text}\n{summary}\n{final_answer}"));
+    let pr_numbers = extract_pr_numbers(&combined_text);
+    let requires_pr_status_checks =
+        !pr_numbers.is_empty() && requires_pr_status_check_evidence(&combined_text);
+
+    if requires_pr_status_checks {
+        return pr_numbers.iter().all(|pr_number| {
+            detail.tool_calls.iter().any(|tool_call| {
+                tool_call.status == "completed"
+                    && tool_call.result_json.as_ref().is_some_and(|result| {
+                        value_pr_number(result).is_some_and(|number| number == *pr_number)
+                            && value_has_successful_status_check_rollup(result)
+                    })
+            })
+        });
+    }
+
+    if detail.tool_calls.iter().any(|tool_call| {
+        tool_call.status == "completed"
+            && tool_call.result_json.as_ref().is_some_and(|result| {
+                tool_call.tool_id == "tests.run" && value_has_successful_test_run(result)
+            })
+    }) {
+        return true;
+    }
+
+    if pr_numbers.is_empty() {
+        return detail.tool_calls.iter().any(|tool_call| {
+            tool_call.status == "completed"
+                && tool_call
+                    .result_json
+                    .as_ref()
+                    .is_some_and(value_has_successful_status_check_rollup)
+        });
+    }
+    pr_numbers.iter().all(|pr_number| {
+        detail.tool_calls.iter().any(|tool_call| {
+            tool_call.status == "completed"
+                && tool_call.result_json.as_ref().is_some_and(|result| {
+                    value_pr_number(result).is_some_and(|number| number == *pr_number)
+                        && value_has_successful_status_check_rollup(result)
+                })
+        })
+    })
+}
+
+fn requires_pr_status_check_evidence(text: &str) -> bool {
+    [
+        "check passed",
+        "checks passed",
+        "no failed checks",
+        "ci passed",
+        "status check",
+        "status checks",
+        "github action",
+        "github actions",
+        "workflow passed",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn has_zero_test_no_match_evidence(detail: &JobDetail) -> bool {
+    for tool_call in detail
+        .tool_calls
+        .iter()
+        .rev()
+        .filter(|tool_call| tool_call.status == "completed")
+    {
+        let Some(result) = tool_call.result_json.as_ref() else {
+            continue;
+        };
+        if result
+            .pointer("/validation_interpretation/status")
+            .and_then(Value::as_str)
+            == Some("no_tests_matched")
+        {
+            return true;
+        }
+        if tool_call.tool_id == "tests.run" && value_has_successful_test_run(result) {
+            return false;
+        }
+    }
+    false
+}
+
+fn has_direct_pr_merged_evidence(detail: &JobDetail) -> bool {
+    detail.tool_calls.iter().any(|tool_call| {
+        tool_call.status == "completed"
+            && (tool_call.tool_id == "github.pr_state"
+                || tool_call
+                    .result_json
+                    .as_ref()
+                    .is_some_and(value_has_pr_state_evidence))
+            && tool_call
+                .result_json
+                .as_ref()
+                .is_some_and(value_says_pr_merged)
+    })
+}
+
+fn has_direct_pr_state_evidence_for_claim(
+    detail: &JobDetail,
+    task_text: &str,
+    summary: &str,
+    final_answer: &str,
+) -> bool {
+    let pr_numbers = extract_pr_numbers(&format!("{task_text}\n{summary}\n{final_answer}"));
+    if pr_numbers.is_empty() {
+        return detail.tool_calls.iter().any(|tool_call| {
+            tool_call.status == "completed"
+                && (tool_call.tool_id == "github.pr_state"
+                    || tool_call
+                        .result_json
+                        .as_ref()
+                        .is_some_and(value_has_pr_state_evidence))
+        });
+    }
+    pr_numbers.iter().all(|pr_number| {
+        detail
+            .tool_calls
+            .iter()
+            .any(|tool_call| completed_pr_state_tool_call_matches_number(tool_call, *pr_number))
+    })
+}
+
+fn has_direct_pr_merged_evidence_for_claim(
+    detail: &JobDetail,
+    task_text: &str,
+    summary: &str,
+    final_answer: &str,
+) -> bool {
+    let pr_numbers = extract_pr_numbers(&format!("{task_text}\n{summary}\n{final_answer}"));
+    if pr_numbers.is_empty() {
+        return has_direct_pr_merged_evidence(detail);
+    }
+    pr_numbers.iter().all(|pr_number| {
+        detail.tool_calls.iter().any(|tool_call| {
+            completed_pr_state_tool_call_matches_number(tool_call, *pr_number)
+                && tool_call
+                    .result_json
+                    .as_ref()
+                    .is_some_and(value_says_pr_merged)
+        })
+    })
+}
+
+fn completed_pr_state_tool_call_matches_number(
+    tool_call: &nucleus_protocol::ToolCallSummary,
+    pr_number: u64,
+) -> bool {
+    tool_call.status == "completed"
+        && (tool_call.tool_id == "github.pr_state"
+            || tool_call
+                .result_json
+                .as_ref()
+                .is_some_and(value_has_pr_state_evidence))
+        && tool_call
+            .result_json
+            .as_ref()
+            .and_then(value_pr_number)
+            .is_some_and(|number| number == pr_number)
+}
+
+fn value_pr_number(value: &Value) -> Option<u64> {
+    value
+        .get("pr_number")
+        .or_else(|| value.get("number"))
+        .and_then(Value::as_u64)
+}
+
+fn extract_pr_numbers(text: &str) -> BTreeSet<u64> {
+    let mut numbers = BTreeSet::new();
+    let normalized = normalize_action_item_text(text);
+    let tokens = normalized
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '#'))
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let mut pr_list_active = false;
+    for (index, token) in tokens.iter().enumerate() {
+        if let Some(number) = token
+            .strip_prefix("pr#")
+            .and_then(|value| value.parse().ok())
+        {
+            numbers.insert(number);
+            pr_list_active = true;
+            continue;
+        }
+        if pr_list_active {
+            if let Some(number) = token.strip_prefix('#').and_then(|value| value.parse().ok()) {
+                numbers.insert(number);
+                continue;
+            }
+            if matches!(*token, "and" | "request" | "requests") {
+                continue;
+            }
+            pr_list_active = false;
+        }
+        if matches!(*token, "pr" | "prs") {
+            if let Some(number) = tokens
+                .get(index + 1)
+                .and_then(|next| parse_pr_reference_number(next))
+            {
+                numbers.insert(number);
+                pr_list_active = true;
+            }
+            continue;
+        }
+        if *token == "pull" && tokens.get(index + 1).copied() == Some("request") {
+            if let Some(number) = tokens
+                .get(index + 2)
+                .and_then(|next| parse_pr_reference_number(next))
+            {
+                numbers.insert(number);
+                pr_list_active = true;
+            }
+        }
+        if *token == "pull" && tokens.get(index + 1).copied() == Some("requests") {
+            if let Some(number) = tokens
+                .get(index + 2)
+                .and_then(|next| parse_pr_reference_number(next))
+            {
+                numbers.insert(number);
+                pr_list_active = true;
+            }
+        }
+    }
+    numbers
+}
+
+fn parse_pr_reference_number(token: &str) -> Option<u64> {
+    token.trim_start_matches('#').parse().ok()
+}
+
+fn value_has_complete_review_threads(value: &Value) -> bool {
+    if value.get("review_threads").is_some() || value.get("reviewThreads").is_some() {
+        let comments_truncated = value
+            .get("thread_comments_truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let threads_complete = value
+            .get("review_threads_complete")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        return threads_complete && !comments_truncated;
+    }
+    match value {
+        Value::Array(items) => items.iter().any(value_has_complete_review_threads),
+        Value::Object(object) => object.values().any(value_has_complete_review_threads),
+        _ => false,
+    }
+}
+
+fn value_has_pr_state_evidence(value: &Value) -> bool {
+    if value.get("evidence_kind").and_then(Value::as_str) == Some("github_pr_state") {
+        return true;
+    }
+    if value.get("mergedAt").is_some()
+        || value.get("merged_at").is_some()
+        || value.get("mergeStateStatus").is_some()
+        || value.get("merge_state_status").is_some()
+    {
+        return true;
+    }
+    match value {
+        Value::Array(items) => items.iter().any(value_has_pr_state_evidence),
+        Value::Object(object) => object.values().any(value_has_pr_state_evidence),
+        _ => false,
+    }
+}
+
+fn value_says_pr_merged(value: &Value) -> bool {
+    value
+        .get("state")
+        .or_else(|| value.get("pr_state"))
+        .and_then(Value::as_str)
+        .is_some_and(|state| state.eq_ignore_ascii_case("MERGED"))
+        || value
+            .get("mergedAt")
+            .or_else(|| value.get("merged_at"))
+            .and_then(Value::as_str)
+            .is_some_and(|merged_at| !merged_at.trim().is_empty())
+}
+
+fn value_has_successful_status_check_rollup(value: &Value) -> bool {
+    if let Some(rollup) = value
+        .get("status_check_rollup")
+        .or_else(|| value.get("statusCheckRollup"))
+    {
+        return rollup
+            .get("state")
+            .and_then(Value::as_str)
+            .is_some_and(|state| state.eq_ignore_ascii_case("SUCCESS"));
+    }
+    match value {
+        Value::Array(items) => items.iter().any(value_has_successful_status_check_rollup),
+        Value::Object(object) => object
+            .values()
+            .any(value_has_successful_status_check_rollup),
+        _ => false,
+    }
+}
+
+fn value_has_successful_test_run(value: &Value) -> bool {
+    value.get("exit_code").and_then(Value::as_i64) == Some(0)
+        && value
+            .pointer("/validation_interpretation/status")
+            .and_then(Value::as_str)
+            != Some("no_tests_matched")
+}
+
 #[derive(Debug, Clone, Default)]
 struct PublicationOutcomePatch {
     publication_requested: Option<bool>,
@@ -5086,6 +5695,24 @@ Return exactly one valid Nucleus worker action JSON object and continue the job.
 - Do not restate the requested action as if it completed.",
         excerpt(&job.prompt_excerpt, 320),
         excerpt(summary, 320),
+        excerpt(final_answer, 1_200)
+    )
+}
+
+fn build_evidence_completion_retry_prompt(summary: &str, final_answer: &str) -> String {
+    format!(
+        "Your previous final_answer made a confident negative claim without complete required evidence.\n\
+Previous summary: {}\n\
+Previous final_answer: {}\n\
+Return exactly one valid Nucleus worker action JSON object.\n\
+Rules:\n\
+- For PR review or latest feedback tasks, fetch thread-aware review data before saying there is no actionable feedback. Prefer github.pr_review_threads for inline review threads.\n\
+- For PR lifecycle claims such as already merged, nothing left to merge, open, closed, ready, mergeable, or approved, fetch direct PR state with github.pr_state. Local git status or log output is not enough.\n\
+- For test or validation tasks, only say tests/checks passed after a tests.run result or check-state evidence actually supports that. If zero tests matched, say no tests matched.\n\
+- If GitHub thread retrieval is unavailable or blocked, return a concise bounded final_answer that says you could not fully verify the PR feedback yet.\n\
+- If the user challenged a prior answer, use a deeper or different evidence path before repeating a clean/no-action conclusion.\n\
+- Keep the eventual user-facing final_answer short and plain.",
+        excerpt(summary, 400),
         excerpt(final_answer, 1_200)
     )
 }
@@ -6197,6 +6824,16 @@ async fn execute_granted_tool(
                 serde_json::from_value::<GitDiffArgs>(args).context("invalid args for git.diff")?;
             execute_git_diff_tool(worker, args).await
         }
+        "github.pr_review_threads" => {
+            let args = serde_json::from_value::<GithubPrReviewThreadsArgs>(args)
+                .context("invalid args for github.pr_review_threads")?;
+            execute_github_pr_review_threads_tool(worker, args).await
+        }
+        "github.pr_state" => {
+            let args = serde_json::from_value::<GithubPrStateArgs>(args)
+                .context("invalid args for github.pr_state")?;
+            execute_github_pr_state_tool(worker, args).await
+        }
         "fs.apply_patch" => {
             let args = serde_json::from_value::<FsApplyPatchArgs>(args)
                 .context("invalid args for fs.apply_patch")?;
@@ -6221,6 +6858,11 @@ async fn execute_granted_tool(
             let args = serde_json::from_value::<GitStagePatchArgs>(args)
                 .context("invalid args for git.stage_patch")?;
             execute_git_stage_patch_tool(worker, args).await
+        }
+        "github.comment" => {
+            let args = serde_json::from_value::<GithubCommentArgs>(args)
+                .context("invalid args for github.comment")?;
+            execute_github_comment_tool(state, job_id, worker, args).await
         }
         "command.run" => {
             let args = serde_json::from_value::<CommandRunArgs>(args)
@@ -6366,6 +7008,11 @@ fn preview_approval_tool(
             let args = serde_json::from_value::<GitStagePatchArgs>(args.clone())
                 .context("invalid args for git.stage_patch")?;
             preview_git_stage_patch(worker, args)
+        }
+        "github.comment" => {
+            let args = serde_json::from_value::<GithubCommentArgs>(args.clone())
+                .context("invalid args for github.comment")?;
+            Ok(preview_github_comment(args))
         }
         "command.run" => {
             let args = serde_json::from_value::<CommandRunArgs>(args.clone())
@@ -6599,6 +7246,453 @@ async fn execute_git_diff_tool(worker: &WorkerSummary, args: GitDiffArgs) -> Res
         "working_dir": worker.working_dir,
         "diff": limit_text(stdout, TOOL_OUTPUT_CHAR_LIMIT),
     }))
+}
+
+async fn execute_github_pr_review_threads_tool(
+    worker: &WorkerSummary,
+    args: GithubPrReviewThreadsArgs,
+) -> Result<Value> {
+    let (owner, repo) = resolve_github_repo(worker, args.owner, args.repo).await?;
+    let query = r#"
+query($owner: String!, $repo: String!, $number: Int!, $threadsCursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      number
+      url
+      title
+      state
+      mergedAt
+      headRefName
+      baseRefName
+      reviewDecision
+      mergeStateStatus
+      comments(last: 100) {
+        nodes {
+          author { login }
+          body
+          createdAt
+          url
+        }
+      }
+      reviews(last: 100) {
+        nodes {
+          author { login }
+          state
+          body
+          submittedAt
+          url
+        }
+      }
+      reviewThreads(first: 100, after: $threadsCursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          id
+          isResolved
+          isOutdated
+          path
+          line
+          startLine
+          comments(first: 100) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+            nodes {
+              id
+              author { login }
+              body
+              createdAt
+              url
+              path
+              line
+              originalLine
+              position
+              originalPosition
+              diffHunk
+            }
+          }
+        }
+      }
+      commits(last: 1) {
+        nodes {
+          commit {
+            statusCheckRollup {
+              state
+              contexts(first: 100) {
+                nodes {
+                  __typename
+                  ... on CheckRun {
+                    name
+                    status
+                    conclusion
+                    detailsUrl
+                  }
+                  ... on StatusContext {
+                    context
+                    state
+                    targetUrl
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+    let raw = github_pr_review_threads_query(&owner, &repo, args.pr_number, query, None).await?;
+    let mut raw: Value = serde_json::from_str(&raw).context("failed to parse gh GraphQL output")?;
+    let pull = raw
+        .pointer_mut("/data/repository/pullRequest")
+        .ok_or_else(|| anyhow!("failed to read GitHub pull request GraphQL response"))?;
+    if pull.is_null() {
+        bail!(
+            "GitHub pull request #{} was not found in {owner}/{repo}",
+            args.pr_number
+        );
+    }
+
+    let mut review_threads = pull
+        .pointer("/reviewThreads/nodes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut thread_comments_truncated = review_threads
+        .iter()
+        .any(|thread| thread_comments_have_next_page(thread));
+    let mut next_cursor = pull
+        .pointer("/reviewThreads/pageInfo/endCursor")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let mut has_next_page = pull
+        .pointer("/reviewThreads/pageInfo/hasNextPage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    while has_next_page {
+        let cursor = next_cursor
+            .as_deref()
+            .ok_or_else(|| anyhow!("GitHub reviewThreads pageInfo omitted endCursor"))?;
+        let page_stdout =
+            github_pr_review_threads_query(&owner, &repo, args.pr_number, query, Some(cursor))
+                .await?;
+        let page: Value =
+            serde_json::from_str(&page_stdout).context("failed to parse gh GraphQL page output")?;
+        let page_pull = page
+            .pointer("/data/repository/pullRequest")
+            .ok_or_else(|| anyhow!("failed to read paginated GitHub pull request response"))?;
+        let page_threads = page_pull
+            .pointer("/reviewThreads/nodes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        thread_comments_truncated |= page_threads
+            .iter()
+            .any(|thread| thread_comments_have_next_page(thread));
+        review_threads.extend(page_threads);
+        has_next_page = page_pull
+            .pointer("/reviewThreads/pageInfo/hasNextPage")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        next_cursor = page_pull
+            .pointer("/reviewThreads/pageInfo/endCursor")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    pull["reviewThreads"]["nodes"] = Value::Array(review_threads.clone());
+    pull["reviewThreads"]["pageInfo"] = json!({
+        "hasNextPage": false,
+        "endCursor": next_cursor,
+    });
+    let pull = pull.clone();
+
+    Ok(github_pr_review_threads_result(
+        &owner,
+        &repo,
+        args.pr_number,
+        &pull,
+        review_threads,
+        thread_comments_truncated,
+    ))
+}
+
+fn github_pr_review_threads_result(
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    pull: &Value,
+    review_threads: Vec<Value>,
+    thread_comments_truncated: bool,
+) -> Value {
+    let top_level_comments = pull
+        .pointer("/comments/nodes")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let reviews = pull
+        .pointer("/reviews/nodes")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let status_check_rollup = pull
+        .pointer("/commits/nodes/0/commit/statusCheckRollup")
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    json!({
+        "evidence_kind": "github_pr_review_threads",
+        "owner": owner,
+        "repo": repo,
+        "pr_number": pr_number,
+        "url": pull.get("url").cloned().unwrap_or(Value::Null),
+        "title": pull.get("title").cloned().unwrap_or(Value::Null),
+        "state": pull.get("state").cloned().unwrap_or(Value::Null),
+        "merged_at": pull.get("mergedAt").cloned().unwrap_or(Value::Null),
+        "head_ref_name": pull.get("headRefName").cloned().unwrap_or(Value::Null),
+        "base_ref_name": pull.get("baseRefName").cloned().unwrap_or(Value::Null),
+        "review_decision": pull.get("reviewDecision").cloned().unwrap_or(Value::Null),
+        "merge_state_status": pull.get("mergeStateStatus").cloned().unwrap_or(Value::Null),
+        "top_level_comments": top_level_comments,
+        "reviews": reviews,
+        "review_threads": review_threads,
+        "review_threads_complete": !thread_comments_truncated,
+        "thread_comments_truncated": thread_comments_truncated,
+        "status_check_rollup": status_check_rollup,
+    })
+}
+
+async fn github_pr_review_threads_query(
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    query: &str,
+    threads_cursor: Option<&str>,
+) -> Result<String> {
+    let number = pr_number.to_string();
+    let command_args = vec![
+        "api".to_string(),
+        "graphql".to_string(),
+        "-f".to_string(),
+        format!("owner={owner}"),
+        "-f".to_string(),
+        format!("repo={repo}"),
+        "-F".to_string(),
+        format!("number={number}"),
+    ];
+    let mut command_args = command_args;
+    if let Some(cursor) = threads_cursor {
+        command_args.push("-f".to_string());
+        command_args.push(format!("threadsCursor={cursor}"));
+    }
+    command_args.push("-f".to_string());
+    command_args.push(format!("query={query}"));
+    let refs = command_args.iter().map(String::as_str).collect::<Vec<_>>();
+    command_output("gh", &refs).await
+}
+
+fn thread_comments_have_next_page(thread: &Value) -> bool {
+    thread
+        .pointer("/comments/pageInfo/hasNextPage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+async fn execute_github_pr_state_tool(
+    worker: &WorkerSummary,
+    args: GithubPrStateArgs,
+) -> Result<Value> {
+    let (owner, repo) = resolve_github_repo(worker, args.owner, args.repo).await?;
+    let selector = args.pr_number.map(|number| number.to_string()).or_else(|| {
+        args.branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|branch| !branch.is_empty())
+            .map(str::to_string)
+    });
+    let repo_arg = format!("{owner}/{repo}");
+    let mut command_args = vec!["pr".to_string(), "view".to_string()];
+    if let Some(selector) = selector {
+        command_args.push(selector);
+    }
+    command_args.extend([
+        "--repo".to_string(),
+        repo_arg.clone(),
+        "--json".to_string(),
+        "number,state,mergedAt,mergeStateStatus,headRefName,baseRefName,url,isDraft,reviewDecision"
+            .to_string(),
+    ]);
+    let refs = command_args.iter().map(String::as_str).collect::<Vec<_>>();
+    let raw = command_output_in_dir("gh", &refs, Some(Path::new(&worker.working_dir))).await?;
+    let value: Value = serde_json::from_str(&raw).context("failed to parse gh pr state output")?;
+    Ok(json!({
+        "evidence_kind": "github_pr_state",
+        "owner": owner,
+        "repo": repo,
+        "pr_number": value.get("number").cloned().unwrap_or(Value::Null),
+        "state": value.get("state").cloned().unwrap_or(Value::Null),
+        "merged_at": value.get("mergedAt").cloned().unwrap_or(Value::Null),
+        "merge_state_status": value.get("mergeStateStatus").cloned().unwrap_or(Value::Null),
+        "head_ref_name": value.get("headRefName").cloned().unwrap_or(Value::Null),
+        "base_ref_name": value.get("baseRefName").cloned().unwrap_or(Value::Null),
+        "url": value.get("url").cloned().unwrap_or(Value::Null),
+        "is_draft": value.get("isDraft").cloned().unwrap_or(Value::Null),
+        "review_decision": value.get("reviewDecision").cloned().unwrap_or(Value::Null),
+        "raw": value,
+    }))
+}
+
+fn preview_github_comment(args: GithubCommentArgs) -> MutationPreview {
+    let target = format!(
+        "{} #{}",
+        normalize_github_comment_target(&args.target_kind).unwrap_or("comment target"),
+        args.number
+    );
+    MutationPreview {
+        detail: format!("Post a GitHub comment on {target} using a body file."),
+        diff_preview: excerpt(&args.body, DIFF_PREVIEW_CHAR_LIMIT),
+        artifact: Some(text_artifact(
+            "github-comment-plan",
+            format!("GitHub comment {target}"),
+            "md",
+            "text/markdown",
+            args.body,
+        )),
+    }
+}
+
+async fn execute_github_comment_tool(
+    state: &AppState,
+    job_id: &str,
+    worker: &WorkerSummary,
+    args: GithubCommentArgs,
+) -> Result<Value> {
+    let target_kind = normalize_github_comment_target(&args.target_kind)
+        .ok_or_else(|| anyhow!("target_kind must be 'pr' or 'issue'"))?;
+    if args.number == 0 {
+        bail!("GitHub comment number must be greater than zero");
+    }
+    if args.body.trim().is_empty() {
+        bail!("GitHub comment body must not be empty");
+    }
+    let (owner, repo) = resolve_github_repo(worker, args.owner, args.repo).await?;
+    let body_dir = publication_job_temp_dir(state, job_id).join("github-comments");
+    fs::create_dir_all(&body_dir)
+        .with_context(|| format!("failed to create '{}'", body_dir.display()))?;
+    let body_path = body_dir.join(format!(
+        "{}-{}-{}.md",
+        target_kind,
+        args.number,
+        Uuid::new_v4()
+    ));
+    fs::write(&body_path, args.body.as_bytes())
+        .with_context(|| format!("failed to write '{}'", body_path.display()))?;
+    let number = args.number.to_string();
+    let repo_arg = format!("{owner}/{repo}");
+    let body_path_arg = body_path.display().to_string();
+    let command_args = vec![
+        target_kind.to_string(),
+        "comment".to_string(),
+        number.clone(),
+        "--repo".to_string(),
+        repo_arg.clone(),
+        "--body-file".to_string(),
+        body_path_arg,
+    ];
+    let refs = command_args.iter().map(String::as_str).collect::<Vec<_>>();
+    let stdout = command_output("gh", &refs).await?;
+    Ok(json!({
+        "posted": true,
+        "target_kind": target_kind,
+        "number": args.number,
+        "repo": repo_arg,
+        "body_file": body_path.display().to_string(),
+        "stdout": stdout,
+    }))
+}
+
+fn normalize_github_comment_target(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "pr" | "pull_request" | "pull request" => Some("pr"),
+        "issue" => Some("issue"),
+        _ => None,
+    }
+}
+
+async fn resolve_github_repo(
+    worker: &WorkerSummary,
+    owner: Option<String>,
+    repo: Option<String>,
+) -> Result<(String, String)> {
+    resolve_github_repo_from_optional(Some(worker), owner, repo).await
+}
+
+async fn resolve_github_repo_from_optional(
+    worker: Option<&WorkerSummary>,
+    owner: Option<String>,
+    repo: Option<String>,
+) -> Result<(String, String)> {
+    let owner = owner
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let repo = repo
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (owner, repo) {
+        (Some(owner), Some(repo)) => {
+            return Ok((owner.to_string(), repo.trim_end_matches(".git").to_string()));
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            bail!("GitHub owner and repo overrides must be provided together");
+        }
+        (None, None) => {}
+    }
+
+    let Some(worker) = worker else {
+        bail!("owner and repo are required when no worker repo context is available");
+    };
+    let remote = command_output(
+        "git",
+        &[
+            "-C",
+            worker.working_dir.as_str(),
+            "remote",
+            "get-url",
+            "origin",
+        ],
+    )
+    .await?;
+    parse_github_remote(&remote).ok_or_else(|| {
+        anyhow!(
+            "could not infer GitHub owner/repo from origin remote '{}'",
+            remote
+        )
+    })
+}
+
+fn parse_github_remote(remote: &str) -> Option<(String, String)> {
+    let trimmed = remote.trim().trim_end_matches(".git");
+    let path = if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("ssh://git@github.com/") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("https://github.com/") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("http://github.com/") {
+        rest
+    } else {
+        return None;
+    };
+    let mut parts = path.split('/');
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim();
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((owner.to_string(), repo.to_string()))
 }
 
 fn preview_fs_apply_patch(
@@ -6995,6 +8089,8 @@ fn resolve_command_spec(
             }
         });
 
+    reject_unsafe_github_comment_shell(&command, &args)?;
+
     Ok(ResolvedCommandSpec {
         mode: mode.to_string(),
         title,
@@ -7006,6 +8102,74 @@ fn resolve_command_spec(
         network_policy,
         env,
     })
+}
+
+fn reject_unsafe_github_comment_shell(command: &str, args: &[String]) -> Result<()> {
+    let executable = Path::new(command)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(command);
+    if !matches!(executable, "sh" | "bash" | "zsh") {
+        return Ok(());
+    }
+    let script = args
+        .windows(2)
+        .find_map(|window| {
+            if matches!(window[0].as_str(), "-c" | "-lc") {
+                Some(window[1].as_str())
+            } else {
+                None
+            }
+        })
+        .unwrap_or("");
+    let normalized = normalize_action_item_text(script);
+    let posts_comment = gh_comment_posts_inline_body(&normalized);
+    let interpolation_risk = script.contains('`')
+        || script.contains("$(")
+        || script.contains("${")
+        || script.contains(';')
+        || script.contains('|')
+        || script.contains('&');
+    if posts_comment && interpolation_risk {
+        bail!(
+            "GitHub comment bodies with shell metacharacters must use github.comment or a body file/stdin path, not sh -lc --body"
+        );
+    }
+    Ok(())
+}
+
+fn gh_comment_posts_inline_body(normalized_script: &str) -> bool {
+    let tokens = normalized_script.split_whitespace().collect::<Vec<_>>();
+    tokens.iter().enumerate().any(|(index, token)| {
+        *token == "gh"
+            && gh_comment_subcommand_index(&tokens[index + 1..]).is_some_and(|command_index| {
+                tokens[index + 1 + command_index..].iter().any(|token| {
+                    *token == "--body" || token.starts_with("--body=") || *token == "-b"
+                })
+            })
+    })
+}
+
+fn gh_comment_subcommand_index(tokens: &[&str]) -> Option<usize> {
+    let mut index = 0;
+    while index < tokens.len() {
+        match tokens[index] {
+            "pr" | "issue" if tokens.get(index + 1).copied() == Some("comment") => {
+                return Some(index);
+            }
+            "--repo" | "-R" | "--hostname" => {
+                index += 2;
+            }
+            token if token.starts_with("--repo=") || token.starts_with("--hostname=") => {
+                index += 1;
+            }
+            token if token.starts_with('-') => {
+                index += 1;
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn validate_command_value(worker: &WorkerSummary, command: &str) -> Result<String> {
@@ -7200,7 +8364,7 @@ async fn execute_tests_run_tool(
         args.env,
         true,
     )?;
-    run_bounded_command_tool(
+    let mut result = run_bounded_command_tool(
         state,
         job_id,
         worker,
@@ -7209,7 +8373,64 @@ async fn execute_tests_run_tool(
         cancel_rx,
         spec,
     )
-    .await
+    .await?;
+    if let Some(interpretation) = interpret_test_command_result(&result) {
+        result["validation_interpretation"] = interpretation;
+    }
+    Ok(result)
+}
+
+fn interpret_test_command_result(result: &Value) -> Option<Value> {
+    let combined = normalize_action_item_text(&format!(
+        "{}\n{}",
+        result
+            .get("stdout_tail")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        result
+            .get("stderr_tail")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    ));
+    if combined.is_empty() {
+        return None;
+    }
+    if test_output_says_zero_matched(&combined) {
+        return Some(json!({
+            "status": "no_tests_matched",
+            "summary": "The command completed, but the output says zero tests matched or ran. Do not treat this as passing validation."
+        }));
+    }
+    None
+}
+
+fn test_output_says_zero_matched(text: &str) -> bool {
+    if test_output_has_nonzero_activity(text) {
+        return false;
+    }
+    [
+        "running 0 tests",
+        "no tests ran",
+        "no tests collected",
+        "collected 0 items",
+        "0 matching tests",
+        "no test files found",
+        "test result: ok. 0 passed",
+        "ran 0 tests",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn test_output_has_nonzero_activity(text: &str) -> bool {
+    let tokens = text
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    tokens.windows(2).any(|window| {
+        window[0].parse::<u64>().is_ok_and(|count| count > 0)
+            && matches!(window[1], "test" | "tests" | "passed" | "failed")
+    })
 }
 
 async fn execute_mcp_tool_call(
@@ -9689,8 +10910,15 @@ fn resolve_scoped_path(
 }
 
 async fn command_output(command: &str, args: &[&str]) -> Result<String> {
+    command_output_in_dir(command, args, None).await
+}
+
+async fn command_output_in_dir(command: &str, args: &[&str], cwd: Option<&Path>) -> Result<String> {
     let mut child = Command::new(command);
     child.args(args);
+    if let Some(cwd) = cwd {
+        child.current_dir(cwd);
+    }
     if let Some(path) = command_path_env() {
         child.env("PATH", path);
     }
@@ -9837,7 +11065,12 @@ fn requires_approval_for_tool(tool: &str) -> bool {
 fn is_mutating_tool(tool: &str) -> bool {
     matches!(
         tool,
-        "fs.apply_patch" | "fs.write_text" | "fs.move" | "fs.mkdir" | "git.stage_patch"
+        "fs.apply_patch"
+            | "fs.write_text"
+            | "fs.move"
+            | "fs.mkdir"
+            | "git.stage_patch"
+            | "github.comment"
     )
 }
 
@@ -10835,6 +12068,30 @@ fn read_only_capabilities() -> Vec<ToolCapabilityGrantRecord> {
             concurrency_group: "git-read".to_string(),
             scope_kind: "repo".to_string(),
         },
+        ToolCapabilityGrantRecord {
+            tool_id: "github.pr_review_threads".to_string(),
+            summary: "Fetch thread-aware GitHub pull request review data, including inline review threads, unresolved and outdated state, paths, lines, and comment bodies.".to_string(),
+            approval_mode: "auto".to_string(),
+            risk_level: "low".to_string(),
+            side_effect_level: "network".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: 65_536,
+            supports_streaming: false,
+            concurrency_group: "github-read".to_string(),
+            scope_kind: "repo".to_string(),
+        },
+        ToolCapabilityGrantRecord {
+            tool_id: "github.pr_state".to_string(),
+            summary: "Fetch direct GitHub pull request lifecycle state, including state, mergedAt, mergeability, head branch, base branch, and URL.".to_string(),
+            approval_mode: "auto".to_string(),
+            risk_level: "low".to_string(),
+            side_effect_level: "network".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: 16_384,
+            supports_streaming: false,
+            concurrency_group: "github-read".to_string(),
+            scope_kind: "repo".to_string(),
+        },
     ]
 }
 
@@ -10898,6 +12155,18 @@ fn mutating_capabilities() -> Vec<ToolCapabilityGrantRecord> {
             max_output_bytes: 16_384,
             supports_streaming: false,
             concurrency_group: "git-write".to_string(),
+            scope_kind: "repo".to_string(),
+        },
+        ToolCapabilityGrantRecord {
+            tool_id: "github.comment".to_string(),
+            summary: "Post a GitHub issue or PR comment using argv and a temporary body file so shell metacharacters in the body are not interpreted.".to_string(),
+            approval_mode: "explicit".to_string(),
+            risk_level: "medium".to_string(),
+            side_effect_level: "external".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: 16_384,
+            supports_streaming: false,
+            concurrency_group: "github-write".to_string(),
             scope_kind: "repo".to_string(),
         },
     ]
@@ -11165,6 +12434,8 @@ Working directory: {}\n",
     let action_shapes = if is_root_worker {
         "{\"kind\":\"tool_call\",\"summary\":\"inspect the active project\",\"tool\":\"project.inspect\",\"args\":{}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"list likely project directories\",\"tool\":\"fs.list\",\"args\":{\"path\":\".\",\"recursive\":false,\"limit\":100}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"fetch inline PR review threads\",\"tool\":\"github.pr_review_threads\",\"args\":{\"pr_number\":123}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"fetch direct PR lifecycle state\",\"tool\":\"github.pr_state\",\"args\":{\"pr_number\":123}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"check running dev processes\",\"tool\":\"command.run\",\"args\":{\"command\":\"sh\",\"args\":[\"-lc\",\"ps -ef | grep -iE 'stfr|vite|next|webpack|dev server' | grep -v grep\"],\"cwd\":\".\",\"timeout_secs\":20}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"verify the UI in Browser\",\"tool\":\"browser.navigate\",\"args\":{\"url\":\"http://127.0.0.1:5299\"}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"read Browser refs\",\"tool\":\"browser.snapshot\",\"args\":{}}\n\
@@ -11175,6 +12446,8 @@ Working directory: {}\n",
     } else {
         "{\"kind\":\"tool_call\",\"summary\":\"inspect the active project\",\"tool\":\"project.inspect\",\"args\":{}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"list likely project directories\",\"tool\":\"fs.list\",\"args\":{\"path\":\".\",\"recursive\":false,\"limit\":100}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"fetch inline PR review threads\",\"tool\":\"github.pr_review_threads\",\"args\":{\"pr_number\":123}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"fetch direct PR lifecycle state\",\"tool\":\"github.pr_state\",\"args\":{\"pr_number\":123}}\n\
 {\"kind\":\"progress_update\",\"summary\":\"durable checkpoint, not done\",\"detail\":\"completed evidence and exact continuation point\"}\n\
 {\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\"}"
     };
@@ -11217,6 +12490,11 @@ Rules:\n\
 - progress_update records a non-terminal checkpoint for Nucleus; it does not complete the job.\n\
 - Do not put plans, next-step instructions, progress updates, partial completion notes, or descriptions of future actions in final_answer.\n\
 - If the requested work is incomplete and you are not blocked or out of budget, continue with a tool_call instead of returning final_answer.\n\
+- For PR feedback, latest review, requested changes, Codex review, or unresolved comment tasks, do not rely on flat gh pr view comments alone. Fetch thread-aware inline review data with github.pr_review_threads before saying there is no actionable feedback.\n\
+- For PR lifecycle claims like merged, open, closed, ready, mergeable, or approved, fetch direct GitHub PR state with github.pr_state. Local git state can supplement, but it is never enough to say a PR is already merged or that nothing is left to merge. Only say that when direct PR state is MERGED or mergedAt is non-empty. If PR identity is unclear, resolve it from the session branch or ask a bounded follow-up.\n\
+- If a user challenges or repeats a prior clean/no-action answer, treat it as a grounding failure signal and use a deeper or different evidence path before repeating the conclusion.\n\
+- Treat zero matched tests as no tests matched, not validation success.\n\
+- When posting GitHub comments, use github.comment or a body file/stdin path. Do not put comment bodies with backticks or shell metacharacters inside sh -lc strings.\n\
 - Use final_answer only as the terminal completion action when the requested task is complete and validated, or when you are genuinely blocked.\n\
 - Do not use provider-native tool wrappers such as tool_call/tool_name/shell; use the exact Nucleus JSON shapes above.\n\
 - Do not wrap JSON in markdown fences.\n\
@@ -11595,6 +12873,15 @@ mod tests {
         );
         assert_eq!(policy_for_tool("command.session.write").decision, "allow");
         assert_eq!(policy_for_tool("fs.read_text").decision, "allow");
+        assert_eq!(
+            policy_for_tool("github.comment").decision,
+            "require_approval"
+        );
+        assert_eq!(
+            policy_for_tool("github.pr_review_threads").decision,
+            "allow"
+        );
+        assert_eq!(policy_for_tool("github.pr_state").decision, "allow");
     }
 
     #[test]
@@ -11709,6 +12996,16 @@ mod tests {
                 .any(|grant| grant.tool_id == "fs.read_text")
         );
         assert!(
+            read_only
+                .iter()
+                .any(|grant| grant.tool_id == "github.pr_review_threads")
+        );
+        assert!(
+            read_only
+                .iter()
+                .any(|grant| grant.tool_id == "github.pr_state")
+        );
+        assert!(
             !read_only
                 .iter()
                 .any(|grant| grant.tool_id == "fs.write_text")
@@ -11720,6 +13017,11 @@ mod tests {
             repo_mutation
                 .iter()
                 .any(|grant| grant.tool_id == "fs.write_text")
+        );
+        assert!(
+            repo_mutation
+                .iter()
+                .any(|grant| grant.tool_id == "github.comment")
         );
         assert!(
             !repo_mutation
@@ -12120,6 +13422,1013 @@ mod tests {
             0,
             0,
         ));
+    }
+
+    #[test]
+    fn pr_review_feedback_does_not_accept_clean_answer_without_inline_thread_evidence() {
+        let worker = test_worker_summary("pr-feedback-evidence", 100, 100);
+        let detail = test_job_detail_with_prompt(
+            "Review latest PR feedback on PR #217, including Codex review comments and unresolved requested changes.",
+        );
+        let checkpoint = test_checkpoint_with_prompt(
+            "Review latest PR feedback on PR #217, including Codex review comments.",
+        );
+
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "No actionable feedback",
+            "There is no actionable feedback and the PR looks clean.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            1,
+        ));
+    }
+
+    #[test]
+    fn pr_review_feedback_compact_pr_ref_requires_thread_aware_evidence() {
+        let worker = test_worker_summary("compact-pr-feedback-evidence", 100, 100);
+        let detail = test_job_detail_with_prompt(
+            "Review PR#217 latest feedback, including unresolved requested changes.",
+        );
+        let checkpoint = test_checkpoint_with_prompt("Review PR#217 latest feedback.");
+
+        assert!(requires_pr_review_thread_evidence(
+            "review pr#217 latest feedback"
+        ));
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "No actionable feedback",
+            "There is no actionable feedback.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            1,
+        ));
+    }
+
+    #[test]
+    fn pr_review_feedback_plural_pr_refs_require_thread_aware_evidence() {
+        let worker = test_worker_summary("plural-pr-feedback-evidence", 100, 100);
+        let detail = test_job_detail_with_prompt(
+            "Check PRs #217 and #219 review feedback and unresolved comments.",
+        );
+        let checkpoint = test_checkpoint_with_prompt("Check PRs #217 and #219 review feedback.");
+
+        assert!(requires_pr_review_thread_evidence(
+            "check prs #217 and #219 review feedback"
+        ));
+        assert!(!requires_pr_review_thread_evidence(
+            "review issue #218 latest feedback"
+        ));
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "No actionable feedback",
+            "There is no actionable feedback.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            1,
+        ));
+    }
+
+    #[test]
+    fn pr_review_feedback_accepts_clean_answer_after_thread_aware_evidence() {
+        let worker = test_worker_summary("pr-feedback-thread-aware", 100, 100);
+        let mut detail = test_job_detail_with_prompt(
+            "Check latest PR feedback on PR #217 and unresolved Codex review comments.",
+        );
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_review_threads",
+            json!({
+                "evidence_kind": "github_pr_review_threads",
+                "pr_number": 217,
+                "review_threads": [
+                    {
+                        "isResolved": true,
+                        "isOutdated": false,
+                        "path": "crates/daemon/src/agent.rs",
+                        "line": 42,
+                        "comments": {"nodes": []}
+                    }
+                ],
+                "review_threads_complete": true,
+                "thread_comments_truncated": false
+            }),
+        ));
+        let checkpoint = test_checkpoint_with_prompt("Check latest PR feedback.");
+
+        assert!(has_thread_aware_pr_review_evidence(
+            &detail,
+            &evidence_task_text(&detail, &checkpoint),
+            "No actionable feedback",
+            "There is no actionable feedback.",
+        ));
+        assert!(!should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "No actionable feedback",
+            "There is no actionable feedback.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+    }
+
+    #[test]
+    fn pr_review_feedback_evidence_must_match_referenced_pr() {
+        let worker = test_worker_summary("wrong-pr-feedback-evidence", 100, 100);
+        let mut detail = test_job_detail_with_prompt(
+            "Check latest PR feedback on PR #217 and unresolved Codex review comments.",
+        );
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_review_threads",
+            json!({
+                "evidence_kind": "github_pr_review_threads",
+                "pr_number": 219,
+                "review_threads": [],
+                "review_threads_complete": true,
+                "thread_comments_truncated": false
+            }),
+        ));
+        let checkpoint = test_checkpoint_with_prompt("Check latest PR feedback on PR #217.");
+
+        assert!(!has_thread_aware_pr_review_evidence(
+            &detail,
+            &evidence_task_text(&detail, &checkpoint),
+            "No actionable feedback",
+            "There is no actionable feedback.",
+        ));
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "No actionable feedback",
+            "There is no actionable feedback.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+
+        detail.tool_calls.clear();
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_review_threads",
+            json!({
+                "evidence_kind": "github_pr_review_threads",
+                "pr_number": 217,
+                "review_threads": [],
+                "review_threads_complete": true,
+                "thread_comments_truncated": false
+            }),
+        ));
+        assert!(!should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "No actionable feedback",
+            "There is no actionable feedback.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+    }
+
+    #[test]
+    fn pr_review_threads_result_reports_incomplete_when_comments_truncated() {
+        let pull = json!({
+            "url": "https://github.com/WebLime-agency/nucleus/pull/219",
+            "title": "fix: improve evidence grounding",
+            "state": "OPEN",
+            "comments": {"nodes": []},
+            "reviews": {"nodes": []},
+            "commits": {
+                "nodes": [
+                    {
+                        "commit": {
+                            "statusCheckRollup": {
+                                "state": "SUCCESS"
+                            }
+                        }
+                    }
+                ]
+            }
+        });
+        let truncated = github_pr_review_threads_result(
+            "WebLime-agency",
+            "nucleus",
+            219,
+            &pull,
+            vec![json!({"id": "thread-1"})],
+            true,
+        );
+        assert_eq!(
+            truncated
+                .get("thread_comments_truncated")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            truncated
+                .get("review_threads_complete")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let complete = github_pr_review_threads_result(
+            "WebLime-agency",
+            "nucleus",
+            219,
+            &pull,
+            vec![json!({"id": "thread-1"})],
+            false,
+        );
+        assert_eq!(
+            complete
+                .get("review_threads_complete")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn pr_review_feedback_retries_when_thread_completeness_is_unknown() {
+        let worker = test_worker_summary("pr-feedback-unknown-thread-completeness", 100, 100);
+        let mut detail = test_job_detail_with_prompt(
+            "Check latest PR feedback on PR #217 and unresolved Codex review comments.",
+        );
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_review_threads",
+            json!({
+                "evidence_kind": "github_pr_review_threads",
+                "review_threads": [
+                    {
+                        "isResolved": true,
+                        "isOutdated": false,
+                        "path": "crates/daemon/src/agent.rs",
+                        "line": 42,
+                        "comments": {"nodes": []}
+                    }
+                ]
+            }),
+        ));
+        let checkpoint = test_checkpoint_with_prompt("Check latest PR feedback.");
+
+        assert!(!has_thread_aware_pr_review_evidence(
+            &detail,
+            &evidence_task_text(&detail, &checkpoint),
+            "No actionable feedback",
+            "There is no actionable feedback.",
+        ));
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "No actionable feedback",
+            "There is no actionable feedback.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+    }
+
+    #[test]
+    fn pr_review_feedback_retries_when_thread_evidence_is_incomplete() {
+        let worker = test_worker_summary("pr-feedback-incomplete-thread-evidence", 100, 100);
+        let mut detail = test_job_detail_with_prompt(
+            "Check latest PR feedback on PR #217 and unresolved Codex review comments.",
+        );
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_review_threads",
+            json!({
+                "evidence_kind": "github_pr_review_threads",
+                "review_threads": [
+                    {
+                        "isResolved": false,
+                        "isOutdated": false,
+                        "path": "crates/daemon/src/agent.rs",
+                        "line": 42,
+                        "comments": {"nodes": []}
+                    }
+                ],
+                "review_threads_complete": false,
+                "thread_comments_truncated": true
+            }),
+        ));
+        let checkpoint = test_checkpoint_with_prompt("Check latest PR feedback.");
+
+        assert!(!has_thread_aware_pr_review_evidence(
+            &detail,
+            &evidence_task_text(&detail, &checkpoint),
+            "No actionable feedback",
+            "There is no actionable feedback.",
+        ));
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "No actionable feedback",
+            "There is no actionable feedback.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+    }
+
+    #[test]
+    fn repeated_user_challenge_blocks_repeated_unsupported_clean_answer() {
+        let worker = test_worker_summary("repeated-grounding-challenge", 100, 100);
+        let detail = test_job_detail_with_prompt(
+            "Are you sure? I can see a screenshot showing Codex review comments on PR #217. Check again.",
+        );
+        let checkpoint = test_checkpoint_with_prompt(
+            "Are you sure? I can see a screenshot showing Codex review comments on PR #217. Check again.",
+        );
+
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Still clean",
+            "There is nothing actionable.",
+            "act",
+            &checkpoint,
+            &worker,
+            4,
+            2,
+        ));
+    }
+
+    #[test]
+    fn non_pr_challenge_does_not_require_pr_review_threads() {
+        let worker = test_worker_summary("non-pr-grounding-challenge", 100, 100);
+        let detail =
+            test_job_detail_with_prompt("Are you sure? Check again whether this note is concise.");
+        let checkpoint =
+            test_checkpoint_with_prompt("Are you sure? Check again whether this note is concise.");
+
+        assert!(!should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Still clean",
+            "There is nothing actionable.",
+            "act",
+            &checkpoint,
+            &worker,
+            4,
+            2,
+        ));
+    }
+
+    #[test]
+    fn codex_review_without_pr_signal_does_not_require_pr_threads() {
+        let worker = test_worker_summary("non-pr-codex-review", 100, 100);
+        let detail = test_job_detail_with_prompt(
+            "Review this local commit and tag @codex review when done.",
+        );
+        let checkpoint = test_checkpoint_with_prompt(
+            "Review this local commit and tag @codex review when done.",
+        );
+
+        assert!(!requires_pr_review_thread_evidence(
+            "review this local commit and tag @codex review when done"
+        ));
+        assert!(!should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "No actionable feedback",
+            "There is no actionable feedback.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            1,
+        ));
+    }
+
+    #[test]
+    fn compact_pr_review_requests_require_thread_evidence() {
+        assert!(requires_pr_review_thread_evidence(
+            "review PR#217 latest feedback"
+        ));
+        assert!(requires_pr_review_thread_evidence(
+            "check PRs #217 and #219 for unresolved comments"
+        ));
+        assert!(requires_pr_review_thread_evidence(
+            "review pull requests #217 and #219 requested changes"
+        ));
+    }
+
+    #[test]
+    fn pr_merged_claim_requires_direct_matching_pr_state() {
+        let worker = test_worker_summary("pr-lifecycle-evidence", 100, 100);
+        let mut detail =
+            test_job_detail_with_prompt("looks like we got the clear to merge PR #217 to dev");
+        detail.job.title = "Merge PR".to_string();
+        let checkpoint =
+            test_checkpoint_with_prompt("looks like we got the clear to merge PR #217 to dev");
+
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Already merged",
+            "PR #217 is already merged into dev; nothing is left to merge.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            1,
+        ));
+
+        let mut wrong_pr_detail = detail.clone();
+        wrong_pr_detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_state",
+            json!({
+                "evidence_kind": "github_pr_state",
+                "pr_number": 219,
+                "state": "MERGED",
+                "merged_at": "2026-05-20T16:00:00Z",
+                "head_ref_name": "issue-218-grounding-evidence",
+                "base_ref_name": "dev"
+            }),
+        ));
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &wrong_pr_detail,
+            "Already merged",
+            "PR #217 is already merged into dev; nothing is left to merge.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+
+        let mut open_detail = detail.clone();
+        open_detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_state",
+            json!({
+                "evidence_kind": "github_pr_state",
+                "pr_number": 217,
+                "state": "OPEN",
+                "merged_at": null,
+                "head_ref_name": "work/nucleus/f8eec90e",
+                "base_ref_name": "dev"
+            }),
+        ));
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &open_detail,
+            "Already merged",
+            "PR #217 is already merged into dev; nothing is left to merge.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+
+        let mut merged_detail = detail.clone();
+        merged_detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_state",
+            json!({
+                "evidence_kind": "github_pr_state",
+                "pr_number": 217,
+                "state": "MERGED",
+                "merged_at": "2026-05-20T16:00:00Z",
+                "head_ref_name": "work/nucleus/f8eec90e",
+                "base_ref_name": "dev"
+            }),
+        ));
+        assert!(has_direct_pr_merged_evidence_for_claim(
+            &merged_detail,
+            &evidence_task_text(&merged_detail, &checkpoint),
+            "Already merged",
+            "PR #217 is already merged into dev; nothing is left to merge.",
+        ));
+        assert!(!should_retry_unsupported_confident_negative_final_answer(
+            &merged_detail,
+            "Already merged",
+            "PR #217 is already merged into dev; nothing is left to merge.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+    }
+
+    #[test]
+    fn pr_lifecycle_claim_matches_compact_pr_reference() {
+        let worker = test_worker_summary("compact-pr-lifecycle-evidence", 100, 100);
+        let mut detail = test_job_detail_with_prompt("looks like PR#217 is already merged");
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_state",
+            json!({
+                "evidence_kind": "github_pr_state",
+                "pr_number": 219,
+                "state": "MERGED",
+                "merged_at": "2026-05-20T16:00:00Z"
+            }),
+        ));
+        let checkpoint = test_checkpoint_with_prompt("looks like PR#217 is already merged");
+
+        assert_eq!(
+            extract_pr_numbers("PR#217").into_iter().collect::<Vec<_>>(),
+            vec![217]
+        );
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Already merged",
+            "PR#217 is already merged into dev; nothing is left to merge.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+    }
+
+    #[test]
+    fn pr_lifecycle_claim_ignores_unqualified_issue_references() {
+        let worker = test_worker_summary("issue-reference-lifecycle-evidence", 100, 100);
+        let mut detail = test_job_detail_with_prompt(
+            "Check whether PR #217 is ready to merge. This also closes #218.",
+        );
+        detail.job.title = "PR lifecycle".to_string();
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_state",
+            json!({
+                "evidence_kind": "github_pr_state",
+                "pr_number": 217,
+                "state": "OPEN",
+                "merged_at": null,
+                "merge_state_status": "CLEAN"
+            }),
+        ));
+        let checkpoint = test_checkpoint_with_prompt(
+            "Check whether PR #217 is ready to merge. This also closes #218.",
+        );
+
+        assert_eq!(
+            extract_pr_numbers("Check PR #217 and close #218")
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![217]
+        );
+        assert_eq!(
+            extract_pr_numbers("Check PR #217 and #219, closes #218")
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![217, 219]
+        );
+        assert_eq!(
+            extract_pr_numbers("Check PRs #217 and #219, closes #218")
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![217, 219]
+        );
+        assert_eq!(
+            extract_pr_numbers("Check pull requests #217 and #219, closes #218")
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![217, 219]
+        );
+        assert!(!should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Ready to merge",
+            "PR #217 is ready to merge and closes #218.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+    }
+
+    #[test]
+    fn pr_lifecycle_claim_requires_state_for_every_referenced_pr() {
+        let worker = test_worker_summary("multi-pr-lifecycle-evidence", 100, 100);
+        let mut detail = test_job_detail_with_prompt("Check whether PR #217 and #219 are ready.");
+        detail.job.title = "PR lifecycle".to_string();
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_state",
+            json!({
+                "evidence_kind": "github_pr_state",
+                "pr_number": 217,
+                "state": "OPEN",
+                "merged_at": null,
+                "merge_state_status": "CLEAN"
+            }),
+        ));
+        let checkpoint = test_checkpoint_with_prompt("Check whether PR #217 and #219 are ready.");
+
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Ready to merge",
+            "PR #217 and #219 are ready to merge.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_state",
+            json!({
+                "evidence_kind": "github_pr_state",
+                "pr_number": 219,
+                "state": "OPEN",
+                "merged_at": null,
+                "merge_state_status": "CLEAN"
+            }),
+        ));
+        assert!(!should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Ready to merge",
+            "PR #217 and #219 are ready to merge.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            3,
+        ));
+    }
+
+    #[test]
+    fn pr_merged_claim_requires_merged_state_for_every_referenced_pr() {
+        let worker = test_worker_summary("multi-pr-merged-evidence", 100, 100);
+        let mut detail =
+            test_job_detail_with_prompt("Check whether PR #217 and PR #219 are already merged.");
+        detail.job.title = "PR lifecycle".to_string();
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_state",
+            json!({
+                "evidence_kind": "github_pr_state",
+                "pr_number": 217,
+                "state": "MERGED",
+                "merged_at": "2026-05-20T16:00:00Z"
+            }),
+        ));
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_state",
+            json!({
+                "evidence_kind": "github_pr_state",
+                "pr_number": 219,
+                "state": "OPEN",
+                "merged_at": null
+            }),
+        ));
+        let checkpoint =
+            test_checkpoint_with_prompt("Check whether PR #217 and PR #219 are already merged.");
+
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Already merged",
+            "PR #217 and PR #219 are already merged; nothing is left to merge.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            3,
+        ));
+
+        detail.tool_calls.pop();
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_state",
+            json!({
+                "evidence_kind": "github_pr_state",
+                "pr_number": 219,
+                "state": "MERGED",
+                "merged_at": "2026-05-20T16:05:00Z"
+            }),
+        ));
+        assert!(!should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Already merged",
+            "PR #217 and PR #219 are already merged; nothing is left to merge.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            3,
+        ));
+    }
+
+    #[test]
+    fn pr_ready_claim_requires_direct_pr_state() {
+        let worker = test_worker_summary("pr-ready-evidence", 100, 100);
+        let mut detail = test_job_detail_with_prompt("Check whether PR #217 is ready to merge.");
+        detail.job.title = "Merge readiness".to_string();
+        let checkpoint = test_checkpoint_with_prompt("Check whether PR #217 is ready to merge.");
+
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Ready to merge",
+            "PR #217 is ready to merge.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            1,
+        ));
+
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_state",
+            json!({
+                "evidence_kind": "github_pr_state",
+                "pr_number": 217,
+                "state": "OPEN",
+                "merged_at": null,
+                "merge_state_status": "CLEAN",
+                "head_ref_name": "work/nucleus/f8eec90e",
+                "base_ref_name": "dev"
+            }),
+        ));
+        assert!(!should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Ready to merge",
+            "PR #217 is ready to merge.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+    }
+
+    #[test]
+    fn zero_test_output_is_not_treated_as_passing_validation() {
+        let zero_result = json!({
+            "stdout_tail": "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored",
+            "stderr_tail": "",
+            "exit_code": 0,
+        });
+        let interpretation =
+            interpret_test_command_result(&zero_result).expect("zero tests should be detected");
+        assert_eq!(interpretation["status"], "no_tests_matched");
+
+        let passing_result = json!({
+            "stdout_tail": "running 1 test\n\ntest result: ok. 1 passed; 0 failed; 0 ignored",
+            "stderr_tail": "",
+            "exit_code": 0,
+        });
+        assert!(interpret_test_command_result(&passing_result).is_none());
+
+        let mixed_cargo_result = json!({
+            "stdout_tail": "running 1 test\n\ntest result: ok. 1 passed; 0 failed; 0 ignored\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored",
+            "stderr_tail": "",
+            "exit_code": 0,
+        });
+        assert!(interpret_test_command_result(&mixed_cargo_result).is_none());
+    }
+
+    #[test]
+    fn test_success_claim_requires_test_or_check_evidence() {
+        let worker = test_worker_summary("test-evidence", 100, 100);
+        let detail = test_job_detail_with_prompt("Check failed tests and validation for this PR.");
+        let checkpoint = test_checkpoint_with_prompt("Check failed tests and validation.");
+
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "No failed tests",
+            "No failed tests; validation passed.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            1,
+        ));
+    }
+
+    #[test]
+    fn failing_test_run_does_not_support_validation_passed_claim() {
+        let worker = test_worker_summary("failed-test-evidence", 100, 100);
+        let mut detail = test_job_detail_with_prompt("Run tests and validate the fix.");
+        detail.tool_calls.push(test_tool_call_summary(
+            "tests.run",
+            json!({
+                "stdout_tail": "test result: FAILED. 0 passed; 1 failed",
+                "stderr_tail": "",
+                "exit_code": 1
+            }),
+        ));
+        let checkpoint = test_checkpoint_with_prompt("Run tests and validate the fix.");
+
+        assert!(!has_test_validation_evidence(
+            &detail,
+            &evidence_task_text(&detail, &checkpoint),
+            "Validation passed",
+            "Tests passed.",
+        ));
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Validation passed",
+            "Tests passed.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+    }
+
+    #[test]
+    fn status_check_evidence_must_match_referenced_pr() {
+        let worker = test_worker_summary("wrong-pr-status-evidence", 100, 100);
+        let mut detail =
+            test_job_detail_with_prompt("Check whether tests passed for PR #217 before merge.");
+        detail.tool_calls.push(test_tool_call_summary(
+            "tests.run",
+            json!({
+                "stdout_tail": "running 1 test\n\ntest result: ok. 1 passed; 0 failed",
+                "exit_code": 0
+            }),
+        ));
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_review_threads",
+            json!({
+                "evidence_kind": "github_pr_review_threads",
+                "pr_number": 219,
+                "status_check_rollup": {
+                    "state": "SUCCESS"
+                }
+            }),
+        ));
+        let checkpoint =
+            test_checkpoint_with_prompt("Check whether tests passed for PR #217 before merge.");
+
+        assert!(!has_test_validation_evidence(
+            &detail,
+            &evidence_task_text(&detail, &checkpoint),
+            "Checks passed",
+            "PR #217 checks passed.",
+        ));
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Checks passed",
+            "PR #217 checks passed.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+
+        detail.tool_calls.clear();
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_review_threads",
+            json!({
+                "evidence_kind": "github_pr_review_threads",
+                "pr_number": 217,
+                "status_check_rollup": {
+                    "state": "SUCCESS"
+                }
+            }),
+        ));
+        assert!(has_test_validation_evidence(
+            &detail,
+            &evidence_task_text(&detail, &checkpoint),
+            "Checks passed",
+            "PR #217 checks passed.",
+        ));
+    }
+
+    #[test]
+    fn zero_matched_test_evidence_blocks_passing_validation_claim() {
+        let worker = test_worker_summary("zero-test-evidence", 100, 100);
+        let mut detail = test_job_detail_with_prompt("Run tests and validate the fix.");
+        detail.tool_calls.push(test_tool_call_summary(
+            "tests.run",
+            json!({
+                "stdout_tail": "running 0 tests",
+                "validation_interpretation": {
+                    "status": "no_tests_matched"
+                }
+            }),
+        ));
+        let checkpoint = test_checkpoint_with_prompt("Run tests and validate the fix.");
+
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Validation passed",
+            "Tests passed.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+    }
+
+    #[test]
+    fn later_successful_test_run_supersedes_zero_matched_evidence() {
+        let worker = test_worker_summary("zero-test-later-success", 100, 100);
+        let mut detail = test_job_detail_with_prompt("Run tests and validate the fix.");
+        detail.tool_calls.push(test_tool_call_summary(
+            "tests.run",
+            json!({
+                "stdout_tail": "running 0 tests",
+                "exit_code": 0,
+                "validation_interpretation": {
+                    "status": "no_tests_matched"
+                }
+            }),
+        ));
+        detail.tool_calls.push(test_tool_call_summary(
+            "tests.run",
+            json!({
+                "stdout_tail": "running 1 test\n\ntest result: ok. 1 passed; 0 failed",
+                "exit_code": 0
+            }),
+        ));
+        let checkpoint = test_checkpoint_with_prompt("Run tests and validate the fix.");
+
+        assert!(!should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Validation passed",
+            "Tests passed.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            3,
+        ));
+    }
+
+    #[test]
+    fn github_comment_shell_body_with_backticks_is_rejected() {
+        let result = reject_unsafe_github_comment_shell(
+            "sh",
+            &[
+                "-lc".to_string(),
+                "gh pr comment 218 --body \"Fixed `danger`\"".to_string(),
+            ],
+        );
+        assert!(result.is_err());
+
+        let short_body_result = reject_unsafe_github_comment_shell(
+            "sh",
+            &[
+                "-lc".to_string(),
+                "gh pr comment 218 -b \"Fixed `danger`\"".to_string(),
+            ],
+        );
+        assert!(short_body_result.is_err());
+
+        let global_repo_result = reject_unsafe_github_comment_shell(
+            "sh",
+            &[
+                "-lc".to_string(),
+                "gh --repo WebLime-agency/nucleus pr comment 218 --body \"Fixed `danger`\""
+                    .to_string(),
+            ],
+        );
+        assert!(global_repo_result.is_err());
+
+        let preview = preview_github_comment(GithubCommentArgs {
+            owner: Some("WebLime-agency".to_string()),
+            repo: Some("nucleus".to_string()),
+            target_kind: "pr".to_string(),
+            number: 218,
+            body: "Fixed `danger` without shell interpolation.".to_string(),
+        });
+        assert!(preview.detail.contains("body file"));
+        assert!(preview.diff_preview.contains("`danger`"));
+    }
+
+    #[test]
+    fn github_comment_shell_body_file_with_metacharacters_is_allowed() {
+        let result = reject_unsafe_github_comment_shell(
+            "sh",
+            &[
+                "-lc".to_string(),
+                "printf '%s' 'Fixed `danger`' > /tmp/body.md; gh pr comment 218 --body-file /tmp/body.md".to_string(),
+            ],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn github_repo_overrides_require_owner_and_repo_together() {
+        assert_eq!(
+            resolve_github_repo_from_optional(
+                None,
+                Some("WebLime-agency".to_string()),
+                Some("nucleus.git".to_string()),
+            )
+            .await
+            .expect("complete override should resolve"),
+            ("WebLime-agency".to_string(), "nucleus".to_string())
+        );
+
+        assert!(
+            resolve_github_repo_from_optional(None, Some("WebLime-agency".to_string()), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            resolve_github_repo_from_optional(None, None, Some("nucleus".to_string()))
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -16352,6 +18661,59 @@ for line in sys.stdin:
             artifact_count: 0,
             created_at: 0,
             updated_at: 0,
+        }
+    }
+
+    fn test_job_detail_with_prompt(prompt: &str) -> JobDetail {
+        let mut job = test_publication_job_summary("evidence-job");
+        job.title = "PR feedback".to_string();
+        job.purpose = "Session prompt".to_string();
+        job.prompt_excerpt = prompt.to_string();
+        JobDetail {
+            job,
+            workers: Vec::new(),
+            child_jobs: Vec::new(),
+            tool_calls: Vec::new(),
+            approvals: Vec::new(),
+            artifacts: Vec::new(),
+            command_sessions: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+
+    fn test_checkpoint_with_prompt(prompt: &str) -> WorkerCheckpoint {
+        WorkerCheckpoint {
+            session_id: "session-evidence".to_string(),
+            prompt_text: prompt.to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        }
+    }
+
+    fn test_tool_call_summary(
+        tool_id: &str,
+        result_json: Value,
+    ) -> nucleus_protocol::ToolCallSummary {
+        nucleus_protocol::ToolCallSummary {
+            id: format!("{tool_id}-call"),
+            job_id: "evidence-job".to_string(),
+            worker_id: "worker-evidence".to_string(),
+            tool_id: tool_id.to_string(),
+            status: "completed".to_string(),
+            summary: String::new(),
+            args_json: json!({}),
+            result_json: Some(result_json),
+            policy_decision: None,
+            artifact_ids: Vec::new(),
+            error_class: String::new(),
+            error_detail: String::new(),
+            created_at: 0,
+            started_at: Some(0),
+            completed_at: Some(1),
         }
     }
 
