@@ -997,6 +997,7 @@
         route_title: session.route_title,
         attempt: 0,
         attempt_count: 0,
+        memory_outcomes: [],
         created_at: now
       }
     ];
@@ -2901,18 +2902,18 @@
             </div>
           {/if}
 
-          <div bind:this={transcriptElement} class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4 pb-40 sm:px-6 sm:py-6 sm:pb-44">
+          <div bind:this={transcriptElement} class="min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain px-4 py-4 pb-40 sm:px-6 sm:py-6 sm:pb-44">
             {#if detail?.turns.length}
-              <div class="space-y-6">
+              <div class="min-w-0 w-full max-w-full space-y-6">
                 {#each detail.turns as turn (turn.id)}
-                  <div class={cn('flex', turnRowClass(turn))}>
-                    <div class={cn('flex max-w-3xl flex-col gap-2', turnStackClass(turn))}>
+                  <div class={cn('flex w-full min-w-0 max-w-full', turnRowClass(turn))}>
+                    <div class={cn('flex w-full min-w-0 max-w-full flex-1 flex-col gap-2 sm:max-w-3xl', turnStackClass(turn))}>
                       <div class="flex items-center gap-2 text-xs text-zinc-500">
                         <span>{turnRoleLabel(turn)}</span>
                         <span class="text-zinc-700">/</span>
                         <span>{formatDateTime(turn.created_at)}</span>
                       </div>
-                      <div class={cn('rounded-2xl border px-4 py-3 shadow-sm', turnBubbleClass(turn))}>
+                      <div class={cn('min-w-0 w-full max-w-full rounded-2xl border px-4 py-3 shadow-sm', turnBubbleClass(turn))}>
                         {#if turn.images.length > 0}
                           <div class="mb-3 grid gap-3 sm:grid-cols-2">
                             {#each turn.images as image}
@@ -2934,7 +2935,7 @@
                           {#if turn.role === 'assistant'}
                             <MarkdownContent content={turn.content} class="break-words text-zinc-100" />
                           {:else}
-                            <div class="break-words whitespace-pre-wrap text-sm leading-6">
+                            <div class="min-w-0 w-full max-w-full break-words whitespace-pre-wrap text-sm leading-6">
                               {turn.content}
                             </div>
                           {/if}

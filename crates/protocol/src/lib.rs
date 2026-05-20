@@ -352,6 +352,8 @@ pub struct ArtifactSummary {
     pub size_bytes: u64,
     #[serde(default)]
     pub preview_text: String,
+    #[serde(default)]
+    pub metadata_json: serde_json::Value,
     pub created_at: i64,
 }
 
@@ -474,6 +476,8 @@ pub struct PromptProgressUpdate {
     pub route_title: String,
     pub attempt: usize,
     pub attempt_count: usize,
+    #[serde(default)]
+    pub memory_outcomes: Vec<MemoryOutcome>,
     pub created_at: i64,
 }
 
@@ -814,6 +818,22 @@ pub struct MemorySearchResult {
 pub struct MemorySearchResponse {
     #[serde(default)]
     pub results: Vec<MemorySearchResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryOutcome {
+    pub kind: String,
+    pub state: String,
+    #[serde(default)]
+    pub memory_id: String,
+    #[serde(default)]
+    pub candidate_id: String,
+    #[serde(default)]
+    pub dedupe_key: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
