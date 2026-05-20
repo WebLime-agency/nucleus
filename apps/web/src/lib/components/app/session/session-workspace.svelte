@@ -86,6 +86,7 @@
     SessionDetail,
     SessionSummary,
     SessionTurn,
+    ToolCapabilitySummary,
     SessionTurnImage,
     ToolCallSummary,
     WorkerSummary
@@ -160,12 +161,6 @@
   let browserError = $state<string | null>(null);
   let browserContext = $state<BrowserContextSummary | null>(null);
   const BROWSER_CAPABILITY_PREFIX = 'browser.';
-  const browserCapabilitySummaries = $derived(
-    (selectedSession?.capabilities ?? []).filter((capability) =>
-      capability.tool_id.startsWith(BROWSER_CAPABILITY_PREFIX)
-    )
-  );
-  const browserCapabilityAvailable = $derived(browserCapabilitySummaries.length > 0);
   let browserSnapshot = $state<BrowserSnapshot | null>(null);
   let browserViewportElement = $state<HTMLImageElement | null>(null);
   let browserStageElement = $state<HTMLDivElement | null>(null);
@@ -223,6 +218,12 @@
     jobDetail?.approvals.some((approval) => approval.state === 'pending') ?? false
   );
   let selectedSessionUserError = $derived(selectedSession?.user_error ?? null);
+  let browserCapabilitySummaries = $derived<ToolCapabilitySummary[]>(
+    (selectedSession?.capabilities ?? []).filter((capability: ToolCapabilitySummary) =>
+      capability.tool_id.startsWith(BROWSER_CAPABILITY_PREFIX)
+    )
+  );
+  let browserCapabilityAvailable = $derived(browserCapabilitySummaries.length > 0);
   let attachedProjects = $derived(selectedSession?.projects ?? []);
   let selectedProject = $derived(attachedProjects.find((project) => project.is_primary) ?? null);
   let selectedProjectTitle = $derived(
