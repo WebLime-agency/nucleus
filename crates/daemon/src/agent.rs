@@ -35,11 +35,13 @@ use uuid::Uuid;
 
 use super::{
     ApiError, AppState, MCP_ENV_BEARER_MIGRATION_MESSAGE, assemble_prompt_input,
+    build_manual_remember_upsert_request, detect_manual_remember_request,
     ensure_prompting_runtime, excerpt, extract_memory_candidates_after_successful_turn,
     load_router_profiles, publish_overview_event, publish_prompt_progress_event,
     publish_session_event, record_instance_log, resolve_mcp_vault_bearer_token,
     resolve_profile_targets, resolve_session_projects, resolve_workspace_profile,
     resolve_workspace_profile_target, try_record_audit_event, unix_timestamp,
+    upsert_memory_from_request,
 };
 use crate::runtime::{PromptStreamEvent, ProviderTurnResult};
 use crate::worker_action::{
@@ -860,6 +862,13 @@ pub async fn start_prompt_job(
         return Err(ApiError::bad_request(
             "this session has a paused job that must be resumed or canceled first",
         ));
+    }
+
+    if payload.images.is_empty() {
+        if let Some(remember) = detect_manual_remember_request(&payload.prompt) {
+            let request = build_manual_remember_upsert_request(&current.session.id, &current.session.project_id, remember);
+            upsert_memory_from_request(&state, request, None)?;
+        }
     }
 
     let prompt_excerpt = excerpt(&execution_prompt, 160);
@@ -12814,6 +12823,152 @@ Cleanup status: clean";
         let _ = fs::remove_dir_all(&state_dir);
     }
 
+
+    #[tokio::test]
+    async fn start_prompt_job_persists_manual_remember_requests_directly() {
+        let state_dir = test_state_dir("manual-remember-direct-save");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace root should exist");
+        let session_id = "manual-remember-session".to_string();
+        state
+            .store
+            .create_session(SessionRecord {
+                id: session_id.clone(),
+                title: "Manual remember".to_string(),
+                profile_id: String::new(),
+                profile_title: String::new(),
+                route_id: String::new(),
+                route_title: String::new(),
+                scope: "ad_hoc".to_string(),
+                project_id: String::new(),
+                project_title: String::new(),
+                project_path: String::new(),
+                project_ids: Vec::new(),
+                provider: "claude".to_string(),
+                model: "sonnet".to_string(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                working_dir: workspace_root.display().to_string(),
+                working_dir_kind: "workspace_scratch".to_string(),
+                workspace_mode: "scratch_only".to_string(),
+                source_project_path: String::new(),
+                git_root: String::new(),
+                worktree_path: String::new(),
+                git_branch: String::new(),
+                git_base_ref: String::new(),
+                git_head: String::new(),
+                git_dirty: false,
+                git_untracked_count: 0,
+                git_remote_tracking_branch: String::new(),
+                workspace_warnings: Vec::new(),
+                approval_mode: "ask".to_string(),
+                execution_mode: "act".to_string(),
+                run_budget_mode: "inherit".to_string(),
+            })
+            .expect("session should persist");
+
+        let payload = SessionPromptRequest {
+            prompt: "Can you remember that I like vanilla ice cream?".to_string(),
+            images: vec![],
+            role: "main".to_string(),
+        };
+        let current = state.store.get_session(&session_id).expect("session should load");
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            payload,
+            current,
+            "Can you remember that I like vanilla ice cream?".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect_err("test may run without a configured worker runtime, but manual memory should save first");
+
+        let entries = state.store.list_memory_entries().expect("memory should list");
+        let saved = entries
+            .iter()
+            .find(|entry| entry.content == "I like vanilla ice cream")
+            .expect("manual remember should save accepted durable memory");
+        assert_eq!(saved.source_kind, "explicit_remember");
+        assert_eq!(saved.created_by, "user");
+        assert_eq!(saved.scope_kind, "workspace");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn start_prompt_job_does_not_persist_ephemeral_remember_to_prompts() {
+        let state_dir = test_state_dir("manual-remember-ephemeral-guardrail");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace root should exist");
+        let session_id = "manual-remember-ephemeral-session".to_string();
+        state
+            .store
+            .create_session(SessionRecord {
+                id: session_id.clone(),
+                title: "Remember to".to_string(),
+                profile_id: String::new(),
+                profile_title: String::new(),
+                route_id: String::new(),
+                route_title: String::new(),
+                scope: "ad_hoc".to_string(),
+                project_id: String::new(),
+                project_title: String::new(),
+                project_path: String::new(),
+                project_ids: Vec::new(),
+                provider: "claude".to_string(),
+                model: "sonnet".to_string(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                working_dir: workspace_root.display().to_string(),
+                working_dir_kind: "workspace_scratch".to_string(),
+                workspace_mode: "scratch_only".to_string(),
+                source_project_path: String::new(),
+                git_root: String::new(),
+                worktree_path: String::new(),
+                git_branch: String::new(),
+                git_base_ref: String::new(),
+                git_head: String::new(),
+                git_dirty: false,
+                git_untracked_count: 0,
+                git_remote_tracking_branch: String::new(),
+                workspace_warnings: Vec::new(),
+                approval_mode: "ask".to_string(),
+                execution_mode: "act".to_string(),
+                run_budget_mode: "inherit".to_string(),
+            })
+            .expect("session should persist");
+
+        let payload = SessionPromptRequest {
+            prompt: "remember to run tests before answering this turn".to_string(),
+            images: vec![],
+            role: "main".to_string(),
+        };
+        let current = state.store.get_session(&session_id).expect("session should load");
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            payload,
+            current,
+            "remember to run tests before answering this turn".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect_err("test may run without a configured worker runtime, but ephemeral remember-to must still avoid saving memory");
+
+        assert!(state
+            .store
+            .list_memory_entries()
+            .expect("memory should list")
+            .into_iter()
+            .all(|entry| entry.content != "run tests before answering this turn"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
     #[tokio::test]
     async fn command_session_open_returns_completed_state_for_quick_exit() {
         let state_dir = test_state_dir("command-session-open-quick-exit");
