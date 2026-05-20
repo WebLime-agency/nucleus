@@ -4132,8 +4132,9 @@ fn should_retry_unsupported_confident_negative_final_answer(
         && !has_direct_pr_state_evidence_for_claim(detail, &task_text, summary, final_answer);
     let unsupported_pr_merged_claim = confident_pr_merged_claim(summary, final_answer)
         && !has_direct_pr_merged_evidence_for_claim(detail, &task_text, summary, final_answer);
-    let challenged_clean_answer =
-        repeated_grounding_challenge(&task_text) && !has_thread_aware_pr_review_evidence(detail);
+    let challenged_clean_answer = requires_pr_review_thread_evidence(&task_text)
+        && repeated_grounding_challenge(&task_text)
+        && !has_thread_aware_pr_review_evidence(detail);
 
     (missing_pr_review_evidence
         || missing_test_evidence
@@ -4339,15 +4340,27 @@ fn has_test_validation_evidence(detail: &JobDetail) -> bool {
 }
 
 fn has_zero_test_no_match_evidence(detail: &JobDetail) -> bool {
-    detail.tool_calls.iter().any(|tool_call| {
-        tool_call.status == "completed"
-            && tool_call.result_json.as_ref().is_some_and(|value| {
-                value
-                    .pointer("/validation_interpretation/status")
-                    .and_then(Value::as_str)
-                    == Some("no_tests_matched")
-            })
-    })
+    for tool_call in detail
+        .tool_calls
+        .iter()
+        .rev()
+        .filter(|tool_call| tool_call.status == "completed")
+    {
+        let Some(result) = tool_call.result_json.as_ref() else {
+            continue;
+        };
+        if result
+            .pointer("/validation_interpretation/status")
+            .and_then(Value::as_str)
+            == Some("no_tests_matched")
+        {
+            return true;
+        }
+        if tool_call.tool_id == "tests.run" && value_has_successful_test_run(result) {
+            return false;
+        }
+    }
+    false
 }
 
 fn has_direct_pr_merged_evidence(detail: &JobDetail) -> bool {
@@ -4502,6 +4515,14 @@ fn value_has_status_check_rollup(value: &Value) -> bool {
         Value::Object(object) => object.values().any(value_has_status_check_rollup),
         _ => false,
     }
+}
+
+fn value_has_successful_test_run(value: &Value) -> bool {
+    value.get("exit_code").and_then(Value::as_i64) == Some(0)
+        && value
+            .pointer("/validation_interpretation/status")
+            .and_then(Value::as_str)
+            != Some("no_tests_matched")
 }
 
 #[derive(Debug, Clone, Default)]
@@ -7859,7 +7880,7 @@ fn reject_unsafe_github_comment_shell(command: &str, args: &[String]) -> Result<
     let normalized = normalize_action_item_text(script);
     let posts_comment = (normalized.contains("gh pr comment")
         || normalized.contains("gh issue comment"))
-        && normalized.contains("--body");
+        && gh_comment_uses_inline_body_flag(&normalized);
     let interpolation_risk = script.contains('`')
         || script.contains("$(")
         || script.contains("${")
@@ -7872,6 +7893,12 @@ fn reject_unsafe_github_comment_shell(command: &str, args: &[String]) -> Result<
         );
     }
     Ok(())
+}
+
+fn gh_comment_uses_inline_body_flag(normalized_script: &str) -> bool {
+    normalized_script
+        .split_whitespace()
+        .any(|token| token == "--body" || token.starts_with("--body="))
 }
 
 fn validate_command_value(worker: &WorkerSummary, command: &str) -> Result<String> {
@@ -8107,8 +8134,11 @@ fn interpret_test_command_result(result: &Value) -> Option<Value> {
 }
 
 fn test_output_says_zero_matched(text: &str) -> bool {
+    if test_output_has_nonzero_activity(text) {
+        return false;
+    }
     [
-        "0 tests",
+        "running 0 tests",
         "no tests ran",
         "no tests collected",
         "collected 0 items",
@@ -8119,6 +8149,17 @@ fn test_output_says_zero_matched(text: &str) -> bool {
     ]
     .iter()
     .any(|needle| text.contains(needle))
+}
+
+fn test_output_has_nonzero_activity(text: &str) -> bool {
+    let tokens = text
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    tokens.windows(2).any(|window| {
+        window[0].parse::<u64>().is_ok_and(|count| count > 0)
+            && matches!(window[1], "test" | "tests" | "passed" | "failed")
+    })
 }
 
 async fn execute_mcp_tool_call(
@@ -13174,13 +13215,33 @@ mod tests {
     fn repeated_user_challenge_blocks_repeated_unsupported_clean_answer() {
         let worker = test_worker_summary("repeated-grounding-challenge", 100, 100);
         let detail = test_job_detail_with_prompt(
-            "Are you sure? I can see a screenshot showing comments. Check again.",
+            "Are you sure? I can see a screenshot showing Codex review comments on PR #217. Check again.",
         );
         let checkpoint = test_checkpoint_with_prompt(
-            "Are you sure? I can see a screenshot showing comments. Check again.",
+            "Are you sure? I can see a screenshot showing Codex review comments on PR #217. Check again.",
         );
 
         assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Still clean",
+            "There is nothing actionable.",
+            "act",
+            &checkpoint,
+            &worker,
+            4,
+            2,
+        ));
+    }
+
+    #[test]
+    fn non_pr_challenge_does_not_require_pr_review_threads() {
+        let worker = test_worker_summary("non-pr-grounding-challenge", 100, 100);
+        let detail =
+            test_job_detail_with_prompt("Are you sure? Check again whether this note is concise.");
+        let checkpoint =
+            test_checkpoint_with_prompt("Are you sure? Check again whether this note is concise.");
+
+        assert!(!should_retry_unsupported_confident_negative_final_answer(
             &detail,
             "Still clean",
             "There is nothing actionable.",
@@ -13347,6 +13408,13 @@ mod tests {
             "exit_code": 0,
         });
         assert!(interpret_test_command_result(&passing_result).is_none());
+
+        let mixed_cargo_result = json!({
+            "stdout_tail": "running 1 test\n\ntest result: ok. 1 passed; 0 failed; 0 ignored\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored",
+            "stderr_tail": "",
+            "exit_code": 0,
+        });
+        assert!(interpret_test_command_result(&mixed_cargo_result).is_none());
     }
 
     #[test]
@@ -13395,6 +13463,41 @@ mod tests {
     }
 
     #[test]
+    fn later_successful_test_run_supersedes_zero_matched_evidence() {
+        let worker = test_worker_summary("zero-test-later-success", 100, 100);
+        let mut detail = test_job_detail_with_prompt("Run tests and validate the fix.");
+        detail.tool_calls.push(test_tool_call_summary(
+            "tests.run",
+            json!({
+                "stdout_tail": "running 0 tests",
+                "exit_code": 0,
+                "validation_interpretation": {
+                    "status": "no_tests_matched"
+                }
+            }),
+        ));
+        detail.tool_calls.push(test_tool_call_summary(
+            "tests.run",
+            json!({
+                "stdout_tail": "running 1 test\n\ntest result: ok. 1 passed; 0 failed",
+                "exit_code": 0
+            }),
+        ));
+        let checkpoint = test_checkpoint_with_prompt("Run tests and validate the fix.");
+
+        assert!(!should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Validation passed",
+            "Tests passed.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            3,
+        ));
+    }
+
+    #[test]
     fn github_comment_shell_body_with_backticks_is_rejected() {
         let result = reject_unsafe_github_comment_shell(
             "sh",
@@ -13414,6 +13517,18 @@ mod tests {
         });
         assert!(preview.detail.contains("body file"));
         assert!(preview.diff_preview.contains("`danger`"));
+    }
+
+    #[test]
+    fn github_comment_shell_body_file_with_metacharacters_is_allowed() {
+        let result = reject_unsafe_github_comment_shell(
+            "sh",
+            &[
+                "-lc".to_string(),
+                "printf '%s' 'Fixed `danger`' > /tmp/body.md; gh pr comment 218 --body-file /tmp/body.md".to_string(),
+            ],
+        );
+        assert!(result.is_ok());
     }
 
     #[test]
