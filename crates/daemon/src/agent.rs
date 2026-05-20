@@ -7524,14 +7524,22 @@ async fn resolve_github_repo_from_optional(
     owner: Option<String>,
     repo: Option<String>,
 ) -> Result<(String, String)> {
-    match (
-        owner.as_deref().map(str::trim),
-        repo.as_deref().map(str::trim),
-    ) {
-        (Some(owner), Some(repo)) if !owner.is_empty() && !repo.is_empty() => {
+    let owner = owner
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let repo = repo
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (owner, repo) {
+        (Some(owner), Some(repo)) => {
             return Ok((owner.to_string(), repo.trim_end_matches(".git").to_string()));
         }
-        _ => {}
+        (Some(_), None) | (None, Some(_)) => {
+            bail!("GitHub owner and repo overrides must be provided together");
+        }
+        (None, None) => {}
     }
 
     let Some(worker) = worker else {
@@ -13864,6 +13872,31 @@ mod tests {
             ],
         );
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn github_repo_overrides_require_owner_and_repo_together() {
+        assert_eq!(
+            resolve_github_repo_from_optional(
+                None,
+                Some("WebLime-agency".to_string()),
+                Some("nucleus.git".to_string()),
+            )
+            .await
+            .expect("complete override should resolve"),
+            ("WebLime-agency".to_string(), "nucleus".to_string())
+        );
+
+        assert!(
+            resolve_github_repo_from_optional(None, Some("WebLime-agency".to_string()), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            resolve_github_repo_from_optional(None, None, Some("nucleus".to_string()))
+                .await
+                .is_err()
+        );
     }
 
     #[test]
