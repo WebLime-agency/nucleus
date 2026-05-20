@@ -7320,6 +7320,24 @@ query($owner: String!, $repo: String!, $number: Int!, $threadsCursor: String) {
     });
     let pull = pull.clone();
 
+    Ok(github_pr_review_threads_result(
+        &owner,
+        &repo,
+        args.pr_number,
+        &pull,
+        review_threads,
+        thread_comments_truncated,
+    ))
+}
+
+fn github_pr_review_threads_result(
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    pull: &Value,
+    review_threads: Vec<Value>,
+    thread_comments_truncated: bool,
+) -> Value {
     let top_level_comments = pull
         .pointer("/comments/nodes")
         .cloned()
@@ -7333,11 +7351,11 @@ query($owner: String!, $repo: String!, $number: Int!, $threadsCursor: String) {
         .cloned()
         .unwrap_or(Value::Null);
 
-    Ok(json!({
+    json!({
         "evidence_kind": "github_pr_review_threads",
         "owner": owner,
         "repo": repo,
-        "pr_number": args.pr_number,
+        "pr_number": pr_number,
         "url": pull.get("url").cloned().unwrap_or(Value::Null),
         "title": pull.get("title").cloned().unwrap_or(Value::Null),
         "state": pull.get("state").cloned().unwrap_or(Value::Null),
@@ -7349,10 +7367,10 @@ query($owner: String!, $repo: String!, $number: Int!, $threadsCursor: String) {
         "top_level_comments": top_level_comments,
         "reviews": reviews,
         "review_threads": review_threads,
-        "review_threads_complete": true,
+        "review_threads_complete": !thread_comments_truncated,
         "thread_comments_truncated": thread_comments_truncated,
         "status_check_rollup": status_check_rollup,
-    }))
+    })
 }
 
 async fn github_pr_review_threads_query(
@@ -13395,6 +13413,63 @@ mod tests {
             3,
             2,
         ));
+    }
+
+    #[test]
+    fn pr_review_threads_result_reports_incomplete_when_comments_truncated() {
+        let pull = json!({
+            "url": "https://github.com/WebLime-agency/nucleus/pull/219",
+            "title": "fix: improve evidence grounding",
+            "state": "OPEN",
+            "comments": {"nodes": []},
+            "reviews": {"nodes": []},
+            "commits": {
+                "nodes": [
+                    {
+                        "commit": {
+                            "statusCheckRollup": {
+                                "state": "SUCCESS"
+                            }
+                        }
+                    }
+                ]
+            }
+        });
+        let truncated = github_pr_review_threads_result(
+            "WebLime-agency",
+            "nucleus",
+            219,
+            &pull,
+            vec![json!({"id": "thread-1"})],
+            true,
+        );
+        assert_eq!(
+            truncated
+                .get("thread_comments_truncated")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            truncated
+                .get("review_threads_complete")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let complete = github_pr_review_threads_result(
+            "WebLime-agency",
+            "nucleus",
+            219,
+            &pull,
+            vec![json!({"id": "thread-1"})],
+            false,
+        );
+        assert_eq!(
+            complete
+                .get("review_threads_complete")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]
