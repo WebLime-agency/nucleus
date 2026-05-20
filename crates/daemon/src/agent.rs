@@ -7958,6 +7958,7 @@ fn shell_command_payloads(args: &[String]) -> Vec<&str> {
 
 fn detect_shell_payload_port(payload: &str) -> Option<u16> {
     let words = payload.split_ascii_whitespace().collect::<Vec<_>>();
+    let looks_like_dev_server = command_tokens_look_like_dev_server(&words);
     let mut iter = words.iter().copied().peekable();
     while let Some(word) = iter.next() {
         if word == "--port" {
@@ -7969,6 +7970,21 @@ fn detect_shell_payload_port(payload: &str) -> Option<u16> {
         if let Some(value) = word.strip_prefix("--port=") {
             if let Some(port) = parse_port_value(value) {
                 return Some(port);
+            }
+        }
+        if looks_like_dev_server && word == "-p" {
+            if let Some(port) = iter.peek().and_then(|value| parse_port_value(value)) {
+                return Some(port);
+            }
+            continue;
+        }
+        if looks_like_dev_server {
+            if let Some(value) = word.strip_prefix("-p") {
+                if !value.is_empty() {
+                    if let Some(port) = parse_port_value(value) {
+                        return Some(port);
+                    }
+                }
             }
         }
         if let Some(port) = detect_port_env_assignment(word) {
@@ -13168,6 +13184,18 @@ Cleanup status: clean";
 
         spec.args = vec!["-lc".to_string(), "PORT=5179 npm run dev".to_string()];
         assert_eq!(detect_command_port(&spec), Some(5179));
+
+        spec.args = vec!["-lc".to_string(), "npm run dev -- -p 5180".to_string()];
+        assert_eq!(detect_command_port(&spec), Some(5180));
+
+        spec.args = vec!["-lc".to_string(), "next dev -p 3000".to_string()];
+        assert_eq!(detect_command_port(&spec), Some(3000));
+
+        spec.args = vec![
+            "-lc".to_string(),
+            "vite --host 127.0.0.1 -p5181".to_string(),
+        ];
+        assert_eq!(detect_command_port(&spec), Some(5181));
     }
 
     #[test]
