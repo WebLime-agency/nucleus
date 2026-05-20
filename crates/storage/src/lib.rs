@@ -2131,6 +2131,26 @@ impl StateStore {
     pub fn update_job(&self, job_id: &str, patch: JobPatch) -> Result<JobSummary> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         let current = load_job_summary(&connection, job_id)?;
+        let next_state = patch.state.unwrap_or_else(|| current.state.clone());
+        let next_browser_verification_required = patch
+            .browser_verification_required
+            .unwrap_or(current.browser_verification_required);
+        let mut next_browser_verification_status = patch
+            .browser_verification_status
+            .unwrap_or_else(|| current.browser_verification_status.clone());
+        let mut next_browser_verification_summary = patch
+            .browser_verification_summary
+            .unwrap_or_else(|| current.browser_verification_summary.clone());
+        if next_browser_verification_required
+            && next_browser_verification_status == "pending"
+            && is_terminal_non_success_job_state(&next_state)
+        {
+            next_browser_verification_status = "unavailable".to_string();
+            if next_browser_verification_summary.trim().is_empty() {
+                next_browser_verification_summary =
+                    "Job failed before browser verification completed.".to_string();
+            }
+        }
         let next_browser_verification_artifact_ids_json = serde_json::to_string(
             &patch
                 .browser_verification_artifact_ids
@@ -2170,21 +2190,15 @@ impl StateStore {
             ",
             params![
                 job_id,
-                patch.state.unwrap_or(current.state),
+                next_state,
                 patch.root_worker_id.or(current.root_worker_id),
                 patch.visible_turn_id.or(current.visible_turn_id),
                 patch.result_summary.unwrap_or(current.result_summary),
                 patch.last_error.unwrap_or(current.last_error),
                 patch.ui_renderable.unwrap_or(current.ui_renderable),
-                patch
-                    .browser_verification_required
-                    .unwrap_or(current.browser_verification_required),
-                patch
-                    .browser_verification_status
-                    .unwrap_or(current.browser_verification_status),
-                patch
-                    .browser_verification_summary
-                    .unwrap_or(current.browser_verification_summary),
+                next_browser_verification_required,
+                next_browser_verification_status,
+                next_browser_verification_summary,
                 next_browser_verification_artifact_ids_json,
                 bool_to_i64(
                     patch
@@ -4368,6 +4382,10 @@ fn table_columns(connection: &Connection, table: &str) -> Result<HashSet<String>
 
 fn bool_to_i64(value: bool) -> i64 {
     if value { 1 } else { 0 }
+}
+
+fn is_terminal_non_success_job_state(state: &str) -> bool {
+    matches!(state, "failed" | "canceled")
 }
 
 fn publication_requested_for_job(_title: &str, _purpose: &str, prompt_excerpt: &str) -> bool {
@@ -9091,6 +9109,61 @@ and open a pull request to dev when it is ready."
         assert_eq!(updated.browser_verification_status, "unavailable");
         assert_eq!(updated.cleanup_status, "clean");
         assert_eq!(updated.cleanup_paths, vec![".tmp-playwright".to_string()]);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn failed_ui_renderable_job_terminalizes_pending_browser_verification() {
+        let state_dir = test_state_dir("failed-browser-verification-terminal");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let scratch_dir = store
+            .scratch_dir_for_session("browser-terminal-session")
+            .expect("scratch dir should resolve");
+
+        store
+            .create_session(test_session_record(
+                "browser-terminal-session",
+                "Browser terminal session",
+                "ad_hoc",
+                scratch_dir,
+            ))
+            .expect("session should persist");
+        store
+            .create_job(JobRecord {
+                id: "browser-terminal-job".to_string(),
+                session_id: Some("browser-terminal-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Fix UI".to_string(),
+                purpose: "Session prompt".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "running".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "fix the rendered UI".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("job should persist");
+        let updated = store
+            .update_job(
+                "browser-terminal-job",
+                JobPatch {
+                    state: Some("failed".to_string()),
+                    ui_renderable: Some("true".to_string()),
+                    browser_verification_required: Some(true),
+                    browser_verification_status: Some("pending".to_string()),
+                    last_error: Some("worker returned invalid Nucleus action".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("job should update");
+
+        assert_eq!(updated.state, "failed");
+        assert_eq!(updated.browser_verification_status, "unavailable");
+        assert_eq!(
+            updated.browser_verification_summary,
+            "Job failed before browser verification completed."
+        );
 
         let _ = fs::remove_dir_all(&state_dir);
     }

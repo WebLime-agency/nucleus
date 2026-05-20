@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
+    net::TcpListener as StdTcpListener,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{Arc, Mutex as StdMutex},
@@ -71,6 +72,7 @@ const COMMAND_MAX_OUTPUT_LIMIT_BYTES: usize = 524_288;
 const COMMAND_DEFAULT_WAIT_FOR_OUTPUT_MS: u64 = 250;
 const COMMAND_MAX_WAIT_FOR_OUTPUT_MS: u64 = 2_000;
 const COMMAND_STATE_SETTLE_WAIT_MS: u64 = 50;
+const COMMAND_TERMINATE_SETTLE_WAIT_MS: u64 = 2_000;
 const WRITE_LOCK_POLL_INTERVAL_MS: u64 = 250;
 const PLAYBOOK_SCHEDULER_INTERVAL_SECS: u64 = 30;
 const PLAYBOOK_MIN_INTERVAL_SECS: u64 = 60;
@@ -1693,7 +1695,7 @@ impl AgentRuntime {
             .cloned()
             .collect::<Vec<_>>();
 
-        for handle in handles {
+        for handle in &handles {
             let _ = handle
                 .control
                 .send(CommandControl::Terminate {
@@ -1701,6 +1703,16 @@ impl AgentRuntime {
                     final_state: final_state.to_string(),
                 })
                 .await;
+        }
+        for handle in &handles {
+            let mut done = handle.done.clone();
+            if !*done.borrow() {
+                let _ = timeout(
+                    Duration::from_millis(COMMAND_TERMINATE_SETTLE_WAIT_MS),
+                    done.changed(),
+                )
+                .await;
+            }
         }
     }
 }
@@ -7898,6 +7910,52 @@ fn detect_command_port(spec: &ResolvedCommandSpec) -> Option<u16> {
     None
 }
 
+fn ensure_declared_command_port_available(spec: &ResolvedCommandSpec) -> Result<()> {
+    let Some(port) = detect_command_port(spec) else {
+        return Ok(());
+    };
+    if port == 0 {
+        return Ok(());
+    }
+
+    match StdTcpListener::bind(("127.0.0.1", port)) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(error) => {
+            let owner = describe_port_owner(port)
+                .filter(|detail| !detail.trim().is_empty())
+                .map(|detail| format!(" Listener detail: {detail}"))
+                .unwrap_or_default();
+            bail!(
+                "requested command port {port} is already in use ({error}). Stop the existing listener or choose another port before starting this dev server.{owner}"
+            );
+        }
+    }
+}
+
+fn describe_port_owner(port: u16) -> Option<String> {
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "ss -H -ltnp 'sport = :{port}' 2>/dev/null | head -n 3"
+        ))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let summary = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    (!summary.is_empty()).then_some(summary)
+}
+
 async fn record_shared_checkout_git_command_warning(
     state: &AppState,
     job_id: &str,
@@ -8229,6 +8287,23 @@ async fn start_command_session(
             ..ToolCallPatch::default()
         },
     )?;
+
+    if let Err(error) = ensure_declared_command_port_available(spec) {
+        fail_command_session_start(
+            state,
+            job_id,
+            &worker.id,
+            tool_call_id,
+            &command_session_id,
+            &command_summary,
+            &stderr_path,
+            Some(&stdout_artifact),
+            Some(&stderr_artifact),
+            &error,
+        )
+        .await;
+        return Err(error);
+    }
 
     let mut command = Command::new(&spec.command);
     command
@@ -8669,6 +8744,21 @@ async fn terminate_command_process(child: &mut tokio::process::Child) -> std::io
     child.kill().await
 }
 
+async fn terminate_command_process_and_wait(
+    child: &mut tokio::process::Child,
+    wait_for_exit: Duration,
+) -> Option<ExitStatus> {
+    let _ = terminate_command_process(child).await;
+    match timeout(wait_for_exit, child.wait()).await {
+        Ok(Ok(status)) => Some(status),
+        Ok(Err(_)) => None,
+        Err(_) => {
+            let _ = child.kill().await;
+            child.wait().await.ok()
+        }
+    }
+}
+
 async fn run_command_session_controller(
     state: AppState,
     worker_id: String,
@@ -8713,8 +8803,9 @@ async fn run_command_session_controller(
                     "command exceeded the {} second Nucleus timeout",
                     summary.timeout_secs
                 );
-                let _ = terminate_command_process(&mut child).await;
-                if let Ok(status) = child.wait().await {
+                if let Some(status) =
+                    terminate_command_process_and_wait(&mut child, Duration::from_secs(2)).await
+                {
                     exit_code = status.code();
                 }
                 break;
@@ -8807,16 +8898,15 @@ async fn run_command_session_controller(
                                 last_error = error.to_string();
                             }
                             Err(_) => {
-                                let _ = terminate_command_process(&mut child).await;
-                                match child.wait().await {
-                                    Ok(status) => {
-                                        exit_code = status.code();
-                                        if !status.success() {
-                                            last_error = format_command_exit_error(status);
-                                        }
-                                    }
-                                    Err(error) => {
-                                        last_error = error.to_string();
+                                if let Some(status) = terminate_command_process_and_wait(
+                                    &mut child,
+                                    Duration::from_secs(2),
+                                )
+                                .await
+                                {
+                                    exit_code = status.code();
+                                    if !status.success() {
+                                        last_error = format_command_exit_error(status);
                                     }
                                 }
                             }
@@ -8827,8 +8917,10 @@ async fn run_command_session_controller(
                         stdin.take();
                         final_state = requested_state;
                         last_error = reason;
-                        let _ = terminate_command_process(&mut child).await;
-                        if let Ok(status) = child.wait().await {
+                        if let Some(status) =
+                            terminate_command_process_and_wait(&mut child, Duration::from_secs(2))
+                                .await
+                        {
                             exit_code = status.code();
                         }
                         break;
@@ -9661,6 +9753,13 @@ async fn fail_job(state: &AppState, job_id: &str, error: &str) -> Result<()> {
             "canceled",
         )
         .await;
+    reconcile_failed_job_command_sessions(
+        state,
+        job_id,
+        "The job failed and closed any remaining Nucleus-owned command sessions.",
+        "canceled",
+    )
+    .await;
     state.store.update_job(
         job_id,
         JobPatch {
@@ -9732,6 +9831,67 @@ async fn fail_job(state: &AppState, job_id: &str, error: &str) -> Result<()> {
     }
     let _ = publish_overview_event(state).await;
     Ok(())
+}
+
+async fn reconcile_failed_job_command_sessions(
+    state: &AppState,
+    job_id: &str,
+    reason: &str,
+    final_state: &str,
+) {
+    let Ok(detail) = state.store.get_job(job_id) else {
+        return;
+    };
+    for command_session in detail.command_sessions {
+        if !is_non_terminal_command_session_state(&command_session.state) {
+            continue;
+        }
+        let Ok(updated) = state.store.update_command_session(
+            &command_session.id,
+            CommandSessionPatch {
+                state: Some(final_state.to_string()),
+                last_error: Some(reason.to_string()),
+                completed_at: Some(Some(unix_timestamp())),
+                ..CommandSessionPatch::default()
+            },
+        ) else {
+            continue;
+        };
+        if let Some(tool_call_id) = command_session.tool_call_id.as_deref() {
+            if detail.tool_calls.iter().any(|tool_call| {
+                tool_call.id == tool_call_id && is_non_terminal_tool_call_status(&tool_call.status)
+            }) {
+                let _ = state.store.update_tool_call(
+                    tool_call_id,
+                    ToolCallPatch {
+                        status: Some("failed".to_string()),
+                        error_class: Some("job_failed".to_string()),
+                        error_detail: Some(reason.to_string()),
+                        completed_at: Some(Some(unix_timestamp())),
+                        ..ToolCallPatch::default()
+                    },
+                );
+            }
+        }
+        let _ = state.store.append_job_event(JobEventRecord {
+            job_id: job_id.to_string(),
+            worker_id: Some(command_session.worker_id),
+            event_type: "command.session.updated".to_string(),
+            status: updated.state.clone(),
+            summary: format!("{} {}", format_state_prefix(&updated.state), updated.title),
+            detail: reason.to_string(),
+            data_json: json!({
+                "command_session_id": updated.id,
+                "mode": updated.mode,
+                "reason": "job_failed",
+            }),
+        });
+        publish_command_session_updated(state, &updated).await;
+    }
+}
+
+fn is_non_terminal_command_session_state(state: &str) -> bool {
+    matches!(state, "starting" | "running")
 }
 
 async fn resolve_hidden_worker_target(
@@ -13131,6 +13291,144 @@ Cleanup status: clean";
         let _ = fs::remove_dir_all(&state_dir);
     }
 
+    #[tokio::test]
+    async fn invalid_worker_action_after_repair_marks_job_worker_and_session_failed() {
+        let state_dir = test_state_dir("worker-action-repair-failure");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener addr should be available")
+        );
+        let server = tokio::spawn(async move {
+            for index in 0..2 {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .expect("test request should connect");
+                let _body = read_test_http_body(&mut socket).await;
+                write_test_openai_sse_response(
+                    &mut socket,
+                    &format!("invalid-turn-{index}"),
+                    r#"{"message":"still not a Nucleus action"}"#,
+                )
+                .await;
+            }
+        });
+
+        let session_id = "session-worker-action-failed";
+        let job_id = "job-worker-action-failed";
+        let worker_id = "worker-action-failed";
+        state
+            .store
+            .create_session(test_session_record(
+                session_id,
+                "Worker action failure",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+        state
+            .store
+            .create_job(JobRecord {
+                id: job_id.to_string(),
+                session_id: Some(session_id.to_string()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Fix UI".to_string(),
+                purpose: "Session prompt".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "queued".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "fix the rendered UI".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("job should persist");
+        let worker = state
+            .store
+            .create_worker(WorkerRecord {
+                id: worker_id.to_string(),
+                job_id: job_id.to_string(),
+                parent_worker_id: None,
+                title: "Root utility worker".to_string(),
+                lane: "utility".to_string(),
+                state: "queued".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "test-model".to_string(),
+                provider_base_url: base_url,
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: workspace_root.display().to_string(),
+                read_roots: vec![workspace_root.display().to_string()],
+                write_roots: vec![workspace_root.display().to_string()],
+                max_steps: 10,
+                max_tool_calls: 10,
+                max_wall_clock_secs: 30,
+            })
+            .expect("worker should persist");
+        state
+            .store
+            .update_job(
+                job_id,
+                JobPatch {
+                    root_worker_id: Some(worker_id.to_string()),
+                    ui_renderable: Some("true".to_string()),
+                    browser_verification_required: Some(true),
+                    browser_verification_status: Some("pending".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("job should update");
+        let checkpoint = WorkerCheckpoint {
+            session_id: session_id.to_string(),
+            prompt_text: "fix the rendered UI".to_string(),
+            images: Vec::new(),
+            conversation: vec![CheckpointMessage {
+                role: "system".to_string(),
+                content: worker_system_prompt(&worker),
+                images: Vec::new(),
+            }],
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        state
+            .store
+            .write_worker_checkpoint(
+                worker_id,
+                &serde_json::to_value(checkpoint).expect("checkpoint should encode"),
+            )
+            .expect("checkpoint should persist");
+
+        spawn_job_task(state.clone(), job_id.to_string());
+        server.await.expect("test server should finish");
+        let session = wait_for_session_state(&state, session_id, "error").await;
+        let detail = state.store.get_job(job_id).expect("job should reload");
+
+        assert_eq!(detail.job.state, "failed");
+        assert_eq!(detail.workers[0].state, "failed");
+        assert_eq!(session.session.state, "error");
+        assert!(detail.job.last_error.contains("repair retry"));
+        assert_eq!(detail.job.browser_verification_status, "unavailable");
+        assert_eq!(
+            detail.job.browser_verification_summary,
+            "Job failed before browser verification completed."
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
     #[test]
     fn preserves_provider_native_input_siblings_for_direct_tool_calls() {
         let action = parse_worker_action(
@@ -14975,6 +15273,110 @@ Cleanup status: clean";
                 .contains("failed to start command session")
         );
 
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn fail_job_reconciles_active_command_sessions() {
+        let state_dir = test_state_dir("command-session-job-failed");
+        let state = initialize_test_state(&state_dir);
+        let (job_id, worker, tool_call_id) =
+            create_command_test_context(&state, "job-failed-command");
+        let spec = resolve_command_spec(
+            &worker,
+            "interactive",
+            Some("Long running dev server".to_string()),
+            "sh".to_string(),
+            vec!["-c".to_string(), "sleep 30".to_string()],
+            None,
+            Some(30),
+            Some(8_192),
+            Some("inherit".to_string()),
+            BTreeMap::new(),
+            false,
+        )
+        .expect("spec should validate");
+
+        let running = start_command_session(&state, &job_id, &worker, &tool_call_id, &spec, true)
+            .await
+            .expect("command session should start");
+        assert_eq!(running.state, "running");
+
+        fail_job(
+            &state,
+            &job_id,
+            "worker returned invalid Nucleus action after repair retry",
+        )
+        .await
+        .expect("job should fail");
+        let detail = state.store.get_job(&job_id).expect("job should reload");
+        let command_session = detail
+            .command_sessions
+            .iter()
+            .find(|session| session.id == running.id)
+            .expect("command session should remain visible");
+
+        assert_eq!(detail.job.state, "failed");
+        assert_eq!(detail.workers[0].state, "failed");
+        assert_eq!(command_session.state, "canceled");
+        assert!(command_session.completed_at.is_some());
+        assert!(command_session.last_error.contains("job failed"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn declared_occupied_command_port_fails_before_spawn() {
+        let state_dir = test_state_dir("command-session-port-occupied");
+        let state = initialize_test_state(&state_dir);
+        let (job_id, worker, tool_call_id) = create_command_test_context(&state, "port-occupied");
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("listener addr should be available")
+            .port();
+        let spec = resolve_command_spec(
+            &worker,
+            "interactive",
+            Some("Dev server".to_string()),
+            "sh".to_string(),
+            vec![
+                "-c".to_string(),
+                "sleep 30".to_string(),
+                "--port".to_string(),
+                port.to_string(),
+            ],
+            None,
+            Some(30),
+            Some(8_192),
+            Some("inherit".to_string()),
+            BTreeMap::new(),
+            false,
+        )
+        .expect("spec should validate");
+
+        let error = start_command_session(&state, &job_id, &worker, &tool_call_id, &spec, true)
+            .await
+            .expect_err("occupied declared port should fail before spawn");
+        assert!(error.to_string().contains("already in use"));
+
+        let detail = state.store.get_job(&job_id).expect("job should reload");
+        assert_eq!(detail.command_sessions.len(), 1);
+        assert_eq!(detail.command_sessions[0].state, "failed");
+        assert!(detail.command_sessions[0].completed_at.is_some());
+        assert!(
+            detail.command_sessions[0]
+                .last_error
+                .contains(&port.to_string())
+        );
+        let running = state
+            .store
+            .list_command_sessions_by_state(&["running"])
+            .expect("running sessions should load");
+        assert!(running.is_empty());
+
+        drop(listener);
         let _ = fs::remove_dir_all(&state_dir);
     }
 
