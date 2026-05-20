@@ -110,6 +110,7 @@ const BROWSER_VERIFICATION_STATUSES: &[&str] = &[
     "not_performed",
     "unavailable",
 ];
+const ACTION_EXECUTOR_LANE: &str = "utility";
 
 fn configured_job_max_wall_clock_secs() -> u64 {
     configured_u64_env(
@@ -855,9 +856,13 @@ pub async fn start_prompt_job(
                 detail: error.message,
             }],
         };
-    let target =
-        resolve_hidden_worker_target(&state, &current.session, &compiler_role, needs_vision_tools)
-            .await?;
+    let target = resolve_hidden_worker_target(
+        &state,
+        &current.session,
+        ACTION_EXECUTOR_LANE,
+        needs_vision_tools,
+    )
+    .await?;
     let root_capabilities = if current.session.execution_mode == "plan" {
         Vec::new()
     } else {
@@ -934,8 +939,8 @@ pub async fn start_prompt_job(
         id: root_worker_id.clone(),
         job_id: job_id.clone(),
         parent_worker_id: None,
-        title: format!("Utility {compiler_role} worker"),
-        lane: compiler_role.clone(),
+        title: "Utility Worker".to_string(),
+        lane: ACTION_EXECUTOR_LANE.to_string(),
         state: "queued".to_string(),
         provider: target.provider.clone(),
         model: target.model.clone(),
@@ -1027,8 +1032,8 @@ pub async fn start_prompt_job(
                 current.session.title
             ),
             detail: format!(
-                "session_id={} utility_provider={} utility_model={}",
-                session_id, target.provider, target.model
+                "session_id={} executor_lane={} utility_provider={} utility_model={}",
+                session_id, ACTION_EXECUTOR_LANE, target.provider, target.model
             ),
         },
     )
@@ -1731,6 +1736,9 @@ async fn run_job_loop(
         .into_iter()
         .find(|item| item.id == worker_id)
         .ok_or_else(|| anyhow!("job '{job_id}' root worker was not found"))?;
+    worker =
+        migrate_legacy_root_worker_to_utility(state, &detail.job, &session.session, worker).await?;
+    ensure_utility_worker_executor(&worker)?;
 
     state.store.update_job(
         job_id,
@@ -1902,7 +1910,15 @@ async fn run_job_loop(
             &prompt,
             prompt_images,
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "Utility Worker route failed (lane={}, provider={}, model={}): check Utility model credentials and endpoint settings: {error}",
+                worker.lane,
+                worker.provider,
+                worker.model
+            )
+        })?;
         checkpoint.conversation.push(CheckpointMessage {
             role: "user".to_string(),
             content: prompt.clone(),
@@ -2182,6 +2198,80 @@ async fn run_job_loop(
             }
         }
     }
+}
+
+async fn migrate_legacy_root_worker_to_utility(
+    state: &AppState,
+    job: &JobSummary,
+    session: &SessionSummary,
+    worker: WorkerSummary,
+) -> Result<WorkerSummary> {
+    if worker.lane == ACTION_EXECUTOR_LANE {
+        return Ok(worker);
+    }
+    if worker.lane != "main"
+        || worker.parent_worker_id.is_some()
+        || job.root_worker_id.as_deref() != Some(worker.id.as_str())
+        || job.trigger_kind != "session_prompt"
+    {
+        return Ok(worker);
+    }
+
+    let Some(checkpoint_value) = state.store.read_worker_checkpoint(&worker.id)? else {
+        return Ok(worker);
+    };
+    let checkpoint: WorkerCheckpoint = serde_json::from_value(checkpoint_value)
+        .context("failed to decode legacy worker checkpoint payload")?;
+    let target = resolve_hidden_worker_target(
+        state,
+        session,
+        ACTION_EXECUTOR_LANE,
+        !checkpoint.images.is_empty(),
+    )
+    .await
+    .map_err(|error| anyhow!(error.message))?;
+    let mut migrated = state.store.update_worker(
+        &worker.id,
+        WorkerPatch {
+            title: Some("Utility Worker".to_string()),
+            lane: Some(ACTION_EXECUTOR_LANE.to_string()),
+            provider: Some(target.provider.clone()),
+            model: Some(target.model.clone()),
+            provider_base_url: Some(target.provider_base_url.clone()),
+            provider_api_key: Some(target.provider_api_key),
+            provider_session_id: Some(String::new()),
+            last_error: Some(String::new()),
+            ..WorkerPatch::default()
+        },
+    )?;
+    let root_capabilities = if session.execution_mode == "plan" {
+        Vec::new()
+    } else {
+        let mut capabilities = root_worker_capabilities();
+        capabilities.extend(mcp_tool_capabilities(state));
+        capabilities
+    };
+    migrated.capabilities = state
+        .store
+        .replace_tool_capability_grants(&worker.id, &root_capabilities)?;
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: job.id.clone(),
+        worker_id: Some(worker.id.clone()),
+        event_type: "worker.legacy_lane_migrated".to_string(),
+        status: "running".to_string(),
+        summary: "Migrated legacy main-lane root worker to Utility Worker.".to_string(),
+        detail: format!(
+            "Legacy persisted root worker '{}' was moved from lane 'main' to lane '{}' before resume.",
+            worker.id, ACTION_EXECUTOR_LANE
+        ),
+        data_json: json!({
+            "from_lane": "main",
+            "to_lane": ACTION_EXECUTOR_LANE,
+            "provider": target.provider,
+            "model": target.model,
+        }),
+    });
+    Ok(migrated)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2574,6 +2664,7 @@ async fn handle_tool_call_proposal(
     tool: String,
     args: Value,
 ) -> Result<LoopDisposition> {
+    ensure_utility_worker_executor(worker)?;
     *tool_calls += 1;
     let policy = policy_for_tool_with_mode(&tool, &session.session.approval_mode);
     let tool_call_id = Uuid::new_v4().to_string();
@@ -6061,6 +6152,7 @@ async fn execute_granted_tool(
     tool: &str,
     args: Value,
 ) -> Result<Value> {
+    ensure_utility_worker_executor(worker)?;
     if !worker
         .capabilities
         .iter()
@@ -6217,6 +6309,17 @@ async fn execute_granted_tool(
         }
         other => bail!("unsupported tool '{}'", other),
     }
+}
+
+fn ensure_utility_worker_executor(worker: &WorkerSummary) -> Result<()> {
+    if worker.lane != ACTION_EXECUTOR_LANE {
+        bail!(
+            "worker '{}' is lane '{}' and cannot execute Nucleus actions; only utility workers may execute actions",
+            worker.id,
+            worker.lane
+        );
+    }
+    Ok(())
 }
 
 fn preview_approval_tool(
@@ -9692,24 +9795,21 @@ async fn resolve_hidden_worker_target(
     }
 
     let workspace = state.store.workspace()?;
-    let profile = resolve_hidden_worker_profile(&workspace, session);
-
-    if let Some(profile) = profile {
-        let target = HiddenWorkerTarget {
-            provider: profile.utility.adapter.clone(),
-            model: profile.utility.model.clone(),
-            provider_base_url: profile.utility.base_url.clone(),
-            provider_api_key: profile.utility.api_key.clone(),
+    let profile = resolve_hidden_worker_profile(&workspace, session).ok_or_else(|| {
+        let requested = if session.profile_id.trim().is_empty() {
+            workspace.default_profile_id.as_str()
+        } else {
+            session.profile_id.as_str()
         };
-        ensure_hidden_worker_target_ready(state, &target, needs_vision_tools).await?;
-        return Ok(target);
-    }
-
+        ApiError::bad_request(format!(
+            "Utility Worker route is not configured: workspace profile '{requested}' was not found"
+        ))
+    })?;
     let target = HiddenWorkerTarget {
-        provider: session.provider.clone(),
-        model: session.model.clone(),
-        provider_base_url: session.provider_base_url.clone(),
-        provider_api_key: session.provider_api_key.clone(),
+        provider: profile.utility.adapter.clone(),
+        model: profile.utility.model.clone(),
+        provider_base_url: profile.utility.base_url.clone(),
+        provider_api_key: profile.utility.api_key.clone(),
     };
     ensure_hidden_worker_target_ready(state, &target, needs_vision_tools).await?;
     Ok(target)
@@ -10898,7 +10998,7 @@ async fn publish_prompt_status(
 mod tests {
     use super::*;
     use crate::vault;
-    use nucleus_protocol::SessionProjectSummary;
+    use nucleus_protocol::{SessionProjectSummary, WorkspaceModelConfig};
 
     #[test]
     fn interrupted_restart_recovery_only_rewrites_non_terminal_tool_calls() {
@@ -13302,6 +13402,9 @@ Cleanup status: clean";
             requested_by: "user".to_string(),
             prompt_excerpt: String::new(),
             root_worker_id: None,
+            executor_lane: String::new(),
+            executor_provider: String::new(),
+            executor_model: String::new(),
             visible_turn_id: None,
             result_summary: String::new(),
             last_error: String::new(),
@@ -13354,6 +13457,9 @@ Cleanup status: clean";
             requested_by: "user".to_string(),
             prompt_excerpt: String::new(),
             root_worker_id: None,
+            executor_lane: String::new(),
+            executor_provider: String::new(),
+            executor_model: String::new(),
             visible_turn_id: None,
             result_summary: String::new(),
             last_error: String::new(),
@@ -14001,6 +14107,7 @@ Cleanup status: clean";
                 .expect("workspace should load")
                 .root_path,
         );
+        set_default_profile_utility_target(&state, "claude", "sonnet", "", "");
         let session_id = "session-image-degrade".to_string();
         state
             .store
@@ -14098,11 +14205,418 @@ Cleanup status: clean";
     }
 
     #[tokio::test]
+    async fn normal_action_session_prompt_uses_utility_lane_executor() {
+        let state_dir = test_state_dir("normal-prompt-utility-executor");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let (base_url, server) = spawn_single_response_openai_server(
+            r#"{"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
+        )
+        .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-test-model",
+            &base_url,
+            "utility-key",
+        );
+
+        let session_id = "session-normal-utility".to_string();
+        state
+            .store
+            .create_session(test_session_record(
+                &session_id,
+                "Normal utility executor",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+
+        let payload = SessionPromptRequest {
+            prompt: "Inspect the repo and answer.".to_string(),
+            images: Vec::new(),
+            role: "main".to_string(),
+        };
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            payload,
+            current,
+            "Inspect the repo and answer.".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("prompt should queue utility executor");
+
+        let _ = wait_for_session_state(&state, &session_id, "active").await;
+        server.await.expect("test server should finish");
+
+        let jobs = state
+            .store
+            .list_jobs_for_session(&session_id)
+            .expect("jobs should load");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].executor_lane, "utility");
+        assert_eq!(jobs[0].executor_model, "utility-test-model");
+        let detail = state.store.get_job(&jobs[0].id).expect("job should load");
+        let worker = detail.workers.first().expect("worker should exist");
+        assert_eq!(worker.title, "Utility Worker");
+        assert_eq!(worker.lane, "utility");
+        assert_eq!(worker.model, "utility-test-model");
+        assert!(
+            worker
+                .capabilities
+                .iter()
+                .any(|grant| grant.tool_id == "command.run")
+        );
+        assert!(!worker.title.contains("main"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn utility_route_auth_failure_does_not_fallback_to_main_route() {
+        let state_dir = test_state_dir("utility-auth-no-main-fallback");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let (base_url, server) =
+            spawn_single_unauthorized_openai_server(r#"{"error":"Missing API key"}"#).await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-auth-model",
+            &base_url,
+            "",
+        );
+
+        let session_id = "session-utility-auth".to_string();
+        let mut session = test_session_record(&session_id, "Utility auth failure", &workspace_root);
+        session.model = "main-route-model".to_string();
+        session.provider_base_url = "http://127.0.0.1:9/v1".to_string();
+        state
+            .store
+            .create_session(session)
+            .expect("session should persist");
+
+        let payload = SessionPromptRequest {
+            prompt: "Run a command.".to_string(),
+            images: Vec::new(),
+            role: "main".to_string(),
+        };
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            payload,
+            current,
+            "Run a command.".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("prompt should queue before utility auth failure");
+
+        let _ = wait_for_session_state(&state, &session_id, "error").await;
+        server.await.expect("test server should finish");
+
+        let jobs = state
+            .store
+            .list_jobs_for_session(&session_id)
+            .expect("jobs should load");
+        assert_eq!(jobs.len(), 1);
+        let detail = state.store.get_job(&jobs[0].id).expect("job should load");
+        assert_eq!(detail.job.state, "failed");
+        assert_eq!(detail.job.executor_lane, "utility");
+        assert_eq!(detail.job.executor_model, "utility-auth-model");
+        assert!(
+            detail
+                .job
+                .last_error
+                .contains("Utility Worker route failed")
+        );
+        assert!(detail.job.last_error.contains("Missing API key"));
+        assert!(!detail.job.last_error.contains("main-route-model"));
+        assert_eq!(detail.workers[0].lane, "utility");
+        assert_eq!(detail.workers[0].model, "utility-auth-model");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn main_lane_workers_cannot_receive_or_execute_action_grants() {
+        let state_dir = test_state_dir("main-lane-no-action-grants");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let job_id = "job-main-lane-grants".to_string();
+        state
+            .store
+            .create_job(JobRecord {
+                id: job_id.clone(),
+                session_id: None,
+                parent_job_id: None,
+                template_id: None,
+                title: "Main lane guard".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "manual".to_string(),
+                state: "running".to_string(),
+                requested_by: "test".to_string(),
+                prompt_excerpt: String::new(),
+                publication_intent_text: None,
+            })
+            .expect("job should persist");
+        let worker = state
+            .store
+            .create_worker(WorkerRecord {
+                id: "worker-main-lane".to_string(),
+                job_id: job_id.clone(),
+                parent_worker_id: None,
+                title: "Main worker".to_string(),
+                lane: "main".to_string(),
+                state: "running".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "main-model".to_string(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: workspace_root.display().to_string(),
+                read_roots: vec![workspace_root.display().to_string()],
+                write_roots: vec![workspace_root.display().to_string()],
+                max_steps: 10,
+                max_tool_calls: 10,
+                max_wall_clock_secs: 30,
+            })
+            .expect("worker should persist");
+        let grant_error = state
+            .store
+            .replace_tool_capability_grants(&worker.id, &execution_capabilities())
+            .expect_err("main lane must not receive action grants");
+        assert!(grant_error.to_string().contains("only utility workers"));
+
+        let mut forged_worker = worker.clone();
+        forged_worker.capabilities = execution_capabilities()
+            .into_iter()
+            .map(|grant| nucleus_protocol::ToolCapabilitySummary {
+                tool_id: grant.tool_id,
+                summary: grant.summary,
+                approval_mode: grant.approval_mode,
+                risk_level: grant.risk_level,
+                side_effect_level: grant.side_effect_level,
+                timeout_secs: grant.timeout_secs,
+                max_output_bytes: grant.max_output_bytes,
+                supports_streaming: grant.supports_streaming,
+                concurrency_group: grant.concurrency_group,
+                scope_kind: grant.scope_kind,
+            })
+            .collect();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: "session-main-lane".to_string(),
+            prompt_text: String::new(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let session = SessionDetail {
+            session: scope_test_session(
+                workspace_root.to_str().expect("workspace path utf-8"),
+                "workspace_scratch",
+                "scratch_only",
+                Vec::new(),
+            ),
+            turns: Vec::new(),
+        };
+        let execute_error = execute_granted_tool(
+            &state,
+            &session,
+            &job_id,
+            &forged_worker,
+            "tool-call-main-lane",
+            &mut checkpoint,
+            &mut cancel_rx,
+            "command.run",
+            json!({ "command": "true" }),
+        )
+        .await
+        .expect_err("main lane must not execute actions");
+        assert!(execute_error.to_string().contains("only utility workers"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn legacy_main_lane_root_worker_resume_migrates_to_utility_executor() {
+        let state_dir = test_state_dir("legacy-main-root-utility-migration");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let (base_url, server) = spawn_single_response_openai_server(
+            r#"{"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
+        )
+        .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-resume-model",
+            &base_url,
+            "utility-key",
+        );
+
+        let session_id = "session-legacy-main-resume".to_string();
+        let job_id = "job-legacy-main-resume".to_string();
+        let worker_id = "worker-legacy-main-resume".to_string();
+        state
+            .store
+            .create_session(test_session_record(
+                &session_id,
+                "Legacy main resume",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+        state
+            .store
+            .create_job(JobRecord {
+                id: job_id.clone(),
+                session_id: Some(session_id.clone()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Legacy prompt job".to_string(),
+                purpose: "Session prompt".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "queued".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "Finish the legacy job".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("job should persist");
+        state
+            .store
+            .create_worker(WorkerRecord {
+                id: worker_id.clone(),
+                job_id: job_id.clone(),
+                parent_worker_id: None,
+                title: "Utility main worker".to_string(),
+                lane: "main".to_string(),
+                state: "queued".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "main-route-model".to_string(),
+                provider_base_url: "http://127.0.0.1:9/v1".to_string(),
+                provider_api_key: "main-key".to_string(),
+                provider_session_id: "legacy-provider-session".to_string(),
+                working_dir: workspace_root.display().to_string(),
+                read_roots: vec![workspace_root.display().to_string()],
+                write_roots: vec![workspace_root.display().to_string()],
+                max_steps: 10,
+                max_tool_calls: 10,
+                max_wall_clock_secs: 30,
+            })
+            .expect("worker should persist");
+        state
+            .store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    root_worker_id: Some(worker_id.clone()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("job should update");
+        let checkpoint = WorkerCheckpoint {
+            session_id: session_id.clone(),
+            prompt_text: "Finish the legacy job".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        state
+            .store
+            .write_worker_checkpoint(&worker_id, &serde_json::to_value(checkpoint).unwrap())
+            .expect("checkpoint should persist");
+
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        run_job_loop(&state, &job_id, &mut cancel_rx)
+            .await
+            .expect("legacy root should migrate and run through utility route");
+        server.await.expect("test server should finish");
+
+        let detail = state.store.get_job(&job_id).expect("job should load");
+        assert_eq!(detail.job.state, "completed");
+        assert_eq!(detail.job.executor_lane, "utility");
+        assert_eq!(detail.job.executor_model, "utility-resume-model");
+        let worker = detail.workers.first().expect("worker should exist");
+        assert_eq!(worker.id, worker_id);
+        assert_eq!(worker.title, "Utility Worker");
+        assert_eq!(worker.lane, "utility");
+        assert_eq!(worker.model, "utility-resume-model");
+        assert_ne!(worker.provider_session_id, "legacy-provider-session");
+        assert!(
+            worker
+                .capabilities
+                .iter()
+                .any(|grant| grant.tool_id == "command.run")
+        );
+        assert!(
+            detail
+                .events
+                .iter()
+                .any(|event| event.event_type == "worker.legacy_lane_migrated")
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
     async fn start_prompt_job_persists_manual_remember_requests_directly() {
         let state_dir = test_state_dir("manual-remember-direct-save");
         let state = initialize_test_state(&state_dir);
         let workspace_root = state_dir.join("workspace");
         fs::create_dir_all(&workspace_root).expect("workspace root should exist");
+        let (base_url, server) = spawn_single_response_openai_server(
+            r#"{"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
+        )
+        .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-memory-model",
+            &base_url,
+            "utility-key",
+        );
         let session_id = "manual-remember-session".to_string();
         state
             .store
@@ -14160,9 +14674,9 @@ Cleanup status: clean";
             "main".to_string(),
         )
         .await
-        .expect_err(
-            "test may run without a configured worker runtime, but manual memory should save first",
-        );
+        .expect("prompt should queue through utility worker");
+        let _ = wait_for_session_state(&state, &session_id, "active").await;
+        server.await.expect("test server should finish");
 
         let entries = state
             .store
@@ -14188,6 +14702,17 @@ Cleanup status: clean";
         let state = initialize_test_state(&state_dir);
         let workspace_root = state_dir.join("workspace");
         fs::create_dir_all(&workspace_root).expect("workspace root should exist");
+        let (base_url, server) = spawn_single_response_openai_server(
+            r#"{"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
+        )
+        .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-memory-model",
+            &base_url,
+            "utility-key",
+        );
         let session_id = "manual-remember-ephemeral-session".to_string();
         state
             .store
@@ -14227,7 +14752,8 @@ Cleanup status: clean";
             .expect("session should persist");
 
         let payload = SessionPromptRequest {
-            prompt: "remember to run tests before answering this turn".to_string(),
+            prompt: "remember to keep the next reply concise before answering this turn"
+                .to_string(),
             images: vec![],
             role: "main".to_string(),
         };
@@ -14241,11 +14767,13 @@ Cleanup status: clean";
             session_id.clone(),
             payload,
             current,
-            "remember to run tests before answering this turn".to_string(),
+            "remember to keep the next reply concise before answering this turn".to_string(),
             "main".to_string(),
         )
         .await
-        .expect_err("test may run without a configured worker runtime, but ephemeral remember-to must still avoid saving memory");
+        .expect("prompt should queue through utility worker");
+        let _ = wait_for_session_state(&state, &session_id, "active").await;
+        server.await.expect("test server should finish");
 
         assert!(
             state
@@ -14253,11 +14781,13 @@ Cleanup status: clean";
                 .list_memory_entries()
                 .expect("memory should list")
                 .into_iter()
-                .all(|entry| entry.content != "run tests before answering this turn")
+                .all(|entry| entry.content
+                    != "keep the next reply concise before answering this turn")
         );
 
         let _ = fs::remove_dir_all(&state_dir);
     }
+
     #[tokio::test]
     async fn paused_session_rejects_prompt_before_explicit_memory_write() {
         let state_dir = test_state_dir("paused-session-memory-guard");
@@ -14621,6 +15151,92 @@ for line in sys.stdin:
         }
     }
 
+    fn set_default_profile_utility_target(
+        state: &AppState,
+        provider: &str,
+        model: &str,
+        base_url: &str,
+        api_key: &str,
+    ) {
+        let workspace = state.store.workspace().expect("workspace should load");
+        let profile = workspace
+            .profiles
+            .into_iter()
+            .find(|profile| profile.id == workspace.default_profile_id)
+            .expect("default profile should exist");
+        state
+            .store
+            .update_workspace_profile(
+                &profile.id,
+                nucleus_storage::WorkspaceProfilePatch {
+                    title: profile.title,
+                    main: profile.main,
+                    utility: WorkspaceModelConfig {
+                        adapter: provider.to_string(),
+                        model: model.to_string(),
+                        base_url: base_url.to_string(),
+                        api_key: api_key.to_string(),
+                    },
+                    is_default: true,
+                },
+            )
+            .expect("default utility profile should update");
+    }
+
+    async fn spawn_single_response_openai_server(
+        content: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener addr should be available")
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("test request should connect");
+            let _ = read_test_http_body(&mut socket).await;
+            write_test_openai_sse_response(&mut socket, "turn-0", content).await;
+        });
+        (base_url, server)
+    }
+
+    async fn spawn_single_unauthorized_openai_server(
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener addr should be available")
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("test request should connect");
+            let _ = read_test_http_body(&mut socket).await;
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("test response should write");
+        });
+        (base_url, server)
+    }
+
     fn create_command_test_context(
         state: &AppState,
         label: &str,
@@ -14867,6 +15483,9 @@ for line in sys.stdin:
             requested_by: "user".to_string(),
             prompt_excerpt: "open a pr to merge to dev".to_string(),
             root_worker_id: Some(format!("{id}-worker")),
+            executor_lane: "utility".to_string(),
+            executor_provider: "openai_compatible".to_string(),
+            executor_model: "gpt-5.4-mini".to_string(),
             visible_turn_id: None,
             result_summary: String::new(),
             last_error: String::new(),
