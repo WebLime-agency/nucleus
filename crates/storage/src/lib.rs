@@ -2146,7 +2146,9 @@ impl StateStore {
             && is_terminal_non_success_job_state(&next_state)
         {
             next_browser_verification_status = "unavailable".to_string();
-            if next_browser_verification_summary.trim().is_empty() {
+            if next_browser_verification_summary.trim().is_empty()
+                || is_pending_browser_verification_summary(&next_browser_verification_summary)
+            {
                 next_browser_verification_summary =
                     terminal_browser_verification_summary(&next_state).to_string();
             }
@@ -4393,6 +4395,10 @@ fn terminal_browser_verification_summary(state: &str) -> &'static str {
         "canceled" => "Job was canceled before browser verification completed.",
         _ => "Job failed before browser verification completed.",
     }
+}
+
+fn is_pending_browser_verification_summary(summary: &str) -> bool {
+    summary.trim() == "Browser verification is required for this UI-renderable job."
 }
 
 fn publication_requested_for_job(_title: &str, _purpose: &str, prompt_excerpt: &str) -> bool {
@@ -9159,6 +9165,9 @@ and open a pull request to dev when it is ready."
                     ui_renderable: Some("true".to_string()),
                     browser_verification_required: Some(true),
                     browser_verification_status: Some("pending".to_string()),
+                    browser_verification_summary: Some(
+                        "Browser verification is required for this UI-renderable job.".to_string(),
+                    ),
                     last_error: Some("worker returned invalid Nucleus action".to_string()),
                     ..JobPatch::default()
                 },
@@ -9214,6 +9223,9 @@ and open a pull request to dev when it is ready."
                     ui_renderable: Some("true".to_string()),
                     browser_verification_required: Some(true),
                     browser_verification_status: Some("pending".to_string()),
+                    browser_verification_summary: Some(
+                        "Browser verification is required for this UI-renderable job.".to_string(),
+                    ),
                     ..JobPatch::default()
                 },
             )
