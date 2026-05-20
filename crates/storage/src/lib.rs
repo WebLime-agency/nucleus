@@ -284,7 +284,13 @@ pub struct WorkerRecord {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkerPatch {
+    pub title: Option<String>,
+    pub lane: Option<String>,
     pub state: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub provider_base_url: Option<String>,
+    pub provider_api_key: Option<String>,
     pub provider_session_id: Option<String>,
     pub step_count: Option<usize>,
     pub tool_call_count: Option<usize>,
@@ -2268,17 +2274,29 @@ impl StateStore {
             "
             UPDATE job_workers
             SET
-                state = ?2,
-                provider_session_id = ?3,
-                step_count = ?4,
-                tool_call_count = ?5,
-                last_error = ?6,
+                title = ?2,
+                lane = ?3,
+                state = ?4,
+                provider = ?5,
+                model = ?6,
+                provider_base_url = ?7,
+                provider_api_key = ?8,
+                provider_session_id = ?9,
+                step_count = ?10,
+                tool_call_count = ?11,
+                last_error = ?12,
                 updated_at = unixepoch()
             WHERE id = ?1
             ",
             params![
                 worker_id,
+                patch.title.unwrap_or(current.title),
+                patch.lane.unwrap_or(current.lane),
                 patch.state.unwrap_or(current.state),
+                patch.provider.unwrap_or(current.provider),
+                patch.model.unwrap_or(current.model),
+                patch.provider_base_url.unwrap_or(current.provider_base_url),
+                patch.provider_api_key.unwrap_or(current.provider_api_key),
                 patch
                     .provider_session_id
                     .unwrap_or(current.provider_session_id),
@@ -2297,7 +2315,14 @@ impl StateStore {
         grants: &[ToolCapabilityGrantRecord],
     ) -> Result<Vec<ToolCapabilitySummary>> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
-        ensure_worker_exists(&connection, worker_id)?;
+        let worker = load_worker_summary(&connection, worker_id)?;
+        if worker.lane != "utility" && !grants.is_empty() {
+            bail!(
+                "worker '{}' is lane '{}' and cannot receive action capability grants; only utility workers may receive action grants",
+                worker_id,
+                worker.lane
+            );
+        }
         connection.execute(
             "DELETE FROM tool_capability_grants WHERE worker_id = ?1",
             params![worker_id],
@@ -6839,6 +6864,13 @@ fn load_job_summary(connection: &Connection, job_id: &str) -> Result<JobSummary>
     job.worker_count = count_for_job(connection, "job_workers", job_id)?;
     job.pending_approval_count = count_pending_approvals_for_job(connection, job_id)?;
     job.artifact_count = count_for_job(connection, "job_artifacts", job_id)?;
+    if let Some(root_worker_id) = job.root_worker_id.as_deref() {
+        if let Ok(worker) = load_worker_summary(connection, root_worker_id) {
+            job.executor_lane = worker.lane;
+            job.executor_provider = worker.provider;
+            job.executor_model = worker.model;
+        }
+    }
     Ok(job)
 }
 
@@ -6866,6 +6898,9 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         requested_by: row.get(8)?,
         prompt_excerpt: row.get(9)?,
         root_worker_id: row.get(10)?,
+        executor_lane: String::new(),
+        executor_provider: String::new(),
+        executor_model: String::new(),
         visible_turn_id: row.get(11)?,
         result_summary: row.get(12)?,
         last_error: row.get(13)?,
