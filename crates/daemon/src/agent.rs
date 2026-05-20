@@ -7900,6 +7900,82 @@ fn detect_command_port(spec: &ResolvedCommandSpec) -> Option<u16> {
         })
 }
 
+fn command_port_preflight_hosts(spec: &ResolvedCommandSpec) -> Vec<&'static str> {
+    let mut hosts = Vec::new();
+    for host in detect_command_hosts(spec) {
+        match normalize_declared_host_for_preflight(&host) {
+            Some(PreflightHost::Ipv4Loopback) => push_unique_host(&mut hosts, "127.0.0.1"),
+            Some(PreflightHost::Ipv6Loopback) => push_unique_host(&mut hosts, "::1"),
+            Some(PreflightHost::BothLoopbacks) => {
+                push_unique_host(&mut hosts, "127.0.0.1");
+                push_unique_host(&mut hosts, "::1");
+            }
+            None => {}
+        }
+    }
+    if hosts.is_empty() {
+        hosts.push("127.0.0.1");
+        hosts.push("::1");
+    }
+    hosts
+}
+
+fn push_unique_host(hosts: &mut Vec<&'static str>, host: &'static str) {
+    if !hosts.contains(&host) {
+        hosts.push(host);
+    }
+}
+
+enum PreflightHost {
+    Ipv4Loopback,
+    Ipv6Loopback,
+    BothLoopbacks,
+}
+
+fn normalize_declared_host_for_preflight(host: &str) -> Option<PreflightHost> {
+    match host.trim_matches(['"', '\'']) {
+        "127.0.0.1" | "0.0.0.0" => Some(PreflightHost::Ipv4Loopback),
+        "::1" | "[::1]" | "::" | "[::]" => Some(PreflightHost::Ipv6Loopback),
+        "localhost" => Some(PreflightHost::BothLoopbacks),
+        _ => None,
+    }
+}
+
+fn detect_command_hosts(spec: &ResolvedCommandSpec) -> Vec<String> {
+    if is_shell_command(&spec.command) {
+        return shell_command_payloads(&spec.args)
+            .into_iter()
+            .flat_map(detect_shell_payload_hosts)
+            .collect();
+    }
+    let tokens = spec.args.iter().map(String::as_str).collect::<Vec<_>>();
+    detect_host_tokens(&tokens)
+}
+
+fn detect_shell_payload_hosts(payload: &str) -> Vec<String> {
+    let words = payload.split_ascii_whitespace().collect::<Vec<_>>();
+    detect_host_tokens(&words)
+}
+
+fn detect_host_tokens(tokens: &[&str]) -> Vec<String> {
+    let mut hosts = Vec::new();
+    let mut iter = tokens.iter().copied().peekable();
+    while let Some(token) = iter.next() {
+        if token == "--host" {
+            if let Some(value) = iter.peek().copied().filter(|value| !value.starts_with('-')) {
+                hosts.push(value.trim_matches(['"', '\'']).to_string());
+            }
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--host=") {
+            if !value.is_empty() {
+                hosts.push(value.trim_matches(['"', '\'']).to_string());
+            }
+        }
+    }
+    hosts
+}
+
 fn detect_command_port_tokens(args: &[String]) -> Option<u16> {
     let mut iter = args.iter().map(String::as_str).peekable();
     while let Some(arg) = iter.next() {
@@ -8069,7 +8145,7 @@ fn ensure_declared_command_port_available(spec: &ResolvedCommandSpec) -> Result<
         return Ok(());
     }
 
-    for host in ["127.0.0.1", "::1"] {
+    for host in command_port_preflight_hosts(spec) {
         match StdTcpListener::bind((host, port)) {
             Ok(listener) => {
                 drop(listener);
@@ -13300,6 +13376,43 @@ Cleanup status: clean";
         let error = ensure_declared_command_port_available(&spec)
             .expect_err("occupied IPv6 loopback port should fail preflight");
         assert!(error.to_string().contains("already in use"));
+    }
+
+    #[test]
+    fn declared_ipv4_loopback_host_ignores_occupied_ipv6_loopback() {
+        let listener = match std::net::TcpListener::bind("[::1]:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == ErrorKind::AddrNotAvailable => return,
+            Err(error) => panic!("test IPv6 listener should bind or be unavailable: {error}"),
+        };
+        let port = listener
+            .local_addr()
+            .expect("listener addr should be available")
+            .port();
+        let ipv4_probe = match std::net::TcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => listener,
+            Err(_) => return,
+        };
+        drop(ipv4_probe);
+
+        let spec = ResolvedCommandSpec {
+            mode: "interactive".to_string(),
+            title: "Dev server".to_string(),
+            command: "sh".to_string(),
+            args: vec![
+                "-lc".to_string(),
+                format!("vite --host 127.0.0.1 --port {port}"),
+            ],
+            cwd: PathBuf::from("/tmp"),
+            timeout_secs: 30,
+            output_limit_bytes: 1024,
+            network_policy: "inherit".to_string(),
+            env: BTreeMap::new(),
+        };
+
+        assert_eq!(detect_command_port(&spec), Some(port));
+        assert_eq!(command_port_preflight_hosts(&spec), vec!["127.0.0.1"]);
+        assert!(ensure_declared_command_port_available(&spec).is_ok());
     }
 
     #[test]
