@@ -366,6 +366,7 @@ pub struct JobArtifactRecord {
     pub mime_type: String,
     pub size_bytes: u64,
     pub preview_text: String,
+    pub metadata_json: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -376,6 +377,7 @@ pub struct JobArtifactPatch {
     pub mime_type: Option<String>,
     pub size_bytes: Option<u64>,
     pub preview_text: Option<String>,
+    pub metadata_json: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2689,9 +2691,10 @@ impl StateStore {
                 path,
                 mime_type,
                 size_bytes,
-                preview_text
+                preview_text,
+                metadata_json
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             ",
             params![
                 record.id,
@@ -2705,6 +2708,7 @@ impl StateStore {
                 record.mime_type,
                 record.size_bytes as i64,
                 record.preview_text,
+                serde_json::to_string(&record.metadata_json)?,
             ],
         )?;
 
@@ -2727,7 +2731,8 @@ impl StateStore {
                 path = ?4,
                 mime_type = ?5,
                 size_bytes = ?6,
-                preview_text = ?7
+                preview_text = ?7,
+                metadata_json = ?8
             WHERE id = ?1
             ",
             params![
@@ -2738,6 +2743,7 @@ impl StateStore {
                 patch.mime_type.unwrap_or(current.mime_type),
                 patch.size_bytes.unwrap_or(current.size_bytes) as i64,
                 patch.preview_text.unwrap_or(current.preview_text),
+                serde_json::to_string(&patch.metadata_json.unwrap_or(current.metadata_json))?,
             ],
         )?;
 
@@ -3311,6 +3317,7 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             mime_type TEXT NOT NULL DEFAULT 'text/plain',
             size_bytes INTEGER NOT NULL DEFAULT 0,
             preview_text TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
             created_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
 
@@ -3760,6 +3767,12 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "job_artifacts",
         "command_session_id",
         "TEXT REFERENCES command_sessions(id) ON DELETE SET NULL",
+    )?;
+    ensure_column(
+        connection,
+        "job_artifacts",
+        "metadata_json",
+        "TEXT NOT NULL DEFAULT '{}'",
     )?;
     ensure_column(
         connection,
@@ -5121,6 +5134,8 @@ fn write_token_file(path: &Path, token: &str) -> Result<()> {
 }
 
 fn sync_projects_with_connection(connection: &Connection) -> Result<()> {
+    connection.execute("UPDATE projects SET active = 0", [])?;
+
     let root_path = workspace_root(connection)?;
     let root = PathBuf::from(&root_path);
 
@@ -5142,6 +5157,7 @@ fn sync_projects_with_connection(connection: &Connection) -> Result<()> {
                 slug = excluded.slug,
                 relative_path = excluded.relative_path,
                 absolute_path = excluded.absolute_path,
+                active = 1,
                 updated_at = unixepoch()
             ",
             params![
@@ -5164,6 +5180,7 @@ fn list_projects_with_connection(connection: &Connection) -> Result<Vec<ProjectS
         "
         SELECT id, title, slug, relative_path, absolute_path, created_at, updated_at
         FROM projects
+        WHERE active = 1
         ORDER BY relative_path ASC, title ASC
         ",
     )?;
@@ -7226,6 +7243,7 @@ fn load_artifact_summary(connection: &Connection, artifact_id: &str) -> Result<A
                 mime_type,
                 size_bytes,
                 preview_text,
+                metadata_json,
                 created_at
             FROM job_artifacts
             WHERE id = ?1
@@ -7244,7 +7262,8 @@ fn load_artifact_summary(connection: &Connection, artifact_id: &str) -> Result<A
                     mime_type: row.get(8)?,
                     size_bytes: row.get::<_, i64>(9)?.max(0) as u64,
                     preview_text: row.get(10)?,
-                    created_at: row.get(11)?,
+                    metadata_json: decode_json_value(row.get(11)?)?,
+                    created_at: row.get(12)?,
                 })
             },
         )
@@ -8237,6 +8256,71 @@ mod tests {
         assert_eq!(active.main.adapter, "openai_compatible");
         assert_eq!(active.main.base_url, "http://127.0.0.1:20128/v1");
         assert_eq!(active.main.api_key, "secret-token");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn changing_workspace_root_hides_projects_from_the_previous_root() {
+        let state_dir = test_state_dir("workspace-root-project-sync");
+        let root_a = state_dir.join("workspace-a");
+        let root_b = state_dir.join("workspace-b");
+        let alpha_git = root_a.join("alpha").join(".git");
+        let beta_git = root_b.join("beta").join(".git");
+
+        fs::create_dir_all(&alpha_git).expect("root a project marker should be created");
+        fs::create_dir_all(&beta_git).expect("root b project marker should be created");
+
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let workspace_a = store
+            .update_workspace(
+                Some(root_a.to_str().expect("workspace root should be utf-8")),
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("workspace root should update");
+        assert_eq!(workspace_a.projects.len(), 1);
+        assert_eq!(workspace_a.projects[0].relative_path, "alpha");
+
+        let workspace_b = store
+            .update_workspace(
+                Some(root_b.to_str().expect("workspace root should be utf-8")),
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("workspace root should update");
+        assert_eq!(workspace_b.projects.len(), 1);
+        assert_eq!(workspace_b.projects[0].relative_path, "beta");
+        assert!(
+            workspace_b
+                .projects
+                .iter()
+                .all(|project| project.relative_path != "alpha")
+        );
+
+        let connection = store.connection.lock().expect("storage mutex poisoned");
+        let inactive_alpha: i64 = connection
+            .query_row(
+                "SELECT active FROM projects WHERE relative_path = 'alpha'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("alpha project row should remain in storage");
+        let active_beta: i64 = connection
+            .query_row(
+                "SELECT active FROM projects WHERE relative_path = 'beta'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("beta project row should exist in storage");
+        drop(connection);
+
+        assert_eq!(inactive_alpha, 0);
+        assert_eq!(active_beta, 1);
 
         let _ = fs::remove_dir_all(&state_dir);
     }

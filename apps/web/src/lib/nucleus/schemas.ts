@@ -246,6 +246,7 @@ export const artifactSummarySchema = z.object({
   mime_type: z.string(),
   size_bytes: z.number().int().nonnegative(),
   preview_text: z.string(),
+  metadata_json: z.unknown().default({}),
   created_at: z.number().int()
 });
 
@@ -345,6 +346,19 @@ export const promptProgressUpdateSchema = z.object({
   route_title: z.string(),
   attempt: z.number().int().nonnegative(),
   attempt_count: z.number().int().nonnegative(),
+  memory_outcomes: z
+    .array(
+      z.object({
+        kind: z.string(),
+        state: z.string(),
+        memory_id: z.string(),
+        candidate_id: z.string(),
+        dedupe_key: z.string(),
+        title: z.string(),
+        detail: z.string()
+      })
+    )
+    .default([]),
   created_at: z.number().int()
 });
 

@@ -49,15 +49,15 @@ use nucleus_protocol::{
     MAX_CONFIGURED_JOB_TOOL_CALLS, MAX_CONFIGURED_JOB_WALL_CLOCK_SECS, McpServerRecord,
     McpServerSummary, McpToolRecord, MemoryCandidate, MemoryCandidateAcceptRequest,
     MemoryCandidateListResponse, MemoryCandidateUpsertRequest, MemoryEntry,
-    MemoryEntryUpsertRequest, MemorySearchResponse, MemorySummary, NucleusToolDescriptor,
-    PlaybookDetail, PlaybookSummary, ProcessKillRequest, ProcessKillResponse, ProcessListResponse,
-    ProcessStreamUpdate, ProjectUpdateRequest, PromptProgressUpdate, RouterProfileSummary,
-    RunBudgetSummary, RuntimeOverview, RuntimeSummary, SessionDetail, SessionPromptRequest,
-    SessionSummary, SettingsSummary, SkillImportRequest, SkillImportResponse, SkillInstallResult,
-    SkillInstallVerification, SkillInstallationRecord, SkillInstallationUpsertRequest,
-    SkillManifest, SkillPackageRecord, SkillPackageUpsertRequest, SkillReconcileCandidate,
-    SkillReconcileRequest, SkillReconcileScanResponse, StreamConnected, SystemStats,
-    UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
+    MemoryEntryUpsertRequest, MemoryOutcome, MemorySearchResponse, MemorySummary,
+    NucleusToolDescriptor, PlaybookDetail, PlaybookSummary, ProcessKillRequest,
+    ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate, ProjectUpdateRequest,
+    PromptProgressUpdate, RouterProfileSummary, RunBudgetSummary, RuntimeOverview, RuntimeSummary,
+    SessionDetail, SessionPromptRequest, SessionSummary, SettingsSummary, SkillImportRequest,
+    SkillImportResponse, SkillInstallResult, SkillInstallVerification, SkillInstallationRecord,
+    SkillInstallationUpsertRequest, SkillManifest, SkillPackageRecord, SkillPackageUpsertRequest,
+    SkillReconcileCandidate, SkillReconcileRequest, SkillReconcileScanResponse, StreamConnected,
+    SystemStats, UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
     UserFacingErrorSummary, VaultInitRequest, VaultSecretListResponse,
     VaultSecretPolicyListResponse, VaultSecretPolicySummary, VaultSecretPolicyUpsertRequest,
     VaultSecretSummary, VaultSecretUpdateRequest, VaultSecretUpsertRequest, VaultStatusSummary,
@@ -1248,10 +1248,16 @@ fn upsert_memory_from_request(
     let scope_kind = normalize_memory_scope_kind(&payload.scope_kind)?;
     let scope_id = payload.scope_id.trim();
     let title = payload.title.trim();
-    let content = security::RedactionSet::new().redact_text(payload.content.trim());
-    if scope_id.is_empty() || title.is_empty() || content.is_empty() {
+    let raw_content = payload.content.trim();
+    let content = security::RedactionSet::new().redact_text(raw_content);
+    if scope_id.is_empty()
+        || title.is_empty()
+        || content.is_empty()
+        || contains_credential_like_value(raw_content)
+        || content.contains("[REDACTED_SECRET]")
+    {
         return Err(ApiError::bad_request(
-            "memory scope, title, and content are required",
+            "memory scope, title, and non-secret content are required",
         ));
     }
     let id = match id_override {
@@ -1710,6 +1716,302 @@ async fn explicit_remember(
     Ok(Json(entry))
 }
 
+#[derive(Debug, Clone)]
+struct ParsedExplicitMemoryIntent {
+    title: String,
+    content: String,
+    memory_kind: String,
+}
+
+fn explicit_memory_clause(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return trimmed;
+    }
+    let mut boundary = trimmed.len();
+    for (idx, ch) in trimmed.char_indices() {
+        let remainder = &trimmed[idx..];
+        if remainder.starts_with(". Also ")
+            || remainder.starts_with(". also ")
+            || remainder.starts_with("! Also ")
+            || remainder.starts_with("! also ")
+            || remainder.starts_with("? Also ")
+            || remainder.starts_with("? also ")
+            || ch == '\n'
+        {
+            boundary = idx;
+            break;
+        }
+    }
+    trimmed[..boundary].trim()
+}
+
+fn detect_explicit_memory_intent(prompt: &str) -> Option<ParsedExplicitMemoryIntent> {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let prefixes = [
+        "remember that ",
+        "can you remember that ",
+        "could you remember that ",
+        "please remember that ",
+        "remember ",
+        "can you remember ",
+        "could you remember ",
+        "please remember ",
+        "for future reference, ",
+        "for future reference ",
+        "keep in mind that ",
+        "keep in mind ",
+        "moving forward please remember ",
+        "moving forward, please remember ",
+    ];
+    let matched = prefixes
+        .iter()
+        .find_map(|prefix| lower.strip_prefix(prefix).map(|_| *prefix))?;
+    let raw_clause = explicit_memory_clause(&trimmed[matched.len()..]).trim();
+    let mut content = if let Some(rest) = raw_clause.strip_prefix('"') {
+        if let Some(closing_quote) = rest.find('"') {
+            let quoted = &rest[..closing_quote];
+            let remainder = rest[closing_quote + 1..].trim_start();
+            if remainder.is_empty() {
+                quoted.to_string()
+            } else {
+                format!("{} {}", quoted, remainder)
+            }
+        } else {
+            rest.to_string()
+        }
+    } else {
+        raw_clause.to_string()
+    };
+    content = content.trim().to_string();
+    if let Some(rest) = content.strip_prefix("that ") {
+        content = rest.trim().to_string();
+    }
+    content = content
+        .trim_end_matches(|c: char| matches!(c, '.' | '!' | '?'))
+        .trim()
+        .to_string();
+    if content.len() < 8 {
+        return None;
+    }
+    let content_lower = content.to_ascii_lowercase();
+    if ["to ", "if ", "when ", "what ", "where ", "why ", "how "]
+        .iter()
+        .any(|prefix| content_lower.starts_with(prefix))
+    {
+        return None;
+    }
+    let memory_kind = if content_lower.contains("prefer") || content_lower.contains("preference") {
+        "preference"
+    } else if content_lower.contains("always") || content_lower.contains("must") {
+        "constraint"
+    } else {
+        "note"
+    };
+    Some(ParsedExplicitMemoryIntent {
+        title: excerpt(&content, 64),
+        content,
+        memory_kind: memory_kind.to_string(),
+    })
+}
+
+fn infer_prompt_memory_scope(session: &SessionSummary) -> (String, String) {
+    let scope_kind = infer_session_memory_scope_kind(session);
+    let scope_id = infer_session_memory_scope_id(session, &scope_kind);
+    (scope_kind, scope_id)
+}
+
+fn normalized_memory_overlap_key(
+    scope_kind: &str,
+    scope_id: &str,
+    _title: &str,
+    content: &str,
+) -> String {
+    let mut h = Sha256::new();
+    h.update(format!(
+        "{}:{}:{}",
+        scope_kind,
+        scope_id,
+        content.to_lowercase()
+    ));
+    format!("memory-overlap:{:x}", h.finalize())
+}
+
+fn find_overlapping_memory_entry(
+    state: &AppState,
+    scope_kind: &str,
+    scope_id: &str,
+    _memory_kind: &str,
+    title: &str,
+    content: &str,
+) -> Result<Option<MemoryEntry>, ApiError> {
+    let key = normalized_memory_overlap_key(scope_kind, scope_id, title, content);
+    Ok(state
+        .store
+        .list_memory_entries()?
+        .into_iter()
+        .find(|entry| {
+            entry.scope_kind == scope_kind
+                && entry.scope_id == scope_id
+                && entry.enabled
+                && entry.status == "accepted"
+                && normalized_memory_overlap_key(
+                    &entry.scope_kind,
+                    &entry.scope_id,
+                    &entry.title,
+                    &entry.content,
+                ) == key
+        }))
+}
+
+fn mark_overlapping_candidates_superseded(
+    state: &AppState,
+    entry: &MemoryEntry,
+) -> Result<Vec<String>, ApiError> {
+    let overlap_key = normalized_memory_overlap_key(
+        &entry.scope_kind,
+        &entry.scope_id,
+        &entry.title,
+        &entry.content,
+    );
+    let mut promoted = Vec::new();
+    for candidate in state.store.list_memory_candidates()? {
+        if candidate.status != "pending"
+            || candidate.scope_kind != entry.scope_kind
+            || candidate.scope_id != entry.scope_id
+            || normalized_memory_overlap_key(
+                &candidate.scope_kind,
+                &candidate.scope_id,
+                &candidate.title,
+                &candidate.content,
+            ) != overlap_key
+        {
+            continue;
+        }
+        let mut next = candidate.clone();
+        next.status = "superseded".to_string();
+        next.accepted_memory_id = entry.id.clone();
+        state.store.upsert_memory_candidate(&next)?;
+        promoted.push(next.id);
+    }
+    Ok(promoted)
+}
+
+fn build_explicit_memory_entry_request(
+    session: &SessionSummary,
+    intent: ParsedExplicitMemoryIntent,
+) -> MemoryEntryUpsertRequest {
+    let (scope_kind, scope_id) = infer_prompt_memory_scope(session);
+    let generated_id = format!(
+        "explicit-{}",
+        stable_short_hash(&format!(
+            "{}:{}:{}:{}",
+            scope_kind, scope_id, intent.title, intent.content
+        ))
+    );
+    MemoryEntryUpsertRequest {
+        id: Some(generated_id),
+        scope_kind,
+        scope_id,
+        title: intent.title,
+        content: intent.content,
+        tags: vec!["explicit".to_string()],
+        enabled: Some(true),
+        status: Some("accepted".to_string()),
+        memory_kind: Some(intent.memory_kind),
+        source_kind: Some("explicit_remember".to_string()),
+        source_id: Some(session.id.clone()),
+        confidence: Some(1.0),
+        created_by: Some("user".to_string()),
+        last_used_at: None,
+        use_count: Some(0),
+        supersedes_id: None,
+        metadata_json: Some(json!({ "source": "prompt_intent" })),
+    }
+}
+
+pub(crate) async fn save_explicit_memory_from_prompt(
+    state: &AppState,
+    session: &SessionSummary,
+    prompt: &str,
+) -> Result<Vec<MemoryOutcome>, ApiError> {
+    let Some(intent) = detect_explicit_memory_intent(prompt) else {
+        return Ok(Vec::new());
+    };
+    let (scope_kind, scope_id) = infer_prompt_memory_scope(session);
+    if let Some(existing) = find_overlapping_memory_entry(
+        state,
+        &scope_kind,
+        &scope_id,
+        &intent.memory_kind,
+        &intent.title,
+        &intent.content,
+    )? {
+        let promoted = mark_overlapping_candidates_superseded(state, &existing)?;
+        return Ok(vec![MemoryOutcome {
+            kind: "explicit_save".to_string(),
+            state: if promoted.is_empty() {
+                "ignored"
+            } else {
+                "promoted"
+            }
+            .to_string(),
+            memory_id: existing.id,
+            candidate_id: promoted.into_iter().next().unwrap_or_default(),
+            dedupe_key: memory_dedupe_key(
+                &scope_kind,
+                &scope_id,
+                &intent.memory_kind,
+                &intent.title,
+                &intent.content,
+            ),
+            title: intent.title,
+            detail: "Explicit remember request matched existing accepted memory.".to_string(),
+        }]);
+    }
+    let entry = upsert_memory_from_request(
+        state,
+        build_explicit_memory_entry_request(session, intent.clone()),
+        None,
+    )?;
+    let promoted = mark_overlapping_candidates_superseded(state, &entry)?;
+    record_memory_audit(
+        state,
+        "memory.explicit.created_from_prompt",
+        &entry.id,
+        "created",
+        &format!(
+            "Created explicit memory '{}' from user turn intent.",
+            entry.title
+        ),
+    )
+    .await;
+    Ok(vec![MemoryOutcome {
+        kind: "explicit_save".to_string(),
+        state: if promoted.is_empty() {
+            "saved"
+        } else {
+            "promoted"
+        }
+        .to_string(),
+        memory_id: entry.id,
+        candidate_id: promoted.into_iter().next().unwrap_or_default(),
+        dedupe_key: memory_dedupe_key(
+            &scope_kind,
+            &scope_id,
+            &entry.memory_kind,
+            &entry.title,
+            &entry.content,
+        ),
+        title: entry.title,
+        detail: "Nucleus saved the explicit durable memory request.".to_string(),
+    }])
+}
+
 async fn upsert_memory_candidate_from_request(
     state: &AppState,
     payload: MemoryCandidateUpsertRequest,
@@ -1835,13 +2137,42 @@ fn memory_dedupe_key(
 }
 fn contains_credential_like_value(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
+    let normalized = lower.replace(['\n', '\r', '\t'], " ");
     lower.contains("authorization: bearer")
         || lower.contains("-----begin ")
         || lower.contains("password=")
         || lower.contains("api_key=")
         || lower.contains("access_token=")
         || lower.contains("refresh_token=")
-        || lower.contains("://") && lower.contains('@')
+        || normalized.contains("password is ")
+        || normalized.contains("password: ")
+        || normalized.contains("my password is ")
+        || normalized.contains("api key is ")
+        || normalized.contains("api key: ")
+        || normalized.contains("my api key is ")
+        || normalized.contains("access token is ")
+        || normalized.contains("access token: ")
+        || normalized.contains("refresh token is ")
+        || normalized.contains("refresh token: ")
+        || normalized.contains("secret is ")
+        || normalized.contains("secret: ")
+        || normalized.contains("token is ")
+        || normalized.contains("token: ")
+        || contains_url_userinfo(&lower)
+}
+
+fn contains_url_userinfo(text: &str) -> bool {
+    text.split_whitespace().any(|token| {
+        let Some(scheme_idx) = token.find("://") else {
+            return false;
+        };
+        let authority = &token[scheme_idx + 3..];
+        let authority_end = authority
+            .find(|c| ['/', '?', '#'].contains(&c))
+            .unwrap_or(authority.len());
+        let host = &authority[..authority_end];
+        host.contains('@')
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1933,58 +2264,6 @@ pub(crate) fn detect_manual_remember_request(prompt: &str) -> Option<ManualRemem
     })
 }
 
-pub(crate) fn memory_scope_for_session(project_id: &str) -> (&'static str, String) {
-    if !project_id.trim().is_empty() {
-        ("project", project_id.trim().to_string())
-    } else {
-        ("workspace", "workspace".to_string())
-    }
-}
-
-pub(crate) fn build_manual_remember_upsert_request(
-    session_id: &str,
-    project_id: &str,
-    remember: ManualRememberRequest,
-) -> MemoryEntryUpsertRequest {
-    let (scope_kind, scope_id) = memory_scope_for_session(project_id);
-    let slug = remember
-        .title
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
-        .collect::<String>()
-        .trim_matches('-')
-        .split('-')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("-");
-    let memory_id = if slug.is_empty() {
-        format!("remember-{session_id}")
-    } else {
-        format!("remember-{slug}")
-    };
-    MemoryEntryUpsertRequest {
-        id: Some(memory_id),
-        scope_kind: scope_kind.to_string(),
-        scope_id,
-        title: remember.title,
-        content: remember.content,
-        tags: Vec::new(),
-        enabled: Some(true),
-        status: Some("accepted".to_string()),
-        memory_kind: Some(remember.memory_kind),
-        source_kind: Some("explicit_remember".to_string()),
-        source_id: Some(session_id.to_string()),
-        confidence: Some(1.0),
-        created_by: Some("user".to_string()),
-        last_used_at: None,
-        use_count: Some(0),
-        supersedes_id: None,
-        metadata_json: Some(json!({
-            "origin": "chat_manual_remember",
-            "session_id": session_id,
-        })),
-    }
-}
 async fn record_memory_audit(
     state: &AppState,
     kind: &str,
@@ -10266,7 +10545,6 @@ mod tests {
         let _ = fs::remove_dir_all(&state_dir);
     }
 
-
     #[test]
     fn detect_manual_remember_request_accepts_natural_language_variants() {
         let direct = detect_manual_remember_request("Remember that I like vanilla ice cream.")
@@ -10274,10 +10552,9 @@ mod tests {
         assert_eq!(direct.content, "I like vanilla ice cream");
         assert_eq!(direct.memory_kind, "preference");
 
-        let polite = detect_manual_remember_request(
-            "Can you remember that I like vanilla ice cream?",
-        )
-        .expect("polite remember should be detected");
+        let polite =
+            detect_manual_remember_request("Can you remember that I like vanilla ice cream?")
+                .expect("polite remember should be detected");
         assert_eq!(polite.content, "I like vanilla ice cream");
 
         let future = detect_manual_remember_request("For future reference, I use fish shell.")
@@ -10293,8 +10570,13 @@ mod tests {
 
     #[test]
     fn detect_manual_remember_request_rejects_ephemeral_and_secret_like_prompts() {
-        assert!(detect_manual_remember_request("remember to run tests before answering this turn").is_none());
-        assert!(detect_manual_remember_request("Please remember to keep this answer short.").is_none());
+        assert!(
+            detect_manual_remember_request("remember to run tests before answering this turn")
+                .is_none()
+        );
+        assert!(
+            detect_manual_remember_request("Please remember to keep this answer short.").is_none()
+        );
         assert!(
             detect_manual_remember_request("Remember that authorization: bearer sk-super-secret")
                 .is_none()
@@ -10390,6 +10672,447 @@ mod tests {
         assert!(bad.is_err());
         let audits = state.store.list_audit_events(20).unwrap();
         assert!(!format!("{audits:?}").contains("sk-super-secret"));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn prompt_explicit_remember_saves_accepted_memory_and_reports_outcome() {
+        let (state_dir, state) = test_named_app_state("memory-prompt-explicit-save");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session =
+            create_test_persisted_session(&state, "memory-prompt-explicit-save", &workspace_root);
+
+        let outcomes = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "remember that release reports should include exact validation commands.",
+        )
+        .await
+        .expect("explicit remember should save");
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].state, "saved");
+
+        let entries = state
+            .store
+            .list_memory_entries()
+            .expect("memory should load");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, "accepted");
+        assert_eq!(entries[0].source_kind, "explicit_remember");
+        assert!(entries[0].content.contains("exact validation commands"));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn prompt_explicit_remember_only_saves_first_clause() {
+        let (state_dir, state) = test_named_app_state("memory-prompt-first-clause");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session =
+            create_test_persisted_session(&state, "memory-prompt-first-clause", &workspace_root);
+
+        let outcomes = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "remember that workspace prefers concise release notes. Also run cargo test before you answer.",
+        )
+        .await
+        .expect("explicit remember should save only the durable clause");
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].state, "saved");
+
+        let entries = state
+            .store
+            .list_memory_entries()
+            .expect("memory should load");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].content,
+            "workspace prefers concise release notes"
+        );
+        assert!(!entries[0].content.contains("run cargo test"));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn prompt_moving_forward_please_remember_regresses_and_dedupes() {
+        let (state_dir, state) = test_named_app_state("memory-prompt-regression");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session =
+            create_test_persisted_session(&state, "memory-prompt-regression", &workspace_root);
+
+        let first = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "moving forward please remember the workspace prefers concise release notes.",
+        )
+        .await
+        .expect("regression phrasing should save");
+        assert_eq!(first[0].state, "saved");
+
+        let second = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "moving forward please remember the workspace prefers concise release notes.",
+        )
+        .await
+        .expect("duplicate explicit remember should not fail");
+        assert_eq!(second[0].state, "ignored");
+        assert_eq!(state.store.list_memory_entries().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn prompt_moving_forward_please_remember_that_strips_optional_that() {
+        let (state_dir, state) = test_named_app_state("memory-prompt-moving-forward-that");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session = create_test_persisted_session(
+            &state,
+            "memory-prompt-moving-forward-that",
+            &workspace_root,
+        );
+
+        let first = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "moving forward please remember that workspace prefers concise release notes.",
+        )
+        .await
+        .expect("moving-forward remember with optional that should save");
+        assert_eq!(first[0].state, "saved");
+
+        let entries = state.store.list_memory_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].content,
+            "workspace prefers concise release notes"
+        );
+
+        let second = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "remember that workspace prefers concise release notes.",
+        )
+        .await
+        .expect("normalized remember phrasing should dedupe");
+        assert_eq!(second[0].state, "ignored");
+        assert_eq!(state.store.list_memory_entries().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn explicit_prompt_repeat_after_title_edit_does_not_overwrite_existing_memory() {
+        let (state_dir, state) = test_named_app_state("memory-prompt-title-edit-dedupe");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session = create_test_persisted_session(
+            &state,
+            "memory-prompt-title-edit-dedupe",
+            &workspace_root,
+        );
+
+        let first = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "remember that I prefer concise release notes",
+        )
+        .await
+        .expect("first explicit remember should save");
+        assert_eq!(first[0].state, "saved");
+
+        let mut existing = state.store.list_memory_entries().unwrap().remove(0);
+        existing.title = "Manually renamed title".to_string();
+        state
+            .store
+            .upsert_memory_entry(&existing)
+            .expect("manual rename should persist");
+
+        let second = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "remember that I prefer concise release notes",
+        )
+        .await
+        .expect("repeat explicit remember should dedupe");
+        assert_eq!(second[0].state, "ignored");
+        assert_eq!(second[0].memory_id, existing.id);
+
+        let entries = state.store.list_memory_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, existing.id);
+        assert_eq!(entries[0].title, "Manually renamed title");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn prompt_non_durable_remember_does_not_save_memory() {
+        let (state_dir, state) = test_named_app_state("memory-prompt-nondurable");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session =
+            create_test_persisted_session(&state, "memory-prompt-nondurable", &workspace_root);
+
+        let outcomes = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "remember to run the tests before you answer this turn",
+        )
+        .await
+        .expect("non-durable remember should not error");
+        assert!(outcomes.is_empty());
+        assert!(state.store.list_memory_entries().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn prompt_explicit_remember_preserves_full_clause_after_leading_quoted_term() {
+        let (state_dir, state) = test_named_app_state("memory-prompt-leading-quoted-term");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session = create_test_persisted_session(
+            &state,
+            "memory-prompt-leading-quoted-term",
+            &workspace_root,
+        );
+
+        let outcomes = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "remember that \"Phoenix\" is the internal codename",
+        )
+        .await
+        .expect("leading quoted term should save full clause");
+        assert_eq!(outcomes[0].state, "saved");
+        let entries = state.store.list_memory_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "Phoenix is the internal codename");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn prompt_explicit_remember_allows_non_secret_scoped_package_url() {
+        let (state_dir, state) = test_named_app_state("memory-prompt-nonsecret-url");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session =
+            create_test_persisted_session(&state, "memory-prompt-nonsecret-url", &workspace_root);
+
+        let outcomes = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "remember that our package mirror is https://registry.npmjs.org/@types/node",
+        )
+        .await
+        .expect("non-secret package URL should save");
+        assert_eq!(outcomes[0].state, "saved");
+        let entries = state.store.list_memory_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0]
+                .content
+                .contains("https://registry.npmjs.org/@types/node")
+        );
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn prompt_explicit_remember_rejects_token_like_content_redacted_before_validation() {
+        let (state_dir, state) = test_named_app_state("memory-prompt-redacted-secret-reject");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session = create_test_persisted_session(
+            &state,
+            "memory-prompt-redacted-secret-reject",
+            &workspace_root,
+        );
+
+        let error =
+            save_explicit_memory_from_prompt(&state, &session, "remember that sk-super-secret")
+                .await
+                .expect_err("token-only explicit remember should fail");
+        assert!(
+            error
+                .message
+                .contains("scope, title, and content are required")
+                || error.message.contains("non-secret")
+        );
+        assert!(state.store.list_memory_entries().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn prompt_explicit_remember_rejects_credential_like_content() {
+        let (state_dir, state) = test_named_app_state("memory-prompt-secret-reject");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session =
+            create_test_persisted_session(&state, "memory-prompt-secret-reject", &workspace_root);
+
+        let error = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "remember that authorization: bearer sk-super-secret",
+        )
+        .await
+        .expect_err("secret-like explicit remember should fail");
+        assert!(
+            error
+                .message
+                .contains("scope, title, and content are required")
+                || error.message.contains("non-secret")
+        );
+        assert!(state.store.list_memory_entries().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn prompt_explicit_remember_rejects_token_in_url_userinfo() {
+        let (state_dir, state) = test_named_app_state("memory-prompt-userinfo-secret-reject");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session = create_test_persisted_session(
+            &state,
+            "memory-prompt-userinfo-secret-reject",
+            &workspace_root,
+        );
+
+        let error = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "remember that the repo lives at https://ghp_super_secret@github.com/org/repo.git",
+        )
+        .await
+        .expect_err("token-in-userinfo explicit remember should fail");
+        assert!(
+            error
+                .message
+                .contains("scope, title, and content are required")
+                || error.message.contains("non-secret")
+        );
+        assert!(state.store.list_memory_entries().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn explicit_prompt_save_supersedes_overlapping_pending_candidate() {
+        let (state_dir, state) = test_named_app_state("memory-prompt-supersede-candidate");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session = create_test_persisted_session(
+            &state,
+            "memory-prompt-supersede-candidate",
+            &workspace_root,
+        );
+
+        upsert_memory_candidate_from_request(
+            &state,
+            MemoryCandidateUpsertRequest {
+                id: Some("pending-overlap".to_string()),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                session_id: Some(session.id.clone()),
+                turn_id_start: None,
+                turn_id_end: None,
+                candidate_kind: Some("note".to_string()),
+                title: "workspace prefers concise release notes".to_string(),
+                content: "workspace prefers concise release notes".to_string(),
+                tags: vec![],
+                evidence: vec![],
+                reason: Some("inferred".to_string()),
+                confidence: Some(0.8),
+                status: Some("pending".to_string()),
+                dedupe_key: None,
+                accepted_memory_id: None,
+                created_by: Some("utility_worker".to_string()),
+                metadata_json: None,
+            },
+            None,
+            false,
+        )
+        .await
+        .expect("candidate should persist");
+
+        let outcomes = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "remember that workspace prefers concise release notes",
+        )
+        .await
+        .expect("explicit remember should resolve overlap");
+        assert!(matches!(outcomes[0].state.as_str(), "saved" | "promoted"));
+
+        let candidate = state
+            .store
+            .load_memory_candidate("pending-overlap")
+            .unwrap();
+        assert_eq!(candidate.status, "superseded");
+        assert!(!candidate.accepted_memory_id.is_empty());
+        assert_eq!(state.store.list_memory_entries().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn explicit_prompt_save_recreates_disabled_overlapping_memory() {
+        let (state_dir, state) = test_named_app_state("memory-prompt-disabled-overlap");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session = create_test_persisted_session(
+            &state,
+            "memory-prompt-disabled-overlap",
+            &workspace_root,
+        );
+
+        state
+            .store
+            .upsert_memory_entry(&MemoryEntry {
+                id: "disabled-memory".to_string(),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "workspace prefers concise release notes".to_string(),
+                content: "workspace prefers concise release notes".to_string(),
+                tags: vec![],
+                enabled: false,
+                status: "accepted".to_string(),
+                memory_kind: "preference".to_string(),
+                source_kind: "manual".to_string(),
+                source_id: String::new(),
+                confidence: 1.0,
+                created_by: "user".to_string(),
+                last_used_at: None,
+                use_count: 0,
+                supersedes_id: String::new(),
+                metadata_json: json!({}),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .expect("disabled memory should persist");
+
+        let outcomes = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "remember that workspace prefers concise release notes",
+        )
+        .await
+        .expect("explicit remember should save a fresh enabled memory");
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].state, "saved");
+
+        let entries = state.store.list_memory_entries().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.id == "disabled-memory" && !entry.enabled)
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.id == outcomes[0].memory_id && entry.enabled)
+        );
         let _ = fs::remove_dir_all(&state_dir);
     }
 
