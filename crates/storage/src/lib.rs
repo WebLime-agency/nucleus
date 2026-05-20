@@ -6267,6 +6267,7 @@ fn load_session_summary(connection: &Connection, session_id: &str) -> Result<Ses
     session.project_count = session.projects.len();
     session.scope = session_scope_from_projects(&session.projects, &session.scope);
     session.run_budget = session_run_budget(connection, &session.run_budget_mode)?;
+    session.capabilities = load_session_capabilities(connection, session_id)?;
 
     if session.project_id.is_empty() {
         if let Some(primary) = session.projects.iter().find(|project| project.is_primary) {
@@ -6318,6 +6319,7 @@ fn map_session_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionS
         provider_session_id: row.get(31)?,
         last_error: row.get(32)?,
         user_error: None,
+        capabilities: Vec::new(),
         last_message_excerpt: row.get(33)?,
         turn_count: row.get(34)?,
         created_at: row.get(35)?,
@@ -7032,6 +7034,33 @@ fn load_worker_summary(connection: &Connection, worker_id: &str) -> Result<Worke
         .ok_or_else(|| anyhow!("worker '{worker_id}' was not found"))?;
     worker.capabilities = load_worker_capabilities(connection, worker_id)?;
     Ok(worker)
+}
+
+fn load_session_capabilities(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<ToolCapabilitySummary>> {
+    let root_worker_id: Option<String> = connection
+        .query_row(
+            "
+            SELECT jw.id
+            FROM jobs j
+            JOIN job_workers jw ON jw.job_id = j.id
+            WHERE j.session_id = ?1
+              AND j.parent_job_id IS NULL
+              AND jw.parent_worker_id IS NULL
+            ORDER BY j.created_at DESC, jw.created_at ASC, jw.id ASC
+            LIMIT 1
+            ",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    match root_worker_id {
+        Some(worker_id) => load_worker_capabilities(connection, &worker_id),
+        None => Ok(Vec::new()),
+    }
 }
 
 fn load_worker_capabilities(

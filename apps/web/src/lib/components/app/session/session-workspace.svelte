@@ -159,6 +159,13 @@
   let browserLoading = $state(false);
   let browserError = $state<string | null>(null);
   let browserContext = $state<BrowserContextSummary | null>(null);
+  const BROWSER_CAPABILITY_PREFIX = 'browser.';
+  const browserCapabilitySummaries = $derived(
+    (selectedSession?.capabilities ?? []).filter((capability) =>
+      capability.tool_id.startsWith(BROWSER_CAPABILITY_PREFIX)
+    )
+  );
+  const browserCapabilityAvailable = $derived(browserCapabilitySummaries.length > 0);
   let browserSnapshot = $state<BrowserSnapshot | null>(null);
   let browserViewportElement = $state<HTMLImageElement | null>(null);
   let browserStageElement = $state<HTMLDivElement | null>(null);
@@ -3588,7 +3595,7 @@
                     </div>
                   {/each}
                 {/if}
-                <Button type="button" variant="ghost" size="icon" class="mb-0.5 h-8 w-8 shrink-0 rounded-md" onclick={handleBrowserOpenTab} aria-label="New browser tab">
+                <Button type="button" variant="ghost" size="icon" class="mb-0.5 h-8 w-8 shrink-0 rounded-md" onclick={handleBrowserOpenTab} aria-label="New browser tab" disabled={!browserCapabilityAvailable}>
                   <Plus class="size-4" />
                 </Button>
                 <div class="sticky right-0 ml-auto flex shrink-0 items-center gap-1 self-stretch bg-zinc-950 pl-2">
@@ -3597,7 +3604,7 @@
                       class="mb-0.5 inline-flex h-8 w-8 items-center justify-center rounded-md text-zinc-400 transition-colors hover:bg-zinc-900 hover:text-zinc-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-700 disabled:pointer-events-none disabled:opacity-50"
                       aria-label={`Viewport: ${browserViewportLabel(browserViewportMode)}`}
                       title={`Viewport: ${browserViewportLabel(browserViewportMode)}`}
-                      disabled={!activeBrowserPage}
+                      disabled={!activeBrowserPage || !browserCapabilityAvailable}
                     >
                       <MonitorSmartphone class="size-4" />
                     </DropdownMenu.Trigger>
@@ -3632,16 +3639,16 @@
                     aria-label={browserAnnotating ? 'Stop annotating' : 'Annotate page'}
                     title={browserAnnotating ? 'Stop annotating' : 'Annotate page'}
                     onclick={() => (browserAnnotating = !browserAnnotating)}
-                    disabled={!activeBrowserPage}
+                    disabled={!activeBrowserPage || !browserCapabilityAvailable}
                   >
                     <NotebookPen class="size-4" />
                   </Button>
                 </div>
               </div>
               <form class="flex gap-2" onsubmit={(event) => { event.preventDefault(); void handleBrowserNavigate(); }}>
-                <Button type="button" variant="outline" size="icon" onclick={() => void handleBrowserCommand('back')} disabled={!activeBrowserPage}><ArrowLeft class="size-4" /></Button>
-                <Button type="button" variant="outline" size="icon" onclick={() => void handleBrowserCommand('forward')} disabled={!activeBrowserPage}><ArrowRight class="size-4" /></Button>
-                <Button type="button" variant="outline" size="icon" onclick={() => void handleBrowserCommand('reload')} disabled={!activeBrowserPage}><RotateCcw class="size-4" /></Button>
+                <Button type="button" variant="outline" size="icon" onclick={() => void handleBrowserCommand('back')} disabled={!activeBrowserPage || !browserCapabilityAvailable}><ArrowLeft class="size-4" /></Button>
+                <Button type="button" variant="outline" size="icon" onclick={() => void handleBrowserCommand('forward')} disabled={!activeBrowserPage || !browserCapabilityAvailable}><ArrowRight class="size-4" /></Button>
+                <Button type="button" variant="outline" size="icon" onclick={() => void handleBrowserCommand('reload')} disabled={!activeBrowserPage || !browserCapabilityAvailable}><RotateCcw class="size-4" /></Button>
                 <Input
                   bind:value={browserUrl}
                   aria-label="Browser URL"
