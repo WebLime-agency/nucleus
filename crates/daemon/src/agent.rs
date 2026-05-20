@@ -4452,6 +4452,13 @@ fn extract_pr_numbers(text: &str) -> BTreeSet<u64> {
             numbers.insert(number);
             continue;
         }
+        if let Some(number) = token
+            .strip_prefix("pr#")
+            .and_then(|value| value.parse().ok())
+        {
+            numbers.insert(number);
+            continue;
+        }
         if matches!(*token, "pr" | "pull" | "request") {
             if let Some(next) = tokens.get(index + 1) {
                 let numeric = next.trim_start_matches('#');
@@ -7898,7 +7905,7 @@ fn reject_unsafe_github_comment_shell(command: &str, args: &[String]) -> Result<
 fn gh_comment_uses_inline_body_flag(normalized_script: &str) -> bool {
     normalized_script
         .split_whitespace()
-        .any(|token| token == "--body" || token.starts_with("--body="))
+        .any(|token| token == "--body" || token.starts_with("--body=") || token == "-b")
 }
 
 fn validate_command_value(worker: &WorkerSummary, command: &str) -> Result<String> {
@@ -13350,6 +13357,37 @@ mod tests {
     }
 
     #[test]
+    fn pr_lifecycle_claim_matches_compact_pr_reference() {
+        let worker = test_worker_summary("compact-pr-lifecycle-evidence", 100, 100);
+        let mut detail = test_job_detail_with_prompt("looks like PR#217 is already merged");
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_state",
+            json!({
+                "evidence_kind": "github_pr_state",
+                "pr_number": 219,
+                "state": "MERGED",
+                "merged_at": "2026-05-20T16:00:00Z"
+            }),
+        ));
+        let checkpoint = test_checkpoint_with_prompt("looks like PR#217 is already merged");
+
+        assert_eq!(
+            extract_pr_numbers("PR#217").into_iter().collect::<Vec<_>>(),
+            vec![217]
+        );
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Already merged",
+            "PR#217 is already merged into dev; nothing is left to merge.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+    }
+
+    #[test]
     fn pr_ready_claim_requires_direct_pr_state() {
         let worker = test_worker_summary("pr-ready-evidence", 100, 100);
         let mut detail = test_job_detail_with_prompt("Check whether PR #217 is ready to merge.");
@@ -13507,6 +13545,15 @@ mod tests {
             ],
         );
         assert!(result.is_err());
+
+        let short_body_result = reject_unsafe_github_comment_shell(
+            "sh",
+            &[
+                "-lc".to_string(),
+                "gh pr comment 218 -b \"Fixed `danger`\"".to_string(),
+            ],
+        );
+        assert!(short_body_result.is_err());
 
         let preview = preview_github_comment(GithubCommentArgs {
             owner: Some("WebLime-agency".to_string()),
