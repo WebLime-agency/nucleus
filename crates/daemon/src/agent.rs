@@ -4521,7 +4521,7 @@ fn value_has_complete_review_threads(value: &Value) -> bool {
         let threads_complete = value
             .get("review_threads_complete")
             .and_then(Value::as_bool)
-            .unwrap_or(true);
+            .unwrap_or(false);
         return threads_complete && !comments_truncated;
     }
     match value {
@@ -13413,7 +13413,9 @@ mod tests {
                         "line": 42,
                         "comments": {"nodes": []}
                     }
-                ]
+                ],
+                "review_threads_complete": true,
+                "thread_comments_truncated": false
             }),
         ));
         let checkpoint = test_checkpoint_with_prompt("Check latest PR feedback.");
@@ -13486,6 +13488,42 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
+    }
+
+    #[test]
+    fn pr_review_feedback_retries_when_thread_completeness_is_unknown() {
+        let worker = test_worker_summary("pr-feedback-unknown-thread-completeness", 100, 100);
+        let mut detail = test_job_detail_with_prompt(
+            "Check latest PR feedback on PR #217 and unresolved Codex review comments.",
+        );
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_review_threads",
+            json!({
+                "evidence_kind": "github_pr_review_threads",
+                "review_threads": [
+                    {
+                        "isResolved": true,
+                        "isOutdated": false,
+                        "path": "crates/daemon/src/agent.rs",
+                        "line": 42,
+                        "comments": {"nodes": []}
+                    }
+                ]
+            }),
+        ));
+        let checkpoint = test_checkpoint_with_prompt("Check latest PR feedback.");
+
+        assert!(!has_thread_aware_pr_review_evidence(&detail));
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "No actionable feedback",
+            "There is no actionable feedback.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
     }
 
     #[test]
