@@ -366,6 +366,7 @@ pub struct JobArtifactRecord {
     pub mime_type: String,
     pub size_bytes: u64,
     pub preview_text: String,
+    pub metadata_json: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -376,6 +377,7 @@ pub struct JobArtifactPatch {
     pub mime_type: Option<String>,
     pub size_bytes: Option<u64>,
     pub preview_text: Option<String>,
+    pub metadata_json: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2689,9 +2691,10 @@ impl StateStore {
                 path,
                 mime_type,
                 size_bytes,
-                preview_text
+                preview_text,
+                metadata_json
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             ",
             params![
                 record.id,
@@ -2705,6 +2708,7 @@ impl StateStore {
                 record.mime_type,
                 record.size_bytes as i64,
                 record.preview_text,
+                serde_json::to_string(&record.metadata_json)?,
             ],
         )?;
 
@@ -2727,7 +2731,8 @@ impl StateStore {
                 path = ?4,
                 mime_type = ?5,
                 size_bytes = ?6,
-                preview_text = ?7
+                preview_text = ?7,
+                metadata_json = ?8
             WHERE id = ?1
             ",
             params![
@@ -2738,6 +2743,7 @@ impl StateStore {
                 patch.mime_type.unwrap_or(current.mime_type),
                 patch.size_bytes.unwrap_or(current.size_bytes) as i64,
                 patch.preview_text.unwrap_or(current.preview_text),
+                serde_json::to_string(&patch.metadata_json.unwrap_or(current.metadata_json))?,
             ],
         )?;
 
@@ -3311,6 +3317,7 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             mime_type TEXT NOT NULL DEFAULT 'text/plain',
             size_bytes INTEGER NOT NULL DEFAULT 0,
             preview_text TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
             created_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
 
@@ -3760,6 +3767,12 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "job_artifacts",
         "command_session_id",
         "TEXT REFERENCES command_sessions(id) ON DELETE SET NULL",
+    )?;
+    ensure_column(
+        connection,
+        "job_artifacts",
+        "metadata_json",
+        "TEXT NOT NULL DEFAULT '{}'",
     )?;
     ensure_column(
         connection,
@@ -7230,6 +7243,7 @@ fn load_artifact_summary(connection: &Connection, artifact_id: &str) -> Result<A
                 mime_type,
                 size_bytes,
                 preview_text,
+                metadata_json,
                 created_at
             FROM job_artifacts
             WHERE id = ?1
@@ -7248,7 +7262,8 @@ fn load_artifact_summary(connection: &Connection, artifact_id: &str) -> Result<A
                     mime_type: row.get(8)?,
                     size_bytes: row.get::<_, i64>(9)?.max(0) as u64,
                     preview_text: row.get(10)?,
-                    created_at: row.get(11)?,
+                    metadata_json: decode_json_value(row.get(11)?)?,
+                    created_at: row.get(12)?,
                 })
             },
         )
