@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
+    io::ErrorKind,
     net::TcpListener as StdTcpListener,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
@@ -7947,13 +7948,17 @@ fn shell_command_payloads(args: &[String]) -> Vec<&str> {
     let mut payloads = Vec::new();
     let mut iter = args.iter().map(String::as_str).peekable();
     while let Some(arg) = iter.next() {
-        if arg.starts_with('-') && arg.contains('c') {
+        if shell_arg_declares_command_payload(arg) {
             if let Some(payload) = iter.next() {
                 payloads.push(payload);
             }
         }
     }
     payloads
+}
+
+fn shell_arg_declares_command_payload(arg: &str) -> bool {
+    arg.starts_with('-') && !arg.starts_with("--") && arg.chars().skip(1).any(|ch| ch == 'c')
 }
 
 fn detect_shell_payload_port(payload: &str) -> Option<u16> {
@@ -8064,21 +8069,26 @@ fn ensure_declared_command_port_available(spec: &ResolvedCommandSpec) -> Result<
         return Ok(());
     }
 
-    match StdTcpListener::bind(("127.0.0.1", port)) {
-        Ok(listener) => {
-            drop(listener);
-            Ok(())
-        }
-        Err(error) => {
-            let owner = describe_port_owner(port)
-                .filter(|detail| !detail.trim().is_empty())
-                .map(|detail| format!(" Listener detail: {detail}"))
-                .unwrap_or_default();
-            bail!(
-                "requested command port {port} is already in use ({error}). Stop the existing listener or choose another port before starting this dev server.{owner}"
-            );
+    for host in ["127.0.0.1", "::1"] {
+        match StdTcpListener::bind((host, port)) {
+            Ok(listener) => {
+                drop(listener);
+            }
+            Err(error) if host == "::1" && error.kind() == ErrorKind::AddrNotAvailable => {
+                continue;
+            }
+            Err(error) => {
+                let owner = describe_port_owner(port)
+                    .filter(|detail| !detail.trim().is_empty())
+                    .map(|detail| format!(" Listener detail: {detail}"))
+                    .unwrap_or_default();
+                bail!(
+                    "requested command port {port} is already in use ({error}). Stop the existing listener or choose another port before starting this dev server.{owner}"
+                );
+            }
         }
     }
+    Ok(())
 }
 
 fn describe_port_owner(port: u16) -> Option<String> {
@@ -13196,6 +13206,14 @@ Cleanup status: clean";
             "vite --host 127.0.0.1 -p5181".to_string(),
         ];
         assert_eq!(detect_command_port(&spec), Some(5181));
+
+        spec.command = "bash".to_string();
+        spec.args = vec![
+            "--norc".to_string(),
+            "-lc".to_string(),
+            "npm run dev -- -p 5182".to_string(),
+        ];
+        assert_eq!(detect_command_port(&spec), Some(5182));
     }
 
     #[test]
@@ -13253,6 +13271,35 @@ Cleanup status: clean";
         };
         assert_eq!(detect_command_port(&shell_client), Some(port));
         assert!(ensure_declared_command_port_available(&shell_client).is_ok());
+    }
+
+    #[test]
+    fn declared_ipv6_loopback_command_port_fails_preflight() {
+        let listener = match std::net::TcpListener::bind("[::1]:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == ErrorKind::AddrNotAvailable => return,
+            Err(error) => panic!("test IPv6 listener should bind or be unavailable: {error}"),
+        };
+        let port = listener
+            .local_addr()
+            .expect("listener addr should be available")
+            .port();
+        let spec = ResolvedCommandSpec {
+            mode: "interactive".to_string(),
+            title: "Dev server".to_string(),
+            command: "sh".to_string(),
+            args: vec!["-lc".to_string(), format!("npm run dev -- --port {port}")],
+            cwd: PathBuf::from("/tmp"),
+            timeout_secs: 30,
+            output_limit_bytes: 1024,
+            network_policy: "inherit".to_string(),
+            env: BTreeMap::new(),
+        };
+
+        assert_eq!(detect_command_port(&spec), Some(port));
+        let error = ensure_declared_command_port_available(&spec)
+            .expect_err("occupied IPv6 loopback port should fail preflight");
+        assert!(error.to_string().contains("already in use"));
     }
 
     #[test]
