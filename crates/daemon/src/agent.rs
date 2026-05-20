@@ -4124,8 +4124,8 @@ fn should_retry_unsupported_confident_negative_final_answer(
     let task_text = evidence_task_text(detail, checkpoint);
     let missing_pr_review_evidence = requires_pr_review_thread_evidence(&task_text)
         && !has_thread_aware_pr_review_evidence(detail);
-    let missing_test_evidence =
-        requires_test_validation_evidence(&task_text) && !has_test_validation_evidence(detail);
+    let missing_test_evidence = requires_test_validation_evidence(&task_text)
+        && !has_test_validation_evidence(detail, &task_text, summary, final_answer);
     let zero_test_misread = confident_test_success_claim(summary, final_answer)
         && has_zero_test_no_match_evidence(detail);
     let missing_pr_lifecycle_state = confident_pr_lifecycle_claim(summary, final_answer)
@@ -4169,8 +4169,8 @@ fn requires_pr_review_thread_evidence(text: &str) -> bool {
     let pr_context = text.contains(" pr ")
         || !extract_pr_numbers(text).is_empty()
         || text.contains("pull request")
-        || text.contains("github")
-        || text.contains("codex");
+        || text.contains("github pr")
+        || text.contains("github pull request");
     let review_context = [
         "latest feedback",
         "review feedback",
@@ -4328,15 +4328,39 @@ fn has_thread_aware_pr_review_evidence(detail: &JobDetail) -> bool {
     })
 }
 
-fn has_test_validation_evidence(detail: &JobDetail) -> bool {
-    detail.tool_calls.iter().any(|tool_call| {
+fn has_test_validation_evidence(
+    detail: &JobDetail,
+    task_text: &str,
+    summary: &str,
+    final_answer: &str,
+) -> bool {
+    if detail.tool_calls.iter().any(|tool_call| {
         tool_call.status == "completed"
             && tool_call.result_json.as_ref().is_some_and(|result| {
-                if tool_call.tool_id == "tests.run" {
-                    return value_has_successful_test_run(result);
-                }
-                value_has_successful_status_check_rollup(result)
+                tool_call.tool_id == "tests.run" && value_has_successful_test_run(result)
             })
+    }) {
+        return true;
+    }
+
+    let pr_numbers = extract_pr_numbers(&format!("{task_text}\n{summary}\n{final_answer}"));
+    if pr_numbers.is_empty() {
+        return detail.tool_calls.iter().any(|tool_call| {
+            tool_call.status == "completed"
+                && tool_call
+                    .result_json
+                    .as_ref()
+                    .is_some_and(value_has_successful_status_check_rollup)
+        });
+    }
+    pr_numbers.iter().all(|pr_number| {
+        detail.tool_calls.iter().any(|tool_call| {
+            tool_call.status == "completed"
+                && tool_call.result_json.as_ref().is_some_and(|result| {
+                    value_pr_number(result).is_some_and(|number| number == *pr_number)
+                        && value_has_successful_status_check_rollup(result)
+                })
+        })
     })
 }
 
@@ -8049,9 +8073,7 @@ fn reject_unsafe_github_comment_shell(command: &str, args: &[String]) -> Result<
         })
         .unwrap_or("");
     let normalized = normalize_action_item_text(script);
-    let posts_comment = (normalized.contains("gh pr comment")
-        || normalized.contains("gh issue comment"))
-        && gh_comment_uses_inline_body_flag(&normalized);
+    let posts_comment = gh_comment_posts_inline_body(&normalized);
     let interpolation_risk = script.contains('`')
         || script.contains("$(")
         || script.contains("${")
@@ -8066,10 +8088,38 @@ fn reject_unsafe_github_comment_shell(command: &str, args: &[String]) -> Result<
     Ok(())
 }
 
-fn gh_comment_uses_inline_body_flag(normalized_script: &str) -> bool {
-    normalized_script
-        .split_whitespace()
-        .any(|token| token == "--body" || token.starts_with("--body=") || token == "-b")
+fn gh_comment_posts_inline_body(normalized_script: &str) -> bool {
+    let tokens = normalized_script.split_whitespace().collect::<Vec<_>>();
+    tokens.iter().enumerate().any(|(index, token)| {
+        *token == "gh"
+            && gh_comment_subcommand_index(&tokens[index + 1..]).is_some_and(|command_index| {
+                tokens[index + 1 + command_index..].iter().any(|token| {
+                    *token == "--body" || token.starts_with("--body=") || *token == "-b"
+                })
+            })
+    })
+}
+
+fn gh_comment_subcommand_index(tokens: &[&str]) -> Option<usize> {
+    let mut index = 0;
+    while index < tokens.len() {
+        match tokens[index] {
+            "pr" | "issue" if tokens.get(index + 1).copied() == Some("comment") => {
+                return Some(index);
+            }
+            "--repo" | "-R" | "--hostname" => {
+                index += 2;
+            }
+            token if token.starts_with("--repo=") || token.starts_with("--hostname=") => {
+                index += 1;
+            }
+            token if token.starts_with('-') => {
+                index += 1;
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn validate_command_value(worker: &WorkerSummary, command: &str) -> Result<String> {
@@ -13607,6 +13657,44 @@ mod tests {
     }
 
     #[test]
+    fn codex_review_without_pr_signal_does_not_require_pr_threads() {
+        let worker = test_worker_summary("non-pr-codex-review", 100, 100);
+        let detail = test_job_detail_with_prompt(
+            "Review this local commit and tag @codex review when done.",
+        );
+        let checkpoint = test_checkpoint_with_prompt(
+            "Review this local commit and tag @codex review when done.",
+        );
+
+        assert!(!requires_pr_review_thread_evidence(
+            "review this local commit and tag @codex review when done"
+        ));
+        assert!(!should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "No actionable feedback",
+            "There is no actionable feedback.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            1,
+        ));
+    }
+
+    #[test]
+    fn compact_pr_review_requests_require_thread_evidence() {
+        assert!(requires_pr_review_thread_evidence(
+            "review PR#217 latest feedback"
+        ));
+        assert!(requires_pr_review_thread_evidence(
+            "check PRs #217 and #219 for unresolved comments"
+        ));
+        assert!(requires_pr_review_thread_evidence(
+            "review pull requests #217 and #219 requested changes"
+        ));
+    }
+
+    #[test]
     fn pr_merged_claim_requires_direct_matching_pr_state() {
         let worker = test_worker_summary("pr-lifecycle-evidence", 100, 100);
         let mut detail =
@@ -14000,7 +14088,12 @@ mod tests {
         ));
         let checkpoint = test_checkpoint_with_prompt("Run tests and validate the fix.");
 
-        assert!(!has_test_validation_evidence(&detail));
+        assert!(!has_test_validation_evidence(
+            &detail,
+            &evidence_task_text(&detail, &checkpoint),
+            "Validation passed",
+            "Tests passed.",
+        ));
         assert!(should_retry_unsupported_confident_negative_final_answer(
             &detail,
             "Validation passed",
@@ -14010,6 +14103,60 @@ mod tests {
             &worker,
             3,
             2,
+        ));
+    }
+
+    #[test]
+    fn status_check_evidence_must_match_referenced_pr() {
+        let worker = test_worker_summary("wrong-pr-status-evidence", 100, 100);
+        let mut detail =
+            test_job_detail_with_prompt("Check whether tests passed for PR #217 before merge.");
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_review_threads",
+            json!({
+                "evidence_kind": "github_pr_review_threads",
+                "pr_number": 219,
+                "status_check_rollup": {
+                    "state": "SUCCESS"
+                }
+            }),
+        ));
+        let checkpoint =
+            test_checkpoint_with_prompt("Check whether tests passed for PR #217 before merge.");
+
+        assert!(!has_test_validation_evidence(
+            &detail,
+            &evidence_task_text(&detail, &checkpoint),
+            "Checks passed",
+            "PR #217 checks passed.",
+        ));
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Checks passed",
+            "PR #217 checks passed.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+
+        detail.tool_calls.clear();
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_review_threads",
+            json!({
+                "evidence_kind": "github_pr_review_threads",
+                "pr_number": 217,
+                "status_check_rollup": {
+                    "state": "SUCCESS"
+                }
+            }),
+        ));
+        assert!(has_test_validation_evidence(
+            &detail,
+            &evidence_task_text(&detail, &checkpoint),
+            "Checks passed",
+            "PR #217 checks passed.",
         ));
     }
 
@@ -14094,6 +14241,16 @@ mod tests {
             ],
         );
         assert!(short_body_result.is_err());
+
+        let global_repo_result = reject_unsafe_github_comment_shell(
+            "sh",
+            &[
+                "-lc".to_string(),
+                "gh --repo WebLime-agency/nucleus pr comment 218 --body \"Fixed `danger`\""
+                    .to_string(),
+            ],
+        );
+        assert!(global_repo_result.is_err());
 
         let preview = preview_github_comment(GithubCommentArgs {
             owner: Some("WebLime-agency".to_string()),
