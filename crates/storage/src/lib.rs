@@ -9708,7 +9708,6 @@ and open a pull request to dev when it is ready."
         let _ = fs::remove_dir_all(&state_dir);
     }
 
-
     fn test_state_dir(label: &str) -> PathBuf {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
