@@ -7891,16 +7891,11 @@ fn command_session_workspace_metadata(
 
 fn detect_command_port(spec: &ResolvedCommandSpec) -> Option<u16> {
     detect_command_port_tokens(&spec.args)
+        .or_else(|| detect_shell_command_port(spec))
         .or_else(|| {
             spec.env
                 .get("PORT")
                 .and_then(|value| parse_port_value(value))
-        })
-        .or_else(|| {
-            spec.args.iter().find_map(|arg| {
-                arg.split_ascii_whitespace()
-                    .find_map(detect_port_env_assignment)
-            })
         })
 }
 
@@ -7926,6 +7921,57 @@ fn detect_command_port_tokens(args: &[String]) -> Option<u16> {
             }
         }
         if let Some(port) = detect_port_env_assignment(arg) {
+            return Some(port);
+        }
+    }
+    None
+}
+
+fn detect_shell_command_port(spec: &ResolvedCommandSpec) -> Option<u16> {
+    if !is_shell_command(&spec.command) {
+        return None;
+    }
+    shell_command_payloads(&spec.args)
+        .into_iter()
+        .find_map(detect_shell_payload_port)
+}
+
+fn is_shell_command(command: &str) -> bool {
+    Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "sh" | "bash" | "dash" | "zsh"))
+}
+
+fn shell_command_payloads(args: &[String]) -> Vec<&str> {
+    let mut payloads = Vec::new();
+    let mut iter = args.iter().map(String::as_str).peekable();
+    while let Some(arg) = iter.next() {
+        if arg.starts_with('-') && arg.contains('c') {
+            if let Some(payload) = iter.next() {
+                payloads.push(payload);
+            }
+        }
+    }
+    payloads
+}
+
+fn detect_shell_payload_port(payload: &str) -> Option<u16> {
+    let words = payload.split_ascii_whitespace().collect::<Vec<_>>();
+    let mut iter = words.iter().copied().peekable();
+    while let Some(word) = iter.next() {
+        if word == "--port" {
+            if let Some(port) = iter.peek().and_then(|value| parse_port_value(value)) {
+                return Some(port);
+            }
+            continue;
+        }
+        if let Some(value) = word.strip_prefix("--port=") {
+            if let Some(port) = parse_port_value(value) {
+                return Some(port);
+            }
+        }
+        if let Some(port) = detect_port_env_assignment(word) {
             return Some(port);
         }
     }
@@ -13059,6 +13105,17 @@ Cleanup status: clean";
         spec.env.insert("PORT".to_string(), "5176".to_string());
         spec.args = vec!["run".to_string(), "dev".to_string()];
         assert_eq!(detect_command_port(&spec), Some(5176));
+
+        spec.env.clear();
+        spec.command = "sh".to_string();
+        spec.args = vec!["-lc".to_string(), "npm run dev -- --port 5177".to_string()];
+        assert_eq!(detect_command_port(&spec), Some(5177));
+
+        spec.args = vec!["-lc".to_string(), "npm run dev -- --port=5178".to_string()];
+        assert_eq!(detect_command_port(&spec), Some(5178));
+
+        spec.args = vec!["-lc".to_string(), "PORT=5179 npm run dev".to_string()];
+        assert_eq!(detect_command_port(&spec), Some(5179));
     }
 
     #[test]

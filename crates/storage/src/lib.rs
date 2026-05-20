@@ -2148,7 +2148,7 @@ impl StateStore {
             next_browser_verification_status = "unavailable".to_string();
             if next_browser_verification_summary.trim().is_empty() {
                 next_browser_verification_summary =
-                    "Job failed before browser verification completed.".to_string();
+                    terminal_browser_verification_summary(&next_state).to_string();
             }
         }
         let next_browser_verification_artifact_ids_json = serde_json::to_string(
@@ -4386,6 +4386,13 @@ fn bool_to_i64(value: bool) -> i64 {
 
 fn is_terminal_non_success_job_state(state: &str) -> bool {
     matches!(state, "failed" | "canceled")
+}
+
+fn terminal_browser_verification_summary(state: &str) -> &'static str {
+    match state {
+        "canceled" => "Job was canceled before browser verification completed.",
+        _ => "Job failed before browser verification completed.",
+    }
 }
 
 fn publication_requested_for_job(_title: &str, _purpose: &str, prompt_excerpt: &str) -> bool {
@@ -9163,6 +9170,60 @@ and open a pull request to dev when it is ready."
         assert_eq!(
             updated.browser_verification_summary,
             "Job failed before browser verification completed."
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn canceled_ui_renderable_job_uses_canceled_browser_verification_summary() {
+        let state_dir = test_state_dir("canceled-browser-verification-terminal");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let scratch_dir = store
+            .scratch_dir_for_session("browser-canceled-session")
+            .expect("scratch dir should resolve");
+
+        store
+            .create_session(test_session_record(
+                "browser-canceled-session",
+                "Browser canceled session",
+                "ad_hoc",
+                scratch_dir,
+            ))
+            .expect("session should persist");
+        store
+            .create_job(JobRecord {
+                id: "browser-canceled-job".to_string(),
+                session_id: Some("browser-canceled-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Fix UI".to_string(),
+                purpose: "Session prompt".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "running".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "fix the rendered UI".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("job should persist");
+        let updated = store
+            .update_job(
+                "browser-canceled-job",
+                JobPatch {
+                    state: Some("canceled".to_string()),
+                    ui_renderable: Some("true".to_string()),
+                    browser_verification_required: Some(true),
+                    browser_verification_status: Some("pending".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("job should update");
+
+        assert_eq!(updated.state, "canceled");
+        assert_eq!(updated.browser_verification_status, "unavailable");
+        assert_eq!(
+            updated.browser_verification_summary,
+            "Job was canceled before browser verification completed."
         );
 
         let _ = fs::remove_dir_all(&state_dir);
