@@ -352,6 +352,8 @@ pub struct ArtifactSummary {
     pub size_bytes: u64,
     #[serde(default)]
     pub preview_text: String,
+    #[serde(default)]
+    pub metadata_json: serde_json::Value,
     pub created_at: i64,
 }
 

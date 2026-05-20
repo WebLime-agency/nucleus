@@ -246,6 +246,7 @@ export const artifactSummarySchema = z.object({
   mime_type: z.string(),
   size_bytes: z.number().int().nonnegative(),
   preview_text: z.string(),
+  metadata_json: z.unknown().default({}),
   created_at: z.number().int()
 });
 
