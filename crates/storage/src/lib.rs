@@ -284,7 +284,13 @@ pub struct WorkerRecord {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkerPatch {
+    pub title: Option<String>,
+    pub lane: Option<String>,
     pub state: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub provider_base_url: Option<String>,
+    pub provider_api_key: Option<String>,
     pub provider_session_id: Option<String>,
     pub step_count: Option<usize>,
     pub tool_call_count: Option<usize>,
@@ -2268,17 +2274,29 @@ impl StateStore {
             "
             UPDATE job_workers
             SET
-                state = ?2,
-                provider_session_id = ?3,
-                step_count = ?4,
-                tool_call_count = ?5,
-                last_error = ?6,
+                title = ?2,
+                lane = ?3,
+                state = ?4,
+                provider = ?5,
+                model = ?6,
+                provider_base_url = ?7,
+                provider_api_key = ?8,
+                provider_session_id = ?9,
+                step_count = ?10,
+                tool_call_count = ?11,
+                last_error = ?12,
                 updated_at = unixepoch()
             WHERE id = ?1
             ",
             params![
                 worker_id,
+                patch.title.unwrap_or(current.title),
+                patch.lane.unwrap_or(current.lane),
                 patch.state.unwrap_or(current.state),
+                patch.provider.unwrap_or(current.provider),
+                patch.model.unwrap_or(current.model),
+                patch.provider_base_url.unwrap_or(current.provider_base_url),
+                patch.provider_api_key.unwrap_or(current.provider_api_key),
                 patch
                     .provider_session_id
                     .unwrap_or(current.provider_session_id),

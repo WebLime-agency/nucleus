@@ -1736,6 +1736,8 @@ async fn run_job_loop(
         .into_iter()
         .find(|item| item.id == worker_id)
         .ok_or_else(|| anyhow!("job '{job_id}' root worker was not found"))?;
+    worker =
+        migrate_legacy_root_worker_to_utility(state, &detail.job, &session.session, worker).await?;
     ensure_utility_worker_executor(&worker)?;
 
     state.store.update_job(
@@ -2196,6 +2198,80 @@ async fn run_job_loop(
             }
         }
     }
+}
+
+async fn migrate_legacy_root_worker_to_utility(
+    state: &AppState,
+    job: &JobSummary,
+    session: &SessionSummary,
+    worker: WorkerSummary,
+) -> Result<WorkerSummary> {
+    if worker.lane == ACTION_EXECUTOR_LANE {
+        return Ok(worker);
+    }
+    if worker.lane != "main"
+        || worker.parent_worker_id.is_some()
+        || job.root_worker_id.as_deref() != Some(worker.id.as_str())
+        || job.trigger_kind != "session_prompt"
+    {
+        return Ok(worker);
+    }
+
+    let Some(checkpoint_value) = state.store.read_worker_checkpoint(&worker.id)? else {
+        return Ok(worker);
+    };
+    let checkpoint: WorkerCheckpoint = serde_json::from_value(checkpoint_value)
+        .context("failed to decode legacy worker checkpoint payload")?;
+    let target = resolve_hidden_worker_target(
+        state,
+        session,
+        ACTION_EXECUTOR_LANE,
+        !checkpoint.images.is_empty(),
+    )
+    .await
+    .map_err(|error| anyhow!(error.message))?;
+    let mut migrated = state.store.update_worker(
+        &worker.id,
+        WorkerPatch {
+            title: Some("Utility Worker".to_string()),
+            lane: Some(ACTION_EXECUTOR_LANE.to_string()),
+            provider: Some(target.provider.clone()),
+            model: Some(target.model.clone()),
+            provider_base_url: Some(target.provider_base_url.clone()),
+            provider_api_key: Some(target.provider_api_key),
+            provider_session_id: Some(String::new()),
+            last_error: Some(String::new()),
+            ..WorkerPatch::default()
+        },
+    )?;
+    let root_capabilities = if session.execution_mode == "plan" {
+        Vec::new()
+    } else {
+        let mut capabilities = root_worker_capabilities();
+        capabilities.extend(mcp_tool_capabilities(state));
+        capabilities
+    };
+    migrated.capabilities = state
+        .store
+        .replace_tool_capability_grants(&worker.id, &root_capabilities)?;
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: job.id.clone(),
+        worker_id: Some(worker.id.clone()),
+        event_type: "worker.legacy_lane_migrated".to_string(),
+        status: "running".to_string(),
+        summary: "Migrated legacy main-lane root worker to Utility Worker.".to_string(),
+        detail: format!(
+            "Legacy persisted root worker '{}' was moved from lane 'main' to lane '{}' before resume.",
+            worker.id, ACTION_EXECUTOR_LANE
+        ),
+        data_json: json!({
+            "from_lane": "main",
+            "to_lane": ACTION_EXECUTOR_LANE,
+            "provider": target.provider,
+            "model": target.model,
+        }),
+    });
+    Ok(migrated)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14391,6 +14467,135 @@ Cleanup status: clean";
         .await
         .expect_err("main lane must not execute actions");
         assert!(execute_error.to_string().contains("only utility workers"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn legacy_main_lane_root_worker_resume_migrates_to_utility_executor() {
+        let state_dir = test_state_dir("legacy-main-root-utility-migration");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let (base_url, server) = spawn_single_response_openai_server(
+            r#"{"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
+        )
+        .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-resume-model",
+            &base_url,
+            "utility-key",
+        );
+
+        let session_id = "session-legacy-main-resume".to_string();
+        let job_id = "job-legacy-main-resume".to_string();
+        let worker_id = "worker-legacy-main-resume".to_string();
+        state
+            .store
+            .create_session(test_session_record(
+                &session_id,
+                "Legacy main resume",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+        state
+            .store
+            .create_job(JobRecord {
+                id: job_id.clone(),
+                session_id: Some(session_id.clone()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Legacy prompt job".to_string(),
+                purpose: "Session prompt".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "queued".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "Finish the legacy job".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("job should persist");
+        state
+            .store
+            .create_worker(WorkerRecord {
+                id: worker_id.clone(),
+                job_id: job_id.clone(),
+                parent_worker_id: None,
+                title: "Utility main worker".to_string(),
+                lane: "main".to_string(),
+                state: "queued".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "main-route-model".to_string(),
+                provider_base_url: "http://127.0.0.1:9/v1".to_string(),
+                provider_api_key: "main-key".to_string(),
+                provider_session_id: "legacy-provider-session".to_string(),
+                working_dir: workspace_root.display().to_string(),
+                read_roots: vec![workspace_root.display().to_string()],
+                write_roots: vec![workspace_root.display().to_string()],
+                max_steps: 10,
+                max_tool_calls: 10,
+                max_wall_clock_secs: 30,
+            })
+            .expect("worker should persist");
+        state
+            .store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    root_worker_id: Some(worker_id.clone()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("job should update");
+        let checkpoint = WorkerCheckpoint {
+            session_id: session_id.clone(),
+            prompt_text: "Finish the legacy job".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        state
+            .store
+            .write_worker_checkpoint(&worker_id, &serde_json::to_value(checkpoint).unwrap())
+            .expect("checkpoint should persist");
+
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        run_job_loop(&state, &job_id, &mut cancel_rx)
+            .await
+            .expect("legacy root should migrate and run through utility route");
+        server.await.expect("test server should finish");
+
+        let detail = state.store.get_job(&job_id).expect("job should load");
+        assert_eq!(detail.job.state, "completed");
+        assert_eq!(detail.job.executor_lane, "utility");
+        assert_eq!(detail.job.executor_model, "utility-resume-model");
+        let worker = detail.workers.first().expect("worker should exist");
+        assert_eq!(worker.id, worker_id);
+        assert_eq!(worker.title, "Utility Worker");
+        assert_eq!(worker.lane, "utility");
+        assert_eq!(worker.model, "utility-resume-model");
+        assert_ne!(worker.provider_session_id, "legacy-provider-session");
+        assert!(
+            worker
+                .capabilities
+                .iter()
+                .any(|grant| grant.tool_id == "command.run")
+        );
+        assert!(
+            detail
+                .events
+                .iter()
+                .any(|event| event.event_type == "worker.legacy_lane_migrated")
+        );
 
         let _ = fs::remove_dir_all(&state_dir);
     }
