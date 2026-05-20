@@ -4455,13 +4455,25 @@ fn extract_pr_numbers(text: &str) -> BTreeSet<u64> {
         .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '#'))
         .filter(|token| !token.is_empty())
         .collect::<Vec<_>>();
+    let mut pr_list_active = false;
     for (index, token) in tokens.iter().enumerate() {
         if let Some(number) = token
             .strip_prefix("pr#")
             .and_then(|value| value.parse().ok())
         {
             numbers.insert(number);
+            pr_list_active = true;
             continue;
+        }
+        if pr_list_active {
+            if let Some(number) = token.strip_prefix('#').and_then(|value| value.parse().ok()) {
+                numbers.insert(number);
+                continue;
+            }
+            if *token == "and" {
+                continue;
+            }
+            pr_list_active = false;
         }
         if *token == "pr" {
             if let Some(number) = tokens
@@ -4469,6 +4481,7 @@ fn extract_pr_numbers(text: &str) -> BTreeSet<u64> {
                 .and_then(|next| parse_pr_reference_number(next))
             {
                 numbers.insert(number);
+                pr_list_active = true;
             }
             continue;
         }
@@ -4478,6 +4491,7 @@ fn extract_pr_numbers(text: &str) -> BTreeSet<u64> {
                 .and_then(|next| parse_pr_reference_number(next))
             {
                 numbers.insert(number);
+                pr_list_active = true;
             }
         }
     }
@@ -13430,6 +13444,12 @@ mod tests {
                 .into_iter()
                 .collect::<Vec<_>>(),
             vec![217]
+        );
+        assert_eq!(
+            extract_pr_numbers("Check PR #217 and #219, closes #218")
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![217, 219]
         );
         assert!(!should_retry_unsupported_confident_negative_final_answer(
             &detail,
