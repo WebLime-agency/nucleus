@@ -648,6 +648,14 @@ struct GithubPrReviewThreadsArgs {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct GithubPrStateArgs {
+    owner: Option<String>,
+    repo: Option<String>,
+    pr_number: Option<u64>,
+    branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct GithubCommentArgs {
     owner: Option<String>,
     repo: Option<String>,
@@ -4120,12 +4128,18 @@ fn should_retry_unsupported_confident_negative_final_answer(
         requires_test_validation_evidence(&task_text) && !has_test_validation_evidence(detail);
     let zero_test_misread = confident_test_success_claim(summary, final_answer)
         && has_zero_test_no_match_evidence(detail);
+    let missing_pr_lifecycle_state = confident_pr_lifecycle_claim(summary, final_answer)
+        && !has_direct_pr_state_evidence_for_claim(detail, &task_text, summary, final_answer);
+    let unsupported_pr_merged_claim = confident_pr_merged_claim(summary, final_answer)
+        && !has_direct_pr_merged_evidence_for_claim(detail, &task_text, summary, final_answer);
     let challenged_clean_answer =
         repeated_grounding_challenge(&task_text) && !has_thread_aware_pr_review_evidence(detail);
 
     (missing_pr_review_evidence
         || missing_test_evidence
         || zero_test_misread
+        || missing_pr_lifecycle_state
+        || unsupported_pr_merged_claim
         || challenged_clean_answer)
         && !final_answer_reports_concrete_blocker(&normalize_action_item_text(final_answer))
 }
@@ -4230,6 +4244,59 @@ fn confident_negative_claim(summary: &str, final_answer: &str) -> bool {
         "checks passed",
         "clean to merge",
         "ready to merge",
+        "clear to merge",
+        "approved",
+        "mergeable",
+        "pr is open",
+        "pull request is open",
+        "pr is closed",
+        "pull request is closed",
+        "already merged",
+        "has already been merged",
+        "nothing left to merge",
+        "nothing to merge",
+        "no merge left",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn confident_pr_lifecycle_claim(summary: &str, final_answer: &str) -> bool {
+    let text = normalize_action_item_text(&format!("{summary}\n{final_answer}"));
+    [
+        "already merged",
+        "has already been merged",
+        "nothing left to merge",
+        "nothing to merge",
+        "ready to merge",
+        "clean to merge",
+        "clear to merge",
+        "mergeable",
+        "approved",
+        "pr is open",
+        "pull request is open",
+        "pr is closed",
+        "pull request is closed",
+        "merge state",
+        "review decision",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn confident_pr_merged_claim(summary: &str, final_answer: &str) -> bool {
+    let text = normalize_action_item_text(&format!("{summary}\n{final_answer}"));
+    [
+        "already merged",
+        "has already been merged",
+        "was already merged",
+        "it is merged",
+        "it's merged",
+        "pr is merged",
+        "pull request is merged",
+        "nothing left to merge",
+        "nothing to merge",
+        "no merge left",
     ]
     .iter()
     .any(|needle| text.contains(needle))
@@ -4283,6 +4350,107 @@ fn has_zero_test_no_match_evidence(detail: &JobDetail) -> bool {
     })
 }
 
+fn has_direct_pr_merged_evidence(detail: &JobDetail) -> bool {
+    detail.tool_calls.iter().any(|tool_call| {
+        tool_call.status == "completed"
+            && (tool_call.tool_id == "github.pr_state"
+                || tool_call
+                    .result_json
+                    .as_ref()
+                    .is_some_and(value_has_pr_state_evidence))
+            && tool_call
+                .result_json
+                .as_ref()
+                .is_some_and(value_says_pr_merged)
+    })
+}
+
+fn has_direct_pr_state_evidence_for_claim(
+    detail: &JobDetail,
+    task_text: &str,
+    summary: &str,
+    final_answer: &str,
+) -> bool {
+    let pr_numbers = extract_pr_numbers(&format!("{task_text}\n{summary}\n{final_answer}"));
+    if pr_numbers.is_empty() {
+        return detail.tool_calls.iter().any(|tool_call| {
+            tool_call.status == "completed"
+                && (tool_call.tool_id == "github.pr_state"
+                    || tool_call
+                        .result_json
+                        .as_ref()
+                        .is_some_and(value_has_pr_state_evidence))
+        });
+    }
+    detail.tool_calls.iter().any(|tool_call| {
+        tool_call.status == "completed"
+            && (tool_call.tool_id == "github.pr_state"
+                || tool_call
+                    .result_json
+                    .as_ref()
+                    .is_some_and(value_has_pr_state_evidence))
+            && tool_call.result_json.as_ref().is_some_and(|value| {
+                value
+                    .get("pr_number")
+                    .or_else(|| value.get("number"))
+                    .and_then(Value::as_u64)
+                    .is_some_and(|number| pr_numbers.contains(&number))
+            })
+    })
+}
+
+fn has_direct_pr_merged_evidence_for_claim(
+    detail: &JobDetail,
+    task_text: &str,
+    summary: &str,
+    final_answer: &str,
+) -> bool {
+    let pr_numbers = extract_pr_numbers(&format!("{task_text}\n{summary}\n{final_answer}"));
+    if pr_numbers.is_empty() {
+        return has_direct_pr_merged_evidence(detail);
+    }
+    detail.tool_calls.iter().any(|tool_call| {
+        tool_call.status == "completed"
+            && (tool_call.tool_id == "github.pr_state"
+                || tool_call
+                    .result_json
+                    .as_ref()
+                    .is_some_and(value_has_pr_state_evidence))
+            && tool_call.result_json.as_ref().is_some_and(|value| {
+                value_says_pr_merged(value)
+                    && value
+                        .get("pr_number")
+                        .or_else(|| value.get("number"))
+                        .and_then(Value::as_u64)
+                        .is_some_and(|number| pr_numbers.contains(&number))
+            })
+    })
+}
+
+fn extract_pr_numbers(text: &str) -> BTreeSet<u64> {
+    let mut numbers = BTreeSet::new();
+    let normalized = normalize_action_item_text(text);
+    let tokens = normalized
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '#'))
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    for (index, token) in tokens.iter().enumerate() {
+        if let Some(number) = token.strip_prefix('#').and_then(|value| value.parse().ok()) {
+            numbers.insert(number);
+            continue;
+        }
+        if matches!(*token, "pr" | "pull" | "request") {
+            if let Some(next) = tokens.get(index + 1) {
+                let numeric = next.trim_start_matches('#');
+                if let Ok(number) = numeric.parse::<u64>() {
+                    numbers.insert(number);
+                }
+            }
+        }
+    }
+    numbers
+}
+
 fn value_has_review_threads(value: &Value) -> bool {
     if value.get("review_threads").is_some() || value.get("reviewThreads").is_some() {
         return true;
@@ -4292,6 +4460,37 @@ fn value_has_review_threads(value: &Value) -> bool {
         Value::Object(object) => object.values().any(value_has_review_threads),
         _ => false,
     }
+}
+
+fn value_has_pr_state_evidence(value: &Value) -> bool {
+    if value.get("evidence_kind").and_then(Value::as_str) == Some("github_pr_state") {
+        return true;
+    }
+    if value.get("mergedAt").is_some()
+        || value.get("merged_at").is_some()
+        || value.get("mergeStateStatus").is_some()
+        || value.get("merge_state_status").is_some()
+    {
+        return true;
+    }
+    match value {
+        Value::Array(items) => items.iter().any(value_has_pr_state_evidence),
+        Value::Object(object) => object.values().any(value_has_pr_state_evidence),
+        _ => false,
+    }
+}
+
+fn value_says_pr_merged(value: &Value) -> bool {
+    value
+        .get("state")
+        .or_else(|| value.get("pr_state"))
+        .and_then(Value::as_str)
+        .is_some_and(|state| state.eq_ignore_ascii_case("MERGED"))
+        || value
+            .get("mergedAt")
+            .or_else(|| value.get("merged_at"))
+            .and_then(Value::as_str)
+            .is_some_and(|merged_at| !merged_at.trim().is_empty())
 }
 
 fn value_has_status_check_rollup(value: &Value) -> bool {
@@ -5349,6 +5548,7 @@ Previous final_answer: {}\n\
 Return exactly one valid Nucleus worker action JSON object.\n\
 Rules:\n\
 - For PR review or latest feedback tasks, fetch thread-aware review data before saying there is no actionable feedback. Prefer github.pr_review_threads for inline review threads.\n\
+- For PR lifecycle claims such as already merged, nothing left to merge, open, closed, ready, mergeable, or approved, fetch direct PR state with github.pr_state. Local git status or log output is not enough.\n\
 - For test or validation tasks, only say tests/checks passed after a tests.run result or check-state evidence actually supports that. If zero tests matched, say no tests matched.\n\
 - If GitHub thread retrieval is unavailable or blocked, return a concise bounded final_answer that says you could not fully verify the PR feedback yet.\n\
 - If the user challenged a prior answer, use a deeper or different evidence path before repeating a clean/no-action conclusion.\n\
@@ -6470,6 +6670,11 @@ async fn execute_granted_tool(
                 .context("invalid args for github.pr_review_threads")?;
             execute_github_pr_review_threads_tool(worker, args).await
         }
+        "github.pr_state" => {
+            let args = serde_json::from_value::<GithubPrStateArgs>(args)
+                .context("invalid args for github.pr_state")?;
+            execute_github_pr_state_tool(worker, args).await
+        }
         "fs.apply_patch" => {
             let args = serde_json::from_value::<FsApplyPatchArgs>(args)
                 .context("invalid args for fs.apply_patch")?;
@@ -6897,6 +7102,9 @@ query($owner: String!, $repo: String!, $number: Int!) {
       url
       title
       state
+      mergedAt
+      headRefName
+      baseRefName
       reviewDecision
       mergeStateStatus
       comments(last: 100) {
@@ -7021,12 +7229,59 @@ query($owner: String!, $repo: String!, $number: Int!) {
         "url": pull.get("url").cloned().unwrap_or(Value::Null),
         "title": pull.get("title").cloned().unwrap_or(Value::Null),
         "state": pull.get("state").cloned().unwrap_or(Value::Null),
+        "merged_at": pull.get("mergedAt").cloned().unwrap_or(Value::Null),
+        "head_ref_name": pull.get("headRefName").cloned().unwrap_or(Value::Null),
+        "base_ref_name": pull.get("baseRefName").cloned().unwrap_or(Value::Null),
         "review_decision": pull.get("reviewDecision").cloned().unwrap_or(Value::Null),
         "merge_state_status": pull.get("mergeStateStatus").cloned().unwrap_or(Value::Null),
         "top_level_comments": top_level_comments,
         "reviews": reviews,
         "review_threads": review_threads,
         "status_check_rollup": status_check_rollup,
+    }))
+}
+
+async fn execute_github_pr_state_tool(
+    worker: &WorkerSummary,
+    args: GithubPrStateArgs,
+) -> Result<Value> {
+    let (owner, repo) = resolve_github_repo(worker, args.owner, args.repo).await?;
+    let selector = args.pr_number.map(|number| number.to_string()).or_else(|| {
+        args.branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|branch| !branch.is_empty())
+            .map(str::to_string)
+    });
+    let repo_arg = format!("{owner}/{repo}");
+    let mut command_args = vec!["pr".to_string(), "view".to_string()];
+    if let Some(selector) = selector {
+        command_args.push(selector);
+    }
+    command_args.extend([
+        "--repo".to_string(),
+        repo_arg.clone(),
+        "--json".to_string(),
+        "number,state,mergedAt,mergeStateStatus,headRefName,baseRefName,url,isDraft,reviewDecision"
+            .to_string(),
+    ]);
+    let refs = command_args.iter().map(String::as_str).collect::<Vec<_>>();
+    let raw = command_output_in_dir("gh", &refs, Some(Path::new(&worker.working_dir))).await?;
+    let value: Value = serde_json::from_str(&raw).context("failed to parse gh pr state output")?;
+    Ok(json!({
+        "evidence_kind": "github_pr_state",
+        "owner": owner,
+        "repo": repo,
+        "pr_number": value.get("number").cloned().unwrap_or(Value::Null),
+        "state": value.get("state").cloned().unwrap_or(Value::Null),
+        "merged_at": value.get("mergedAt").cloned().unwrap_or(Value::Null),
+        "merge_state_status": value.get("mergeStateStatus").cloned().unwrap_or(Value::Null),
+        "head_ref_name": value.get("headRefName").cloned().unwrap_or(Value::Null),
+        "base_ref_name": value.get("baseRefName").cloned().unwrap_or(Value::Null),
+        "url": value.get("url").cloned().unwrap_or(Value::Null),
+        "is_draft": value.get("isDraft").cloned().unwrap_or(Value::Null),
+        "review_decision": value.get("reviewDecision").cloned().unwrap_or(Value::Null),
+        "raw": value,
     }))
 }
 
@@ -10343,8 +10598,15 @@ fn resolve_scoped_path(
 }
 
 async fn command_output(command: &str, args: &[&str]) -> Result<String> {
+    command_output_in_dir(command, args, None).await
+}
+
+async fn command_output_in_dir(command: &str, args: &[&str], cwd: Option<&Path>) -> Result<String> {
     let mut child = Command::new(command);
     child.args(args);
+    if let Some(cwd) = cwd {
+        child.current_dir(cwd);
+    }
     if let Some(path) = command_path_env() {
         child.env("PATH", path);
     }
@@ -11506,6 +11768,18 @@ fn read_only_capabilities() -> Vec<ToolCapabilityGrantRecord> {
             concurrency_group: "github-read".to_string(),
             scope_kind: "repo".to_string(),
         },
+        ToolCapabilityGrantRecord {
+            tool_id: "github.pr_state".to_string(),
+            summary: "Fetch direct GitHub pull request lifecycle state, including state, mergedAt, mergeability, head branch, base branch, and URL.".to_string(),
+            approval_mode: "auto".to_string(),
+            risk_level: "low".to_string(),
+            side_effect_level: "network".to_string(),
+            timeout_secs: 30,
+            max_output_bytes: 16_384,
+            supports_streaming: false,
+            concurrency_group: "github-read".to_string(),
+            scope_kind: "repo".to_string(),
+        },
     ]
 }
 
@@ -11849,6 +12123,7 @@ Working directory: {}\n",
         "{\"kind\":\"tool_call\",\"summary\":\"inspect the active project\",\"tool\":\"project.inspect\",\"args\":{}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"list likely project directories\",\"tool\":\"fs.list\",\"args\":{\"path\":\".\",\"recursive\":false,\"limit\":100}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"fetch inline PR review threads\",\"tool\":\"github.pr_review_threads\",\"args\":{\"pr_number\":123}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"fetch direct PR lifecycle state\",\"tool\":\"github.pr_state\",\"args\":{\"pr_number\":123}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"check running dev processes\",\"tool\":\"command.run\",\"args\":{\"command\":\"sh\",\"args\":[\"-lc\",\"ps -ef | grep -iE 'stfr|vite|next|webpack|dev server' | grep -v grep\"],\"cwd\":\".\",\"timeout_secs\":20}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"verify the UI in Browser\",\"tool\":\"browser.navigate\",\"args\":{\"url\":\"http://127.0.0.1:5299\"}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"read Browser refs\",\"tool\":\"browser.snapshot\",\"args\":{}}\n\
@@ -11860,6 +12135,7 @@ Working directory: {}\n",
         "{\"kind\":\"tool_call\",\"summary\":\"inspect the active project\",\"tool\":\"project.inspect\",\"args\":{}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"list likely project directories\",\"tool\":\"fs.list\",\"args\":{\"path\":\".\",\"recursive\":false,\"limit\":100}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"fetch inline PR review threads\",\"tool\":\"github.pr_review_threads\",\"args\":{\"pr_number\":123}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"fetch direct PR lifecycle state\",\"tool\":\"github.pr_state\",\"args\":{\"pr_number\":123}}\n\
 {\"kind\":\"progress_update\",\"summary\":\"durable checkpoint, not done\",\"detail\":\"completed evidence and exact continuation point\"}\n\
 {\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\"}"
     };
@@ -11903,6 +12179,7 @@ Rules:\n\
 - Do not put plans, next-step instructions, progress updates, partial completion notes, or descriptions of future actions in final_answer.\n\
 - If the requested work is incomplete and you are not blocked or out of budget, continue with a tool_call instead of returning final_answer.\n\
 - For PR feedback, latest review, requested changes, Codex review, or unresolved comment tasks, do not rely on flat gh pr view comments alone. Fetch thread-aware inline review data with github.pr_review_threads before saying there is no actionable feedback.\n\
+- For PR lifecycle claims like merged, open, closed, ready, mergeable, or approved, fetch direct GitHub PR state with github.pr_state. Local git state can supplement, but it is never enough to say a PR is already merged or that nothing is left to merge. Only say that when direct PR state is MERGED or mergedAt is non-empty. If PR identity is unclear, resolve it from the session branch or ask a bounded follow-up.\n\
 - If a user challenges or repeats a prior clean/no-action answer, treat it as a grounding failure signal and use a deeper or different evidence path before repeating the conclusion.\n\
 - Treat zero matched tests as no tests matched, not validation success.\n\
 - When posting GitHub comments, use github.comment or a body file/stdin path. Do not put comment bodies with backticks or shell metacharacters inside sh -lc strings.\n\
@@ -12292,6 +12569,7 @@ mod tests {
             policy_for_tool("github.pr_review_threads").decision,
             "allow"
         );
+        assert_eq!(policy_for_tool("github.pr_state").decision, "allow");
     }
 
     #[test]
@@ -12409,6 +12687,11 @@ mod tests {
             read_only
                 .iter()
                 .any(|grant| grant.tool_id == "github.pr_review_threads")
+        );
+        assert!(
+            read_only
+                .iter()
+                .any(|grant| grant.tool_id == "github.pr_state")
         );
         assert!(
             !read_only
@@ -12905,6 +13188,144 @@ mod tests {
             &checkpoint,
             &worker,
             4,
+            2,
+        ));
+    }
+
+    #[test]
+    fn pr_merged_claim_requires_direct_matching_pr_state() {
+        let worker = test_worker_summary("pr-lifecycle-evidence", 100, 100);
+        let mut detail =
+            test_job_detail_with_prompt("looks like we got the clear to merge PR #217 to dev");
+        detail.job.title = "Merge PR".to_string();
+        let checkpoint =
+            test_checkpoint_with_prompt("looks like we got the clear to merge PR #217 to dev");
+
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Already merged",
+            "PR #217 is already merged into dev; nothing is left to merge.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            1,
+        ));
+
+        let mut wrong_pr_detail = detail.clone();
+        wrong_pr_detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_state",
+            json!({
+                "evidence_kind": "github_pr_state",
+                "pr_number": 219,
+                "state": "MERGED",
+                "merged_at": "2026-05-20T16:00:00Z",
+                "head_ref_name": "issue-218-grounding-evidence",
+                "base_ref_name": "dev"
+            }),
+        ));
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &wrong_pr_detail,
+            "Already merged",
+            "PR #217 is already merged into dev; nothing is left to merge.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+
+        let mut open_detail = detail.clone();
+        open_detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_state",
+            json!({
+                "evidence_kind": "github_pr_state",
+                "pr_number": 217,
+                "state": "OPEN",
+                "merged_at": null,
+                "head_ref_name": "work/nucleus/f8eec90e",
+                "base_ref_name": "dev"
+            }),
+        ));
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &open_detail,
+            "Already merged",
+            "PR #217 is already merged into dev; nothing is left to merge.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+
+        let mut merged_detail = detail.clone();
+        merged_detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_state",
+            json!({
+                "evidence_kind": "github_pr_state",
+                "pr_number": 217,
+                "state": "MERGED",
+                "merged_at": "2026-05-20T16:00:00Z",
+                "head_ref_name": "work/nucleus/f8eec90e",
+                "base_ref_name": "dev"
+            }),
+        ));
+        assert!(has_direct_pr_merged_evidence_for_claim(
+            &merged_detail,
+            &evidence_task_text(&merged_detail, &checkpoint),
+            "Already merged",
+            "PR #217 is already merged into dev; nothing is left to merge.",
+        ));
+        assert!(!should_retry_unsupported_confident_negative_final_answer(
+            &merged_detail,
+            "Already merged",
+            "PR #217 is already merged into dev; nothing is left to merge.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+    }
+
+    #[test]
+    fn pr_ready_claim_requires_direct_pr_state() {
+        let worker = test_worker_summary("pr-ready-evidence", 100, 100);
+        let mut detail = test_job_detail_with_prompt("Check whether PR #217 is ready to merge.");
+        detail.job.title = "Merge readiness".to_string();
+        let checkpoint = test_checkpoint_with_prompt("Check whether PR #217 is ready to merge.");
+
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Ready to merge",
+            "PR #217 is ready to merge.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            1,
+        ));
+
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_state",
+            json!({
+                "evidence_kind": "github_pr_state",
+                "pr_number": 217,
+                "state": "OPEN",
+                "merged_at": null,
+                "merge_state_status": "CLEAN",
+                "head_ref_name": "work/nucleus/f8eec90e",
+                "base_ref_name": "dev"
+            }),
+        ));
+        assert!(!should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Ready to merge",
+            "PR #217 is ready to merge.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
             2,
         ));
     }
