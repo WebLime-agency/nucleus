@@ -841,6 +841,21 @@ pub async fn start_prompt_job(
     let job_id = Uuid::new_v4().to_string();
     let root_worker_id = Uuid::new_v4().to_string();
     let needs_vision_tools = !payload.images.is_empty();
+    let memory_outcomes =
+        match crate::save_explicit_memory_from_prompt(&state, &current.session, &payload.prompt)
+            .await
+        {
+            Ok(outcomes) => outcomes,
+            Err(error) => vec![MemoryOutcome {
+                kind: "explicit_save".to_string(),
+                state: "rejected".to_string(),
+                memory_id: String::new(),
+                candidate_id: String::new(),
+                dedupe_key: String::new(),
+                title: "Explicit memory not saved".to_string(),
+                detail: error.message,
+            }],
+        };
     let target = resolve_hidden_worker_target(
         &state,
         &current.session,
@@ -967,22 +982,6 @@ pub async fn start_prompt_job(
         &payload.images,
         &compiler_role,
     )?;
-
-    let memory_outcomes =
-        match crate::save_explicit_memory_from_prompt(&state, &current.session, &payload.prompt)
-            .await
-        {
-            Ok(outcomes) => outcomes,
-            Err(error) => vec![MemoryOutcome {
-                kind: "explicit_save".to_string(),
-                state: "rejected".to_string(),
-                memory_id: String::new(),
-                candidate_id: String::new(),
-                dedupe_key: String::new(),
-                title: "Explicit memory not saved".to_string(),
-                detail: error.message,
-            }],
-        };
 
     let checkpoint = WorkerCheckpoint {
         session_id: session_id.clone(),
@@ -14392,6 +14391,194 @@ Cleanup status: clean";
         .await
         .expect_err("main lane must not execute actions");
         assert!(execute_error.to_string().contains("only utility workers"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn start_prompt_job_persists_manual_remember_requests_directly() {
+        let state_dir = test_state_dir("manual-remember-direct-save");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace root should exist");
+        let (base_url, server) = spawn_single_response_openai_server(
+            r#"{"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
+        )
+        .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-memory-model",
+            &base_url,
+            "utility-key",
+        );
+        let session_id = "manual-remember-session".to_string();
+        state
+            .store
+            .create_session(SessionRecord {
+                id: session_id.clone(),
+                title: "Manual remember".to_string(),
+                profile_id: String::new(),
+                profile_title: String::new(),
+                route_id: String::new(),
+                route_title: String::new(),
+                scope: "ad_hoc".to_string(),
+                project_id: String::new(),
+                project_title: String::new(),
+                project_path: String::new(),
+                project_ids: Vec::new(),
+                provider: "claude".to_string(),
+                model: "sonnet".to_string(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                working_dir: workspace_root.display().to_string(),
+                working_dir_kind: "workspace_scratch".to_string(),
+                workspace_mode: "scratch_only".to_string(),
+                source_project_path: String::new(),
+                git_root: String::new(),
+                worktree_path: String::new(),
+                git_branch: String::new(),
+                git_base_ref: String::new(),
+                git_head: String::new(),
+                git_dirty: false,
+                git_untracked_count: 0,
+                git_remote_tracking_branch: String::new(),
+                workspace_warnings: Vec::new(),
+                approval_mode: "ask".to_string(),
+                execution_mode: "act".to_string(),
+                run_budget_mode: "inherit".to_string(),
+            })
+            .expect("session should persist");
+
+        let payload = SessionPromptRequest {
+            prompt: "Can you remember that I like vanilla ice cream?".to_string(),
+            images: vec![],
+            role: "main".to_string(),
+        };
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            payload,
+            current,
+            "Can you remember that I like vanilla ice cream?".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("prompt should queue through utility worker");
+        let _ = wait_for_session_state(&state, &session_id, "active").await;
+        server.await.expect("test server should finish");
+
+        let entries = state
+            .store
+            .list_memory_entries()
+            .expect("memory should list");
+        let saved = entries
+            .iter()
+            .find(|entry| {
+                entry.source_kind == "explicit_remember"
+                    && entry.content == "I like vanilla ice cream"
+            })
+            .expect("manual remember should save accepted durable memory");
+        assert_eq!(saved.source_kind, "explicit_remember");
+        assert_eq!(saved.created_by, "user");
+        assert_eq!(saved.scope_kind, "workspace");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn start_prompt_job_does_not_persist_ephemeral_remember_to_prompts() {
+        let state_dir = test_state_dir("manual-remember-ephemeral-guardrail");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace root should exist");
+        let (base_url, server) = spawn_single_response_openai_server(
+            r#"{"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
+        )
+        .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-memory-model",
+            &base_url,
+            "utility-key",
+        );
+        let session_id = "manual-remember-ephemeral-session".to_string();
+        state
+            .store
+            .create_session(SessionRecord {
+                id: session_id.clone(),
+                title: "Remember to".to_string(),
+                profile_id: String::new(),
+                profile_title: String::new(),
+                route_id: String::new(),
+                route_title: String::new(),
+                scope: "ad_hoc".to_string(),
+                project_id: String::new(),
+                project_title: String::new(),
+                project_path: String::new(),
+                project_ids: Vec::new(),
+                provider: "claude".to_string(),
+                model: "sonnet".to_string(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                working_dir: workspace_root.display().to_string(),
+                working_dir_kind: "workspace_scratch".to_string(),
+                workspace_mode: "scratch_only".to_string(),
+                source_project_path: String::new(),
+                git_root: String::new(),
+                worktree_path: String::new(),
+                git_branch: String::new(),
+                git_base_ref: String::new(),
+                git_head: String::new(),
+                git_dirty: false,
+                git_untracked_count: 0,
+                git_remote_tracking_branch: String::new(),
+                workspace_warnings: Vec::new(),
+                approval_mode: "ask".to_string(),
+                execution_mode: "act".to_string(),
+                run_budget_mode: "inherit".to_string(),
+            })
+            .expect("session should persist");
+
+        let payload = SessionPromptRequest {
+            prompt: "remember to keep the next reply concise before answering this turn"
+                .to_string(),
+            images: vec![],
+            role: "main".to_string(),
+        };
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            payload,
+            current,
+            "remember to keep the next reply concise before answering this turn".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("prompt should queue through utility worker");
+        let _ = wait_for_session_state(&state, &session_id, "active").await;
+        server.await.expect("test server should finish");
+
+        assert!(
+            state
+                .store
+                .list_memory_entries()
+                .expect("memory should list")
+                .into_iter()
+                .all(|entry| entry.content
+                    != "keep the next reply concise before answering this turn")
+        );
 
         let _ = fs::remove_dir_all(&state_dir);
     }
