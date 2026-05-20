@@ -4321,22 +4321,22 @@ fn confident_test_success_claim(summary: &str, final_answer: &str) -> bool {
 fn has_thread_aware_pr_review_evidence(detail: &JobDetail) -> bool {
     detail.tool_calls.iter().any(|tool_call| {
         tool_call.status == "completed"
-            && (tool_call.tool_id == "github.pr_review_threads"
-                || tool_call
-                    .result_json
-                    .as_ref()
-                    .is_some_and(value_has_review_threads))
+            && tool_call
+                .result_json
+                .as_ref()
+                .is_some_and(value_has_complete_review_threads)
     })
 }
 
 fn has_test_validation_evidence(detail: &JobDetail) -> bool {
     detail.tool_calls.iter().any(|tool_call| {
         tool_call.status == "completed"
-            && (tool_call.tool_id == "tests.run"
-                || tool_call
-                    .result_json
-                    .as_ref()
-                    .is_some_and(value_has_status_check_rollup))
+            && tool_call.result_json.as_ref().is_some_and(|result| {
+                if tool_call.tool_id == "tests.run" {
+                    return value_has_successful_test_run(result);
+                }
+                value_has_successful_status_check_rollup(result)
+            })
     })
 }
 
@@ -4512,13 +4512,21 @@ fn parse_pr_reference_number(token: &str) -> Option<u64> {
     token.trim_start_matches('#').parse().ok()
 }
 
-fn value_has_review_threads(value: &Value) -> bool {
+fn value_has_complete_review_threads(value: &Value) -> bool {
     if value.get("review_threads").is_some() || value.get("reviewThreads").is_some() {
-        return true;
+        let comments_truncated = value
+            .get("thread_comments_truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let threads_complete = value
+            .get("review_threads_complete")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        return threads_complete && !comments_truncated;
     }
     match value {
-        Value::Array(items) => items.iter().any(value_has_review_threads),
-        Value::Object(object) => object.values().any(value_has_review_threads),
+        Value::Array(items) => items.iter().any(value_has_complete_review_threads),
+        Value::Object(object) => object.values().any(value_has_complete_review_threads),
         _ => false,
     }
 }
@@ -4554,13 +4562,21 @@ fn value_says_pr_merged(value: &Value) -> bool {
             .is_some_and(|merged_at| !merged_at.trim().is_empty())
 }
 
-fn value_has_status_check_rollup(value: &Value) -> bool {
-    if value.get("status_check_rollup").is_some() || value.get("statusCheckRollup").is_some() {
-        return true;
+fn value_has_successful_status_check_rollup(value: &Value) -> bool {
+    if let Some(rollup) = value
+        .get("status_check_rollup")
+        .or_else(|| value.get("statusCheckRollup"))
+    {
+        return rollup
+            .get("state")
+            .and_then(Value::as_str)
+            .is_some_and(|state| state.eq_ignore_ascii_case("SUCCESS"));
     }
     match value {
-        Value::Array(items) => items.iter().any(value_has_status_check_rollup),
-        Value::Object(object) => object.values().any(value_has_status_check_rollup),
+        Value::Array(items) => items.iter().any(value_has_successful_status_check_rollup),
+        Value::Object(object) => object
+            .values()
+            .any(value_has_successful_status_check_rollup),
         _ => false,
     }
 }
@@ -13473,6 +13489,44 @@ mod tests {
     }
 
     #[test]
+    fn pr_review_feedback_retries_when_thread_evidence_is_incomplete() {
+        let worker = test_worker_summary("pr-feedback-incomplete-thread-evidence", 100, 100);
+        let mut detail = test_job_detail_with_prompt(
+            "Check latest PR feedback on PR #217 and unresolved Codex review comments.",
+        );
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_review_threads",
+            json!({
+                "evidence_kind": "github_pr_review_threads",
+                "review_threads": [
+                    {
+                        "isResolved": false,
+                        "isOutdated": false,
+                        "path": "crates/daemon/src/agent.rs",
+                        "line": 42,
+                        "comments": {"nodes": []}
+                    }
+                ],
+                "review_threads_complete": false,
+                "thread_comments_truncated": true
+            }),
+        ));
+        let checkpoint = test_checkpoint_with_prompt("Check latest PR feedback.");
+
+        assert!(!has_thread_aware_pr_review_evidence(&detail));
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "No actionable feedback",
+            "There is no actionable feedback.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+    }
+
+    #[test]
     fn repeated_user_challenge_blocks_repeated_unsupported_clean_answer() {
         let worker = test_worker_summary("repeated-grounding-challenge", 100, 100);
         let detail = test_job_detail_with_prompt(
@@ -13891,6 +13945,33 @@ mod tests {
             &worker,
             3,
             1,
+        ));
+    }
+
+    #[test]
+    fn failing_test_run_does_not_support_validation_passed_claim() {
+        let worker = test_worker_summary("failed-test-evidence", 100, 100);
+        let mut detail = test_job_detail_with_prompt("Run tests and validate the fix.");
+        detail.tool_calls.push(test_tool_call_summary(
+            "tests.run",
+            json!({
+                "stdout_tail": "test result: FAILED. 0 passed; 1 failed",
+                "stderr_tail": "",
+                "exit_code": 1
+            }),
+        ));
+        let checkpoint = test_checkpoint_with_prompt("Run tests and validate the fix.");
+
+        assert!(!has_test_validation_evidence(&detail));
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Validation passed",
+            "Tests passed.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
         ));
     }
 
