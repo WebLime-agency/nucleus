@@ -208,6 +208,12 @@ pub struct JobSummary {
     pub requested_by: String,
     pub prompt_excerpt: String,
     pub root_worker_id: Option<String>,
+    #[serde(default)]
+    pub executor_lane: String,
+    #[serde(default)]
+    pub executor_provider: String,
+    #[serde(default)]
+    pub executor_model: String,
     pub visible_turn_id: Option<String>,
     pub result_summary: String,
     pub last_error: String,
@@ -1802,6 +1808,9 @@ mod tests {
             requested_by: "user".to_string(),
             prompt_excerpt: "fix layout".to_string(),
             root_worker_id: Some("worker-1".to_string()),
+            executor_lane: "utility".to_string(),
+            executor_provider: "openai_compatible".to_string(),
+            executor_model: "gpt-5.4-mini".to_string(),
             visible_turn_id: Some("turn-1".to_string()),
             result_summary: "done".to_string(),
             last_error: String::new(),
