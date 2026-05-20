@@ -4123,7 +4123,7 @@ fn should_retry_unsupported_confident_negative_final_answer(
 
     let task_text = evidence_task_text(detail, checkpoint);
     let missing_pr_review_evidence = requires_pr_review_thread_evidence(&task_text)
-        && !has_thread_aware_pr_review_evidence(detail);
+        && !has_thread_aware_pr_review_evidence(detail, &task_text, summary, final_answer);
     let missing_test_evidence = requires_test_validation_evidence(&task_text)
         && !has_test_validation_evidence(detail, &task_text, summary, final_answer);
     let zero_test_misread = confident_test_success_claim(summary, final_answer)
@@ -4134,7 +4134,7 @@ fn should_retry_unsupported_confident_negative_final_answer(
         && !has_direct_pr_merged_evidence_for_claim(detail, &task_text, summary, final_answer);
     let challenged_clean_answer = requires_pr_review_thread_evidence(&task_text)
         && repeated_grounding_challenge(&task_text)
-        && !has_thread_aware_pr_review_evidence(detail);
+        && !has_thread_aware_pr_review_evidence(detail, &task_text, summary, final_answer);
 
     (missing_pr_review_evidence
         || missing_test_evidence
@@ -4318,13 +4318,30 @@ fn confident_test_success_claim(summary: &str, final_answer: &str) -> bool {
     .any(|needle| text.contains(needle))
 }
 
-fn has_thread_aware_pr_review_evidence(detail: &JobDetail) -> bool {
-    detail.tool_calls.iter().any(|tool_call| {
-        tool_call.status == "completed"
-            && tool_call
-                .result_json
-                .as_ref()
-                .is_some_and(value_has_complete_review_threads)
+fn has_thread_aware_pr_review_evidence(
+    detail: &JobDetail,
+    task_text: &str,
+    summary: &str,
+    final_answer: &str,
+) -> bool {
+    let pr_numbers = extract_pr_numbers(&format!("{task_text}\n{summary}\n{final_answer}"));
+    if pr_numbers.is_empty() {
+        return detail.tool_calls.iter().any(|tool_call| {
+            tool_call.status == "completed"
+                && tool_call
+                    .result_json
+                    .as_ref()
+                    .is_some_and(value_has_complete_review_threads)
+        });
+    }
+    pr_numbers.iter().all(|pr_number| {
+        detail.tool_calls.iter().any(|tool_call| {
+            tool_call.status == "completed"
+                && tool_call.result_json.as_ref().is_some_and(|result| {
+                    value_pr_number(result).is_some_and(|number| number == *pr_number)
+                        && value_has_complete_review_threads(result)
+                })
+        })
     })
 }
 
@@ -4334,6 +4351,24 @@ fn has_test_validation_evidence(
     summary: &str,
     final_answer: &str,
 ) -> bool {
+    let combined_text =
+        normalize_action_item_text(&format!("{task_text}\n{summary}\n{final_answer}"));
+    let pr_numbers = extract_pr_numbers(&combined_text);
+    let requires_pr_status_checks =
+        !pr_numbers.is_empty() && requires_pr_status_check_evidence(&combined_text);
+
+    if requires_pr_status_checks {
+        return pr_numbers.iter().all(|pr_number| {
+            detail.tool_calls.iter().any(|tool_call| {
+                tool_call.status == "completed"
+                    && tool_call.result_json.as_ref().is_some_and(|result| {
+                        value_pr_number(result).is_some_and(|number| number == *pr_number)
+                            && value_has_successful_status_check_rollup(result)
+                    })
+            })
+        });
+    }
+
     if detail.tool_calls.iter().any(|tool_call| {
         tool_call.status == "completed"
             && tool_call.result_json.as_ref().is_some_and(|result| {
@@ -4343,7 +4378,6 @@ fn has_test_validation_evidence(
         return true;
     }
 
-    let pr_numbers = extract_pr_numbers(&format!("{task_text}\n{summary}\n{final_answer}"));
     if pr_numbers.is_empty() {
         return detail.tool_calls.iter().any(|tool_call| {
             tool_call.status == "completed"
@@ -4362,6 +4396,22 @@ fn has_test_validation_evidence(
                 })
         })
     })
+}
+
+fn requires_pr_status_check_evidence(text: &str) -> bool {
+    [
+        "check passed",
+        "checks passed",
+        "no failed checks",
+        "ci passed",
+        "status check",
+        "status checks",
+        "github action",
+        "github actions",
+        "workflow passed",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 fn has_zero_test_no_match_evidence(detail: &JobDetail) -> bool {
@@ -13455,6 +13505,7 @@ mod tests {
             "github.pr_review_threads",
             json!({
                 "evidence_kind": "github_pr_review_threads",
+                "pr_number": 217,
                 "review_threads": [
                     {
                         "isResolved": true,
@@ -13470,7 +13521,70 @@ mod tests {
         ));
         let checkpoint = test_checkpoint_with_prompt("Check latest PR feedback.");
 
-        assert!(has_thread_aware_pr_review_evidence(&detail));
+        assert!(has_thread_aware_pr_review_evidence(
+            &detail,
+            &evidence_task_text(&detail, &checkpoint),
+            "No actionable feedback",
+            "There is no actionable feedback.",
+        ));
+        assert!(!should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "No actionable feedback",
+            "There is no actionable feedback.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+    }
+
+    #[test]
+    fn pr_review_feedback_evidence_must_match_referenced_pr() {
+        let worker = test_worker_summary("wrong-pr-feedback-evidence", 100, 100);
+        let mut detail = test_job_detail_with_prompt(
+            "Check latest PR feedback on PR #217 and unresolved Codex review comments.",
+        );
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_review_threads",
+            json!({
+                "evidence_kind": "github_pr_review_threads",
+                "pr_number": 219,
+                "review_threads": [],
+                "review_threads_complete": true,
+                "thread_comments_truncated": false
+            }),
+        ));
+        let checkpoint = test_checkpoint_with_prompt("Check latest PR feedback on PR #217.");
+
+        assert!(!has_thread_aware_pr_review_evidence(
+            &detail,
+            &evidence_task_text(&detail, &checkpoint),
+            "No actionable feedback",
+            "There is no actionable feedback.",
+        ));
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "No actionable feedback",
+            "There is no actionable feedback.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            2,
+        ));
+
+        detail.tool_calls.clear();
+        detail.tool_calls.push(test_tool_call_summary(
+            "github.pr_review_threads",
+            json!({
+                "evidence_kind": "github_pr_review_threads",
+                "pr_number": 217,
+                "review_threads": [],
+                "review_threads_complete": true,
+                "thread_comments_truncated": false
+            }),
+        ));
         assert!(!should_retry_unsupported_confident_negative_final_answer(
             &detail,
             "No actionable feedback",
@@ -13563,7 +13677,12 @@ mod tests {
         ));
         let checkpoint = test_checkpoint_with_prompt("Check latest PR feedback.");
 
-        assert!(!has_thread_aware_pr_review_evidence(&detail));
+        assert!(!has_thread_aware_pr_review_evidence(
+            &detail,
+            &evidence_task_text(&detail, &checkpoint),
+            "No actionable feedback",
+            "There is no actionable feedback.",
+        ));
         assert!(should_retry_unsupported_confident_negative_final_answer(
             &detail,
             "No actionable feedback",
@@ -13601,7 +13720,12 @@ mod tests {
         ));
         let checkpoint = test_checkpoint_with_prompt("Check latest PR feedback.");
 
-        assert!(!has_thread_aware_pr_review_evidence(&detail));
+        assert!(!has_thread_aware_pr_review_evidence(
+            &detail,
+            &evidence_task_text(&detail, &checkpoint),
+            "No actionable feedback",
+            "There is no actionable feedback.",
+        ));
         assert!(should_retry_unsupported_confident_negative_final_answer(
             &detail,
             "No actionable feedback",
@@ -14111,6 +14235,13 @@ mod tests {
         let worker = test_worker_summary("wrong-pr-status-evidence", 100, 100);
         let mut detail =
             test_job_detail_with_prompt("Check whether tests passed for PR #217 before merge.");
+        detail.tool_calls.push(test_tool_call_summary(
+            "tests.run",
+            json!({
+                "stdout_tail": "running 1 test\n\ntest result: ok. 1 passed; 0 failed",
+                "exit_code": 0
+            }),
+        ));
         detail.tool_calls.push(test_tool_call_summary(
             "github.pr_review_threads",
             json!({
