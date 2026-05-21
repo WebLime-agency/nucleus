@@ -787,14 +787,14 @@ impl StateStore {
         Ok(
             setting_value_optional(&connection, MEMORY_CLASSIFIER_KIND_KEY)?
                 .map(|value| value.trim().to_ascii_lowercase())
-                .filter(|value| matches!(value.as_str(), "legacy" | "llm"))
+                .filter(|value| matches!(value.as_str(), "legacy" | "llm" | "shadow"))
                 .unwrap_or_else(|| DEFAULT_MEMORY_CLASSIFIER_KIND.to_string()),
         )
     }
 
     pub fn set_memory_classifier_kind(&self, kind: &str) -> Result<()> {
         let normalized = kind.trim().to_ascii_lowercase();
-        if !matches!(normalized.as_str(), "legacy" | "llm") {
+        if !matches!(normalized.as_str(), "legacy" | "llm" | "shadow") {
             bail!("unsupported memory classifier kind '{kind}'");
         }
         let connection = self.connection.lock().expect("storage mutex poisoned");
