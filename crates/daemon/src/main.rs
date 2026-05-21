@@ -1596,7 +1596,25 @@ async fn extract_memory_decisions_after_turn_inner(
     };
 
     if classifier_kind == "shadow" {
-        run_shadow_memory_classifier(state, &detail.session, assistant_turn_id).await;
+        // The shadow classifier is non-authoritative — legacy already wrote
+        // everything that affects the user. Detaching keeps a slow/unavailable
+        // utility endpoint from adding the 30s classifier timeout to every
+        // post-turn extraction.
+        let shadow_state = state.clone();
+        let shadow_session = detail.session.clone();
+        let shadow_turn = assistant_turn_id.map(str::to_string);
+        let shadow_handle = tokio::spawn(async move {
+            run_shadow_memory_classifier(&shadow_state, &shadow_session, shadow_turn.as_deref())
+                .await;
+        });
+        #[cfg(test)]
+        {
+            let _ = shadow_handle.await;
+        }
+        #[cfg(not(test))]
+        {
+            let _ = shadow_handle;
+        }
     }
 
     Ok(legacy_outcomes)
