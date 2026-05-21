@@ -38,15 +38,17 @@ use uuid::Uuid;
 use super::{
     ApiError, AppState, MCP_ENV_BEARER_MIGRATION_MESSAGE, assemble_prompt_input,
     ensure_prompting_runtime, excerpt, load_router_profiles, publish_overview_event,
-    publish_prompt_progress_event, publish_session_event, record_instance_log,
+    publish_prompt_progress_event, publish_session_event, record_instance_log, record_memory_audit,
     resolve_mcp_vault_bearer_token, resolve_profile_targets, resolve_session_projects,
     resolve_workspace_profile, resolve_workspace_profile_target, try_record_audit_event,
     unix_timestamp,
 };
 use crate::runtime::{PromptStreamEvent, ProviderTurnResult};
+#[cfg(test)]
+use crate::worker_action::parse_worker_action;
 use crate::worker_action::{
     BrowserVerificationClaim, ChildJobProposal, FinalAnswerArtifact, WorkerAction,
-    parse_worker_action, parse_worker_action_with_registered_mcp_tools,
+    parse_worker_action_with_registered_mcp_tools,
 };
 use crate::{error_display, security};
 
@@ -1929,23 +1931,31 @@ async fn run_job_loop(
         )
         .await;
 
-        let response = call_worker_model(
+        let response = match call_worker_model(
             state,
             Some(&session.session),
             &worker,
             &checkpoint.conversation,
             &prompt,
             prompt_images,
+            cancel_rx,
         )
         .await
-        .map_err(|error| {
-            anyhow!(
-                "Utility Worker route failed (lane={}, provider={}, model={}): check Utility model credentials and endpoint settings: {error}",
-                worker.lane,
-                worker.provider,
-                worker.model
-            )
-        })?;
+        {
+            Ok(response) => response,
+            Err(_) if *cancel_rx.borrow() => return Ok(()),
+            Err(error) => {
+                return Err(anyhow!(
+                    "Utility Worker route failed (lane={}, provider={}, model={}): check Utility model credentials and endpoint settings: {error}",
+                    worker.lane,
+                    worker.provider,
+                    worker.model
+                ));
+            }
+        };
+        if *cancel_rx.borrow() {
+            return Ok(());
+        }
         checkpoint.conversation.push(CheckpointMessage {
             role: "user".to_string(),
             content: prompt.clone(),
@@ -6073,9 +6083,18 @@ async fn call_worker_model(
     conversation: &[CheckpointMessage],
     prompt: &str,
     images: &[SessionTurnImage],
+    cancel_rx: &mut watch::Receiver<bool>,
 ) -> Result<ModelResponse> {
-    let result =
-        execute_worker_model_turn(state, session, worker, conversation, prompt, images).await?;
+    let result = execute_worker_model_turn(
+        state,
+        session,
+        worker,
+        conversation,
+        prompt,
+        images,
+        cancel_rx,
+    )
+    .await?;
     let registered_mcp_tool_ids = registered_mcp_tool_ids(state);
     let action = match parse_worker_action_with_registered_mcp_tools(
         &result.content,
@@ -6105,6 +6124,7 @@ async fn call_worker_model(
                 &repair_conversation,
                 &repair_prompt,
                 &[],
+                cancel_rx,
             )
             .await?;
             let action = parse_worker_action_with_registered_mcp_tools(
@@ -6157,6 +6177,7 @@ async fn execute_worker_model_turn(
     conversation: &[CheckpointMessage],
     prompt: &str,
     images: &[SessionTurnImage],
+    cancel_rx: &mut watch::Receiver<bool>,
 ) -> Result<ProviderTurnResult> {
     let (events, mut receiver) = mpsc::unbounded_channel();
     let execution = build_execution_session(worker);
@@ -6166,6 +6187,7 @@ async fn execute_worker_model_turn(
     let execution_clone = execution.clone();
     let history_clone = history.clone();
     let images = images.to_vec();
+    let cancel_for_runtime = cancel_rx.clone();
     // Compile the real session's context (memory layers, prompt includes,
     // skill layers, tool/mcp catalogs) so the provider call sees the same
     // system prompt the daemon advertises in debug summaries. Without this
@@ -6188,22 +6210,24 @@ async fn execute_worker_model_turn(
         match compiled_turn {
             Some(turn) => {
                 runtimes
-                    .execute_compiled_turn_stream(
+                    .execute_compiled_turn_stream_cancellable(
                         &execution_clone,
                         std::sync::Arc::new(turn),
                         events,
+                        Some(cancel_for_runtime),
                     )
                     .await
             }
             None => {
                 runtimes
-                    .execute_prompt_stream(
+                    .execute_prompt_stream_cancellable(
                         &execution_clone,
                         &history_clone,
                         &prompt_body,
                         &images,
                         "utility",
                         events,
+                        Some(cancel_for_runtime),
                     )
                     .await
             }
@@ -6212,11 +6236,31 @@ async fn execute_worker_model_turn(
 
     let mut last_reasoning = String::new();
     while let Some(event) = receiver.recv().await {
-        if let PromptStreamEvent::ReasoningSnapshot { text } = event {
-            let excerpted = excerpt(&text, 240);
-            if excerpted != last_reasoning {
-                last_reasoning = excerpted;
+        match event {
+            PromptStreamEvent::ReasoningSnapshot { text } => {
+                let excerpted = excerpt(&text, 240);
+                if excerpted != last_reasoning {
+                    last_reasoning = excerpted;
+                }
             }
+            PromptStreamEvent::ProviderRetry {
+                attempt,
+                error_class,
+                backoff,
+            } => {
+                record_memory_audit(
+                    state,
+                    "worker.provider.retry",
+                    &worker.id,
+                    "retrying",
+                    &format!(
+                        "Retrying provider call attempt {attempt} after {error_class}; backoff={}ms",
+                        backoff.as_millis()
+                    ),
+                )
+                .await;
+            }
+            _ => {}
         }
     }
 
@@ -12854,7 +12898,7 @@ mod tests {
             Arc, Mutex as TestMutex,
             atomic::{AtomicUsize, Ordering},
         },
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
     use tokio::sync::broadcast;
 
@@ -16170,9 +16214,18 @@ Cleanup status: clean";
         let mut worker = test_worker_summary("repair-worker", 10, 10);
         worker.provider_base_url = base_url;
         worker.working_dir = state_dir.display().to_string();
-        let response = call_worker_model(&state, None, &worker, &[], "Inspect the repo.", &[])
-            .await
-            .expect("repair turn should produce a valid action");
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let response = call_worker_model(
+            &state,
+            None,
+            &worker,
+            &[],
+            "Inspect the repo.",
+            &[],
+            &mut cancel_rx,
+        )
+        .await
+        .expect("repair turn should produce a valid action");
 
         let WorkerAction::FinalAnswer {
             summary,
@@ -16196,6 +16249,275 @@ Cleanup status: clean";
         assert!(bodies[1].contains("Nucleus action contract"));
         assert!(bodies[1].contains("I should inspect the repo next"));
 
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn call_worker_model_retries_500_once_and_records_audit() {
+        let state_dir = test_state_dir("worker-provider-retry-500-once");
+        let state = initialize_test_state(&state_dir);
+        let (base_url, request_count, server) = spawn_retry_openai_server(vec![
+            TestOpenAiProviderResponse {
+                status: 500,
+                retry_after_secs: None,
+                body: r#"{"error":"temporary"}"#,
+                content: None,
+            },
+            TestOpenAiProviderResponse {
+                status: 200,
+                retry_after_secs: None,
+                body: "",
+                content: Some(
+                    r#"{"kind":"final_answer","summary":"retried","final_answer":"Done."}"#,
+                ),
+            },
+        ])
+        .await;
+
+        let mut worker = test_worker_summary("provider-retry-500", 10, 10);
+        worker.provider_base_url = base_url;
+        worker.working_dir = state_dir.display().to_string();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let response =
+            call_worker_model(&state, None, &worker, &[], "Try once.", &[], &mut cancel_rx)
+                .await
+                .expect("transient 500 should retry and succeed");
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            response.action,
+            WorkerAction::FinalAnswer { final_answer, .. } if final_answer == "Done."
+        ));
+        let audits = state.store.list_audit_events(20).expect("audit lists");
+        assert!(
+            audits.iter().any(|event| {
+                event.kind == "worker.provider.retry"
+                    && event.target == worker.id
+                    && event.summary.contains("http_500")
+            }),
+            "expected worker.provider.retry audit event, got {audits:?}"
+        );
+
+        server.await.expect("test server should finish");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn call_worker_model_honors_retry_after_header() {
+        let state_dir = test_state_dir("worker-provider-retry-after");
+        let state = initialize_test_state(&state_dir);
+        let (base_url, request_count, server) = spawn_retry_openai_server(vec![
+            TestOpenAiProviderResponse {
+                status: 429,
+                retry_after_secs: Some(5),
+                body: r#"{"error":"rate limited"}"#,
+                content: None,
+            },
+            TestOpenAiProviderResponse {
+                status: 200,
+                retry_after_secs: None,
+                body: "",
+                content: Some(
+                    r#"{"kind":"final_answer","summary":"retried","final_answer":"Done."}"#,
+                ),
+            },
+        ])
+        .await;
+
+        let mut worker = test_worker_summary("provider-retry-after", 10, 10);
+        worker.provider_base_url = base_url;
+        worker.working_dir = state_dir.display().to_string();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let started = Instant::now();
+        call_worker_model(
+            &state,
+            None,
+            &worker,
+            &[],
+            "Try later.",
+            &[],
+            &mut cancel_rx,
+        )
+        .await
+        .expect("429 with retry-after should retry and succeed");
+
+        assert!(
+            started.elapsed() >= Duration::from_secs(5),
+            "retry-after backoff should delay the second attempt"
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+
+        server.await.expect("test server should finish");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn call_worker_model_does_not_retry_401() {
+        let state_dir = test_state_dir("worker-provider-retry-401");
+        let state = initialize_test_state(&state_dir);
+        let (base_url, request_count, server) =
+            spawn_retry_openai_server(vec![TestOpenAiProviderResponse {
+                status: 401,
+                retry_after_secs: None,
+                body: r#"{"error":"bad key"}"#,
+                content: None,
+            }])
+            .await;
+
+        let mut worker = test_worker_summary("provider-retry-401", 10, 10);
+        worker.provider_base_url = base_url;
+        worker.working_dir = state_dir.display().to_string();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let error = call_worker_model(&state, None, &worker, &[], "Try auth.", &[], &mut cancel_rx)
+            .await
+            .expect_err("401 should fail immediately");
+
+        assert!(error.to_string().contains("401"));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert!(
+            !state
+                .store
+                .list_audit_events(20)
+                .expect("audit lists")
+                .iter()
+                .any(|event| event.kind == "worker.provider.retry")
+        );
+
+        server.await.expect("test server should finish");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn call_worker_model_gives_up_after_max_retries() {
+        let state_dir = test_state_dir("worker-provider-retry-max");
+        let state = initialize_test_state(&state_dir);
+        let responses = vec![
+            TestOpenAiProviderResponse {
+                status: 500,
+                retry_after_secs: None,
+                body: r#"{"error":"still down"}"#,
+                content: None,
+            };
+            (crate::retry::MAX_RETRY_ATTEMPTS + 1) as usize
+        ];
+        let (base_url, request_count, server) = spawn_retry_openai_server(responses).await;
+
+        let mut worker = test_worker_summary("provider-retry-max", 10, 10);
+        worker.provider_base_url = base_url;
+        worker.working_dir = state_dir.display().to_string();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let error = call_worker_model(
+            &state,
+            None,
+            &worker,
+            &[],
+            "Try until cap.",
+            &[],
+            &mut cancel_rx,
+        )
+        .await
+        .expect_err("permanent 500 should give up");
+
+        assert!(error.to_string().contains("500"));
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            (crate::retry::MAX_RETRY_ATTEMPTS + 1) as usize
+        );
+        let audits = state.store.list_audit_events(20).expect("audit lists");
+        assert_eq!(
+            audits
+                .iter()
+                .filter(|event| event.kind == "worker.provider.retry")
+                .count(),
+            crate::retry::MAX_RETRY_ATTEMPTS as usize
+        );
+
+        server.await.expect("test server should finish");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn call_worker_model_cancellation_aborts_retry_backoff() {
+        let state_dir = test_state_dir("worker-provider-retry-cancel");
+        let state = initialize_test_state(&state_dir);
+        let (base_url, request_count, server) =
+            spawn_retry_openai_server(vec![TestOpenAiProviderResponse {
+                status: 429,
+                retry_after_secs: Some(5),
+                body: r#"{"error":"rate limited"}"#,
+                content: None,
+            }])
+            .await;
+
+        let mut worker = test_worker_summary("provider-retry-cancel", 10, 10);
+        worker.provider_base_url = base_url;
+        worker.working_dir = state_dir.display().to_string();
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let model_call = call_worker_model(
+            &state,
+            None,
+            &worker,
+            &[],
+            "Try then cancel.",
+            &[],
+            &mut cancel_rx,
+        );
+        let cancel_after_first_retry = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel_tx.send(true).expect("cancel signal should send");
+        };
+        let (result, _) = tokio::join!(model_call, cancel_after_first_retry);
+
+        let error = result.expect_err("cancel should abort retry backoff");
+        assert!(error.to_string().contains("canceled"));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+        server.await.expect("test server should finish");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn call_worker_model_accepts_sse_content_without_done_marker() {
+        let state_dir = test_state_dir("worker-provider-sse-no-done");
+        let state = initialize_test_state(&state_dir);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener addr should be available")
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("test request should connect");
+            let _ = read_test_http_body(&mut socket).await;
+            write_test_openai_sse_response_without_done(
+                &mut socket,
+                "no-done-turn",
+                r#"{"kind":"final_answer","summary":"answered","final_answer":"Done."}"#,
+            )
+            .await;
+        });
+
+        let mut worker = test_worker_summary("provider-sse-no-done", 10, 10);
+        worker.provider_base_url = base_url;
+        worker.working_dir = state_dir.display().to_string();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let response =
+            call_worker_model(&state, None, &worker, &[], "Try once.", &[], &mut cancel_rx)
+                .await
+                .expect("provider content without DONE marker should still succeed");
+
+        assert!(matches!(
+            response.action,
+            WorkerAction::FinalAnswer { final_answer, .. } if final_answer == "Done."
+        ));
+
+        server.await.expect("test server should finish");
         let _ = fs::remove_dir_all(&state_dir);
     }
 
@@ -16285,6 +16607,7 @@ Cleanup status: clean";
         let mut worker = test_worker_summary("memory-layer-worker", 10, 10);
         worker.provider_base_url = base_url;
         worker.working_dir = workspace_root.display().to_string();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
 
         let response = call_worker_model(
             &state,
@@ -16293,6 +16616,7 @@ Cleanup status: clean";
             &[],
             "What ice cream do I like?",
             &[],
+            &mut cancel_rx,
         )
         .await
         .expect("model turn should produce a valid action");
@@ -18812,6 +19136,57 @@ for line in sys.stdin:
         (base_url, server)
     }
 
+    #[derive(Clone, Copy)]
+    struct TestOpenAiProviderResponse {
+        status: u16,
+        retry_after_secs: Option<u64>,
+        body: &'static str,
+        content: Option<&'static str>,
+    }
+
+    async fn spawn_retry_openai_server(
+        responses: Vec<TestOpenAiProviderResponse>,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener addr should be available")
+        );
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server_request_count = request_count.clone();
+        let server = tokio::spawn(async move {
+            for (index, response) in responses.into_iter().enumerate() {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .expect("test request should connect");
+                let _ = read_test_http_body(&mut socket).await;
+                server_request_count.fetch_add(1, Ordering::SeqCst);
+                if response.status == 200 {
+                    write_test_openai_sse_response(
+                        &mut socket,
+                        &format!("retry-turn-{index}"),
+                        response.content.expect("successful response needs content"),
+                    )
+                    .await;
+                } else {
+                    write_test_http_status_response(
+                        &mut socket,
+                        response.status,
+                        response.retry_after_secs,
+                        response.body,
+                    )
+                    .await;
+                }
+            }
+        });
+        (base_url, request_count, server)
+    }
+
     fn create_command_test_context(
         state: &AppState,
         label: &str,
@@ -18971,6 +19346,59 @@ for line in sys.stdin:
         let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
         let response = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("test response should write");
+    }
+
+    async fn write_test_openai_sse_response_without_done(
+        socket: &mut tokio::net::TcpStream,
+        id: &str,
+        content: &str,
+    ) {
+        let chunk = serde_json::json!({
+            "id": id,
+            "choices": [
+                {
+                    "delta": {
+                        "content": content,
+                    },
+                },
+            ],
+        });
+        let body = format!("data: {chunk}\n\n");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("test response should write");
+    }
+
+    async fn write_test_http_status_response(
+        socket: &mut tokio::net::TcpStream,
+        status: u16,
+        retry_after_secs: Option<u64>,
+        body: &str,
+    ) {
+        let reason = match status {
+            401 => "Unauthorized",
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            _ => "Error",
+        };
+        let retry_after = retry_after_secs
+            .map(|seconds| format!("retry-after: {seconds}\r\n"))
+            .unwrap_or_default();
+        let response = format!(
+            "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n{retry_after}content-length: {}\r\nconnection: close\r\n\r\n{}",
             body.len(),
             body
         );

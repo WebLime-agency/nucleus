@@ -3,6 +3,7 @@ mod browser;
 mod error_display;
 mod host;
 mod memory_classifier;
+mod retry;
 mod runtime;
 mod security;
 mod updates;
