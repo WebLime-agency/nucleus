@@ -405,6 +405,8 @@ Issue #236 replaces the brittle inline `<memory_decisions>` protocol and Rust st
 
 Phase 1 lands the classifier behind `memory.classifier_kind = llm`; the default remains `legacy`, so production behavior is unchanged until the migration finishes. The classifier reuses the configured Utility Worker target, renders a bounded recent-turn context plus matching accepted memory rows, asks for one strict JSON object, parses the `decisions` array into the existing `ExtractedMemoryCandidate` shape, and then routes every decision through `consume_memory_decisions`.
 
+Phase 2 adds `memory.classifier_kind = shadow`. In shadow mode, legacy extraction remains authoritative and still performs the only writes. The LLM classifier runs after the legacy path and emits `memory.classifier.shadow_decision` audit events without storing entries or candidates. Shadow audit summaries intentionally omit proposed memory content so classifier mistakes cannot leak secrets into the audit trail.
+
 The validator path is intentionally unchanged: accepted writes still pass through `upsert_memory_from_request`, candidates still pass through `upsert_memory_candidate_from_request`, and supersedes archival still happens only after the replacement entry persists. Classifier failures, malformed JSON, timeouts, and unavailable utility models are audited and dropped without mutating memory or user turns.
 
 ### Backend tasks

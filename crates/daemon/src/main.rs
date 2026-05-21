@@ -1572,28 +1572,34 @@ async fn extract_memory_decisions_after_turn_inner(
         decisions.extend(parsed);
     }
 
-    if decisions.is_empty() {
-        return Ok(Vec::new());
-    }
+    let legacy_outcomes = if decisions.is_empty() {
+        Vec::new()
+    } else {
+        let context = MemoryDecisionContext {
+            source_label: "post_turn_classifier",
+            assistant_turn_id: assistant_turn_id.map(str::to_string),
+            first_turn_id: detail.turns.first().map(|turn| turn.id.clone()),
+            recent_context_chars: recent_context.len(),
+            propagate_errors: false,
+            format_label: "structured_json_decisions",
+        };
 
-    let context = MemoryDecisionContext {
-        source_label: "post_turn_classifier",
-        assistant_turn_id: assistant_turn_id.map(str::to_string),
-        first_turn_id: detail.turns.first().map(|turn| turn.id.clone()),
-        recent_context_chars: recent_context.len(),
-        propagate_errors: false,
-        format_label: "structured_json_decisions",
+        let (outcomes, _) = consume_memory_decisions(
+            state,
+            &detail.session,
+            decisions,
+            MemoryDecisionCategory::Candidate,
+            &context,
+        )
+        .await?;
+        outcomes
     };
 
-    let (outcomes, _) = consume_memory_decisions(
-        state,
-        &detail.session,
-        decisions,
-        MemoryDecisionCategory::Candidate,
-        &context,
-    )
-    .await?;
-    Ok(outcomes)
+    if classifier_kind == "shadow" {
+        run_shadow_memory_classifier(state, &detail.session, assistant_turn_id).await;
+    }
+
+    Ok(legacy_outcomes)
 }
 
 async fn extract_llm_memory_decisions_after_turn(
@@ -1682,6 +1688,73 @@ async fn extract_llm_memory_decisions_after_turn(
     )
     .await?;
     Ok(outcomes)
+}
+
+async fn run_shadow_memory_classifier(
+    state: &AppState,
+    session: &SessionSummary,
+    assistant_turn_id: Option<&str>,
+) {
+    match memory_classifier::classify_memory_for_turn(state, &session.id, assistant_turn_id).await {
+        Ok(decisions) => {
+            for decision in decisions {
+                let category = decision
+                    .category
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("candidate");
+                let confidence = decision
+                    .confidence
+                    .map(|value| format!("{value:.2}"))
+                    .unwrap_or_else(|| "unknown".to_string());
+                let scope_kind = decision
+                    .scope_kind
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("inferred");
+                let scope_id = decision
+                    .scope_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("inferred");
+                let supersedes = if decision.effective_supersedes_id().is_empty() {
+                    "none"
+                } else {
+                    "set"
+                };
+                record_memory_audit(
+                    state,
+                    "memory.classifier.shadow_decision",
+                    &session.id,
+                    "shadow",
+                    &format!(
+                        "Shadow classifier decision: category={category}, memory_kind={}, confidence={confidence}, scope={scope_kind}/{scope_id}, supersedes_id={supersedes}.",
+                        decision.candidate_kind
+                    ),
+                )
+                .await;
+            }
+        }
+        Err(error) => {
+            warn!(
+                error = ?error,
+                session_id = session.id.as_str(),
+                assistant_turn_id,
+                "shadow memory classifier failed without affecting legacy memory behavior"
+            );
+            record_memory_audit(
+                state,
+                "memory.classifier.failed",
+                &session.id,
+                "failed",
+                "Shadow memory classifier failed without affecting legacy memory behavior.",
+            )
+            .await;
+        }
+    }
 }
 
 /// Carries the daemon-side context for a batch of decisions so each decision can be
@@ -11467,6 +11540,102 @@ mod tests {
         let detail = state.store.get_session(&session.id).unwrap();
         assert!(detail.turns.iter().any(|turn| turn.id == "user-turn"));
         assert!(detail.turns.iter().any(|turn| turn.id == "assistant-turn"));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn shadow_memory_classifier_keeps_legacy_writes_authoritative() {
+        let (state_dir, state) = test_named_app_state("memory-236-shadow-legacy");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let session = create_test_persisted_session(&state, "memory-236-shadow", &workspace_root);
+        state.store.set_memory_classifier_kind("shadow").unwrap();
+        let classifier_json = r#"{"decisions":[{"category":"auto_save","title":"Shadow-only preference","content":"The user likes chocolate ice cream.","memory_kind":"preference","reason":"Shadow proposal only.","confidence":0.95,"scope_kind":"workspace","scope_id":"workspace"}]}"#;
+        let (base_url, server) = spawn_memory_classifier_openai_server(classifier_json).await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "gpt-5.4-mini",
+            &base_url,
+            "test-key",
+        );
+        state
+            .store
+            .append_session_turn(
+                &session.id,
+                "user-turn",
+                "user",
+                "remember that I prefer vanilla ice cream.",
+                &[],
+            )
+            .unwrap();
+        state
+            .store
+            .append_session_turn(&session.id, "assistant-turn", "assistant", "Saved.", &[])
+            .unwrap();
+
+        let outcomes =
+            extract_memory_decisions_after_turn(&state, &session.id, Some("assistant-turn")).await;
+        let _ = server.await.expect("server should finish");
+        assert!(
+            outcomes
+                .iter()
+                .any(|outcome| outcome.kind == "explicit_save")
+        );
+        let entries = state.store.list_memory_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source_kind, "explicit_remember");
+        assert!(entries[0].content.contains("vanilla"));
+        assert!(!format!("{entries:?}").contains("chocolate"));
+        let audits = state.store.list_audit_events(50).unwrap();
+        let rendered = format!("{audits:?}");
+        assert!(rendered.contains("memory.classifier.shadow_decision"));
+        assert!(!rendered.contains("chocolate ice cream"));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn shadow_memory_classifier_never_writes_llm_decisions() {
+        let (state_dir, state) = test_named_app_state("memory-236-shadow-no-write");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let session =
+            create_test_persisted_session(&state, "memory-236-shadow-no-write", &workspace_root);
+        state.store.set_memory_classifier_kind("shadow").unwrap();
+        let classifier_json = r#"{"decisions":[{"category":"auto_save","title":"Shadow-only preference","content":"The user likes strawberry ice cream.","memory_kind":"preference","reason":"Shadow proposal only.","confidence":0.95,"scope_kind":"workspace","scope_id":"workspace"}]}"#;
+        let (base_url, server) = spawn_memory_classifier_openai_server(classifier_json).await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "gpt-5.4-mini",
+            &base_url,
+            "test-key",
+        );
+        state
+            .store
+            .append_session_turn(
+                &session.id,
+                "user-turn",
+                "user",
+                "I tried strawberry ice cream today.",
+                &[],
+            )
+            .unwrap();
+        state
+            .store
+            .append_session_turn(&session.id, "assistant-turn", "assistant", "Nice.", &[])
+            .unwrap();
+
+        let outcomes =
+            extract_memory_decisions_after_turn(&state, &session.id, Some("assistant-turn")).await;
+        let _ = server.await.expect("server should finish");
+        assert!(outcomes.is_empty());
+        assert!(state.store.list_memory_entries().unwrap().is_empty());
+        assert!(state.store.list_memory_candidates().unwrap().is_empty());
+        let audits = state.store.list_audit_events(50).unwrap();
+        let rendered = format!("{audits:?}");
+        assert!(rendered.contains("memory.classifier.shadow_decision"));
+        assert!(!rendered.contains("strawberry ice cream"));
         let _ = fs::remove_dir_all(&state_dir);
     }
 
