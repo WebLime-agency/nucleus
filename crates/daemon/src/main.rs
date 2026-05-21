@@ -7769,7 +7769,12 @@ fn mcp_vault_bearer_invocation_availability(
         Ok(secrets) => secrets
             .into_iter()
             .find(|secret| secret.name == reference.name),
-        Err(_) => None,
+        Err(_) => {
+            return (
+                "runtime_unavailable",
+                "MCP invocation credential state is temporarily unavailable.",
+            );
+        }
     };
     let Some(secret) = secret else {
         return (
@@ -7778,17 +7783,21 @@ fn mcp_vault_bearer_invocation_availability(
         );
     };
 
-    let allowed = state
-        .store
-        .list_vault_secret_policies(&secret.id)
-        .unwrap_or_default()
-        .into_iter()
-        .any(|policy| {
-            policy.consumer_kind == "mcp"
-                && policy.consumer_id == server.id
-                && policy.permission == "read"
-                && policy.approval_mode == "allow"
-        });
+    let policies = match state.store.list_vault_secret_policies(&secret.id) {
+        Ok(policies) => policies,
+        Err(_) => {
+            return (
+                "runtime_unavailable",
+                "MCP invocation credential state is temporarily unavailable.",
+            );
+        }
+    };
+    let allowed = policies.into_iter().any(|policy| {
+        policy.consumer_kind == "mcp"
+            && policy.consumer_id == server.id
+            && policy.permission == "read"
+            && policy.approval_mode == "allow"
+    });
     if !allowed {
         return (
             "vault_policy_denied",
@@ -7800,7 +7809,7 @@ fn mcp_vault_bearer_invocation_availability(
         Ok(vault) => vault,
         Err(_) => {
             return (
-                "auth_required",
+                "runtime_unavailable",
                 "MCP invocation credential state is temporarily unavailable.",
             );
         }
