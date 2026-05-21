@@ -17496,9 +17496,10 @@ Cleanup status: clean";
                 .expect("workspace should load")
                 .root_path,
         );
-        let (base_url, server) = spawn_single_response_openai_server(
+        let (base_url, server) = spawn_response_sequence_openai_server(vec![
             r#"{"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
-        )
+            r#"{"decisions":[]}"#,
+        ])
         .await;
         set_default_profile_utility_target(
             &state,
@@ -17763,9 +17764,10 @@ Cleanup status: clean";
                 .expect("workspace should load")
                 .root_path,
         );
-        let (base_url, server) = spawn_single_response_openai_server(
+        let (base_url, server) = spawn_response_sequence_openai_server(vec![
             r#"{"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
-        )
+            r#"{"decisions":[]}"#,
+        ])
         .await;
         set_default_profile_utility_target(
             &state,
@@ -17887,9 +17889,10 @@ Cleanup status: clean";
         let state = initialize_test_state(&state_dir);
         let workspace_root = state_dir.join("workspace");
         fs::create_dir_all(&workspace_root).expect("workspace root should exist");
-        let (base_url, server) = spawn_single_response_openai_server(
+        let (base_url, server) = spawn_response_sequence_openai_server(vec![
             r#"{"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
-        )
+            r#"{"decisions":[{"category":"explicit","title":"Vanilla ice cream preference","content":"I like vanilla ice cream","memory_kind":"preference","reason":"The user explicitly asked Nucleus to remember this preference.","confidence":0.98,"scope_kind":"workspace","scope_id":"workspace"}]}"#,
+        ])
         .await;
         set_default_profile_utility_target(
             &state,
@@ -17983,9 +17986,10 @@ Cleanup status: clean";
         let state = initialize_test_state(&state_dir);
         let workspace_root = state_dir.join("workspace");
         fs::create_dir_all(&workspace_root).expect("workspace root should exist");
-        let (base_url, server) = spawn_single_response_openai_server(
+        let (base_url, server) = spawn_response_sequence_openai_server(vec![
             r#"{"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
-        )
+            r#"{"decisions":[]}"#,
+        ])
         .await;
         set_default_profile_utility_target(
             &state,
@@ -18563,8 +18567,8 @@ for line in sys.stdin:
             .expect("default utility profile should update");
     }
 
-    async fn spawn_single_response_openai_server(
-        content: &'static str,
+    async fn spawn_response_sequence_openai_server(
+        contents: Vec<&'static str>,
     ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -18576,12 +18580,15 @@ for line in sys.stdin:
                 .expect("listener addr should be available")
         );
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener
-                .accept()
-                .await
-                .expect("test request should connect");
-            let _ = read_test_http_body(&mut socket).await;
-            write_test_openai_sse_response(&mut socket, "turn-0", content).await;
+            for (index, content) in contents.into_iter().enumerate() {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .expect("test request should connect");
+                let _ = read_test_http_body(&mut socket).await;
+                write_test_openai_sse_response(&mut socket, &format!("turn-{index}"), content)
+                    .await;
+            }
         });
         (base_url, server)
     }
