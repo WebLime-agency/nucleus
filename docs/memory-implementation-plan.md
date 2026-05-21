@@ -440,26 +440,46 @@ Add the mechanism that notices useful long-term information and proposes it with
      - `source_kind = explicit_remember`
      - `created_by = user` or `assistant` depending on caller
 
-5. Add automatic candidate extraction.
-   - After a successful assistant turn, enqueue a utility job.
+5. Add automatic memory decision extraction.
+   - After every turn completion — success **or** failure — run the
+     daemon-owned post-turn classifier
+     (`extract_memory_decisions_after_turn`).
    - Use recent session turns as input, with a bounded character budget.
-   - Ask for structured JSON candidates only.
-   - Store candidates as `pending`.
-   - Never auto-write accepted memory in the first version.
-   - If utility extraction fails or returns invalid JSON, log/audit but do not affect the user turn.
+   - The classifier returns a structured list of `MemoryDecision` items, each
+     tagged with a category:
+     - `explicit` → write to `memory_entries` with
+       `source_kind = explicit_remember` when the user explicitly requested
+       a save.
+     - `auto_save` → write to `memory_entries` with
+       `source_kind = auto_memory` when confidence meets the single tunable
+       threshold (`MEMORY_AUTO_SAVE_CONFIDENCE_THRESHOLD`); otherwise the
+       decision is downgraded to a `candidate`.
+     - `candidate` → write to `memory_candidates` as `pending` for operator
+       review.
+     - `none` → ignored.
+   - The user response must never be gated on the classifier; it runs
+     out-of-band after the turn lands.
+   - When the worker errored before producing an assistant reply, the
+     classifier still reads the most recent user turn so an explicit
+     `"remember X"` still saves.
+   - The daemon — not the classifier — owns scope inference, secret
+     redaction, dedupe, supersedes_id consolidation, and audit emission.
+     The same validator pipelines (`upsert_memory_from_request` and
+     `upsert_memory_candidate_from_request`) run for every category.
+   - If the classifier fails or returns invalid JSON, log and audit but do
+     not affect the user turn.
 
-6. Candidate extraction prompt requirements.
-   - Return JSON array only.
-   - Each item includes:
-     - `scope_kind`
-     - `scope_id`
-     - `candidate_kind`
-     - `title`
-     - `content`
-     - `tags`
-     - `confidence`
-     - `reason`
-     - `evidence`
+6. Memory decision protocol requirements (assistant-emitted block).
+   - Return a JSON array inside a single `<memory_decisions>...</memory_decisions>` block at the very end of the assistant reply. The block is daemon-only and never user-visible.
+   - Each item is `{"category": "explicit|auto_save|candidate|none", "content": "...", "memory_kind": "fact|preference|decision|project_note|solution|constraint|note", "scope_kind": "workspace|project|session", "scope_id": "...", "confidence": 0.0..1.0, "supersedes_id": "optional existing memory id this replaces", "reason": "short non-secret explanation"}`.
+   - The legacy `<memory_candidates>` tag is still parsed for backward compatibility; items default to `category = candidate`.
+   - Use `explicit` when the user explicitly asked to remember something.
+   - Use `auto_save` only for clearly durable user preferences, project
+     decisions, or stable facts with high confidence.
+   - Use `candidate` for plausibly durable information that an operator
+     should review.
+   - Use `none` (or omit the block) when nothing in the turn warrants
+     durable memory.
    - Only propose complete, stable, future-useful information.
    - Do not propose vague topics.
    - Do not propose transient facts unless they are part of a durable decision/state.
@@ -467,6 +487,8 @@ Add the mechanism that notices useful long-term information and proposes it with
    - Do not propose secrets or credential-bearing values, including API tokens, cookies, bearer headers, private keys, passwords, recovery phrases, `.env` values, or database URLs with credentials.
    - If a durable operational note involves credentials, propose only a non-secret memory such as "This project uses a project-scoped Vercel token stored in Vault" and include no value.
    - Prefer fewer, merged candidates over many tiny candidates.
+   - When updating an existing memory, set `supersedes_id` to its id; the
+     daemon archives the prior entry rather than appending duplicates.
 
 7. Dedupe guardrails.
    - Compute a normalized `dedupe_key` from scope + kind + title/content hash.
@@ -523,12 +545,15 @@ Add the mechanism that notices useful long-term information and proposes it with
 
 ### PR 2 exit criteria
 
-- Nucleus can propose durable memory candidates from completed sessions/turns.
+- Nucleus can propose durable memory candidates from any completed turn (success or failure).
 - Candidates remain separate from accepted memory.
 - The operator can accept/reject/edit candidates in the UI.
 - Accepted candidates become memory entries and appear in matching future compiled turns.
 - Pending/rejected candidates never affect prompt context.
-- Explicit remember creates accepted memory immediately.
+- Explicit remember creates accepted memory immediately, even when the worker errors mid-reply.
+- High-confidence `auto_save` decisions create accepted memory with `source_kind = auto_memory` without operator review; medium-confidence decisions downgrade to candidates.
+- The user response is never gated on the post-turn classifier — memory outcomes stream into the same turn's outcome list after the assistant reply.
+- Duplicate or updated memories consolidate via `supersedes_id` instead of appending duplicates.
 
 ## Follow-up PRs after the two core PRs
 
@@ -576,12 +601,16 @@ Add the mechanism that notices useful long-term information and proposes it with
 - No vector DB requirement.
 - No Python sidecar.
 - No loose Markdown memory source of truth.
-- No automatic acceptance of extracted memories.
+- No medium- or low-confidence automatic acceptance — `auto_save` is gated by
+  a single tunable confidence threshold, and everything below it downgrades
+  to `candidate` for operator review.
 - No large-scale memory compaction/dreaming system.
 - No provider-native memory dependency.
 - No Vault secret storage in memory records or candidates.
 - No decrypted secret values in prompt context, memory search, transcripts, audit payloads, or UI state.
 - No automatic memory extraction from credential-bearing content without redaction/skip guardrails.
+- No phrase-list classifier for explicit-save intent — replaced by a
+  structural detector and the post-turn decision classifier.
 
 ## Acceptance checklist
 
@@ -590,8 +619,10 @@ Add the mechanism that notices useful long-term information and proposes it with
 - [ ] Accepted memory is represented in compiled prompt context with scope and budget controls.
 - [ ] Memory UI can manage accepted memory.
 - [ ] Candidate memory has a separate lifecycle from accepted memory.
-- [ ] Automatic extraction creates pending candidates only.
-- [ ] Explicit remember creates accepted memory.
+- [ ] Automatic extraction routes by category: `explicit`/`auto_save` to accepted memory, `candidate` to pending, `none` ignored.
+- [ ] High-confidence `auto_save` decisions create accepted memory; medium-confidence decisions downgrade to candidates via the single tunable threshold.
+- [ ] Explicit remember creates accepted memory and works on failed turns too.
+- [ ] Duplicate and updated memories consolidate via `supersedes_id` instead of appending duplicates.
 - [ ] Memory extraction and storage reject or redact credential-like content.
 - [ ] Memory and Vault share scope/audit/redaction conventions but remain separate product capabilities.
-- [ ] Tests cover prompt inclusion, scoping, candidate lifecycle, and failure isolation.
+- [ ] Tests cover prompt inclusion, scoping, candidate lifecycle, supersedes_id consolidation, post-turn classifier failure isolation, and paused-session guardrails.
