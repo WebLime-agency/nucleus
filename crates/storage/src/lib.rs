@@ -1088,11 +1088,17 @@ impl StateStore {
         // pattern (same as `vault_state` and the candidate path) so that callers
         // who construct `MemoryEntry` with zeroed timestamps — which is every
         // caller funneling through `upsert_memory_from_request` — get a real
-        // wall-clock stamp instead of `0`. Non-zero timestamps explicitly
-        // supplied by the supersedes-archive branch or import/migration paths
-        // are preserved verbatim. The conflict clause always refreshes
-        // `updated_at` to the current `unixepoch()` because a logical edit
-        // happened by definition.
+        // wall-clock stamp.
+        //
+        // The ON CONFLICT branch applies the same `COALESCE` rule to
+        // `updated_at`: when the caller passes a real, non-zero `updated_at`
+        // (e.g. the already-accepted branch in `accept_memory_candidate`,
+        // which round-trips an existing row through `upsert_memory_entry` as
+        // an idempotent fetch/ensure), we preserve it. When the caller passes
+        // `0` (every real edit through `upsert_memory_from_request`), we
+        // refresh to the current epoch. This avoids creating spurious
+        // mutation events for idempotent reads while still bumping
+        // `updated_at` for genuine edits.
         connection.execute(
             "
             INSERT INTO memory_entries (
@@ -1116,7 +1122,7 @@ impl StateStore {
                 use_count = excluded.use_count,
                 supersedes_id = excluded.supersedes_id,
                 metadata_json = excluded.metadata_json,
-                updated_at = unixepoch()
+                updated_at = COALESCE(NULLIF(excluded.updated_at, 0), unixepoch())
             ",
             params![
                 entry.id,

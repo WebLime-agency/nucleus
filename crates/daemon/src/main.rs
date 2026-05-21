@@ -10804,16 +10804,39 @@ mod tests {
             entry.updated_at
         );
 
-        // An in-place update must preserve `created_at` and refresh
-        // `updated_at` to the current epoch.
+        // A real edit through `upsert_memory_from_request` always rebuilds the
+        // struct with `created_at = 0` and `updated_at = 0` (see
+        // `upsert_memory_from_request`). The storage layer must refresh
+        // `updated_at` on the ON CONFLICT branch when the caller passes `0`,
+        // while preserving the original `created_at` (which the API layer
+        // also passes as `0` — the existing row's value is retained because
+        // the conflict clause does not touch `created_at`).
         let original_created_at = entry.created_at;
-        let mut edited = entry.clone();
-        edited.content = "Edited content.".to_string();
         std::thread::sleep(std::time::Duration::from_secs(1));
-        let updated = state
-            .store
-            .upsert_memory_entry(&edited)
-            .expect("memory should update");
+        let updated = upsert_memory_from_request(
+            &state,
+            MemoryEntryUpsertRequest {
+                id: Some(entry.id.clone()),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: entry.title.clone(),
+                content: "Edited content.".to_string(),
+                tags: Vec::new(),
+                enabled: None,
+                status: None,
+                memory_kind: None,
+                source_kind: None,
+                source_id: None,
+                confidence: None,
+                created_by: None,
+                last_used_at: None,
+                use_count: None,
+                supersedes_id: None,
+                metadata_json: None,
+            },
+            None,
+        )
+        .expect("memory should update");
         assert_eq!(
             updated.created_at, original_created_at,
             "created_at must be preserved across in-place updates",
@@ -10861,6 +10884,26 @@ mod tests {
         assert_eq!(
             imported.updated_at, 1_000_000_000,
             "explicit non-zero updated_at must be preserved on INSERT",
+        );
+
+        // Idempotent fetch/ensure path: callers like
+        // `accept_memory_candidate`'s already-accepted branch round-trip the
+        // existing row through `upsert_memory_entry` to return the persisted
+        // shape. That call must NOT bump `updated_at` — otherwise repeated
+        // accept calls churn the timestamp and reorder lists that sort by
+        // recency. Regression for Codex P2 finding on #231.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let echoed = state
+            .store
+            .upsert_memory_entry(&imported)
+            .expect("idempotent re-upsert should succeed");
+        assert_eq!(
+            echoed.created_at, imported.created_at,
+            "created_at must not change on idempotent re-upsert",
+        );
+        assert_eq!(
+            echoed.updated_at, imported.updated_at,
+            "updated_at must not change on idempotent re-upsert with the original timestamps",
         );
 
         let _ = fs::remove_dir_all(&state_dir);
