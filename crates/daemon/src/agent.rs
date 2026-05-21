@@ -113,7 +113,7 @@ const BROWSER_VERIFICATION_STATUSES: &[&str] = &[
     "not_performed",
     "unavailable",
 ];
-const ACTION_EXECUTOR_LANE: &str = "utility";
+pub(crate) const ACTION_EXECUTOR_LANE: &str = "utility";
 
 fn configured_job_max_wall_clock_secs() -> u64 {
     configured_u64_env(
@@ -6314,6 +6314,60 @@ fn build_execution_session(worker: &WorkerSummary) -> SessionSummary {
         created_at: worker.created_at,
         updated_at: worker.updated_at,
     }
+}
+
+pub(crate) async fn resolve_utility_worker_execution_session(
+    state: &AppState,
+    session: &SessionSummary,
+    execution_id: &str,
+    title: &str,
+) -> Result<SessionSummary, ApiError> {
+    let target = resolve_hidden_worker_target(state, session, ACTION_EXECUTOR_LANE, false).await?;
+    let now = unix_timestamp();
+    Ok(SessionSummary {
+        id: execution_id.to_string(),
+        title: title.to_string(),
+        profile_id: session.profile_id.clone(),
+        profile_title: session.profile_title.clone(),
+        route_id: String::new(),
+        route_title: String::new(),
+        project_id: session.project_id.clone(),
+        project_title: session.project_title.clone(),
+        project_path: session.project_path.clone(),
+        provider: target.provider,
+        model: target.model,
+        provider_base_url: target.provider_base_url,
+        provider_api_key: target.provider_api_key,
+        working_dir: session.working_dir.clone(),
+        working_dir_kind: session.working_dir_kind.clone(),
+        workspace_mode: session.workspace_mode.clone(),
+        source_project_path: session.source_project_path.clone(),
+        git_root: session.git_root.clone(),
+        worktree_path: session.worktree_path.clone(),
+        git_branch: session.git_branch.clone(),
+        git_base_ref: session.git_base_ref.clone(),
+        git_head: session.git_head.clone(),
+        git_dirty: session.git_dirty,
+        git_untracked_count: session.git_untracked_count,
+        git_remote_tracking_branch: session.git_remote_tracking_branch.clone(),
+        workspace_warnings: Vec::new(),
+        scope: "job".to_string(),
+        approval_mode: "ask".to_string(),
+        execution_mode: "act".to_string(),
+        run_budget_mode: "standard".to_string(),
+        run_budget: RunBudgetSummary::default(),
+        project_count: 0,
+        projects: Vec::new(),
+        state: "running".to_string(),
+        provider_session_id: String::new(),
+        last_error: String::new(),
+        user_error: None,
+        capabilities: Vec::new(),
+        last_message_excerpt: String::new(),
+        turn_count: 0,
+        created_at: now,
+        updated_at: now,
+    })
 }
 
 fn checkpoint_history(messages: &[CheckpointMessage], session_id: &str) -> Vec<SessionTurn> {
@@ -17442,9 +17496,10 @@ Cleanup status: clean";
                 .expect("workspace should load")
                 .root_path,
         );
-        let (base_url, server) = spawn_single_response_openai_server(
+        let (base_url, server) = spawn_response_sequence_openai_server(vec![
             r#"{"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
-        )
+            r#"{"decisions":[]}"#,
+        ])
         .await;
         set_default_profile_utility_target(
             &state,
@@ -17709,9 +17764,10 @@ Cleanup status: clean";
                 .expect("workspace should load")
                 .root_path,
         );
-        let (base_url, server) = spawn_single_response_openai_server(
+        let (base_url, server) = spawn_response_sequence_openai_server(vec![
             r#"{"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
-        )
+            r#"{"decisions":[]}"#,
+        ])
         .await;
         set_default_profile_utility_target(
             &state,
@@ -17833,9 +17889,10 @@ Cleanup status: clean";
         let state = initialize_test_state(&state_dir);
         let workspace_root = state_dir.join("workspace");
         fs::create_dir_all(&workspace_root).expect("workspace root should exist");
-        let (base_url, server) = spawn_single_response_openai_server(
+        let (base_url, server) = spawn_response_sequence_openai_server(vec![
             r#"{"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
-        )
+            r#"{"decisions":[{"category":"explicit","title":"Vanilla ice cream preference","content":"I like vanilla ice cream","memory_kind":"preference","reason":"The user explicitly asked Nucleus to remember this preference.","confidence":0.98,"scope_kind":"workspace","scope_id":"workspace"}]}"#,
+        ])
         .await;
         set_default_profile_utility_target(
             &state,
@@ -17929,9 +17986,10 @@ Cleanup status: clean";
         let state = initialize_test_state(&state_dir);
         let workspace_root = state_dir.join("workspace");
         fs::create_dir_all(&workspace_root).expect("workspace root should exist");
-        let (base_url, server) = spawn_single_response_openai_server(
+        let (base_url, server) = spawn_response_sequence_openai_server(vec![
             r#"{"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
-        )
+            r#"{"decisions":[]}"#,
+        ])
         .await;
         set_default_profile_utility_target(
             &state,
@@ -18509,8 +18567,8 @@ for line in sys.stdin:
             .expect("default utility profile should update");
     }
 
-    async fn spawn_single_response_openai_server(
-        content: &'static str,
+    async fn spawn_response_sequence_openai_server(
+        contents: Vec<&'static str>,
     ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -18522,12 +18580,15 @@ for line in sys.stdin:
                 .expect("listener addr should be available")
         );
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener
-                .accept()
-                .await
-                .expect("test request should connect");
-            let _ = read_test_http_body(&mut socket).await;
-            write_test_openai_sse_response(&mut socket, "turn-0", content).await;
+            for (index, content) in contents.into_iter().enumerate() {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .expect("test request should connect");
+                let _ = read_test_http_body(&mut socket).await;
+                write_test_openai_sse_response(&mut socket, &format!("turn-{index}"), content)
+                    .await;
+            }
         });
         (base_url, server)
     }

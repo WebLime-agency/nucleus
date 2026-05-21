@@ -399,6 +399,18 @@ Make accepted durable memory actually useful in turns and expose real operator c
 
 Add the mechanism that notices useful long-term information and proposes it without polluting accepted memory.
 
+## 2026 LLM Classifier Migration
+
+Issue #236 replaced the brittle inline `<memory_decisions>` protocol and Rust structural fallback with a daemon-owned utility-model classifier.
+
+Phase 1 lands the classifier behind `memory.classifier_kind = llm`; the default remains `legacy`, so production behavior is unchanged until the migration finishes. The classifier reuses the configured Utility Worker target, renders a bounded recent-turn context plus matching accepted memory rows, asks for one strict JSON object, parses the `decisions` array into the existing `ExtractedMemoryCandidate` shape, and then routes every decision through `consume_memory_decisions`.
+
+Phase 2 adds `memory.classifier_kind = shadow`. In shadow mode, legacy extraction remains authoritative and still performs the only writes. The LLM classifier runs after the legacy path and emits `memory.classifier.shadow_decision` audit events without storing entries or candidates. Shadow audit summaries intentionally omit proposed memory content so classifier mistakes cannot leak secrets into the audit trail.
+
+Phase 3 makes `llm` the default and canonical classifier. Stored `legacy` settings are treated as `llm` on read, new settings only accept `llm` and `shadow`, and the Rust structural detector plus user-facing assistant tag protocol are removed. Shadow mode remains available as an audit-only classifier run and does not write memory. Existing bogus interrogative fragments produced by the legacy detector are archived during storage initialization and removed from the derived FTS index.
+
+The validator path is intentionally unchanged: accepted writes still pass through `upsert_memory_from_request`, candidates still pass through `upsert_memory_candidate_from_request`, and supersedes archival still happens only after the replacement entry persists. Classifier failures, malformed JSON, timeouts, and unavailable utility models are audited and dropped without mutating memory or user turns.
+
 ### Backend tasks
 
 1. Add protocol types.
@@ -441,8 +453,10 @@ Add the mechanism that notices useful long-term information and proposes it with
      daemon-owned post-turn classifier
      (`extract_memory_decisions_after_turn`).
    - Use recent session turns as input, with a bounded character budget.
-   - The classifier returns a structured list of `MemoryDecision` items, each
-     tagged with a category:
+   - The classifier uses the configured Utility Worker model. There is no
+     separate classifier model setting.
+   - The classifier returns a strict JSON object with a `decisions` array. Each
+     decision is tagged with a category:
      - `explicit` → write to `memory_entries` with
        `source_kind = explicit_remember` when the user explicitly requested
        a save.
@@ -465,10 +479,10 @@ Add the mechanism that notices useful long-term information and proposes it with
    - If the classifier fails or returns invalid JSON, log and audit but do
      not affect the user turn.
 
-6. Memory decision protocol requirements (assistant-emitted block).
-   - Return a JSON array inside a single `<memory_decisions>...</memory_decisions>` block at the very end of the assistant reply. The block is daemon-only and never user-visible.
+6. Memory decision classifier output requirements.
+   - Return one JSON object, never free text.
+   - The top-level object is `{"decisions": [...]}`.
    - Each item is `{"category": "explicit|auto_save|candidate|none", "content": "...", "memory_kind": "fact|preference|decision|project_note|solution|constraint|note", "scope_kind": "workspace|project|session", "scope_id": "...", "confidence": 0.0..1.0, "supersedes_id": "optional existing memory id this replaces", "reason": "short non-secret explanation"}`.
-   - The legacy `<memory_candidates>` tag is still parsed for backward compatibility; items default to `category = candidate`.
    - Use `explicit` when the user explicitly asked to remember something.
    - Use `auto_save` only for clearly durable user preferences, project
      decisions, or stable facts with high confidence.
@@ -605,8 +619,8 @@ Add the mechanism that notices useful long-term information and proposes it with
 - No Vault secret storage in memory records or candidates.
 - No decrypted secret values in prompt context, memory search, transcripts, audit payloads, or UI state.
 - No automatic memory extraction from credential-bearing content without redaction/skip guardrails.
-- No phrase-list classifier for explicit-save intent — replaced by a
-  structural detector and the post-turn decision classifier.
+- No phrase-list or structural classifier for explicit-save intent — replaced
+  by the daemon-owned utility-model classifier.
 
 ## Acceptance checklist
 

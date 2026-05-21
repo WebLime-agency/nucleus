@@ -30,6 +30,8 @@ use uuid::Uuid;
 const LOCAL_AUTH_TOKEN_HASH_KEY: &str = "auth.local_token_hash";
 const LOCAL_AUTH_TOKEN_FILE_NAME: &str = "local-auth-token";
 const UPDATE_STATE_KEY: &str = "updates.state.v1";
+const MEMORY_CLASSIFIER_KIND_KEY: &str = "memory.classifier_kind";
+const DEFAULT_MEMORY_CLASSIFIER_KIND: &str = "llm";
 const PLAYBOOK_RECENT_JOB_LIMIT: usize = 12;
 pub const INSTANCE_LOG_RETENTION_DAYS: i64 = 30;
 pub const INSTANCE_LOG_MAX_ROWS: usize = 5_000;
@@ -648,6 +650,7 @@ impl StateStore {
         seed_workspace_profiles(&connection)?;
         migrate_legacy_workspace_targets(&connection)?;
         migrate_seeded_cli_defaults_to_protocol(&connection)?;
+        archive_bogus_interrogative_memory_fragments(&connection)?;
         ensure_local_auth_token_with_connection(&plan, &connection)?;
         sync_projects_with_connection(&connection)?;
 
@@ -778,6 +781,32 @@ impl StateStore {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         sync_projects_with_connection(&connection)?;
         load_workspace_summary(&connection)
+    }
+
+    pub fn memory_classifier_kind(&self) -> Result<String> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        Ok(
+            setting_value_optional(&connection, MEMORY_CLASSIFIER_KIND_KEY)?
+                .map(|value| value.trim().to_ascii_lowercase())
+                .map(|value| {
+                    if value == "legacy" {
+                        DEFAULT_MEMORY_CLASSIFIER_KIND.to_string()
+                    } else {
+                        value
+                    }
+                })
+                .filter(|value| matches!(value.as_str(), "llm" | "shadow"))
+                .unwrap_or_else(|| DEFAULT_MEMORY_CLASSIFIER_KIND.to_string()),
+        )
+    }
+
+    pub fn set_memory_classifier_kind(&self, kind: &str) -> Result<()> {
+        let normalized = kind.trim().to_ascii_lowercase();
+        if !matches!(normalized.as_str(), "llm" | "shadow") {
+            bail!("unsupported memory classifier kind '{kind}'");
+        }
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        set_setting_value(&connection, MEMORY_CLASSIFIER_KIND_KEY, &normalized)
     }
 
     pub fn update_workspace(
@@ -5204,6 +5233,33 @@ fn write_token_file(path: &Path, token: &str) -> Result<()> {
     Ok(())
 }
 
+fn archive_bogus_interrogative_memory_fragments(connection: &Connection) -> Result<()> {
+    let patterns = [
+        "it if i go to a new session",
+        "it if i go to a new session?",
+        "if i go to a new session",
+        "will you remember it if i go to a new session",
+    ];
+    // Only fold rows that came from the legacy auto/explicit paths the
+    // structural detector and inline-tag parser used; manual/operator-created
+    // entries (`source_kind = 'manual'`) and candidate-promoted entries
+    // (`source_kind = 'candidate'`) must not be archived even if their
+    // content happens to match a phrase here.
+    for pattern in patterns {
+        connection.execute(
+            "
+            UPDATE memory_entries
+            SET status = 'archived', updated_at = unixepoch()
+            WHERE status = 'accepted'
+              AND source_kind IN ('explicit_remember', 'auto_memory')
+              AND lower(trim(content)) = ?1
+            ",
+            params![pattern],
+        )?;
+    }
+    rebuild_memory_search_index_with_connection(connection)
+}
+
 fn sync_projects_with_connection(connection: &Connection) -> Result<()> {
     connection.execute("UPDATE projects SET active = 0", [])?;
 
@@ -8277,6 +8333,157 @@ mod tests {
         let debug = format!("{results:?}");
         assert!(!debug.contains("Legacy archived"));
         assert!(!debug.contains("Legacy disabled"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn memory_classifier_kind_defaults_to_llm_and_maps_legacy_to_llm() {
+        let state_dir = test_state_dir("memory-classifier-kind-default");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+
+        assert_eq!(store.memory_classifier_kind().unwrap(), "llm");
+        store.set_memory_classifier_kind("shadow").unwrap();
+        assert_eq!(store.memory_classifier_kind().unwrap(), "shadow");
+        assert!(store.set_memory_classifier_kind("legacy").is_err());
+
+        {
+            let connection = store.connection.lock().expect("storage mutex poisoned");
+            set_setting_value(&connection, MEMORY_CLASSIFIER_KIND_KEY, "legacy")
+                .expect("legacy setting should insert");
+        }
+        assert_eq!(store.memory_classifier_kind().unwrap(), "llm");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn initialization_archives_known_interrogative_memory_fragments() {
+        let state_dir = test_state_dir("memory-archive-bogus-interrogative");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+
+        for entry in [
+            MemoryEntry {
+                id: "bogus-interrogative".to_string(),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "Bad fragment".to_string(),
+                content: "it if i go to a new session".to_string(),
+                tags: Vec::new(),
+                enabled: true,
+                status: "accepted".to_string(),
+                memory_kind: "note".to_string(),
+                source_kind: "auto_memory".to_string(),
+                source_id: String::new(),
+                confidence: 0.9,
+                created_by: "utility_worker".to_string(),
+                last_used_at: None,
+                use_count: 0,
+                supersedes_id: String::new(),
+                metadata_json: serde_json::json!({}),
+                created_at: 0,
+                updated_at: 0,
+            },
+            MemoryEntry {
+                id: "good-memory".to_string(),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "Good preference".to_string(),
+                content: "The user likes vanilla ice cream.".to_string(),
+                tags: Vec::new(),
+                enabled: true,
+                status: "accepted".to_string(),
+                memory_kind: "preference".to_string(),
+                source_kind: "auto_memory".to_string(),
+                source_id: String::new(),
+                confidence: 0.95,
+                created_by: "utility_worker".to_string(),
+                last_used_at: None,
+                use_count: 0,
+                supersedes_id: String::new(),
+                metadata_json: serde_json::json!({}),
+                created_at: 0,
+                updated_at: 0,
+            },
+        ] {
+            store
+                .upsert_memory_entry(&entry)
+                .expect("memory entry should persist");
+        }
+        drop(store);
+
+        let reopened = StateStore::initialize_at(&state_dir)
+            .expect("storage reinitialization should archive bad fragment");
+        let entries = reopened.list_memory_entries().unwrap();
+        let bogus = entries
+            .iter()
+            .find(|entry| entry.id == "bogus-interrogative")
+            .expect("bogus row should still exist");
+        assert_eq!(bogus.status, "archived");
+        let good = entries
+            .iter()
+            .find(|entry| entry.id == "good-memory")
+            .expect("good row should still exist");
+        assert_eq!(good.status, "accepted");
+
+        assert!(
+            reopened
+                .search_memory_entries("new session", Some("workspace"), Some("workspace"), 10)
+                .expect("search should work after archival")
+                .is_empty()
+        );
+        let good_results = reopened
+            .search_memory_entries("vanilla", Some("workspace"), Some("workspace"), 10)
+            .expect("search should keep good memory indexed");
+        assert_eq!(good_results.len(), 1);
+        assert_eq!(good_results[0].entry.id, "good-memory");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn initialization_preserves_manual_memory_matching_interrogative_fragment() {
+        let state_dir = test_state_dir("memory-archive-manual-protected");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+
+        // An operator-created entry whose content happens to match one of the
+        // legacy interrogative fragments must not be archived by the
+        // initialization migration — that data didn't come from the legacy
+        // detector and represents real user intent.
+        let manual_entry = MemoryEntry {
+            id: "manual-match".to_string(),
+            scope_kind: "workspace".to_string(),
+            scope_id: "workspace".to_string(),
+            title: "Operator note".to_string(),
+            content: "it if i go to a new session".to_string(),
+            tags: Vec::new(),
+            enabled: true,
+            status: "accepted".to_string(),
+            memory_kind: "note".to_string(),
+            source_kind: "manual".to_string(),
+            source_id: String::new(),
+            confidence: 1.0,
+            created_by: "user".to_string(),
+            last_used_at: None,
+            use_count: 0,
+            supersedes_id: String::new(),
+            metadata_json: serde_json::json!({}),
+            created_at: 0,
+            updated_at: 0,
+        };
+        store
+            .upsert_memory_entry(&manual_entry)
+            .expect("manual entry should persist");
+        drop(store);
+
+        let reopened = StateStore::initialize_at(&state_dir)
+            .expect("storage reinitialization should keep manual rows intact");
+        let entries = reopened.list_memory_entries().unwrap();
+        let manual = entries
+            .iter()
+            .find(|entry| entry.id == "manual-match")
+            .expect("manual row should still exist");
+        assert_eq!(manual.status, "accepted");
 
         let _ = fs::remove_dir_all(&state_dir);
     }
