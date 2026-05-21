@@ -46,7 +46,7 @@ use super::{
 use crate::runtime::{PromptStreamEvent, ProviderTurnResult};
 use crate::worker_action::{
     BrowserVerificationClaim, ChildJobProposal, FinalAnswerArtifact, WorkerAction,
-    parse_worker_action,
+    parse_worker_action, parse_worker_action_with_registered_mcp_tools,
 };
 use crate::{error_display, security};
 
@@ -662,12 +662,6 @@ struct GithubCommentArgs {
     target_kind: String,
     number: u64,
     body: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct McpToolCallArgs {
-    #[serde(default)]
-    params: Value,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -6082,7 +6076,11 @@ async fn call_worker_model(
 ) -> Result<ModelResponse> {
     let result =
         execute_worker_model_turn(state, session, worker, conversation, prompt, images).await?;
-    let action = match parse_worker_action(&result.content) {
+    let registered_mcp_tool_ids = registered_mcp_tool_ids(state);
+    let action = match parse_worker_action_with_registered_mcp_tools(
+        &result.content,
+        registered_mcp_tool_ids.iter().map(String::as_str),
+    ) {
         Ok(action) => action,
         Err(error)
             if worker_supports_action_contract_repair(worker)
@@ -6109,7 +6107,11 @@ async fn call_worker_model(
                 &[],
             )
             .await?;
-            let action = parse_worker_action(&repaired.content).with_context(|| {
+            let action = parse_worker_action_with_registered_mcp_tools(
+                &repaired.content,
+                registered_mcp_tool_ids.iter().map(String::as_str),
+            )
+            .with_context(|| {
                 format!(
                     "worker returned invalid Nucleus action after repair retry; original response: {}; repaired response: {}",
                     excerpt(&result.content, 220),
@@ -7047,17 +7049,27 @@ async fn execute_granted_tool(
             execute_browser_submit_tool(state, session, job_id, worker, tool_call_id, args).await
         }
         other if other.starts_with("mcp.") => {
-            let args = serde_json::from_value::<McpToolCallArgs>(args.clone())
-                .unwrap_or(McpToolCallArgs { params: args });
             execute_mcp_tool_call(
                 state,
                 other,
-                args.params,
+                mcp_tool_params(args),
                 Some(session.session.project_id.as_str()),
             )
             .await
         }
-        other => bail!("unsupported tool '{}'", other),
+        other => {
+            if is_registered_mcp_tool_id(state, other)? {
+                execute_mcp_tool_call(
+                    state,
+                    other,
+                    mcp_tool_params(args),
+                    Some(session.session.project_id.as_str()),
+                )
+                .await
+            } else {
+                bail!("unsupported tool '{}'", other)
+            }
+        }
     }
 }
 
@@ -7073,7 +7085,7 @@ fn ensure_utility_worker_executor(worker: &WorkerSummary) -> Result<()> {
 }
 
 fn preview_approval_tool(
-    _state: &AppState,
+    state: &AppState,
     worker: &WorkerSummary,
     tool: &str,
     args: &Value,
@@ -7138,8 +7150,46 @@ fn preview_approval_tool(
             diff_preview: String::new(),
             artifact: None,
         }),
-        other => bail!("'{}' does not support approval previews", other),
+        other => {
+            if is_registered_mcp_tool_id(state, other)? {
+                Ok(MutationPreview {
+                    detail: format!(
+                        "Invoke MCP tool {} through the Nucleus action bridge.",
+                        other
+                    ),
+                    diff_preview: String::new(),
+                    artifact: None,
+                })
+            } else {
+                bail!("'{}' does not support approval previews", other)
+            }
+        }
     }
+}
+
+fn registered_mcp_tool_ids(state: &AppState) -> Vec<String> {
+    state
+        .store
+        .list_mcp_tools()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|tool| tool.id)
+        .collect()
+}
+
+fn is_registered_mcp_tool_id(state: &AppState, tool_id: &str) -> Result<bool> {
+    Ok(state
+        .store
+        .list_mcp_tools()?
+        .into_iter()
+        .any(|tool| tool.id == tool_id))
+}
+
+fn mcp_tool_params(args: Value) -> Value {
+    args.as_object()
+        .and_then(|object| object.get("params"))
+        .cloned()
+        .unwrap_or(args)
 }
 
 fn preview_browser_tool(tool: &str, args: &Value) -> MutationPreview {
@@ -18443,6 +18493,144 @@ for line in sys.stdin:
         .expect("mcp tool call should succeed");
 
         assert_eq!(result["content"][0]["text"], "result:nucleus");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn execute_granted_tool_routes_registered_non_mcp_tool_id_through_mcp_bridge() {
+        let state_dir = test_state_dir("registered-non-mcp-tool-call");
+        let state = initialize_test_state(&state_dir);
+
+        let script_path = state_dir.join("fake-cloudflare-mcp-call.py");
+        fs::write(
+            &script_path,
+            r#"
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get('method') == 'initialize' and 'id' in msg:
+        sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':msg['id'],'result':{'protocolVersion':'2024-11-05','capabilities':{},'serverInfo':{'name':'fake','version':'1.0'}}}) + '\n')
+        sys.stdout.flush()
+    elif msg.get('method') == 'tools/call' and 'id' in msg:
+        args = msg.get('params', {}).get('arguments', {})
+        query = args.get('query', '')
+        sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':msg['id'],'result':{'content':[{'type':'text','text':'cloudflare:' + query}]}}) + '\n')
+        sys.stdout.flush()
+        break
+"#
+            .trim_start(),
+        )
+        .expect("fake mcp script should write");
+
+        state
+            .store
+            .upsert_mcp_server_record(
+                &McpServerRecord {
+                    id: "cloudflare-api".to_string(),
+                    workspace_id: "workspace".to_string(),
+                    title: "Cloudflare API".to_string(),
+                    transport: "stdio".to_string(),
+                    command: "python3".to_string(),
+                    args: vec![script_path.to_string_lossy().to_string()],
+                    env_json: json!({}),
+                    url: String::new(),
+                    headers_json: json!({}),
+                    auth_kind: "none".to_string(),
+                    auth_ref: String::new(),
+                    enabled: true,
+                    sync_status: "ready".to_string(),
+                    last_error: String::new(),
+                    last_synced_at: Some(1),
+                    created_at: 1,
+                    updated_at: 1,
+                },
+                &[],
+                &[],
+            )
+            .expect("mcp server should persist");
+        state
+            .store
+            .upsert_mcp_tool(&McpToolRecord {
+                id: "cloudflare-api.search".to_string(),
+                server_id: "cloudflare-api".to_string(),
+                name: "search".to_string(),
+                description: "Search Cloudflare docs".to_string(),
+                input_schema: json!({"type":"object"}),
+                source: "cloudflare-api".to_string(),
+                discovered_at: 1,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("mcp tool should persist");
+
+        let capabilities = mcp_tool_capabilities(&state);
+        assert_eq!(capabilities.len(), 1);
+        assert_eq!(capabilities[0].tool_id, "cloudflare-api.search");
+
+        let (job_id, worker, tool_call_id) =
+            create_command_test_context(&state, "registered-non-mcp-tool-call");
+        state
+            .store
+            .replace_tool_capability_grants(&worker.id, &capabilities)
+            .expect("worker mcp capability should persist");
+        let worker = state
+            .store
+            .get_job(&job_id)
+            .expect("job should reload")
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.id == worker.id)
+            .expect("worker should reload with mcp capability");
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: "session-registered-non-mcp".to_string(),
+            prompt_text: String::new(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let session = SessionDetail {
+            session: scope_test_session(
+                worker.working_dir.as_str(),
+                "workspace_scratch",
+                "scratch_only",
+                Vec::new(),
+            ),
+            turns: Vec::new(),
+        };
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+
+        let preview = preview_approval_tool(
+            &state,
+            &worker,
+            "cloudflare-api.search",
+            &json!({"query":"workers ai"}),
+        )
+        .expect("registered non-mcp MCP tool should have an approval preview");
+        assert!(
+            preview
+                .detail
+                .contains("cloudflare-api.search through the Nucleus action bridge")
+        );
+
+        let result = execute_granted_tool(
+            &state,
+            &session,
+            &job_id,
+            &worker,
+            &tool_call_id,
+            &mut checkpoint,
+            &mut cancel_rx,
+            "cloudflare-api.search",
+            json!({"query":"workers ai"}),
+        )
+        .await
+        .expect("registered non-mcp MCP tool id should execute through MCP bridge");
+
+        assert_eq!(result["content"][0]["text"], "cloudflare:workers ai");
 
         let _ = fs::remove_dir_all(&state_dir);
     }
