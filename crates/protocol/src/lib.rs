@@ -651,6 +651,9 @@ fn default_mcp_auth_kind() -> String {
 fn default_mcp_sync_status() -> String {
     "pending".to_string()
 }
+fn default_mcp_invocation_status() -> String {
+    "unknown".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpServerSummary {
@@ -679,6 +682,10 @@ pub struct McpServerSummary {
     pub last_error: String,
     #[serde(default)]
     pub last_synced_at: Option<i64>,
+    #[serde(default = "default_mcp_invocation_status")]
+    pub invocation_status: String,
+    #[serde(default)]
+    pub invocation_message: String,
     #[serde(default)]
     pub tools: Vec<NucleusToolDescriptor>,
     #[serde(default)]
