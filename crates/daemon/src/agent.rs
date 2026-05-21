@@ -6280,7 +6280,13 @@ async fn call_worker_model(
                 compacted: false,
                 compacted_range: None,
             });
-            let repair_prompt = build_worker_action_repair_prompt(&result.content, &error);
+            let repair_supported_tool_ids =
+                worker_action_repair_supported_tool_ids(worker, &registered_mcp_tool_ids);
+            let repair_prompt = build_worker_action_repair_prompt(
+                &result.content,
+                &error,
+                &repair_supported_tool_ids,
+            );
             let repaired = execute_worker_text_turn(
                 state,
                 session,
@@ -6433,17 +6439,52 @@ pub(crate) async fn execute_worker_text_turn(
         .map_err(|error| anyhow!("worker model task crashed: {error}"))?
 }
 
-fn build_worker_action_repair_prompt(raw_response: &str, error: &dyn std::fmt::Display) -> String {
+fn worker_action_repair_supported_tool_ids(
+    worker: &WorkerSummary,
+    registered_mcp_tool_ids: &[String],
+) -> Vec<String> {
+    let mut ids = worker
+        .capabilities
+        .iter()
+        .map(|capability| capability.tool_id.clone())
+        .collect::<BTreeSet<_>>();
+    ids.extend(registered_mcp_tool_ids.iter().cloned());
+    ids.into_iter().collect()
+}
+
+fn build_worker_action_repair_prompt(
+    raw_response: &str,
+    error: &dyn std::fmt::Display,
+    supported_tool_ids: &[String],
+) -> String {
+    let supported_tool_text = if supported_tool_ids.is_empty() {
+        "No tool IDs were available in the repair context.".to_string()
+    } else {
+        supported_tool_ids
+            .iter()
+            .take(80)
+            .map(|tool_id| format!("- {tool_id}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
     format!(
         "Your previous Utility Worker response did not match the Nucleus action contract: {}.\n\
 Convert the previous response into exactly one valid Nucleus worker action JSON object and nothing else.\n\
+Currently supported tool IDs:\n\
+{}\n\
 Use the supported action shape that matches the previous intent:\n\
 - final_answer: {{\"kind\":\"final_answer\",\"summary\":\"brief reason the work is done\",\"final_answer\":\"user-facing answer\"}}\n\
 - tool_call: {{\"kind\":\"tool_call\",\"summary\":\"why this action is needed\",\"tool\":\"command.run\",\"args\":{{\"command\":\"sh\",\"args\":[\"-lc\",\"command text\"],\"cwd\":\"/path/if/needed\"}}}}\n\
 - progress_update: {{\"kind\":\"progress_update\",\"summary\":\"checkpoint summary\",\"detail\":\"non-terminal progress detail\"}}\n\
 - spawn_child_jobs: {{\"kind\":\"spawn_child_jobs\",\"summary\":\"why fan-out is needed\",\"jobs\":[{{\"title\":\"Focused child job\",\"prompt\":\"specific child task\",\"working_dir\":null}}]}}\n\
+Rules:\n\
+- If the previous response named one of the supported tool IDs above, preserve that exact tool ID.\n\
+- Do not replace a supported non-command tool with command.run.\n\
+- If the previous response named an unsupported tool and no safe supported action matches, return final_answer or progress_update instead of inventing a tool.\n\
 Previous response:\n{}",
         error,
+        supported_tool_text,
         excerpt(raw_response, 1_200)
     )
 }
@@ -16358,6 +16399,10 @@ Cleanup status: clean";
         let prompt = build_worker_action_repair_prompt(
             r#"{"message":"I should inspect the repo next"}"#,
             &crate::worker_action::WorkerActionParseError::InvalidActionShape,
+            &[
+                "cloudflare-api.search".to_string(),
+                "command.run".to_string(),
+            ],
         );
 
         assert!(prompt.contains("Nucleus action contract"));
@@ -16366,6 +16411,9 @@ Cleanup status: clean";
         assert!(prompt.contains("\"kind\":\"progress_update\""));
         assert!(prompt.contains("\"kind\":\"spawn_child_jobs\""));
         assert!(prompt.contains("exactly one valid Nucleus worker action"));
+        assert!(prompt.contains("cloudflare-api.search"));
+        assert!(prompt.contains("preserve that exact tool ID"));
+        assert!(prompt.contains("Do not replace a supported non-command tool with command.run"));
     }
 
     #[tokio::test]
