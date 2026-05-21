@@ -1,4 +1,4 @@
-use std::{error::Error, fmt};
+use std::{collections::BTreeSet, error::Error, fmt};
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -100,6 +100,49 @@ impl fmt::Display for WorkerActionParseError {
 impl Error for WorkerActionParseError {}
 
 pub fn parse_worker_action(content: &str) -> Result<WorkerAction, WorkerActionParseError> {
+    parse_worker_action_with_support(content, &WorkerToolSupport::default())
+}
+
+pub fn parse_worker_action_with_registered_mcp_tools<'a, I>(
+    content: &str,
+    registered_mcp_tool_ids: I,
+) -> Result<WorkerAction, WorkerActionParseError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let support = WorkerToolSupport::from_registered_mcp_tools(registered_mcp_tool_ids);
+    parse_worker_action_with_support(content, &support)
+}
+
+#[derive(Debug, Default)]
+struct WorkerToolSupport {
+    registered_mcp_tool_ids: BTreeSet<String>,
+}
+
+impl WorkerToolSupport {
+    fn from_registered_mcp_tools<'a, I>(registered_mcp_tool_ids: I) -> Self
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        Self {
+            registered_mcp_tool_ids: registered_mcp_tool_ids
+                .into_iter()
+                .map(str::trim)
+                .filter(|tool_id| !tool_id.is_empty())
+                .map(ToString::to_string)
+                .collect(),
+        }
+    }
+
+    fn is_supported_tool(&self, tool: &str) -> bool {
+        is_builtin_nucleus_tool(tool) || self.registered_mcp_tool_ids.contains(tool)
+    }
+}
+
+fn parse_worker_action_with_support(
+    content: &str,
+    support: &WorkerToolSupport,
+) -> Result<WorkerAction, WorkerActionParseError> {
     let trimmed = content.trim();
     let start = trimmed
         .find('{')
@@ -112,18 +155,18 @@ pub fn parse_worker_action(content: &str) -> Result<WorkerAction, WorkerActionPa
     let value = match parse_worker_action_value(candidate) {
         Ok(value) => value,
         Err(error) => {
-            if let Some(action) = recover_provider_shell_action(candidate)? {
-                return validate_worker_action(action);
+            if let Some(action) = recover_provider_shell_action(candidate, support)? {
+                return validate_worker_action(action, support);
             }
             return Err(error);
         }
     };
-    if let Some(action) = normalize_worker_action_value(&value)? {
-        return validate_worker_action(action);
+    if let Some(action) = normalize_worker_action_value(&value, support)? {
+        return validate_worker_action(action, support);
     }
 
     match serde_json::from_str::<WorkerAction>(candidate) {
-        Ok(parsed) => validate_worker_action(parsed),
+        Ok(parsed) => validate_worker_action(parsed, support),
         Err(_error) if serde_json::from_str::<Value>(candidate).is_ok() => {
             Err(WorkerActionParseError::InvalidActionShape)
         }
@@ -135,6 +178,7 @@ pub fn parse_worker_action(content: &str) -> Result<WorkerAction, WorkerActionPa
 
 fn recover_provider_shell_action(
     candidate: &str,
+    support: &WorkerToolSupport,
 ) -> Result<Option<WorkerAction>, WorkerActionParseError> {
     let lower = candidate.to_ascii_lowercase();
     if !lower.contains("tool_call") || !lower.contains("shell") || !lower.contains("command") {
@@ -161,13 +205,15 @@ fn recover_provider_shell_action(
         }
     }
 
-    normalize_worker_tool_name_and_args("shell", Value::Object(args)).map(|(tool, args)| {
-        Some(WorkerAction::ToolCall {
-            summary: "Run the requested Nucleus action.".to_string(),
-            tool,
-            args,
-        })
-    })
+    normalize_worker_tool_name_and_args("shell", Value::Object(args), support).map(
+        |(tool, args)| {
+            Some(WorkerAction::ToolCall {
+                summary: "Run the requested Nucleus action.".to_string(),
+                tool,
+                args,
+            })
+        },
+    )
 }
 
 fn extract_jsonish_string_field(
@@ -248,9 +294,12 @@ fn unescape_jsonish_string(value: &str) -> String {
     output
 }
 
-fn validate_worker_action(action: WorkerAction) -> Result<WorkerAction, WorkerActionParseError> {
+fn validate_worker_action(
+    action: WorkerAction,
+    support: &WorkerToolSupport,
+) -> Result<WorkerAction, WorkerActionParseError> {
     if let WorkerAction::ToolCall { tool, .. } = &action {
-        if !is_supported_nucleus_tool(tool) {
+        if !support.is_supported_tool(tool) {
             return Err(WorkerActionParseError::UnknownTool { tool: tool.clone() });
         }
     }
@@ -307,6 +356,7 @@ fn is_json_escape_character(ch: char) -> bool {
 
 fn normalize_worker_action_value(
     value: &Value,
+    support: &WorkerToolSupport,
 ) -> Result<Option<WorkerAction>, WorkerActionParseError> {
     let object = value
         .as_object()
@@ -342,11 +392,11 @@ fn normalize_worker_action_value(
     }
 
     if let Some(tool_call) = object.get("tool_call") {
-        return normalize_worker_tool_call_value(tool_call).map(Some);
+        return normalize_worker_tool_call_value(tool_call, support).map(Some);
     }
 
     if let Some(function_call) = object.get("function_call") {
-        return normalize_worker_tool_call_value(function_call).map(Some);
+        return normalize_worker_tool_call_value(function_call, support).map(Some);
     }
 
     if object
@@ -360,7 +410,7 @@ fn normalize_worker_action_value(
             || object.contains_key("tool_name")
             || object.contains_key("name"))
     {
-        return normalize_worker_tool_call_value(value).map(Some);
+        return normalize_worker_tool_call_value(value, support).map(Some);
     }
 
     if object
@@ -382,7 +432,7 @@ fn normalize_worker_action_value(
         || object.contains_key("tool_name")
         || object.contains_key("name")
     {
-        return normalize_worker_tool_call_value(value).map(Some);
+        return normalize_worker_tool_call_value(value, support).map(Some);
     }
 
     Ok(None)
@@ -851,7 +901,10 @@ fn final_answer_artifact_priority(kind: &str) -> usize {
     }
 }
 
-fn normalize_worker_tool_call_value(value: &Value) -> Result<WorkerAction, WorkerActionParseError> {
+fn normalize_worker_tool_call_value(
+    value: &Value,
+    support: &WorkerToolSupport,
+) -> Result<WorkerAction, WorkerActionParseError> {
     let object = value
         .as_object()
         .ok_or(WorkerActionParseError::InvalidActionShape)?;
@@ -898,7 +951,7 @@ fn normalize_worker_tool_call_value(value: &Value) -> Result<WorkerAction, Worke
         .unwrap_or("Run the requested Nucleus action.")
         .to_string();
 
-    let (tool, args) = normalize_worker_tool_name_and_args(raw_tool, args)?;
+    let (tool, args) = normalize_worker_tool_name_and_args(raw_tool, args, support)?;
     Ok(WorkerAction::ToolCall {
         summary,
         tool,
@@ -935,6 +988,7 @@ fn decode_worker_tool_args(args: Value) -> Value {
 fn normalize_worker_tool_name_and_args(
     raw_tool: &str,
     args: Value,
+    support: &WorkerToolSupport,
 ) -> Result<(String, Value), WorkerActionParseError> {
     let normalized = raw_tool.trim().to_ascii_lowercase();
     match normalized.as_str() {
@@ -950,7 +1004,9 @@ fn normalize_worker_tool_name_and_args(
         )),
         "git_status" => Ok(("git.status".to_string(), args)),
         "git_diff" => Ok(("git.diff".to_string(), args)),
-        tool if tool.contains('.') && is_supported_nucleus_tool(tool) => {
+        tool if tool.contains('.')
+            && (support.is_supported_tool(raw_tool.trim()) || support.is_supported_tool(tool)) =>
+        {
             Ok((raw_tool.trim().to_string(), args))
         }
         _ => Err(WorkerActionParseError::UnknownTool {
@@ -1023,7 +1079,7 @@ fn normalize_shell_tool_args(args: Value) -> Result<Value, WorkerActionParseErro
     Ok(Value::Object(normalized))
 }
 
-fn is_supported_nucleus_tool(tool: &str) -> bool {
+fn is_builtin_nucleus_tool(tool: &str) -> bool {
     if tool.starts_with("mcp.") {
         return true;
     }
@@ -1121,6 +1177,44 @@ mod tests {
         assert_eq!(summary, "search source");
         assert_eq!(tool, "rg.search");
         assert_eq!(args["pattern"], "home");
+    }
+
+    #[test]
+    fn accepts_registered_mcp_tool_id_without_mcp_prefix() {
+        let action = parse_worker_action_with_registered_mcp_tools(
+            r#"{"kind":"tool_call","summary":"search cloudflare","tool":"cloudflare-api.search","args":{"query":"workers ai"}}"#,
+            ["cloudflare-api.search"],
+        )
+        .expect("registered non-mcp MCP tool id should parse");
+
+        let WorkerAction::ToolCall {
+            summary,
+            tool,
+            args,
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(summary, "search cloudflare");
+        assert_eq!(tool, "cloudflare-api.search");
+        assert_eq!(args["query"], "workers ai");
+    }
+
+    #[test]
+    fn rejects_unregistered_non_mcp_tool_id() {
+        let error = parse_worker_action_with_registered_mcp_tools(
+            r#"{"kind":"tool_call","summary":"invent","tool":"cloudflare-api.execute","args":{}}"#,
+            ["cloudflare-api.search"],
+        )
+        .expect_err("unregistered non-mcp tool id should still be rejected");
+
+        assert_eq!(
+            error,
+            WorkerActionParseError::UnknownTool {
+                tool: "cloudflare-api.execute".to_string()
+            }
+        );
     }
 
     #[test]
