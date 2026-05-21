@@ -1084,12 +1084,21 @@ impl StateStore {
 
     pub fn upsert_memory_entry(&self, entry: &MemoryEntry) -> Result<MemoryEntry> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
+        // `created_at` / `updated_at` use the COALESCE(NULLIF(?, 0), unixepoch())
+        // pattern (same as `vault_state` and the candidate path) so that callers
+        // who construct `MemoryEntry` with zeroed timestamps — which is every
+        // caller funneling through `upsert_memory_from_request` — get a real
+        // wall-clock stamp instead of `0`. Non-zero timestamps explicitly
+        // supplied by the supersedes-archive branch or import/migration paths
+        // are preserved verbatim. The conflict clause always refreshes
+        // `updated_at` to the current `unixepoch()` because a logical edit
+        // happened by definition.
         connection.execute(
             "
             INSERT INTO memory_entries (
                 id, scope_kind, scope_id, title, content, tags_json, enabled, status, memory_kind, source_kind, source_id, confidence, created_by, last_used_at, use_count, supersedes_id, metadata_json, created_at, updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, COALESCE(NULLIF(?18, 0), unixepoch()), COALESCE(NULLIF(?19, 0), unixepoch()))
             ON CONFLICT(id) DO UPDATE SET
                 scope_kind = excluded.scope_kind,
                 scope_id = excluded.scope_id,
@@ -1107,7 +1116,7 @@ impl StateStore {
                 use_count = excluded.use_count,
                 supersedes_id = excluded.supersedes_id,
                 metadata_json = excluded.metadata_json,
-                updated_at = excluded.updated_at
+                updated_at = unixepoch()
             ",
             params![
                 entry.id,

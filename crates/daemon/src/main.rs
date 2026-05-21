@@ -10756,6 +10756,116 @@ mod tests {
         let _ = fs::remove_dir_all(&state_dir);
     }
 
+    /// Regression for #231: every caller funneling through
+    /// `upsert_memory_from_request` initializes `MemoryEntry` with `created_at`
+    /// and `updated_at` set to literal `0`. The storage layer used to bind
+    /// those zeros directly, which prevented the schema's
+    /// `DEFAULT (unixepoch())` from firing. The fix wraps the bind in
+    /// `COALESCE(NULLIF(?, 0), unixepoch())` so the common zero case is
+    /// auto-stamped on INSERT while the ON CONFLICT path always refreshes
+    /// `updated_at` to the current epoch and leaves the original
+    /// `created_at` untouched.
+    #[test]
+    fn memory_upsert_stamps_created_at_and_updated_at_for_zeroed_struct() {
+        let (state_dir, state) = test_named_app_state("memory-issue-231-timestamps");
+
+        let entry = upsert_memory_from_request(
+            &state,
+            MemoryEntryUpsertRequest {
+                id: Some("ts-stamp".to_string()),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "Timestamp regression".to_string(),
+                content: "Timestamps should be stamped, not zero.".to_string(),
+                tags: Vec::new(),
+                enabled: None,
+                status: None,
+                memory_kind: None,
+                source_kind: None,
+                source_id: None,
+                confidence: None,
+                created_by: None,
+                last_used_at: None,
+                use_count: None,
+                supersedes_id: None,
+                metadata_json: None,
+            },
+            None,
+        )
+        .expect("memory should save");
+        assert!(
+            entry.created_at > 0,
+            "created_at should be a unix-epoch timestamp, got {}",
+            entry.created_at
+        );
+        assert!(
+            entry.updated_at > 0,
+            "updated_at should be a unix-epoch timestamp, got {}",
+            entry.updated_at
+        );
+
+        // An in-place update must preserve `created_at` and refresh
+        // `updated_at` to the current epoch.
+        let original_created_at = entry.created_at;
+        let mut edited = entry.clone();
+        edited.content = "Edited content.".to_string();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let updated = state
+            .store
+            .upsert_memory_entry(&edited)
+            .expect("memory should update");
+        assert_eq!(
+            updated.created_at, original_created_at,
+            "created_at must be preserved across in-place updates",
+        );
+        assert!(
+            updated.updated_at > entry.updated_at,
+            "updated_at must refresh on edit; before={}, after={}",
+            entry.updated_at,
+            updated.updated_at,
+        );
+
+        // A separate caller building a `MemoryEntry` with a real non-zero
+        // `created_at` (e.g. the supersedes-archive branch which clones an
+        // existing entry and only flips `status`) gets that explicit value
+        // preserved on the INSERT path. Use a fresh id so we exercise the
+        // INSERT branch rather than the ON CONFLICT branch.
+        let imported = state
+            .store
+            .upsert_memory_entry(&MemoryEntry {
+                id: "import-explicit-ts".to_string(),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "Imported entry".to_string(),
+                content: "Imported with explicit timestamps.".to_string(),
+                tags: Vec::new(),
+                enabled: true,
+                status: "accepted".to_string(),
+                memory_kind: "note".to_string(),
+                source_kind: "import".to_string(),
+                source_id: String::new(),
+                confidence: 1.0,
+                created_by: "system".to_string(),
+                last_used_at: None,
+                use_count: 0,
+                supersedes_id: String::new(),
+                metadata_json: json!({}),
+                created_at: 1_000_000_000,
+                updated_at: 1_000_000_000,
+            })
+            .expect("import should save");
+        assert_eq!(
+            imported.created_at, 1_000_000_000,
+            "explicit non-zero created_at must be preserved on INSERT",
+        );
+        assert_eq!(
+            imported.updated_at, 1_000_000_000,
+            "explicit non-zero updated_at must be preserved on INSERT",
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
     fn create_test_persisted_session(
         state: &AppState,
         session_id: &str,
