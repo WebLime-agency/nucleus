@@ -92,3 +92,11 @@ There are two layers of durable context:
 The public layer explains what Nucleus is and why it behaves the way it does.
 
 The private layer is for local deployment notes, active priorities, and operator-specific context that should not ship in the repo.
+
+## Worker Context Compaction
+
+Long-running worker jobs keep their active conversation in `WorkerCheckpoint.conversation`. Before each Utility Worker model call, the daemon estimates the compiled prompt size with a character-count heuristic and compares it with a conservative model-keyed context threshold. When the next call is likely to exceed the threshold, the daemon asks the configured Utility Worker model to summarize the oldest safe checkpoint window.
+
+Compaction preserves daemon-owned prompt layers, accepted memory, skill layers, MCP catalogs, and tool catalogs because those are rebuilt into the compiled turn outside the checkpoint window. It also preserves the most recent checkpoint turns verbatim and avoids the assistant turn associated with a still-pending tool action.
+
+Successful compaction replaces the selected checkpoint window with a synthetic `system` message marked `compacted=true` and carrying the original checkpoint range. The summary includes a `[Compacted: <range> via <model>]` marker plus preserved identifiers, artifact ids, file paths, image attachment metadata, and user preferences. The daemon frames compacted content as untrusted historical summary rather than new instructions. Prompt compilation replays compacted summaries as non-authoritative user history, and replays image attachments from compacted metadata as a separate non-system history turn so multimodal context remains available without producing system-role image payloads. The daemon records `memory.compaction.applied` audit events for successful rewrites and `memory.compaction.failed` when the compaction model returns malformed output or the compaction call fails. Failed compaction leaves the original checkpoint untouched and the worker continues with the uncompacted prompt.
