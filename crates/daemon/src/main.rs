@@ -1354,11 +1354,31 @@ fn upsert_memory_from_request(
 
 const MEMORY_EXTRACTION_CONTEXT_CHAR_BUDGET: usize = 8_000;
 
-#[derive(Debug, Deserialize)]
+/// Single tunable threshold that separates a "save automatically as accepted memory"
+/// from a "queue as a pending candidate for operator review". The post-turn classifier
+/// emits a `confidence` in `[0, 1]`; values at or above this threshold become
+/// `memory_entries` with `source_kind = auto_memory`, anything below stays a candidate.
+const MEMORY_AUTO_SAVE_CONFIDENCE_THRESHOLD: f64 = 0.85;
+
+/// Resolved destination for a single memory decision emitted by the post-turn
+/// classifier. The same validator pipeline (`upsert_memory_from_request` /
+/// `upsert_memory_candidate_from_request`) runs regardless of category — only the
+/// final table and `source_kind` differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryDecisionCategory {
+    Explicit,
+    AutoSave,
+    Candidate,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 struct ExtractedMemoryCandidate {
+    #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
     title: String,
     content: String,
-    #[serde(default = "default_extracted_candidate_kind")]
+    #[serde(default = "default_extracted_candidate_kind", alias = "memory_kind")]
     candidate_kind: String,
     #[serde(default)]
     tags: Vec<String>,
@@ -1372,123 +1392,575 @@ struct ExtractedMemoryCandidate {
     scope_kind: Option<String>,
     #[serde(default)]
     scope_id: Option<String>,
+    #[serde(default)]
+    supersedes_id: Option<String>,
 }
 
 fn default_extracted_candidate_kind() -> String {
     "note".to_string()
 }
 
+impl ExtractedMemoryCandidate {
+    /// Resolve the classifier-suggested category to a concrete routing decision.
+    /// Returns `None` when the classifier explicitly said `none`, signaling the
+    /// daemon should skip this proposal without writing anything.
+    fn classify(&self, default_category: MemoryDecisionCategory) -> Option<MemoryDecisionCategory> {
+        let raw = self
+            .category
+            .as_deref()
+            .map(|s| s.trim().to_ascii_lowercase());
+        match raw.as_deref() {
+            Some("none") => None,
+            Some("explicit") => Some(MemoryDecisionCategory::Explicit),
+            Some("auto_save") => {
+                if self.confidence.unwrap_or(0.0) >= MEMORY_AUTO_SAVE_CONFIDENCE_THRESHOLD {
+                    Some(MemoryDecisionCategory::AutoSave)
+                } else {
+                    Some(MemoryDecisionCategory::Candidate)
+                }
+            }
+            Some("candidate") => Some(MemoryDecisionCategory::Candidate),
+            Some(_) | None => Some(default_category),
+        }
+    }
+
+    fn effective_title(&self) -> String {
+        let trimmed = self.title.trim();
+        if !trimmed.is_empty() {
+            excerpt(trimmed, 64)
+        } else {
+            excerpt(self.content.trim(), 64)
+        }
+    }
+
+    fn effective_supersedes_id(&self) -> String {
+        self.supersedes_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_string()
+    }
+}
+
+/// Backwards-compatible wrapper that mirrors the legacy entry point used by
+/// tests and the assistant-success code path. Delegates to the unified
+/// `extract_memory_decisions_after_turn` which now also runs on failed turns.
 pub(crate) async fn extract_memory_candidates_after_successful_turn(
     state: &AppState,
     session_id: &str,
     assistant_turn_id: &str,
 ) {
+    let _ = extract_memory_decisions_after_turn(state, session_id, Some(assistant_turn_id)).await;
+}
+
+/// Run the post-turn memory decision classifier and route every accepted
+/// decision through the existing validator pipelines. Runs after any turn
+/// completion (success or failure) — when `assistant_turn_id` is `None`,
+/// the classifier still reads the user prompt so `"remember X"` saves even
+/// when the worker errored mid-reply.
+///
+/// Always returns the memory outcomes the UI should render under the assistant
+/// reply. Errors are recorded via audit but never returned, so a malformed
+/// classifier response never affects the user turn.
+pub(crate) async fn extract_memory_decisions_after_turn(
+    state: &AppState,
+    session_id: &str,
+    assistant_turn_id: Option<&str>,
+) -> Vec<MemoryOutcome> {
     record_memory_audit(
         state,
         "memory.candidate.extraction_started",
         session_id,
         "started",
-        "Started automatic memory candidate extraction.",
+        "Started post-turn memory decision extraction.",
     )
     .await;
 
-    match extract_memory_candidates_after_successful_turn_inner(
-        state,
-        session_id,
-        assistant_turn_id,
-    )
-    .await
-    {
-        Ok(count) => {
+    match extract_memory_decisions_after_turn_inner(state, session_id, assistant_turn_id).await {
+        Ok(outcomes) => {
             record_memory_audit(
                 state,
                 "memory.candidate.extraction_completed",
                 session_id,
                 "completed",
-                &format!("Completed automatic memory candidate extraction; stored {count} pending candidates."),
+                &format!(
+                    "Completed post-turn memory decision extraction; emitted {} outcomes.",
+                    outcomes.len()
+                ),
             )
             .await;
+            outcomes
         }
         Err(error) => {
-            warn!(error = ?error, session_id, assistant_turn_id, "automatic memory candidate extraction failed without affecting the user turn");
+            warn!(
+                error = ?error,
+                session_id,
+                assistant_turn_id,
+                "post-turn memory decision extraction failed without affecting the user turn"
+            );
             record_memory_audit(
                 state,
                 "memory.candidate.extraction_failed",
                 session_id,
                 "failed",
-                "Automatic memory candidate extraction failed without affecting the user turn.",
+                "Post-turn memory decision extraction failed without affecting the user turn.",
             )
             .await;
+            Vec::new()
         }
     }
 }
 
-async fn extract_memory_candidates_after_successful_turn_inner(
+async fn extract_memory_decisions_after_turn_inner(
     state: &AppState,
     session_id: &str,
-    assistant_turn_id: &str,
-) -> Result<usize, ApiError> {
+    assistant_turn_id: Option<&str>,
+) -> Result<Vec<MemoryOutcome>, ApiError> {
     let detail = state
         .store
         .get_session(session_id)
         .map_err(ApiError::from)?;
-    let Some(assistant_turn) = detail
+
+    // Paused sessions must never write memory — they already reject prompts
+    // pre-worker, but a defense-in-depth check keeps us honest if post-turn
+    // extraction is ever called for a session that just got paused.
+    if detail.session.state == "paused" {
+        return Ok(Vec::new());
+    }
+
+    let recent_context = bounded_recent_turn_context(&detail.turns);
+
+    // Find the most recent user turn so the explicit-intent detector can run
+    // even when the worker errored before producing an assistant reply.
+    let latest_user_prompt = detail
         .turns
         .iter()
-        .find(|turn| turn.id == assistant_turn_id && turn.role == "assistant")
-    else {
-        return Err(ApiError::bad_request(
-            "assistant turn was not found for memory extraction",
-        ));
-    };
-    let recent_context = bounded_recent_turn_context(&detail.turns);
-    let extracted = parse_structured_memory_candidates(&assistant_turn.content, &recent_context)?;
-    let mut stored_count = 0usize;
-    for item in extracted {
-        let scope_kind = item
-            .scope_kind
-            .unwrap_or_else(|| infer_session_memory_scope_kind(&detail.session));
-        let scope_id = item
-            .scope_id
-            .unwrap_or_else(|| infer_session_memory_scope_id(&detail.session, &scope_kind));
-        let payload = MemoryCandidateUpsertRequest {
-            id: Some(format!(
-                "auto-{}-{}",
-                assistant_turn_id,
-                stable_short_hash(&format!("{}:{}", item.title, item.content))
-            )),
-            scope_kind,
-            scope_id,
-            session_id: Some(session_id.to_string()),
-            turn_id_start: detail.turns.first().map(|turn| turn.id.clone()),
-            turn_id_end: Some(assistant_turn_id.to_string()),
-            candidate_kind: Some(item.candidate_kind),
-            title: item.title,
-            content: item.content,
-            tags: item.tags,
-            evidence: item.evidence,
-            reason: Some(item.reason),
-            confidence: item.confidence,
-            status: Some("pending".to_string()),
-            dedupe_key: None,
-            accepted_memory_id: None,
-            created_by: Some("utility_worker".to_string()),
-            metadata_json: Some(json!({
-                "source": "automatic_extraction",
-                "assistant_turn_id": assistant_turn_id,
-                "context_char_budget": MEMORY_EXTRACTION_CONTEXT_CHAR_BUDGET,
-                "context_chars_used": recent_context.len(),
-                "format": "structured_json_candidates"
-            })),
-        };
-        match upsert_memory_candidate_from_request(state, payload, None, false).await {
-            Ok(_) => stored_count += 1,
-            Err(error) if error.message.contains("duplicate pending memory candidate") => {}
-            Err(error) if error.message.contains("credential-like") => {}
-            Err(error) => return Err(error),
+        .rev()
+        .find(|turn| turn.role == "user")
+        .map(|turn| turn.content.clone());
+
+    let assistant_turn = assistant_turn_id.and_then(|id| {
+        detail
+            .turns
+            .iter()
+            .find(|turn| turn.id == id && turn.role == "assistant")
+            .cloned()
+    });
+
+    let mut decisions: Vec<ExtractedMemoryCandidate> = Vec::new();
+
+    if let Some(prompt) = latest_user_prompt.as_deref() {
+        if let Some(intent) = detect_explicit_memory_intent(prompt) {
+            let (scope_kind, scope_id) = infer_prompt_memory_scope(&detail.session);
+            decisions.push(explicit_intent_to_decision(intent, &scope_kind, &scope_id));
         }
     }
-    Ok(stored_count)
+
+    if let Some(turn) = assistant_turn.as_ref() {
+        let parsed = parse_structured_memory_candidates(&turn.content, &recent_context)?;
+        decisions.extend(parsed);
+    }
+
+    if decisions.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let context = MemoryDecisionContext {
+        source_label: "post_turn_classifier",
+        assistant_turn_id: assistant_turn_id.map(str::to_string),
+        first_turn_id: detail.turns.first().map(|turn| turn.id.clone()),
+        recent_context_chars: recent_context.len(),
+        propagate_errors: false,
+        format_label: "structured_json_decisions",
+    };
+
+    let (outcomes, _) = consume_memory_decisions(
+        state,
+        &detail.session,
+        decisions,
+        MemoryDecisionCategory::Candidate,
+        &context,
+    )
+    .await?;
+    Ok(outcomes)
+}
+
+/// Carries the daemon-side context for a batch of decisions so each decision can be
+/// linked back to the turn that produced it for audit/source records, and so the
+/// consumer knows whether to propagate validator errors or swallow them.
+#[derive(Debug, Clone)]
+struct MemoryDecisionContext {
+    /// `automatic_extraction`, `explicit_prompt`, or similar — recorded in metadata.
+    source_label: &'static str,
+    /// Assistant turn id, when an assistant turn exists. Absent for failed turns.
+    assistant_turn_id: Option<String>,
+    first_turn_id: Option<String>,
+    recent_context_chars: usize,
+    /// When `true`, validator errors bubble up. Used by the explicit-prompt path so
+    /// `save_explicit_memory_from_prompt` can surface credential rejections to the
+    /// caller (existing test contract). The post-turn batch path sets it `false`.
+    propagate_errors: bool,
+    format_label: &'static str,
+}
+
+impl Default for MemoryDecisionContext {
+    fn default() -> Self {
+        Self {
+            source_label: "automatic_extraction",
+            assistant_turn_id: None,
+            first_turn_id: None,
+            recent_context_chars: 0,
+            propagate_errors: false,
+            format_label: "structured_json_candidates",
+        }
+    }
+}
+
+/// Route decisions to `memory_entries` (explicit/auto_save) or `memory_candidates`
+/// (candidate) via the existing validator pipelines and emit `MemoryOutcome`s the
+/// UI can render under the assistant reply.
+async fn consume_memory_decisions(
+    state: &AppState,
+    session: &SessionSummary,
+    decisions: Vec<ExtractedMemoryCandidate>,
+    default_category: MemoryDecisionCategory,
+    context: &MemoryDecisionContext,
+) -> Result<(Vec<MemoryOutcome>, usize), ApiError> {
+    let mut outcomes: Vec<MemoryOutcome> = Vec::new();
+    let mut stored_count = 0usize;
+    for item in decisions {
+        let Some(category) = item.classify(default_category) else {
+            continue;
+        };
+        if item.content.trim().is_empty() {
+            continue;
+        }
+        let scope_kind = item
+            .scope_kind
+            .clone()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| infer_session_memory_scope_kind(session));
+        let scope_id = item
+            .scope_id
+            .clone()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| infer_session_memory_scope_id(session, &scope_kind));
+        match category {
+            MemoryDecisionCategory::Explicit => {
+                let outcome = store_decision_as_entry(
+                    state,
+                    session,
+                    &item,
+                    &scope_kind,
+                    &scope_id,
+                    "explicit_remember",
+                    "explicit_save",
+                    "user",
+                    context,
+                )
+                .await;
+                match outcome {
+                    Ok(Some(o)) => {
+                        if o.state == "saved" || o.state == "promoted" {
+                            stored_count += 1;
+                        }
+                        outcomes.push(o);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if context.propagate_errors {
+                            return Err(error);
+                        }
+                        if !error.message.contains("non-secret")
+                            && !error.message.contains("credential-like")
+                        {
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+            MemoryDecisionCategory::AutoSave => {
+                let outcome = store_decision_as_entry(
+                    state,
+                    session,
+                    &item,
+                    &scope_kind,
+                    &scope_id,
+                    "auto_memory",
+                    "auto_save",
+                    "assistant",
+                    context,
+                )
+                .await;
+                match outcome {
+                    Ok(Some(o)) => {
+                        if o.state == "saved" || o.state == "promoted" {
+                            stored_count += 1;
+                        }
+                        outcomes.push(o);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if context.propagate_errors {
+                            return Err(error);
+                        }
+                        if !error.message.contains("non-secret")
+                            && !error.message.contains("credential-like")
+                        {
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+            MemoryDecisionCategory::Candidate => {
+                let outcome = store_decision_as_candidate(
+                    state,
+                    session,
+                    &item,
+                    &scope_kind,
+                    &scope_id,
+                    context,
+                )
+                .await;
+                match outcome {
+                    Ok(o) => {
+                        outcomes.push(o);
+                        stored_count += 1;
+                    }
+                    Err(error) if error.message.contains("duplicate pending memory candidate") => {}
+                    Err(error) if error.message.contains("credential-like") => {}
+                    Err(error) if error.message.contains("non-secret") => {}
+                    Err(error) => {
+                        if context.propagate_errors {
+                            return Err(error);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+    Ok((outcomes, stored_count))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn store_decision_as_entry(
+    state: &AppState,
+    session: &SessionSummary,
+    item: &ExtractedMemoryCandidate,
+    scope_kind: &str,
+    scope_id: &str,
+    source_kind: &str,
+    outcome_kind: &str,
+    created_by: &str,
+    context: &MemoryDecisionContext,
+) -> Result<Option<MemoryOutcome>, ApiError> {
+    let memory_kind = normalize_memory_kind(Some(item.candidate_kind.as_str()))
+        .unwrap_or_else(|_| "note".to_string());
+    let title = item.effective_title();
+    let content = item.content.trim().to_string();
+    let supersedes_id = item.effective_supersedes_id();
+
+    // 1. Explicit supersede targeted by id: archive the old entry first.
+    let mut superseded_archived: Option<MemoryEntry> = None;
+    if !supersedes_id.is_empty() {
+        if let Some(prior) = state
+            .store
+            .list_memory_entries()?
+            .into_iter()
+            .find(|entry| entry.id == supersedes_id)
+        {
+            if prior.scope_kind == scope_kind && prior.scope_id == scope_id {
+                let mut archived = prior.clone();
+                archived.status = "archived".to_string();
+                state.store.upsert_memory_entry(&archived)?;
+                superseded_archived = Some(archived);
+            }
+        }
+    }
+
+    // 2. Dedupe against same-scope overlapping accepted memory.
+    if let Some(existing) =
+        find_overlapping_memory_entry(state, scope_kind, scope_id, &memory_kind, &title, &content)?
+    {
+        let promoted = mark_overlapping_candidates_superseded(state, &existing)?;
+        return Ok(Some(MemoryOutcome {
+            kind: outcome_kind.to_string(),
+            state: if promoted.is_empty() {
+                "ignored"
+            } else {
+                "promoted"
+            }
+            .to_string(),
+            memory_id: existing.id.clone(),
+            candidate_id: promoted.into_iter().next().unwrap_or_default(),
+            dedupe_key: memory_dedupe_key(scope_kind, scope_id, &memory_kind, &title, &content),
+            title: existing.title,
+            detail: match outcome_kind {
+                "explicit_save" => {
+                    "Explicit remember request matched existing accepted memory.".to_string()
+                }
+                _ => "Auto-saved memory matched existing accepted entry.".to_string(),
+            },
+        }));
+    }
+
+    // 3. Create a new entry, tagging supersedes_id when set.
+    let generated_id = format!(
+        "{}-{}",
+        match outcome_kind {
+            "explicit_save" => "explicit",
+            _ => "auto",
+        },
+        stable_short_hash(&format!(
+            "{}:{}:{}:{}",
+            scope_kind, scope_id, title, content
+        ))
+    );
+    let payload = MemoryEntryUpsertRequest {
+        id: Some(generated_id),
+        scope_kind: scope_kind.to_string(),
+        scope_id: scope_id.to_string(),
+        title: title.clone(),
+        content: content.clone(),
+        tags: item.tags.clone(),
+        enabled: Some(true),
+        status: Some("accepted".to_string()),
+        memory_kind: Some(memory_kind.clone()),
+        source_kind: Some(source_kind.to_string()),
+        source_id: Some(session.id.clone()),
+        confidence: Some(item.confidence.unwrap_or(1.0).clamp(0.0, 1.0)),
+        created_by: Some(created_by.to_string()),
+        last_used_at: None,
+        use_count: Some(0),
+        supersedes_id: if supersedes_id.is_empty() {
+            None
+        } else {
+            Some(supersedes_id.clone())
+        },
+        metadata_json: Some(json!({
+            "source": context.source_label,
+            "assistant_turn_id": context.assistant_turn_id.clone().unwrap_or_default(),
+            "context_char_budget": MEMORY_EXTRACTION_CONTEXT_CHAR_BUDGET,
+            "context_chars_used": context.recent_context_chars,
+            "format": context.format_label,
+            "reason": item.reason.clone(),
+            "evidence": item.evidence.clone(),
+            "supersedes_id": supersedes_id.clone(),
+        })),
+    };
+    let entry = upsert_memory_from_request(state, payload, None)?;
+    let promoted = mark_overlapping_candidates_superseded(state, &entry)?;
+
+    let audit_event = match outcome_kind {
+        "explicit_save" => "memory.explicit.created_from_prompt",
+        _ => "memory.auto.created_from_turn",
+    };
+    let audit_summary = match outcome_kind {
+        "explicit_save" => format!(
+            "Created explicit memory '{}' from user turn intent.",
+            entry.title
+        ),
+        _ => format!(
+            "Auto-saved memory '{}' from a high-confidence post-turn decision.",
+            entry.title
+        ),
+    };
+    record_memory_audit(state, audit_event, &entry.id, "created", &audit_summary).await;
+    if let Some(archived) = superseded_archived {
+        record_memory_audit(
+            state,
+            "memory.entry.superseded",
+            &archived.id,
+            "archived",
+            &format!(
+                "Memory '{}' archived because '{}' supersedes it.",
+                archived.title, entry.title
+            ),
+        )
+        .await;
+    }
+    Ok(Some(MemoryOutcome {
+        kind: outcome_kind.to_string(),
+        state: if promoted.is_empty() {
+            "saved"
+        } else {
+            "promoted"
+        }
+        .to_string(),
+        memory_id: entry.id.clone(),
+        candidate_id: promoted.into_iter().next().unwrap_or_default(),
+        dedupe_key: memory_dedupe_key(
+            &entry.scope_kind,
+            &entry.scope_id,
+            &entry.memory_kind,
+            &entry.title,
+            &entry.content,
+        ),
+        title: entry.title,
+        detail: match outcome_kind {
+            "explicit_save" => "Nucleus saved the explicit durable memory request.".to_string(),
+            _ => "Nucleus auto-saved a high-confidence durable memory.".to_string(),
+        },
+    }))
+}
+
+async fn store_decision_as_candidate(
+    state: &AppState,
+    session: &SessionSummary,
+    item: &ExtractedMemoryCandidate,
+    scope_kind: &str,
+    scope_id: &str,
+    context: &MemoryDecisionContext,
+) -> Result<MemoryOutcome, ApiError> {
+    let title = item.effective_title();
+    let assistant_turn_marker = context
+        .assistant_turn_id
+        .clone()
+        .unwrap_or_else(|| "pending".to_string());
+    let payload = MemoryCandidateUpsertRequest {
+        id: Some(format!(
+            "auto-{}-{}",
+            assistant_turn_marker,
+            stable_short_hash(&format!("{}:{}", title, item.content))
+        )),
+        scope_kind: scope_kind.to_string(),
+        scope_id: scope_id.to_string(),
+        session_id: Some(session.id.clone()),
+        turn_id_start: context.first_turn_id.clone(),
+        turn_id_end: context.assistant_turn_id.clone(),
+        candidate_kind: Some(item.candidate_kind.clone()),
+        title: title.clone(),
+        content: item.content.trim().to_string(),
+        tags: item.tags.clone(),
+        evidence: item.evidence.clone(),
+        reason: Some(item.reason.clone()),
+        confidence: item.confidence,
+        status: Some("pending".to_string()),
+        dedupe_key: None,
+        accepted_memory_id: None,
+        created_by: Some("utility_worker".to_string()),
+        metadata_json: Some(json!({
+            "source": context.source_label,
+            "assistant_turn_id": context.assistant_turn_id.clone().unwrap_or_default(),
+            "context_char_budget": MEMORY_EXTRACTION_CONTEXT_CHAR_BUDGET,
+            "context_chars_used": context.recent_context_chars,
+            "format": context.format_label,
+        })),
+    };
+    let candidate = upsert_memory_candidate_from_request(state, payload, None, false).await?;
+    Ok(MemoryOutcome {
+        kind: "candidate".to_string(),
+        state: "pending".to_string(),
+        memory_id: String::new(),
+        candidate_id: candidate.id.clone(),
+        dedupe_key: candidate.dedupe_key.clone(),
+        title: candidate.title.clone(),
+        detail: "Nucleus stored a pending memory candidate for operator review.".to_string(),
+    })
 }
 
 fn parse_structured_memory_candidates(
@@ -1498,12 +1970,21 @@ fn parse_structured_memory_candidates(
     if assistant_content.contains("NUCLEUS_MEMORY_EXTRACT_FAIL") {
         return Err(ApiError::bad_request("simulated memory extraction failure"));
     }
+    let mut decisions: Vec<ExtractedMemoryCandidate> = Vec::new();
+    if let Some(json_text) = extract_tagged_json_array(assistant_content, "memory_decisions") {
+        let parsed: Vec<ExtractedMemoryCandidate> = serde_json::from_str(json_text)
+            .map_err(|_| ApiError::bad_request("memory_decisions returned invalid JSON"))?;
+        decisions.extend(parsed);
+    }
     if let Some(json_text) = extract_tagged_json_array(assistant_content, "memory_candidates") {
-        return serde_json::from_str::<Vec<ExtractedMemoryCandidate>>(json_text)
-            .map_err(|_| ApiError::bad_request("memory extraction returned invalid JSON"));
+        let parsed: Vec<ExtractedMemoryCandidate> = serde_json::from_str(json_text)
+            .map_err(|_| ApiError::bad_request("memory extraction returned invalid JSON"))?;
+        decisions.extend(parsed);
+    }
+    if !decisions.is_empty() {
+        return Ok(decisions);
     }
 
-    let mut candidates = Vec::new();
     for line in assistant_content.lines() {
         let trimmed = line.trim();
         let Some(content) = trimmed
@@ -1516,7 +1997,8 @@ fn parse_structured_memory_candidates(
         if content.len() < 12 {
             continue;
         }
-        candidates.push(ExtractedMemoryCandidate {
+        decisions.push(ExtractedMemoryCandidate {
+            category: None,
             title: excerpt(content, 64),
             content: content.to_string(),
             candidate_kind: "note".to_string(),
@@ -1526,9 +2008,10 @@ fn parse_structured_memory_candidates(
             confidence: Some(0.7),
             scope_kind: None,
             scope_id: None,
+            supersedes_id: None,
         });
     }
-    Ok(candidates)
+    Ok(decisions)
 }
 
 fn extract_tagged_json_array<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
@@ -1807,26 +2290,15 @@ fn detect_explicit_memory_intent(prompt: &str) -> Option<ParsedExplicitMemoryInt
         return None;
     }
     let lower = trimmed.to_ascii_lowercase();
-    let prefixes = [
-        "remember that ",
-        "can you remember that ",
-        "could you remember that ",
-        "please remember that ",
-        "remember ",
-        "can you remember ",
-        "could you remember ",
-        "please remember ",
-        "for future reference, ",
-        "for future reference ",
-        "keep in mind that ",
-        "keep in mind ",
-        "moving forward please remember ",
-        "moving forward, please remember ",
-    ];
-    let matched = prefixes
-        .iter()
-        .find_map(|prefix| lower.strip_prefix(prefix).map(|_| *prefix))?;
-    let raw_clause = explicit_memory_clause(&trimmed[matched.len()..]).trim();
+    let after_remember = locate_remember_verb_after(&lower, trimmed)?;
+    let after_remember_text = trimmed[after_remember..].trim_start();
+    let after_remember_lower = after_remember_text.to_ascii_lowercase();
+    let post_that = after_remember_lower
+        .strip_prefix("that ")
+        .map(|rest| after_remember_text.len() - rest.len())
+        .unwrap_or(0);
+    let body = after_remember_text[post_that..].trim_start();
+    let raw_clause = explicit_memory_clause(body).trim();
     let mut content = if let Some(rest) = raw_clause.strip_prefix('"') {
         if let Some(closing_quote) = rest.find('"') {
             let quoted = &rest[..closing_quote];
@@ -1843,9 +2315,6 @@ fn detect_explicit_memory_intent(prompt: &str) -> Option<ParsedExplicitMemoryInt
         raw_clause.to_string()
     };
     content = content.trim().to_string();
-    if let Some(rest) = content.strip_prefix("that ") {
-        content = rest.trim().to_string();
-    }
     content = content
         .trim_end_matches(|c: char| matches!(c, '.' | '!' | '?'))
         .trim()
@@ -1872,6 +2341,72 @@ fn detect_explicit_memory_intent(prompt: &str) -> Option<ParsedExplicitMemoryInt
         content,
         memory_kind: memory_kind.to_string(),
     })
+}
+
+/// Find the first standalone "remember" verb in an imperative or interrogative-request
+/// position and return the byte index immediately after it. This is a single structural
+/// rule rather than a phrase-list, so it accepts any natural phrasing like
+/// "Moving forward remember that X", "Please could you remember X", or plain "Remember X".
+///
+/// Returns `None` when "remember" is absent, appears only inside other words
+/// ("remembered", "remembering"), or appears in clearly declarative subject position
+/// such as "I remember", "we remember", "they remembered".
+fn locate_remember_verb_after(lower: &str, original: &str) -> Option<usize> {
+    debug_assert_eq!(lower.len(), original.len());
+    let needle = "remember";
+    let mut search = 0usize;
+    while search + needle.len() <= lower.len() {
+        let Some(rel) = lower[search..].find(needle) else {
+            return None;
+        };
+        let abs = search + rel;
+        let after_idx = abs + needle.len();
+        let prev_char = lower[..abs].chars().last();
+        let next_char = lower[after_idx..].chars().next();
+        let is_word_start = prev_char.is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        let is_word_end = next_char.is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        if is_word_start && is_word_end && !preceded_by_declarative_subject(&lower[..abs]) {
+            return Some(after_idx);
+        }
+        search = abs + 1;
+    }
+    None
+}
+
+/// Reject "remember" when it sits in a declarative subject position like "I remember"
+/// or "we remembered". These describe the speaker's own act of recall, not a request
+/// to durably store something for Nucleus.
+fn preceded_by_declarative_subject(prefix: &str) -> bool {
+    let trimmed = prefix.trim_end();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let tail = trimmed
+        .rsplit(|c: char| !c.is_alphanumeric() && c != '\'')
+        .next()
+        .unwrap_or("");
+    matches!(
+        tail,
+        "i" | "i'll"
+            | "i've"
+            | "i'd"
+            | "i'm"
+            | "we"
+            | "we'll"
+            | "we've"
+            | "we'd"
+            | "they"
+            | "they'll"
+            | "they've"
+            | "he"
+            | "she"
+            | "you've"
+            | "always"
+            | "usually"
+            | "never"
+            | "rarely"
+            | "still"
+    )
 }
 
 fn infer_prompt_memory_scope(session: &SessionSummary) -> (String, String) {
@@ -1956,39 +2491,6 @@ fn mark_overlapping_candidates_superseded(
     Ok(promoted)
 }
 
-fn build_explicit_memory_entry_request(
-    session: &SessionSummary,
-    intent: ParsedExplicitMemoryIntent,
-) -> MemoryEntryUpsertRequest {
-    let (scope_kind, scope_id) = infer_prompt_memory_scope(session);
-    let generated_id = format!(
-        "explicit-{}",
-        stable_short_hash(&format!(
-            "{}:{}:{}:{}",
-            scope_kind, scope_id, intent.title, intent.content
-        ))
-    );
-    MemoryEntryUpsertRequest {
-        id: Some(generated_id),
-        scope_kind,
-        scope_id,
-        title: intent.title,
-        content: intent.content,
-        tags: vec!["explicit".to_string()],
-        enabled: Some(true),
-        status: Some("accepted".to_string()),
-        memory_kind: Some(intent.memory_kind),
-        source_kind: Some("explicit_remember".to_string()),
-        source_id: Some(session.id.clone()),
-        confidence: Some(1.0),
-        created_by: Some("user".to_string()),
-        last_used_at: None,
-        use_count: Some(0),
-        supersedes_id: None,
-        metadata_json: Some(json!({ "source": "prompt_intent" })),
-    }
-}
-
 pub(crate) async fn save_explicit_memory_from_prompt(
     state: &AppState,
     session: &SessionSummary,
@@ -1998,73 +2500,42 @@ pub(crate) async fn save_explicit_memory_from_prompt(
         return Ok(Vec::new());
     };
     let (scope_kind, scope_id) = infer_prompt_memory_scope(session);
-    if let Some(existing) = find_overlapping_memory_entry(
+    let decision = explicit_intent_to_decision(intent, &scope_kind, &scope_id);
+    let context = MemoryDecisionContext {
+        source_label: "prompt_intent",
+        propagate_errors: true,
+        format_label: "explicit_prompt",
+        ..MemoryDecisionContext::default()
+    };
+    let (outcomes, _) = consume_memory_decisions(
         state,
-        &scope_kind,
-        &scope_id,
-        &intent.memory_kind,
-        &intent.title,
-        &intent.content,
-    )? {
-        let promoted = mark_overlapping_candidates_superseded(state, &existing)?;
-        return Ok(vec![MemoryOutcome {
-            kind: "explicit_save".to_string(),
-            state: if promoted.is_empty() {
-                "ignored"
-            } else {
-                "promoted"
-            }
-            .to_string(),
-            memory_id: existing.id,
-            candidate_id: promoted.into_iter().next().unwrap_or_default(),
-            dedupe_key: memory_dedupe_key(
-                &scope_kind,
-                &scope_id,
-                &intent.memory_kind,
-                &intent.title,
-                &intent.content,
-            ),
-            title: intent.title,
-            detail: "Explicit remember request matched existing accepted memory.".to_string(),
-        }]);
-    }
-    let entry = upsert_memory_from_request(
-        state,
-        build_explicit_memory_entry_request(session, intent.clone()),
-        None,
-    )?;
-    let promoted = mark_overlapping_candidates_superseded(state, &entry)?;
-    record_memory_audit(
-        state,
-        "memory.explicit.created_from_prompt",
-        &entry.id,
-        "created",
-        &format!(
-            "Created explicit memory '{}' from user turn intent.",
-            entry.title
-        ),
+        session,
+        vec![decision],
+        MemoryDecisionCategory::Explicit,
+        &context,
     )
-    .await;
-    Ok(vec![MemoryOutcome {
-        kind: "explicit_save".to_string(),
-        state: if promoted.is_empty() {
-            "saved"
-        } else {
-            "promoted"
-        }
-        .to_string(),
-        memory_id: entry.id,
-        candidate_id: promoted.into_iter().next().unwrap_or_default(),
-        dedupe_key: memory_dedupe_key(
-            &scope_kind,
-            &scope_id,
-            &entry.memory_kind,
-            &entry.title,
-            &entry.content,
-        ),
-        title: entry.title,
-        detail: "Nucleus saved the explicit durable memory request.".to_string(),
-    }])
+    .await?;
+    Ok(outcomes)
+}
+
+fn explicit_intent_to_decision(
+    intent: ParsedExplicitMemoryIntent,
+    scope_kind: &str,
+    scope_id: &str,
+) -> ExtractedMemoryCandidate {
+    ExtractedMemoryCandidate {
+        category: Some("explicit".to_string()),
+        title: intent.title,
+        content: intent.content,
+        candidate_kind: intent.memory_kind,
+        tags: vec!["explicit".to_string()],
+        evidence: Vec::new(),
+        reason: "Explicit remember intent detected in the user prompt.".to_string(),
+        confidence: Some(1.0),
+        scope_kind: Some(scope_kind.to_string()),
+        scope_id: Some(scope_id.to_string()),
+        supersedes_id: None,
+    }
 }
 
 async fn upsert_memory_candidate_from_request(
@@ -2284,9 +2755,11 @@ fn normalize_memory_kind(value: Option<&str>) -> Result<String, ApiError> {
 fn normalize_memory_source_kind(value: Option<&str>) -> Result<String, ApiError> {
     let value = value.unwrap_or("manual").trim();
     match value {
-        "manual" | "candidate" | "explicit_remember" | "import" | "system" => Ok(value.to_string()),
+        "manual" | "candidate" | "explicit_remember" | "auto_memory" | "import" | "system" => {
+            Ok(value.to_string())
+        }
         _ => Err(ApiError::bad_request(
-            "memory source kind must be manual, candidate, explicit_remember, import, or system",
+            "memory source kind must be manual, candidate, explicit_remember, auto_memory, import, or system",
         )),
     }
 }
@@ -11086,6 +11559,506 @@ mod tests {
                 .iter()
                 .any(|entry| entry.id == outcomes[0].memory_id && entry.enabled)
         );
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn issue_227_moving_forward_remember_without_please_saves_explicit_memory() {
+        let (state_dir, state) = test_named_app_state("memory-issue-227-moving-forward-no-please");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session = create_test_persisted_session(
+            &state,
+            "memory-issue-227-moving-forward-no-please",
+            &workspace_root,
+        );
+
+        let outcomes = save_explicit_memory_from_prompt(
+            &state,
+            &session,
+            "Moving forward remember that I like vanilla ice cream better than chocolate ice cream",
+        )
+        .await
+        .expect("issue #227 regression prompt should save explicit memory");
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "issue #227 regression prompt should produce one memory outcome"
+        );
+        assert_eq!(outcomes[0].state, "saved");
+
+        let entries = state
+            .store
+            .list_memory_entries()
+            .expect("memory should load");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, "accepted");
+        assert_eq!(entries[0].source_kind, "explicit_remember");
+        assert!(
+            entries[0].content.contains("vanilla ice cream"),
+            "content should preserve user's durable preference"
+        );
+        assert!(
+            entries[0].content.contains("chocolate ice cream"),
+            "content should preserve the comparison clause"
+        );
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    /// Three natural-language phrasings the issue lists as required false-positives:
+    /// they all contain the word "remember" but none are a request to durably store
+    /// information. None should produce a memory entry.
+    #[tokio::test]
+    async fn issue_227_false_positive_remember_phrases_do_not_save_memory() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "memory-227-false-positive-when",
+                "remember when we switched providers?",
+            ),
+            (
+                "memory-227-false-positive-to",
+                "remember to keep this short",
+            ),
+            (
+                "memory-227-false-positive-question",
+                "can you remember what I said earlier?",
+            ),
+        ];
+        for (test_name, prompt) in cases {
+            let (state_dir, state) = test_named_app_state(test_name);
+            let workspace_root = state_dir.join("workspace");
+            fs::create_dir_all(&workspace_root).expect("workspace should exist");
+            let session = create_test_persisted_session(&state, test_name, &workspace_root);
+
+            let outcomes = save_explicit_memory_from_prompt(&state, &session, prompt)
+                .await
+                .expect("false-positive remember phrase should not error");
+            assert!(
+                outcomes.is_empty(),
+                "phrase {prompt:?} should not produce a memory outcome",
+            );
+            assert!(
+                state.store.list_memory_entries().unwrap().is_empty(),
+                "phrase {prompt:?} should not create any memory entries",
+            );
+            let _ = fs::remove_dir_all(&state_dir);
+        }
+    }
+
+    /// Stable user preferences without the word "remember" should still become
+    /// durable memory when the post-turn classifier emits a high-confidence
+    /// `auto_save` decision. The entry lands in memory_entries with
+    /// `source_kind = auto_memory`.
+    #[tokio::test]
+    async fn issue_227_auto_save_decision_creates_accepted_memory() {
+        let (state_dir, state) = test_named_app_state("memory-227-auto-save-accepted");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session =
+            create_test_persisted_session(&state, "memory-227-auto-save-accepted", &workspace_root);
+
+        state
+            .store
+            .append_session_turn(
+                &session.id,
+                "user-turn",
+                "user",
+                "I always run cargo test before committing.",
+                &[],
+            )
+            .unwrap();
+        let assistant = r#"Got it — cargo test before every commit.
+<memory_decisions>[{"category":"auto_save","content":"User always runs cargo test before committing","memory_kind":"preference","confidence":0.92,"reason":"Stable user preference"}]</memory_decisions>"#;
+        state
+            .store
+            .append_session_turn(&session.id, "assistant-turn", "assistant", assistant, &[])
+            .unwrap();
+
+        let outcomes =
+            extract_memory_decisions_after_turn(&state, &session.id, Some("assistant-turn")).await;
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| o.kind == "auto_save" && o.state == "saved"),
+            "auto_save outcome missing: {outcomes:?}",
+        );
+        let entries = state.store.list_memory_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, "accepted");
+        assert_eq!(entries[0].source_kind, "auto_memory");
+        assert!(entries[0].content.contains("cargo test"));
+        let candidates = state.store.list_memory_candidates().unwrap();
+        assert!(
+            candidates.is_empty(),
+            "auto_save should not also create a candidate"
+        );
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    /// An auto_save decision whose confidence is below the tunable threshold
+    /// must downgrade to a pending candidate rather than silently writing
+    /// accepted memory. Existing operator-review semantics are preserved.
+    #[tokio::test]
+    async fn issue_227_auto_save_below_threshold_downgrades_to_candidate() {
+        let (state_dir, state) = test_named_app_state("memory-227-auto-save-downgrade");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session = create_test_persisted_session(
+            &state,
+            "memory-227-auto-save-downgrade",
+            &workspace_root,
+        );
+
+        state
+            .store
+            .append_session_turn(
+                &session.id,
+                "user-turn",
+                "user",
+                "Maybe I should use a darker palette in this app.",
+                &[],
+            )
+            .unwrap();
+        let assistant = r#"Noted.
+<memory_decisions>[{"category":"auto_save","content":"User may prefer dark palette in this app","memory_kind":"preference","confidence":0.60,"reason":"Soft preference"}]</memory_decisions>"#;
+        state
+            .store
+            .append_session_turn(&session.id, "assistant-turn", "assistant", assistant, &[])
+            .unwrap();
+
+        let _ =
+            extract_memory_decisions_after_turn(&state, &session.id, Some("assistant-turn")).await;
+        let entries = state.store.list_memory_entries().unwrap();
+        assert!(
+            entries.is_empty(),
+            "below-threshold auto_save must not save accepted memory"
+        );
+        let candidates = state.store.list_memory_candidates().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].status, "pending");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    /// An explicit `candidate` decision routes to memory_candidates regardless
+    /// of confidence; the operator still reviews before acceptance.
+    #[tokio::test]
+    async fn issue_227_candidate_decision_creates_pending_candidate() {
+        let (state_dir, state) = test_named_app_state("memory-227-candidate-decision");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session =
+            create_test_persisted_session(&state, "memory-227-candidate-decision", &workspace_root);
+
+        state
+            .store
+            .append_session_turn(
+                &session.id,
+                "user-turn",
+                "user",
+                "We could add end-to-end browser tests next quarter.",
+                &[],
+            )
+            .unwrap();
+        let assistant = r#"Acknowledged.
+<memory_decisions>[{"category":"candidate","content":"Add end-to-end browser tests to the next quarter plan","memory_kind":"todo","confidence":0.55,"reason":"Possible next-quarter plan"}]</memory_decisions>"#;
+        state
+            .store
+            .append_session_turn(&session.id, "assistant-turn", "assistant", assistant, &[])
+            .unwrap();
+
+        let _ =
+            extract_memory_decisions_after_turn(&state, &session.id, Some("assistant-turn")).await;
+        assert!(state.store.list_memory_entries().unwrap().is_empty());
+        let candidates = state.store.list_memory_candidates().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].status, "pending");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    /// `category=none` decisions are ignored — no memory entry, no candidate.
+    #[tokio::test]
+    async fn issue_227_none_decision_writes_no_memory_or_candidate() {
+        let (state_dir, state) = test_named_app_state("memory-227-none-decision");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session =
+            create_test_persisted_session(&state, "memory-227-none-decision", &workspace_root);
+        state
+            .store
+            .append_session_turn(
+                &session.id,
+                "user-turn",
+                "user",
+                "Just checking the weather.",
+                &[],
+            )
+            .unwrap();
+        let assistant = r#"OK.
+<memory_decisions>[{"category":"none","content":"nothing durable","reason":"ephemeral"}]</memory_decisions>"#;
+        state
+            .store
+            .append_session_turn(&session.id, "assistant-turn", "assistant", assistant, &[])
+            .unwrap();
+
+        let _ =
+            extract_memory_decisions_after_turn(&state, &session.id, Some("assistant-turn")).await;
+        assert!(state.store.list_memory_entries().unwrap().is_empty());
+        assert!(state.store.list_memory_candidates().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    /// A decision with `supersedes_id` archives the prior entry and creates a
+    /// fresh accepted entry that links to it. The compiled prompt only sees
+    /// the new (accepted) entry afterward.
+    #[tokio::test]
+    async fn issue_227_supersedes_id_archives_old_entry_and_creates_new_one() {
+        let (state_dir, state) = test_named_app_state("memory-227-supersedes-id");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session =
+            create_test_persisted_session(&state, "memory-227-supersedes-id", &workspace_root);
+        let old_entry = upsert_memory_from_request(
+            &state,
+            MemoryEntryUpsertRequest {
+                id: Some("preference-flavor".to_string()),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "Flavor preference".to_string(),
+                content: "User prefers vanilla ice cream".to_string(),
+                tags: Vec::new(),
+                enabled: Some(true),
+                status: Some("accepted".to_string()),
+                memory_kind: Some("preference".to_string()),
+                source_kind: Some("explicit_remember".to_string()),
+                source_id: Some(session.id.clone()),
+                confidence: Some(1.0),
+                created_by: Some("user".to_string()),
+                last_used_at: None,
+                use_count: Some(0),
+                supersedes_id: None,
+                metadata_json: None,
+            },
+            None,
+        )
+        .expect("old preference should persist");
+
+        state
+            .store
+            .append_session_turn(
+                &session.id,
+                "user-turn",
+                "user",
+                "Actually I changed my mind, I prefer strawberry now.",
+                &[],
+            )
+            .unwrap();
+        let assistant = format!(
+            r#"Updated.
+<memory_decisions>[{{"category":"auto_save","content":"User prefers strawberry ice cream","memory_kind":"preference","confidence":0.95,"supersedes_id":"{}","reason":"User explicitly updated preference"}}]</memory_decisions>"#,
+            old_entry.id
+        );
+        state
+            .store
+            .append_session_turn(&session.id, "assistant-turn", "assistant", &assistant, &[])
+            .unwrap();
+
+        let _ =
+            extract_memory_decisions_after_turn(&state, &session.id, Some("assistant-turn")).await;
+        let entries = state.store.list_memory_entries().unwrap();
+        let archived = entries
+            .iter()
+            .find(|e| e.id == old_entry.id)
+            .expect("old entry should still exist as an archived row");
+        assert_eq!(archived.status, "archived");
+        let new_entry = entries
+            .iter()
+            .find(|e| e.content.contains("strawberry"))
+            .expect("new accepted entry should exist");
+        assert_eq!(new_entry.status, "accepted");
+        assert_eq!(new_entry.supersedes_id, old_entry.id);
+
+        let compiled = compile_session_turn(&state, &session, &[], "future", &[], "main").unwrap();
+        let rendered = nucleus_core::render_compiled_turn_system_text(&compiled);
+        assert!(rendered.contains("strawberry"));
+        assert!(!rendered.contains("vanilla"));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    /// Even when the worker errored before producing an assistant reply, a user
+    /// turn that explicitly says "remember X" must still create a durable memory
+    /// slice. Mirrors the failure-path contract from the issue.
+    #[tokio::test]
+    async fn issue_227_failed_turn_still_saves_explicit_remember_intent() {
+        let (state_dir, state) = test_named_app_state("memory-227-failed-turn-explicit");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session = create_test_persisted_session(
+            &state,
+            "memory-227-failed-turn-explicit",
+            &workspace_root,
+        );
+        state
+            .store
+            .append_session_turn(
+                &session.id,
+                "user-failed-turn",
+                "user",
+                "remember that our staging URL is https://staging.example.com",
+                &[],
+            )
+            .unwrap();
+
+        // No assistant turn is appended — simulates worker failure mid-reply.
+        let outcomes = extract_memory_decisions_after_turn(&state, &session.id, None).await;
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| o.kind == "explicit_save" && o.state == "saved"),
+            "explicit_save outcome should fire even without an assistant reply: {outcomes:?}",
+        );
+        let entries = state.store.list_memory_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source_kind, "explicit_remember");
+        assert!(entries[0].content.contains("staging.example.com"));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    /// Defense in depth: a paused session must never accept new memory writes,
+    /// even via the post-turn extractor. The extractor exits early without
+    /// touching `memory_entries` or `memory_candidates`.
+    #[tokio::test]
+    async fn issue_227_paused_session_blocks_post_turn_memory_writes() {
+        let (state_dir, state) = test_named_app_state("memory-227-paused-block");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session =
+            create_test_persisted_session(&state, "memory-227-paused-block", &workspace_root);
+        state
+            .store
+            .update_session(
+                &session.id,
+                SessionPatch {
+                    state: Some("paused".to_string()),
+                    ..SessionPatch::default()
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .append_session_turn(
+                &session.id,
+                "paused-user-turn",
+                "user",
+                "remember that I prefer concise release notes",
+                &[],
+            )
+            .unwrap();
+        let assistant = r#"Acknowledged.
+<memory_decisions>[{"category":"auto_save","content":"User prefers concise release notes","memory_kind":"preference","confidence":0.97,"reason":"Stable preference"}]</memory_decisions>"#;
+        state
+            .store
+            .append_session_turn(
+                &session.id,
+                "paused-assistant-turn",
+                "assistant",
+                assistant,
+                &[],
+            )
+            .unwrap();
+
+        let outcomes =
+            extract_memory_decisions_after_turn(&state, &session.id, Some("paused-assistant-turn"))
+                .await;
+        assert!(
+            outcomes.is_empty(),
+            "paused sessions must not emit memory outcomes"
+        );
+        assert!(state.store.list_memory_entries().unwrap().is_empty());
+        assert!(state.store.list_memory_candidates().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    /// Credential-bearing decisions are rejected by the existing validators —
+    /// the decision-routing layer must not bypass them. The candidate is
+    /// silently dropped (not stored) and no entry is created.
+    #[tokio::test]
+    async fn issue_227_credential_bearing_auto_save_is_rejected() {
+        let (state_dir, state) = test_named_app_state("memory-227-credential-rejection");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session = create_test_persisted_session(
+            &state,
+            "memory-227-credential-rejection",
+            &workspace_root,
+        );
+        state
+            .store
+            .append_session_turn(
+                &session.id,
+                "user-turn",
+                "user",
+                "Just touched up the auth flow.",
+                &[],
+            )
+            .unwrap();
+        let assistant = r#"Done.
+<memory_decisions>[{"category":"auto_save","content":"authorization: bearer sk-secret-token","memory_kind":"note","confidence":0.95,"reason":"trying to plant credential"}]</memory_decisions>"#;
+        state
+            .store
+            .append_session_turn(&session.id, "assistant-turn", "assistant", assistant, &[])
+            .unwrap();
+
+        let _ =
+            extract_memory_decisions_after_turn(&state, &session.id, Some("assistant-turn")).await;
+        assert!(
+            state.store.list_memory_entries().unwrap().is_empty(),
+            "credential-bearing auto_save must not produce an accepted entry"
+        );
+        assert!(state.store.list_memory_candidates().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    /// A malformed `<memory_decisions>` block must not affect the user-visible
+    /// turn. The audit trail captures the failure and the session stays clean.
+    #[tokio::test]
+    async fn issue_227_classifier_failure_is_audited_but_does_not_affect_turn() {
+        let (state_dir, state) = test_named_app_state("memory-227-classifier-failure");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session =
+            create_test_persisted_session(&state, "memory-227-classifier-failure", &workspace_root);
+        state
+            .store
+            .append_session_turn(
+                &session.id,
+                "user-turn",
+                "user",
+                "Just a normal question.",
+                &[],
+            )
+            .unwrap();
+        state
+            .store
+            .append_session_turn(
+                &session.id,
+                "assistant-turn",
+                "assistant",
+                "NUCLEUS_MEMORY_EXTRACT_FAIL",
+                &[],
+            )
+            .unwrap();
+
+        let outcomes =
+            extract_memory_decisions_after_turn(&state, &session.id, Some("assistant-turn")).await;
+        assert!(
+            outcomes.is_empty(),
+            "classifier failure must return an empty outcome list"
+        );
+        let audits = state.store.list_audit_events(50).unwrap();
+        let rendered = format!("{audits:?}");
+        assert!(rendered.contains("memory.candidate.extraction_failed"));
+        assert!(state.store.list_memory_entries().unwrap().is_empty());
+        assert!(state.store.list_memory_candidates().unwrap().is_empty());
         let _ = fs::remove_dir_all(&state_dir);
     }
 
