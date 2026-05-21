@@ -2112,7 +2112,23 @@ async fn store_decision_as_candidate(
 pub(crate) fn bounded_recent_turn_context(turns: &[nucleus_protocol::SessionTurn]) -> String {
     let mut selected = Vec::new();
     let mut remaining = MEMORY_EXTRACTION_CONTEXT_CHAR_BUDGET;
-    for turn in turns.iter().rev() {
+    let mut iter = turns.iter().rev();
+    if let Some(latest) = iter.next() {
+        let rendered = format!("{}: {}", latest.role, latest.content);
+        if rendered.len() <= remaining {
+            remaining -= rendered.len();
+            selected.push(rendered);
+        } else if let Some(truncated) = tail_truncate_turn(&latest.role, &latest.content, remaining)
+        {
+            // The classifier cannot reason about a turn that's been dropped
+            // entirely — explicit "remember" requests in long prompts would
+            // produce no memory outcome. Keep the tail of the latest turn so
+            // the most recent intent survives instead.
+            remaining = remaining.saturating_sub(truncated.len());
+            selected.push(truncated);
+        }
+    }
+    for turn in iter {
         let rendered = format!("{}: {}", turn.role, turn.content);
         if rendered.len() > remaining {
             continue;
@@ -2122,6 +2138,22 @@ pub(crate) fn bounded_recent_turn_context(turns: &[nucleus_protocol::SessionTurn
     }
     selected.reverse();
     selected.join("\n")
+}
+
+fn tail_truncate_turn(role: &str, content: &str, max_bytes: usize) -> Option<String> {
+    // Render as `role: …<tail>` and trim from the start of `content` so the
+    // most recent text survives. Returns `None` if even the prefix would
+    // overflow the budget.
+    let prefix = format!("{role}: \u{2026}");
+    if prefix.len() >= max_bytes {
+        return None;
+    }
+    let content_budget = max_bytes - prefix.len();
+    let mut start = content.len().saturating_sub(content_budget);
+    while start < content.len() && !content.is_char_boundary(start) {
+        start += 1;
+    }
+    Some(format!("{prefix}{}", &content[start..]))
 }
 
 fn infer_session_memory_scope_kind(session: &SessionSummary) -> String {
@@ -8953,6 +8985,55 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
     use tokio::io::AsyncReadExt;
+
+    fn turn(role: &str, content: &str) -> nucleus_protocol::SessionTurn {
+        nucleus_protocol::SessionTurn {
+            id: format!("turn-{role}"),
+            session_id: "test-session".to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+            images: Vec::new(),
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn bounded_recent_turn_context_truncates_oversized_latest_turn() {
+        // Latest turn is bigger than the entire budget; without truncation it
+        // would be skipped and the classifier would see no recent context.
+        let user_content = "a".repeat(MEMORY_EXTRACTION_CONTEXT_CHAR_BUDGET + 1_000);
+        let turns = vec![turn("user", &user_content)];
+        let rendered = bounded_recent_turn_context(&turns);
+        assert!(!rendered.is_empty(), "latest turn must not be dropped");
+        assert!(
+            rendered.len() <= MEMORY_EXTRACTION_CONTEXT_CHAR_BUDGET,
+            "rendered context must respect the budget, was {} bytes",
+            rendered.len()
+        );
+        assert!(
+            rendered.starts_with("user: \u{2026}"),
+            "truncated output must keep the role prefix and an ellipsis"
+        );
+        let user_tail = &user_content[user_content.len() - 16..];
+        assert!(
+            rendered.ends_with(user_tail),
+            "truncated output must preserve the tail of the latest content"
+        );
+    }
+
+    #[test]
+    fn bounded_recent_turn_context_skips_older_turns_that_overflow() {
+        // Latest turn fits; older turn is too big to add without overflow and
+        // should be skipped (existing behavior for non-latest turns).
+        let huge_assistant = "b".repeat(MEMORY_EXTRACTION_CONTEXT_CHAR_BUDGET);
+        let turns = vec![
+            turn("assistant", &huge_assistant),
+            turn("user", "remember vanilla."),
+        ];
+        let rendered = bounded_recent_turn_context(&turns);
+        assert!(rendered.contains("user: remember vanilla."));
+        assert!(!rendered.contains("assistant:"));
+    }
 
     #[test]
     fn api_session_response_redacts_provider_api_key() {

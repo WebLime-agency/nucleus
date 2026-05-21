@@ -5240,12 +5240,18 @@ fn archive_bogus_interrogative_memory_fragments(connection: &Connection) -> Resu
         "if i go to a new session",
         "will you remember it if i go to a new session",
     ];
+    // Only fold rows that came from the legacy auto/explicit paths the
+    // structural detector and inline-tag parser used; manual/operator-created
+    // entries (`source_kind = 'manual'`) and candidate-promoted entries
+    // (`source_kind = 'candidate'`) must not be archived even if their
+    // content happens to match a phrase here.
     for pattern in patterns {
         connection.execute(
             "
             UPDATE memory_entries
             SET status = 'archived', updated_at = unixepoch()
             WHERE status = 'accepted'
+              AND source_kind IN ('explicit_remember', 'auto_memory')
               AND lower(trim(content)) = ?1
             ",
             params![pattern],
@@ -8431,6 +8437,53 @@ mod tests {
             .expect("search should keep good memory indexed");
         assert_eq!(good_results.len(), 1);
         assert_eq!(good_results[0].entry.id, "good-memory");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn initialization_preserves_manual_memory_matching_interrogative_fragment() {
+        let state_dir = test_state_dir("memory-archive-manual-protected");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+
+        // An operator-created entry whose content happens to match one of the
+        // legacy interrogative fragments must not be archived by the
+        // initialization migration — that data didn't come from the legacy
+        // detector and represents real user intent.
+        let manual_entry = MemoryEntry {
+            id: "manual-match".to_string(),
+            scope_kind: "workspace".to_string(),
+            scope_id: "workspace".to_string(),
+            title: "Operator note".to_string(),
+            content: "it if i go to a new session".to_string(),
+            tags: Vec::new(),
+            enabled: true,
+            status: "accepted".to_string(),
+            memory_kind: "note".to_string(),
+            source_kind: "manual".to_string(),
+            source_id: String::new(),
+            confidence: 1.0,
+            created_by: "user".to_string(),
+            last_used_at: None,
+            use_count: 0,
+            supersedes_id: String::new(),
+            metadata_json: serde_json::json!({}),
+            created_at: 0,
+            updated_at: 0,
+        };
+        store
+            .upsert_memory_entry(&manual_entry)
+            .expect("manual entry should persist");
+        drop(store);
+
+        let reopened = StateStore::initialize_at(&state_dir)
+            .expect("storage reinitialization should keep manual rows intact");
+        let entries = reopened.list_memory_entries().unwrap();
+        let manual = entries
+            .iter()
+            .find(|entry| entry.id == "manual-match")
+            .expect("manual row should still exist");
+        assert_eq!(manual.status, "accepted");
 
         let _ = fs::remove_dir_all(&state_dir);
     }
