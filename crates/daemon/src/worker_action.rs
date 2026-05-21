@@ -144,6 +144,10 @@ fn parse_worker_action_with_support(
     support: &WorkerToolSupport,
 ) -> Result<WorkerAction, WorkerActionParseError> {
     let trimmed = content.trim();
+    if let Some(action) = recover_provider_tool_action(trimmed, support)? {
+        return validate_worker_action(action, support);
+    }
+
     let start = trimmed
         .find('{')
         .ok_or(WorkerActionParseError::NoJsonObject)?;
@@ -152,15 +156,19 @@ fn parse_worker_action_with_support(
         .ok_or(WorkerActionParseError::NoJsonObject)?;
     let candidate = &trimmed[start..=end];
 
-    let value = match parse_worker_action_value(candidate) {
-        Ok(value) => value,
-        Err(error) => {
-            if let Some(action) = recover_provider_shell_action(candidate, support)? {
-                return validate_worker_action(action, support);
-            }
-            return Err(error);
+    parse_worker_action_json_candidate(candidate, support).or_else(|error| {
+        if let Some(action) = recover_provider_shell_action(candidate, support)? {
+            return validate_worker_action(action, support);
         }
-    };
+        Err(error)
+    })
+}
+
+fn parse_worker_action_json_candidate(
+    candidate: &str,
+    support: &WorkerToolSupport,
+) -> Result<WorkerAction, WorkerActionParseError> {
+    let value = parse_worker_action_value(candidate)?;
     if let Some(action) = normalize_worker_action_value(&value, support)? {
         return validate_worker_action(action, support);
     }
@@ -174,6 +182,235 @@ fn parse_worker_action_with_support(
             detail: excerpt(&error.to_string(), 220),
         }),
     }
+}
+
+fn recover_provider_tool_action(
+    content: &str,
+    support: &WorkerToolSupport,
+) -> Result<Option<WorkerAction>, WorkerActionParseError> {
+    if !contains_provider_tool_marker(content) {
+        return Ok(None);
+    }
+
+    let mut recovered = Vec::new();
+    let mut unknown_tool = None;
+
+    collect_xml_provider_tool_actions(content, support, &mut recovered, &mut unknown_tool)?;
+    collect_json_provider_tool_actions(content, support, &mut recovered, &mut unknown_tool)?;
+
+    match recovered.len() {
+        0 => {
+            if let Some(error) = unknown_tool {
+                Err(error)
+            } else {
+                Ok(None)
+            }
+        }
+        1 => Ok(recovered.pop()),
+        _ => Err(WorkerActionParseError::InvalidActionShape),
+    }
+}
+
+fn contains_provider_tool_marker(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    lower.contains("tool_call") || lower.contains("function_call")
+}
+
+fn collect_xml_provider_tool_actions(
+    content: &str,
+    support: &WorkerToolSupport,
+    recovered: &mut Vec<WorkerAction>,
+    unknown_tool: &mut Option<WorkerActionParseError>,
+) -> Result<(), WorkerActionParseError> {
+    let mut search_start = 0;
+    while let Some((tag_start, tag_name)) = find_next_provider_tool_tag(content, search_start) {
+        let after_tag_name = tag_start + tag_name.len() + 1;
+        let Some(relative_tag_end) = content[after_tag_name..].find('>') else {
+            break;
+        };
+        let tag_end = after_tag_name + relative_tag_end;
+        let attributes = &content[after_tag_name..tag_end];
+        let body_start = tag_end + 1;
+        let closing = format!("</{tag_name}>");
+        let body_end = find_ascii_case_insensitive(&content[body_start..], &closing)
+            .map(|relative| body_start + relative)
+            .unwrap_or(content.len());
+        search_start = if body_end < content.len() {
+            body_end + closing.len()
+        } else {
+            body_end
+        };
+
+        let Some(tool) = xml_attribute(attributes, "name")
+            .or_else(|| xml_attribute(attributes, "tool"))
+            .or_else(|| xml_attribute(attributes, "tool_name"))
+        else {
+            continue;
+        };
+        let tool = tool.trim();
+        if tool.is_empty() {
+            continue;
+        }
+
+        let args = xml_tool_call_body_args(&content[body_start..body_end], tool);
+        let value = json!({
+            "name": tool,
+            "arguments": args,
+        });
+        match normalize_worker_tool_call_value(&value, support) {
+            Ok(action) => recovered.push(action),
+            Err(error @ WorkerActionParseError::UnknownTool { .. }) => {
+                unknown_tool.get_or_insert(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(())
+}
+
+fn find_next_provider_tool_tag(
+    content: &str,
+    search_start: usize,
+) -> Option<(usize, &'static str)> {
+    let tool_call = find_ascii_case_insensitive(&content[search_start..], "<tool_call")
+        .map(|index| (search_start + index, "tool_call"));
+    let function_call = find_ascii_case_insensitive(&content[search_start..], "<function_call")
+        .map(|index| (search_start + index, "function_call"));
+
+    match (tool_call, function_call) {
+        (Some(left), Some(right)) if left.0 <= right.0 => Some(left),
+        (Some(_), Some(right)) => Some(right),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .to_ascii_lowercase()
+        .find(&needle.to_ascii_lowercase())
+}
+
+fn xml_attribute(attributes: &str, name: &str) -> Option<String> {
+    let mut search_start = 0;
+    while search_start < attributes.len() {
+        let relative_name_start = attributes[search_start..].find(name)?;
+        let name_start = search_start + relative_name_start;
+        let name_end = name_start + name.len();
+        let before_name = attributes[..name_start].chars().last();
+        let after_name = attributes[name_end..].chars().next();
+        if before_name.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+            || after_name.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        {
+            search_start = name_end;
+            continue;
+        }
+
+        let after_name_text = attributes[name_end..].trim_start();
+        if !after_name_text.starts_with('=') {
+            search_start = name_end;
+            continue;
+        }
+        let after_equals = after_name_text[1..].trim_start();
+        let quote = after_equals.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let value_start = quote.len_utf8();
+        let value_end = after_equals[value_start..].find(quote)?;
+        return Some(after_equals[value_start..value_start + value_end].to_string());
+    }
+
+    None
+}
+
+fn xml_tool_call_body_args(body: &str, raw_tool: &str) -> Value {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Value::Object(Map::new());
+    }
+
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        return value;
+    }
+
+    let normalized = raw_tool.trim().to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "shell" | "bash" | "terminal" | "command" | "run_command"
+    ) {
+        return Value::String(trimmed.to_string());
+    }
+
+    Value::Object(Map::new())
+}
+
+fn collect_json_provider_tool_actions(
+    content: &str,
+    support: &WorkerToolSupport,
+    recovered: &mut Vec<WorkerAction>,
+    unknown_tool: &mut Option<WorkerActionParseError>,
+) -> Result<(), WorkerActionParseError> {
+    for candidate in json_object_candidates(content) {
+        match parse_worker_action_json_candidate(candidate, support) {
+            Ok(action @ WorkerAction::ToolCall { .. }) => recovered.push(action),
+            Ok(_) => {}
+            Err(error @ WorkerActionParseError::UnknownTool { .. }) => {
+                unknown_tool.get_or_insert(error);
+            }
+            Err(WorkerActionParseError::MalformedJson { .. })
+            | Err(WorkerActionParseError::NoJsonObject)
+            | Err(WorkerActionParseError::InvalidActionShape) => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn json_object_candidates(content: &str) -> Vec<&str> {
+    let mut candidates = Vec::new();
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (index, ch) in content.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(index);
+                }
+                depth += 1;
+            }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(start) = start.take() {
+                        candidates.push(&content[start..index + ch.len_utf8()]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    candidates
 }
 
 fn recover_provider_shell_action(
@@ -1202,6 +1439,44 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_xml_style_registered_tool_call() {
+        let action = parse_worker_action_with_registered_mcp_tools(
+            r#"<tool_call name="cloudflare-api.search">async () => { return "liite.io"; }</tool_call>"#,
+            ["cloudflare-api.search"],
+        )
+        .expect("xml-style provider-native registered tool call should normalize");
+
+        let WorkerAction::ToolCall {
+            summary,
+            tool,
+            args,
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(summary, "Run the requested Nucleus action.");
+        assert_eq!(tool, "cloudflare-api.search");
+        assert_eq!(args, json!({}));
+    }
+
+    #[test]
+    fn preserves_provider_native_registered_tool_id() {
+        let action = parse_worker_action_with_registered_mcp_tools(
+            r#"{"type":"tool_call","name":"cloudflare-api.search","arguments":{"q":"workers ai"}}"#,
+            ["cloudflare-api.search"],
+        )
+        .expect("provider-native registered tool call should preserve the supported tool id");
+
+        let WorkerAction::ToolCall { tool, args, .. } = action else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(tool, "cloudflare-api.search");
+        assert_eq!(args["q"], "workers ai");
+    }
+
+    #[test]
     fn rejects_unregistered_non_mcp_tool_id() {
         let error = parse_worker_action_with_registered_mcp_tools(
             r#"{"kind":"tool_call","summary":"invent","tool":"cloudflare-api.execute","args":{}}"#,
@@ -1215,6 +1490,52 @@ mod tests {
                 tool: "cloudflare-api.execute".to_string()
             }
         );
+    }
+
+    #[test]
+    fn rejects_xml_style_unknown_tool_without_repair() {
+        let error = parse_worker_action_with_registered_mcp_tools(
+            r#"<tool_call name="cloudflare-api.execute">{"script":"lookup"}</tool_call>"#,
+            ["cloudflare-api.search"],
+        )
+        .expect_err("unsupported xml-style provider tool call should fail closed");
+
+        assert_eq!(
+            error,
+            WorkerActionParseError::UnknownTool {
+                tool: "cloudflare-api.execute".to_string()
+            }
+        );
+        assert!(!error.is_repairable_contract_error());
+    }
+
+    #[test]
+    fn recovers_single_supported_tool_call_from_mixed_output() {
+        let action = parse_worker_action_with_registered_mcp_tools(
+            r#"{"message":"I should check the site first."}
+{"tool_call":{"name":"cloudflare-api.search","arguments":{"query":"liite.io dns"}}}"#,
+            ["cloudflare-api.search"],
+        )
+        .expect("exactly one recoverable supported tool call should normalize");
+
+        let WorkerAction::ToolCall { tool, args, .. } = action else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(tool, "cloudflare-api.search");
+        assert_eq!(args["query"], "liite.io dns");
+    }
+
+    #[test]
+    fn rejects_ambiguous_mixed_supported_tool_calls() {
+        let error = parse_worker_action_with_registered_mcp_tools(
+            r#"{"tool_call":{"name":"cloudflare-api.search","arguments":{"query":"liite.io"}}}
+{"tool_call":{"name":"rg.search","arguments":{"pattern":"liite","path":"."}}}"#,
+            ["cloudflare-api.search"],
+        )
+        .expect_err("multiple recoverable supported tool calls should fail closed");
+
+        assert_eq!(error, WorkerActionParseError::InvalidActionShape);
     }
 
     #[test]
