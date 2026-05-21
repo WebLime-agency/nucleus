@@ -102,18 +102,7 @@ pub fn render_compiled_turn_text(turn: &nucleus_protocol::CompiledTurn) -> Strin
         }
     }
 
-    if !turn.mcp_catalog.is_empty() {
-        rendered.push_str("\n[Registered MCP metadata - not executable in this runtime]\n");
-        for server in &turn.mcp_catalog {
-            rendered.push_str("- mcp/");
-            rendered.push_str(&server.id);
-            rendered.push_str(": ");
-            rendered.push_str(&server.title);
-            rendered.push_str(" (");
-            rendered.push_str(&server.tools.len().to_string());
-            rendered.push_str(" registered tool descriptor(s))\n");
-        }
-    }
+    render_mcp_catalog(&turn.mcp_catalog, &mut rendered);
 
     if !turn.history.is_empty() {
         rendered.push_str("\n[Conversation history]\n");
@@ -189,20 +178,49 @@ pub fn render_compiled_turn_system_text(turn: &nucleus_protocol::CompiledTurn) -
         }
     }
 
-    if !turn.mcp_catalog.is_empty() {
-        rendered.push_str("\n[Registered MCP metadata - not executable in this runtime]\n");
-        for server in &turn.mcp_catalog {
-            rendered.push_str("- mcp/");
-            rendered.push_str(&server.id);
-            rendered.push_str(": ");
-            rendered.push_str(&server.title);
-            rendered.push_str(" (");
-            rendered.push_str(&server.tools.len().to_string());
-            rendered.push_str(" registered tool descriptor(s))\n");
-        }
-    }
+    render_mcp_catalog(&turn.mcp_catalog, &mut rendered);
 
     rendered
+}
+
+fn render_mcp_catalog(catalog: &[nucleus_protocol::McpServerSummary], rendered: &mut String) {
+    if catalog.is_empty() {
+        return;
+    }
+
+    rendered.push_str(
+        "\n[Registered MCP metadata - daemon action bridge execution]\n\
+MCP tool descriptors are available to this turn when granted. Invocation still runs through the Nucleus daemon and may be blocked by runtime credential state.\n",
+    );
+    for server in catalog {
+        rendered.push_str("- mcp/");
+        rendered.push_str(&server.id);
+        rendered.push_str(": ");
+        rendered.push_str(&server.title);
+        rendered.push_str("; enabled=");
+        rendered.push_str(if server.enabled { "true" } else { "false" });
+        rendered.push_str("; discovery_status=");
+        rendered.push_str(&server.sync_status);
+        rendered.push_str("; ");
+        rendered.push_str(&server.tools.len().to_string());
+        rendered.push_str(" registered tool descriptor(s)");
+        if !server.invocation_status.trim().is_empty() && server.invocation_status != "unknown" {
+            rendered.push_str("; invocation_status=");
+            rendered.push_str(&server.invocation_status);
+        }
+        if !server.invocation_message.trim().is_empty() {
+            rendered.push_str("; ");
+            rendered.push_str(&server.invocation_message);
+        }
+        rendered.push('\n');
+        for tool in &server.tools {
+            rendered.push_str("  - ");
+            rendered.push_str(&tool.id);
+            rendered.push_str(": ");
+            rendered.push_str(&tool.description);
+            rendered.push('\n');
+        }
+    }
 }
 
 fn render_layers(

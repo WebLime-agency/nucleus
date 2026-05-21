@@ -3300,6 +3300,8 @@ async fn discover_mcp_server_tools(
                 sync_status: "ready".to_string(),
                 last_error: String::new(),
                 last_synced_at: Some(now),
+                invocation_status: "unknown".to_string(),
+                invocation_message: String::new(),
                 tools: discovered.tools.clone(),
                 resources: discovered.resources.clone(),
             };
@@ -7600,6 +7602,7 @@ fn compile_session_turn(
     let skill_layers = skill_collection.layers;
     let mut mcp_catalog = state.store.list_mcp_servers()?;
     mcp_catalog.retain(|server| server.enabled);
+    annotate_mcp_invocation_availability(state, session, &mut mcp_catalog);
     mcp_catalog.sort_by(|a, b| a.id.cmp(&b.id));
     let tool_catalog = mcp_catalog
         .iter()
@@ -7645,6 +7648,174 @@ fn compile_session_turn(
         skill_diagnostics: skill_collection.diagnostics,
     };
     Ok(compiled)
+}
+
+fn annotate_mcp_invocation_availability(
+    state: &AppState,
+    session: &SessionSummary,
+    mcp_catalog: &mut [McpServerSummary],
+) {
+    let project_context = session_primary_project_context(session);
+    for server in mcp_catalog {
+        let (status, message) = mcp_invocation_availability(state, server, project_context);
+        server.invocation_status = status.to_string();
+        server.invocation_message = message.to_string();
+    }
+}
+
+fn session_primary_project_context(session: &SessionSummary) -> Option<&str> {
+    session
+        .projects
+        .iter()
+        .find(|project| project.is_primary)
+        .map(|project| project.id.as_str())
+        .or_else(|| {
+            let project_id = session.project_id.trim();
+            (!project_id.is_empty()).then_some(project_id)
+        })
+}
+
+fn mcp_invocation_availability(
+    state: &AppState,
+    server: &McpServerSummary,
+    project_context: Option<&str>,
+) -> (&'static str, &'static str) {
+    if !server.enabled {
+        return ("disabled", "MCP server is disabled.");
+    }
+    if matches!(server.transport.as_str(), "streamable-http" | "http")
+        && server.url.trim().is_empty()
+    {
+        return (
+            "unsupported_misconfigured",
+            "MCP invocation is blocked because the remote URL is missing.",
+        );
+    }
+    if server.transport == "stdio" && server.command.trim().is_empty() {
+        return (
+            "unsupported_misconfigured",
+            "MCP invocation is blocked because the stdio command is missing.",
+        );
+    }
+    if !matches!(
+        server.transport.as_str(),
+        "streamable-http" | "http" | "stdio"
+    ) {
+        return (
+            "unsupported_misconfigured",
+            "MCP invocation is blocked because the transport is unsupported.",
+        );
+    }
+
+    match server.auth_kind.as_str() {
+        "" | "none" | "static_headers" => (
+            "ready",
+            "MCP invocation is available through the Nucleus daemon action bridge.",
+        ),
+        "oauth" | "device" => (
+            "auth_required",
+            "MCP invocation is blocked because interactive MCP auth is required.",
+        ),
+        "bearer_env" | "env_bearer" => (
+            "unsupported_misconfigured",
+            "MCP invocation is blocked because bearer env auth must be migrated to Vault.",
+        ),
+        "vault_bearer" => mcp_vault_bearer_invocation_availability(state, server, project_context),
+        _ => (
+            "unsupported_misconfigured",
+            "MCP invocation is blocked because the auth configuration is unsupported.",
+        ),
+    }
+}
+
+fn mcp_vault_bearer_invocation_availability(
+    state: &AppState,
+    server: &McpServerSummary,
+    project_context: Option<&str>,
+) -> (&'static str, &'static str) {
+    let reference = match parse_vault_reference(&server.auth_ref) {
+        Ok(reference) => reference,
+        Err(_) => {
+            return (
+                "unsupported_misconfigured",
+                "MCP invocation is blocked because the Vault reference is invalid.",
+            );
+        }
+    };
+    if let Err(error) = enforce_vault_reference_context(&reference, project_context) {
+        let message = error.to_string();
+        if message.contains("vault_project_context_missing") {
+            return (
+                "project_context_missing",
+                "MCP invocation is blocked because this project Vault reference requires a matching project context.",
+            );
+        }
+        if message.contains("vault_project_context_mismatch") {
+            return (
+                "project_context_mismatch",
+                "MCP invocation is blocked because this project Vault reference does not match the current project context.",
+            );
+        }
+        return (
+            "unsupported_misconfigured",
+            "MCP invocation is blocked because the Vault reference context is invalid.",
+        );
+    }
+
+    let secret = match state
+        .store
+        .list_vault_secrets(Some(&reference.scope_kind), Some(&reference.scope_id))
+    {
+        Ok(secrets) => secrets
+            .into_iter()
+            .find(|secret| secret.name == reference.name),
+        Err(_) => None,
+    };
+    let Some(secret) = secret else {
+        return (
+            "vault_secret_missing",
+            "MCP invocation is blocked because the configured Vault secret is missing.",
+        );
+    };
+
+    let allowed = state
+        .store
+        .list_vault_secret_policies(&secret.id)
+        .unwrap_or_default()
+        .into_iter()
+        .any(|policy| {
+            policy.consumer_kind == "mcp"
+                && policy.consumer_id == server.id
+                && policy.permission == "read"
+                && policy.approval_mode == "allow"
+        });
+    if !allowed {
+        return (
+            "vault_policy_denied",
+            "MCP invocation is blocked because Vault policy does not allow this MCP server to read the credential.",
+        );
+    }
+
+    let mut vault = match state.vault.try_lock() {
+        Ok(vault) => vault,
+        Err(_) => {
+            return (
+                "auth_required",
+                "MCP invocation credential state is temporarily unavailable.",
+            );
+        }
+    };
+    if vault.is_unlocked() {
+        (
+            "ready",
+            "MCP invocation is available through the Nucleus daemon action bridge.",
+        )
+    } else {
+        (
+            "vault_locked",
+            "MCP credential is blocked because the Workspace Vault is locked. Unlock the Vault before invoking this MCP.",
+        )
+    }
 }
 
 fn collect_compiled_skill_layers(
@@ -9100,6 +9271,8 @@ mod tests {
             sync_status: "ready".to_string(),
             last_error: String::new(),
             last_synced_at: None,
+            invocation_status: "ready".to_string(),
+            invocation_message: String::new(),
             tools: Vec::new(),
             resources: Vec::new(),
         });
@@ -9506,6 +9679,8 @@ mod tests {
                 sync_status: "ready".to_string(),
                 last_error: String::new(),
                 last_synced_at: None,
+                invocation_status: "ready".to_string(),
+                invocation_message: String::new(),
                 tools: vec![NucleusToolDescriptor {
                     id: "mcp.docs.searchDocs".to_string(),
                     title: "searchDocs".to_string(),
@@ -9607,6 +9782,113 @@ mod tests {
         assert_eq!(compiled.debug_summary.tool_count, 1);
         assert!(compiled.capabilities.needs_mcp);
         assert!(compiled.capabilities.needs_tools);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn compile_session_turn_reports_ready_mcp_blocked_by_locked_vault() {
+        let (state_dir, state) = test_named_app_state("mcp-vault-locked-compiled-context");
+        let workspace_root = state_dir.join("workspace");
+        let record = McpServerRecord {
+            id: "cloudflare-api".to_string(),
+            workspace_id: "workspace".to_string(),
+            title: "Cloudflare API".to_string(),
+            transport: "streamable-http".to_string(),
+            command: String::new(),
+            args: Vec::new(),
+            env_json: json!({}),
+            url: "https://mcp.cloudflare.com/mcp".to_string(),
+            headers_json: json!({}),
+            auth_kind: "vault_bearer".to_string(),
+            auth_ref: "vault://workspace/CLOUDFLARE_API_TOKEN".to_string(),
+            enabled: true,
+            sync_status: "ready".to_string(),
+            last_error: String::new(),
+            last_synced_at: Some(1),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let tools = vec![
+            NucleusToolDescriptor {
+                id: "cloudflare-api.search".to_string(),
+                title: "search".to_string(),
+                description: "Search the Cloudflare API".to_string(),
+                input_schema: json!({"type":"object"}),
+                source: record.id.clone(),
+            },
+            NucleusToolDescriptor {
+                id: "cloudflare-api.execute".to_string(),
+                title: "execute".to_string(),
+                description: "Execute a Cloudflare API request".to_string(),
+                input_schema: json!({"type":"object"}),
+                source: record.id.clone(),
+            },
+        ];
+        state
+            .store
+            .upsert_mcp_server_record(&record, &tools, &[])
+            .expect("ready mcp record persists");
+
+        {
+            let mut vault = state.vault.lock().await;
+            vault
+                .initialize(&state.store, "correct horse battery staple")
+                .expect("vault initializes");
+            let secret = vault
+                .create_or_update_secret(
+                    &state.store,
+                    vault::VaultSecretInput {
+                        id: Some("cloudflare-token".to_string()),
+                        scope_kind: "workspace".to_string(),
+                        scope_id: "workspace".to_string(),
+                        name: "CLOUDFLARE_API_TOKEN".to_string(),
+                        description: "Cloudflare API token".to_string(),
+                        secret: "phase6-vault-token".to_string(),
+                    },
+                )
+                .expect("secret stores");
+            state
+                .store
+                .upsert_vault_secret_policy(&VaultSecretPolicyRecord {
+                    id: "policy-cloudflare-api".to_string(),
+                    secret_id: secret.id,
+                    consumer_kind: "mcp".to_string(),
+                    consumer_id: record.id.clone(),
+                    permission: "read".to_string(),
+                    approval_mode: "allow".to_string(),
+                    created_at: 0,
+                    updated_at: 0,
+                })
+                .expect("policy stores");
+            vault.lock();
+        }
+
+        let session = test_session(&workspace_root);
+        let compiled = compile_session_turn(
+            &state,
+            &session,
+            &[],
+            "Can you use Cloudflare?",
+            &[],
+            "main",
+        )
+        .expect("compiled turn should build");
+        let rendered = nucleus_core::render_compiled_turn_system_text(&compiled);
+
+        assert_eq!(compiled.mcp_catalog.len(), 1);
+        assert_eq!(compiled.mcp_catalog[0].sync_status, "ready");
+        assert_eq!(compiled.mcp_catalog[0].tools.len(), 2);
+        assert_eq!(compiled.mcp_catalog[0].invocation_status, "vault_locked");
+        assert!(rendered.contains("cloudflare-api.search"));
+        assert!(rendered.contains("cloudflare-api.execute"));
+        assert!(rendered.contains("invocation_status=vault_locked"));
+        assert!(rendered.contains("Workspace Vault is locked"));
+        assert!(!rendered.contains("0 registered tool descriptor"));
+        assert!(!rendered.contains("not executable in this runtime"));
+        assert!(!rendered.contains("resync"));
+        assert!(!rendered.contains("restart"));
+        assert!(!rendered.contains("pending"));
 
         let _ = fs::remove_dir_all(&state_dir);
     }
