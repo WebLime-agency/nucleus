@@ -157,6 +157,17 @@ fn probe_system_runtime(mut runtime: RuntimeSummary) -> RuntimeSummary {
     runtime
 }
 
+/// System-layer guidance that tells the assistant how to emit structured memory
+/// decisions for the daemon-side classifier consumer. Kept in one place so the
+/// prompt text and the parser in main.rs stay in lock-step.
+pub(crate) fn memory_decisions_protocol_instructions() -> &'static str {
+    "Memory decision protocol — daemon-only, not user-facing.\n\
+After your reply, optionally append a single `<memory_decisions>...</memory_decisions>` block containing a JSON array.\n\
+Each array item is `{\"category\": \"explicit|auto_save|candidate|none\", \"content\": \"non-secret durable statement\", \"memory_kind\": \"fact|preference|decision|project_note|solution|constraint|note\", \"scope_kind\": \"workspace|project|session\", \"scope_id\": \"...\", \"confidence\": 0.0..1.0, \"supersedes_id\": \"optional id of an entry this replaces\", \"reason\": \"short non-secret why\"}`.\n\
+Pick `explicit` when the user explicitly asked you to remember something. Pick `auto_save` only for clearly durable user preferences, project decisions, or stable facts that you are highly confident should persist without operator review. Pick `candidate` for plausibly durable information that an operator should review before acceptance. Pick `none` (or omit the block entirely) when nothing in this turn warrants durable memory.\n\
+Never include secrets, tokens, passwords, recovery phrases, authorization headers, or ephemeral instructions like \"keep this answer short.\" The daemon redacts and rejects credential-bearing content."
+}
+
 pub(crate) fn compiled_turn_from_prompt(
     history: &[SessionTurn],
     prompt: &str,
@@ -185,14 +196,24 @@ pub(crate) fn compiled_turn_from_prompt(
         id: uuid::Uuid::new_v4().to_string(),
         role: role.to_string(),
         provider_neutral: true,
-        system_layers: vec![CompiledPromptLayer {
-            id: "platform:nucleus-runtime".to_string(),
-            kind: "platform".to_string(),
-            scope: "nucleus".to_string(),
-            title: "Nucleus runtime contract".to_string(),
-            source_path: String::new(),
-            content: "Nucleus owns prompt assembly, project context, skills, tools, and turn execution semantics. Provider-native project memory, skills, and MCP configuration are not authoritative for this turn.".to_string(),
-        }],
+        system_layers: vec![
+            CompiledPromptLayer {
+                id: "platform:nucleus-runtime".to_string(),
+                kind: "platform".to_string(),
+                scope: "nucleus".to_string(),
+                title: "Nucleus runtime contract".to_string(),
+                source_path: String::new(),
+                content: "Nucleus owns prompt assembly, project context, skills, tools, and turn execution semantics. Provider-native project memory, skills, and MCP configuration are not authoritative for this turn.".to_string(),
+            },
+            CompiledPromptLayer {
+                id: "platform:nucleus-memory-decisions".to_string(),
+                kind: "platform".to_string(),
+                scope: "nucleus".to_string(),
+                title: "Memory decision protocol".to_string(),
+                source_path: String::new(),
+                content: memory_decisions_protocol_instructions().to_string(),
+            },
+        ],
         project_layers: Vec::new(),
         skill_layers: skill_layers.to_vec(),
         tool_catalog: tool_catalog.to_vec(),
