@@ -991,7 +991,12 @@ pub async fn start_prompt_job(
             ApiError::internal_message("failed to reload Utility Worker capabilities")
         })?;
 
-    let _compiled_turn = crate::compile_session_turn(
+    // Pre-flight compile so any compile-time error (missing include file,
+    // overflowing budget, malformed metadata) surfaces synchronously to the
+    // user before the job queues. The actual CompiledTurn sent to the provider
+    // is rebuilt per model call inside `execute_worker_model_turn` so memory,
+    // skill, and include layers reflect the latest session state.
+    let _ = crate::compile_session_turn(
         &state,
         &current.session,
         &current.turns,
@@ -1932,6 +1937,7 @@ async fn run_job_loop(
 
         let response = call_worker_model(
             state,
+            Some(&session.session),
             &worker,
             &checkpoint.conversation,
             &prompt,
@@ -6068,12 +6074,14 @@ fn unsupported_vision_with_tools_detail(worker: &WorkerSummary, image_count: usi
 
 async fn call_worker_model(
     state: &AppState,
+    session: Option<&SessionSummary>,
     worker: &WorkerSummary,
     conversation: &[CheckpointMessage],
     prompt: &str,
     images: &[SessionTurnImage],
 ) -> Result<ModelResponse> {
-    let result = execute_worker_model_turn(state, worker, conversation, prompt, images).await?;
+    let result =
+        execute_worker_model_turn(state, session, worker, conversation, prompt, images).await?;
     let action = match parse_worker_action(&result.content) {
         Ok(action) => action,
         Err(error)
@@ -6092,9 +6100,15 @@ async fn call_worker_model(
                 images: Vec::new(),
             });
             let repair_prompt = build_worker_action_repair_prompt(&result.content, &error);
-            let repaired =
-                execute_worker_model_turn(state, worker, &repair_conversation, &repair_prompt, &[])
-                    .await?;
+            let repaired = execute_worker_model_turn(
+                state,
+                session,
+                worker,
+                &repair_conversation,
+                &repair_prompt,
+                &[],
+            )
+            .await?;
             let action = parse_worker_action(&repaired.content).with_context(|| {
                 format!(
                     "worker returned invalid Nucleus action after repair retry; original response: {}; repaired response: {}",
@@ -6136,6 +6150,7 @@ fn worker_supports_action_contract_repair(worker: &WorkerSummary) -> bool {
 
 async fn execute_worker_model_turn(
     state: &AppState,
+    session: Option<&SessionSummary>,
     worker: &WorkerSummary,
     conversation: &[CheckpointMessage],
     prompt: &str,
@@ -6149,17 +6164,48 @@ async fn execute_worker_model_turn(
     let execution_clone = execution.clone();
     let history_clone = history.clone();
     let images = images.to_vec();
+    // Compile the real session's context (memory layers, prompt includes,
+    // skill layers, tool/mcp catalogs) so the provider call sees the same
+    // system prompt the daemon advertises in debug summaries. Without this
+    // wiring `execute_prompt_stream` would rebuild an empty CompiledTurn
+    // (see issue #232).
+    let compiled_turn = session
+        .and_then(|sess| {
+            crate::compile_session_turn(state, sess, &history, &prompt_body, &images, "utility")
+                .inspect_err(|error| {
+                    warn!(
+                        ?error,
+                        session_id = sess.id.as_str(),
+                        "session-aware prompt compile failed; falling back to layered-empty CompiledTurn",
+                    );
+                })
+                .ok()
+        });
+
     let handle = tokio::spawn(async move {
-        runtimes
-            .execute_prompt_stream(
-                &execution_clone,
-                &history_clone,
-                &prompt_body,
-                &images,
-                "utility",
-                events,
-            )
-            .await
+        match compiled_turn {
+            Some(turn) => {
+                runtimes
+                    .execute_compiled_turn_stream(
+                        &execution_clone,
+                        std::sync::Arc::new(turn),
+                        events,
+                    )
+                    .await
+            }
+            None => {
+                runtimes
+                    .execute_prompt_stream(
+                        &execution_clone,
+                        &history_clone,
+                        &prompt_body,
+                        &images,
+                        "utility",
+                        events,
+                    )
+                    .await
+            }
+        }
     });
 
     let mut last_reasoning = String::new();
@@ -16020,7 +16066,7 @@ Cleanup status: clean";
         let mut worker = test_worker_summary("repair-worker", 10, 10);
         worker.provider_base_url = base_url;
         worker.working_dir = state_dir.display().to_string();
-        let response = call_worker_model(&state, &worker, &[], "Inspect the repo.", &[])
+        let response = call_worker_model(&state, None, &worker, &[], "Inspect the repo.", &[])
             .await
             .expect("repair turn should produce a valid action");
 
@@ -16045,6 +16091,131 @@ Cleanup status: clean";
         assert!(bodies[0].contains("Inspect the repo."));
         assert!(bodies[1].contains("Nucleus action contract"));
         assert!(bodies[1].contains("I should inspect the repo next"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    /// Regression for #232: until now `start_prompt_job` built a CompiledTurn
+    /// for debug summaries and discarded it; the runtime then rebuilt an
+    /// empty CompiledTurn for the actual provider call. As a result, accepted
+    /// workspace memory (and prompt includes and skill layers) never reached
+    /// the model. This test asserts that, given a real session id and a
+    /// workspace-scoped accepted memory entry, the outbound HTTP body to the
+    /// OpenAI-compatible provider contains the memory entry's content.
+    #[tokio::test]
+    async fn call_worker_model_includes_workspace_memory_in_provider_request() {
+        use nucleus_protocol::MemoryEntry;
+
+        let state_dir = test_state_dir("worker-prompt-memory-layer");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let session = state
+            .store
+            .create_session(test_session_record(
+                "memory-layer-session",
+                "Memory layer session",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+
+        let sentinel = "Issue 232 sentinel: workspace prefers vanilla ice cream over chocolate.";
+        state
+            .store
+            .upsert_memory_entry(&MemoryEntry {
+                id: "issue-232-memory".to_string(),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "Issue 232 memory sentinel".to_string(),
+                content: sentinel.to_string(),
+                tags: Vec::new(),
+                enabled: true,
+                status: "accepted".to_string(),
+                memory_kind: "preference".to_string(),
+                source_kind: "explicit_remember".to_string(),
+                source_id: session.id.clone(),
+                confidence: 1.0,
+                created_by: "user".to_string(),
+                last_used_at: None,
+                use_count: 0,
+                supersedes_id: String::new(),
+                metadata_json: json!({}),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .expect("memory entry should persist");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener addr should be available")
+        );
+        let captured_body = Arc::new(TestMutex::new(String::new()));
+        let server_captured = captured_body.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("test request should connect");
+            let body = read_test_http_body(&mut socket).await;
+            *server_captured
+                .lock()
+                .expect("captured body lock should not be poisoned") = body;
+            write_test_openai_sse_response(
+                &mut socket,
+                "memory-layer-turn",
+                r#"{"kind":"final_answer","summary":"answered","final_answer":"Done."}"#,
+            )
+            .await;
+        });
+
+        let mut worker = test_worker_summary("memory-layer-worker", 10, 10);
+        worker.provider_base_url = base_url;
+        worker.working_dir = workspace_root.display().to_string();
+
+        let response = call_worker_model(
+            &state,
+            Some(&session),
+            &worker,
+            &[],
+            "What ice cream do I like?",
+            &[],
+        )
+        .await
+        .expect("model turn should produce a valid action");
+
+        match response.action {
+            WorkerAction::FinalAnswer { final_answer, .. } => {
+                assert_eq!(final_answer, "Done.");
+            }
+            other => panic!("expected final_answer action, got {other:?}"),
+        }
+
+        server.await.expect("test server should finish");
+        let body = captured_body
+            .lock()
+            .expect("captured body lock should not be poisoned")
+            .clone();
+        assert!(
+            body.contains(sentinel),
+            "outbound provider request must carry workspace memory content; body was: {body}",
+        );
+        assert!(
+            body.contains("Project layers")
+                || body.contains("[memory:")
+                || body.contains("[memory ")
+                || body.contains("memory:workspace"),
+            "outbound provider request must include a memory/project-layer heading; body was: {body}",
+        );
 
         let _ = fs::remove_dir_all(&state_dir);
     }
