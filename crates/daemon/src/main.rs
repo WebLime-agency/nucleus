@@ -1,5 +1,6 @@
 mod agent;
 mod browser;
+mod compaction;
 mod error_display;
 mod host;
 mod memory_classifier;
