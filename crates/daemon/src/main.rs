@@ -2,6 +2,7 @@ mod agent;
 mod browser;
 mod error_display;
 mod host;
+mod memory_classifier;
 mod runtime;
 mod security;
 mod updates;
@@ -1372,28 +1373,28 @@ enum MemoryDecisionCategory {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-struct ExtractedMemoryCandidate {
+pub(crate) struct ExtractedMemoryCandidate {
     #[serde(default)]
-    category: Option<String>,
+    pub(crate) category: Option<String>,
     #[serde(default)]
-    title: String,
-    content: String,
+    pub(crate) title: String,
+    pub(crate) content: String,
     #[serde(default = "default_extracted_candidate_kind", alias = "memory_kind")]
-    candidate_kind: String,
+    pub(crate) candidate_kind: String,
     #[serde(default)]
-    tags: Vec<String>,
+    pub(crate) tags: Vec<String>,
     #[serde(default)]
-    evidence: Vec<String>,
+    pub(crate) evidence: Vec<String>,
     #[serde(default)]
-    reason: String,
+    pub(crate) reason: String,
     #[serde(default)]
-    confidence: Option<f64>,
+    pub(crate) confidence: Option<f64>,
     #[serde(default)]
-    scope_kind: Option<String>,
+    pub(crate) scope_kind: Option<String>,
     #[serde(default)]
-    scope_id: Option<String>,
+    pub(crate) scope_id: Option<String>,
     #[serde(default)]
-    supersedes_id: Option<String>,
+    pub(crate) supersedes_id: Option<String>,
 }
 
 fn default_extracted_candidate_kind() -> String {
@@ -1529,6 +1530,15 @@ async fn extract_memory_decisions_after_turn_inner(
         return Ok(Vec::new());
     }
 
+    let classifier_kind = state
+        .store
+        .memory_classifier_kind()
+        .map_err(ApiError::from)?;
+    if classifier_kind == "llm" {
+        return extract_llm_memory_decisions_after_turn(state, &detail.session, assistant_turn_id)
+            .await;
+    }
+
     let recent_context = bounded_recent_turn_context(&detail.turns);
 
     // Find the most recent user turn so the explicit-intent detector can run
@@ -1578,6 +1588,94 @@ async fn extract_memory_decisions_after_turn_inner(
     let (outcomes, _) = consume_memory_decisions(
         state,
         &detail.session,
+        decisions,
+        MemoryDecisionCategory::Candidate,
+        &context,
+    )
+    .await?;
+    Ok(outcomes)
+}
+
+async fn extract_llm_memory_decisions_after_turn(
+    state: &AppState,
+    session: &SessionSummary,
+    assistant_turn_id: Option<&str>,
+) -> Result<Vec<MemoryOutcome>, ApiError> {
+    record_memory_audit(
+        state,
+        "memory.classifier.started",
+        &session.id,
+        "started",
+        "Started LLM memory classifier.",
+    )
+    .await;
+
+    let decisions =
+        match memory_classifier::classify_memory_for_turn(state, &session.id, assistant_turn_id)
+            .await
+        {
+            Ok(decisions) => decisions,
+            Err(error) => {
+                warn!(
+                    error = ?error,
+                    session_id = session.id.as_str(),
+                    assistant_turn_id,
+                    "LLM memory classifier failed without affecting the user turn"
+                );
+                let (kind, status, summary) = if error.message.contains("not configured")
+                    || error.message.contains("unsupported provider")
+                    || error.message.contains("requires a model")
+                {
+                    (
+                        "memory.classifier.skipped",
+                        "skipped",
+                        "LLM memory classifier skipped because the utility worker is unavailable.",
+                    )
+                } else {
+                    (
+                        "memory.classifier.failed",
+                        "failed",
+                        "LLM memory classifier failed without affecting the user turn.",
+                    )
+                };
+                record_memory_audit(state, kind, &session.id, status, summary).await;
+                return Ok(Vec::new());
+            }
+        };
+
+    record_memory_audit(
+        state,
+        "memory.classifier.completed",
+        &session.id,
+        "completed",
+        &format!(
+            "Completed LLM memory classifier; emitted {} decisions.",
+            decisions.len()
+        ),
+    )
+    .await;
+
+    if decisions.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let detail = state
+        .store
+        .get_session(&session.id)
+        .map_err(ApiError::from)?;
+    let recent_context = bounded_recent_turn_context(&detail.turns);
+    let context = MemoryDecisionContext {
+        source_label: "llm_memory_classifier",
+        assistant_turn_id: assistant_turn_id.map(str::to_string),
+        first_turn_id: detail.turns.first().map(|turn| turn.id.clone()),
+        recent_context_chars: recent_context.len(),
+        propagate_errors: false,
+        format_label: "llm_json_decisions",
+    };
+
+    let (outcomes, _) = consume_memory_decisions(
+        state,
+        session,
         decisions,
         MemoryDecisionCategory::Candidate,
         &context,
@@ -2036,7 +2134,7 @@ fn extract_tagged_json_array<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
     Some(text[start..end].trim())
 }
 
-fn bounded_recent_turn_context(turns: &[nucleus_protocol::SessionTurn]) -> String {
+pub(crate) fn bounded_recent_turn_context(turns: &[nucleus_protocol::SessionTurn]) -> String {
     let mut selected = Vec::new();
     let mut remaining = MEMORY_EXTRACTION_CONTEXT_CHAR_BUDGET;
     for turn in turns.iter().rev() {
@@ -2737,7 +2835,7 @@ fn contains_url_userinfo(text: &str) -> bool {
     })
 }
 
-async fn record_memory_audit(
+pub(crate) async fn record_memory_audit(
     state: &AppState,
     kind: &str,
     target: &str,
@@ -9109,6 +9207,7 @@ mod tests {
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn api_session_response_redacts_provider_api_key() {
@@ -10976,6 +11075,137 @@ mod tests {
         }
     }
 
+    fn set_default_profile_utility_target(
+        state: &AppState,
+        provider: &str,
+        model: &str,
+        base_url: &str,
+        api_key: &str,
+    ) {
+        let workspace = state.store.workspace().expect("workspace should load");
+        let profile = workspace
+            .profiles
+            .into_iter()
+            .find(|profile| profile.id == workspace.default_profile_id)
+            .expect("default profile should exist");
+        state
+            .store
+            .update_workspace_profile(
+                &profile.id,
+                WorkspaceProfilePatch {
+                    title: profile.title,
+                    main: profile.main,
+                    utility: WorkspaceModelConfig {
+                        adapter: provider.to_string(),
+                        model: model.to_string(),
+                        base_url: base_url.to_string(),
+                        api_key: api_key.to_string(),
+                    },
+                    is_default: true,
+                },
+            )
+            .expect("default utility profile should update");
+    }
+
+    async fn spawn_memory_classifier_openai_server(
+        content: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener addr should be available")
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("test request should connect");
+            let body = read_test_http_body(&mut socket).await;
+            write_test_openai_sse_response(&mut socket, "memory-classifier", content).await;
+            body
+        });
+        (base_url, server)
+    }
+
+    async fn spawn_timeout_memory_classifier_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener addr should be available")
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("test request should connect");
+            let _ = read_test_http_body(&mut socket).await;
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        });
+        (base_url, server)
+    }
+
+    async fn read_test_http_body(socket: &mut tokio::net::TcpStream) -> String {
+        let mut reader = BufReader::new(socket);
+        let mut headers = String::new();
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            let bytes = reader
+                .read_line(&mut line)
+                .await
+                .expect("header line should read");
+            if bytes == 0 || line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line
+                .to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(str::trim)
+            {
+                content_length = value.parse::<usize>().unwrap_or(0);
+            }
+            headers.push_str(&line);
+        }
+        let mut body = vec![0u8; content_length];
+        reader
+            .read_exact(&mut body)
+            .await
+            .expect("request body should read");
+        format!("{headers}\n{}", String::from_utf8_lossy(&body))
+    }
+
+    async fn write_test_openai_sse_response(
+        socket: &mut tokio::net::TcpStream,
+        id: &str,
+        content: &str,
+    ) {
+        let payload = json!({
+            "id": id,
+            "choices": [{
+                "delta": { "content": content },
+                "finish_reason": null
+            }]
+        });
+        let body = format!("data: {payload}\n\ndata: [DONE]\n\n");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("test response should write");
+    }
+
     #[tokio::test]
     async fn automatic_memory_extraction_creates_pending_only_and_is_prompt_safe() {
         let (state_dir, state) = test_named_app_state("memory-auto-extraction");
@@ -11025,6 +11255,218 @@ mod tests {
         let compiled = compile_session_turn(&state, &session, &[], "future", &[], "main").unwrap();
         let rendered = nucleus_core::render_compiled_turn_system_text(&compiled);
         assert!(rendered.contains(&entry.content));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn llm_memory_classifier_auto_save_creates_accepted_entry() {
+        let (state_dir, state) = test_named_app_state("memory-236-llm-auto-save");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let session = create_test_persisted_session(&state, "memory-236-auto", &workspace_root);
+        state.store.set_memory_classifier_kind("llm").unwrap();
+        let classifier_json = r#"{"decisions":[{"category":"auto_save","title":"Ice cream preference","content":"The user likes vanilla ice cream.","memory_kind":"preference","tags":["preference"],"evidence":["User said they love vanilla ice cream."],"reason":"Durable stated preference.","confidence":0.96,"scope_kind":"workspace","scope_id":"workspace"}]}"#;
+        let (base_url, server) = spawn_memory_classifier_openai_server(classifier_json).await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "gpt-5.4-mini",
+            &base_url,
+            "test-key",
+        );
+        state
+            .store
+            .append_session_turn(
+                &session.id,
+                "user-turn",
+                "user",
+                "I love vanilla icea cream can you rememebr that?",
+                &[],
+            )
+            .unwrap();
+        state
+            .store
+            .append_session_turn(
+                &session.id,
+                "assistant-turn",
+                "assistant",
+                "I can keep track of that.",
+                &[],
+            )
+            .unwrap();
+
+        let outcomes =
+            extract_memory_decisions_after_turn(&state, &session.id, Some("assistant-turn")).await;
+        assert!(
+            outcomes.iter().any(|outcome| outcome.state == "saved"),
+            "classifier should produce a saved memory outcome: {outcomes:?}"
+        );
+        let request_body = server.await.expect("server should finish");
+        assert!(request_body.contains("response_format"));
+        assert!(request_body.contains("json_object"));
+        let entries = state.store.list_memory_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source_kind, "auto_memory");
+        assert_eq!(entries[0].memory_kind, "preference");
+        assert!(entries[0].content.contains("vanilla ice cream"));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn llm_memory_classifier_supersedes_archives_prior_entry() {
+        let (state_dir, state) = test_named_app_state("memory-236-llm-supersedes");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let session =
+            create_test_persisted_session(&state, "memory-236-supersedes", &workspace_root);
+        state.store.set_memory_classifier_kind("llm").unwrap();
+        let prior = upsert_memory_from_request(
+            &state,
+            MemoryEntryUpsertRequest {
+                id: Some("flavor-prior".to_string()),
+                scope_kind: "workspace".to_string(),
+                scope_id: "workspace".to_string(),
+                title: "Flavor preference".to_string(),
+                content: "The user likes vanilla ice cream.".to_string(),
+                tags: Vec::new(),
+                enabled: Some(true),
+                status: Some("accepted".to_string()),
+                memory_kind: Some("preference".to_string()),
+                source_kind: Some("manual".to_string()),
+                source_id: None,
+                confidence: Some(1.0),
+                created_by: None,
+                last_used_at: None,
+                use_count: None,
+                supersedes_id: None,
+                metadata_json: None,
+            },
+            None,
+        )
+        .unwrap();
+        let classifier_json = r#"{"decisions":[{"category":"auto_save","title":"Flavor preference","content":"The user likes chocolate ice cream.","memory_kind":"preference","reason":"User updated their preference.","confidence":0.94,"scope_kind":"workspace","scope_id":"workspace","supersedes_id":"flavor-prior"}]}"#;
+        let (base_url, server) = spawn_memory_classifier_openai_server(classifier_json).await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "gpt-5.4-mini",
+            &base_url,
+            "test-key",
+        );
+        state
+            .store
+            .append_session_turn(
+                &session.id,
+                "user-turn",
+                "user",
+                "Actually I prefer chocolate ice cream now.",
+                &[],
+            )
+            .unwrap();
+        state
+            .store
+            .append_session_turn(&session.id, "assistant-turn", "assistant", "Got it.", &[])
+            .unwrap();
+
+        let _ =
+            extract_memory_decisions_after_turn(&state, &session.id, Some("assistant-turn")).await;
+        let _ = server.await.expect("server should finish");
+        let entries = state.store.list_memory_entries().unwrap();
+        let archived = entries
+            .iter()
+            .find(|entry| entry.id == prior.id)
+            .expect("prior entry should still exist");
+        assert_eq!(archived.status, "archived");
+        let replacement = entries
+            .iter()
+            .find(|entry| entry.content.contains("chocolate"))
+            .expect("replacement should be saved");
+        assert_eq!(replacement.status, "accepted");
+        assert_eq!(replacement.supersedes_id, prior.id);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn llm_memory_classifier_malformed_json_audits_failure_without_writes() {
+        let (state_dir, state) = test_named_app_state("memory-236-llm-malformed");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let session =
+            create_test_persisted_session(&state, "memory-236-malformed", &workspace_root);
+        state.store.set_memory_classifier_kind("llm").unwrap();
+        let (base_url, server) = spawn_memory_classifier_openai_server("not-json").await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "gpt-5.4-mini",
+            &base_url,
+            "test-key",
+        );
+        state
+            .store
+            .append_session_turn(&session.id, "user-turn", "user", "Hello there.", &[])
+            .unwrap();
+        state
+            .store
+            .append_session_turn(&session.id, "assistant-turn", "assistant", "Hi.", &[])
+            .unwrap();
+
+        let outcomes =
+            extract_memory_decisions_after_turn(&state, &session.id, Some("assistant-turn")).await;
+        let _ = server.await.expect("server should finish");
+        assert!(outcomes.is_empty());
+        assert!(state.store.list_memory_entries().unwrap().is_empty());
+        assert!(state.store.list_memory_candidates().unwrap().is_empty());
+        let audits = state.store.list_audit_events(50).unwrap();
+        assert!(format!("{audits:?}").contains("memory.classifier.failed"));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn llm_memory_classifier_timeout_leaves_turn_and_memory_untouched() {
+        let (state_dir, state) = test_named_app_state("memory-236-llm-timeout");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let session = create_test_persisted_session(&state, "memory-236-timeout", &workspace_root);
+        state.store.set_memory_classifier_kind("llm").unwrap();
+        let (base_url, server) = spawn_timeout_memory_classifier_server().await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "gpt-5.4-mini",
+            &base_url,
+            "test-key",
+        );
+        state
+            .store
+            .append_session_turn(
+                &session.id,
+                "user-turn",
+                "user",
+                "Remember that I prefer vanilla ice cream.",
+                &[],
+            )
+            .unwrap();
+        state
+            .store
+            .append_session_turn(
+                &session.id,
+                "assistant-turn",
+                "assistant",
+                "I will remember that.",
+                &[],
+            )
+            .unwrap();
+
+        let outcomes =
+            extract_memory_decisions_after_turn(&state, &session.id, Some("assistant-turn")).await;
+        server.abort();
+        assert!(outcomes.is_empty());
+        assert!(state.store.list_memory_entries().unwrap().is_empty());
+        assert!(state.store.list_memory_candidates().unwrap().is_empty());
+        let detail = state.store.get_session(&session.id).unwrap();
+        assert!(detail.turns.iter().any(|turn| turn.id == "user-turn"));
+        assert!(detail.turns.iter().any(|turn| turn.id == "assistant-turn"));
         let _ = fs::remove_dir_all(&state_dir);
     }
 
