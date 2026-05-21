@@ -72,9 +72,11 @@ Return exactly one JSON object and nothing else.
 Task:
 - Read the recent conversation.
 - Decide whether the user's latest durable information should be saved as memory.
-- Use ADD for durable user facts, preferences, project decisions, constraints, or stable operational notes.
-- Use UPDATE when the new durable information replaces an existing memory; set supersedes_id to the existing memory id.
-- Use IGNORE/NOOP by returning an empty decisions array for greetings, temporary instructions, ordinary questions, and meta questions about memory such as "will you remember it if I open a new session?"
+- Use category `explicit` when the user explicitly asked Nucleus to remember something.
+- Use category `auto_save` for high-confidence durable user facts, preferences, project decisions, constraints, or stable operational notes that should be accepted now without operator review. To update or replace an existing memory, emit a single `auto_save` decision and set `supersedes_id` to the existing memory id.
+- Use category `candidate` for plausibly durable information that should be reviewed by an operator before acceptance.
+- For greetings, temporary instructions, ordinary questions, and meta questions about memory such as "will you remember it if I open a new session?", return an empty decisions array (`{{"decisions":[]}}`).
+- Only emit `category` values from this set: `explicit`, `auto_save`, `candidate`, `none`. Anything else is rejected and the whole response is discarded.
 - Do not store secrets, credentials, tokens, cookies, private keys, passwords, authorization headers, or raw secret values.
 
 Output schema:
@@ -292,6 +294,14 @@ mod tests {
         assert!(prompt.contains("pref-flavor"));
         assert!(prompt.contains("supersedes_id"));
         assert!(prompt.contains("Do not store secrets"));
+        // Task verbs must match the schema categories the parser accepts so a
+        // model following the instructions cannot produce ADD/UPDATE responses
+        // that get rejected wholesale.
+        assert!(prompt.contains("category `explicit`"));
+        assert!(prompt.contains("category `auto_save`"));
+        assert!(prompt.contains("category `candidate`"));
+        assert!(!prompt.contains("Use ADD"));
+        assert!(!prompt.contains("Use UPDATE"));
     }
 
     #[test]
