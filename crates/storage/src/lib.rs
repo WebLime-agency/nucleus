@@ -30,6 +30,8 @@ use uuid::Uuid;
 const LOCAL_AUTH_TOKEN_HASH_KEY: &str = "auth.local_token_hash";
 const LOCAL_AUTH_TOKEN_FILE_NAME: &str = "local-auth-token";
 const UPDATE_STATE_KEY: &str = "updates.state.v1";
+const MEMORY_CLASSIFIER_KIND_KEY: &str = "memory.classifier_kind";
+const DEFAULT_MEMORY_CLASSIFIER_KIND: &str = "legacy";
 const PLAYBOOK_RECENT_JOB_LIMIT: usize = 12;
 pub const INSTANCE_LOG_RETENTION_DAYS: i64 = 30;
 pub const INSTANCE_LOG_MAX_ROWS: usize = 5_000;
@@ -778,6 +780,25 @@ impl StateStore {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         sync_projects_with_connection(&connection)?;
         load_workspace_summary(&connection)
+    }
+
+    pub fn memory_classifier_kind(&self) -> Result<String> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        Ok(
+            setting_value_optional(&connection, MEMORY_CLASSIFIER_KIND_KEY)?
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| matches!(value.as_str(), "legacy" | "llm"))
+                .unwrap_or_else(|| DEFAULT_MEMORY_CLASSIFIER_KIND.to_string()),
+        )
+    }
+
+    pub fn set_memory_classifier_kind(&self, kind: &str) -> Result<()> {
+        let normalized = kind.trim().to_ascii_lowercase();
+        if !matches!(normalized.as_str(), "legacy" | "llm") {
+            bail!("unsupported memory classifier kind '{kind}'");
+        }
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        set_setting_value(&connection, MEMORY_CLASSIFIER_KIND_KEY, &normalized)
     }
 
     pub fn update_workspace(
