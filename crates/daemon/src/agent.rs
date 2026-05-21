@@ -37,11 +37,11 @@ use uuid::Uuid;
 
 use super::{
     ApiError, AppState, MCP_ENV_BEARER_MIGRATION_MESSAGE, assemble_prompt_input,
-    ensure_prompting_runtime, excerpt, extract_memory_candidates_after_successful_turn,
-    load_router_profiles, publish_overview_event, publish_prompt_progress_event,
-    publish_session_event, record_instance_log, resolve_mcp_vault_bearer_token,
-    resolve_profile_targets, resolve_session_projects, resolve_workspace_profile,
-    resolve_workspace_profile_target, try_record_audit_event, unix_timestamp,
+    ensure_prompting_runtime, excerpt, load_router_profiles, publish_overview_event,
+    publish_prompt_progress_event, publish_session_event, record_instance_log,
+    resolve_mcp_vault_bearer_token, resolve_profile_targets, resolve_session_projects,
+    resolve_workspace_profile, resolve_workspace_profile_target, try_record_audit_event,
+    unix_timestamp,
 };
 use crate::runtime::{PromptStreamEvent, ProviderTurnResult};
 use crate::worker_action::{
@@ -868,21 +868,11 @@ pub async fn start_prompt_job(
     let job_id = Uuid::new_v4().to_string();
     let root_worker_id = Uuid::new_v4().to_string();
     let needs_vision_tools = !payload.images.is_empty();
-    let memory_outcomes =
-        match crate::save_explicit_memory_from_prompt(&state, &current.session, &payload.prompt)
-            .await
-        {
-            Ok(outcomes) => outcomes,
-            Err(error) => vec![MemoryOutcome {
-                kind: "explicit_save".to_string(),
-                state: "rejected".to_string(),
-                memory_id: String::new(),
-                candidate_id: String::new(),
-                dedupe_key: String::new(),
-                title: "Explicit memory not saved".to_string(),
-                detail: error.message,
-            }],
-        };
+    // Memory classification now happens entirely post-turn (see
+    // `extract_memory_decisions_after_turn`). The user response must never be
+    // gated on a memory decision, so this enqueue path no longer touches the
+    // memory subsystem.
+    let memory_outcomes: Vec<MemoryOutcome> = Vec::new();
     let target = resolve_hidden_worker_target(
         &state,
         &current.session,
@@ -3355,6 +3345,7 @@ async fn complete_job_with_final_answer(
         )?;
         structured_artifacts.push(artifact);
     }
+    let mut post_turn_memory_outcomes: Vec<MemoryOutcome> = Vec::new();
     if detail.job.parent_job_id.is_none() {
         let final_turn_id = Uuid::new_v4().to_string();
         state.store.append_session_turn(
@@ -3364,8 +3355,12 @@ async fn complete_job_with_final_answer(
             &final_answer,
             &[],
         )?;
-        extract_memory_candidates_after_successful_turn(state, &session.session.id, &final_turn_id)
-            .await;
+        post_turn_memory_outcomes = crate::extract_memory_decisions_after_turn(
+            state,
+            &session.session.id,
+            Some(&final_turn_id),
+        )
+        .await;
         visible_turn_id = Some(final_turn_id);
         state.store.update_session(
             &session.session.id,
@@ -3527,7 +3522,7 @@ async fn complete_job_with_final_answer(
             "completed",
             "Utility Worker completed",
             "Nucleus persisted a clean assistant turn from the Utility Worker result.",
-            &[],
+            &post_turn_memory_outcomes,
         )
         .await;
     } else {
@@ -11301,6 +11296,14 @@ async fn fail_job(state: &AppState, job_id: &str, error: &str) -> Result<()> {
     publish_job_failed(state, &state.store.get_job(job_id)?.job).await;
     if let Some(parent_job_id) = detail.job.parent_job_id.as_deref() {
         publish_job_updated(state, &state.store.get_job(parent_job_id)?.job).await;
+    }
+    // Run the post-turn memory decision classifier even when the worker errored.
+    // The user's prompt is already persisted as a session turn at this point, so
+    // an explicit "remember X" still saves even though no assistant reply exists.
+    if is_root_job {
+        if let Some(session_id) = detail.job.session_id.as_deref() {
+            let _ = crate::extract_memory_decisions_after_turn(state, session_id, None).await;
+        }
     }
     let _ = publish_overview_event(state).await;
     Ok(())
