@@ -1084,12 +1084,27 @@ impl StateStore {
 
     pub fn upsert_memory_entry(&self, entry: &MemoryEntry) -> Result<MemoryEntry> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
+        // `created_at` / `updated_at` use the COALESCE(NULLIF(?, 0), unixepoch())
+        // pattern (same as `vault_state` and the candidate path) so that callers
+        // who construct `MemoryEntry` with zeroed timestamps — which is every
+        // caller funneling through `upsert_memory_from_request` — get a real
+        // wall-clock stamp.
+        //
+        // The ON CONFLICT branch applies the same `COALESCE` rule to
+        // `updated_at`: when the caller passes a real, non-zero `updated_at`
+        // (e.g. the already-accepted branch in `accept_memory_candidate`,
+        // which round-trips an existing row through `upsert_memory_entry` as
+        // an idempotent fetch/ensure), we preserve it. When the caller passes
+        // `0` (every real edit through `upsert_memory_from_request`), we
+        // refresh to the current epoch. This avoids creating spurious
+        // mutation events for idempotent reads while still bumping
+        // `updated_at` for genuine edits.
         connection.execute(
             "
             INSERT INTO memory_entries (
                 id, scope_kind, scope_id, title, content, tags_json, enabled, status, memory_kind, source_kind, source_id, confidence, created_by, last_used_at, use_count, supersedes_id, metadata_json, created_at, updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, COALESCE(NULLIF(?18, 0), unixepoch()), COALESCE(NULLIF(?19, 0), unixepoch()))
             ON CONFLICT(id) DO UPDATE SET
                 scope_kind = excluded.scope_kind,
                 scope_id = excluded.scope_id,
@@ -1107,7 +1122,7 @@ impl StateStore {
                 use_count = excluded.use_count,
                 supersedes_id = excluded.supersedes_id,
                 metadata_json = excluded.metadata_json,
-                updated_at = excluded.updated_at
+                updated_at = COALESCE(NULLIF(excluded.updated_at, 0), unixepoch())
             ",
             params![
                 entry.id,
