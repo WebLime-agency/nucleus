@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{Arc, Mutex as StdMutex},
+    time::UNIX_EPOCH,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -51,7 +52,7 @@ use crate::runtime::{PromptStreamEvent, ProviderTurnResult};
 #[cfg(test)]
 use crate::worker_action::parse_worker_action;
 use crate::worker_action::{
-    BrowserVerificationClaim, ChildJobProposal, FinalAnswerArtifact, WorkerAction,
+    BrowserVerificationClaim, ChildJobProposal, FinalAnswerArtifact, WaitUntil, WorkerAction,
     parse_worker_action_with_registered_mcp_tools,
 };
 use crate::{error_display, security};
@@ -84,6 +85,10 @@ const WRITE_LOCK_POLL_INTERVAL_MS: u64 = 250;
 const PLAYBOOK_SCHEDULER_INTERVAL_SECS: u64 = 30;
 const PLAYBOOK_MIN_INTERVAL_SECS: u64 = 60;
 const PLAYBOOK_MAX_INTERVAL_SECS: u64 = 86_400;
+const WAIT_WATCHER_INTERVAL_SECS: u64 = 1;
+const WAIT_CHILD_JOB_POLL_INTERVAL_SECS: u64 = 5;
+const JOB_REGISTRATION_RETRY_ATTEMPTS: usize = 20;
+const JOB_REGISTRATION_RETRY_DELAY_MS: u64 = 100;
 const COMMAND_TRUNCATED_NOTE: &str = "[output truncated by the Nucleus budget]";
 const UI_RENDERABLE_TERMS: &[&str] = &[
     "ui",
@@ -538,6 +543,20 @@ pub(crate) struct PendingToolAction {
     pub(crate) summary: String,
     pub(crate) tool: String,
     pub(crate) args: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct WorkerWaitRecord {
+    pub(crate) id: String,
+    pub(crate) summary: String,
+    pub(crate) until: WaitUntil,
+    #[serde(default)]
+    pub(crate) max_wait_seconds: Option<u64>,
+    #[serde(default)]
+    pub(crate) wake_note: Option<String>,
+    pub(crate) started_at: i64,
+    #[serde(default)]
+    pub(crate) last_checked_at: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1125,6 +1144,9 @@ pub async fn cancel_job(state: AppState, job_id: String) -> Result<JobDetail, Ap
             },
         )?;
         for worker in child_detail.workers {
+            if worker.state == "waiting" {
+                cancel_waiting_worker(&state, &worker).await;
+            }
             let _ = state.store.update_worker(
                 &worker.id,
                 WorkerPatch {
@@ -1582,6 +1604,476 @@ pub async fn recover_interrupted_jobs(state: &AppState) -> Result<()> {
     Ok(())
 }
 
+pub fn spawn_wait_watcher(state: AppState) {
+    tokio::spawn(async move {
+        let mut events = state.events.subscribe();
+        let mut interval = tokio::time::interval(Duration::from_secs(WAIT_WATCHER_INTERVAL_SECS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        if let Err(error) = process_waiting_workers(&state, None).await {
+            warn!(error = %error, "wait watcher startup rehydration failed");
+        }
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(error) = process_waiting_workers(&state, None).await {
+                        warn!(error = %error, "wait watcher tick failed");
+                    }
+                }
+                event = events.recv() => {
+                    match event {
+                        Ok(event) => {
+                            if let Err(error) = process_waiting_workers(&state, Some(&event)).await {
+                                warn!(error = %error, "wait watcher event pass failed");
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            if let Err(error) = process_waiting_workers(&state, None).await {
+                                warn!(error = %error, "wait watcher lag recovery failed");
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }
+    });
+}
+
+async fn process_waiting_workers(state: &AppState, event: Option<&DaemonEvent>) -> Result<()> {
+    let now = unix_timestamp();
+    for worker in state.store.list_workers_by_state(&["waiting"])? {
+        let Some(wait_value) = worker.wait_until_json.clone() else {
+            continue;
+        };
+        let mut wait: WorkerWaitRecord =
+            serde_json::from_value(wait_value).context("failed to decode worker wait")?;
+        if worker_wall_clock_exceeded(&worker, now) {
+            complete_wait_with_wall_clock_budget(state, &worker, &wait).await?;
+            continue;
+        }
+        if wait_timed_out(&wait, now) {
+            resume_waiting_worker(state, &worker, &wait, "timeout", "worker.wait.timeout").await?;
+            continue;
+        }
+        let child_poll_due = child_job_poll_due(&wait, event, now);
+        if wait_condition_satisfied(state, &wait, event, now)? {
+            resume_waiting_worker(state, &worker, &wait, "satisfied", "worker.wait.completed")
+                .await?;
+        } else if child_poll_due {
+            wait.last_checked_at = Some(now);
+            persist_worker_wait_record(state, &worker.id, &wait)?;
+        }
+    }
+    Ok(())
+}
+
+fn wait_timed_out(wait: &WorkerWaitRecord, now: i64) -> bool {
+    wait.max_wait_seconds.is_some_and(|max_wait_seconds| {
+        now.saturating_sub(wait.started_at) >= max_wait_seconds as i64
+    })
+}
+
+fn wait_condition_satisfied(
+    state: &AppState,
+    wait: &WorkerWaitRecord,
+    event: Option<&DaemonEvent>,
+    now: i64,
+) -> Result<bool> {
+    match &wait.until {
+        WaitUntil::DelaySeconds { delay_seconds } => {
+            Ok(now.saturating_sub(wait.started_at) >= *delay_seconds as i64)
+        }
+        WaitUntil::AbsoluteUnix { absolute_unix } => Ok(now >= *absolute_unix),
+        WaitUntil::AuditEvent {
+            event_kind,
+            target_pattern,
+            status,
+        } => Ok(event_matches_audit_wait(
+            event,
+            wait.started_at,
+            event_kind,
+            target_pattern,
+            status,
+        ) || persisted_audit_matches_wait(
+            state,
+            wait.started_at,
+            event_kind,
+            target_pattern,
+            status,
+        )?),
+        WaitUntil::ChildJobsCompleted { job_ids } => {
+            if job_ids.is_empty() {
+                return Ok(true);
+            }
+            if !child_job_poll_due(wait, event, now) {
+                return Ok(false);
+            }
+            for job_id in job_ids {
+                if !state.store.job_exists(job_id)? {
+                    return Ok(false);
+                }
+                let detail = state.store.get_job(job_id)?;
+                if !matches!(
+                    detail.job.state.as_str(),
+                    "completed" | "failed" | "canceled"
+                ) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        WaitUntil::ArtifactKind {
+            job_id,
+            artifact_kind,
+        } => {
+            if event_matches_artifact_wait(event, job_id, artifact_kind, wait.started_at) {
+                return Ok(true);
+            }
+            if !state.store.job_exists(job_id)? {
+                return Ok(false);
+            }
+            let detail = state.store.get_job(job_id)?;
+            Ok(detail.artifacts.iter().any(|artifact| {
+                artifact.kind == *artifact_kind && artifact.created_at > wait.started_at
+            }))
+        }
+    }
+}
+
+fn child_job_poll_due(wait: &WorkerWaitRecord, event: Option<&DaemonEvent>, now: i64) -> bool {
+    let WaitUntil::ChildJobsCompleted { job_ids } = &wait.until else {
+        return false;
+    };
+    let elapsed = now.saturating_sub(wait.last_checked_at.unwrap_or(wait.started_at));
+    elapsed >= WAIT_CHILD_JOB_POLL_INTERVAL_SECS as i64
+        || event_matches_child_job_wait(event, job_ids)
+}
+
+fn event_matches_child_job_wait(event: Option<&DaemonEvent>, job_ids: &[String]) -> bool {
+    let Some(event) = event else {
+        return false;
+    };
+    let job = match event {
+        DaemonEvent::JobUpdated(job)
+        | DaemonEvent::JobCompleted(job)
+        | DaemonEvent::JobFailed(job) => job,
+        _ => return false,
+    };
+    job_ids.iter().any(|job_id| job_id == &job.id)
+}
+
+fn persist_worker_wait_record(
+    state: &AppState,
+    worker_id: &str,
+    wait: &WorkerWaitRecord,
+) -> Result<()> {
+    state.store.update_worker(
+        worker_id,
+        WorkerPatch {
+            wait_until_json: Some(Some(
+                serde_json::to_value(wait).context("failed to encode worker wait")?,
+            )),
+            wait_started_at: Some(Some(wait.started_at)),
+            ..WorkerPatch::default()
+        },
+    )?;
+    Ok(())
+}
+
+fn event_matches_audit_wait(
+    event: Option<&DaemonEvent>,
+    started_at: i64,
+    kind: &str,
+    target_pattern: &Option<String>,
+    status: &Option<String>,
+) -> bool {
+    let Some(DaemonEvent::AuditUpdated(events)) = event else {
+        return false;
+    };
+    events.iter().any(|event| {
+        event.created_at > started_at
+            && audit_event_matches_wait(event, kind, target_pattern.as_deref(), status.as_deref())
+    })
+}
+
+fn persisted_audit_matches_wait(
+    state: &AppState,
+    started_at: i64,
+    kind: &str,
+    target_pattern: &Option<String>,
+    status: &Option<String>,
+) -> Result<bool> {
+    Ok(state
+        .store
+        .list_audit_events_since(started_at)?
+        .iter()
+        .any(|event| {
+            event.created_at > started_at
+                && audit_event_matches_wait(
+                    event,
+                    kind,
+                    target_pattern.as_deref(),
+                    status.as_deref(),
+                )
+        }))
+}
+
+fn audit_event_matches_wait(
+    event: &nucleus_protocol::AuditEvent,
+    kind: &str,
+    target_pattern: Option<&str>,
+    status: Option<&str>,
+) -> bool {
+    event.kind == kind
+        && target_pattern
+            .filter(|value| !value.is_empty())
+            .is_none_or(|pattern| event.target.contains(pattern))
+        && status
+            .filter(|value| !value.is_empty())
+            .is_none_or(|expected| event.status == expected)
+}
+
+fn event_matches_artifact_wait(
+    event: Option<&DaemonEvent>,
+    job_id: &str,
+    kind: &str,
+    started_at: i64,
+) -> bool {
+    let Some(DaemonEvent::ArtifactAdded(artifact)) = event else {
+        return false;
+    };
+    artifact.job_id == job_id && artifact.kind == kind && artifact.created_at > started_at
+}
+
+async fn complete_wait_with_wall_clock_budget(
+    state: &AppState,
+    worker: &WorkerSummary,
+    wait: &WorkerWaitRecord,
+) -> Result<()> {
+    let detail = state.store.get_job(&worker.job_id)?;
+    if matches!(
+        detail.job.state.as_str(),
+        "completed" | "failed" | "canceled"
+    ) {
+        return Ok(());
+    }
+    let session_id = detail.job.session_id.clone().ok_or_else(|| {
+        anyhow!(
+            "waiting job '{}' is not attached to a session",
+            detail.job.id
+        )
+    })?;
+    let session = state.store.get_session(&session_id)?;
+    let checkpoint_value = state
+        .store
+        .read_worker_checkpoint(&worker.id)?
+        .ok_or_else(|| anyhow!("waiting worker '{}' has no checkpoint", worker.id))?;
+    let checkpoint: WorkerCheckpoint = serde_json::from_value(checkpoint_value)
+        .context("failed to decode waiting worker checkpoint")?;
+    let mut worker = state.store.update_worker(
+        &worker.id,
+        WorkerPatch {
+            wait_until_json: Some(None),
+            wait_started_at: Some(None),
+            ..WorkerPatch::default()
+        },
+    )?;
+    emit_wait_finished_event(
+        state,
+        &worker,
+        wait,
+        "wall_clock_exceeded",
+        "worker.wait.timeout",
+    )
+    .await;
+    let step_count = worker.step_count;
+    let tool_call_count = worker.tool_call_count;
+    complete_job_with_budget_checkpoint(
+        state,
+        &session,
+        &detail.job.id,
+        &mut worker,
+        &checkpoint,
+        step_count,
+        tool_call_count,
+        "wall-clock",
+    )
+    .await
+}
+
+async fn resume_waiting_worker(
+    state: &AppState,
+    worker: &WorkerSummary,
+    wait: &WorkerWaitRecord,
+    reason: &str,
+    event_type: &str,
+) -> Result<()> {
+    let detail = state.store.get_job(&worker.job_id)?;
+    if matches!(
+        detail.job.state.as_str(),
+        "completed" | "failed" | "canceled"
+    ) {
+        return Ok(());
+    }
+    let session_id = detail.job.session_id.clone().ok_or_else(|| {
+        anyhow!(
+            "waiting job '{}' is not attached to a session",
+            detail.job.id
+        )
+    })?;
+    let mut checkpoint: WorkerCheckpoint = state
+        .store
+        .read_worker_checkpoint(&worker.id)?
+        .ok_or_else(|| anyhow!("waiting worker '{}' has no checkpoint", worker.id))
+        .and_then(|value| {
+            serde_json::from_value(value).context("failed to decode waiting worker checkpoint")
+        })?;
+    checkpoint.conversation.push(CheckpointMessage {
+        role: "system".to_string(),
+        content: build_wake_system_note(wait, reason),
+        images: Vec::new(),
+        compacted: false,
+        compacted_range: None,
+    });
+    checkpoint.next_prompt = Some(build_wait_resume_prompt(wait, reason));
+    state.store.write_worker_checkpoint(
+        &worker.id,
+        &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+    )?;
+    state.store.update_job(
+        &worker.job_id,
+        JobPatch {
+            state: Some("queued".to_string()),
+            last_error: Some(String::new()),
+            ..JobPatch::default()
+        },
+    )?;
+    if detail.job.parent_job_id.is_none() {
+        state.store.update_session(
+            &session_id,
+            SessionPatch {
+                state: Some("running".to_string()),
+                last_error: Some(String::new()),
+                ..SessionPatch::default()
+            },
+        )?;
+        if let Ok(session) = state.store.get_session(&session_id) {
+            let _ = publish_session_event(state, session).await;
+        }
+    }
+    let worker = state.store.update_worker(
+        &worker.id,
+        WorkerPatch {
+            state: Some("queued".to_string()),
+            wait_until_json: Some(None),
+            wait_started_at: Some(None),
+            last_error: Some(String::new()),
+            ..WorkerPatch::default()
+        },
+    )?;
+    emit_wait_finished_event(state, &worker, wait, reason, event_type).await;
+    publish_job_updated(state, &state.store.get_job(&worker.job_id)?.job).await;
+    publish_worker_updated(state, &worker).await;
+    let _ = publish_overview_event(state).await;
+    spawn_job_task(state.clone(), worker.job_id.clone());
+    Ok(())
+}
+
+async fn cancel_waiting_worker(state: &AppState, worker: &WorkerSummary) {
+    let Some(wait_value) = worker.wait_until_json.clone() else {
+        return;
+    };
+    let Ok(wait) = serde_json::from_value::<WorkerWaitRecord>(wait_value) else {
+        return;
+    };
+    let _ = state.store.update_worker(
+        &worker.id,
+        WorkerPatch {
+            wait_until_json: Some(None),
+            wait_started_at: Some(None),
+            ..WorkerPatch::default()
+        },
+    );
+    emit_wait_finished_event(state, worker, &wait, "canceled", "worker.wait.canceled").await;
+}
+
+async fn emit_wait_finished_event(
+    state: &AppState,
+    worker: &WorkerSummary,
+    wait: &WorkerWaitRecord,
+    reason: &str,
+    event_type: &str,
+) {
+    let status = match event_type {
+        "worker.wait.canceled" => "canceled",
+        "worker.wait.timeout" => "timeout",
+        _ => "completed",
+    };
+    let data_json = {
+        let mut data = wait_audit_data(wait);
+        if let Some(object) = data.as_object_mut() {
+            object.insert("reason".to_string(), json!(reason));
+            object.insert("completed_at".to_string(), json!(unix_timestamp()));
+        }
+        data
+    };
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: worker.job_id.clone(),
+        worker_id: Some(worker.id.clone()),
+        event_type: event_type.to_string(),
+        status: status.to_string(),
+        summary: format!("Worker wait {} ended with reason {reason}", wait.id),
+        detail: wait.summary.clone(),
+        data_json: data_json.clone(),
+    });
+    let _ = try_record_audit_event(
+        state,
+        AuditEventRecord {
+            kind: event_type.to_string(),
+            target: format!("worker:{}", worker.id),
+            status: status.to_string(),
+            summary: format!("Worker wait {} ended with reason {reason}.", wait.id),
+            detail: serde_json::to_string(&data_json).unwrap_or_else(|_| "{}".to_string()),
+        },
+    )
+    .await;
+}
+
+fn build_wake_system_note(wait: &WorkerWaitRecord, reason: &str) -> String {
+    let mut note = format!(
+        "[wake-up at {} | reason={} | condition={} | wait_id={}]",
+        format_unix_timestamp(unix_timestamp()),
+        reason,
+        wait_condition_label(&wait.until),
+        wait.id
+    );
+    if let Some(wake_note) = wait
+        .wake_note
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        note.push_str("\nWake note: ");
+        note.push_str(&excerpt(wake_note, 500));
+    }
+    note
+}
+
+fn build_wait_resume_prompt(wait: &WorkerWaitRecord, reason: &str) -> String {
+    format!(
+        "Nucleus resumed this worker after a wait.\nWait summary: {}\nWake reason: {}\nCondition: {}\nReturn exactly one valid Nucleus worker action JSON object for the next step.",
+        excerpt(&wait.summary, 500),
+        reason,
+        wait_condition_label(&wait.until)
+    )
+}
+
+fn format_unix_timestamp(timestamp: i64) -> String {
+    let Ok(duration) = u64::try_from(timestamp).map(Duration::from_secs) else {
+        return format!("unix:{timestamp}");
+    };
+    httpdate::fmt_http_date(UNIX_EPOCH + duration)
+}
+
 fn is_non_terminal_tool_call_status(status: &str) -> bool {
     matches!(status, "queued" | "starting" | "running")
 }
@@ -1751,12 +2243,34 @@ impl AgentRuntime {
 }
 
 async fn run_job(state: AppState, job_id: String) -> Result<()> {
-    let Some(mut cancel_rx) = state.agent.register_job(&job_id).await else {
+    let Some(mut cancel_rx) = register_queued_job_with_retry(&state, &job_id).await? else {
         return Ok(());
     };
     let result = run_job_loop(&state, &job_id, &mut cancel_rx).await;
     state.agent.finish_job(&job_id).await;
     result
+}
+
+async fn register_queued_job_with_retry(
+    state: &AppState,
+    job_id: &str,
+) -> Result<Option<watch::Receiver<bool>>> {
+    for attempt in 0..=JOB_REGISTRATION_RETRY_ATTEMPTS {
+        if let Some(cancel_rx) = state.agent.register_job(job_id).await {
+            return Ok(Some(cancel_rx));
+        }
+
+        let detail = state.store.get_job(job_id)?;
+        if detail.job.state != "queued" {
+            return Ok(None);
+        }
+        if attempt == JOB_REGISTRATION_RETRY_ATTEMPTS {
+            bail!("job '{job_id}' is queued but another runner did not release registration");
+        }
+        tokio::time::sleep(Duration::from_millis(JOB_REGISTRATION_RETRY_DELAY_MS)).await;
+    }
+
+    Ok(None)
 }
 
 async fn run_job_loop(
@@ -1854,6 +2368,21 @@ async fn run_job_loop(
         )
         .await?
         {
+            return Ok(());
+        }
+
+        if worker_wall_clock_exceeded(&worker, unix_timestamp()) {
+            complete_job_with_budget_checkpoint(
+                state,
+                &session,
+                job_id,
+                &mut worker,
+                &checkpoint,
+                step,
+                tool_calls,
+                "wall-clock",
+            )
+            .await?;
             return Ok(());
         }
 
@@ -2270,6 +2799,41 @@ async fn run_job_loop(
                 )
                 .await?;
                 continue;
+            }
+            WorkerAction::Wait {
+                summary,
+                until,
+                max_wait_seconds,
+                wake_note,
+            } => {
+                if session.session.execution_mode == "plan" {
+                    retry_plan_mode_action(
+                        state,
+                        job_id,
+                        &mut worker,
+                        &mut checkpoint,
+                        &mut step,
+                        tool_calls,
+                        &summary,
+                        "park the worker with wait",
+                    )
+                    .await?;
+                    continue;
+                }
+
+                park_worker_wait(
+                    state,
+                    &session,
+                    job_id,
+                    &mut worker,
+                    &checkpoint,
+                    summary,
+                    until,
+                    max_wait_seconds,
+                    wake_note,
+                )
+                .await?;
+                return Ok(());
             }
             WorkerAction::ToolCall {
                 summary,
@@ -3022,6 +3586,87 @@ async fn handle_child_job_proposal(
     Ok(LoopDisposition::Continue)
 }
 
+async fn park_worker_wait(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &mut WorkerSummary,
+    checkpoint: &WorkerCheckpoint,
+    summary: String,
+    until: WaitUntil,
+    max_wait_seconds: Option<u64>,
+    wake_note: Option<String>,
+) -> Result<()> {
+    let started_at = unix_timestamp();
+    let wait = WorkerWaitRecord {
+        id: Uuid::new_v4().to_string(),
+        summary: summary.clone(),
+        until,
+        max_wait_seconds,
+        wake_note,
+        started_at,
+        last_checked_at: None,
+    };
+    let wait_json = serde_json::to_value(&wait).context("failed to encode worker wait")?;
+    state.store.write_worker_checkpoint(
+        &worker.id,
+        &serde_json::to_value(checkpoint).context("failed to encode worker checkpoint")?,
+    )?;
+    state.store.update_job(
+        job_id,
+        JobPatch {
+            state: Some("waiting".to_string()),
+            last_error: Some(wait_status_text(&wait, started_at)),
+            ..JobPatch::default()
+        },
+    )?;
+    *worker = state.store.update_worker(
+        &worker.id,
+        WorkerPatch {
+            state: Some("waiting".to_string()),
+            wait_until_json: Some(Some(wait_json.clone())),
+            wait_started_at: Some(Some(started_at)),
+            last_error: Some(wait_status_text(&wait, started_at)),
+            ..WorkerPatch::default()
+        },
+    )?;
+    let data_json = wait_audit_data(&wait);
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: job_id.to_string(),
+        worker_id: Some(worker.id.clone()),
+        event_type: "worker.wait.started".to_string(),
+        status: "waiting".to_string(),
+        summary: format!("Started worker wait {}", wait.id),
+        detail: summary,
+        data_json: data_json.clone(),
+    });
+    let _ = try_record_audit_event(
+        state,
+        AuditEventRecord {
+            kind: "worker.wait.started".to_string(),
+            target: format!("worker:{}", worker.id),
+            status: "waiting".to_string(),
+            summary: format!("Started worker wait {}.", wait.id),
+            detail: serde_json::to_string(&data_json).unwrap_or_else(|_| "{}".to_string()),
+        },
+    )
+    .await;
+    publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+    publish_worker_updated(state, worker).await;
+    publish_prompt_status(
+        state,
+        &session.session,
+        worker,
+        "waiting",
+        "Utility Worker waiting",
+        &wait_status_text(&wait, started_at),
+        &[],
+    )
+    .await;
+    let _ = publish_overview_event(state).await;
+    Ok(())
+}
+
 async fn retry_worker_final_answer(
     state: &AppState,
     job_id: &str,
@@ -3249,6 +3894,119 @@ Return one JSON action for the next step. If the work is done, return final_answ
 
 fn is_pending_child_job_action(pending: &PendingToolAction) -> bool {
     pending.action_kind == "child_jobs" || !pending.child_job_ids.is_empty()
+}
+
+fn worker_wall_clock_exceeded(worker: &WorkerSummary, now: i64) -> bool {
+    worker.max_wall_clock_secs > 0
+        && now.saturating_sub(worker.created_at) >= worker.max_wall_clock_secs as i64
+}
+
+fn wait_audit_data(wait: &WorkerWaitRecord) -> Value {
+    json!({
+        "wait_id": wait.id,
+        "summary": excerpt(&wait.summary, 240),
+        "until": &wait.until,
+        "max_wait_seconds": wait.max_wait_seconds,
+        "started_at": wait.started_at,
+    })
+}
+
+fn wait_status_text(wait: &WorkerWaitRecord, now: i64) -> String {
+    let waited = now.saturating_sub(wait.started_at).max(0);
+    format!(
+        "waiting until {} (woke in {})",
+        wait_condition_label(&wait.until),
+        format_duration(wait_remaining_seconds(wait, now).unwrap_or(0).max(0) as u64)
+            .unwrap_or_else(|| "0s".to_string())
+    )
+    .replace(
+        "(woke in 0s)",
+        &format!(
+            "(waiting for {} elapsed)",
+            format_duration(waited as u64).unwrap_or_else(|| "0s".to_string())
+        ),
+    )
+}
+
+fn wait_condition_label(until: &WaitUntil) -> String {
+    match until {
+        WaitUntil::DelaySeconds { delay_seconds } => {
+            format!(
+                "delay of {}",
+                format_duration(*delay_seconds).unwrap_or_else(|| format!("{delay_seconds}s"))
+            )
+        }
+        WaitUntil::AbsoluteUnix { absolute_unix } => {
+            format!("unix time {absolute_unix}")
+        }
+        WaitUntil::AuditEvent {
+            event_kind,
+            target_pattern,
+            status,
+        } => {
+            let mut parts = vec![format!("audit event '{event_kind}'")];
+            if let Some(target_pattern) =
+                target_pattern.as_deref().filter(|value| !value.is_empty())
+            {
+                parts.push(format!("target matching '{target_pattern}'"));
+            }
+            if let Some(status) = status.as_deref().filter(|value| !value.is_empty()) {
+                parts.push(format!("status '{status}'"));
+            }
+            parts.join(", ")
+        }
+        WaitUntil::ChildJobsCompleted { job_ids } => {
+            format!("{} child job(s) complete", job_ids.len())
+        }
+        WaitUntil::ArtifactKind {
+            job_id,
+            artifact_kind,
+        } => {
+            format!("artifact kind '{artifact_kind}' on job {job_id}")
+        }
+    }
+}
+
+fn wait_remaining_seconds(wait: &WorkerWaitRecord, now: i64) -> Option<i64> {
+    let condition_remaining = match &wait.until {
+        WaitUntil::DelaySeconds { delay_seconds } => Some(
+            wait.started_at
+                .saturating_add(*delay_seconds as i64)
+                .saturating_sub(now),
+        ),
+        WaitUntil::AbsoluteUnix { absolute_unix } => Some(absolute_unix.saturating_sub(now)),
+        WaitUntil::AuditEvent { .. }
+        | WaitUntil::ChildJobsCompleted { .. }
+        | WaitUntil::ArtifactKind { .. } => None,
+    };
+    let cap_remaining = wait.max_wait_seconds.map(|max_wait_seconds| {
+        wait.started_at
+            .saturating_add(max_wait_seconds as i64)
+            .saturating_sub(now)
+    });
+
+    match (condition_remaining, cap_remaining) {
+        (Some(condition), Some(cap)) => Some(condition.min(cap)),
+        (Some(condition), None) => Some(condition),
+        (None, Some(cap)) => Some(cap),
+        (None, None) => None,
+    }
+}
+
+fn format_duration(seconds: u64) -> Option<String> {
+    if seconds == 0 {
+        return Some("0s".to_string());
+    }
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let secs = seconds % 60;
+    if hours > 0 {
+        Some(format!("{hours}h {minutes}m"))
+    } else if minutes > 0 {
+        Some(format!("{minutes}m {secs}s"))
+    } else {
+        Some(format!("{secs}s"))
+    }
 }
 
 fn child_job_result_json(detail: &JobDetail) -> Result<Value> {
@@ -3655,6 +4413,7 @@ fn build_budget_checkpoint_answer(
 ) -> String {
     let limit = match budget_kind {
         "action" => worker.max_tool_calls,
+        "wall-clock" => worker.max_wall_clock_secs as usize,
         _ => worker.max_steps,
     };
     let latest_checkpoint = checkpoint
@@ -11642,6 +12401,11 @@ fn limit_text(value: String, max_chars: usize) -> String {
 async fn fail_job(state: &AppState, job_id: &str, error: &str) -> Result<()> {
     let detail = state.store.get_job(job_id)?;
     let is_root_job = detail.job.parent_job_id.is_none();
+    for child in &detail.child_jobs {
+        if is_non_terminal_job_state(&child.state) {
+            let _ = cancel_job(state.clone(), child.id.clone()).await;
+        }
+    }
     state
         .agent
         .terminate_job_command_sessions(
@@ -11736,6 +12500,10 @@ async fn fail_job(state: &AppState, job_id: &str, error: &str) -> Result<()> {
     }
     let _ = publish_overview_event(state).await;
     Ok(())
+}
+
+fn is_non_terminal_job_state(state: &str) -> bool {
+    matches!(state, "queued" | "running" | "paused" | "waiting")
 }
 
 async fn reconcile_failed_job_command_sessions(
@@ -12115,9 +12883,10 @@ async fn update_playbook_session(
 }
 
 fn ensure_no_active_playbook_jobs(state: &AppState, playbook_id: &str) -> Result<(), ApiError> {
-    let active = state
-        .store
-        .list_jobs_for_template_by_state(playbook_id, &["queued", "running", "paused"])?;
+    let active = state.store.list_jobs_for_template_by_state(
+        playbook_id,
+        &["queued", "running", "paused", "waiting"],
+    )?;
     if let Some(job) = active.first() {
         return Err(ApiError::bad_request(format!(
             "playbook '{}' already has an active job ({})",
@@ -12140,7 +12909,10 @@ async fn run_scheduled_playbooks(state: &AppState) -> Result<()> {
 
         if state
             .store
-            .list_jobs_for_template_by_state(&playbook.id, &["queued", "running", "paused"])?
+            .list_jobs_for_template_by_state(
+                &playbook.id,
+                &["queued", "running", "paused", "waiting"],
+            )?
             .is_empty()
         {
             let latest_scheduled = state
@@ -12187,7 +12959,10 @@ async fn dispatch_playbook_event_inner(state: &AppState, event_kind: &str) -> Re
         }
         if !state
             .store
-            .list_jobs_for_template_by_state(&playbook.id, &["queued", "running", "paused"])?
+            .list_jobs_for_template_by_state(
+                &playbook.id,
+                &["queued", "running", "paused", "waiting"],
+            )?
             .is_empty()
         {
             continue;
@@ -12876,6 +13651,8 @@ Working directory: {}\n",
 {\"kind\":\"tool_call\",\"summary\":\"click a Browser control by ref\",\"tool\":\"browser.click\",\"args\":{\"target_ref\":\"ref-1\"}}\n\
 {\"kind\":\"spawn_child_jobs\",\"summary\":\"why parallel exploration helps\",\"jobs\":[{\"title\":\"focused subtask\",\"prompt\":\"precise child prompt\",\"working_dir\":\"optional/path/inside/scope\"}]}\n\
 {\"kind\":\"progress_update\",\"summary\":\"durable checkpoint, not done\",\"detail\":\"completed evidence and exact continuation point\"}\n\
+{\"kind\":\"wait\",\"summary\":\"park until an external condition is ready\",\"until\":{\"kind\":\"delay_seconds\",\"delay_seconds\":60},\"max_wait_seconds\":1800,\"wake_note\":\"optional wake-up context\"}\n\
+{\"kind\":\"wait\",\"summary\":\"park until memory classification finishes\",\"until\":{\"kind\":\"audit_event\",\"event_kind\":\"memory.classifier.completed\",\"target_pattern\":\"session:\",\"status\":\"success\"},\"max_wait_seconds\":1800}\n\
 {\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\",\"browser_verification\":{\"status\":\"passed|failed|not_performed|unavailable\",\"summary\":\"concise Browser verification result\",\"artifact_ids\":[\"artifact-id\"]}}"
     } else {
         "{\"kind\":\"tool_call\",\"summary\":\"inspect the active project\",\"tool\":\"project.inspect\",\"args\":{}}\n\
@@ -12883,6 +13660,8 @@ Working directory: {}\n",
 {\"kind\":\"tool_call\",\"summary\":\"fetch inline PR review threads\",\"tool\":\"github.pr_review_threads\",\"args\":{\"pr_number\":123}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"fetch direct PR lifecycle state\",\"tool\":\"github.pr_state\",\"args\":{\"pr_number\":123}}\n\
 {\"kind\":\"progress_update\",\"summary\":\"durable checkpoint, not done\",\"detail\":\"completed evidence and exact continuation point\"}\n\
+{\"kind\":\"wait\",\"summary\":\"park until an external condition is ready\",\"until\":{\"kind\":\"delay_seconds\",\"delay_seconds\":60},\"max_wait_seconds\":1800,\"wake_note\":\"optional wake-up context\"}\n\
+{\"kind\":\"wait\",\"summary\":\"park until a child report exists\",\"until\":{\"kind\":\"artifact_kind\",\"job_id\":\"job-id\",\"artifact_kind\":\"child-report\"},\"max_wait_seconds\":1800}\n\
 {\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\"}"
     };
     let tool_help = worker
@@ -12922,6 +13701,7 @@ Rules:\n\
 - Prefer daemon-generated Browser refs for browser.click/browser.type/browser.fill/browser.scroll/browser.press/browser.submit. Do not invent selectors when a ref is available.\n\
 - The visible chat will only receive final_answer, not your intermediate reasoning.\n\
 - progress_update records a non-terminal checkpoint for Nucleus; it does not complete the job.\n\
+- wait parks the worker until delay_seconds, absolute_unix, audit_event, child_jobs_completed, or artifact_kind is satisfied. It does not spend step/action budget but still spends wall-clock budget.\n\
 - Do not put plans, next-step instructions, progress updates, partial completion notes, or descriptions of future actions in final_answer.\n\
 - If the requested work is incomplete and you are not blocked or out of budget, continue with a tool_call instead of returning final_answer.\n\
 - For PR feedback, latest review, requested changes, Codex review, or unresolved comment tasks, do not rely on flat gh pr view comments alone. Fetch thread-aware inline review data with github.pr_review_threads before saying there is no actionable feedback.\n\
@@ -13127,7 +13907,9 @@ mod tests {
         runtime::RuntimeManager,
         updates::{InstanceRuntime, UpdateManager},
     };
-    use nucleus_storage::{JobRecord, SessionRecord, StateStore, ToolCallRecord, WorkerRecord};
+    use nucleus_storage::{
+        JobArtifactRecord, JobRecord, SessionRecord, StateStore, ToolCallRecord, WorkerRecord,
+    };
     use std::{
         env, fs,
         path::{Path, PathBuf},
@@ -13634,6 +14416,8 @@ mod tests {
             max_wall_clock_secs: 30,
             step_count: 0,
             tool_call_count: 0,
+            wait_until_json: None,
+            wait_started_at: None,
             last_error: String::new(),
             user_error: None,
             capabilities: Vec::new(),
@@ -13694,6 +14478,8 @@ mod tests {
             max_wall_clock_secs: 30,
             step_count: 0,
             tool_call_count: 0,
+            wait_until_json: None,
+            wait_started_at: None,
             last_error: String::new(),
             user_error: None,
             capabilities: Vec::new(),
@@ -17386,6 +18172,8 @@ Cleanup status: clean";
             max_wall_clock_secs: 30,
             step_count: 0,
             tool_call_count: 0,
+            wait_until_json: None,
+            wait_started_at: None,
             last_error: String::new(),
             user_error: None,
             capabilities: Vec::new(),
@@ -17462,6 +18250,8 @@ Cleanup status: clean";
             max_wall_clock_secs: 30,
             step_count: 0,
             tool_call_count: 0,
+            wait_until_json: None,
+            wait_started_at: None,
             last_error: String::new(),
             user_error: None,
             capabilities: Vec::new(),
@@ -17825,6 +18615,8 @@ Cleanup status: clean";
             max_wall_clock_secs: 30,
             step_count: 0,
             tool_call_count: 0,
+            wait_until_json: None,
+            wait_started_at: None,
             last_error: String::new(),
             user_error: None,
             capabilities: Vec::new(),
@@ -17925,6 +18717,8 @@ Cleanup status: clean";
             max_wall_clock_secs: 30,
             step_count: 0,
             tool_call_count: 0,
+            wait_until_json: None,
+            wait_started_at: None,
             last_error: String::new(),
             user_error: None,
             capabilities: Vec::new(),
@@ -18987,6 +19781,452 @@ Cleanup status: clean";
     }
 
     #[tokio::test]
+    async fn worker_wait_delay_parks_without_extra_model_call_then_resumes() {
+        let state_dir = test_state_dir("worker-wait-delay-resume");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let (base_url, request_count, server) = spawn_retry_openai_server(vec![
+            TestOpenAiProviderResponse {
+                status: 200,
+                retry_after_secs: None,
+                body: "",
+                content: Some(
+                    r#"{"kind":"wait","summary":"sleep briefly","until":{"kind":"delay_seconds","delay_seconds":2},"max_wait_seconds":10,"wake_note":"continue after sleep"}"#,
+                ),
+            },
+            TestOpenAiProviderResponse {
+                status: 200,
+                retry_after_secs: None,
+                body: "",
+                content: Some(
+                    r#"{"kind":"final_answer","summary":"done after wake","final_answer":"Awake."}"#,
+                ),
+            },
+        ])
+        .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-wait-model",
+            &base_url,
+            "utility-key",
+        );
+        let session_id = "worker-wait-delay-session".to_string();
+        state
+            .store
+            .create_session(test_session_record(
+                &session_id,
+                "Worker wait delay",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+        spawn_wait_watcher(state.clone());
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            SessionPromptRequest {
+                prompt: "wait briefly, then finish".to_string(),
+                images: vec![],
+                role: "main".to_string(),
+            },
+            current,
+            "wait briefly, then finish".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("prompt should queue");
+
+        let waiting = wait_for_latest_job_state(&state, &session_id, "waiting").await;
+        assert_eq!(waiting.workers[0].state, "waiting");
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            1,
+            "wait should not make a provider call while parked"
+        );
+
+        let _completed = wait_for_session_state(&state, &session_id, "active").await;
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        let jobs = state
+            .store
+            .list_jobs_for_session(&session_id)
+            .expect("session jobs should load");
+        let job = jobs.first().expect("completed session should have a job");
+        let detail = state
+            .store
+            .get_job(&job.id)
+            .expect("job detail should load");
+        let checkpoint: WorkerCheckpoint = serde_json::from_value(
+            state
+                .store
+                .read_worker_checkpoint(&detail.workers[0].id)
+                .expect("checkpoint should read")
+                .expect("checkpoint should exist"),
+        )
+        .expect("checkpoint should decode");
+        assert!(checkpoint.conversation.iter().any(|message| {
+            message.role == "system" && message.content.contains("[wake-up at")
+        }));
+        assert!(
+            detail
+                .events
+                .iter()
+                .any(|event| event.event_type == "worker.wait.started")
+        );
+        assert!(
+            detail
+                .events
+                .iter()
+                .any(|event| event.event_type == "worker.wait.completed")
+        );
+
+        server.await.expect("test server should finish");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn wait_watcher_rehydrates_persisted_delay_wait() {
+        let state_dir = test_state_dir("worker-wait-rehydrate");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let (base_url, request_count, server) =
+            spawn_retry_openai_server(vec![TestOpenAiProviderResponse {
+                status: 200,
+                retry_after_secs: None,
+                body: "",
+                content: Some(r#"{"kind":"final_answer","summary":"done","final_answer":"Done."}"#),
+            }])
+            .await;
+        let session_id = "worker-wait-rehydrate-session".to_string();
+        let (job_id, worker_id) = create_waiting_test_job(
+            &state,
+            &session_id,
+            &workspace_root,
+            &base_url,
+            WaitUntil::DelaySeconds { delay_seconds: 0 },
+            Some(30),
+        );
+
+        process_waiting_workers(&state, None)
+            .await
+            .expect("watcher pass should wake persisted wait");
+
+        let _ = wait_for_session_state(&state, &session_id, "active").await;
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        let detail = state.store.get_job(&job_id).expect("job should load");
+        assert_eq!(detail.workers[0].id, worker_id);
+        assert_eq!(detail.workers[0].state, "completed");
+        assert!(detail.workers[0].wait_until_json.is_none());
+
+        server.await.expect("test server should finish");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn wait_watcher_handles_missing_job_refs_and_persists_child_poll_time() {
+        let state_dir = test_state_dir("worker-wait-missing-job-ref");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let session_id = "worker-wait-missing-job-session".to_string();
+        let (job_id, worker_id) = create_waiting_test_job(
+            &state,
+            &session_id,
+            &workspace_root,
+            "http://127.0.0.1:9/v1",
+            WaitUntil::ChildJobsCompleted {
+                job_ids: vec!["missing-child-job".to_string()],
+            },
+            Some(60),
+        );
+        let started_at = unix_timestamp() - WAIT_CHILD_JOB_POLL_INTERVAL_SECS as i64 - 1;
+        let wait = WorkerWaitRecord {
+            id: "missing-job-wait".to_string(),
+            summary: "wait on a missing child job".to_string(),
+            until: WaitUntil::ChildJobsCompleted {
+                job_ids: vec!["missing-child-job".to_string()],
+            },
+            max_wait_seconds: Some(60),
+            wake_note: None,
+            started_at,
+            last_checked_at: None,
+        };
+        state
+            .store
+            .update_worker(
+                &worker_id,
+                WorkerPatch {
+                    wait_until_json: Some(Some(
+                        serde_json::to_value(&wait).expect("wait should encode"),
+                    )),
+                    wait_started_at: Some(Some(wait.started_at)),
+                    ..WorkerPatch::default()
+                },
+            )
+            .expect("wait should update");
+
+        let before_poll = unix_timestamp();
+        process_waiting_workers(&state, None)
+            .await
+            .expect("missing job refs should not abort the watcher pass");
+
+        let detail = state.store.get_job(&job_id).expect("job should load");
+        assert_eq!(detail.workers[0].state, "waiting");
+        let persisted_wait: WorkerWaitRecord = serde_json::from_value(
+            detail.workers[0]
+                .wait_until_json
+                .clone()
+                .expect("wait should remain persisted"),
+        )
+        .expect("wait should decode");
+        assert!(
+            persisted_wait.last_checked_at.unwrap_or_default() >= before_poll,
+            "child wait poll timestamp should persist"
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn queued_job_registration_retries_until_existing_runner_releases() {
+        let state_dir = test_state_dir("worker-wait-registration-retry");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let session_id = "worker-wait-registration-session".to_string();
+        let job_id = "worker-wait-registration-job".to_string();
+        state
+            .store
+            .create_session(test_session_record(
+                &session_id,
+                "Registration retry session",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+        state
+            .store
+            .create_job(JobRecord {
+                id: job_id.clone(),
+                session_id: Some(session_id),
+                parent_job_id: None,
+                template_id: None,
+                title: "Queued registration retry".to_string(),
+                purpose: "retry registration".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "queued".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "retry registration".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("job should persist");
+
+        let first_registration = state
+            .agent
+            .register_job(&job_id)
+            .await
+            .expect("first registration should claim job");
+        let release_state = state.clone();
+        let release_job_id = job_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            release_state.agent.finish_job(&release_job_id).await;
+        });
+
+        let retry_registration = register_queued_job_with_retry(&state, &job_id)
+            .await
+            .expect("queued retry should not fail")
+            .expect("registration should be retried after release");
+        drop(first_registration);
+        drop(retry_registration);
+        state.agent.finish_job(&job_id).await;
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn wait_condition_variants_match_expected_state() {
+        let state_dir = test_state_dir("worker-wait-condition-variants");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let session_id = "worker-wait-condition-session".to_string();
+        state
+            .store
+            .create_session(test_session_record(
+                &session_id,
+                "Wait condition session",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+        let child_done = state
+            .store
+            .create_job(JobRecord {
+                id: "child-done".to_string(),
+                session_id: Some(session_id.clone()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Child done".to_string(),
+                purpose: "done".to_string(),
+                trigger_kind: "child_job".to_string(),
+                state: "completed".to_string(),
+                requested_by: "agent".to_string(),
+                prompt_excerpt: String::new(),
+                publication_intent_text: None,
+            })
+            .expect("child job should persist");
+        let child_failed = state
+            .store
+            .create_job(JobRecord {
+                id: "child-failed".to_string(),
+                state: "failed".to_string(),
+                title: "Child failed".to_string(),
+                purpose: "failed".to_string(),
+                requested_by: "agent".to_string(),
+                trigger_kind: "child_job".to_string(),
+                session_id: Some(session_id.clone()),
+                parent_job_id: None,
+                template_id: None,
+                prompt_excerpt: String::new(),
+                publication_intent_text: None,
+            })
+            .expect("child job should persist");
+        let child_artifact = state
+            .store
+            .create_job_artifact(JobArtifactRecord {
+                id: "artifact-1".to_string(),
+                job_id: child_done.id.clone(),
+                worker_id: None,
+                tool_call_id: None,
+                command_session_id: None,
+                kind: "child-report".to_string(),
+                title: "Report".to_string(),
+                path: "/tmp/report.md".to_string(),
+                mime_type: "text/markdown".to_string(),
+                size_bytes: 4,
+                preview_text: "done".to_string(),
+                metadata_json: json!({}),
+            })
+            .expect("artifact should persist");
+        let matching_audit = state
+            .store
+            .append_audit_event(AuditEventRecord {
+                kind: "memory.classifier.completed".to_string(),
+                target: "session:abc".to_string(),
+                status: "success".to_string(),
+                summary: "classified".to_string(),
+                detail: String::new(),
+            })
+            .expect("audit should persist");
+        for index in 0..101 {
+            state
+                .store
+                .append_audit_event(AuditEventRecord {
+                    kind: "other.event".to_string(),
+                    target: format!("session:{index}"),
+                    status: "success".to_string(),
+                    summary: "noise".to_string(),
+                    detail: String::new(),
+                })
+                .expect("noise audit should persist");
+        }
+
+        let now = unix_timestamp();
+        assert!(
+            wait_condition_satisfied(
+                &state,
+                &test_wait(WaitUntil::ChildJobsCompleted {
+                    job_ids: vec![child_done.id.clone(), child_failed.id.clone()]
+                }),
+                None,
+                now + WAIT_CHILD_JOB_POLL_INTERVAL_SECS as i64,
+            )
+            .expect("child wait should evaluate")
+        );
+        assert!(
+            wait_condition_satisfied(
+                &state,
+                &test_wait(WaitUntil::ArtifactKind {
+                    job_id: child_done.id.clone(),
+                    artifact_kind: "child-report".to_string()
+                }),
+                None,
+                now,
+            )
+            .expect("artifact wait should evaluate")
+        );
+        assert!(
+            wait_condition_satisfied(
+                &state,
+                &test_wait(WaitUntil::AuditEvent {
+                    event_kind: "memory.classifier.completed".to_string(),
+                    target_pattern: Some("session:abc".to_string()),
+                    status: Some("success".to_string()),
+                }),
+                None,
+                now,
+            )
+            .expect("audit wait should evaluate")
+        );
+        let mut same_second_audit_wait = test_wait(WaitUntil::AuditEvent {
+            event_kind: "memory.classifier.completed".to_string(),
+            target_pattern: Some("session:abc".to_string()),
+            status: Some("success".to_string()),
+        });
+        same_second_audit_wait.started_at = matching_audit.created_at;
+        assert!(
+            !wait_condition_satisfied(
+                &state,
+                &same_second_audit_wait,
+                Some(&DaemonEvent::AuditUpdated(vec![matching_audit.clone()])),
+                now,
+            )
+            .expect("same-second audit wait should evaluate")
+        );
+        let mut same_second_artifact_wait = test_wait(WaitUntil::ArtifactKind {
+            job_id: child_done.id.clone(),
+            artifact_kind: "child-report".to_string(),
+        });
+        same_second_artifact_wait.started_at = child_artifact.created_at;
+        assert!(
+            !wait_condition_satisfied(
+                &state,
+                &same_second_artifact_wait,
+                Some(&DaemonEvent::ArtifactAdded(child_artifact.clone())),
+                now,
+            )
+            .expect("same-second artifact wait should evaluate")
+        );
+        assert!(
+            !wait_condition_satisfied(
+                &state,
+                &test_wait(WaitUntil::ChildJobsCompleted {
+                    job_ids: vec!["missing-child-job".to_string()]
+                }),
+                None,
+                now + WAIT_CHILD_JOB_POLL_INTERVAL_SECS as i64,
+            )
+            .expect("missing child job should evaluate as pending")
+        );
+        assert!(
+            !wait_condition_satisfied(
+                &state,
+                &test_wait(WaitUntil::ArtifactKind {
+                    job_id: "missing-artifact-job".to_string(),
+                    artifact_kind: "child-report".to_string()
+                }),
+                None,
+                now,
+            )
+            .expect("missing artifact job should evaluate as pending")
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
     async fn paused_session_rejects_prompt_before_explicit_memory_write() {
         let state_dir = test_state_dir("paused-session-memory-guard");
         let state = initialize_test_state(&state_dir);
@@ -19947,6 +21187,165 @@ for line in sys.stdin:
             .expect("test response should write");
     }
 
+    fn test_wait(until: WaitUntil) -> WorkerWaitRecord {
+        WorkerWaitRecord {
+            id: "wait-test".to_string(),
+            summary: "test wait".to_string(),
+            until,
+            max_wait_seconds: Some(60),
+            wake_note: None,
+            started_at: 0,
+            last_checked_at: None,
+        }
+    }
+
+    fn create_waiting_test_job(
+        state: &AppState,
+        session_id: &str,
+        workspace_root: &Path,
+        provider_base_url: &str,
+        until: WaitUntil,
+        max_wait_seconds: Option<u64>,
+    ) -> (String, String) {
+        state
+            .store
+            .create_session(test_session_record(
+                session_id,
+                "Waiting test session",
+                workspace_root,
+            ))
+            .expect("session should persist");
+        state
+            .store
+            .update_session(
+                session_id,
+                SessionPatch {
+                    state: Some("running".to_string()),
+                    ..SessionPatch::default()
+                },
+            )
+            .expect("session should become running");
+        let job_id = format!("{session_id}-job");
+        let worker_id = format!("{session_id}-worker");
+        state
+            .store
+            .create_job(JobRecord {
+                id: job_id.clone(),
+                session_id: Some(session_id.to_string()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Waiting job".to_string(),
+                purpose: "wait".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "waiting".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "wait".to_string(),
+                publication_intent_text: Some("wait".to_string()),
+            })
+            .expect("job should persist");
+        state
+            .store
+            .create_worker(WorkerRecord {
+                id: worker_id.clone(),
+                job_id: job_id.clone(),
+                parent_worker_id: None,
+                title: "Utility Worker".to_string(),
+                lane: ACTION_EXECUTOR_LANE.to_string(),
+                state: "queued".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "test-model".to_string(),
+                provider_base_url: provider_base_url.to_string(),
+                provider_api_key: "test-key".to_string(),
+                provider_session_id: String::new(),
+                working_dir: workspace_root.display().to_string(),
+                read_roots: vec![workspace_root.display().to_string()],
+                write_roots: vec![workspace_root.display().to_string()],
+                max_steps: 10,
+                max_tool_calls: 10,
+                max_wall_clock_secs: 30,
+            })
+            .expect("worker should persist");
+        state
+            .store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    root_worker_id: Some(worker_id.clone()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("job root worker should update");
+        let wait = WorkerWaitRecord {
+            id: "persisted-wait".to_string(),
+            summary: "persisted wait".to_string(),
+            until,
+            max_wait_seconds,
+            wake_note: Some("resume after persisted wait".to_string()),
+            started_at: unix_timestamp(),
+            last_checked_at: None,
+        };
+        state
+            .store
+            .update_worker(
+                &worker_id,
+                WorkerPatch {
+                    state: Some("waiting".to_string()),
+                    wait_until_json: Some(Some(
+                        serde_json::to_value(&wait).expect("wait should encode"),
+                    )),
+                    wait_started_at: Some(Some(wait.started_at)),
+                    ..WorkerPatch::default()
+                },
+            )
+            .expect("worker wait should persist");
+        state
+            .store
+            .write_worker_checkpoint(
+                &worker_id,
+                &serde_json::to_value(WorkerCheckpoint {
+                    session_id: session_id.to_string(),
+                    prompt_text: "wait".to_string(),
+                    images: Vec::new(),
+                    conversation: vec![CheckpointMessage {
+                        role: "system".to_string(),
+                        content: "Return exactly one JSON object and nothing else.".to_string(),
+                        images: Vec::new(),
+                        compacted: false,
+                        compacted_range: None,
+                    }],
+                    next_prompt: None,
+                    pending_action: None,
+                    browser_verification_final_answer_rejected: false,
+                    patch_loop_guardrail_triggered: false,
+                })
+                .expect("checkpoint should encode"),
+            )
+            .expect("checkpoint should persist");
+        (job_id, worker_id)
+    }
+
+    async fn wait_for_latest_job_state(
+        state: &AppState,
+        session_id: &str,
+        expected_state: &str,
+    ) -> JobDetail {
+        for _ in 0..200 {
+            let jobs = state
+                .store
+                .list_jobs_for_session(session_id)
+                .expect("session jobs should load while polling");
+            if let Some(job) = jobs.first() {
+                let detail = state.store.get_job(&job.id).expect("job should load");
+                if detail.job.state == expected_state {
+                    return detail;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        panic!("latest session job did not reach state '{expected_state}'");
+    }
+
     fn test_session_record(id: &str, title: &str, working_dir: &Path) -> SessionRecord {
         SessionRecord {
             id: id.to_string(),
@@ -20004,6 +21403,8 @@ for line in sys.stdin:
             max_wall_clock_secs: 300,
             step_count: 0,
             tool_call_count: 0,
+            wait_until_json: None,
+            wait_started_at: None,
             last_error: String::new(),
             user_error: None,
             capabilities: Vec::new(),
@@ -20143,7 +21544,7 @@ for line in sys.stdin:
         session_id: &str,
         expected_state: &str,
     ) -> SessionDetail {
-        for _ in 0..100 {
+        for _ in 0..500 {
             let detail = state
                 .store
                 .get_session(session_id)

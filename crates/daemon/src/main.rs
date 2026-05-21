@@ -170,6 +170,7 @@ async fn main() -> anyhow::Result<()> {
     spawn_event_publisher(state.clone());
     spawn_update_monitor(state.clone());
     agent::spawn_playbook_scheduler(state.clone());
+    agent::spawn_wait_watcher(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
