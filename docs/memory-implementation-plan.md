@@ -294,16 +294,12 @@ Make accepted durable memory actually useful in turns and expose real operator c
      - confidence clamping
      - JSON field decoding
 
-3. Fix prompt/include split.
-   - This is a release-blocking part of PR 1, not a later cleanup.
-   - Current issue: `compile_session_turn()` discovers prompt include sources and updates debug counts, but those include contents are not carried into the compiled turn that provider execution uses.
-   - Remove the split between `assemble_prompt_input()` rendered raw text and `compile_session_turn()` structured context.
-   - Convert prompt include sources into compiled layers.
-   - Populate `project_layers` or an equivalent `include_layers`/context-layer field.
-   - Ensure compiled turns sent to providers include the same context represented by debug summaries.
-   - Ensure prompt include layers are rendered before memory and skills so stable product/project context remains foundational.
+3. Fix prompt/include split. **Landed in #232 — keep working.**
+   - This was a release-blocking part of PR 1, not a later cleanup.
+   - Original issue: `compile_session_turn()` discovered prompt include sources and updated debug counts, but those include contents (and memory and skill layers) were never carried into the compiled turn that provider execution used. `start_prompt_job` built the CompiledTurn and discarded it; the runtime then rebuilt an empty CompiledTurn for the actual outbound HTTP call. So the model only ever saw the two hardcoded platform `system_layers` plus the conversation history.
+   - Fix: `execute_worker_model_turn` now accepts the real `SessionSummary`, calls `compile_session_turn` per model invocation, and forwards the compiled turn to `RuntimeManager::execute_compiled_turn_stream`. The synthetic worker session is still used for transport (provider/model/api key/working-dir validation); the compiled turn carries memory/include/skill/MCP/tool layers from the real session.
    - Keep daemon-owned prompt assembly as the source of truth.
-   - Add regression tests proving include file text appears in the provider-visible compiled prompt, not only in debug metadata.
+   - Regression test `call_worker_model_includes_workspace_memory_in_provider_request` captures the actual outbound HTTP body from a fake OpenAI-compatible endpoint and asserts that workspace memory content reaches the model.
 
 4. Add memory compilation.
    - Implement `collect_compiled_memory_layers(state, session)` as the first memory context provider.
