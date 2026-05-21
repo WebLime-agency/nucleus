@@ -1,7 +1,7 @@
 use std::{
     path::Path,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -12,13 +12,18 @@ use nucleus_protocol::{
     CompiledTurnDebugSummary, McpServerSummary, NucleusToolDescriptor, RuntimeSummary,
     SessionSummary, SessionTurn, SessionTurnImage,
 };
-use reqwest::header::AUTHORIZATION;
+use reqwest::header::{AUTHORIZATION, HeaderMap, RETRY_AFTER};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
 const RUNTIME_CACHE_TTL: Duration = Duration::from_secs(30);
+
+use crate::retry::{
+    ProviderTransportError, RetryDecision, classify_provider_error, provider_error_class,
+    retry_after_from_error,
+};
 
 #[derive(Default)]
 pub struct RuntimeManager {
@@ -38,10 +43,23 @@ pub struct ProviderTurnResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptStreamEvent {
-    ProviderSessionReady { provider_session_id: String },
-    AssistantChunk { text: String },
-    AssistantSnapshot { text: String },
-    ReasoningSnapshot { text: String },
+    ProviderSessionReady {
+        provider_session_id: String,
+    },
+    AssistantChunk {
+        text: String,
+    },
+    AssistantSnapshot {
+        text: String,
+    },
+    ReasoningSnapshot {
+        text: String,
+    },
+    ProviderRetry {
+        attempt: u32,
+        error_class: String,
+        backoff: Duration,
+    },
 }
 
 impl RuntimeManager {
@@ -69,7 +87,7 @@ impl RuntimeManager {
         Ok(refreshed)
     }
 
-    pub async fn execute_prompt_stream(
+    pub async fn execute_prompt_stream_cancellable(
         &self,
         session: &SessionSummary,
         history: &[SessionTurn],
@@ -77,11 +95,17 @@ impl RuntimeManager {
         images: &[SessionTurnImage],
         compiler_role: &str,
         events: mpsc::UnboundedSender<PromptStreamEvent>,
+        cancel_rx: Option<watch::Receiver<bool>>,
     ) -> Result<ProviderTurnResult> {
         let compiled_turn =
             compiled_turn_from_prompt(history, prompt, images, compiler_role, &[], &[], &[]);
-        self.execute_compiled_turn_stream(session, Arc::new(compiled_turn), events)
-            .await
+        self.execute_compiled_turn_stream_cancellable(
+            session,
+            Arc::new(compiled_turn),
+            events,
+            cancel_rx,
+        )
+        .await
     }
 
     pub async fn execute_compiled_turn_stream(
@@ -90,12 +114,23 @@ impl RuntimeManager {
         compiled_turn: Arc<CompiledTurn>,
         events: mpsc::UnboundedSender<PromptStreamEvent>,
     ) -> Result<ProviderTurnResult> {
+        self.execute_compiled_turn_stream_cancellable(session, compiled_turn, events, None)
+            .await
+    }
+
+    pub async fn execute_compiled_turn_stream_cancellable(
+        &self,
+        session: &SessionSummary,
+        compiled_turn: Arc<CompiledTurn>,
+        events: mpsc::UnboundedSender<PromptStreamEvent>,
+        cancel_rx: Option<watch::Receiver<bool>>,
+    ) -> Result<ProviderTurnResult> {
         let runtime = AdapterKind::parse(&session.provider)
             .ok_or_else(|| anyhow!("unsupported provider '{}'", session.provider))?;
 
         match runtime {
             AdapterKind::OpenAiCompatible => {
-                execute_openai_compatible_prompt(session, &compiled_turn, events).await
+                execute_openai_compatible_prompt(session, &compiled_turn, events, cancel_rx).await
             }
             AdapterKind::Claude | AdapterKind::Codex => bail!(
                 "provider '{}' requires a protocol backend or loopback bridge; CLI model execution is disabled",
@@ -231,6 +266,7 @@ async fn execute_openai_compatible_prompt(
     session: &SessionSummary,
     compiled_turn: &CompiledTurn,
     events: mpsc::UnboundedSender<PromptStreamEvent>,
+    mut cancel_rx: Option<watch::Receiver<bool>>,
 ) -> Result<ProviderTurnResult> {
     validate_working_directory(&session.working_dir)?;
 
@@ -257,9 +293,52 @@ async fn execute_openai_compatible_prompt(
         payload["response_format"] = json!({ "type": "json_object" });
     }
 
+    let mut attempt = 0_u32;
+    loop {
+        if cancel_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
+            bail!("worker canceled before provider call");
+        }
+
+        match execute_openai_compatible_prompt_once(session, base_url, &client, &payload, &events)
+            .await
+        {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                attempt = attempt.saturating_add(1);
+                let retry_after = retry_after_from_error(&error);
+                match classify_provider_error(&error, attempt, retry_after) {
+                    RetryDecision::Retry { backoff } => {
+                        let _ = events.send(PromptStreamEvent::ProviderRetry {
+                            attempt,
+                            error_class: provider_error_class(&error),
+                            backoff,
+                        });
+                        wait_for_retry_backoff(backoff, cancel_rx.as_mut()).await?;
+                    }
+                    RetryDecision::GiveUp { reason } => {
+                        let detail = error.to_string();
+                        return Err(error).with_context(|| {
+                            format!("provider retry policy gave up: {reason}; {detail}")
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn execute_openai_compatible_prompt_once(
+    session: &SessionSummary,
+    base_url: &str,
+    client: &reqwest::Client,
+    payload: &serde_json::Value,
+    events: &mpsc::UnboundedSender<PromptStreamEvent>,
+) -> Result<ProviderTurnResult> {
+    // The OpenAI-compatible adapter does not expose a portable idempotency key
+    // today. If a future provider does, retries should reuse the same key here.
     let mut request = client
         .post(format!("{base_url}/chat/completions"))
-        .json(&payload);
+        .json(payload);
 
     if !session.provider_api_key.trim().is_empty() {
         request = request.header(
@@ -275,19 +354,45 @@ async fn execute_openai_compatible_prompt(
     let status = response.status();
 
     if !status.is_success() {
+        let retry_after = retry_after_from_headers(response.headers());
         let body = response.text().await.unwrap_or_default();
         let detail = if body.trim().is_empty() {
             format!("HTTP {}", status.as_u16())
         } else {
             truncate(body, 200)
         };
-        bail!(
-            "OpenAI-compatible endpoint failed (HTTP {}): {detail}",
-            status.as_u16()
-        );
+        return Err(anyhow!(ProviderTransportError::Http {
+            status: status.as_u16(),
+            detail,
+            retry_after,
+        }));
     }
 
-    read_openai_compatible_stream(response, events).await
+    read_openai_compatible_stream(response, events.clone()).await
+}
+
+async fn wait_for_retry_backoff(
+    backoff: Duration,
+    cancel_rx: Option<&mut watch::Receiver<bool>>,
+) -> Result<()> {
+    let Some(cancel_rx) = cancel_rx else {
+        tokio::time::sleep(backoff).await;
+        return Ok(());
+    };
+
+    if *cancel_rx.borrow() {
+        bail!("worker canceled during provider retry backoff");
+    }
+
+    tokio::select! {
+        _ = tokio::time::sleep(backoff) => Ok(()),
+        changed = cancel_rx.changed() => {
+            if changed.is_ok() && *cancel_rx.borrow() {
+                bail!("worker canceled during provider retry backoff");
+            }
+            Ok(())
+        }
+    }
 }
 
 async fn read_openai_compatible_stream(
@@ -297,6 +402,7 @@ async fn read_openai_compatible_stream(
     let mut provider_session_id = String::new();
     let mut content = String::new();
     let mut pending = String::new();
+    let mut saw_done = false;
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
@@ -308,20 +414,34 @@ async fn read_openai_compatible_stream(
         while let Some(index) = pending.find('\n') {
             let line = pending[..index].trim().trim_end_matches('\r').to_string();
             pending = pending[index + 1..].to_string();
-            handle_openai_compatible_line(&line, &mut provider_session_id, &mut content, &events)?;
+            if handle_openai_compatible_line(
+                &line,
+                &mut provider_session_id,
+                &mut content,
+                &events,
+            )? {
+                saw_done = true;
+            }
         }
     }
 
     if !pending.trim().is_empty() {
-        handle_openai_compatible_line(
+        if handle_openai_compatible_line(
             pending.trim(),
             &mut provider_session_id,
             &mut content,
             &events,
-        )?;
+        )? {
+            saw_done = true;
+        }
     }
 
     let content = content.trim().to_string();
+    if !saw_done && content.is_empty() {
+        return Err(anyhow!(ProviderTransportError::Stream {
+            detail: "EOF before stream complete".to_string(),
+        }));
+    }
     if content.is_empty() {
         bail!("OpenAI-compatible endpoint returned an empty response.");
     }
@@ -337,14 +457,14 @@ fn handle_openai_compatible_line(
     provider_session_id: &mut String,
     content: &mut String,
     events: &mpsc::UnboundedSender<PromptStreamEvent>,
-) -> Result<()> {
+) -> Result<bool> {
     if line.is_empty() || !line.starts_with("data:") {
-        return Ok(());
+        return Ok(false);
     }
 
     let payload = line["data:".len()..].trim();
     if payload == "[DONE]" {
-        return Ok(());
+        return Ok(true);
     }
 
     let chunk = serde_json::from_str::<OpenAiStreamChunk>(payload)
@@ -377,7 +497,24 @@ fn handle_openai_compatible_line(
         }
     }
 
-    Ok(())
+    Ok(false)
+}
+
+fn retry_after_from_headers(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)?;
+
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+
+    httpdate::parse_http_date(value).ok().map(|deadline| {
+        deadline
+            .duration_since(SystemTime::now())
+            .unwrap_or_default()
+    })
 }
 
 fn compiled_turn_requires_json_object(compiled_turn: &CompiledTurn) -> bool {
@@ -501,5 +638,28 @@ mod tests {
             compiled_turn_from_prompt(&history, "Summarize.", &[], "main", &[], &[], &[]);
 
         assert!(!compiled_turn_requires_json_object(&compiled));
+    }
+
+    #[test]
+    fn retry_after_header_accepts_delta_seconds_and_http_date() {
+        let mut delta_headers = HeaderMap::new();
+        delta_headers.insert(RETRY_AFTER, "5".parse().unwrap());
+        assert_eq!(
+            retry_after_from_headers(&delta_headers),
+            Some(Duration::from_secs(5))
+        );
+
+        let deadline = SystemTime::now() + Duration::from_secs(60);
+        let mut date_headers = HeaderMap::new();
+        date_headers.insert(
+            RETRY_AFTER,
+            httpdate::fmt_http_date(deadline).parse().unwrap(),
+        );
+        let parsed =
+            retry_after_from_headers(&date_headers).expect("HTTP-date Retry-After should parse");
+        assert!(
+            parsed > Duration::from_secs(55) && parsed <= Duration::from_secs(60),
+            "expected roughly 60s retry-after, got {parsed:?}"
+        );
     }
 }

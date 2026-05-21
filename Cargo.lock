@@ -1086,6 +1086,7 @@ dependencies = [
  "dirs",
  "flate2",
  "futures-util",
+ "httpdate",
  "libc",
  "nucleus-core",
  "nucleus-protocol",
