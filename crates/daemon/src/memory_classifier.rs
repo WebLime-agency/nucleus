@@ -44,7 +44,11 @@ pub(crate) async fn classify_memory_for_turn(
     .await?;
 
     let compiled_turn = compiled_classifier_turn(system_text, user_prompt);
-    let (events, _receiver) = mpsc::unbounded_channel::<PromptStreamEvent>();
+    // The classifier ignores streamed `PromptStreamEvent`s; drop the receiver so
+    // the runtime's `let _ = events.send(...)` calls fail-fast instead of
+    // queueing chunk/snapshot clones that would never be drained.
+    let (events, receiver) = mpsc::unbounded_channel::<PromptStreamEvent>();
+    drop(receiver);
     let result = timeout(
         MEMORY_CLASSIFIER_TIMEOUT,
         state
