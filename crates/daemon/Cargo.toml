@@ -16,6 +16,7 @@ base64.workspace = true
 dirs.workspace = true
 flate2.workspace = true
 futures-util.workspace = true
+httpdate.workspace = true
 libc.workspace = true
 nucleus-core.workspace = true
 nucleus-protocol.workspace = true
