@@ -2230,95 +2230,6 @@ fn contains_url_userinfo(text: &str) -> bool {
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ManualRememberRequest {
-    pub title: String,
-    pub content: String,
-    pub memory_kind: String,
-}
-
-pub(crate) fn detect_manual_remember_request(prompt: &str) -> Option<ManualRememberRequest> {
-    let trimmed = prompt.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("remember to ")
-        || lower.starts_with("please remember to ")
-        || lower.starts_with("can you remember to ")
-        || lower.starts_with("could you remember to ")
-    {
-        return None;
-    }
-
-    let durable_prefixes = [
-        "remember that ",
-        "can you remember that ",
-        "could you remember that ",
-        "please remember that ",
-        "please remember ",
-        "remember ",
-        "for future reference, ",
-        "for future reference ",
-        "keep in mind that ",
-        "keep in mind ",
-    ];
-    let matched_prefix = durable_prefixes
-        .iter()
-        .find(|prefix| lower.starts_with(**prefix))?;
-
-    let mut content = trimmed[matched_prefix.len()..]
-        .trim()
-        .trim_matches(|c: char| matches!(c, '"' | '\'' | '`'))
-        .trim()
-        .trim_end_matches(|c: char| matches!(c, '.' | '!' | '?'))
-        .trim()
-        .to_string();
-    if let Some(stripped) = content
-        .strip_prefix("that ")
-        .or_else(|| content.strip_prefix("That "))
-    {
-        content = stripped.trim().to_string();
-    }
-    if content.is_empty() {
-        return None;
-    }
-
-    let content_lower = content.to_ascii_lowercase();
-    if content_lower.starts_with("to ")
-        || content_lower.contains(" this turn")
-        || content_lower.contains(" before answering")
-        || content_lower.contains(" in this response")
-        || contains_credential_like_value(&content)
-    {
-        return None;
-    }
-
-    let title = content
-        .split_whitespace()
-        .take(6)
-        .collect::<Vec<_>>()
-        .join(" ");
-    let memory_kind = if content_lower.starts_with("i like ")
-        || content_lower.starts_with("i prefer ")
-        || content_lower.starts_with("we prefer ")
-        || content_lower.starts_with("our team prefers ")
-        || content_lower.contains(" prefer ")
-    {
-        "preference"
-    } else {
-        "fact"
-    }
-    .to_string();
-
-    Some(ManualRememberRequest {
-        title,
-        content,
-        memory_kind,
-    })
-}
-
 async fn record_memory_audit(
     state: &AppState,
     kind: &str,
@@ -10644,43 +10555,6 @@ mod tests {
         let _ = fs::remove_dir_all(&state_dir);
     }
 
-    #[test]
-    fn detect_manual_remember_request_accepts_natural_language_variants() {
-        let direct = detect_manual_remember_request("Remember that I like vanilla ice cream.")
-            .expect("direct remember should be detected");
-        assert_eq!(direct.content, "I like vanilla ice cream");
-        assert_eq!(direct.memory_kind, "preference");
-
-        let polite =
-            detect_manual_remember_request("Can you remember that I like vanilla ice cream?")
-                .expect("polite remember should be detected");
-        assert_eq!(polite.content, "I like vanilla ice cream");
-
-        let future = detect_manual_remember_request("For future reference, I use fish shell.")
-            .expect("future reference should be detected");
-        assert_eq!(future.content, "I use fish shell");
-        assert_eq!(future.memory_kind, "fact");
-
-        let keep_in_mind =
-            detect_manual_remember_request("Keep in mind that our staging host is app-staging.")
-                .expect("keep in mind should be detected");
-        assert_eq!(keep_in_mind.content, "our staging host is app-staging");
-    }
-
-    #[test]
-    fn detect_manual_remember_request_rejects_ephemeral_and_secret_like_prompts() {
-        assert!(
-            detect_manual_remember_request("remember to run tests before answering this turn")
-                .is_none()
-        );
-        assert!(
-            detect_manual_remember_request("Please remember to keep this answer short.").is_none()
-        );
-        assert!(
-            detect_manual_remember_request("Remember that authorization: bearer sk-super-secret")
-                .is_none()
-        );
-    }
     #[tokio::test]
     async fn memory_candidate_prompt_visibility_and_dedupe_guardrails() {
         let (state_dir, state) = test_named_app_state("memory-candidate-prompt");
