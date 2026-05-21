@@ -755,6 +755,8 @@ export const mcpServerSummarySchema = z.object({
   sync_status: z.string().default('pending'),
   last_error: z.string().default(''),
   last_synced_at: z.number().int().nullable().default(null),
+  invocation_status: z.string().default('unknown'),
+  invocation_message: z.string().default(''),
   tools: z.array(nucleusToolDescriptorSchema).default([]),
   resources: z.array(z.string()).default([])
 });

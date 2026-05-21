@@ -5824,6 +5824,8 @@ fn map_mcp_server(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpServerSummary>
         sync_status: row.get(11)?,
         last_error: row.get(12)?,
         last_synced_at: row.get(13)?,
+        invocation_status: "unknown".to_string(),
+        invocation_message: String::new(),
         tools,
         resources,
     })
@@ -10211,6 +10213,8 @@ mod skills_mcp_phase2_tests {
             sync_status: "ready".to_string(),
             last_error: String::new(),
             last_synced_at: None,
+            invocation_status: "unknown".to_string(),
+            invocation_message: String::new(),
             tools: vec![NucleusToolDescriptor {
                 id: "docs.search".to_string(),
                 title: "Docs Search".to_string(),
