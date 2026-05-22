@@ -4360,12 +4360,11 @@ async fn complete_job_with_final_answer(
     if terminal_job_state == "blocked" {
         terminal_metadata["terminal_status"] = Value::String("blocked".to_string());
         terminal_metadata["blocked"] = Value::Bool(true);
+    } else {
+        terminal_metadata["terminal_status"] = Value::String("completed".to_string());
+        terminal_metadata["blocked"] = Value::Bool(false);
     }
-    let terminal_status = terminal_metadata
-        .get("terminal_status")
-        .and_then(Value::as_str)
-        .unwrap_or("completed")
-        .to_string();
+    let terminal_status = terminal_job_state.to_string();
     let _ = state.store.append_job_event(JobEventRecord {
         job_id: job_id.to_string(),
         worker_id: Some(worker.id.clone()),
