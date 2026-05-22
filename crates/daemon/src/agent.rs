@@ -4437,13 +4437,28 @@ async fn complete_job_with_final_answer(
     let _ = try_record_audit_event(
         state,
         AuditEventRecord {
-            kind: "session.job.completed".to_string(),
+            kind: if terminal_job_state == "blocked" {
+                "session.job.blocked".to_string()
+            } else {
+                "session.job.completed".to_string()
+            },
             target: format!("job:{job_id}"),
-            status: "success".to_string(),
-            summary: format!(
-                "Completed Utility Worker job for session '{}'.",
-                session.session.title
-            ),
+            status: if terminal_job_state == "blocked" {
+                "warning".to_string()
+            } else {
+                "success".to_string()
+            },
+            summary: if terminal_job_state == "blocked" {
+                format!(
+                    "Blocked Utility Worker job for session '{}'.",
+                    session.session.title
+                )
+            } else {
+                format!(
+                    "Completed Utility Worker job for session '{}'.",
+                    session.session.title
+                )
+            },
             detail: format!(
                 "session_id={} provider={} model={} steps={} tool_calls={}",
                 session.session.id, worker.provider, worker.model, step_count, tool_call_count
@@ -4456,13 +4471,15 @@ async fn complete_job_with_final_answer(
         if let Ok(updated) = state.store.get_session(&session.session.id) {
             let _ = publish_session_event(state, updated).await;
         }
+        let (prompt_status, prompt_label, prompt_detail) =
+            terminal_prompt_status_copy(terminal_job_state);
         publish_prompt_status(
             state,
             &session.session,
             worker,
-            "completed",
-            "Utility Worker completed",
-            "Nucleus persisted a clean assistant turn from the Utility Worker result.",
+            prompt_status,
+            prompt_label,
+            prompt_detail,
             &post_turn_memory_outcomes,
         )
         .await;
@@ -5782,6 +5799,24 @@ fn contradiction_checked_final_answer(
     }
 
     format!("Blocked: {blocker}\n\n{final_answer}")
+}
+
+fn terminal_prompt_status_copy(
+    terminal_job_state: &str,
+) -> (&'static str, &'static str, &'static str) {
+    if terminal_job_state == "blocked" {
+        (
+            "blocked",
+            "Utility Worker blocked",
+            "Nucleus persisted a blocked assistant turn because daemon completion gates are unmet.",
+        )
+    } else {
+        (
+            "completed",
+            "Utility Worker completed",
+            "Nucleus persisted a clean assistant turn from the Utility Worker result.",
+        )
+    }
 }
 
 fn final_answer_is_generic_completion_claim(normalized: &str) -> bool {
@@ -16179,6 +16214,26 @@ Remaining:\n\
     }
 
     #[test]
+    fn terminal_prompt_status_copy_matches_persisted_terminal_state() {
+        assert_eq!(
+            terminal_prompt_status_copy("blocked"),
+            (
+                "blocked",
+                "Utility Worker blocked",
+                "Nucleus persisted a blocked assistant turn because daemon completion gates are unmet."
+            )
+        );
+        assert_eq!(
+            terminal_prompt_status_copy("completed"),
+            (
+                "completed",
+                "Utility Worker completed",
+                "Nucleus persisted a clean assistant turn from the Utility Worker result."
+            )
+        );
+    }
+
+    #[test]
     fn publication_outcome_patch_extracts_structured_terminal_fields() {
         let job = test_publication_job_summary("publication-extract");
         let patch = publication_outcome_patch(
@@ -16621,7 +16676,6 @@ Cleanup status: clean";
             content: "Implement the daemon-owned final-response contract.".to_string(),
             metadata: json!({"target": "issue-209"}),
         }];
-
         complete_job_with_final_answer(
             &state,
             &session,
