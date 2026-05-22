@@ -130,6 +130,8 @@ mod observability_tests {
             state: "running".to_string(),
             provider: "openai_compatible".to_string(),
             model: model.to_string(),
+            route_id: String::new(),
+            route_title: String::new(),
             provider_base_url: String::new(),
             provider_api_key: String::new(),
             provider_session_id: String::new(),
@@ -508,6 +510,8 @@ pub struct WorkerRecord {
     pub state: String,
     pub provider: String,
     pub model: String,
+    pub route_id: String,
+    pub route_title: String,
     pub provider_base_url: String,
     pub provider_api_key: String,
     pub provider_session_id: String,
@@ -1822,6 +1826,31 @@ impl StateStore {
         load_router_profile(&connection, route_id)
     }
 
+    pub fn upsert_router_profile(&self, profile: RouterProfileSummary) -> Result<()> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        connection.execute(
+            "
+            INSERT INTO router_profiles (id, title, summary, enabled, targets_json)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                summary = excluded.summary,
+                enabled = excluded.enabled,
+                targets_json = excluded.targets_json,
+                updated_at = unixepoch()
+            ",
+            params![
+                profile.id,
+                profile.title,
+                profile.summary,
+                profile.enabled as i64,
+                serde_json::to_string(&profile.targets)
+                    .context("failed to serialize router profile targets")?,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         list_sessions_with_connection(&connection)
@@ -2567,6 +2596,8 @@ impl StateStore {
                 state,
                 provider,
                 model,
+                route_id,
+                route_title,
                 provider_base_url,
                 provider_api_key,
                 provider_session_id,
@@ -2577,7 +2608,7 @@ impl StateStore {
                 max_tool_calls,
                 max_wall_clock_secs
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
             ",
             params![
                 record.id,
@@ -2588,6 +2619,8 @@ impl StateStore {
                 record.state,
                 record.provider,
                 record.model,
+                record.route_id,
+                record.route_title,
                 record.provider_base_url,
                 record.provider_api_key,
                 record.provider_session_id,
@@ -4210,6 +4243,18 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
     )?;
     ensure_column(connection, "job_workers", "wait_until_json", "TEXT")?;
     ensure_column(connection, "job_workers", "wait_started_at", "INTEGER")?;
+    ensure_column(
+        connection,
+        "job_workers",
+        "route_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "job_workers",
+        "route_title",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
     ensure_column(
         connection,
         "job_workers",
@@ -7417,6 +7462,8 @@ fn load_job_summary(connection: &Connection, job_id: &str) -> Result<JobSummary>
             job.executor_lane = worker.lane;
             job.executor_provider = worker.provider;
             job.executor_model = worker.model;
+            job.executor_route_id = worker.route_id;
+            job.executor_route_title = worker.route_title;
         }
     }
     Ok(job)
@@ -7449,6 +7496,8 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         executor_lane: String::new(),
         executor_provider: String::new(),
         executor_model: String::new(),
+        executor_route_id: String::new(),
+        executor_route_title: String::new(),
         visible_turn_id: row.get(11)?,
         result_summary: row.get(12)?,
         last_error: row.get(13)?,
@@ -7866,6 +7915,8 @@ fn load_worker_summary(connection: &Connection, worker_id: &str) -> Result<Worke
                 state,
                 provider,
                 model,
+                route_id,
+                route_title,
                 provider_base_url,
                 provider_api_key,
                 provider_session_id,
@@ -7902,31 +7953,33 @@ fn load_worker_summary(connection: &Connection, worker_id: &str) -> Result<Worke
                     state: row.get(5)?,
                     provider: row.get(6)?,
                     model: row.get(7)?,
-                    provider_base_url: row.get(8)?,
-                    provider_api_key: row.get(9)?,
-                    provider_session_id: row.get(10)?,
-                    working_dir: row.get(11)?,
-                    read_roots: decode_string_list(row.get::<_, String>(12)?)?,
-                    write_roots: decode_string_list(row.get::<_, String>(13)?)?,
-                    max_steps: row.get::<_, i64>(14)?.max(0) as usize,
-                    max_tool_calls: row.get::<_, i64>(15)?.max(0) as usize,
-                    max_wall_clock_secs: row.get::<_, i64>(16)?.max(0) as u64,
-                    step_count: row.get::<_, i64>(17)?.max(0) as usize,
-                    tool_call_count: row.get::<_, i64>(18)?.max(0) as usize,
-                    wait_until_json: decode_optional_json_column(row, 19)?,
-                    wait_started_at: row.get(20)?,
-                    last_error: row.get(21)?,
+                    route_id: row.get(8)?,
+                    route_title: row.get(9)?,
+                    provider_base_url: row.get(10)?,
+                    provider_api_key: row.get(11)?,
+                    provider_session_id: row.get(12)?,
+                    working_dir: row.get(13)?,
+                    read_roots: decode_string_list(row.get::<_, String>(14)?)?,
+                    write_roots: decode_string_list(row.get::<_, String>(15)?)?,
+                    max_steps: row.get::<_, i64>(16)?.max(0) as usize,
+                    max_tool_calls: row.get::<_, i64>(17)?.max(0) as usize,
+                    max_wall_clock_secs: row.get::<_, i64>(18)?.max(0) as u64,
+                    step_count: row.get::<_, i64>(19)?.max(0) as usize,
+                    tool_call_count: row.get::<_, i64>(20)?.max(0) as usize,
+                    wait_until_json: decode_optional_json_column(row, 21)?,
+                    wait_started_at: row.get(22)?,
+                    last_error: row.get(23)?,
                     user_error: None,
                     capabilities: Vec::new(),
-                    last_reasoning: row.get(22)?,
-                    last_reasoning_at: row.get(23)?,
-                    token_usage_known: row.get::<_, i64>(24)? != 0,
-                    prompt_tokens: row.get::<_, i64>(25)?.max(0) as u64,
-                    completion_tokens: row.get::<_, i64>(26)?.max(0) as u64,
-                    cached_tokens: row.get::<_, i64>(27)?.max(0) as u64,
+                    last_reasoning: row.get(24)?,
+                    last_reasoning_at: row.get(25)?,
+                    token_usage_known: row.get::<_, i64>(26)? != 0,
+                    prompt_tokens: row.get::<_, i64>(27)?.max(0) as u64,
+                    completion_tokens: row.get::<_, i64>(28)?.max(0) as u64,
+                    cached_tokens: row.get::<_, i64>(29)?.max(0) as u64,
                     cost_usd_estimate: None,
-                    created_at: row.get(28)?,
-                    updated_at: row.get(29)?,
+                    created_at: row.get(30)?,
+                    updated_at: row.get(31)?,
                 })
             },
         )
@@ -10654,6 +10707,8 @@ and open a pull request to dev when it is ready."
                 state: "completed".to_string(),
                 provider: "openai_compatible".to_string(),
                 model: "cx/gpt-5.4".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
                 provider_base_url: String::new(),
                 provider_api_key: String::new(),
                 provider_session_id: String::new(),
@@ -10706,6 +10761,8 @@ and open a pull request to dev when it is ready."
                 state: "completed".to_string(),
                 provider: "openai_compatible".to_string(),
                 model: "cx/gpt-5.4".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
                 provider_base_url: String::new(),
                 provider_api_key: String::new(),
                 provider_session_id: String::new(),
@@ -10784,6 +10841,8 @@ and open a pull request to dev when it is ready."
                 state: "completed".to_string(),
                 provider: "openai_compatible".to_string(),
                 model: "cx/gpt-5.4".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
                 provider_base_url: String::new(),
                 provider_api_key: String::new(),
                 provider_session_id: String::new(),
@@ -10836,6 +10895,8 @@ and open a pull request to dev when it is ready."
                 state: "completed".to_string(),
                 provider: "openai_compatible".to_string(),
                 model: "cx/gpt-5.4".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
                 provider_base_url: String::new(),
                 provider_api_key: String::new(),
                 provider_session_id: String::new(),

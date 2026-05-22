@@ -70,7 +70,7 @@
     updateSession
   } from '$lib/nucleus/client';
   import { compactPath, formatDateTime, formatState } from '$lib/nucleus/format';
-  import { noActivity, usageView } from '$lib/nucleus/session-ux.js';
+  import { childRouteLabel, noActivity, usageView } from '$lib/nucleus/session-ux.js';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
   import type {
     ActionSummary,
@@ -4338,6 +4338,7 @@
                                   </div>
                                   <div class="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-zinc-600">
                                     <RuntimeBadge record={childJob} nowSeconds={observabilityNow} />
+                                    <span>Profile {childRouteLabel(childJob)}</span>
                                     <span title={childUsage.title}>{childUsage.label}</span>
                                     <span class="font-mono">{childJob.id}</span>
                                     <span>Created {formatDateTime(childJob.created_at)}</span>
