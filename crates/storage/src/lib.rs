@@ -4999,7 +4999,7 @@ fn task_class_from_tool_id(tool_id: &str) -> Option<&'static str> {
 
 fn task_class_from_command(command: &str, args: &[String]) -> Option<&'static str> {
     let text = command_session_text(command, args);
-    if is_deployment_command(&text) {
+    if is_deployment_command_session(command, args) {
         Some("deployment")
     } else if is_process_command_session(command, args) {
         Some("process_server")
@@ -7707,7 +7707,7 @@ fn apply_job_evidence_rollups(connection: &Connection, job: &mut JobSummary) -> 
             if is_validation_command(&command_text) {
                 evidence.push(format!("validation:{label}"));
             }
-            if is_deployment_command(&command_text) {
+            if is_deployment_command_session(&command_session.command, &command_session.args) {
                 evidence.push(format!("deployment_status:{label}"));
             }
             if is_version_command(&command_text) {
@@ -7941,12 +7941,66 @@ fn is_validation_command(text: &str) -> bool {
     .any(|phrase| command_phrase_contains(&phrase_text, phrase))
 }
 
-fn is_deployment_command(text: &str) -> bool {
-    [
-        "deploy", "publish", "release", "wrangler", "vercel", "netlify", "flyctl",
-    ]
-    .iter()
-    .any(|needle| text.contains(needle))
+fn is_deployment_command_session(command: &str, args: &[String]) -> bool {
+    let command_name = normalized_command_name(command);
+    if matches!(
+        command_name.as_str(),
+        "deploy" | "flyctl" | "netlify" | "publish" | "release" | "vercel" | "wrangler"
+    ) {
+        return true;
+    }
+
+    if matches!(command_name.as_str(), "bun" | "npm" | "pnpm" | "yarn") {
+        let arg_text = command_phrase_text(&args.join(" "));
+        return [
+            "deploy",
+            "publish",
+            "release",
+            "run deploy",
+            "run publish",
+            "run release",
+        ]
+        .iter()
+        .any(|phrase| command_phrase_contains(&arg_text, phrase));
+    }
+
+    if command_name == "gh" {
+        let arg_text = command_phrase_text(&args.join(" "));
+        return ["release create", "release upload"]
+            .iter()
+            .any(|phrase| command_phrase_contains(&arg_text, phrase));
+    }
+
+    if matches!(command_name.as_str(), "bash" | "fish" | "sh" | "zsh") {
+        let shell_text = command_phrase_text(&args.join(" "));
+        return [
+            "bun run deploy",
+            "bun run publish",
+            "bun run release",
+            "flyctl deploy",
+            "gh release create",
+            "gh release upload",
+            "netlify deploy",
+            "npm run deploy",
+            "npm run publish",
+            "npm run release",
+            "pnpm run deploy",
+            "pnpm run publish",
+            "pnpm run release",
+            "vercel deploy",
+            "wrangler deploy",
+            "yarn deploy",
+            "yarn publish",
+            "yarn release",
+            "yarn run deploy",
+            "yarn run publish",
+            "yarn run release",
+        ]
+        .iter()
+        .any(|phrase| command_phrase_contains(&shell_text, phrase));
+    }
+
+    false
 }
 
 fn is_version_command(text: &str) -> bool {
@@ -11327,6 +11381,14 @@ and open a pull request to dev when it is ready."
             "npm",
             &["run".to_string(), "build:web".to_string()]
         )));
+        assert!(!is_deployment_command_session(
+            "cargo",
+            &["build".to_string(), "--release".to_string()]
+        ));
+        assert!(is_deployment_command_session(
+            "wrangler",
+            &["deploy".to_string()]
+        ));
         assert!(is_process_command_session("ps", &[]));
         assert!(is_process_command_session(
             "npm",
@@ -11349,6 +11411,10 @@ and open a pull request to dev when it is ready."
                 "cargo",
                 &["test".to_string(), "tests/server.rs".to_string()]
             ),
+            Some("local_project")
+        );
+        assert_eq!(
+            task_class_from_command("cargo", &["build".to_string(), "--release".to_string()]),
             Some("local_project")
         );
         assert_eq!(task_class_from_command("ps", &[]), Some("process_server"));
