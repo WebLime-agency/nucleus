@@ -605,8 +605,8 @@ impl OpenAiDelta {
         self.reasoning
             .as_ref()
             .or(self.reasoning_content.as_ref())
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.to_string())
     }
 }
 
@@ -723,5 +723,16 @@ mod tests {
             }
         }
         assert!(saw_usage);
+    }
+
+    #[test]
+    fn openai_reasoning_delta_preserves_spacing() {
+        let delta = OpenAiDelta {
+            reasoning: Some("checking ".to_string()),
+            reasoning_content: None,
+            content: None,
+        };
+
+        assert_eq!(delta.reasoning_text().as_deref(), Some("checking "));
     }
 }

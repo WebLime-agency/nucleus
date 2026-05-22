@@ -7198,11 +7198,12 @@ pub(crate) async fn execute_worker_text_turn(
         }
     });
 
+    let mut reasoning_buffer = String::new();
     let mut last_reasoning = String::new();
     while let Some(event) = receiver.recv().await {
         match event {
             PromptStreamEvent::ReasoningSnapshot { text } => {
-                let excerpted = excerpt(&text, 240);
+                let excerpted = append_reasoning_snapshot(&mut reasoning_buffer, &text);
                 if excerpted != last_reasoning {
                     last_reasoning = excerpted.clone();
                     match state.store.record_worker_reasoning(
@@ -7274,6 +7275,13 @@ pub(crate) async fn execute_worker_text_turn(
     handle
         .await
         .map_err(|error| anyhow!("worker model task crashed: {error}"))?
+}
+
+fn append_reasoning_snapshot(buffer: &mut String, text: &str) -> String {
+    if !text.trim().is_empty() {
+        buffer.push_str(text);
+    }
+    excerpt(buffer.trim(), 240)
 }
 
 fn worker_action_repair_supported_tool_ids(
@@ -13996,6 +14004,21 @@ mod tests {
             assert!(!is_non_terminal_tool_call_status(status));
         }
     }
+
+    #[test]
+    fn reasoning_snapshots_accumulate_streamed_chunks() {
+        let mut buffer = String::new();
+
+        assert_eq!(
+            append_reasoning_snapshot(&mut buffer, "checking "),
+            "checking"
+        );
+        assert_eq!(
+            append_reasoning_snapshot(&mut buffer, "the next result"),
+            "checking the next result"
+        );
+    }
+
     use crate::{
         host::HostEngine,
         runtime::RuntimeManager,
