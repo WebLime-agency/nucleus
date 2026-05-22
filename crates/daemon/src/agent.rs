@@ -1761,6 +1761,7 @@ fn event_matches_child_job_wait(event: Option<&DaemonEvent>, job_ids: &[String])
     let job = match event {
         DaemonEvent::JobUpdated(job)
         | DaemonEvent::JobCompleted(job)
+        | DaemonEvent::JobBlocked(job)
         | DaemonEvent::JobFailed(job) => job,
         _ => return false,
     };
@@ -4485,7 +4486,7 @@ async fn complete_job_with_final_answer(
         }
     }
 
-    publish_job_completed(state, &state.store.get_job(job_id)?.job).await;
+    publish_terminal_job_event(state, &state.store.get_job(job_id)?.job).await;
     publish_worker_updated(state, worker).await;
     let _ = publish_overview_event(state).await;
     Ok(())
@@ -14109,6 +14110,21 @@ async fn publish_job_completed(state: &AppState, summary: &JobSummary) {
     let _ = record_job_log(state, "info", "job.completed", summary).await;
 }
 
+async fn publish_job_blocked(state: &AppState, summary: &JobSummary) {
+    let _ = state
+        .events
+        .send(DaemonEvent::JobBlocked(publishable_job_summary(summary)));
+    let _ = record_job_log(state, "warn", "job.blocked", summary).await;
+}
+
+async fn publish_terminal_job_event(state: &AppState, summary: &JobSummary) {
+    if summary.state == "blocked" {
+        publish_job_blocked(state, summary).await;
+    } else {
+        publish_job_completed(state, summary).await;
+    }
+}
+
 async fn record_job_log(
     state: &AppState,
     level: &str,
@@ -16215,6 +16231,61 @@ Remaining:\n\
                 "Nucleus persisted a clean assistant turn from the Utility Worker result."
             )
         );
+    }
+
+    #[tokio::test]
+    async fn blocked_terminal_publish_uses_blocked_event_type() {
+        let state_dir = test_state_dir("blocked-terminal-publish");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let session_id = "blocked-terminal-publish-session";
+        state
+            .store
+            .create_session(test_session_record(
+                session_id,
+                "Blocked publish session",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+        let job = state
+            .store
+            .create_job(JobRecord {
+                id: "blocked-terminal-publish-job".to_string(),
+                state: "blocked".to_string(),
+                title: "Blocked job".to_string(),
+                purpose: "blocked publish".to_string(),
+                requested_by: "agent".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                session_id: Some(session_id.to_string()),
+                parent_job_id: None,
+                template_id: None,
+                prompt_excerpt: String::new(),
+                publication_intent_text: None,
+            })
+            .expect("job should persist");
+        let mut events = state.events.subscribe();
+
+        publish_terminal_job_event(&state, &job).await;
+
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("blocked event should be published")
+            .expect("blocked event should be readable");
+        match event {
+            DaemonEvent::JobBlocked(summary) => {
+                assert_eq!(summary.id, "blocked-terminal-publish-job");
+                assert_eq!(summary.state, "blocked");
+            }
+            other => panic!("expected job.blocked event, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(&state_dir);
     }
 
     #[test]

@@ -1228,6 +1228,10 @@ export const daemonEventSchema = z.discriminatedUnion('event', [
     data: jobSummarySchema
   }),
   z.object({
+    event: z.literal('job.blocked'),
+    data: jobSummarySchema
+  }),
+  z.object({
     event: z.literal('job.failed'),
     data: jobSummarySchema
   }),

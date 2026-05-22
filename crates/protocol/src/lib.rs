@@ -2243,6 +2243,8 @@ pub enum DaemonEvent {
     CommandSessionUpdated(CommandSessionSummary),
     #[serde(rename = "job.completed")]
     JobCompleted(JobSummary),
+    #[serde(rename = "job.blocked")]
+    JobBlocked(JobSummary),
     #[serde(rename = "job.failed")]
     JobFailed(JobSummary),
     #[serde(rename = "prompt.progress")]
