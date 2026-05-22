@@ -70,7 +70,7 @@
     updateSession
   } from '$lib/nucleus/client';
   import { compactPath, formatDateTime, formatState } from '$lib/nucleus/format';
-  import { childRouteLabel, noActivity, usageView } from '$lib/nucleus/session-ux.js';
+  import { childRouteLabel, completionGateGroups, gateBadgeVariant, noActivity, usageView } from '$lib/nucleus/session-ux.js';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
   import type {
     ActionSummary,
@@ -112,6 +112,7 @@
   type BrowserViewportMode = 'fit' | 'mobile' | 'desktop' | 'wide';
   type BrowserAnnotationDraft = { page_id: string; x: number; y: number };
   type JobOutcomeRow = { label: string; value: string; href?: string };
+  type CompletionGateSection = { key: string; label: string; gates: JobSummary['completion_gates'] };
 
   const COMPOSER_MODES: SessionComposerMode[] = ['plan', 'ask', 'trusted'];
   const RUN_BUDGET_MODES: SessionRunBudgetMode[] = [
@@ -537,6 +538,33 @@
     if (job.cleanup_paths.length) rows.push({ label: 'Cleanup paths', value: job.cleanup_paths.join(', ') });
     if (job.publication_summary) rows.push({ label: 'Summary', value: job.publication_summary });
     return rows;
+  }
+
+  function completionStatusLabel(status: string): string {
+    if (status === 'satisfied') return 'Gates satisfied';
+    if (status === 'blocked') return 'Gates blocked';
+    if (status === 'pending') return 'Gates pending';
+    return 'No completion gates';
+  }
+
+  function gateStateLabel(state: string): string {
+    if (state === 'done') return 'Done';
+    if (state === 'blocked') return 'Blocked';
+    return 'Pending';
+  }
+
+  function completionGateSections(job: JobSummary): CompletionGateSection[] {
+    const groups = completionGateGroups(job);
+    return [
+      { key: 'blocked', label: 'Blocked', gates: groups.blocked },
+      { key: 'pending', label: 'Pending', gates: groups.pending },
+      { key: 'done', label: 'Done', gates: groups.done }
+    ];
+  }
+
+  function gateEvidenceHref(value: string) {
+    const parts = value.trim().split(/\s+/);
+    return safeExternalHref(parts[parts.length - 1] ?? '');
   }
 
   function safeExternalHref(value: string) {
@@ -4157,6 +4185,15 @@
                           <span>{formatDateTime(job.updated_at)}</span>
                         </div>
                         <ReasoningActivity record={job} nowSeconds={observabilityNow} />
+                        {#if job.completion_gates.length > 0}
+                          <div class="mt-2 flex flex-wrap gap-1.5">
+                            {#each job.completion_gates.slice(0, 4) as gate}
+                              <Badge variant={gateBadgeVariant(gate.state)}>
+                                {gate.title}: {gateStateLabel(gate.state)}
+                              </Badge>
+                            {/each}
+                          </div>
+                        {/if}
                         {#if publicationOutcomeLabel(job)}
                           <div class="mt-2 text-xs text-zinc-400">
                             {publicationOutcomeLabel(job)}
@@ -4198,6 +4235,66 @@
                       {:else if jobDetail.job.last_error}
                         <div class="mt-3 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-200">
                           {jobDetail.job.last_error}
+                        </div>
+                      {/if}
+
+                      {#if jobDetail.job.completion_gates.length > 0}
+                        <div class="mt-3 rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-3">
+                          <div class="flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                              <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Completion Gates</div>
+                              <div class="mt-1 text-xs text-zinc-500">
+                                {completionStatusLabel(jobDetail.job.completion_status)}
+                              </div>
+                              {#if jobDetail.job.last_reasoning}
+                                <div class="mt-1 text-xs leading-5 text-zinc-600">
+                                  Latest heartbeat: {jobDetail.job.last_reasoning}
+                                </div>
+                              {/if}
+                            </div>
+                            <Badge variant={jobDetail.job.completion_status === 'blocked' ? 'destructive' : jobDetail.job.completion_status === 'pending' ? 'warning' : 'default'}>
+                              {jobDetail.job.completion_blockers.length} blocker{jobDetail.job.completion_blockers.length === 1 ? '' : 's'}
+                            </Badge>
+                          </div>
+                          <div class="mt-3 space-y-3">
+                            {#each completionGateSections(jobDetail.job) as section}
+                              {#if section.gates.length > 0}
+                                <div class="space-y-2">
+                                  <div class="text-[11px] uppercase tracking-[0.12em] text-zinc-600">{section.label}</div>
+                                  {#each section.gates as gate}
+                                    <div class="rounded-md border border-zinc-800 bg-zinc-900/70 px-3 py-2">
+                                      <div class="flex min-w-0 items-start justify-between gap-3">
+                                        <div class="min-w-0">
+                                          <div class="truncate text-sm text-zinc-100">{gate.title}</div>
+                                          <div class="mt-1 text-xs leading-5 text-zinc-500">{gate.summary}</div>
+                                        </div>
+                                        <Badge variant={gateBadgeVariant(gate.state)}>{gateStateLabel(gate.state)}</Badge>
+                                      </div>
+                                      {#if gate.evidence.length > 0}
+                                        <div class="mt-2 flex flex-wrap gap-1.5">
+                                          {#each gate.evidence as evidence}
+                                            {@const evidenceHref = gateEvidenceHref(evidence)}
+                                            {#if evidenceHref}
+                                              <a
+                                                href={evidenceHref}
+                                                target="_blank"
+                                                rel="noreferrer"
+                                                class="max-w-full truncate rounded border border-zinc-800 bg-zinc-950 px-2 py-1 text-[11px] text-lime-200 hover:text-lime-100"
+                                              >
+                                                {evidence}
+                                              </a>
+                                            {:else}
+                                              <span class="max-w-full truncate rounded border border-zinc-800 bg-zinc-950 px-2 py-1 text-[11px] text-zinc-500">{evidence}</span>
+                                            {/if}
+                                          {/each}
+                                        </div>
+                                      {/if}
+                                    </div>
+                                  {/each}
+                                </div>
+                              {/if}
+                            {/each}
+                          </div>
                         </div>
                       {/if}
 

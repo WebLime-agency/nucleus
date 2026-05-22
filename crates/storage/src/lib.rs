@@ -4871,7 +4871,7 @@ fn bool_to_i64(value: bool) -> i64 {
 }
 
 fn is_terminal_non_success_job_state(state: &str) -> bool {
-    matches!(state, "failed" | "canceled")
+    matches!(state, "blocked" | "failed" | "canceled")
 }
 
 fn terminal_browser_verification_summary(state: &str) -> &'static str {
@@ -7516,6 +7516,9 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         validation_status: row.get(25)?,
         cleanup_status: row.get(26)?,
         cleanup_paths: decode_string_vec_column(row, 27)?,
+        completion_status: String::new(),
+        completion_gates: Vec::new(),
+        completion_blockers: Vec::new(),
         worker_count: 0,
         pending_approval_count: 0,
         artifact_count: 0,
@@ -7529,7 +7532,8 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         cost_usd_estimate: None,
         created_at: row.get(29)?,
         updated_at: row.get(30)?,
-    })
+    }
+    .with_completion_gates())
 }
 
 fn apply_job_observability_rollups(connection: &Connection, job: &mut JobSummary) -> Result<()> {

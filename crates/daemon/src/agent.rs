@@ -4247,6 +4247,14 @@ async fn complete_job_with_final_answer(
 
     let completion_job = state.store.get_job(job_id)?.job;
     reconcile_publication_browser_status_with_completion(&completion_job, &mut publication_patch);
+    let terminal_job_state =
+        if projected_completion_gates_blocked(&completion_job, &publication_patch) {
+            "blocked"
+        } else {
+            "completed"
+        };
+    let visible_final_answer =
+        contradiction_checked_final_answer(final_answer, terminal_job_state, &publication_patch);
 
     let mut visible_turn_id = None;
     let mut report_artifact = None;
@@ -4275,7 +4283,7 @@ async fn complete_job_with_final_answer(
             &session.session.id,
             &final_turn_id,
             "assistant",
-            &final_answer,
+            &visible_final_answer,
             &[],
         )?;
         post_turn_memory_outcomes = crate::extract_memory_decisions_after_turn(
@@ -4304,7 +4312,7 @@ async fn complete_job_with_final_answer(
                 format!("{} report", detail.job.title),
                 "md",
                 "text/markdown",
-                final_answer.to_string(),
+                visible_final_answer.clone(),
             ),
         )?;
         report_artifact = Some(artifact);
@@ -4313,7 +4321,7 @@ async fn complete_job_with_final_answer(
     state.store.update_job(
         job_id,
         JobPatch {
-            state: Some("completed".to_string()),
+            state: Some(terminal_job_state.to_string()),
             visible_turn_id,
             result_summary: Some(summary.to_string()),
             last_error: Some(String::new()),
@@ -4340,15 +4348,19 @@ async fn complete_job_with_final_answer(
             ..WorkerPatch::default()
         },
     )?;
-    let terminal_metadata = final_answer_terminal_metadata(
+    let mut terminal_metadata = final_answer_terminal_metadata(
         summary,
-        final_answer,
+        &visible_final_answer,
         final_answer_metadata,
         &structured_artifacts,
         step_count,
         tool_call_count,
         &publication_patch,
     );
+    if terminal_job_state == "blocked" {
+        terminal_metadata["terminal_status"] = Value::String("blocked".to_string());
+        terminal_metadata["blocked"] = Value::Bool(true);
+    }
     let terminal_status = terminal_metadata
         .get("terminal_status")
         .and_then(Value::as_str)
@@ -4357,10 +4369,14 @@ async fn complete_job_with_final_answer(
     let _ = state.store.append_job_event(JobEventRecord {
         job_id: job_id.to_string(),
         worker_id: Some(worker.id.clone()),
-        event_type: "job.completed".to_string(),
+        event_type: if terminal_status == "blocked" {
+            "job.blocked".to_string()
+        } else {
+            "job.completed".to_string()
+        },
         status: terminal_status,
         summary: summary.to_string(),
-        detail: excerpt(&final_answer, 320),
+        detail: excerpt(&visible_final_answer, 320),
         data_json: terminal_metadata,
     });
     if let Some(publication_status) = publication_patch.publication_status.as_deref() {
@@ -4379,7 +4395,7 @@ async fn complete_job_with_final_answer(
                     .publication_summary
                     .clone()
                     .unwrap_or_else(|| summary.to_string()),
-                detail: excerpt(&final_answer, 320),
+                detail: excerpt(&visible_final_answer, 320),
                 data_json: json!({
                     "publication_requested": publication_patch.publication_requested.unwrap_or(true),
                     "publication_status": publication_status,
@@ -5686,6 +5702,97 @@ fn publication_patch_terminal_status_is_blocked(patch: &PublicationOutcomePatch)
             .publication_status
             .as_deref()
             .is_some_and(|status| matches!(status, "blocked" | "not_opened" | "failed"))
+}
+
+fn projected_completion_gates_blocked(
+    current: &JobSummary,
+    publication_patch: &PublicationOutcomePatch,
+) -> bool {
+    let mut projected = current.clone();
+    projected.state = "completed".to_string();
+    if let Some(value) = publication_patch.publication_requested {
+        projected.publication_requested = value;
+    }
+    if let Some(value) = publication_patch.publication_status.as_ref() {
+        projected.publication_status = value.clone();
+    }
+    if let Some(value) = publication_patch.publication_summary.as_ref() {
+        projected.publication_summary = value.clone();
+    }
+    if let Some(value) = publication_patch.pr_url.as_ref() {
+        projected.pr_url = value.clone();
+    }
+    if let Some(value) = publication_patch.source_branch.as_ref() {
+        projected.source_branch = value.clone();
+    }
+    if let Some(value) = publication_patch.target_branch.as_ref() {
+        projected.target_branch = value.clone();
+    }
+    if let Some(value) = publication_patch.validation_status.as_ref() {
+        projected.validation_status = value.clone();
+    }
+    if let Some(value) = publication_patch.browser_verification_status.as_ref() {
+        projected.browser_verification_status = value.clone();
+    }
+    if let Some(value) = publication_patch.cleanup_status.as_ref() {
+        projected.cleanup_status = value.clone();
+    }
+    if let Some(value) = publication_patch.cleanup_paths.as_ref() {
+        projected.cleanup_paths = value.clone();
+    }
+
+    if !projected.publication_requested {
+        return false;
+    }
+
+    projected
+        .with_completion_gates()
+        .has_blocking_completion_gates()
+}
+
+fn contradiction_checked_final_answer(
+    final_answer: &str,
+    terminal_job_state: &str,
+    publication_patch: &PublicationOutcomePatch,
+) -> String {
+    if terminal_job_state != "blocked" {
+        return final_answer.to_string();
+    }
+
+    let normalized = normalize_action_item_text(final_answer);
+    if contains_blocked_terminal_result_language(&normalized) {
+        return final_answer.to_string();
+    }
+
+    let blocker = if publication_patch
+        .browser_verification_status
+        .as_deref()
+        .is_some_and(|status| matches!(status, "failed" | "unavailable" | "not_performed"))
+    {
+        "Browser verification evidence is missing or blocked."
+    } else if publication_patch.cleanup_status.as_deref() == Some("cleanup_required") {
+        "Cleanup is required before completion can be claimed."
+    } else {
+        publication_patch
+            .publication_summary
+            .as_deref()
+            .filter(|summary| !summary.trim().is_empty())
+            .unwrap_or("Required daemon completion gates are unmet.")
+    };
+    if final_answer_is_generic_completion_claim(&normalized) {
+        return format!("Blocked: {blocker}");
+    }
+
+    format!("Blocked: {blocker}\n\n{final_answer}")
+}
+
+fn final_answer_is_generic_completion_claim(normalized: &str) -> bool {
+    matches!(
+        normalized.trim_matches(|character: char| {
+            character.is_ascii_whitespace() || matches!(character, '.' | '!' | ':' | ';')
+        }),
+        "done" | "all set" | "complete" | "completed" | "the work is done" | "work is done"
+    )
 }
 
 fn contains_blocked_terminal_result_language(text: &str) -> bool {
@@ -16541,9 +16648,11 @@ Cleanup status: clean";
             .iter()
             .find(|turn| turn.role == "assistant")
             .expect("assistant turn should persist");
-        assert_eq!(assistant_turn.content, "Published the PR.");
+        assert_eq!(
+            assistant_turn.content,
+            "Blocked: Browser verification evidence is missing or blocked.\n\nPublished the PR."
+        );
         assert!(!assistant_turn.content.contains("publication_status"));
-        assert!(!assistant_turn.content.contains("Browser verification"));
         assert!(!assistant_turn.content.contains("Result:"));
         assert!(!assistant_turn.content.contains("Implementation prompt:"));
 
@@ -16556,14 +16665,16 @@ Cleanup status: clean";
         assert_eq!(detail.job.validation_status, "passed");
         assert_eq!(detail.job.browser_verification_status, "not_performed");
         assert_eq!(detail.job.cleanup_status, "clean");
+        assert_eq!(detail.job.state, "blocked");
+        assert_eq!(detail.job.completion_status, "blocked");
         assert_eq!(detail.artifacts.len(), 1);
         assert_eq!(detail.artifacts[0].kind, "implementation_prompt");
         assert_eq!(detail.artifacts[0].metadata_json["target"], "issue-209");
         let completed = detail
             .events
             .iter()
-            .find(|event| event.event_type == "job.completed")
-            .expect("completion event should persist");
+            .find(|event| event.event_type == "job.blocked")
+            .expect("blocked event should persist");
         assert_eq!(
             completed.data_json["final_response_metadata"]["publication_status"],
             "opened"
@@ -18677,6 +18788,9 @@ Cleanup status: clean";
             validation_status: "not_performed".to_string(),
             cleanup_status: "unknown".to_string(),
             cleanup_paths: Vec::new(),
+            completion_status: String::new(),
+            completion_gates: Vec::new(),
+            completion_blockers: Vec::new(),
             worker_count: 0,
             pending_approval_count: 0,
             artifact_count: 0,
@@ -18742,6 +18856,9 @@ Cleanup status: clean";
             validation_status: "not_performed".to_string(),
             cleanup_status: "unknown".to_string(),
             cleanup_paths: Vec::new(),
+            completion_status: String::new(),
+            completion_gates: Vec::new(),
+            completion_blockers: Vec::new(),
             worker_count: 0,
             pending_approval_count: 0,
             artifact_count: 0,
@@ -22875,6 +22992,9 @@ for line in sys.stdin:
             browser_verification_status: "not_performed".to_string(),
             cleanup_status: "unknown".to_string(),
             cleanup_paths: Vec::new(),
+            completion_status: String::new(),
+            completion_gates: Vec::new(),
+            completion_blockers: Vec::new(),
             worker_count: 1,
             pending_approval_count: 0,
             artifact_count: 0,

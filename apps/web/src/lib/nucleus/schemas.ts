@@ -142,6 +142,14 @@ export const toolCapabilitySummarySchema = z.object({
   scope_kind: z.string()
 });
 
+export const completionGateSummarySchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  state: z.enum(['done', 'pending', 'blocked']).default('pending'),
+  summary: z.string(),
+  evidence: z.array(z.string()).default([])
+});
+
 export const jobSummarySchema = z.object({
   id: z.string(),
   session_id: z.string().nullable(),
@@ -179,6 +187,9 @@ export const jobSummarySchema = z.object({
   validation_status: z.enum(['passed', 'failed', 'not_performed', 'unavailable']).default('not_performed'),
   cleanup_status: z.enum(['clean', 'cleaned', 'cleanup_required', 'unknown']).default('unknown'),
   cleanup_paths: z.array(z.string()).default([]),
+  completion_status: z.enum(['not_gated', 'pending', 'satisfied', 'blocked']).default('not_gated'),
+  completion_gates: z.array(completionGateSummarySchema).default([]),
+  completion_blockers: z.array(z.string()).default([]),
   worker_count: z.number().int().nonnegative(),
   pending_approval_count: z.number().int().nonnegative(),
   artifact_count: z.number().int().nonnegative(),
@@ -1259,6 +1270,7 @@ export type SessionTurn = z.infer<typeof sessionTurnSchema>;
 export type SessionDetail = z.infer<typeof sessionDetailSchema>;
 export type PolicyDecisionSummary = z.infer<typeof policyDecisionSummarySchema>;
 export type ToolCapabilitySummary = z.infer<typeof toolCapabilitySummarySchema>;
+export type CompletionGateSummary = z.infer<typeof completionGateSummarySchema>;
 export type JobSummary = z.infer<typeof jobSummarySchema>;
 export type WorkerSummary = z.infer<typeof workerSummarySchema>;
 export type ToolCallSummary = z.infer<typeof toolCallSummarySchema>;
