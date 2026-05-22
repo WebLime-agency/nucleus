@@ -7711,8 +7711,18 @@ fn apply_job_evidence_rollups(connection: &Connection, job: &mut JobSummary) -> 
         if is_successful_tool_status(&status) {
             if is_research_tool(&tool_text) {
                 evidence.push(format!("fresh_sources:{tool_id}"));
-                evidence.push(format!("source_quality:{tool_id}"));
-                evidence.push(format!("contradictions:{tool_id}"));
+                if tool_text.contains("source quality")
+                    || tool_text.contains("primary source")
+                    || tool_text.contains("quality check")
+                {
+                    evidence.push(format!("source_quality:{tool_id}"));
+                }
+                if tool_text.contains("contradiction")
+                    || tool_text.contains("cross-check")
+                    || tool_text.contains("alternate source")
+                {
+                    evidence.push(format!("contradictions:{tool_id}"));
+                }
             }
             if is_automation_tool(&tool_text) {
                 evidence.push(format!("schedule_state:{tool_id}"));
@@ -10624,6 +10634,87 @@ and open a pull request to dev when it is ready."
             assert_eq!(job.completion_status, "satisfied", "{task_class}");
             assert!(!job.task_evidence.is_empty());
         }
+
+        let research_tool_only = store
+            .create_job(JobRecord {
+                id: "research-tool-only-job".to_string(),
+                session_id: Some("task-class-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("research".to_string()),
+                title: "Research tool only job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "research a topic".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("research tool-only job should persist");
+        store
+            .create_worker(WorkerRecord {
+                id: "research-tool-only-worker".to_string(),
+                job_id: research_tool_only.id.clone(),
+                parent_worker_id: None,
+                title: "Research tool-only worker".to_string(),
+                lane: "utility".to_string(),
+                state: "completed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "cx/gpt-5.4".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: std::env::temp_dir().display().to_string(),
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                max_steps: 8,
+                max_tool_calls: 8,
+                max_wall_clock_secs: 60,
+            })
+            .expect("research tool-only worker should persist");
+        store
+            .create_tool_call(ToolCallRecord {
+                id: "research-tool-only-call".to_string(),
+                job_id: research_tool_only.id.clone(),
+                worker_id: "research-tool-only-worker".to_string(),
+                tool_id: "web.search".to_string(),
+                status: "success".to_string(),
+                summary: "captured search results".to_string(),
+                args_json: json!({}),
+                result_json: Some(json!({ "ok": true })),
+                policy_decision: None,
+                artifact_ids: Vec::new(),
+                error_class: String::new(),
+                error_detail: String::new(),
+                started_at: None,
+                completed_at: None,
+            })
+            .expect("research tool-only call should persist");
+        let research_tool_only = store
+            .get_job(&research_tool_only.id)
+            .expect("research tool-only job should load")
+            .job;
+        assert_eq!(research_tool_only.completion_status, "blocked");
+        assert!(
+            research_tool_only
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("fresh_sources:"))
+        );
+        assert!(
+            !research_tool_only
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("source_quality:"))
+        );
+        assert!(
+            !research_tool_only
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("contradictions:"))
+        );
 
         let local_project = store
             .create_job(JobRecord {

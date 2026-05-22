@@ -5940,7 +5940,8 @@ fn publication_outcome_patch_with_metadata(
     _step_count: usize,
     _tool_call_count: usize,
 ) -> PublicationOutcomePatch {
-    if !current.publication_requested {
+    let explicit_github_pr = current.task_class.as_deref() == Some("github_pr");
+    if !current.publication_requested && !explicit_github_pr {
         return PublicationOutcomePatch::default();
     }
 
@@ -16393,6 +16394,33 @@ Cleanup status: clean";
             Some("not_performed")
         );
         assert_eq!(patch.cleanup_status.as_deref(), Some("clean"));
+    }
+
+    #[test]
+    fn publication_outcome_patch_honors_explicit_github_pr_task_class() {
+        let mut job = test_publication_job_summary("explicit-github-pr-publication");
+        job.publication_requested = false;
+        job.task_class = Some("github_pr".to_string());
+        job.publication_status = "not_requested".to_string();
+
+        let patch = publication_outcome_patch(
+            &job,
+            "Opened PR",
+            "Publication status: opened\n\
+PR URL: https://github.com/WebLime-agency/nucleus/pull/275\n\
+Validation status: passed\n\
+Cleanup status: clean",
+            10,
+            5,
+        );
+
+        assert_eq!(patch.publication_requested, Some(true));
+        assert_eq!(patch.publication_status.as_deref(), Some("opened"));
+        assert_eq!(
+            patch.pr_url.as_deref(),
+            Some("https://github.com/WebLime-agency/nucleus/pull/275")
+        );
+        assert_eq!(patch.validation_status.as_deref(), Some("passed"));
     }
 
     #[test]
