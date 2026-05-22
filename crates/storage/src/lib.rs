@@ -7721,7 +7721,7 @@ fn apply_job_evidence_rollups(connection: &Connection, job: &mut JobSummary) -> 
                 evidence.push(format!("operation_result:{tool_id}"));
             }
         } else if status == "failed" {
-            evidence.push(format!("failed_command:{tool_id}"));
+            evidence.push(format!("failed_tool:{tool_id}"));
         }
     }
 
@@ -7759,7 +7759,7 @@ fn apply_job_evidence_rollups(connection: &Connection, job: &mut JobSummary) -> 
             evidence.push(format!("health:{}", event.summary));
             evidence.push(format!("health_or_logs:{}", event.summary));
         }
-        if event_text.contains("memory") || event_text.contains("session") {
+        if is_memory_operation_event(&event_text) {
             evidence.push(format!("operation_result:{}", event.summary));
         }
         if event_text.contains("process")
@@ -7877,9 +7877,27 @@ fn is_automation_tool(text: &str) -> bool {
 }
 
 fn is_memory_tool(text: &str) -> bool {
-    ["memory", "session", "knowledge"]
+    ["memory", "remember", "knowledge"]
         .iter()
         .any(|needle| text.contains(needle))
+}
+
+fn is_memory_operation_event(text: &str) -> bool {
+    text.contains("memory")
+        && contains_any(
+            text,
+            &[
+                "accepted",
+                "created",
+                "delete",
+                "deleted",
+                "operation",
+                "receipt",
+                "saved",
+                "superseded",
+                "write",
+            ],
+        )
 }
 
 fn usage_for_session(connection: &Connection, session_id: &str) -> Result<UsageTotals> {
@@ -10610,6 +10628,125 @@ and open a pull request to dev when it is ready."
             )
             .expect("validation status should persist");
         assert_eq!(local_project.completion_status, "satisfied");
+
+        let failed_tool_job = store
+            .create_job(JobRecord {
+                id: "local-project-failed-tool-job".to_string(),
+                session_id: Some("task-class-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("local_project".to_string()),
+                title: "Local project with failed tool".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "prompt".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("local project failed-tool job should persist");
+        store
+            .create_worker(WorkerRecord {
+                id: "local-project-failed-tool-worker".to_string(),
+                job_id: failed_tool_job.id.clone(),
+                parent_worker_id: None,
+                title: "Failed tool worker".to_string(),
+                lane: "utility".to_string(),
+                state: "completed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "cx/gpt-5.4".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: std::env::temp_dir().display().to_string(),
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                max_steps: 8,
+                max_tool_calls: 8,
+                max_wall_clock_secs: 60,
+            })
+            .expect("worker should persist");
+        store
+            .create_tool_call(ToolCallRecord {
+                id: "local-project-failed-tool-call".to_string(),
+                job_id: failed_tool_job.id.clone(),
+                worker_id: "local-project-failed-tool-worker".to_string(),
+                tool_id: "browser.snapshot".to_string(),
+                status: "failed".to_string(),
+                summary: "browser snapshot failed".to_string(),
+                args_json: json!({}),
+                result_json: None,
+                policy_decision: None,
+                artifact_ids: Vec::new(),
+                error_class: "transient".to_string(),
+                error_detail: "snapshot unavailable".to_string(),
+                started_at: None,
+                completed_at: None,
+            })
+            .expect("failed tool call should persist");
+        let failed_tool_job = store
+            .update_job(
+                &failed_tool_job.id,
+                JobPatch {
+                    validation_status: Some("passed".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("validation status should persist after failed tool");
+        assert_eq!(failed_tool_job.completion_status, "satisfied");
+        assert!(
+            failed_tool_job
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("failed_tool:"))
+        );
+        assert!(
+            !failed_tool_job
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("failed_command:"))
+        );
+
+        let memory_generic_session_event = store
+            .create_job(JobRecord {
+                id: "memory-generic-session-event-job".to_string(),
+                session_id: Some("task-class-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("memory_session".to_string()),
+                title: "Memory generic session event job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "prompt".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("memory generic event job should persist");
+        store
+            .append_job_event(JobEventRecord {
+                job_id: memory_generic_session_event.id.clone(),
+                worker_id: None,
+                event_type: "session.updated".to_string(),
+                status: "success".to_string(),
+                summary: "session title updated".to_string(),
+                detail: "generic session event without memory mutation".to_string(),
+                data_json: json!({}),
+            })
+            .expect("generic session event should persist");
+        let memory_generic_session_event = store
+            .get_job(&memory_generic_session_event.id)
+            .expect("memory generic event job should load")
+            .job;
+        assert_eq!(memory_generic_session_event.completion_status, "blocked");
+        assert!(
+            !memory_generic_session_event
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("operation_result:"))
+        );
 
         let blocked = store
             .create_job(JobRecord {
