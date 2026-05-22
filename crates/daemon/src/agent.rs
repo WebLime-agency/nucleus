@@ -1721,10 +1721,7 @@ fn wait_condition_satisfied(
                     return Ok(false);
                 }
                 let detail = state.store.get_job(job_id)?;
-                if !matches!(
-                    detail.job.state.as_str(),
-                    "completed" | "failed" | "canceled"
-                ) {
+                if !is_terminal_job_state(&detail.job.state) {
                     return Ok(false);
                 }
             }
@@ -1859,10 +1856,7 @@ async fn complete_wait_with_wall_clock_budget(
     wait: &WorkerWaitRecord,
 ) -> Result<()> {
     let detail = state.store.get_job(&worker.job_id)?;
-    if matches!(
-        detail.job.state.as_str(),
-        "completed" | "failed" | "canceled"
-    ) {
+    if is_terminal_job_state(&detail.job.state) {
         return Ok(());
     }
     let session_id = detail.job.session_id.clone().ok_or_else(|| {
@@ -1917,10 +1911,7 @@ async fn resume_waiting_worker(
     event_type: &str,
 ) -> Result<()> {
     let detail = state.store.get_job(&worker.job_id)?;
-    if matches!(
-        detail.job.state.as_str(),
-        "completed" | "failed" | "canceled"
-    ) {
+    if is_terminal_job_state(&detail.job.state) {
         return Ok(());
     }
     let session_id = detail.job.session_id.clone().ok_or_else(|| {
@@ -2359,10 +2350,7 @@ async fn run_job_loop(
         }
 
         session = state.store.get_session(&session_id)?;
-        if matches!(
-            state.store.get_job(job_id)?.job.state.as_str(),
-            "completed" | "failed" | "canceled"
-        ) {
+        if is_terminal_job_state(&state.store.get_job(job_id)?.job.state) {
             return Ok(());
         }
         if let LoopDisposition::Return = handle_pending_action(
@@ -3084,12 +3072,9 @@ async fn handle_pending_action(
             .iter()
             .map(|child_job_id| state.store.get_job(child_job_id))
             .collect::<Result<Vec<_>>>()?;
-        let all_complete = child_details.iter().all(|detail| {
-            matches!(
-                detail.job.state.as_str(),
-                "completed" | "failed" | "canceled"
-            )
-        });
+        let all_complete = child_details
+            .iter()
+            .all(|detail| is_terminal_job_state(&detail.job.state));
         if all_complete {
             let results = child_details
                 .iter()
@@ -8151,12 +8136,7 @@ async fn execute_pending_tool_action(
         .await?;
     }
 
-    if *cancel_rx.borrow()
-        || matches!(
-            state.store.get_job(job_id)?.job.state.as_str(),
-            "completed" | "failed" | "canceled"
-        )
-    {
+    if *cancel_rx.borrow() || is_terminal_job_state(&state.store.get_job(job_id)?.job.state) {
         let _ = state.store.update_tool_call(
             &pending.tool_call_id,
             ToolCallPatch {
@@ -12814,6 +12794,10 @@ async fn fail_job(state: &AppState, job_id: &str, error: &str) -> Result<()> {
 
 fn is_non_terminal_job_state(state: &str) -> bool {
     matches!(state, "queued" | "running" | "paused" | "waiting")
+}
+
+fn is_terminal_job_state(state: &str) -> bool {
+    matches!(state, "completed" | "blocked" | "failed" | "canceled")
 }
 
 async fn reconcile_failed_job_command_sessions(
@@ -21145,11 +21129,11 @@ Cleanup status: clean";
             "waiting"
         );
 
-        mark_job_state(&state, &child_ids[2], "completed");
-        let event = DaemonEvent::JobCompleted(state.store.get_job(&child_ids[2]).unwrap().job);
+        mark_job_state(&state, &child_ids[2], "blocked");
+        let event = DaemonEvent::JobUpdated(state.store.get_job(&child_ids[2]).unwrap().job);
         process_waiting_workers(&state, Some(&event))
             .await
-            .expect("last terminal child should wake parent");
+            .expect("blocked terminal child should wake parent");
 
         let parent = wait_for_job_state(&state, &parent_job_id, "completed").await;
         server.await.expect("test server should finish");
@@ -21340,6 +21324,22 @@ Cleanup status: clean";
                 publication_intent_text: None,
             })
             .expect("child job should persist");
+        let child_blocked = state
+            .store
+            .create_job(JobRecord {
+                id: "child-blocked".to_string(),
+                state: "blocked".to_string(),
+                title: "Child blocked".to_string(),
+                purpose: "blocked".to_string(),
+                requested_by: "agent".to_string(),
+                trigger_kind: "child_job".to_string(),
+                session_id: Some(session_id.clone()),
+                parent_job_id: None,
+                template_id: None,
+                prompt_excerpt: String::new(),
+                publication_intent_text: None,
+            })
+            .expect("child job should persist");
         let child_artifact = state
             .store
             .create_job_artifact(JobArtifactRecord {
@@ -21391,6 +21391,17 @@ Cleanup status: clean";
                 now + WAIT_CHILD_JOB_POLL_INTERVAL_SECS as i64,
             )
             .expect("child wait should evaluate")
+        );
+        assert!(
+            wait_condition_satisfied(
+                &state,
+                &test_wait(WaitUntil::ChildJobsCompleted {
+                    job_ids: vec![child_done.id.clone(), child_blocked.id.clone()]
+                }),
+                None,
+                now + WAIT_CHILD_JOB_POLL_INTERVAL_SECS as i64,
+            )
+            .expect("blocked child wait should evaluate")
         );
         assert!(
             wait_condition_satisfied(
