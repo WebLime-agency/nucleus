@@ -1,9 +1,9 @@
 use std::{collections::BTreeSet, error::Error, fmt};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkerAction {
     ToolCall {
@@ -20,6 +20,14 @@ pub enum WorkerAction {
         summary: String,
         detail: String,
     },
+    Wait {
+        summary: String,
+        until: WaitUntil,
+        #[serde(default)]
+        max_wait_seconds: Option<u64>,
+        #[serde(default)]
+        wake_note: Option<String>,
+    },
     FinalAnswer {
         summary: String,
         final_answer: String,
@@ -32,14 +40,40 @@ pub enum WorkerAction {
     },
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WaitUntil {
+    DelaySeconds {
+        delay_seconds: u64,
+    },
+    AbsoluteUnix {
+        absolute_unix: i64,
+    },
+    AuditEvent {
+        event_kind: String,
+        #[serde(default)]
+        target_pattern: Option<String>,
+        #[serde(default)]
+        status: Option<String>,
+    },
+    ChildJobsCompleted {
+        job_ids: Vec<String>,
+    },
+    ArtifactKind {
+        job_id: String,
+        #[serde(alias = "artifact_kind")]
+        artifact_kind: String,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ChildJobProposal {
     pub title: String,
     pub prompt: String,
     pub working_dir: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct BrowserVerificationClaim {
     pub status: String,
     #[serde(default)]
@@ -48,7 +82,7 @@ pub struct BrowserVerificationClaim {
     pub artifact_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct FinalAnswerArtifact {
     pub kind: String,
     pub title: String,
@@ -2100,5 +2134,34 @@ mod tests {
         assert_eq!(args["type"], "issue");
         assert_eq!(args["id"], "123");
         assert_eq!(args["title"], "Fix login");
+    }
+
+    #[test]
+    fn wait_until_variants_round_trip() {
+        let variants = vec![
+            WaitUntil::DelaySeconds { delay_seconds: 2 },
+            WaitUntil::AbsoluteUnix {
+                absolute_unix: 1_900_000_000,
+            },
+            WaitUntil::AuditEvent {
+                event_kind: "memory.classifier.completed".to_string(),
+                target_pattern: Some("session:abc".to_string()),
+                status: Some("success".to_string()),
+            },
+            WaitUntil::ChildJobsCompleted {
+                job_ids: vec!["job-a".to_string(), "job-b".to_string()],
+            },
+            WaitUntil::ArtifactKind {
+                job_id: "job-a".to_string(),
+                artifact_kind: "child-report".to_string(),
+            },
+        ];
+
+        for until in variants {
+            let encoded = serde_json::to_string(&until).expect("wait until should serialize");
+            let decoded: WaitUntil =
+                serde_json::from_str(&encoded).expect("wait until should deserialize");
+            assert_eq!(decoded, until);
+        }
     }
 }

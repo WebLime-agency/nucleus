@@ -296,6 +296,8 @@ pub struct WorkerPatch {
     pub provider_session_id: Option<String>,
     pub step_count: Option<usize>,
     pub tool_call_count: Option<usize>,
+    pub wait_until_json: Option<Option<serde_json::Value>>,
+    pub wait_started_at: Option<Option<i64>>,
     pub last_error: Option<String>,
 }
 
@@ -1964,6 +1966,11 @@ impl StateStore {
         list_audit_events_with_connection(&connection, limit)
     }
 
+    pub fn list_audit_events_since(&self, started_at: i64) -> Result<Vec<AuditEvent>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_audit_events_since_with_connection(&connection, started_at)
+    }
+
     pub fn append_audit_event(&self, record: AuditEventRecord) -> Result<AuditEvent> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         connection.execute(
@@ -2076,6 +2083,11 @@ impl StateStore {
         list_jobs_by_state_with_connection(&connection, states)
     }
 
+    pub fn list_workers_by_state(&self, states: &[&str]) -> Result<Vec<WorkerSummary>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_workers_by_state_with_connection(&connection, states)
+    }
+
     pub fn list_pending_approvals(&self) -> Result<Vec<ApprovalRequestSummary>> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         list_pending_approvals_with_connection(&connection)
@@ -2089,6 +2101,18 @@ impl StateStore {
     pub fn get_job(&self, job_id: &str) -> Result<JobDetail> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         load_job_detail(&connection, job_id)
+    }
+
+    pub fn job_exists(&self, job_id: &str) -> Result<bool> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE id = ?1)",
+                params![job_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count != 0)
+            .context("failed to check job existence")
     }
 
     pub fn list_command_sessions_by_state(
@@ -2330,6 +2354,18 @@ impl StateStore {
     pub fn update_worker(&self, worker_id: &str, patch: WorkerPatch) -> Result<WorkerSummary> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         let current = load_worker_summary(&connection, worker_id)?;
+        let wait_until_json = match patch.wait_until_json {
+            Some(Some(value)) => {
+                Some(serde_json::to_string(&value).context("failed to serialize worker wait")?)
+            }
+            Some(None) => None,
+            None => current
+                .wait_until_json
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .context("failed to serialize existing worker wait")?,
+        };
         connection.execute(
             "
             UPDATE job_workers
@@ -2344,7 +2380,9 @@ impl StateStore {
                 provider_session_id = ?9,
                 step_count = ?10,
                 tool_call_count = ?11,
-                last_error = ?12,
+                wait_until_json = ?12,
+                wait_started_at = ?13,
+                last_error = ?14,
                 updated_at = unixepoch()
             WHERE id = ?1
             ",
@@ -2362,6 +2400,8 @@ impl StateStore {
                     .unwrap_or(current.provider_session_id),
                 patch.step_count.unwrap_or(current.step_count) as i64,
                 patch.tool_call_count.unwrap_or(current.tool_call_count) as i64,
+                wait_until_json,
+                patch.wait_started_at.unwrap_or(current.wait_started_at),
                 patch.last_error.unwrap_or(current.last_error),
             ],
         )?;
@@ -3050,6 +3090,8 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             max_wall_clock_secs INTEGER NOT NULL DEFAULT 600,
             step_count INTEGER NOT NULL DEFAULT 0,
             tool_call_count INTEGER NOT NULL DEFAULT 0,
+            wait_until_json TEXT,
+            wait_started_at INTEGER,
             last_error TEXT NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
@@ -3847,6 +3889,8 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "images_json",
         "TEXT NOT NULL DEFAULT '[]'",
     )?;
+    ensure_column(connection, "job_workers", "wait_until_json", "TEXT")?;
+    ensure_column(connection, "job_workers", "wait_started_at", "INTEGER")?;
     ensure_column(
         connection,
         "job_artifacts",
@@ -6590,6 +6634,24 @@ fn list_audit_events_with_connection(
         .context("failed to load audit events")
 }
 
+fn list_audit_events_since_with_connection(
+    connection: &Connection,
+    started_at: i64,
+) -> Result<Vec<AuditEvent>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id, kind, target, status, summary, detail, created_at
+        FROM audit_events
+        WHERE created_at > ?1
+        ORDER BY id DESC
+        ",
+    )?;
+
+    let rows = statement.query_map(params![started_at], map_audit_event)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load audit events since timestamp")
+}
+
 fn load_audit_event(connection: &Connection, event_id: i64) -> Result<AuditEvent> {
     connection
         .query_row(
@@ -7109,6 +7171,36 @@ fn load_workers_for_job(connection: &Connection, job_id: &str) -> Result<Vec<Wor
         .collect()
 }
 
+fn list_workers_by_state_with_connection(
+    connection: &Connection,
+    states: &[&str],
+) -> Result<Vec<WorkerSummary>> {
+    if states.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = (0..states.len())
+        .map(|index| format!("?{}", index + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "
+        SELECT id
+        FROM job_workers
+        WHERE state IN ({placeholders})
+        ORDER BY created_at ASC, id ASC
+        "
+    );
+    let params = rusqlite::params_from_iter(states.iter().copied());
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(params, |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load workers by state")?
+        .into_iter()
+        .map(|worker_id| load_worker_summary(connection, &worker_id))
+        .collect()
+}
+
 fn load_worker_summary(connection: &Connection, worker_id: &str) -> Result<WorkerSummary> {
     let mut worker = connection
         .query_row(
@@ -7133,6 +7225,8 @@ fn load_worker_summary(connection: &Connection, worker_id: &str) -> Result<Worke
                 max_wall_clock_secs,
                 step_count,
                 tool_call_count,
+                wait_until_json,
+                wait_started_at,
                 last_error,
                 created_at,
                 updated_at
@@ -7161,11 +7255,13 @@ fn load_worker_summary(connection: &Connection, worker_id: &str) -> Result<Worke
                     max_wall_clock_secs: row.get::<_, i64>(16)?.max(0) as u64,
                     step_count: row.get::<_, i64>(17)?.max(0) as usize,
                     tool_call_count: row.get::<_, i64>(18)?.max(0) as usize,
-                    last_error: row.get(19)?,
+                    wait_until_json: decode_optional_json_column(row, 19)?,
+                    wait_started_at: row.get(20)?,
+                    last_error: row.get(21)?,
                     user_error: None,
                     capabilities: Vec::new(),
-                    created_at: row.get(20)?,
-                    updated_at: row.get(21)?,
+                    created_at: row.get(22)?,
+                    updated_at: row.get(23)?,
                 })
             },
         )
@@ -7626,6 +7722,14 @@ fn decode_json_value(value: String) -> rusqlite::Result<serde_json::Value> {
             Box::new(error),
         )
     })
+}
+
+fn decode_optional_json_column(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<serde_json::Value>> {
+    let value: Option<String> = row.get(index)?;
+    value.map(decode_json_value).transpose()
 }
 
 fn decode_policy_decision(value: String) -> rusqlite::Result<PolicyDecisionSummary> {
