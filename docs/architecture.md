@@ -82,6 +82,8 @@ The state directory stores larger or local-only artifacts such as:
 
 Instance logs are product support/debugging events owned by the daemon. They are written as structured JSONL under `<state-dir>/logs/events.jsonl`, indexed in SQLite for authenticated Workspace -> Logs APIs, redacted before persistence, and kept out of prompt context.
 
+Parallel parent/child Utility Worker orchestration uses the daemon job model. See [Parallel Fan-Out](parallel-fan-out.md) for the worktree-per-child pattern, cancellation semantics, and child report aggregation contract.
+
 ## Context Model
 
 There are two layers of durable context:
