@@ -2525,41 +2525,46 @@ impl StateStore {
             .unwrap_or_else(|| current.cleanup_paths.clone());
         let cleanup_paths_json =
             serde_json::to_string(&cleanup_paths).context("failed to serialize cleanup paths")?;
+        let current_task_class_cleared = job_task_class_cleared(&connection, job_id)?;
+        let (next_task_class, next_task_class_cleared) = match patch.task_class {
+            Some(Some(value)) => (normalize_task_class(Some(&value)), false),
+            Some(None) => (None, true),
+            None => (current.task_class.clone(), current_task_class_cleared),
+        };
         connection.execute(
             "
             UPDATE jobs
             SET
                 state = ?2,
                 task_class = ?3,
-                root_worker_id = ?4,
-                visible_turn_id = ?5,
-                result_summary = ?6,
-                last_error = ?7,
-                ui_renderable = ?8,
-                browser_verification_required = ?9,
-                browser_verification_status = ?10,
-                browser_verification_summary = ?11,
-                browser_verification_artifact_ids_json = ?12,
-                publication_requested = ?13,
-                publication_status = ?14,
-                publication_summary = ?15,
-                pr_url = ?16,
-                source_branch = ?17,
-                target_branch = ?18,
-                validation_status = ?19,
-                cleanup_status = ?20,
-                cleanup_paths_json = ?21,
-                last_resumed_at = ?22,
+                task_class_cleared = ?4,
+                root_worker_id = ?5,
+                visible_turn_id = ?6,
+                result_summary = ?7,
+                last_error = ?8,
+                ui_renderable = ?9,
+                browser_verification_required = ?10,
+                browser_verification_status = ?11,
+                browser_verification_summary = ?12,
+                browser_verification_artifact_ids_json = ?13,
+                publication_requested = ?14,
+                publication_status = ?15,
+                publication_summary = ?16,
+                pr_url = ?17,
+                source_branch = ?18,
+                target_branch = ?19,
+                validation_status = ?20,
+                cleanup_status = ?21,
+                cleanup_paths_json = ?22,
+                last_resumed_at = ?23,
                 updated_at = unixepoch()
             WHERE id = ?1
             ",
             params![
                 job_id,
                 next_state,
-                match patch.task_class {
-                    Some(value) => value.and_then(|value| normalize_task_class(Some(&value))),
-                    None => current.task_class,
-                },
+                next_task_class,
+                bool_to_i64(next_task_class_cleared),
                 patch.root_worker_id.or(current.root_worker_id),
                 patch.visible_turn_id.or(current.visible_turn_id),
                 patch.result_summary.unwrap_or(current.result_summary),
@@ -3413,6 +3418,7 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             parent_job_id TEXT REFERENCES jobs(id) ON DELETE CASCADE,
             template_id TEXT,
             task_class TEXT,
+            task_class_cleared INTEGER NOT NULL DEFAULT 0,
             title TEXT NOT NULL,
             purpose TEXT NOT NULL DEFAULT '',
             trigger_kind TEXT NOT NULL DEFAULT 'session_prompt',
@@ -4334,6 +4340,12 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
     ensure_column(
         connection,
         "jobs",
+        "task_class_cleared",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
         "ui_renderable",
         "TEXT NOT NULL DEFAULT 'unknown'",
     )?;
@@ -5021,10 +5033,22 @@ fn assign_task_class_if_missing(
         SET task_class = ?2, updated_at = unixepoch()
         WHERE id = ?1
           AND (task_class IS NULL OR task_class = '')
+          AND COALESCE(task_class_cleared, 0) = 0
         ",
         params![job_id, task_class],
     )?;
     Ok(())
+}
+
+fn job_task_class_cleared(connection: &Connection, job_id: &str) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT COALESCE(task_class_cleared, 0) FROM jobs WHERE id = ?1",
+            params![job_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .context("failed to load job task class clear state")
 }
 
 fn publication_segment_requests_publication(text: &str) -> bool {
@@ -7616,12 +7640,13 @@ fn count_jobs_for_template(connection: &Connection, template_id: &str) -> Result
 }
 
 fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> {
+    let task_class = row.get::<_, Option<String>>(4)?;
     Ok(JobSummary {
         id: row.get(0)?,
         session_id: row.get(1)?,
         parent_job_id: row.get(2)?,
         template_id: row.get(3)?,
-        task_class: row.get(4)?,
+        task_class: normalize_task_class(task_class.as_deref()),
         title: row.get(5)?,
         purpose: row.get(6)?,
         trigger_kind: row.get(7)?,
@@ -7704,13 +7729,15 @@ fn apply_job_evidence_rollups(connection: &Connection, job: &mut JobSummary) -> 
         let command_text = command_session_text(&command_session.command, &command_session.args);
         let label = command_evidence_label(&command_session);
         if command_session.state == "completed" && command_session.exit_code == Some(0) {
+            let is_deployment_command =
+                is_deployment_command_session(&command_session.command, &command_session.args);
             if is_validation_command(&command_text) {
                 evidence.push(format!("validation:{label}"));
             }
-            if is_deployment_command_session(&command_session.command, &command_session.args) {
+            if is_deployment_command {
                 evidence.push(format!("deployment_status:{label}"));
             }
-            if is_version_command(&command_text) {
+            if !is_deployment_command && is_version_command(&command_text) {
                 evidence.push(format!("version:{label}"));
             }
             if is_health_command(&command_text) {
@@ -8010,17 +8037,9 @@ fn is_deployment_command_session(command: &str, args: &[String]) -> bool {
 
 fn is_version_command(text: &str) -> bool {
     let phrase_text = command_phrase_text(text);
-    [
-        "artifact",
-        "rev parse",
-        "sha",
-        "tag",
-        "tagname",
-        "tags",
-        "version",
-    ]
-    .iter()
-    .any(|phrase| command_phrase_contains(&phrase_text, phrase))
+    ["artifact", "rev parse", "sha", "tagname", "version"]
+        .iter()
+        .any(|phrase| command_phrase_contains(&phrase_text, phrase))
 }
 
 fn is_health_command(text: &str) -> bool {
@@ -10988,6 +11007,15 @@ and open a pull request to dev when it is ready."
                 vec!["deploy".to_string()],
             ),
             (
+                "deployment-tagged-command-session",
+                "wrangler",
+                vec![
+                    "deploy".to_string(),
+                    "--tag".to_string(),
+                    "staging".to_string(),
+                ],
+            ),
+            (
                 "git-status-command-session",
                 "git",
                 vec!["status".to_string()],
@@ -11051,6 +11079,13 @@ and open a pull request to dev when it is ready."
                 .iter()
                 .any(|evidence| evidence.starts_with("health:")),
             "git status should not satisfy deployment health evidence"
+        );
+        assert!(
+            !deployment_with_git_status
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("version:")),
+            "deploy tagging flags should not satisfy deployment version evidence"
         );
         assert!(
             deployment_with_git_status
@@ -11373,6 +11408,64 @@ and open a pull request to dev when it is ready."
             .expect("task class clear should persist");
         assert_eq!(cleared.task_class, None);
         assert_eq!(cleared.completion_status, "not_gated");
+        store
+            .create_worker(WorkerRecord {
+                id: "clear-task-class-worker".to_string(),
+                job_id: cleared.id.clone(),
+                parent_worker_id: None,
+                title: "Clear task class worker".to_string(),
+                lane: "utility".to_string(),
+                state: "completed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "cx/gpt-5.4".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: std::env::temp_dir().display().to_string(),
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                max_steps: 8,
+                max_tool_calls: 8,
+                max_wall_clock_secs: 60,
+            })
+            .expect("clear task class worker should persist");
+        store
+            .create_command_session(CommandSessionRecord {
+                id: "clear-task-class-command".to_string(),
+                job_id: cleared.id.clone(),
+                worker_id: "clear-task-class-worker".to_string(),
+                tool_call_id: None,
+                mode: "exec".to_string(),
+                title: "cargo check".to_string(),
+                state: "completed".to_string(),
+                command: "cargo".to_string(),
+                args: vec!["check".to_string()],
+                cwd: std::env::temp_dir().display().to_string(),
+                session_id: "task-class-session".to_string(),
+                project_id: String::new(),
+                worktree_path: std::env::temp_dir().display().to_string(),
+                branch: "dev".to_string(),
+                port: None,
+                env_json: json!({}),
+                network_policy: "none".to_string(),
+                timeout_secs: 60,
+                output_limit_bytes: 1024,
+                last_error: String::new(),
+                exit_code: Some(0),
+                stdout_artifact_id: None,
+                stderr_artifact_id: None,
+                started_at: None,
+                completed_at: None,
+            })
+            .expect("clear task class command should persist");
+        let cleared = store
+            .get_job(&cleared.id)
+            .expect("cleared job should reload")
+            .job;
+        assert_eq!(cleared.task_class, None);
+        assert_eq!(cleared.completion_status, "not_gated");
 
         let _ = fs::remove_dir_all(&state_dir);
     }
@@ -11406,6 +11499,14 @@ and open a pull request to dev when it is ready."
         assert!(!is_version_command(&command_session_text(
             "vercel",
             &["deploy".to_string(), "--target=staging".to_string()]
+        )));
+        assert!(!is_version_command(&command_session_text(
+            "wrangler",
+            &[
+                "deploy".to_string(),
+                "--tag".to_string(),
+                "staging".to_string()
+            ]
         )));
         assert!(is_version_command(&command_session_text(
             "git",
