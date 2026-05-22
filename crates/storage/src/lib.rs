@@ -4958,6 +4958,22 @@ fn contains_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
 }
 
+fn command_tokens(text: &str) -> Vec<&str> {
+    text.split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn command_phrase_text(text: &str) -> String {
+    format!(" {} ", command_tokens(text).join(" "))
+}
+
+fn has_command_token(text: &str, needles: &[&str]) -> bool {
+    command_tokens(text)
+        .iter()
+        .any(|token| needles.contains(token))
+}
+
 fn task_class_from_tool_id(tool_id: &str) -> Option<&'static str> {
     let tool_id = tool_id.to_ascii_lowercase();
     if is_research_classification_tool(&tool_id) {
@@ -7843,9 +7859,73 @@ fn command_evidence_label(command_session: &CommandSessionSummary) -> String {
 }
 
 fn is_validation_command(text: &str) -> bool {
-    ["test", "fmt", "clippy", "lint", "check", "build"]
-        .iter()
-        .any(|needle| text.contains(needle))
+    let phrase_text = command_phrase_text(text);
+    [
+        "astro check",
+        "bun run build",
+        "bun run check",
+        "bun run lint",
+        "bun run test",
+        "bun test",
+        "cargo build",
+        "cargo check",
+        "cargo clippy",
+        "cargo fmt",
+        "cargo nextest",
+        "cargo test",
+        "dotnet build",
+        "dotnet test",
+        "eslint",
+        "git diff check",
+        "go build",
+        "go test",
+        "gradle build",
+        "gradle test",
+        "jest",
+        "just build",
+        "just check",
+        "just lint",
+        "just test",
+        "make build",
+        "make check",
+        "make lint",
+        "make test",
+        "mvn package",
+        "mvn test",
+        "next build",
+        "node test",
+        "npm run build",
+        "npm run check",
+        "npm run lint",
+        "npm run test",
+        "npm run typecheck",
+        "npm test",
+        "pnpm build",
+        "pnpm run build",
+        "pnpm run check",
+        "pnpm run lint",
+        "pnpm run test",
+        "pnpm run typecheck",
+        "pnpm test",
+        "pre commit run",
+        "prettier",
+        "pytest",
+        "svelte check",
+        "tsc",
+        "vite build",
+        "vitest",
+        "yarn build",
+        "yarn check",
+        "yarn lint",
+        "yarn run build",
+        "yarn run check",
+        "yarn run lint",
+        "yarn run test",
+        "yarn run typecheck",
+        "yarn test",
+    ]
+    .iter()
+    .any(|phrase| phrase_text.contains(&format!(" {phrase} ")))
 }
 
 fn is_deployment_command(text: &str) -> bool {
@@ -7869,18 +7949,21 @@ fn is_health_command(text: &str) -> bool {
 }
 
 fn is_process_command(text: &str) -> bool {
-    [
-        "serve",
-        "server",
-        "restart",
-        "systemctl",
-        "pm2",
-        "kill",
-        "lsof",
-        "ps ",
-    ]
-    .iter()
-    .any(|needle| text.contains(needle))
+    has_command_token(
+        text,
+        &[
+            "kill",
+            "launchctl",
+            "lsof",
+            "pm2",
+            "ps",
+            "restart",
+            "serve",
+            "server",
+            "supervisorctl",
+            "systemctl",
+        ],
+    )
 }
 
 fn is_successful_tool_status(status: &str) -> bool {
@@ -11134,6 +11217,32 @@ and open a pull request to dev when it is ready."
         assert_eq!(cleared.completion_status, "not_gated");
 
         let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn task_class_command_classifiers_use_command_scoped_tokens() {
+        assert!(!is_validation_command(&command_session_text(
+            "git",
+            &["checkout".to_string(), "check-this-branch".to_string()]
+        )));
+        assert!(!is_validation_command(&command_session_text(
+            "docker",
+            &["build".to_string(), ".".to_string()]
+        )));
+        assert!(is_validation_command(&command_session_text(
+            "cargo",
+            &["check".to_string()]
+        )));
+        assert!(is_validation_command(&command_session_text(
+            "npm",
+            &["run".to_string(), "build:web".to_string()]
+        )));
+        assert!(is_process_command(&command_session_text("ps", &[])));
+        assert_eq!(
+            task_class_from_command("git", &["checkout".to_string()]),
+            None
+        );
+        assert_eq!(task_class_from_command("ps", &[]), Some("process_server"));
     }
 
     #[test]
