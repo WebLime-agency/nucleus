@@ -23,7 +23,7 @@ use nucleus_storage::{
     ApprovalRequestRecord, AuditEventRecord, CommandSessionPatch, CommandSessionRecord,
     JobArtifactPatch, JobArtifactRecord, JobEventRecord, JobPatch, JobRecord, PlaybookPatch,
     PlaybookRecord, PolicyDecisionRecord, SessionPatch, SessionRecord, ToolCallPatch,
-    ToolCallRecord, ToolCapabilityGrantRecord, WorkerPatch, WorkerRecord,
+    ToolCallRecord, ToolCapabilityGrantRecord, WorkerPatch, WorkerRecord, WorkerUsageDelta,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1242,6 +1242,7 @@ pub async fn resume_job(state: AppState, job_id: String) -> Result<JobDetail, Ap
             JobPatch {
                 state: Some("queued".to_string()),
                 last_error: Some(String::new()),
+                last_resumed_at: Some(Some(unix_timestamp())),
                 ..JobPatch::default()
             },
         )?;
@@ -1945,6 +1946,7 @@ async fn resume_waiting_worker(
         JobPatch {
             state: Some("queued".to_string()),
             last_error: Some(String::new()),
+            last_resumed_at: Some(Some(unix_timestamp())),
             ..JobPatch::default()
         },
     )?;
@@ -7202,9 +7204,52 @@ pub(crate) async fn execute_worker_text_turn(
             PromptStreamEvent::ReasoningSnapshot { text } => {
                 let excerpted = excerpt(&text, 240);
                 if excerpted != last_reasoning {
-                    last_reasoning = excerpted;
+                    last_reasoning = excerpted.clone();
+                    match state.store.record_worker_reasoning(
+                        &worker.id,
+                        &excerpted,
+                        unix_timestamp(),
+                    ) {
+                        Ok(summary) => {
+                            publish_worker_updated(state, &summary).await;
+                            if let Ok(detail) = state.store.get_job(&summary.job_id) {
+                                publish_job_updated(state, &detail.job).await;
+                            }
+                            let _ = publish_overview_event(state).await;
+                        }
+                        Err(error) => warn!(
+                            ?error,
+                            worker_id = worker.id.as_str(),
+                            "failed to persist worker reasoning snapshot"
+                        ),
+                    }
                 }
             }
+            PromptStreamEvent::TokenUsage {
+                prompt_tokens,
+                completion_tokens,
+                cached_tokens,
+            } => match state.store.record_worker_usage(
+                &worker.id,
+                WorkerUsageDelta {
+                    prompt_tokens,
+                    completion_tokens,
+                    cached_tokens,
+                },
+            ) {
+                Ok(summary) => {
+                    publish_worker_updated(state, &summary).await;
+                    if let Ok(detail) = state.store.get_job(&summary.job_id) {
+                        publish_job_updated(state, &detail.job).await;
+                    }
+                    let _ = publish_overview_event(state).await;
+                }
+                Err(error) => warn!(
+                    ?error,
+                    worker_id = worker.id.as_str(),
+                    "failed to persist worker token usage"
+                ),
+            },
             PromptStreamEvent::ProviderRetry {
                 attempt,
                 error_class,
@@ -7355,6 +7400,14 @@ fn build_execution_session(worker: &WorkerSummary) -> SessionSummary {
         capabilities: worker.capabilities.clone(),
         last_message_excerpt: String::new(),
         turn_count: 0,
+        last_resumed_at: None,
+        last_reasoning: worker.last_reasoning.clone(),
+        last_reasoning_at: worker.last_reasoning_at,
+        token_usage_known: worker.token_usage_known,
+        prompt_tokens: worker.prompt_tokens,
+        completion_tokens: worker.completion_tokens,
+        cached_tokens: worker.cached_tokens,
+        cost_usd_estimate: worker.cost_usd_estimate,
         created_at: worker.created_at,
         updated_at: worker.updated_at,
     }
@@ -7409,6 +7462,14 @@ pub(crate) async fn resolve_utility_worker_execution_session(
         capabilities: Vec::new(),
         last_message_excerpt: String::new(),
         turn_count: 0,
+        last_resumed_at: None,
+        last_reasoning: String::new(),
+        last_reasoning_at: None,
+        token_usage_known: false,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        cached_tokens: 0,
+        cost_usd_estimate: None,
         created_at: now,
         updated_at: now,
     })
@@ -14104,6 +14165,14 @@ mod tests {
             capabilities: Vec::new(),
             last_message_excerpt: String::new(),
             turn_count: 0,
+            last_resumed_at: None,
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         }
@@ -14454,6 +14523,13 @@ mod tests {
             last_error: String::new(),
             user_error: None,
             capabilities: Vec::new(),
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -14516,6 +14592,13 @@ mod tests {
             last_error: String::new(),
             user_error: None,
             capabilities: Vec::new(),
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -18210,6 +18293,13 @@ Cleanup status: clean";
             last_error: String::new(),
             user_error: None,
             capabilities: Vec::new(),
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -18288,6 +18378,13 @@ Cleanup status: clean";
             last_error: String::new(),
             user_error: None,
             capabilities: Vec::new(),
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -18443,6 +18540,14 @@ Cleanup status: clean";
             worker_count: 0,
             pending_approval_count: 0,
             artifact_count: 0,
+            last_resumed_at: None,
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 1,
             updated_at: 1,
         }];
@@ -18498,6 +18603,14 @@ Cleanup status: clean";
             worker_count: 0,
             pending_approval_count: 0,
             artifact_count: 0,
+            last_resumed_at: None,
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 1,
             updated_at: 1,
         };
@@ -18653,6 +18766,13 @@ Cleanup status: clean";
             last_error: String::new(),
             user_error: None,
             capabilities: Vec::new(),
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -18727,6 +18847,14 @@ Cleanup status: clean";
             capabilities: Vec::new(),
             last_message_excerpt: String::new(),
             turn_count: 0,
+            last_resumed_at: None,
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -18755,6 +18883,13 @@ Cleanup status: clean";
             last_error: String::new(),
             user_error: None,
             capabilities: Vec::new(),
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -18821,6 +18956,14 @@ Cleanup status: clean";
             capabilities: Vec::new(),
             last_message_excerpt: String::new(),
             turn_count: 0,
+            last_resumed_at: None,
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -18889,6 +19032,14 @@ Cleanup status: clean";
             capabilities: Vec::new(),
             last_message_excerpt: String::new(),
             turn_count: 0,
+            last_resumed_at: None,
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -22034,6 +22185,13 @@ for line in sys.stdin:
             last_error: String::new(),
             user_error: None,
             capabilities: Vec::new(),
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         }
@@ -22107,6 +22265,14 @@ for line in sys.stdin:
             worker_count: 1,
             pending_approval_count: 0,
             artifact_count: 0,
+            last_resumed_at: None,
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         }

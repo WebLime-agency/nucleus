@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "NODE_OPTIONS=--max-http-header-size=65536 vite dev",
     "build": "svelte-kit sync && vite build",
-    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json && npm run test",
+    "test": "node --test src/lib/nucleus/*.test.mjs"
   },
   "devDependencies": {
     "@internationalized/date": "^3.12.1",

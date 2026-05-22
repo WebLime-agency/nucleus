@@ -55,6 +55,212 @@ pub struct VaultStateRecord {
     pub updated_at: i64,
 }
 
+#[cfg(test)]
+mod observability_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_state_dir(label: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        std::env::temp_dir().join(format!("nucleus-{label}-{}-{suffix}", std::process::id()))
+    }
+
+    fn session_record(id: &str) -> SessionRecord {
+        SessionRecord {
+            id: id.to_string(),
+            title: "Session".to_string(),
+            profile_id: String::new(),
+            profile_title: String::new(),
+            route_id: String::new(),
+            route_title: String::new(),
+            scope: "ad_hoc".to_string(),
+            project_id: String::new(),
+            project_title: String::new(),
+            project_path: String::new(),
+            project_ids: Vec::new(),
+            provider: "openai_compatible".to_string(),
+            model: "gpt-5.4-mini".to_string(),
+            provider_base_url: String::new(),
+            provider_api_key: String::new(),
+            working_dir: std::env::temp_dir().display().to_string(),
+            working_dir_kind: "workspace_scratch".to_string(),
+            workspace_mode: "scratch_only".to_string(),
+            source_project_path: String::new(),
+            git_root: String::new(),
+            worktree_path: String::new(),
+            git_branch: String::new(),
+            git_base_ref: String::new(),
+            git_head: String::new(),
+            git_dirty: false,
+            git_untracked_count: 0,
+            git_remote_tracking_branch: String::new(),
+            workspace_warnings: Vec::new(),
+            approval_mode: "ask".to_string(),
+            execution_mode: "act".to_string(),
+            run_budget_mode: "inherit".to_string(),
+        }
+    }
+
+    fn job_record(id: &str, session_id: &str, parent_job_id: Option<&str>) -> JobRecord {
+        JobRecord {
+            id: id.to_string(),
+            session_id: Some(session_id.to_string()),
+            parent_job_id: parent_job_id.map(str::to_string),
+            template_id: None,
+            title: id.to_string(),
+            purpose: "test job".to_string(),
+            trigger_kind: "session_prompt".to_string(),
+            state: "running".to_string(),
+            requested_by: "user".to_string(),
+            prompt_excerpt: "test".to_string(),
+            publication_intent_text: None,
+        }
+    }
+
+    fn worker_record(id: &str, job_id: &str, model: &str) -> WorkerRecord {
+        WorkerRecord {
+            id: id.to_string(),
+            job_id: job_id.to_string(),
+            parent_worker_id: None,
+            title: id.to_string(),
+            lane: "utility".to_string(),
+            state: "running".to_string(),
+            provider: "openai_compatible".to_string(),
+            model: model.to_string(),
+            provider_base_url: String::new(),
+            provider_api_key: String::new(),
+            provider_session_id: String::new(),
+            working_dir: std::env::temp_dir().display().to_string(),
+            read_roots: Vec::new(),
+            write_roots: Vec::new(),
+            max_steps: 8,
+            max_tool_calls: 8,
+            max_wall_clock_secs: 60,
+        }
+    }
+
+    #[test]
+    fn worker_observability_migration_is_idempotent() {
+        let state_dir = test_state_dir("worker-observability-migration");
+        let store = StateStore::initialize_at(&state_dir).expect("store initializes");
+        drop(store);
+        let store = StateStore::initialize_at(&state_dir).expect("store initializes again");
+        let connection = store.connection.lock().expect("storage mutex poisoned");
+        let worker_columns = table_columns(&connection, "job_workers").expect("columns load");
+        let job_columns = table_columns(&connection, "jobs").expect("columns load");
+
+        for column in [
+            "last_reasoning",
+            "last_reasoning_at",
+            "token_usage_known",
+            "prompt_tokens",
+            "completion_tokens",
+            "cached_tokens",
+        ] {
+            assert!(worker_columns.contains(column), "missing {column}");
+        }
+        assert!(job_columns.contains("last_resumed_at"));
+    }
+
+    #[test]
+    fn worker_reasoning_and_usage_roll_up_to_session_and_parent_jobs() {
+        let state_dir = test_state_dir("worker-observability-rollup");
+        let store = StateStore::initialize_at(&state_dir).expect("store initializes");
+        store
+            .create_session(session_record("session"))
+            .expect("session persists");
+        store
+            .create_job(job_record("parent", "session", None))
+            .expect("parent persists");
+        store
+            .create_worker(worker_record("parent-worker", "parent", "gpt-5.4-mini"))
+            .expect("parent worker persists");
+        store
+            .create_job(job_record("child-a", "session", Some("parent")))
+            .expect("child a persists");
+        store
+            .create_worker(worker_record("child-worker-a", "child-a", "gpt-5.4-mini"))
+            .expect("child worker a persists");
+        store
+            .create_job(job_record("child-b", "session", Some("parent")))
+            .expect("child b persists");
+        store
+            .create_worker(worker_record("child-worker-b", "child-b", "unknown-model"))
+            .expect("child worker b persists");
+
+        store
+            .record_worker_usage(
+                "parent-worker",
+                WorkerUsageDelta {
+                    prompt_tokens: 100,
+                    completion_tokens: 50,
+                    cached_tokens: 20,
+                },
+            )
+            .expect("parent usage records");
+        store
+            .record_worker_usage(
+                "parent-worker",
+                WorkerUsageDelta {
+                    prompt_tokens: 25,
+                    completion_tokens: 5,
+                    cached_tokens: 5,
+                },
+            )
+            .expect("second parent usage records");
+        store
+            .record_worker_usage(
+                "child-worker-a",
+                WorkerUsageDelta {
+                    prompt_tokens: 200,
+                    completion_tokens: 60,
+                    cached_tokens: 10,
+                },
+            )
+            .expect("child usage records");
+        store
+            .record_worker_usage(
+                "child-worker-b",
+                WorkerUsageDelta {
+                    prompt_tokens: 300,
+                    completion_tokens: 70,
+                    cached_tokens: 0,
+                },
+            )
+            .expect("unknown price usage records");
+        store
+            .record_worker_reasoning("parent-worker", "older parent thought", 122)
+            .expect("older reasoning records");
+        store
+            .record_worker_reasoning("child-worker-a", "latest child thought", 123)
+            .expect("reasoning records");
+
+        let parent = store.get_job("parent").expect("parent loads").job;
+        assert_eq!(parent.prompt_tokens, 625);
+        assert_eq!(parent.completion_tokens, 185);
+        assert_eq!(parent.cached_tokens, 35);
+        assert_eq!(parent.last_reasoning, "latest child thought");
+        assert_eq!(parent.last_reasoning_at, Some(123));
+        assert!(parent.cost_usd_estimate.is_none());
+
+        let session = store.get_session("session").expect("session loads").session;
+        assert_eq!(session.prompt_tokens, 625);
+        assert_eq!(session.completion_tokens, 185);
+        assert!(session.token_usage_known);
+        assert!(session.cost_usd_estimate.is_none());
+    }
+
+    #[test]
+    fn price_table_returns_known_prices_and_unknown_sentinel() {
+        assert!(price_for_model("openai_compatible", "gpt-5.4-mini").is_some());
+        assert!(price_for_model("openai_compatible", "cx/gpt-5.4").is_some());
+        assert!(price_for_model("openai_compatible", "unknown-model").is_none());
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VaultScopeKeyRecord {
     pub id: String,
@@ -261,6 +467,7 @@ pub struct JobPatch {
     pub validation_status: Option<String>,
     pub cleanup_status: Option<String>,
     pub cleanup_paths: Option<Vec<String>>,
+    pub last_resumed_at: Option<Option<i64>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,6 +506,21 @@ pub struct WorkerPatch {
     pub wait_until_json: Option<Option<serde_json::Value>>,
     pub wait_started_at: Option<Option<i64>>,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkerUsageDelta {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cached_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct UsageTotals {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    cached_tokens: u64,
+    token_usage_known: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2255,6 +2477,7 @@ impl StateStore {
                 validation_status = ?18,
                 cleanup_status = ?19,
                 cleanup_paths_json = ?20,
+                last_resumed_at = ?21,
                 updated_at = unixepoch()
             WHERE id = ?1
             ",
@@ -2287,6 +2510,7 @@ impl StateStore {
                 patch.validation_status.unwrap_or(current.validation_status),
                 patch.cleanup_status.unwrap_or(current.cleanup_status),
                 cleanup_paths_json,
+                patch.last_resumed_at.unwrap_or(current.last_resumed_at),
             ],
         )?;
 
@@ -2383,6 +2607,12 @@ impl StateStore {
                 wait_until_json = ?12,
                 wait_started_at = ?13,
                 last_error = ?14,
+                last_reasoning = ?15,
+                last_reasoning_at = ?16,
+                token_usage_known = ?17,
+                prompt_tokens = ?18,
+                completion_tokens = ?19,
+                cached_tokens = ?20,
                 updated_at = unixepoch()
             WHERE id = ?1
             ",
@@ -2403,9 +2633,63 @@ impl StateStore {
                 wait_until_json,
                 patch.wait_started_at.unwrap_or(current.wait_started_at),
                 patch.last_error.unwrap_or(current.last_error),
+                current.last_reasoning,
+                current.last_reasoning_at,
+                bool_to_i64(current.token_usage_known),
+                current.prompt_tokens as i64,
+                current.completion_tokens as i64,
+                current.cached_tokens as i64,
             ],
         )?;
 
+        load_worker_summary(&connection, worker_id)
+    }
+
+    pub fn record_worker_reasoning(
+        &self,
+        worker_id: &str,
+        excerpt: &str,
+        observed_at: i64,
+    ) -> Result<WorkerSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        ensure_worker_exists(&connection, worker_id)?;
+        connection.execute(
+            "
+            UPDATE job_workers
+            SET last_reasoning = ?2,
+                last_reasoning_at = ?3,
+                updated_at = unixepoch()
+            WHERE id = ?1
+            ",
+            params![worker_id, excerpt, observed_at],
+        )?;
+        load_worker_summary(&connection, worker_id)
+    }
+
+    pub fn record_worker_usage(
+        &self,
+        worker_id: &str,
+        delta: WorkerUsageDelta,
+    ) -> Result<WorkerSummary> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        ensure_worker_exists(&connection, worker_id)?;
+        connection.execute(
+            "
+            UPDATE job_workers
+            SET token_usage_known = 1,
+                prompt_tokens = prompt_tokens + ?2,
+                completion_tokens = completion_tokens + ?3,
+                cached_tokens = cached_tokens + ?4,
+                updated_at = unixepoch()
+            WHERE id = ?1
+            ",
+            params![
+                worker_id,
+                delta.prompt_tokens as i64,
+                delta.completion_tokens as i64,
+                delta.cached_tokens as i64,
+            ],
+        )?;
         load_worker_summary(&connection, worker_id)
     }
 
@@ -3060,6 +3344,7 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             validation_status TEXT NOT NULL DEFAULT 'not_performed',
             cleanup_status TEXT NOT NULL DEFAULT 'unknown',
             cleanup_paths_json TEXT NOT NULL DEFAULT '[]',
+            last_resumed_at INTEGER,
             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
@@ -3093,6 +3378,12 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             wait_until_json TEXT,
             wait_started_at INTEGER,
             last_error TEXT NOT NULL DEFAULT '',
+            last_reasoning TEXT NOT NULL DEFAULT '',
+            last_reasoning_at INTEGER,
+            token_usage_known INTEGER NOT NULL DEFAULT 0,
+            prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0,
+            cached_tokens INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
@@ -3893,6 +4184,37 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
     ensure_column(connection, "job_workers", "wait_started_at", "INTEGER")?;
     ensure_column(
         connection,
+        "job_workers",
+        "last_reasoning",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(connection, "job_workers", "last_reasoning_at", "INTEGER")?;
+    ensure_column(
+        connection,
+        "job_workers",
+        "token_usage_known",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        connection,
+        "job_workers",
+        "prompt_tokens",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        connection,
+        "job_workers",
+        "completion_tokens",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        connection,
+        "job_workers",
+        "cached_tokens",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        connection,
         "job_artifacts",
         "command_session_id",
         "TEXT REFERENCES command_sessions(id) ON DELETE SET NULL",
@@ -3982,6 +4304,7 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "cleanup_paths_json",
         "TEXT NOT NULL DEFAULT '[]'",
     )?;
+    ensure_column(connection, "jobs", "last_resumed_at", "INTEGER")?;
 
     for (column, definition) in [
         ("source_kind", "TEXT NOT NULL DEFAULT 'manual'"),
@@ -6449,6 +6772,7 @@ fn load_session_summary(connection: &Connection, session_id: &str) -> Result<Ses
             session.project_path = primary.absolute_path.clone();
         }
     }
+    apply_session_observability_rollups(connection, &mut session)?;
 
     Ok(session)
 }
@@ -6495,9 +6819,37 @@ fn map_session_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionS
         capabilities: Vec::new(),
         last_message_excerpt: row.get(33)?,
         turn_count: row.get(34)?,
+        last_resumed_at: None,
+        last_reasoning: String::new(),
+        last_reasoning_at: None,
+        token_usage_known: false,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        cached_tokens: 0,
+        cost_usd_estimate: None,
         created_at: row.get(35)?,
         updated_at: row.get(36)?,
     })
+}
+
+fn apply_session_observability_rollups(
+    connection: &Connection,
+    session: &mut SessionSummary,
+) -> Result<()> {
+    let usage = usage_for_session(connection, &session.id)?;
+    session.token_usage_known = usage.token_usage_known;
+    session.prompt_tokens = usage.prompt_tokens;
+    session.completion_tokens = usage.completion_tokens;
+    session.cached_tokens = usage.cached_tokens;
+    session.cost_usd_estimate = cost_for_session(connection, &session.id)?;
+    session.last_resumed_at = active_start_for_session(connection, &session.id)?;
+
+    if let Some((reasoning, observed_at)) = latest_reasoning_for_session(connection, &session.id)? {
+        session.last_reasoning = reasoning;
+        session.last_reasoning_at = Some(observed_at);
+    }
+
+    Ok(())
 }
 
 fn load_session_detail(connection: &Connection, session_id: &str) -> Result<SessionDetail> {
@@ -7016,6 +7368,7 @@ fn load_job_summary(connection: &Connection, job_id: &str) -> Result<JobSummary>
                 validation_status,
                 cleanup_status,
                 cleanup_paths_json,
+                last_resumed_at,
                 created_at,
                 updated_at
             FROM jobs
@@ -7030,6 +7383,7 @@ fn load_job_summary(connection: &Connection, job_id: &str) -> Result<JobSummary>
     job.worker_count = count_for_job(connection, "job_workers", job_id)?;
     job.pending_approval_count = count_pending_approvals_for_job(connection, job_id)?;
     job.artifact_count = count_for_job(connection, "job_artifacts", job_id)?;
+    apply_job_observability_rollups(connection, &mut job)?;
     if let Some(root_worker_id) = job.root_worker_id.as_deref() {
         if let Ok(worker) = load_worker_summary(connection, root_worker_id) {
             job.executor_lane = worker.lane;
@@ -7088,9 +7442,279 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         worker_count: 0,
         pending_approval_count: 0,
         artifact_count: 0,
-        created_at: row.get(28)?,
-        updated_at: row.get(29)?,
+        last_resumed_at: row.get(28)?,
+        last_reasoning: String::new(),
+        last_reasoning_at: None,
+        token_usage_known: false,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        cached_tokens: 0,
+        cost_usd_estimate: None,
+        created_at: row.get(29)?,
+        updated_at: row.get(30)?,
     })
+}
+
+fn apply_job_observability_rollups(connection: &Connection, job: &mut JobSummary) -> Result<()> {
+    let usage = usage_for_job_tree(connection, &job.id)?;
+    job.token_usage_known = usage.token_usage_known;
+    job.prompt_tokens = usage.prompt_tokens;
+    job.completion_tokens = usage.completion_tokens;
+    job.cached_tokens = usage.cached_tokens;
+    job.cost_usd_estimate = cost_for_job_tree(connection, &job.id)?;
+
+    if let Some((reasoning, observed_at)) = latest_reasoning_for_job_tree(connection, &job.id)? {
+        job.last_reasoning = reasoning;
+        job.last_reasoning_at = Some(observed_at);
+    }
+
+    Ok(())
+}
+
+fn usage_for_session(connection: &Connection, session_id: &str) -> Result<UsageTotals> {
+    connection
+        .query_row(
+            "
+            SELECT
+                COALESCE(SUM(prompt_tokens), 0),
+                COALESCE(SUM(completion_tokens), 0),
+                COALESCE(SUM(cached_tokens), 0),
+                COALESCE(MAX(token_usage_known), 0)
+            FROM job_workers
+            JOIN jobs ON jobs.id = job_workers.job_id
+            WHERE jobs.session_id = ?1
+            ",
+            params![session_id],
+            map_usage_totals,
+        )
+        .context("failed to load session token usage")
+}
+
+fn usage_for_job_tree(connection: &Connection, job_id: &str) -> Result<UsageTotals> {
+    connection
+        .query_row(
+            "
+            WITH RECURSIVE tree(id) AS (
+                SELECT ?1
+                UNION ALL
+                SELECT jobs.id
+                FROM jobs
+                JOIN tree ON jobs.parent_job_id = tree.id
+            )
+            SELECT
+                COALESCE(SUM(prompt_tokens), 0),
+                COALESCE(SUM(completion_tokens), 0),
+                COALESCE(SUM(cached_tokens), 0),
+                COALESCE(MAX(token_usage_known), 0)
+            FROM job_workers
+            JOIN tree ON tree.id = job_workers.job_id
+            ",
+            params![job_id],
+            map_usage_totals,
+        )
+        .context("failed to load job token usage")
+}
+
+fn map_usage_totals(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageTotals> {
+    Ok(UsageTotals {
+        prompt_tokens: row.get::<_, i64>(0)?.max(0) as u64,
+        completion_tokens: row.get::<_, i64>(1)?.max(0) as u64,
+        cached_tokens: row.get::<_, i64>(2)?.max(0) as u64,
+        token_usage_known: row.get::<_, i64>(3)? != 0,
+    })
+}
+
+fn latest_reasoning_for_session(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Option<(String, i64)>> {
+    connection
+        .query_row(
+            "
+            SELECT job_workers.last_reasoning, job_workers.last_reasoning_at
+            FROM job_workers
+            JOIN jobs ON jobs.id = job_workers.job_id
+            WHERE jobs.session_id = ?1
+              AND job_workers.last_reasoning != ''
+              AND job_workers.last_reasoning_at IS NOT NULL
+            ORDER BY job_workers.last_reasoning_at DESC, job_workers.updated_at DESC
+            LIMIT 1
+            ",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .context("failed to load latest session reasoning")
+}
+
+fn latest_reasoning_for_job_tree(
+    connection: &Connection,
+    job_id: &str,
+) -> Result<Option<(String, i64)>> {
+    connection
+        .query_row(
+            "
+            WITH RECURSIVE tree(id) AS (
+                SELECT ?1
+                UNION ALL
+                SELECT jobs.id
+                FROM jobs
+                JOIN tree ON jobs.parent_job_id = tree.id
+            )
+            SELECT job_workers.last_reasoning, job_workers.last_reasoning_at
+            FROM job_workers
+            JOIN tree ON tree.id = job_workers.job_id
+            WHERE job_workers.last_reasoning != ''
+              AND job_workers.last_reasoning_at IS NOT NULL
+            ORDER BY job_workers.last_reasoning_at DESC, job_workers.updated_at DESC
+            LIMIT 1
+            ",
+            params![job_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .context("failed to load latest job reasoning")
+}
+
+fn active_start_for_session(connection: &Connection, session_id: &str) -> Result<Option<i64>> {
+    connection
+        .query_row(
+            "
+            SELECT MAX(
+                CASE
+                    WHEN last_resumed_at IS NOT NULL AND last_resumed_at > created_at
+                    THEN last_resumed_at
+                    ELSE created_at
+                END
+            )
+            FROM jobs
+            WHERE session_id = ?1
+              AND state IN ('running', 'waiting', 'paused')
+            ",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .context("failed to load active session start")
+}
+
+fn cost_for_session(connection: &Connection, session_id: &str) -> Result<Option<f64>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT provider, model, prompt_tokens, completion_tokens, cached_tokens
+        FROM job_workers
+        JOIN jobs ON jobs.id = job_workers.job_id
+        WHERE jobs.session_id = ?1
+          AND token_usage_known != 0
+        ",
+    )?;
+    let rows = statement.query_map(params![session_id], map_worker_usage_cost_input)?;
+    sum_cost_rows(rows)
+}
+
+fn cost_for_job_tree(connection: &Connection, job_id: &str) -> Result<Option<f64>> {
+    let mut statement = connection.prepare(
+        "
+        WITH RECURSIVE tree(id) AS (
+            SELECT ?1
+            UNION ALL
+            SELECT jobs.id
+            FROM jobs
+            JOIN tree ON jobs.parent_job_id = tree.id
+        )
+        SELECT provider, model, prompt_tokens, completion_tokens, cached_tokens
+        FROM job_workers
+        JOIN tree ON tree.id = job_workers.job_id
+        WHERE token_usage_known != 0
+        ",
+    )?;
+    let rows = statement.query_map(params![job_id], map_worker_usage_cost_input)?;
+    sum_cost_rows(rows)
+}
+
+type CostInput = (String, String, u64, u64, u64);
+
+fn map_worker_usage_cost_input(row: &rusqlite::Row<'_>) -> rusqlite::Result<CostInput> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get::<_, i64>(2)?.max(0) as u64,
+        row.get::<_, i64>(3)?.max(0) as u64,
+        row.get::<_, i64>(4)?.max(0) as u64,
+    ))
+}
+
+fn sum_cost_rows<I>(rows: I) -> Result<Option<f64>>
+where
+    I: IntoIterator<Item = rusqlite::Result<CostInput>>,
+{
+    let mut total = 0.0;
+    let mut saw_usage = false;
+
+    for row in rows {
+        let (provider, model, prompt_tokens, completion_tokens, cached_tokens) = row?;
+        saw_usage = true;
+        let Some(cost) = worker_cost_usd_estimate(
+            &provider,
+            &model,
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+        ) else {
+            return Ok(None);
+        };
+        total += cost;
+    }
+
+    Ok(saw_usage.then_some(total))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ModelPrice {
+    prompt_per_1k_usd: f64,
+    completion_per_1k_usd: f64,
+    cached_per_1k_usd: f64,
+}
+
+fn worker_cost_usd_estimate(
+    provider: &str,
+    model: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    cached_tokens: u64,
+) -> Option<f64> {
+    let price = price_for_model(provider, model)?;
+    let billable_prompt_tokens = prompt_tokens.saturating_sub(cached_tokens);
+    Some(
+        (billable_prompt_tokens as f64 / 1_000.0) * price.prompt_per_1k_usd
+            + (completion_tokens as f64 / 1_000.0) * price.completion_per_1k_usd
+            + (cached_tokens as f64 / 1_000.0) * price.cached_per_1k_usd,
+    )
+}
+
+fn price_for_model(provider: &str, model: &str) -> Option<ModelPrice> {
+    let provider = provider.trim().to_ascii_lowercase();
+    let model = model.trim().to_ascii_lowercase();
+    let model = model.strip_prefix("cx/").unwrap_or(&model);
+    let model = model.strip_prefix("openai/").unwrap_or(model);
+
+    match (provider.as_str(), model) {
+        ("openai_compatible" | "codex", "gpt-5.4") => Some(ModelPrice {
+            prompt_per_1k_usd: 0.0025,
+            completion_per_1k_usd: 0.015,
+            cached_per_1k_usd: 0.00025,
+        }),
+        ("openai_compatible" | "codex", "gpt-5.4-mini") => Some(ModelPrice {
+            prompt_per_1k_usd: 0.00075,
+            completion_per_1k_usd: 0.0045,
+            cached_per_1k_usd: 0.000075,
+        }),
+        ("openai_compatible" | "codex", "gpt-4.1-mini") => Some(ModelPrice {
+            prompt_per_1k_usd: 0.0004,
+            completion_per_1k_usd: 0.0016,
+            cached_per_1k_usd: 0.0001,
+        }),
+        _ => None,
+    }
 }
 
 fn count_for_job(connection: &Connection, table: &str, job_id: &str) -> Result<usize> {
@@ -7228,6 +7852,12 @@ fn load_worker_summary(connection: &Connection, worker_id: &str) -> Result<Worke
                 wait_until_json,
                 wait_started_at,
                 last_error,
+                last_reasoning,
+                last_reasoning_at,
+                token_usage_known,
+                prompt_tokens,
+                completion_tokens,
+                cached_tokens,
                 created_at,
                 updated_at
             FROM job_workers
@@ -7260,14 +7890,28 @@ fn load_worker_summary(connection: &Connection, worker_id: &str) -> Result<Worke
                     last_error: row.get(21)?,
                     user_error: None,
                     capabilities: Vec::new(),
-                    created_at: row.get(22)?,
-                    updated_at: row.get(23)?,
+                    last_reasoning: row.get(22)?,
+                    last_reasoning_at: row.get(23)?,
+                    token_usage_known: row.get::<_, i64>(24)? != 0,
+                    prompt_tokens: row.get::<_, i64>(25)?.max(0) as u64,
+                    completion_tokens: row.get::<_, i64>(26)?.max(0) as u64,
+                    cached_tokens: row.get::<_, i64>(27)?.max(0) as u64,
+                    cost_usd_estimate: None,
+                    created_at: row.get(28)?,
+                    updated_at: row.get(29)?,
                 })
             },
         )
         .optional()?
         .ok_or_else(|| anyhow!("worker '{worker_id}' was not found"))?;
     worker.capabilities = load_worker_capabilities(connection, worker_id)?;
+    worker.cost_usd_estimate = worker_cost_usd_estimate(
+        &worker.provider,
+        &worker.model,
+        worker.prompt_tokens,
+        worker.completion_tokens,
+        worker.cached_tokens,
+    );
     Ok(worker)
 }
 
