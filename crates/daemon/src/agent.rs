@@ -23,7 +23,7 @@ use nucleus_storage::{
     ApprovalRequestRecord, AuditEventRecord, CommandSessionPatch, CommandSessionRecord,
     JobArtifactPatch, JobArtifactRecord, JobEventRecord, JobPatch, JobRecord, PlaybookPatch,
     PlaybookRecord, PolicyDecisionRecord, SessionPatch, SessionRecord, ToolCallPatch,
-    ToolCallRecord, ToolCapabilityGrantRecord, WorkerPatch, WorkerRecord,
+    ToolCallRecord, ToolCapabilityGrantRecord, WorkerPatch, WorkerRecord, WorkerUsageDelta,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -61,7 +61,7 @@ const DEFAULT_JOB_MAX_WALL_CLOCK_SECS: u64 = 7_200;
 const MAX_CONFIGURED_JOB_STEPS: usize = 1_000;
 const MAX_CONFIGURED_JOB_TOOL_CALLS: usize = 2_000;
 const MAX_CONFIGURED_JOB_WALL_CLOCK_SECS: u64 = 86_400;
-const JOB_MAX_CHILDREN_PER_FANOUT: usize = 3;
+const JOB_MAX_CHILDREN_PER_FANOUT: usize = 5;
 const DEFAULT_CHILD_JOB_MAX_STEPS: usize = 24;
 const DEFAULT_CHILD_JOB_MAX_TOOL_CALLS: usize = 48;
 const CHILD_JOB_POLL_INTERVAL_MS: u64 = 250;
@@ -1242,6 +1242,7 @@ pub async fn resume_job(state: AppState, job_id: String) -> Result<JobDetail, Ap
             JobPatch {
                 state: Some("queued".to_string()),
                 last_error: Some(String::new()),
+                last_resumed_at: Some(Some(unix_timestamp())),
                 ..JobPatch::default()
             },
         )?;
@@ -1945,6 +1946,7 @@ async fn resume_waiting_worker(
         JobPatch {
             state: Some("queued".to_string()),
             last_error: Some(String::new()),
+            last_resumed_at: Some(Some(unix_timestamp())),
             ..JobPatch::default()
         },
     )?;
@@ -3767,6 +3769,36 @@ async fn create_child_job(
     parent_worker: &WorkerSummary,
     proposal: ChildJobProposal,
 ) -> Result<String> {
+    create_child_job_with_limits(
+        state,
+        session,
+        parent_job_id,
+        parent_worker,
+        proposal,
+        ChildJobRunLimits {
+            max_steps: configured_child_job_max_steps(),
+            max_tool_calls: configured_child_job_max_tool_calls(),
+            max_wall_clock_secs: configured_job_max_wall_clock_secs(),
+        },
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChildJobRunLimits {
+    max_steps: usize,
+    max_tool_calls: usize,
+    max_wall_clock_secs: u64,
+}
+
+async fn create_child_job_with_limits(
+    state: &AppState,
+    session: &SessionDetail,
+    parent_job_id: &str,
+    parent_worker: &WorkerSummary,
+    proposal: ChildJobProposal,
+    limits: ChildJobRunLimits,
+) -> Result<String> {
     let title = proposal.title.trim();
     if title.is_empty() {
         bail!("child job titles must not be empty");
@@ -3775,6 +3807,9 @@ async fn create_child_job(
     if prompt.is_empty() {
         bail!("child job prompts must not be empty");
     }
+    // `working_dir` is per-child and scope-checked here. It is not a lock:
+    // parents that spawn write-capable siblings should pass a dedicated
+    // worktree path for each child.
     let working_dir = if let Some(value) = proposal.working_dir.as_deref() {
         resolve_scoped_path_in_roots(
             parent_worker,
@@ -3826,9 +3861,9 @@ async fn create_child_job(
         working_dir: child_working_dir,
         read_roots,
         write_roots: Vec::new(),
-        max_steps: configured_child_job_max_steps(),
-        max_tool_calls: configured_child_job_max_tool_calls(),
-        max_wall_clock_secs: configured_job_max_wall_clock_secs(),
+        max_steps: limits.max_steps,
+        max_tool_calls: limits.max_tool_calls,
+        max_wall_clock_secs: limits.max_wall_clock_secs,
     })?;
     state.store.update_job(
         &child_job_id,
@@ -7163,15 +7198,59 @@ pub(crate) async fn execute_worker_text_turn(
         }
     });
 
+    let mut reasoning_buffer = String::new();
     let mut last_reasoning = String::new();
     while let Some(event) = receiver.recv().await {
         match event {
             PromptStreamEvent::ReasoningSnapshot { text } => {
-                let excerpted = excerpt(&text, 240);
+                let excerpted = append_reasoning_snapshot(&mut reasoning_buffer, &text);
                 if excerpted != last_reasoning {
-                    last_reasoning = excerpted;
+                    last_reasoning = excerpted.clone();
+                    match state.store.record_worker_reasoning(
+                        &worker.id,
+                        &excerpted,
+                        unix_timestamp(),
+                    ) {
+                        Ok(summary) => {
+                            publish_worker_updated(state, &summary).await;
+                            if let Ok(detail) = state.store.get_job(&summary.job_id) {
+                                publish_job_updated(state, &detail.job).await;
+                            }
+                            let _ = publish_overview_event(state).await;
+                        }
+                        Err(error) => warn!(
+                            ?error,
+                            worker_id = worker.id.as_str(),
+                            "failed to persist worker reasoning snapshot"
+                        ),
+                    }
                 }
             }
+            PromptStreamEvent::TokenUsage {
+                prompt_tokens,
+                completion_tokens,
+                cached_tokens,
+            } => match state.store.record_worker_usage(
+                &worker.id,
+                WorkerUsageDelta {
+                    prompt_tokens,
+                    completion_tokens,
+                    cached_tokens,
+                },
+            ) {
+                Ok(summary) => {
+                    publish_worker_updated(state, &summary).await;
+                    if let Ok(detail) = state.store.get_job(&summary.job_id) {
+                        publish_job_updated(state, &detail.job).await;
+                    }
+                    let _ = publish_overview_event(state).await;
+                }
+                Err(error) => warn!(
+                    ?error,
+                    worker_id = worker.id.as_str(),
+                    "failed to persist worker token usage"
+                ),
+            },
             PromptStreamEvent::ProviderRetry {
                 attempt,
                 error_class,
@@ -7196,6 +7275,13 @@ pub(crate) async fn execute_worker_text_turn(
     handle
         .await
         .map_err(|error| anyhow!("worker model task crashed: {error}"))?
+}
+
+fn append_reasoning_snapshot(buffer: &mut String, text: &str) -> String {
+    if !text.trim().is_empty() {
+        buffer.push_str(text);
+    }
+    excerpt(buffer.trim(), 240)
 }
 
 fn worker_action_repair_supported_tool_ids(
@@ -7322,6 +7408,14 @@ fn build_execution_session(worker: &WorkerSummary) -> SessionSummary {
         capabilities: worker.capabilities.clone(),
         last_message_excerpt: String::new(),
         turn_count: 0,
+        last_resumed_at: None,
+        last_reasoning: worker.last_reasoning.clone(),
+        last_reasoning_at: worker.last_reasoning_at,
+        token_usage_known: worker.token_usage_known,
+        prompt_tokens: worker.prompt_tokens,
+        completion_tokens: worker.completion_tokens,
+        cached_tokens: worker.cached_tokens,
+        cost_usd_estimate: worker.cost_usd_estimate,
         created_at: worker.created_at,
         updated_at: worker.updated_at,
     }
@@ -7376,6 +7470,14 @@ pub(crate) async fn resolve_utility_worker_execution_session(
         capabilities: Vec::new(),
         last_message_excerpt: String::new(),
         turn_count: 0,
+        last_resumed_at: None,
+        last_reasoning: String::new(),
+        last_reasoning_at: None,
+        token_usage_known: false,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        cached_tokens: 0,
+        cost_usd_estimate: None,
         created_at: now,
         updated_at: now,
     })
@@ -13680,7 +13782,7 @@ Working directory: {}\n",
         .join("\n");
     let child_job_rules = if is_root_worker {
         "- Only root workers may fan out child jobs, and child jobs must stay read-only.\n\
-- Use at most 3 child jobs in a single spawn_child_jobs action.\n"
+- Use at most 5 child jobs in a single spawn_child_jobs action.\n"
     } else {
         ""
     };
@@ -13902,6 +14004,21 @@ mod tests {
             assert!(!is_non_terminal_tool_call_status(status));
         }
     }
+
+    #[test]
+    fn reasoning_snapshots_accumulate_streamed_chunks() {
+        let mut buffer = String::new();
+
+        assert_eq!(
+            append_reasoning_snapshot(&mut buffer, "checking "),
+            "checking"
+        );
+        assert_eq!(
+            append_reasoning_snapshot(&mut buffer, "the next result"),
+            "checking the next result"
+        );
+    }
+
     use crate::{
         host::HostEngine,
         runtime::RuntimeManager,
@@ -14071,6 +14188,14 @@ mod tests {
             capabilities: Vec::new(),
             last_message_excerpt: String::new(),
             turn_count: 0,
+            last_resumed_at: None,
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         }
@@ -14421,6 +14546,13 @@ mod tests {
             last_error: String::new(),
             user_error: None,
             capabilities: Vec::new(),
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -14483,6 +14615,13 @@ mod tests {
             last_error: String::new(),
             user_error: None,
             capabilities: Vec::new(),
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -18177,6 +18316,13 @@ Cleanup status: clean";
             last_error: String::new(),
             user_error: None,
             capabilities: Vec::new(),
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -18255,6 +18401,13 @@ Cleanup status: clean";
             last_error: String::new(),
             user_error: None,
             capabilities: Vec::new(),
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -18410,6 +18563,14 @@ Cleanup status: clean";
             worker_count: 0,
             pending_approval_count: 0,
             artifact_count: 0,
+            last_resumed_at: None,
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 1,
             updated_at: 1,
         }];
@@ -18465,6 +18626,14 @@ Cleanup status: clean";
             worker_count: 0,
             pending_approval_count: 0,
             artifact_count: 0,
+            last_resumed_at: None,
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 1,
             updated_at: 1,
         };
@@ -18620,6 +18789,13 @@ Cleanup status: clean";
             last_error: String::new(),
             user_error: None,
             capabilities: Vec::new(),
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -18694,6 +18870,14 @@ Cleanup status: clean";
             capabilities: Vec::new(),
             last_message_excerpt: String::new(),
             turn_count: 0,
+            last_resumed_at: None,
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -18722,6 +18906,13 @@ Cleanup status: clean";
             last_error: String::new(),
             user_error: None,
             capabilities: Vec::new(),
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -18788,6 +18979,14 @@ Cleanup status: clean";
             capabilities: Vec::new(),
             last_message_excerpt: String::new(),
             turn_count: 0,
+            last_resumed_at: None,
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -18856,6 +19055,14 @@ Cleanup status: clean";
             capabilities: Vec::new(),
             last_message_excerpt: String::new(),
             turn_count: 0,
+            last_resumed_at: None,
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -19993,6 +20200,292 @@ Cleanup status: clean";
     }
 
     #[tokio::test]
+    async fn spawn_child_jobs_completes_five_children_and_joins_reports() {
+        let state_dir = test_state_dir("spawn-child-jobs-five-way");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let spawn_action = spawn_child_jobs_action_json(5, None, "fanout-child");
+        let (base_url, request_count, _bodies, server) =
+            spawn_dynamic_openai_server(7, move |index, _body| {
+                if index == 0 {
+                    return DynamicOpenAiProviderResponse::content(spawn_action.clone());
+                }
+                if index >= 6 {
+                    return DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"final_answer","summary":"joined","final_answer":"All child reports joined."}"#,
+                    );
+                }
+                DynamicOpenAiProviderResponse::content(
+                    r#"{"kind":"final_answer","summary":"child done","final_answer":"Child report complete."}"#,
+                )
+            })
+            .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-fanout-model",
+            &base_url,
+            "utility-key",
+        );
+        let session_id = "spawn-child-jobs-five-session".to_string();
+        state
+            .store
+            .create_session(test_session_record(
+                &session_id,
+                "Spawn child jobs five",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            SessionPromptRequest {
+                prompt: "spawn five fanout children".to_string(),
+                images: vec![],
+                role: "main".to_string(),
+            },
+            current,
+            "spawn five fanout children".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("prompt should queue");
+
+        let _ = wait_for_session_state(&state, &session_id, "active").await;
+        server.await.expect("test server should finish");
+        assert_eq!(request_count.load(Ordering::SeqCst), 7);
+
+        let parent = latest_job_detail(&state, &session_id);
+        assert_eq!(parent.job.state, "completed");
+        assert_eq!(parent.child_jobs.len(), 5);
+        for child in &parent.child_jobs {
+            let detail = state
+                .store
+                .get_job(&child.id)
+                .expect("child job should load");
+            assert_eq!(detail.job.state, "completed");
+            assert_eq!(detail.workers.len(), 1);
+            assert_eq!(detail.workers[0].provider_session_id, "dynamic-turn");
+            assert!(
+                detail
+                    .artifacts
+                    .iter()
+                    .any(|artifact| artifact.kind == "child-report")
+            );
+        }
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn canceling_parent_cascades_to_in_flight_children_within_bound() {
+        let state_dir = test_state_dir("spawn-child-jobs-cancel-cascade");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let spawn_action = spawn_child_jobs_action_json(3, None, "cancel-child");
+        let (base_url, _request_count, _bodies, server) =
+            spawn_dynamic_openai_server(4, move |index, _body| {
+                if index == 0 {
+                    return DynamicOpenAiProviderResponse::content(spawn_action.clone());
+                }
+                DynamicOpenAiProviderResponse::content(
+                    r#"{"kind":"final_answer","summary":"late child","final_answer":"Too late."}"#,
+                )
+                .delayed(30_000)
+            })
+            .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-cancel-model",
+            &base_url,
+            "utility-key",
+        );
+        let session_id = "spawn-child-jobs-cancel-session".to_string();
+        state
+            .store
+            .create_session(test_session_record(
+                &session_id,
+                "Spawn child jobs cancel",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            SessionPromptRequest {
+                prompt: "spawn cancellable children".to_string(),
+                images: vec![],
+                role: "main".to_string(),
+            },
+            current,
+            "spawn cancellable children".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("prompt should queue");
+
+        let parent = wait_for_child_count(&state, &session_id, 3).await;
+        let started = Instant::now();
+        cancel_job(state.clone(), parent.job.id.clone())
+            .await
+            .expect("cancel should cascade");
+        let canceled_parent = wait_for_job_state(&state, &parent.job.id, "canceled").await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(canceled_parent.child_jobs.len(), 3);
+        for child in canceled_parent.child_jobs {
+            let detail = wait_for_job_state(&state, &child.id, "canceled").await;
+            assert_eq!(detail.workers[0].state, "canceled");
+        }
+
+        server.abort();
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn child_jobs_completed_wait_wakes_only_after_last_terminal_child() {
+        let state_dir = test_state_dir("spawn-child-jobs-wait-last-child");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let (base_url, request_count, _bodies, server) =
+            spawn_dynamic_openai_server(1, |_index, _body| {
+                DynamicOpenAiProviderResponse::content(
+                    r#"{"kind":"final_answer","summary":"parent resumed","final_answer":"Children are terminal."}"#,
+                )
+            })
+            .await;
+        let session_id = "spawn-child-jobs-wait-session".to_string();
+        let (parent_job_id, worker_id) = create_waiting_test_job(
+            &state,
+            &session_id,
+            &workspace_root,
+            &base_url,
+            WaitUntil::ChildJobsCompleted { job_ids: vec![] },
+            Some(60),
+        );
+        let child_ids = create_manual_child_jobs(&state, &session_id, &parent_job_id, 3);
+        replace_worker_wait(
+            &state,
+            &worker_id,
+            WaitUntil::ChildJobsCompleted {
+                job_ids: child_ids.clone(),
+            },
+        );
+
+        mark_job_state(&state, &child_ids[1], "completed");
+        let event = DaemonEvent::JobCompleted(state.store.get_job(&child_ids[1]).unwrap().job);
+        process_waiting_workers(&state, Some(&event))
+            .await
+            .expect("first child completion should be processed");
+        assert_eq!(
+            state.store.get_job(&parent_job_id).unwrap().job.state,
+            "waiting"
+        );
+
+        mark_job_state(&state, &child_ids[0], "failed");
+        let event = DaemonEvent::JobFailed(state.store.get_job(&child_ids[0]).unwrap().job);
+        process_waiting_workers(&state, Some(&event))
+            .await
+            .expect("failed child should be terminal but not enough");
+        assert_eq!(
+            state.store.get_job(&parent_job_id).unwrap().job.state,
+            "waiting"
+        );
+
+        mark_job_state(&state, &child_ids[2], "completed");
+        let event = DaemonEvent::JobCompleted(state.store.get_job(&child_ids[2]).unwrap().job);
+        process_waiting_workers(&state, Some(&event))
+            .await
+            .expect("last terminal child should wake parent");
+
+        let parent = wait_for_job_state(&state, &parent_job_id, "completed").await;
+        server.await.expect("test server should finish");
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(parent.workers[0].id, worker_id);
+        assert!(parent.workers[0].wait_until_json.is_none());
+        let failed_child = state
+            .store
+            .get_job(&child_ids[0])
+            .expect("failed child should load");
+        let failed_result = child_job_result_json(&failed_child)
+            .expect("failed child result should serialize for parent aggregation");
+        assert_eq!(failed_result["state"], "failed");
+        assert!(
+            failed_result["last_error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("child failed for wait test")
+        );
+        assert!(
+            parent
+                .events
+                .iter()
+                .any(|event| event.event_type == "worker.wait.completed")
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn child_run_budget_is_independent_from_parent_budget() {
+        let state_dir = test_state_dir("spawn-child-jobs-independent-budget");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let (base_url, _request_count, _bodies, server) =
+            spawn_dynamic_openai_server(10, |_index, _body| {
+                DynamicOpenAiProviderResponse::content(
+                    r#"{"kind":"progress_update","summary":"still working","detail":"advance one child step"}"#,
+                )
+            })
+            .await;
+        let (session, parent_job_id, parent_worker) =
+            create_parent_fanout_context(&state, "independent-budget", &workspace_root, &base_url);
+        let child_job_id = create_child_job_with_limits(
+            &state,
+            &session,
+            &parent_job_id,
+            &parent_worker,
+            ChildJobProposal {
+                title: "Budget child".to_string(),
+                prompt: "run until child budget".to_string(),
+                working_dir: None,
+            },
+            ChildJobRunLimits {
+                max_steps: 10,
+                max_tool_calls: configured_child_job_max_tool_calls(),
+                max_wall_clock_secs: configured_job_max_wall_clock_secs(),
+            },
+        )
+        .await
+        .expect("child job should be created");
+
+        let child = wait_for_job_state(&state, &child_job_id, "completed").await;
+        server.await.expect("test server should finish");
+        assert_eq!(parent_worker.max_steps, 100);
+        assert_eq!(child.workers[0].max_steps, 10);
+        assert_eq!(child.workers[0].step_count, 10);
+        assert!(child.job.result_summary.contains("step budget"));
+        let parent = state
+            .store
+            .get_job(&parent_job_id)
+            .expect("parent job should load");
+        assert_eq!(parent.workers[0].max_steps, 100);
+        assert_eq!(parent.workers[0].step_count, 0);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
     async fn queued_job_registration_retries_until_existing_runner_releases() {
         let state_dir = test_state_dir("worker-wait-registration-retry");
         let state = initialize_test_state(&state_dir);
@@ -20966,6 +21459,105 @@ for line in sys.stdin:
         (base_url, request_count, server)
     }
 
+    struct DynamicOpenAiProviderResponse {
+        status: u16,
+        body: String,
+        content: Option<String>,
+        delay_ms: u64,
+    }
+
+    impl DynamicOpenAiProviderResponse {
+        fn content(content: impl Into<String>) -> Self {
+            Self {
+                status: 200,
+                body: String::new(),
+                content: Some(content.into()),
+                delay_ms: 0,
+            }
+        }
+
+        fn delayed(mut self, delay_ms: u64) -> Self {
+            self.delay_ms = delay_ms;
+            self
+        }
+    }
+
+    async fn spawn_dynamic_openai_server<F>(
+        max_requests: usize,
+        responder: F,
+    ) -> (
+        String,
+        Arc<AtomicUsize>,
+        Arc<TestMutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    )
+    where
+        F: Fn(usize, &str) -> DynamicOpenAiProviderResponse + Send + Sync + 'static,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener addr should be available")
+        );
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_bodies = Arc::new(TestMutex::new(Vec::new()));
+        let responder = Arc::new(responder);
+        let server_request_count = request_count.clone();
+        let server_request_bodies = request_bodies.clone();
+        let server = tokio::spawn(async move {
+            let mut handlers = Vec::with_capacity(max_requests);
+            for _ in 0..max_requests {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .expect("test request should connect");
+                let responder = responder.clone();
+                let request_count = server_request_count.clone();
+                let request_bodies = server_request_bodies.clone();
+                handlers.push(tokio::spawn(async move {
+                    let body = read_test_http_body(&mut socket).await;
+                    request_bodies
+                        .lock()
+                        .expect("request bodies lock should not be poisoned")
+                        .push(body.clone());
+                    let index = request_count.fetch_add(1, Ordering::SeqCst);
+                    let response = responder(index, &body);
+                    if response.delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(response.delay_ms)).await;
+                    }
+                    if response.status == 200 {
+                        write_test_openai_sse_response(
+                            &mut socket,
+                            "dynamic-turn",
+                            response
+                                .content
+                                .as_deref()
+                                .expect("successful response needs content"),
+                        )
+                        .await;
+                    } else {
+                        write_test_http_status_response(
+                            &mut socket,
+                            response.status,
+                            None,
+                            &response.body,
+                        )
+                        .await;
+                    }
+                }));
+            }
+
+            for handler in handlers {
+                handler.await.expect("test request handler should finish");
+            }
+        });
+        (base_url, request_count, request_bodies, server)
+    }
+
     fn create_command_test_context(
         state: &AppState,
         label: &str,
@@ -21346,6 +21938,214 @@ for line in sys.stdin:
         panic!("latest session job did not reach state '{expected_state}'");
     }
 
+    async fn wait_for_job_state(state: &AppState, job_id: &str, expected_state: &str) -> JobDetail {
+        for _ in 0..500 {
+            let detail = state.store.get_job(job_id).expect("job should load");
+            if detail.job.state == expected_state {
+                return detail;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        panic!("job '{job_id}' did not reach state '{expected_state}'");
+    }
+
+    async fn wait_for_child_count(
+        state: &AppState,
+        session_id: &str,
+        expected_count: usize,
+    ) -> JobDetail {
+        for _ in 0..500 {
+            let detail = latest_job_detail(state, session_id);
+            if detail.child_jobs.len() == expected_count {
+                return detail;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        panic!("latest session job did not record {expected_count} child jobs");
+    }
+
+    fn latest_job_detail(state: &AppState, session_id: &str) -> JobDetail {
+        let jobs = state
+            .store
+            .list_jobs_for_session(session_id)
+            .expect("session jobs should load");
+        let job = jobs.first().expect("session should have a job");
+        state
+            .store
+            .get_job(&job.id)
+            .expect("job detail should load")
+    }
+
+    fn spawn_child_jobs_action_json(
+        count: usize,
+        failing_index: Option<usize>,
+        prompt_prefix: &str,
+    ) -> String {
+        let jobs = (0..count)
+            .map(|index| {
+                let prompt = if Some(index) == failing_index {
+                    format!("{prompt_prefix}-{index}: child-fail")
+                } else {
+                    format!("{prompt_prefix}-{index}: child-success")
+                };
+                json!({
+                    "title": format!("Child {index}"),
+                    "prompt": prompt,
+                    "working_dir": null,
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "kind": "spawn_child_jobs",
+            "summary": format!("fan out to {count} child jobs"),
+            "jobs": jobs,
+        })
+        .to_string()
+    }
+
+    fn create_manual_child_jobs(
+        state: &AppState,
+        session_id: &str,
+        parent_job_id: &str,
+        count: usize,
+    ) -> Vec<String> {
+        (0..count)
+            .map(|index| {
+                let id = format!("{parent_job_id}-manual-child-{index}");
+                state
+                    .store
+                    .create_job(JobRecord {
+                        id: id.clone(),
+                        session_id: Some(session_id.to_string()),
+                        parent_job_id: Some(parent_job_id.to_string()),
+                        template_id: None,
+                        title: format!("Manual child {index}"),
+                        purpose: "wait test child".to_string(),
+                        trigger_kind: "child_job".to_string(),
+                        state: "running".to_string(),
+                        requested_by: "agent".to_string(),
+                        prompt_excerpt: String::new(),
+                        publication_intent_text: None,
+                    })
+                    .expect("manual child should persist");
+                id
+            })
+            .collect()
+    }
+
+    fn mark_job_state(state: &AppState, job_id: &str, next_state: &str) {
+        state
+            .store
+            .update_job(
+                job_id,
+                JobPatch {
+                    state: Some(next_state.to_string()),
+                    last_error: (next_state == "failed")
+                        .then(|| "child failed for wait test".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("job state should update");
+    }
+
+    fn replace_worker_wait(state: &AppState, worker_id: &str, until: WaitUntil) {
+        let started_at = unix_timestamp();
+        let wait = WorkerWaitRecord {
+            id: format!("{worker_id}-wait"),
+            summary: "wait for manual child jobs".to_string(),
+            until,
+            max_wait_seconds: Some(60),
+            wake_note: Some("resume after children finish".to_string()),
+            started_at,
+            last_checked_at: None,
+        };
+        state
+            .store
+            .update_worker(
+                worker_id,
+                WorkerPatch {
+                    wait_until_json: Some(Some(
+                        serde_json::to_value(&wait).expect("wait should encode"),
+                    )),
+                    wait_started_at: Some(Some(started_at)),
+                    last_error: Some(wait_status_text(&wait, started_at)),
+                    ..WorkerPatch::default()
+                },
+            )
+            .expect("worker wait should update");
+    }
+
+    fn create_parent_fanout_context(
+        state: &AppState,
+        label: &str,
+        workspace_root: &Path,
+        provider_base_url: &str,
+    ) -> (SessionDetail, String, WorkerSummary) {
+        let session_id = format!("{label}-session");
+        state
+            .store
+            .create_session(test_session_record(
+                &session_id,
+                "Parent fanout context",
+                workspace_root,
+            ))
+            .expect("session should persist");
+        let job_id = format!("{label}-parent-job");
+        state
+            .store
+            .create_job(JobRecord {
+                id: job_id.clone(),
+                session_id: Some(session_id.clone()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Parent fanout job".to_string(),
+                purpose: "test parent".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "running".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "parent".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("parent job should persist");
+        let worker_id = format!("{label}-parent-worker");
+        let worker = state
+            .store
+            .create_worker(WorkerRecord {
+                id: worker_id.clone(),
+                job_id: job_id.clone(),
+                parent_worker_id: None,
+                title: "Parent utility worker".to_string(),
+                lane: "utility".to_string(),
+                state: "running".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "test-model".to_string(),
+                provider_base_url: provider_base_url.to_string(),
+                provider_api_key: "test-key".to_string(),
+                provider_session_id: String::new(),
+                working_dir: workspace_root.display().to_string(),
+                read_roots: vec![workspace_root.display().to_string()],
+                write_roots: vec![workspace_root.display().to_string()],
+                max_steps: 100,
+                max_tool_calls: 100,
+                max_wall_clock_secs: 300,
+            })
+            .expect("parent worker should persist");
+        state
+            .store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    root_worker_id: Some(worker_id),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("parent root worker should update");
+        let session = state.store.get_session(&session_id).expect("session loads");
+        (session, job_id, worker)
+    }
+
     fn test_session_record(id: &str, title: &str, working_dir: &Path) -> SessionRecord {
         SessionRecord {
             id: id.to_string(),
@@ -21408,6 +22208,13 @@ for line in sys.stdin:
             last_error: String::new(),
             user_error: None,
             capabilities: Vec::new(),
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         }
@@ -21481,6 +22288,14 @@ for line in sys.stdin:
             worker_count: 1,
             pending_approval_count: 0,
             artifact_count: 0,
+            last_resumed_at: None,
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 0,
             updated_at: 0,
         }
