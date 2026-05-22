@@ -1,0 +1,95 @@
+name: Bug report
+description: Report something that is broken.
+title: "[Bug]: "
+labels:
+  - "type: bug"
+  - "status: needs-triage"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a Nucleus bug. Do not paste secrets, local auth tokens, or private credentials in logs.
+  - type: input
+    id: summary
+    attributes:
+      label: Short summary
+      description: What broke?
+      placeholder: Nucleus stops streaming after a worker command fails
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Nucleus version / release id
+      description: Use `/api/instance`, the Settings screen, or the managed release symlink target.
+      placeholder: nucleus-stable-0.1.0-20260522-abcdef123456
+    validations:
+      required: true
+  - type: dropdown
+    id: install-kind
+    attributes:
+      label: Install kind
+      options:
+        - managed_release
+        - dev checkout
+        - other
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: Include OS and architecture.
+      placeholder: Ubuntu 24.04, x86_64
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected subsystem
+      description: This selection is mirrored into an `area:` label by the issue-form area label workflow.
+      options:
+        - "area: daemon"
+        - "area: web"
+        - "area: storage"
+        - "area: protocol"
+        - "area: memory"
+        - "area: workers"
+        - "area: vault"
+        - "area: skills"
+        - "area: mcp"
+        - "area: publication"
+        - "area: release"
+        - "area: infra"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start Nucleus...
+        2. Open...
+        3. Run...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste the smallest useful excerpt. Redact secrets, local auth tokens, and private credentials.
+      render: shell
+    validations:
+      required: true
