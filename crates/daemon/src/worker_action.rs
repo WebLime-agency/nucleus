@@ -71,6 +71,8 @@ pub struct ChildJobProposal {
     pub title: String,
     pub prompt: String,
     pub working_dir: Option<String>,
+    #[serde(default)]
+    pub route_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -2134,6 +2136,36 @@ mod tests {
         assert_eq!(args["type"], "issue");
         assert_eq!(args["id"], "123");
         assert_eq!(args["title"], "Fix login");
+    }
+
+    #[test]
+    fn spawn_child_jobs_deserializes_optional_route_id() {
+        let action = parse_worker_action(
+            r#"{"kind":"spawn_child_jobs","summary":"fan out","jobs":[{"title":"Developer","prompt":"Implement the change","working_dir":null,"route_id":"developer-profile"}]}"#,
+        )
+        .expect("spawn_child_jobs with route_id should parse");
+
+        let WorkerAction::SpawnChildJobs { jobs, .. } = action else {
+            panic!("expected spawn_child_jobs");
+        };
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].route_id.as_deref(), Some("developer-profile"));
+    }
+
+    #[test]
+    fn spawn_child_jobs_without_route_id_remains_backward_compatible() {
+        let action = parse_worker_action(
+            r#"{"kind":"spawn_child_jobs","summary":"fan out","jobs":[{"title":"Inherited","prompt":"Inspect the repo","working_dir":null}]}"#,
+        )
+        .expect("spawn_child_jobs without route_id should parse");
+
+        let WorkerAction::SpawnChildJobs { jobs, .. } = action else {
+            panic!("expected spawn_child_jobs");
+        };
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].route_id, None);
     }
 
     #[test]
