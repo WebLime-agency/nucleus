@@ -31,6 +31,8 @@
   } from 'lucide-svelte';
 
   import FriendlyErrorNotice from '$lib/components/app/session/friendly-error-notice.svelte';
+  import ReasoningActivity from '$lib/components/app/session/reasoning-activity.svelte';
+  import RuntimeBadge from '$lib/components/app/session/runtime-badge.svelte';
   import MarkdownContent from '$lib/components/session/markdown-content.svelte';
   import { Badge } from '$lib/components/ui/badge';
   import { Button } from '$lib/components/ui/button';
@@ -68,6 +70,7 @@
     updateSession
   } from '$lib/nucleus/client';
   import { compactPath, formatDateTime, formatState } from '$lib/nucleus/format';
+  import { noActivity, usageView } from '$lib/nucleus/session-ux.js';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
   import type {
     ActionSummary,
@@ -188,6 +191,7 @@
   let activityJobDetail = $state<JobDetail | null>(null);
   let activityJobRequestInFlight = $state('');
   let transcriptAnchor = $state('');
+  let observabilityNow = $state(Math.floor(Date.now() / 1000));
 
   let transcriptElement = $state<HTMLDivElement | null>(null);
   let composerTextareaElement = $state<HTMLTextAreaElement | null>(null);
@@ -2285,6 +2289,12 @@
     return `${formatState(worker.provider)}${worker.model ? ` / ${worker.model}` : ''}`;
   }
 
+  function observabilityRowClass(record: { state: string; last_reasoning?: string; last_reasoning_at?: number | null }) {
+    return noActivity(record, observabilityNow)
+      ? 'border-amber-500/45 bg-amber-950/20'
+      : 'border-zinc-800 bg-zinc-950/70';
+  }
+
   function formatWorkerWaitSummary(worker: WorkerSummary) {
     const wait = worker.wait_until_json;
     const condition = formatWaitCondition(wait);
@@ -2782,6 +2792,9 @@
 
   onMount(() => {
     void loadAll();
+    const observabilityInterval = window.setInterval(() => {
+      observabilityNow = Math.floor(Date.now() / 1000);
+    }, 10_000);
 
     const disconnect = connectDaemonStream({
       onEvent: applyStreamEvent,
@@ -2794,6 +2807,7 @@
     });
 
     return () => {
+      window.clearInterval(observabilityInterval);
       disconnect();
     };
   });
@@ -4110,13 +4124,16 @@
                 {:else}
                   <div class="space-y-3">
                     {#each jobSummaries.slice(0, 4) as job}
+                      {@const jobUsage = usageView(job)}
                       <button
                         type="button"
                         class={cn(
                           'w-full rounded-xl border px-3 py-3 text-left transition-colors',
                           selectedJobId === job.id
                             ? 'border-lime-300/35 bg-lime-300/8'
-                            : 'border-zinc-800 bg-zinc-900/75 hover:border-zinc-700'
+                            : noActivity(job, observabilityNow)
+                              ? 'border-amber-500/45 bg-amber-950/20 hover:border-amber-400/60'
+                              : 'border-zinc-800 bg-zinc-900/75 hover:border-zinc-700'
                         )}
                         onclick={() => {
                           void loadJob(job.id);
@@ -4132,11 +4149,14 @@
                           </Badge>
                         </div>
                         <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-zinc-600">
+                          <RuntimeBadge record={job} nowSeconds={observabilityNow} />
+                          <span title={jobUsage.title}>{jobUsage.label}</span>
                           <span>{job.worker_count} Utility Worker{job.worker_count === 1 ? '' : 's'}</span>
                           <span>{job.pending_approval_count} approvals</span>
                           <span>{job.artifact_count} artifacts</span>
                           <span>{formatDateTime(job.updated_at)}</span>
                         </div>
+                        <ReasoningActivity record={job} nowSeconds={observabilityNow} />
                         {#if publicationOutcomeLabel(job)}
                           <div class="mt-2 text-xs text-zinc-400">
                             {publicationOutcomeLabel(job)}
@@ -4147,7 +4167,8 @@
                   </div>
 
                   {#if jobDetail}
-                    <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
+                    {@const detailJobUsage = usageView(jobDetail.job)}
+                    <div class={cn('rounded-xl border px-3 py-3', observabilityRowClass(jobDetail.job))}>
                       <div class="flex items-start justify-between gap-3">
                         <div class="min-w-0">
                           <div class="truncate text-sm font-medium text-zinc-100">{jobDetail.job.title}</div>
@@ -4159,6 +4180,11 @@
                           {jobCompletionLabel(jobDetail.job)}
                         </Badge>
                       </div>
+                      <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-zinc-600">
+                        <RuntimeBadge record={jobDetail.job} nowSeconds={observabilityNow} />
+                        <span title={detailJobUsage.title}>{detailJobUsage.label}</span>
+                      </div>
+                      <ReasoningActivity record={jobDetail.job} nowSeconds={observabilityNow} />
 
                       {#if jobDetail.job.user_error}
                         <FriendlyErrorNotice
@@ -4297,7 +4323,8 @@
                                 {/if}
                               </div>
                               {#each jobDetail.child_jobs as childJob}
-                                <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2">
+                                {@const childUsage = usageView(childJob)}
+                                <div class={cn('rounded-lg border px-3 py-2', observabilityRowClass(childJob))}>
                                   <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                       <div class="truncate text-sm text-zinc-100">{childJob.title}</div>
@@ -4310,6 +4337,8 @@
                                     </Badge>
                                   </div>
                                   <div class="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-zinc-600">
+                                    <RuntimeBadge record={childJob} nowSeconds={observabilityNow} />
+                                    <span title={childUsage.title}>{childUsage.label}</span>
                                     <span class="font-mono">{childJob.id}</span>
                                     <span>Created {formatDateTime(childJob.created_at)}</span>
                                     <span>{childJob.worker_count} Utility Worker{childJob.worker_count === 1 ? '' : 's'}</span>
@@ -4318,6 +4347,7 @@
                                       <span>Updated {formatDateTime(childJob.updated_at)}</span>
                                     {/if}
                                   </div>
+                                  <ReasoningActivity record={childJob} nowSeconds={observabilityNow} />
                                   {#if childJob.user_error}
                                     <FriendlyErrorNotice userError={childJob.user_error} class="mt-2" />
                                   {:else if childJob.last_error}
@@ -4333,7 +4363,8 @@
                           <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">Utility Workers</div>
                           <div class="mt-2 space-y-2">
                             {#each jobDetail.workers as worker}
-                              <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2">
+                              {@const workerUsage = usageView(worker)}
+                              <div class={cn('rounded-lg border px-3 py-2', observabilityRowClass(worker))}>
                                 <div class="flex items-center justify-between gap-3">
                                   <div class="min-w-0">
                                     <div class="truncate text-sm text-zinc-100">{worker.title}</div>
@@ -4346,10 +4377,13 @@
                                   </Badge>
                                 </div>
                                 <div class="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-zinc-600">
+                                  <RuntimeBadge record={worker} nowSeconds={observabilityNow} />
+                                  <span title={workerUsage.title}>{workerUsage.label}</span>
                                   <span>{worker.step_count}/{worker.max_steps} steps</span>
                                   <span>{worker.tool_call_count}/{worker.max_tool_calls} actions</span>
                                   <span>{compactPath(worker.working_dir)}</span>
                                 </div>
+                                <ReasoningActivity record={worker} nowSeconds={observabilityNow} />
                                 {#if worker.user_error}
                                   <FriendlyErrorNotice userError={worker.user_error} class="mt-2" />
                                 {:else if worker.last_error}

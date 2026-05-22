@@ -89,6 +89,14 @@ export const sessionSummarySchema = z.object({
   capabilities: z.array(z.lazy(() => toolCapabilitySummarySchema)).default([]),
   last_message_excerpt: z.string(),
   turn_count: z.number().int().nonnegative(),
+  last_resumed_at: z.number().int().nullable().default(null),
+  last_reasoning: z.string().default(''),
+  last_reasoning_at: z.number().int().nullable().default(null),
+  token_usage_known: z.boolean().default(false),
+  prompt_tokens: z.number().int().nonnegative().default(0),
+  completion_tokens: z.number().int().nonnegative().default(0),
+  cached_tokens: z.number().int().nonnegative().default(0),
+  cost_usd_estimate: z.number().nullable().default(null),
   created_at: z.number().int(),
   updated_at: z.number().int()
 });
@@ -172,6 +180,14 @@ export const jobSummarySchema = z.object({
   worker_count: z.number().int().nonnegative(),
   pending_approval_count: z.number().int().nonnegative(),
   artifact_count: z.number().int().nonnegative(),
+  last_resumed_at: z.number().int().nullable().default(null),
+  last_reasoning: z.string().default(''),
+  last_reasoning_at: z.number().int().nullable().default(null),
+  token_usage_known: z.boolean().default(false),
+  prompt_tokens: z.number().int().nonnegative().default(0),
+  completion_tokens: z.number().int().nonnegative().default(0),
+  cached_tokens: z.number().int().nonnegative().default(0),
+  cost_usd_estimate: z.number().nullable().default(null),
   created_at: z.number().int(),
   updated_at: z.number().int()
 });
@@ -201,6 +217,13 @@ export const workerSummarySchema = z.object({
   last_error: z.string(),
   user_error: userFacingErrorSummarySchema.nullable().default(null),
   capabilities: z.array(toolCapabilitySummarySchema).default([]),
+  last_reasoning: z.string().default(''),
+  last_reasoning_at: z.number().int().nullable().default(null),
+  token_usage_known: z.boolean().default(false),
+  prompt_tokens: z.number().int().nonnegative().default(0),
+  completion_tokens: z.number().int().nonnegative().default(0),
+  cached_tokens: z.number().int().nonnegative().default(0),
+  cost_usd_estimate: z.number().nullable().default(null),
   created_at: z.number().int(),
   updated_at: z.number().int()
 });
