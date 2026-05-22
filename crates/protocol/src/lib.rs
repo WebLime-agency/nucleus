@@ -1876,6 +1876,8 @@ mod tests {
             executor_lane: "utility".to_string(),
             executor_provider: "openai_compatible".to_string(),
             executor_model: "gpt-5.4-mini".to_string(),
+            executor_route_id: String::new(),
+            executor_route_title: String::new(),
             visible_turn_id: Some("turn-1".to_string()),
             result_summary: "done".to_string(),
             last_error: String::new(),
