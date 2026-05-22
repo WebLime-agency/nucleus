@@ -2556,10 +2556,10 @@ impl StateStore {
             params![
                 job_id,
                 next_state,
-                patch
-                    .task_class
-                    .map(|value| value.and_then(|value| normalize_task_class(Some(&value))))
-                    .unwrap_or(current.task_class),
+                match patch.task_class {
+                    Some(value) => value.and_then(|value| normalize_task_class(Some(&value))),
+                    None => current.task_class,
+                },
                 patch.root_worker_id.or(current.root_worker_id),
                 patch.visible_turn_id.or(current.visible_turn_id),
                 patch.result_summary.unwrap_or(current.result_summary),
@@ -4960,7 +4960,7 @@ fn contains_any(text: &str, needles: &[&str]) -> bool {
 
 fn task_class_from_tool_id(tool_id: &str) -> Option<&'static str> {
     let tool_id = tool_id.to_ascii_lowercase();
-    if is_research_tool(&tool_id) {
+    if is_research_classification_tool(&tool_id) {
         Some("research")
     } else if is_automation_tool(&tool_id) {
         Some("automation")
@@ -7870,6 +7870,12 @@ fn is_research_tool(text: &str) -> bool {
         .any(|needle| text.contains(needle))
 }
 
+fn is_research_classification_tool(text: &str) -> bool {
+    ["web", "search", "fetch", "source"]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
 fn is_automation_tool(text: &str) -> bool {
     ["automation", "schedule", "monitor", "reminder"]
         .iter()
@@ -10709,6 +10715,70 @@ and open a pull request to dev when it is ready."
                 .any(|evidence| evidence.starts_with("failed_command:"))
         );
 
+        let browser_only_job = store
+            .create_job(JobRecord {
+                id: "browser-only-job".to_string(),
+                session_id: Some("task-class-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: None,
+                title: "Browser only job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "inspect the local UI".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("browser-only job should persist");
+        store
+            .create_worker(WorkerRecord {
+                id: "browser-only-worker".to_string(),
+                job_id: browser_only_job.id.clone(),
+                parent_worker_id: None,
+                title: "Browser only worker".to_string(),
+                lane: "utility".to_string(),
+                state: "completed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "cx/gpt-5.4".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: std::env::temp_dir().display().to_string(),
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                max_steps: 8,
+                max_tool_calls: 8,
+                max_wall_clock_secs: 60,
+            })
+            .expect("browser-only worker should persist");
+        store
+            .create_tool_call(ToolCallRecord {
+                id: "browser-only-tool-call".to_string(),
+                job_id: browser_only_job.id.clone(),
+                worker_id: "browser-only-worker".to_string(),
+                tool_id: "browser.snapshot".to_string(),
+                status: "success".to_string(),
+                summary: "captured local UI snapshot".to_string(),
+                args_json: json!({}),
+                result_json: Some(json!({ "ok": true })),
+                policy_decision: None,
+                artifact_ids: Vec::new(),
+                error_class: String::new(),
+                error_detail: String::new(),
+                started_at: None,
+                completed_at: None,
+            })
+            .expect("browser-only tool call should persist");
+        let browser_only_job = store
+            .get_job(&browser_only_job.id)
+            .expect("browser-only job should load")
+            .job;
+        assert_eq!(browser_only_job.task_class, None);
+        assert_eq!(browser_only_job.completion_status, "not_gated");
+
         let memory_generic_session_event = store
             .create_job(JobRecord {
                 id: "memory-generic-session-event-job".to_string(),
@@ -10783,6 +10853,35 @@ and open a pull request to dev when it is ready."
             })
             .expect("ungated job should persist");
         assert_eq!(ungated.completion_status, "not_gated");
+
+        let cleared = store
+            .create_job(JobRecord {
+                id: "clear-task-class-job".to_string(),
+                session_id: Some("task-class-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("local_project".to_string()),
+                title: "Clear task class job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "prompt".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("clear task class job should persist");
+        assert_eq!(cleared.completion_status, "blocked");
+        let cleared = store
+            .update_job(
+                &cleared.id,
+                JobPatch {
+                    task_class: Some(None),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("task class clear should persist");
+        assert_eq!(cleared.task_class, None);
+        assert_eq!(cleared.completion_status, "not_gated");
 
         let _ = fs::remove_dir_all(&state_dir);
     }
