@@ -313,7 +313,7 @@
     latestByState(activityJobDetail?.command_sessions ?? [], ['running', 'starting'])
   );
   let composerActivityWorker = $derived.by(() =>
-    latestByState(activityJobDetail?.workers ?? [], ['running', 'queued', 'paused'])
+    latestByState(activityJobDetail?.workers ?? [], ['running', 'waiting', 'queued', 'paused'])
   );
   let composerActivitySummary = $derived.by(() => {
     if (activePromptProgress) {
@@ -2278,7 +2278,76 @@
   }
 
   function formatWorkerSummary(worker: WorkerSummary) {
+    if (worker.state === 'waiting') {
+      return formatWorkerWaitSummary(worker);
+    }
+
     return `${formatState(worker.provider)}${worker.model ? ` / ${worker.model}` : ''}`;
+  }
+
+  function formatWorkerWaitSummary(worker: WorkerSummary) {
+    const wait = worker.wait_until_json;
+    const condition = formatWaitCondition(wait);
+    const remaining = formatWaitRemaining(wait, worker.wait_started_at);
+    return `waiting until ${condition}${remaining ? ` (woke in ${remaining})` : ''}`;
+  }
+
+  function formatWaitCondition(wait: unknown) {
+    if (!wait || typeof wait !== 'object') return 'saved wake condition';
+    const record = wait as {
+      until?: {
+        kind?: string;
+        delay_seconds?: number;
+        absolute_unix?: number;
+        job_ids?: string[];
+        job_id?: string;
+        artifact_kind?: string;
+        event_kind?: string;
+        target_pattern?: string;
+        status?: string;
+      };
+    };
+    const until = record.until;
+    if (!until || typeof until !== 'object') return 'saved wake condition';
+    if (until.kind === 'delay_seconds') return `a ${formatDuration(until.delay_seconds ?? 0)} delay`;
+    if (until.kind === 'absolute_unix') return formatDateTime(until.absolute_unix ?? 0);
+    if (until.kind === 'audit_event') {
+      const parts = [`audit event ${until.event_kind ?? ''}`.trim()];
+      if (until.target_pattern) parts.push(`target ${until.target_pattern}`);
+      if (until.status) parts.push(until.status);
+      return parts.join(' / ');
+    }
+    if (until.kind === 'child_jobs_completed') return `${until.job_ids?.length ?? 0} child jobs complete`;
+    if (until.kind === 'artifact_kind') return `${until.artifact_kind ?? 'artifact'} on ${until.job_id ?? 'job'}`;
+    return formatState(until.kind ?? 'wake condition');
+  }
+
+  function formatWaitRemaining(wait: unknown, waitStartedAt: number | null) {
+    if (!wait || typeof wait !== 'object' || !waitStartedAt) return '';
+    const record = wait as {
+      max_wait_seconds?: number | null;
+      until?: { kind?: string; delay_seconds?: number; absolute_unix?: number };
+    };
+    const now = Math.floor(Date.now() / 1000);
+    const candidates: number[] = [];
+    if (record.until?.kind === 'delay_seconds' && typeof record.until.delay_seconds === 'number') {
+      candidates.push(waitStartedAt + record.until.delay_seconds - now);
+    }
+    if (record.until?.kind === 'absolute_unix' && typeof record.until.absolute_unix === 'number') {
+      candidates.push(record.until.absolute_unix - now);
+    }
+    if (typeof record.max_wait_seconds === 'number') {
+      candidates.push(waitStartedAt + record.max_wait_seconds - now);
+    }
+    const remaining = candidates.length ? Math.max(0, Math.min(...candidates)) : null;
+    return remaining === null ? '' : formatDuration(remaining);
+  }
+
+  function formatDuration(seconds: number) {
+    const total = Math.max(0, Math.round(seconds));
+    if (total >= 3600) return `${Math.floor(total / 3600)}h ${Math.floor((total % 3600) / 60)}m`;
+    if (total >= 60) return `${Math.floor(total / 60)}m ${total % 60}s`;
+    return `${total}s`;
   }
 
   function formatJobEvent(event: JobEvent) {
