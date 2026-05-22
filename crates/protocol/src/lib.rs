@@ -292,6 +292,10 @@ pub struct WorkerSummary {
     pub max_wall_clock_secs: u64,
     pub step_count: usize,
     pub tool_call_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_until_json: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_started_at: Option<i64>,
     #[serde(default)]
     pub last_error: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
