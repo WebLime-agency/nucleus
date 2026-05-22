@@ -55,6 +55,11 @@ pub enum PromptStreamEvent {
     ReasoningSnapshot {
         text: String,
     },
+    TokenUsage {
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        cached_tokens: u64,
+    },
     ProviderRetry {
         attempt: u32,
         error_class: String,
@@ -287,6 +292,7 @@ async fn execute_openai_compatible_prompt(
     let mut payload = json!({
         "model": session.model,
         "stream": true,
+        "stream_options": { "include_usage": true },
         "messages": compiled_turn_openai_messages(compiled_turn),
     });
     if compiled_turn_requires_json_object(compiled_turn) {
@@ -479,6 +485,17 @@ fn handle_openai_compatible_line(
         }
     }
 
+    if let Some(usage) = chunk.usage {
+        let _ = events.send(PromptStreamEvent::TokenUsage {
+            prompt_tokens: usage.prompt_tokens.unwrap_or(0),
+            completion_tokens: usage.completion_tokens.unwrap_or(0),
+            cached_tokens: usage
+                .prompt_tokens_details
+                .and_then(|details| details.cached_tokens)
+                .unwrap_or(0),
+        });
+    }
+
     for choice in chunk.choices {
         if let Some(reasoning) = choice.delta.reasoning_text() {
             let _ = events.send(PromptStreamEvent::ReasoningSnapshot { text: reasoning });
@@ -554,6 +571,19 @@ struct OpenAiStreamChunk {
     id: Option<String>,
     #[serde(default)]
     choices: Vec<OpenAiChoice>,
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenAiUsage {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenAiPromptTokensDetails {
+    cached_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -575,8 +605,8 @@ impl OpenAiDelta {
         self.reasoning
             .as_ref()
             .or(self.reasoning_content.as_ref())
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.to_string())
     }
 }
 
@@ -661,5 +691,48 @@ mod tests {
             parsed > Duration::from_secs(55) && parsed <= Duration::from_secs(60),
             "expected roughly 60s retry-after, got {parsed:?}"
         );
+    }
+
+    #[test]
+    fn openai_stream_usage_block_emits_token_usage() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let mut provider_session_id = String::new();
+        let mut content = String::new();
+        let done = handle_openai_compatible_line(
+            r#"data: {"id":"chatcmpl-test","choices":[],"usage":{"prompt_tokens":120,"completion_tokens":45,"prompt_tokens_details":{"cached_tokens":30}}}"#,
+            &mut provider_session_id,
+            &mut content,
+            &events,
+        )
+        .expect("usage chunk should decode");
+
+        assert!(!done);
+        assert_eq!(provider_session_id, "chatcmpl-test");
+        let mut saw_usage = false;
+        while let Ok(event) = receiver.try_recv() {
+            if let PromptStreamEvent::TokenUsage {
+                prompt_tokens,
+                completion_tokens,
+                cached_tokens,
+            } = event
+            {
+                saw_usage = true;
+                assert_eq!(prompt_tokens, 120);
+                assert_eq!(completion_tokens, 45);
+                assert_eq!(cached_tokens, 30);
+            }
+        }
+        assert!(saw_usage);
+    }
+
+    #[test]
+    fn openai_reasoning_delta_preserves_spacing() {
+        let delta = OpenAiDelta {
+            reasoning: Some("checking ".to_string()),
+            reasoning_content: None,
+            content: None,
+        };
+
+        assert_eq!(delta.reasoning_text().as_deref(), Some("checking "));
     }
 }

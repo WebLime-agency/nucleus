@@ -81,7 +81,7 @@ pub struct UserFacingErrorSummary {
     pub technical_detail: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionSummary {
     pub id: String,
     pub title: String,
@@ -144,6 +144,22 @@ pub struct SessionSummary {
     pub capabilities: Vec<ToolCapabilitySummary>,
     pub last_message_excerpt: String,
     pub turn_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_resumed_at: Option<i64>,
+    #[serde(default)]
+    pub last_reasoning: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reasoning_at: Option<i64>,
+    #[serde(default)]
+    pub token_usage_known: bool,
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd_estimate: Option<f64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -166,7 +182,7 @@ pub struct SessionTurn {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionDetail {
     pub session: SessionSummary,
     pub turns: Vec<SessionTurn>,
@@ -195,7 +211,7 @@ pub struct ToolCapabilitySummary {
     pub scope_kind: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JobSummary {
     pub id: String,
     pub session_id: Option<String>,
@@ -246,6 +262,22 @@ pub struct JobSummary {
     pub worker_count: usize,
     pub pending_approval_count: usize,
     pub artifact_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_resumed_at: Option<i64>,
+    #[serde(default)]
+    pub last_reasoning: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reasoning_at: Option<i64>,
+    #[serde(default)]
+    pub token_usage_known: bool,
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd_estimate: Option<f64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -266,7 +298,7 @@ fn default_cleanup_status() -> String {
     "unknown".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkerSummary {
     pub id: String,
     pub job_id: String,
@@ -302,6 +334,20 @@ pub struct WorkerSummary {
     pub user_error: Option<UserFacingErrorSummary>,
     #[serde(default)]
     pub capabilities: Vec<ToolCapabilitySummary>,
+    #[serde(default)]
+    pub last_reasoning: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reasoning_at: Option<i64>,
+    #[serde(default)]
+    pub token_usage_known: bool,
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd_estimate: Option<f64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -464,7 +510,7 @@ pub struct PlaybookSummary {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PlaybookDetail {
     pub playbook: PlaybookSummary,
     pub session: SessionSummary,
@@ -1843,6 +1889,14 @@ mod tests {
             worker_count: 1,
             pending_approval_count: 0,
             artifact_count: 1,
+            last_resumed_at: None,
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
             created_at: 1,
             updated_at: 2,
         };
