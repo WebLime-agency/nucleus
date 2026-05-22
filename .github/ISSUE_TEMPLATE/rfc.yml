@@ -1,0 +1,69 @@
+name: RFC
+description: Start a design discussion or larger plan.
+title: "[RFC]: "
+labels:
+  - "type: rfc"
+  - "status: needs-design"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for proposals that need design discussion before implementation.
+  - type: input
+    id: title
+    attributes:
+      label: RFC title
+      placeholder: Daemon-owned completion gates
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected subsystem
+      description: This selection is mirrored into an `area:` label by the issue-form area label workflow.
+      options:
+        - "area: daemon"
+        - "area: web"
+        - "area: storage"
+        - "area: protocol"
+        - "area: memory"
+        - "area: workers"
+        - "area: vault"
+        - "area: skills"
+        - "area: mcp"
+        - "area: publication"
+        - "area: release"
+        - "area: infra"
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+    validations:
+      required: true
+  - type: textarea
+    id: proposed-direction
+    attributes:
+      label: Proposed direction
+      description: Keep this high level. Detailed specs can live in comments.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance criteria
+    validations:
+      required: true
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out-of-scope
+    validations:
+      required: true
+  - type: textarea
+    id: open-questions
+    attributes:
+      label: Open design questions
+    validations:
+      required: true

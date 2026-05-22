@@ -83,6 +83,31 @@ export function usageView(record) {
   };
 }
 
+export function completionGateGroups(record) {
+  const gates = Array.isArray(record?.completion_gates) ? record.completion_gates : [];
+  return {
+    blocked: gates.filter((gate) => gate.state === 'blocked'),
+    pending: gates.filter((gate) => gate.state === 'pending'),
+    done: gates.filter((gate) => gate.state === 'done')
+  };
+}
+
+export function gateBadgeVariant(state) {
+  if (state === 'done') return 'default';
+  if (state === 'blocked') return 'destructive';
+  return 'warning';
+}
+
+export function childRouteLabel(record) {
+  const title = String(record?.executor_route_title ?? '').trim();
+  if (title) return title;
+
+  const id = String(record?.executor_route_id ?? '').trim();
+  if (id) return id;
+
+  return '(inherits parent)';
+}
+
 export function noActivity(record, nowSeconds) {
   return reasoningActivityView(record, nowSeconds)?.stale ?? false;
 }

@@ -211,6 +211,35 @@ pub struct ToolCapabilitySummary {
     pub scope_kind: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompletionGateSummary {
+    pub id: String,
+    pub title: String,
+    pub state: String,
+    pub summary: String,
+    #[serde(default)]
+    pub task_class: String,
+    #[serde(default)]
+    pub required_evidence: Vec<String>,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceRequirementSummary {
+    pub id: String,
+    pub title: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskEvidenceContractSummary {
+    pub task_class: String,
+    pub title: String,
+    pub summary: String,
+    pub requirements: Vec<EvidenceRequirementSummary>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JobSummary {
     pub id: String,
@@ -230,6 +259,10 @@ pub struct JobSummary {
     pub executor_provider: String,
     #[serde(default)]
     pub executor_model: String,
+    #[serde(default)]
+    pub executor_route_id: String,
+    #[serde(default)]
+    pub executor_route_title: String,
     pub visible_turn_id: Option<String>,
     pub result_summary: String,
     pub last_error: String,
@@ -259,6 +292,12 @@ pub struct JobSummary {
     pub cleanup_status: String,
     #[serde(default)]
     pub cleanup_paths: Vec<String>,
+    #[serde(default)]
+    pub completion_status: String,
+    #[serde(default)]
+    pub completion_gates: Vec<CompletionGateSummary>,
+    #[serde(default)]
+    pub completion_blockers: Vec<String>,
     pub worker_count: usize,
     pub pending_approval_count: usize,
     pub artifact_count: usize,
@@ -282,6 +321,41 @@ pub struct JobSummary {
     pub updated_at: i64,
 }
 
+impl JobSummary {
+    pub fn with_completion_gates(mut self) -> Self {
+        let gates = derive_completion_gates(&self);
+        let blockers = gates
+            .iter()
+            .filter(|gate| gate.state == "blocked")
+            .map(|gate| gate.summary.clone())
+            .collect::<Vec<_>>();
+        let completion_status = if blockers.is_empty() {
+            if gates.iter().any(|gate| gate.state == "pending") {
+                "pending"
+            } else if gates.is_empty() {
+                "not_gated"
+            } else {
+                "satisfied"
+            }
+        } else {
+            "blocked"
+        };
+
+        self.completion_status = completion_status.to_string();
+        self.completion_gates = gates;
+        self.completion_blockers = blockers;
+        self
+    }
+
+    pub fn has_blocking_completion_gates(&self) -> bool {
+        self.completion_status == "blocked"
+            || self
+                .completion_gates
+                .iter()
+                .any(|gate| gate.state == "blocked")
+    }
+}
+
 fn default_publication_status() -> String {
     "not_requested".to_string()
 }
@@ -298,6 +372,421 @@ fn default_cleanup_status() -> String {
     "unknown".to_string()
 }
 
+fn derive_completion_gates(job: &JobSummary) -> Vec<CompletionGateSummary> {
+    if !job.publication_requested
+        && !job.browser_verification_required
+        && job.cleanup_status != "cleanup_required"
+    {
+        return Vec::new();
+    }
+
+    let terminal = matches!(
+        job.state.as_str(),
+        "completed" | "blocked" | "failed" | "canceled"
+    );
+    let mut gates = Vec::new();
+
+    if job.publication_requested {
+        gates.push(publication_gate(job, terminal));
+        gates.push(validation_gate(job, terminal));
+    }
+
+    if job.publication_requested || job.browser_verification_required {
+        gates.push(browser_gate(job, terminal));
+    }
+
+    if job.publication_requested || job.cleanup_status == "cleanup_required" {
+        gates.push(cleanup_gate(job, terminal));
+    }
+
+    gates
+}
+
+pub fn task_evidence_contract_catalog() -> Vec<TaskEvidenceContractSummary> {
+    vec![
+        task_evidence_contract(
+            "github_pr",
+            "GitHub/PR work",
+            "Ground PR lifecycle, review, and CI claims in direct GitHub evidence.",
+            &[
+                (
+                    "pr_state",
+                    "Direct PR state",
+                    "Use direct PR state evidence for open, closed, merged, mergeability, and review-decision claims.",
+                ),
+                (
+                    "review_threads",
+                    "Thread-aware review evidence",
+                    "Use unresolved review-thread evidence before claiming no actionable PR feedback remains.",
+                ),
+                (
+                    "status_checks",
+                    "Status check evidence",
+                    "Use CI/check-suite evidence before claiming PR checks are green.",
+                ),
+            ],
+        ),
+        task_evidence_contract(
+            "research",
+            "Research",
+            "Ground research answers in source freshness, provenance, and contradiction checks.",
+            &[
+                (
+                    "fresh_sources",
+                    "Fresh direct sources",
+                    "Use direct, recent sources for time-sensitive claims.",
+                ),
+                (
+                    "source_quality",
+                    "Source quality",
+                    "Prefer primary or authoritative sources before confident conclusions.",
+                ),
+                (
+                    "contradictions",
+                    "Contradiction check",
+                    "Check for conflicting evidence before final-sounding answers.",
+                ),
+            ],
+        ),
+        task_evidence_contract(
+            "automation",
+            "Automation",
+            "Ground automation claims in actual schedule, execution, and side-effect state.",
+            &[
+                (
+                    "schedule_state",
+                    "Schedule state",
+                    "Verify the target automation schedule or monitor state.",
+                ),
+                (
+                    "execution_logs",
+                    "Execution logs",
+                    "Use run logs or exit status before claiming an automation ran successfully.",
+                ),
+                (
+                    "side_effects",
+                    "Observed side effects",
+                    "Confirm expected side effects before saying the automation completed.",
+                ),
+            ],
+        ),
+        task_evidence_contract(
+            "local_project",
+            "Local project work",
+            "Ground local project claims in cwd, branch, changed files, and validation evidence.",
+            &[
+                (
+                    "workspace_context",
+                    "Workspace context",
+                    "Verify cwd, branch, repo, and target project before using command output as evidence.",
+                ),
+                (
+                    "changed_files",
+                    "Changed files",
+                    "Use the actual changed-file set before summarizing code changes.",
+                ),
+                (
+                    "validation",
+                    "Validation evidence",
+                    "Use test, build, lint, or explicit unavailable evidence before claiming validation passed.",
+                ),
+            ],
+        ),
+        task_evidence_contract(
+            "deployment",
+            "Deployment/release work",
+            "Ground shipped/released claims in remote deployment, version, and health evidence.",
+            &[
+                (
+                    "deployment_status",
+                    "Deployment status",
+                    "Verify the remote deployment or release workflow status.",
+                ),
+                (
+                    "version",
+                    "Version evidence",
+                    "Confirm the shipped version, artifact, or commit.",
+                ),
+                (
+                    "health",
+                    "Health check",
+                    "Check service health before saying a deployment is live.",
+                ),
+            ],
+        ),
+        task_evidence_contract(
+            "memory_session",
+            "Memory/session operations",
+            "Ground memory and session claims in target scope and persisted state.",
+            &[
+                (
+                    "target_scope",
+                    "Target scope",
+                    "Verify the session, project, profile, or memory scope before mutating or reporting state.",
+                ),
+                (
+                    "operation_result",
+                    "Operation result",
+                    "Use the store operation result before claiming memory/session state changed.",
+                ),
+                (
+                    "retrieval_source",
+                    "Retrieval source",
+                    "Report or use the source of retrieved memory/session evidence.",
+                ),
+            ],
+        ),
+        task_evidence_contract(
+            "process_server",
+            "Process/server state",
+            "Ground running/stopped/server-ready claims in process, port, and health evidence.",
+            &[
+                (
+                    "process_state",
+                    "Process state",
+                    "Verify the target process or service state.",
+                ),
+                (
+                    "port_state",
+                    "Port state",
+                    "Check the expected port or listener before claiming a server is reachable.",
+                ),
+                (
+                    "health_or_logs",
+                    "Health/log evidence",
+                    "Use a health endpoint or logs before claiming a server is healthy.",
+                ),
+            ],
+        ),
+    ]
+}
+
+fn task_evidence_contract(
+    task_class: &str,
+    title: &str,
+    summary: &str,
+    requirements: &[(&str, &str, &str)],
+) -> TaskEvidenceContractSummary {
+    TaskEvidenceContractSummary {
+        task_class: task_class.to_string(),
+        title: title.to_string(),
+        summary: summary.to_string(),
+        requirements: requirements
+            .iter()
+            .map(|(id, title, summary)| EvidenceRequirementSummary {
+                id: (*id).to_string(),
+                title: (*title).to_string(),
+                summary: (*summary).to_string(),
+            })
+            .collect(),
+    }
+}
+
+fn required_evidence_for(task_class: &str, ids: &[&str]) -> Vec<String> {
+    task_evidence_contract_catalog()
+        .into_iter()
+        .find(|contract| contract.task_class == task_class)
+        .map(|contract| {
+            contract
+                .requirements
+                .into_iter()
+                .filter(|requirement| ids.contains(&requirement.id.as_str()))
+                .map(|requirement| requirement.title)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn publication_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
+    let evidence = [
+        non_empty_evidence("PR", &job.pr_url),
+        non_empty_evidence("Source", &job.source_branch),
+        non_empty_evidence("Target", &job.target_branch),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+
+    let has_open_pr_evidence = job.publication_status == "opened"
+        && !job.pr_url.is_empty()
+        && !job.target_branch.is_empty();
+    let state = if has_open_pr_evidence {
+        "done"
+    } else if matches!(
+        job.publication_status.as_str(),
+        "blocked" | "failed" | "not_opened"
+    ) || terminal
+    {
+        "blocked"
+    } else {
+        "pending"
+    };
+    let summary = match state {
+        "done" => format!(
+            "PR is open against {}.",
+            empty_fallback(&job.target_branch, "the requested base")
+        ),
+        "pending" => "PR publication evidence is still pending.".to_string(),
+        _ if job.publication_summary.trim().is_empty() => {
+            "Publication was requested, but no open PR URL and target branch evidence are recorded."
+                .to_string()
+        }
+        _ => job.publication_summary.clone(),
+    };
+
+    completion_gate(
+        "publication",
+        "PR publication",
+        state,
+        summary,
+        "github_pr",
+        required_evidence_for("github_pr", &["pr_state"]),
+        evidence,
+    )
+}
+
+fn validation_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
+    let state = match job.validation_status.as_str() {
+        "passed" => "done",
+        "failed" => "blocked",
+        "unavailable" | "not_performed" if terminal => "blocked",
+        _ => "pending",
+    };
+    let summary = match state {
+        "done" => "Validation passed.".to_string(),
+        "pending" => "Validation evidence is still pending.".to_string(),
+        _ => format!(
+            "Validation is {}.",
+            format_gate_status(&job.validation_status)
+        ),
+    };
+
+    completion_gate(
+        "validation",
+        "Validation",
+        state,
+        summary,
+        "local_project",
+        required_evidence_for("local_project", &["validation"]),
+        Vec::new(),
+    )
+}
+
+fn browser_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
+    let evidence = job
+        .browser_verification_artifact_ids
+        .iter()
+        .map(|id| format!("Artifact {id}"))
+        .collect::<Vec<_>>();
+    let state = match job.browser_verification_status.as_str() {
+        "passed" | "not_required" => "done",
+        "failed" => "blocked",
+        "unavailable" | "not_performed" if terminal || job.publication_status == "blocked" => {
+            "blocked"
+        }
+        "pending" => "pending",
+        _ => "pending",
+    };
+    let summary = match state {
+        "done" if job.browser_verification_status == "not_required" => {
+            "Browser verification is not required.".to_string()
+        }
+        "done" => empty_fallback(
+            &job.browser_verification_summary,
+            "Browser verification passed.",
+        )
+        .to_string(),
+        "pending" => "Browser verification evidence is still pending.".to_string(),
+        _ => empty_fallback(
+            &job.browser_verification_summary,
+            "Browser verification is missing or blocked.",
+        )
+        .to_string(),
+    };
+
+    completion_gate(
+        "browser_verification",
+        "Browser verification",
+        state,
+        summary,
+        "local_project",
+        required_evidence_for("local_project", &["validation"]),
+        evidence,
+    )
+}
+
+fn cleanup_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
+    let evidence = job
+        .cleanup_paths
+        .iter()
+        .map(|path| format!("Path {path}"))
+        .collect::<Vec<_>>();
+    let state = match job.cleanup_status.as_str() {
+        "clean" | "cleaned" => "done",
+        "cleanup_required" => "blocked",
+        "unknown" if terminal => "blocked",
+        _ => "pending",
+    };
+    let summary = match state {
+        "done" => format!("Cleanup is {}.", format_gate_status(&job.cleanup_status)),
+        "pending" => "Cleanup state is still pending.".to_string(),
+        _ if job.cleanup_paths.is_empty() => {
+            "Cleanup is required or unknown before completion can be claimed.".to_string()
+        }
+        _ => format!("Cleanup required for {}.", job.cleanup_paths.join(", ")),
+    };
+
+    completion_gate(
+        "cleanup",
+        "Cleanup",
+        state,
+        summary,
+        "local_project",
+        required_evidence_for("local_project", &["workspace_context", "changed_files"]),
+        evidence,
+    )
+}
+
+fn completion_gate(
+    id: &str,
+    title: &str,
+    state: &str,
+    summary: String,
+    task_class: &str,
+    required_evidence: Vec<String>,
+    evidence: Vec<String>,
+) -> CompletionGateSummary {
+    CompletionGateSummary {
+        id: id.to_string(),
+        title: title.to_string(),
+        state: state.to_string(),
+        summary,
+        task_class: task_class.to_string(),
+        required_evidence,
+        evidence,
+    }
+}
+
+fn non_empty_evidence(label: &str, value: &str) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(format!("{label} {value}"))
+    }
+}
+
+fn empty_fallback<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.trim().is_empty() {
+        fallback
+    } else {
+        value
+    }
+}
+
+fn format_gate_status(status: &str) -> String {
+    status.replace('_', " ")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkerSummary {
     pub id: String,
@@ -308,6 +797,10 @@ pub struct WorkerSummary {
     pub state: String,
     pub provider: String,
     pub model: String,
+    #[serde(default)]
+    pub route_id: String,
+    #[serde(default)]
+    pub route_title: String,
     #[serde(default)]
     pub provider_base_url: String,
     #[serde(default)]
@@ -1750,6 +2243,8 @@ pub enum DaemonEvent {
     CommandSessionUpdated(CommandSessionSummary),
     #[serde(rename = "job.completed")]
     JobCompleted(JobSummary),
+    #[serde(rename = "job.blocked")]
+    JobBlocked(JobSummary),
     #[serde(rename = "job.failed")]
     JobFailed(JobSummary),
     #[serde(rename = "prompt.progress")]
@@ -1868,6 +2363,8 @@ mod tests {
             executor_lane: "utility".to_string(),
             executor_provider: "openai_compatible".to_string(),
             executor_model: "gpt-5.4-mini".to_string(),
+            executor_route_id: String::new(),
+            executor_route_title: String::new(),
             visible_turn_id: Some("turn-1".to_string()),
             result_summary: "done".to_string(),
             last_error: String::new(),
@@ -1886,6 +2383,9 @@ mod tests {
             validation_status: "not_performed".to_string(),
             cleanup_status: "unknown".to_string(),
             cleanup_paths: Vec::new(),
+            completion_status: String::new(),
+            completion_gates: Vec::new(),
+            completion_blockers: Vec::new(),
             worker_count: 1,
             pending_approval_count: 0,
             artifact_count: 1,
@@ -1906,6 +2406,108 @@ mod tests {
         assert_eq!(value["browser_verification_required"], true);
         assert_eq!(value["browser_verification_status"], "passed");
         assert_eq!(value["browser_verification_artifact_ids"][0], "artifact-1");
+    }
+
+    #[test]
+    fn publication_completion_gates_block_missing_pr_evidence() {
+        let summary = JobSummary {
+            id: "job-1".to_string(),
+            session_id: Some("session-1".to_string()),
+            parent_job_id: None,
+            template_id: None,
+            title: "Publish job".to_string(),
+            purpose: "test".to_string(),
+            trigger_kind: "session_prompt".to_string(),
+            state: "blocked".to_string(),
+            requested_by: "user".to_string(),
+            prompt_excerpt: "open a pr to merge to dev".to_string(),
+            root_worker_id: Some("worker-1".to_string()),
+            executor_lane: "utility".to_string(),
+            executor_provider: "openai_compatible".to_string(),
+            executor_model: "gpt-5.4-mini".to_string(),
+            executor_route_id: String::new(),
+            executor_route_title: String::new(),
+            visible_turn_id: Some("turn-1".to_string()),
+            result_summary: "Done.".to_string(),
+            last_error: String::new(),
+            user_error: None,
+            ui_renderable: "unknown".to_string(),
+            browser_verification_required: false,
+            browser_verification_status: "not_performed".to_string(),
+            browser_verification_summary: String::new(),
+            browser_verification_artifact_ids: Vec::new(),
+            publication_requested: true,
+            publication_status: "blocked".to_string(),
+            publication_summary: String::new(),
+            pr_url: String::new(),
+            source_branch: "weblime/issue-270".to_string(),
+            target_branch: "dev".to_string(),
+            validation_status: "passed".to_string(),
+            cleanup_status: "clean".to_string(),
+            cleanup_paths: Vec::new(),
+            completion_status: String::new(),
+            completion_gates: Vec::new(),
+            completion_blockers: Vec::new(),
+            worker_count: 1,
+            pending_approval_count: 0,
+            artifact_count: 0,
+            last_resumed_at: None,
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
+            created_at: 1,
+            updated_at: 2,
+        }
+        .with_completion_gates();
+
+        assert_eq!(summary.completion_status, "blocked");
+        assert!(summary.has_blocking_completion_gates());
+        assert!(
+            summary
+                .completion_gates
+                .iter()
+                .any(|gate| gate.id == "publication" && gate.state == "blocked")
+        );
+        let publication_gate = summary
+            .completion_gates
+            .iter()
+            .find(|gate| gate.id == "publication")
+            .expect("publication gate should be present");
+        assert_eq!(publication_gate.task_class, "github_pr");
+        assert_eq!(
+            publication_gate.required_evidence,
+            vec!["Direct PR state".to_string()]
+        );
+        assert!(
+            summary
+                .completion_gates
+                .iter()
+                .any(|gate| gate.id == "validation" && gate.state == "done")
+        );
+    }
+
+    #[test]
+    fn task_evidence_contract_catalog_covers_grounding_classes() {
+        let catalog = task_evidence_contract_catalog();
+        for task_class in [
+            "github_pr",
+            "research",
+            "automation",
+            "local_project",
+            "deployment",
+            "memory_session",
+            "process_server",
+        ] {
+            let contract = catalog
+                .iter()
+                .find(|contract| contract.task_class == task_class)
+                .unwrap_or_else(|| panic!("{task_class} contract should be present"));
+            assert!(contract.requirements.len() >= 3);
+        }
     }
 
     #[test]

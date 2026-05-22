@@ -248,3 +248,9 @@ The repo already includes:
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Community entry points
+
+Start with the repo's [contributor view](https://github.com/WebLime-agency/nucleus/contribute) to find curated `good first issue` and `help wanted` work. File new bugs, feature requests, and RFCs through the guided forms in [.github/ISSUE_TEMPLATE/](.github/ISSUE_TEMPLATE/).
+
+Issue labels are managed as code in [.github/labels.yml](.github/labels.yml). The `type:` labels describe the kind of work, `area:` labels point to the affected subsystem, `status:` labels show lifecycle state, and `good first issue` / `help wanted` keep contributor-facing work intentionally curated.

@@ -142,6 +142,16 @@ export const toolCapabilitySummarySchema = z.object({
   scope_kind: z.string()
 });
 
+export const completionGateSummarySchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  state: z.enum(['done', 'pending', 'blocked']).default('pending'),
+  summary: z.string(),
+  task_class: z.string().default(''),
+  required_evidence: z.array(z.string()).default([]),
+  evidence: z.array(z.string()).default([])
+});
+
 export const jobSummarySchema = z.object({
   id: z.string(),
   session_id: z.string().nullable(),
@@ -157,6 +167,8 @@ export const jobSummarySchema = z.object({
   executor_lane: z.string().default(''),
   executor_provider: z.string().default(''),
   executor_model: z.string().default(''),
+  executor_route_id: z.string().default(''),
+  executor_route_title: z.string().default(''),
   visible_turn_id: z.string().nullable(),
   result_summary: z.string(),
   last_error: z.string(),
@@ -177,6 +189,9 @@ export const jobSummarySchema = z.object({
   validation_status: z.enum(['passed', 'failed', 'not_performed', 'unavailable']).default('not_performed'),
   cleanup_status: z.enum(['clean', 'cleaned', 'cleanup_required', 'unknown']).default('unknown'),
   cleanup_paths: z.array(z.string()).default([]),
+  completion_status: z.enum(['not_gated', 'pending', 'satisfied', 'blocked']).default('not_gated'),
+  completion_gates: z.array(completionGateSummarySchema).default([]),
+  completion_blockers: z.array(z.string()).default([]),
   worker_count: z.number().int().nonnegative(),
   pending_approval_count: z.number().int().nonnegative(),
   artifact_count: z.number().int().nonnegative(),
@@ -201,6 +216,8 @@ export const workerSummarySchema = z.object({
   state: z.string(),
   provider: z.string(),
   model: z.string(),
+  route_id: z.string().default(''),
+  route_title: z.string().default(''),
   provider_base_url: z.string(),
   provider_api_key: z.string(),
   provider_session_id: z.string(),
@@ -1211,6 +1228,10 @@ export const daemonEventSchema = z.discriminatedUnion('event', [
     data: jobSummarySchema
   }),
   z.object({
+    event: z.literal('job.blocked'),
+    data: jobSummarySchema
+  }),
+  z.object({
     event: z.literal('job.failed'),
     data: jobSummarySchema
   }),
@@ -1255,6 +1276,7 @@ export type SessionTurn = z.infer<typeof sessionTurnSchema>;
 export type SessionDetail = z.infer<typeof sessionDetailSchema>;
 export type PolicyDecisionSummary = z.infer<typeof policyDecisionSummarySchema>;
 export type ToolCapabilitySummary = z.infer<typeof toolCapabilitySummarySchema>;
+export type CompletionGateSummary = z.infer<typeof completionGateSummarySchema>;
 export type JobSummary = z.infer<typeof jobSummarySchema>;
 export type WorkerSummary = z.infer<typeof workerSummarySchema>;
 export type ToolCallSummary = z.infer<typeof toolCallSummarySchema>;
