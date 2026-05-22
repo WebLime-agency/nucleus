@@ -246,6 +246,8 @@ pub struct JobSummary {
     pub session_id: Option<String>,
     pub parent_job_id: Option<String>,
     pub template_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_class: Option<String>,
     pub title: String,
     pub purpose: String,
     pub trigger_kind: String,
@@ -292,6 +294,8 @@ pub struct JobSummary {
     pub cleanup_status: String,
     #[serde(default)]
     pub cleanup_paths: Vec<String>,
+    #[serde(default)]
+    pub task_evidence: Vec<String>,
     #[serde(default)]
     pub completion_status: String,
     #[serde(default)]
@@ -373,7 +377,8 @@ fn default_cleanup_status() -> String {
 }
 
 fn derive_completion_gates(job: &JobSummary) -> Vec<CompletionGateSummary> {
-    if !job.publication_requested
+    if job.task_class.is_none()
+        && !job.publication_requested
         && !job.browser_verification_required
         && job.cleanup_status != "cleanup_required"
     {
@@ -397,6 +402,14 @@ fn derive_completion_gates(job: &JobSummary) -> Vec<CompletionGateSummary> {
 
     if job.publication_requested || job.cleanup_status == "cleanup_required" {
         gates.push(cleanup_gate(job, terminal));
+    }
+
+    if let Some(task_class) = normalized_task_class(job) {
+        if !job.publication_requested || task_class != "github_pr" {
+            if let Some(gate) = task_class_gate(job, terminal, task_class) {
+                gates.push(gate);
+            }
+        }
     }
 
     gates
@@ -747,6 +760,184 @@ fn cleanup_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
     )
 }
 
+fn task_class_gate(
+    job: &JobSummary,
+    terminal: bool,
+    task_class: &str,
+) -> Option<CompletionGateSummary> {
+    match task_class {
+        "research" => Some(research_gate(job, terminal)),
+        "automation" => Some(automation_gate(job, terminal)),
+        "local_project" => Some(local_project_gate(job, terminal)),
+        "deployment" => Some(deployment_gate(job, terminal)),
+        "memory_session" => Some(memory_session_gate(job, terminal)),
+        "process_server" => Some(process_server_gate(job, terminal)),
+        _ => None,
+    }
+}
+
+fn research_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
+    evidence_contract_gate(
+        "research_evidence",
+        "Research evidence",
+        "research",
+        &["fresh_sources", "source_quality", "contradictions"],
+        job,
+        terminal,
+        "Research sources, quality, and contradiction checks are recorded.",
+        "Research source evidence is still pending.",
+        "Research completion was claimed without captured fresh sources, source quality, and contradiction-check evidence.",
+    )
+}
+
+fn automation_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
+    evidence_contract_gate(
+        "automation_evidence",
+        "Automation evidence",
+        "automation",
+        &["schedule_state"],
+        job,
+        terminal,
+        "Automation schedule evidence is recorded.",
+        "Automation schedule evidence is still pending.",
+        "Automation setup was claimed without a daemon-owned schedule record.",
+    )
+}
+
+fn local_project_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
+    let failed = evidence_with_prefix(job, "failed_command");
+    let waived = has_evidence(job, "waiver:command_failure");
+    let has_validation = job.validation_status == "passed" || has_evidence(job, "validation");
+    let state = if !failed.is_empty() && !waived {
+        "blocked"
+    } else if has_validation {
+        "done"
+    } else if terminal || job.validation_status == "failed" {
+        "blocked"
+    } else {
+        "pending"
+    };
+    let summary = match state {
+        "done" => "Local validation evidence is recorded.".to_string(),
+        "pending" => "Local validation evidence is still pending.".to_string(),
+        _ if !failed.is_empty() && !waived => {
+            format!(
+                "Recent command failure blocks completion: {}.",
+                failed.join(", ")
+            )
+        }
+        _ => "Local project completion was claimed without successful validation evidence."
+            .to_string(),
+    };
+
+    completion_gate(
+        "local_project_evidence",
+        "Local project evidence",
+        state,
+        summary,
+        "local_project",
+        required_evidence_for("local_project", &["validation"]),
+        evidence_for_requirements(job, &["validation", "failed_command", "waiver"]),
+    )
+}
+
+fn deployment_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
+    let has_deployment = has_evidence(job, "deployment_status");
+    let has_verification = has_any_evidence(job, &["health", "version", "waiver"]);
+    let state = if has_deployment && has_verification {
+        "done"
+    } else if terminal {
+        "blocked"
+    } else {
+        "pending"
+    };
+    let summary = match state {
+        "done" => {
+            "Deployment and post-deploy verification evidence are recorded.".to_string()
+        }
+        "pending" => "Deployment verification evidence is still pending.".to_string(),
+        _ => "Deployment was claimed without a successful deployment command and post-deploy verification evidence.".to_string(),
+    };
+
+    completion_gate(
+        "deployment_evidence",
+        "Deployment evidence",
+        state,
+        summary,
+        "deployment",
+        required_evidence_for("deployment", &["deployment_status", "version", "health"]),
+        evidence_for_requirements(job, &["deployment_status", "version", "health", "waiver"]),
+    )
+}
+
+fn memory_session_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
+    evidence_contract_gate(
+        "memory_session_evidence",
+        "Memory/session evidence",
+        "memory_session",
+        &["target_scope", "operation_result"],
+        job,
+        terminal,
+        "Memory/session operation receipts are recorded.",
+        "Memory/session operation evidence is still pending.",
+        "Memory/session changes were claimed without matching daemon-side write or delete receipts.",
+    )
+}
+
+fn process_server_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
+    evidence_contract_gate(
+        "process_server_evidence",
+        "Process/server evidence",
+        "process_server",
+        &["process_state", "port_state"],
+        job,
+        terminal,
+        "Process/server state evidence is recorded.",
+        "Process/server state evidence is still pending.",
+        "Process/server completion was claimed without observable process or port state evidence.",
+    )
+}
+
+fn evidence_contract_gate(
+    id: &str,
+    title: &str,
+    task_class: &str,
+    requirement_ids: &[&str],
+    job: &JobSummary,
+    terminal: bool,
+    done_summary: &str,
+    pending_summary: &str,
+    blocked_summary: &str,
+) -> CompletionGateSummary {
+    let missing = requirement_ids
+        .iter()
+        .filter(|requirement_id| !has_evidence(job, requirement_id))
+        .copied()
+        .collect::<Vec<_>>();
+    let state = if missing.is_empty() {
+        "done"
+    } else if terminal {
+        "blocked"
+    } else {
+        "pending"
+    };
+    let summary = match state {
+        "done" => done_summary.to_string(),
+        "pending" => pending_summary.to_string(),
+        _ => blocked_summary.to_string(),
+    };
+
+    completion_gate(
+        id,
+        title,
+        state,
+        summary,
+        task_class,
+        required_evidence_for(task_class, requirement_ids),
+        evidence_for_requirements(job, requirement_ids),
+    )
+}
+
 fn completion_gate(
     id: &str,
     title: &str,
@@ -773,6 +964,49 @@ fn non_empty_evidence(label: &str, value: &str) -> Option<String> {
     } else {
         Some(format!("{label} {value}"))
     }
+}
+
+fn normalized_task_class(job: &JobSummary) -> Option<&str> {
+    job.task_class
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn has_evidence(job: &JobSummary, requirement_id: &str) -> bool {
+    let prefix = format!("{requirement_id}:");
+    job.task_evidence
+        .iter()
+        .any(|evidence| evidence == requirement_id || evidence.starts_with(&prefix))
+}
+
+fn has_any_evidence(job: &JobSummary, requirement_ids: &[&str]) -> bool {
+    requirement_ids
+        .iter()
+        .any(|requirement_id| has_evidence(job, requirement_id))
+}
+
+fn evidence_with_prefix(job: &JobSummary, requirement_id: &str) -> Vec<String> {
+    job.task_evidence
+        .iter()
+        .filter_map(|evidence| evidence.strip_prefix(requirement_id))
+        .map(str::trim)
+        .filter(|evidence| !evidence.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn evidence_for_requirements(job: &JobSummary, requirement_ids: &[&str]) -> Vec<String> {
+    job.task_evidence
+        .iter()
+        .filter(|evidence| {
+            requirement_ids.iter().any(|requirement_id| {
+                evidence.as_str() == *requirement_id
+                    || evidence.starts_with(&format!("{requirement_id}:"))
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 fn empty_fallback<'a>(value: &'a str, fallback: &'a str) -> &'a str {
@@ -1089,6 +1323,8 @@ pub struct SessionPromptRequest {
     pub prompt: String,
     #[serde(default)]
     pub images: Vec<SessionTurnImage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_class: Option<String>,
     #[serde(default = "default_compiler_role")]
     pub role: String,
 }
@@ -2353,6 +2589,7 @@ mod tests {
             session_id: Some("session-1".to_string()),
             parent_job_id: None,
             template_id: None,
+            task_class: None,
             title: "UI job".to_string(),
             purpose: "test".to_string(),
             trigger_kind: "session_prompt".to_string(),
@@ -2383,6 +2620,7 @@ mod tests {
             validation_status: "not_performed".to_string(),
             cleanup_status: "unknown".to_string(),
             cleanup_paths: Vec::new(),
+            task_evidence: Vec::new(),
             completion_status: String::new(),
             completion_gates: Vec::new(),
             completion_blockers: Vec::new(),
@@ -2415,6 +2653,7 @@ mod tests {
             session_id: Some("session-1".to_string()),
             parent_job_id: None,
             template_id: None,
+            task_class: Some("github_pr".to_string()),
             title: "Publish job".to_string(),
             purpose: "test".to_string(),
             trigger_kind: "session_prompt".to_string(),
@@ -2445,6 +2684,7 @@ mod tests {
             validation_status: "passed".to_string(),
             cleanup_status: "clean".to_string(),
             cleanup_paths: Vec::new(),
+            task_evidence: Vec::new(),
             completion_status: String::new(),
             completion_gates: Vec::new(),
             completion_blockers: Vec::new(),
@@ -2507,6 +2747,141 @@ mod tests {
                 .find(|contract| contract.task_class == task_class)
                 .unwrap_or_else(|| panic!("{task_class} contract should be present"));
             assert!(contract.requirements.len() >= 3);
+        }
+    }
+
+    #[test]
+    fn task_class_completion_gates_cover_happy_and_blocked_paths() {
+        let cases = [
+            (
+                "research",
+                vec![
+                    "fresh_sources:https://example.test/source".to_string(),
+                    "source_quality:primary source".to_string(),
+                    "contradictions:checked alternate sources".to_string(),
+                ],
+                "research_evidence",
+            ),
+            (
+                "automation",
+                vec!["schedule_state:automation task created".to_string()],
+                "automation_evidence",
+            ),
+            (
+                "local_project",
+                vec!["validation:cargo test passed".to_string()],
+                "local_project_evidence",
+            ),
+            (
+                "deployment",
+                vec![
+                    "deployment_status:deploy command passed".to_string(),
+                    "health:post-deploy endpoint returned 200".to_string(),
+                ],
+                "deployment_evidence",
+            ),
+            (
+                "memory_session",
+                vec![
+                    "target_scope:session".to_string(),
+                    "operation_result:memory write receipt".to_string(),
+                ],
+                "memory_session_evidence",
+            ),
+            (
+                "process_server",
+                vec![
+                    "process_state:restart completed".to_string(),
+                    "port_state:listener observed".to_string(),
+                ],
+                "process_server_evidence",
+            ),
+        ];
+
+        for (task_class, evidence, gate_id) in cases {
+            let satisfied = task_class_job(task_class, evidence.clone()).with_completion_gates();
+            assert_eq!(satisfied.completion_status, "satisfied", "{task_class}");
+            assert!(satisfied.completion_gates.iter().any(|gate| {
+                gate.id == gate_id && gate.state == "done" && gate.task_class == task_class
+            }));
+
+            let blocked = task_class_job(task_class, Vec::new()).with_completion_gates();
+            assert_eq!(blocked.completion_status, "blocked", "{task_class}");
+            assert!(blocked.completion_blockers.iter().any(|blocker| {
+                blocker.to_ascii_lowercase().contains("without")
+                    || blocker.to_ascii_lowercase().contains("missing")
+            }));
+        }
+    }
+
+    #[test]
+    fn task_class_none_derives_no_extra_gates() {
+        let summary = task_class_job("research", Vec::new()).with_completion_gates();
+        let mut ungated = summary.clone();
+        ungated.task_class = None;
+        ungated.completion_status.clear();
+        ungated.completion_gates.clear();
+        ungated.completion_blockers.clear();
+
+        let ungated = ungated.with_completion_gates();
+        assert_eq!(ungated.completion_status, "not_gated");
+        assert!(ungated.completion_gates.is_empty());
+    }
+
+    fn task_class_job(task_class: &str, task_evidence: Vec<String>) -> JobSummary {
+        JobSummary {
+            id: format!("{task_class}-job"),
+            session_id: Some("session-1".to_string()),
+            parent_job_id: None,
+            template_id: None,
+            task_class: Some(task_class.to_string()),
+            title: format!("{task_class} job"),
+            purpose: "test".to_string(),
+            trigger_kind: "session_prompt".to_string(),
+            state: "completed".to_string(),
+            requested_by: "user".to_string(),
+            prompt_excerpt: "prompt".to_string(),
+            root_worker_id: None,
+            executor_lane: String::new(),
+            executor_provider: String::new(),
+            executor_model: String::new(),
+            executor_route_id: String::new(),
+            executor_route_title: String::new(),
+            visible_turn_id: None,
+            result_summary: "done".to_string(),
+            last_error: String::new(),
+            user_error: None,
+            ui_renderable: "unknown".to_string(),
+            browser_verification_required: false,
+            browser_verification_status: "not_required".to_string(),
+            browser_verification_summary: String::new(),
+            browser_verification_artifact_ids: Vec::new(),
+            publication_requested: false,
+            publication_status: "not_requested".to_string(),
+            publication_summary: String::new(),
+            pr_url: String::new(),
+            source_branch: String::new(),
+            target_branch: String::new(),
+            validation_status: "not_performed".to_string(),
+            cleanup_status: "unknown".to_string(),
+            cleanup_paths: Vec::new(),
+            task_evidence,
+            completion_status: String::new(),
+            completion_gates: Vec::new(),
+            completion_blockers: Vec::new(),
+            worker_count: 0,
+            pending_approval_count: 0,
+            artifact_count: 0,
+            last_resumed_at: None,
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
+            created_at: 1,
+            updated_at: 1,
         }
     }
 

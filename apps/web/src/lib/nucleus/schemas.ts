@@ -157,6 +157,7 @@ export const jobSummarySchema = z.object({
   session_id: z.string().nullable(),
   parent_job_id: z.string().nullable(),
   template_id: z.string().nullable(),
+  task_class: z.string().nullable().default(null),
   title: z.string(),
   purpose: z.string(),
   trigger_kind: z.string(),
@@ -189,6 +190,7 @@ export const jobSummarySchema = z.object({
   validation_status: z.enum(['passed', 'failed', 'not_performed', 'unavailable']).default('not_performed'),
   cleanup_status: z.enum(['clean', 'cleaned', 'cleanup_required', 'unknown']).default('unknown'),
   cleanup_paths: z.array(z.string()).default([]),
+  task_evidence: z.array(z.string()).default([]),
   completion_status: z.enum(['not_gated', 'pending', 'satisfied', 'blocked']).default('not_gated'),
   completion_gates: z.array(completionGateSummarySchema).default([]),
   completion_blockers: z.array(z.string()).default([]),
@@ -444,6 +446,7 @@ export const updateSessionRequestSchema = z.object({
 export const sessionPromptRequestSchema = z.object({
   prompt: z.string().default(''),
   images: z.array(sessionTurnImageSchema).default([]),
+  task_class: z.string().trim().optional(),
   role: z.enum(['main', 'utility']).default('main')
 }).refine((value) => value.prompt.trim().length > 0 || value.images.length > 0, {
   message: 'A prompt or at least one image is required.'

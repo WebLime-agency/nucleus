@@ -110,6 +110,7 @@ mod observability_tests {
             session_id: Some(session_id.to_string()),
             parent_job_id: parent_job_id.map(str::to_string),
             template_id: None,
+            task_class: None,
             title: id.to_string(),
             purpose: "test job".to_string(),
             trigger_kind: "session_prompt".to_string(),
@@ -467,6 +468,7 @@ pub struct JobRecord {
     pub session_id: Option<String>,
     pub parent_job_id: Option<String>,
     pub template_id: Option<String>,
+    pub task_class: Option<String>,
     pub title: String,
     pub purpose: String,
     pub trigger_kind: String,
@@ -479,6 +481,7 @@ pub struct JobRecord {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JobPatch {
     pub state: Option<String>,
+    pub task_class: Option<Option<String>>,
     pub root_worker_id: Option<String>,
     pub visible_turn_id: Option<String>,
     pub result_summary: Option<String>,
@@ -2426,6 +2429,15 @@ impl StateStore {
             .unwrap_or(&record.prompt_excerpt);
         let publication_requested =
             publication_requested_for_job(&record.title, &record.purpose, publication_prompt);
+        let task_class = normalize_task_class(record.task_class.as_deref()).or_else(|| {
+            infer_task_class_for_job(
+                publication_requested,
+                &record.trigger_kind,
+                &record.title,
+                &record.purpose,
+                publication_prompt,
+            )
+        });
         let publication_status = "not_requested";
         let browser_verification_status = if publication_requested {
             "not_performed"
@@ -2440,6 +2452,7 @@ impl StateStore {
                 session_id,
                 parent_job_id,
                 template_id,
+                task_class,
                 title,
                 purpose,
                 trigger_kind,
@@ -2453,13 +2466,14 @@ impl StateStore {
                 cleanup_status,
                 cleanup_paths_json
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'not_performed', ?13, 'unknown', '[]')
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'not_performed', ?14, 'unknown', '[]')
             ",
             params![
                 record.id,
                 record.session_id,
                 record.parent_job_id,
                 record.template_id,
+                task_class,
                 record.title,
                 record.purpose,
                 record.trigger_kind,
@@ -2516,31 +2530,36 @@ impl StateStore {
             UPDATE jobs
             SET
                 state = ?2,
-                root_worker_id = ?3,
-                visible_turn_id = ?4,
-                result_summary = ?5,
-                last_error = ?6,
-                ui_renderable = ?7,
-                browser_verification_required = ?8,
-                browser_verification_status = ?9,
-                browser_verification_summary = ?10,
-                browser_verification_artifact_ids_json = ?11,
-                publication_requested = ?12,
-                publication_status = ?13,
-                publication_summary = ?14,
-                pr_url = ?15,
-                source_branch = ?16,
-                target_branch = ?17,
-                validation_status = ?18,
-                cleanup_status = ?19,
-                cleanup_paths_json = ?20,
-                last_resumed_at = ?21,
+                task_class = ?3,
+                root_worker_id = ?4,
+                visible_turn_id = ?5,
+                result_summary = ?6,
+                last_error = ?7,
+                ui_renderable = ?8,
+                browser_verification_required = ?9,
+                browser_verification_status = ?10,
+                browser_verification_summary = ?11,
+                browser_verification_artifact_ids_json = ?12,
+                publication_requested = ?13,
+                publication_status = ?14,
+                publication_summary = ?15,
+                pr_url = ?16,
+                source_branch = ?17,
+                target_branch = ?18,
+                validation_status = ?19,
+                cleanup_status = ?20,
+                cleanup_paths_json = ?21,
+                last_resumed_at = ?22,
                 updated_at = unixepoch()
             WHERE id = ?1
             ",
             params![
                 job_id,
                 next_state,
+                patch
+                    .task_class
+                    .map(|value| value.and_then(|value| normalize_task_class(Some(&value))))
+                    .unwrap_or(current.task_class),
                 patch.root_worker_id.or(current.root_worker_id),
                 patch.visible_turn_id.or(current.visible_turn_id),
                 patch.result_summary.unwrap_or(current.result_summary),
@@ -2868,6 +2887,10 @@ impl StateStore {
             ],
         )?;
 
+        if let Some(task_class) = task_class_from_tool_id(&record.tool_id) {
+            assign_task_class_if_missing(&connection, &record.job_id, task_class)?;
+        }
+
         load_tool_call_summary(&connection, &record.id)
     }
 
@@ -2931,6 +2954,10 @@ impl StateStore {
                 patch.completed_at.unwrap_or(current.completed_at),
             ],
         )?;
+
+        if let Some(task_class) = task_class_from_tool_id(&current.tool_id) {
+            assign_task_class_if_missing(&connection, &current.job_id, task_class)?;
+        }
 
         load_tool_call_summary(&connection, tool_call_id)
     }
@@ -3088,6 +3115,10 @@ impl StateStore {
                 record.completed_at,
             ],
         )?;
+
+        if let Some(task_class) = task_class_from_command(&record.command, &record.args) {
+            assign_task_class_if_missing(&connection, &record.job_id, task_class)?;
+        }
 
         load_command_session_summary(&connection, &record.id)
     }
@@ -3381,6 +3412,7 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
             parent_job_id TEXT REFERENCES jobs(id) ON DELETE CASCADE,
             template_id TEXT,
+            task_class TEXT,
             title TEXT NOT NULL,
             purpose TEXT NOT NULL DEFAULT '',
             trigger_kind TEXT NOT NULL DEFAULT 'session_prompt',
@@ -4298,6 +4330,7 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "metadata_json",
         "TEXT NOT NULL DEFAULT '{}'",
     )?;
+    ensure_column(connection, "jobs", "task_class", "TEXT")?;
     ensure_column(
         connection,
         "jobs",
@@ -4893,6 +4926,83 @@ fn publication_requested_for_job(_title: &str, _purpose: &str, prompt_excerpt: &
     }
 
     false
+}
+
+fn normalize_task_class(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let normalized = value.replace('-', "_").to_ascii_lowercase();
+    match normalized.as_str() {
+        "github_pr" | "research" | "automation" | "local_project" | "deployment"
+        | "memory_session" | "process_server" => Some(normalized),
+        _ => None,
+    }
+}
+
+fn infer_task_class_for_job(
+    publication_requested: bool,
+    _trigger_kind: &str,
+    _title: &str,
+    _purpose: &str,
+    _prompt_excerpt: &str,
+) -> Option<String> {
+    if publication_requested {
+        return Some("github_pr".to_string());
+    }
+    None
+}
+
+fn contains_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
+fn task_class_from_tool_id(tool_id: &str) -> Option<&'static str> {
+    let tool_id = tool_id.to_ascii_lowercase();
+    if is_research_tool(&tool_id) {
+        Some("research")
+    } else if is_automation_tool(&tool_id) {
+        Some("automation")
+    } else if is_memory_tool(&tool_id) {
+        Some("memory_session")
+    } else if contains_any(&tool_id, &["deploy", "release", "publish"]) {
+        Some("deployment")
+    } else if contains_any(&tool_id, &["process", "server", "daemon"]) {
+        Some("process_server")
+    } else {
+        None
+    }
+}
+
+fn task_class_from_command(command: &str, args: &[String]) -> Option<&'static str> {
+    let text = command_session_text(command, args);
+    if is_deployment_command(&text) {
+        Some("deployment")
+    } else if is_process_command(&text) {
+        Some("process_server")
+    } else if is_validation_command(&text) {
+        Some("local_project")
+    } else {
+        None
+    }
+}
+
+fn assign_task_class_if_missing(
+    connection: &Connection,
+    job_id: &str,
+    task_class: &str,
+) -> Result<()> {
+    connection.execute(
+        "
+        UPDATE jobs
+        SET task_class = ?2, updated_at = unixepoch()
+        WHERE id = ?1
+          AND (task_class IS NULL OR task_class = '')
+        ",
+        params![job_id, task_class],
+    )?;
+    Ok(())
 }
 
 fn publication_segment_requests_publication(text: &str) -> bool {
@@ -7418,6 +7528,7 @@ fn load_job_summary(connection: &Connection, job_id: &str) -> Result<JobSummary>
                 session_id,
                 parent_job_id,
                 template_id,
+                task_class,
                 title,
                 purpose,
                 trigger_kind,
@@ -7458,6 +7569,7 @@ fn load_job_summary(connection: &Connection, job_id: &str) -> Result<JobSummary>
     job.pending_approval_count = count_pending_approvals_for_job(connection, job_id)?;
     job.artifact_count = count_for_job(connection, "job_artifacts", job_id)?;
     apply_job_observability_rollups(connection, &mut job)?;
+    apply_job_evidence_rollups(connection, &mut job)?;
     if let Some(root_worker_id) = job.root_worker_id.as_deref() {
         if let Ok(worker) = load_worker_summary(connection, root_worker_id) {
             job.executor_lane = worker.lane;
@@ -7467,7 +7579,7 @@ fn load_job_summary(connection: &Connection, job_id: &str) -> Result<JobSummary>
             job.executor_route_title = worker.route_title;
         }
     }
-    Ok(job)
+    Ok(job.with_completion_gates())
 }
 
 fn count_jobs_for_template(connection: &Connection, template_id: &str) -> Result<usize> {
@@ -7487,43 +7599,45 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         session_id: row.get(1)?,
         parent_job_id: row.get(2)?,
         template_id: row.get(3)?,
-        title: row.get(4)?,
-        purpose: row.get(5)?,
-        trigger_kind: row.get(6)?,
-        state: row.get(7)?,
-        requested_by: row.get(8)?,
-        prompt_excerpt: row.get(9)?,
-        root_worker_id: row.get(10)?,
+        task_class: row.get(4)?,
+        title: row.get(5)?,
+        purpose: row.get(6)?,
+        trigger_kind: row.get(7)?,
+        state: row.get(8)?,
+        requested_by: row.get(9)?,
+        prompt_excerpt: row.get(10)?,
+        root_worker_id: row.get(11)?,
         executor_lane: String::new(),
         executor_provider: String::new(),
         executor_model: String::new(),
         executor_route_id: String::new(),
         executor_route_title: String::new(),
-        visible_turn_id: row.get(11)?,
-        result_summary: row.get(12)?,
-        last_error: row.get(13)?,
+        visible_turn_id: row.get(12)?,
+        result_summary: row.get(13)?,
+        last_error: row.get(14)?,
         user_error: None,
-        ui_renderable: row.get(14)?,
-        browser_verification_required: row.get(15)?,
-        browser_verification_status: row.get(16)?,
-        browser_verification_summary: row.get(17)?,
-        browser_verification_artifact_ids: decode_string_list(row.get::<_, String>(18)?)?,
-        publication_requested: row.get::<_, i64>(19)? != 0,
-        publication_status: row.get(20)?,
-        publication_summary: row.get(21)?,
-        pr_url: row.get(22)?,
-        source_branch: row.get(23)?,
-        target_branch: row.get(24)?,
-        validation_status: row.get(25)?,
-        cleanup_status: row.get(26)?,
-        cleanup_paths: decode_string_vec_column(row, 27)?,
+        ui_renderable: row.get(15)?,
+        browser_verification_required: row.get(16)?,
+        browser_verification_status: row.get(17)?,
+        browser_verification_summary: row.get(18)?,
+        browser_verification_artifact_ids: decode_string_list(row.get::<_, String>(19)?)?,
+        publication_requested: row.get::<_, i64>(20)? != 0,
+        publication_status: row.get(21)?,
+        publication_summary: row.get(22)?,
+        pr_url: row.get(23)?,
+        source_branch: row.get(24)?,
+        target_branch: row.get(25)?,
+        validation_status: row.get(26)?,
+        cleanup_status: row.get(27)?,
+        cleanup_paths: decode_string_vec_column(row, 28)?,
+        task_evidence: Vec::new(),
         completion_status: String::new(),
         completion_gates: Vec::new(),
         completion_blockers: Vec::new(),
         worker_count: 0,
         pending_approval_count: 0,
         artifact_count: 0,
-        last_resumed_at: row.get(28)?,
+        last_resumed_at: row.get(29)?,
         last_reasoning: String::new(),
         last_reasoning_at: None,
         token_usage_known: false,
@@ -7531,10 +7645,9 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         completion_tokens: 0,
         cached_tokens: 0,
         cost_usd_estimate: None,
-        created_at: row.get(29)?,
-        updated_at: row.get(30)?,
-    }
-    .with_completion_gates())
+        created_at: row.get(30)?,
+        updated_at: row.get(31)?,
+    })
 }
 
 fn apply_job_observability_rollups(connection: &Connection, job: &mut JobSummary) -> Result<()> {
@@ -7551,6 +7664,222 @@ fn apply_job_observability_rollups(connection: &Connection, job: &mut JobSummary
     }
 
     Ok(())
+}
+
+fn apply_job_evidence_rollups(connection: &Connection, job: &mut JobSummary) -> Result<()> {
+    let mut evidence = Vec::new();
+    if job.session_id.is_some() {
+        evidence.push("target_scope:session".to_string());
+    }
+    if job.validation_status == "passed" {
+        evidence.push("validation:validation status passed".to_string());
+    }
+    if !job.browser_verification_artifact_ids.is_empty() {
+        evidence.push("health_or_logs:browser verification artifacts".to_string());
+    }
+
+    for command_session in load_command_sessions_for_job(connection, &job.id)? {
+        let command_text = command_session_text(&command_session.command, &command_session.args);
+        let label = command_evidence_label(&command_session);
+        if command_session.state == "completed" && command_session.exit_code == Some(0) {
+            if is_validation_command(&command_text) {
+                evidence.push(format!("validation:{label}"));
+            }
+            if is_deployment_command(&command_text) {
+                evidence.push(format!("deployment_status:{label}"));
+            }
+            if is_version_command(&command_text) {
+                evidence.push(format!("version:{label}"));
+            }
+            if is_health_command(&command_text) {
+                evidence.push(format!("health:{label}"));
+                evidence.push(format!("health_or_logs:{label}"));
+            }
+            if is_process_command(&command_text) {
+                evidence.push(format!("process_state:{label}"));
+            }
+            if command_session.port.is_some() {
+                evidence.push(format!("port_state:{label}"));
+            }
+        } else if is_failed_command_session(&command_session.state, command_session.exit_code) {
+            evidence.push(format!("failed_command:{label}"));
+        }
+    }
+
+    for (tool_id, status, summary) in load_tool_call_evidence_rows(connection, &job.id)? {
+        let tool_text = format!("{} {}", tool_id, summary).to_ascii_lowercase();
+        if is_successful_tool_status(&status) {
+            if is_research_tool(&tool_text) {
+                evidence.push(format!("fresh_sources:{tool_id}"));
+                evidence.push(format!("source_quality:{tool_id}"));
+                evidence.push(format!("contradictions:{tool_id}"));
+            }
+            if is_automation_tool(&tool_text) {
+                evidence.push(format!("schedule_state:{tool_id}"));
+            }
+            if is_memory_tool(&tool_text) {
+                evidence.push(format!("operation_result:{tool_id}"));
+            }
+        } else if status == "failed" {
+            evidence.push(format!("failed_command:{tool_id}"));
+        }
+    }
+
+    for event in load_job_events_for_job(connection, &job.id)? {
+        let event_text = format!(
+            "{} {} {} {}",
+            event.event_type, event.status, event.summary, event.detail
+        )
+        .to_ascii_lowercase();
+        if event_text.contains("waiver") || event_text.contains("waived") {
+            evidence.push("waiver:command_failure".to_string());
+        }
+        if event_text.contains("research") || event_text.contains("source") {
+            evidence.push(format!("fresh_sources:{}", event.summary));
+        }
+        if event_text.contains("source quality") || event_text.contains("primary source") {
+            evidence.push(format!("source_quality:{}", event.summary));
+        }
+        if event_text.contains("contradiction") || event_text.contains("cross-check") {
+            evidence.push(format!("contradictions:{}", event.summary));
+        }
+        if event_text.contains("automation") || event_text.contains("schedule") {
+            evidence.push(format!("schedule_state:{}", event.summary));
+        }
+        if event_text.contains("execution") || event_text.contains("run log") {
+            evidence.push(format!("execution_logs:{}", event.summary));
+        }
+        if event_text.contains("deploy") || event_text.contains("release") {
+            evidence.push(format!("deployment_status:{}", event.summary));
+        }
+        if event_text.contains("version") || event_text.contains("artifact") {
+            evidence.push(format!("version:{}", event.summary));
+        }
+        if event_text.contains("health") || event_text.contains("endpoint") {
+            evidence.push(format!("health:{}", event.summary));
+            evidence.push(format!("health_or_logs:{}", event.summary));
+        }
+        if event_text.contains("memory") || event_text.contains("session") {
+            evidence.push(format!("operation_result:{}", event.summary));
+        }
+        if event_text.contains("process")
+            || event_text.contains("server")
+            || event_text.contains("restart")
+        {
+            evidence.push(format!("process_state:{}", event.summary));
+        }
+        if event_text.contains("port") || event_text.contains("listener") {
+            evidence.push(format!("port_state:{}", event.summary));
+        }
+    }
+
+    evidence.retain(|item| !item.trim().is_empty());
+    evidence.sort();
+    evidence.dedup();
+    job.task_evidence = evidence;
+    Ok(())
+}
+
+fn load_tool_call_evidence_rows(
+    connection: &Connection,
+    job_id: &str,
+) -> Result<Vec<(String, String, String)>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT tool_id, status, summary
+        FROM tool_calls
+        WHERE job_id = ?1
+        ORDER BY created_at ASC, id ASC
+        ",
+    )?;
+    let rows = statement.query_map(params![job_id], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load tool-call evidence rows")
+}
+
+fn is_failed_command_session(state: &str, exit_code: Option<i32>) -> bool {
+    matches!(state, "failed" | "orphaned" | "canceled") || exit_code.is_some_and(|code| code != 0)
+}
+
+fn command_session_text(command: &str, args: &[String]) -> String {
+    std::iter::once(command)
+        .chain(args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn command_evidence_label(command_session: &CommandSessionSummary) -> String {
+    if command_session.title.trim().is_empty() {
+        command_session.command.clone()
+    } else {
+        command_session.title.clone()
+    }
+}
+
+fn is_validation_command(text: &str) -> bool {
+    ["test", "fmt", "clippy", "lint", "check", "build"]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
+fn is_deployment_command(text: &str) -> bool {
+    [
+        "deploy", "publish", "release", "wrangler", "vercel", "netlify", "flyctl",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn is_version_command(text: &str) -> bool {
+    ["version", "sha", "rev-parse", "tag", "artifact"]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
+fn is_health_command(text: &str) -> bool {
+    ["curl", "health", "smoke", "ping", "status", "http"]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
+fn is_process_command(text: &str) -> bool {
+    [
+        "serve",
+        "server",
+        "restart",
+        "systemctl",
+        "pm2",
+        "kill",
+        "lsof",
+        "ps ",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn is_successful_tool_status(status: &str) -> bool {
+    matches!(status, "success" | "completed")
+}
+
+fn is_research_tool(text: &str) -> bool {
+    ["web", "search", "fetch", "browser", "source"]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
+fn is_automation_tool(text: &str) -> bool {
+    ["automation", "schedule", "monitor", "reminder"]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
+fn is_memory_tool(text: &str) -> bool {
+    ["memory", "session", "knowledge"]
+        .iter()
+        .any(|needle| text.contains(needle))
 }
 
 fn usage_for_session(connection: &Connection, session_id: &str) -> Result<UsageTotals> {
@@ -9908,6 +10237,7 @@ mod tests {
                 session_id: Some("session-jobs".to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Root job".to_string(),
                 purpose: "test".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -9923,6 +10253,7 @@ mod tests {
                 session_id: Some("session-jobs".to_string()),
                 parent_job_id: Some("root-job".to_string()),
                 template_id: None,
+                task_class: None,
                 title: "Child job".to_string(),
                 purpose: "test".to_string(),
                 trigger_kind: "child_job".to_string(),
@@ -9970,6 +10301,7 @@ mod tests {
                 session_id: Some("publication-session".to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Prompt open a PR".to_string(),
                 purpose: "Session prompt".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -9991,6 +10323,7 @@ mod tests {
                 session_id: Some("publication-session".to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Prompt prep work".to_string(),
                 purpose: "Session prompt".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -10012,6 +10345,7 @@ and open a pull request to dev when it is ready."
                 session_id: Some("publication-session".to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Open PR".to_string(),
                 purpose: "Publish branch".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -10185,6 +10519,138 @@ and open a pull request to dev when it is ready."
     }
 
     #[test]
+    fn task_class_jobs_persist_and_roll_up_completion_evidence() {
+        let state_dir = test_state_dir("task-class-evidence-rollups");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let scratch_dir = store
+            .scratch_dir_for_session("task-class-session")
+            .expect("scratch dir should resolve");
+        store
+            .create_session(test_session_record(
+                "task-class-session",
+                "Task class session",
+                "ad_hoc",
+                scratch_dir,
+            ))
+            .expect("session should persist");
+
+        let cases = [
+            (
+                "research",
+                "research source quality contradiction check recorded",
+            ),
+            ("automation", "automation schedule created"),
+            (
+                "deployment",
+                "deployment health endpoint version artifact recorded",
+            ),
+            ("memory_session", "memory session write receipt recorded"),
+            ("process_server", "server restart port listener observed"),
+        ];
+
+        for (task_class, evidence_text) in cases {
+            let job_id = format!("{task_class}-job");
+            store
+                .create_job(JobRecord {
+                    id: job_id.clone(),
+                    session_id: Some("task-class-session".to_string()),
+                    parent_job_id: None,
+                    template_id: None,
+                    task_class: Some(task_class.to_string()),
+                    title: format!("{task_class} job"),
+                    purpose: "test".to_string(),
+                    trigger_kind: "session_prompt".to_string(),
+                    state: "completed".to_string(),
+                    requested_by: "user".to_string(),
+                    prompt_excerpt: "prompt".to_string(),
+                    publication_intent_text: None,
+                })
+                .expect("job should persist");
+            store
+                .append_job_event(JobEventRecord {
+                    job_id: job_id.clone(),
+                    worker_id: None,
+                    event_type: format!("job.{task_class}.evidence"),
+                    status: "success".to_string(),
+                    summary: evidence_text.to_string(),
+                    detail: evidence_text.to_string(),
+                    data_json: json!({}),
+                })
+                .expect("event should persist");
+
+            let job = store.get_job(&job_id).expect("job should load").job;
+            assert_eq!(job.task_class.as_deref(), Some(task_class));
+            assert_eq!(job.completion_status, "satisfied", "{task_class}");
+            assert!(!job.task_evidence.is_empty());
+        }
+
+        let local_project = store
+            .create_job(JobRecord {
+                id: "local-project-job".to_string(),
+                session_id: Some("task-class-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("local_project".to_string()),
+                title: "Local project job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "prompt".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("local project job should persist");
+        let local_project = store
+            .update_job(
+                &local_project.id,
+                JobPatch {
+                    validation_status: Some("passed".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("validation status should persist");
+        assert_eq!(local_project.completion_status, "satisfied");
+
+        let blocked = store
+            .create_job(JobRecord {
+                id: "blocked-research-job".to_string(),
+                session_id: Some("task-class-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("research".to_string()),
+                title: "Blocked research job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "prompt".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("blocked job should persist");
+        assert_eq!(blocked.completion_status, "blocked");
+
+        let ungated = store
+            .create_job(JobRecord {
+                id: "ungated-job".to_string(),
+                session_id: Some("task-class-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: None,
+                title: "Ungated job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "prompt".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("ungated job should persist");
+        assert_eq!(ungated.completion_status, "not_gated");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
     fn failed_ui_renderable_job_terminalizes_pending_browser_verification() {
         let state_dir = test_state_dir("failed-browser-verification-terminal");
         let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
@@ -10206,6 +10672,7 @@ and open a pull request to dev when it is ready."
                 session_id: Some("browser-terminal-session".to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Fix UI".to_string(),
                 purpose: "Session prompt".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -10264,6 +10731,7 @@ and open a pull request to dev when it is ready."
                 session_id: Some("browser-canceled-session".to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Fix UI".to_string(),
                 purpose: "Session prompt".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -10321,6 +10789,7 @@ and open a pull request to dev when it is ready."
                 session_id: Some("browser-blocked-session".to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Fix UI".to_string(),
                 purpose: "Session prompt".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -10487,6 +10956,7 @@ and open a pull request to dev when it is ready."
                 session_id: Some("playbook-session".to_string()),
                 parent_job_id: None,
                 template_id: Some("playbook-1".to_string()),
+                task_class: Some("automation".to_string()),
                 title: "Playbook run".to_string(),
                 purpose: "automation".to_string(),
                 trigger_kind: "playbook_event".to_string(),
@@ -10502,6 +10972,7 @@ and open a pull request to dev when it is ready."
                 session_id: Some("playbook-session".to_string()),
                 parent_job_id: None,
                 template_id: Some("playbook-1".to_string()),
+                task_class: Some("automation".to_string()),
                 title: "Playbook run complete".to_string(),
                 purpose: "automation".to_string(),
                 trigger_kind: "playbook_manual".to_string(),
@@ -10517,6 +10988,7 @@ and open a pull request to dev when it is ready."
                 session_id: Some("playbook-session".to_string()),
                 parent_job_id: Some("playbook-job-a".to_string()),
                 template_id: Some("playbook-1".to_string()),
+                task_class: Some("automation".to_string()),
                 title: "Playbook child".to_string(),
                 purpose: "automation".to_string(),
                 trigger_kind: "child_job".to_string(),
@@ -10750,6 +11222,7 @@ and open a pull request to dev when it is ready."
                 session_id: Some("session-capabilities".to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Prompt run".to_string(),
                 purpose: "Session prompt".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -10804,6 +11277,7 @@ and open a pull request to dev when it is ready."
                 session_id: Some("session-capabilities".to_string()),
                 parent_job_id: None,
                 template_id: Some("playbook-1".to_string()),
+                task_class: Some("automation".to_string()),
                 title: "Playbook run".to_string(),
                 purpose: "automation".to_string(),
                 trigger_kind: "playbook_manual".to_string(),
@@ -10884,6 +11358,7 @@ and open a pull request to dev when it is ready."
                 session_id: Some("session-capabilities-tie".to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Prompt run 1".to_string(),
                 purpose: "Session prompt".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -10938,6 +11413,7 @@ and open a pull request to dev when it is ready."
                 session_id: Some("session-capabilities-tie".to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Prompt run 2".to_string(),
                 purpose: "Session prompt".to_string(),
                 trigger_kind: "session_prompt".to_string(),

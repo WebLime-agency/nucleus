@@ -956,6 +956,7 @@ pub async fn start_prompt_job(
         session_id: Some(session_id.clone()),
         parent_job_id: None,
         template_id: None,
+        task_class: payload.task_class.clone(),
         title: format!("Prompt {}", excerpt(&execution_prompt, 48)),
         purpose: "Session prompt".to_string(),
         trigger_kind: "session_prompt".to_string(),
@@ -3886,6 +3887,7 @@ async fn create_child_job_with_limits(
         session_id: Some(session.session.id.clone()),
         parent_job_id: Some(parent_job_id.to_string()),
         template_id: None,
+        task_class: proposal.task_class.clone(),
         title: format!("Child {}", title),
         purpose: title.to_string(),
         trigger_kind: "child_job".to_string(),
@@ -4236,14 +4238,18 @@ async fn complete_job_with_final_answer(
 
     let completion_job = state.store.get_job(job_id)?.job;
     reconcile_publication_browser_status_with_completion(&completion_job, &mut publication_patch);
-    let terminal_job_state =
-        if projected_completion_gates_blocked(&completion_job, &publication_patch) {
-            "blocked"
-        } else {
-            "completed"
-        };
-    let visible_final_answer =
-        contradiction_checked_final_answer(final_answer, terminal_job_state, &publication_patch);
+    let projected_blocker = projected_completion_gate_blocker(&completion_job, &publication_patch);
+    let terminal_job_state = if projected_blocker.is_some() {
+        "blocked"
+    } else {
+        "completed"
+    };
+    let visible_final_answer = contradiction_checked_final_answer(
+        final_answer,
+        terminal_job_state,
+        &publication_patch,
+        projected_blocker.as_deref(),
+    );
 
     let mut visible_turn_id = None;
     let mut report_artifact = None;
@@ -5709,10 +5715,18 @@ fn publication_patch_terminal_status_is_blocked(patch: &PublicationOutcomePatch)
             .is_some_and(|status| matches!(status, "blocked" | "not_opened" | "failed"))
 }
 
+#[cfg(test)]
 fn projected_completion_gates_blocked(
     current: &JobSummary,
     publication_patch: &PublicationOutcomePatch,
 ) -> bool {
+    projected_completion_gate_blocker(current, publication_patch).is_some()
+}
+
+fn projected_completion_gate_blocker(
+    current: &JobSummary,
+    publication_patch: &PublicationOutcomePatch,
+) -> Option<String> {
     let mut projected = current.clone();
     projected.state = "completed".to_string();
     if let Some(value) = publication_patch.publication_requested {
@@ -5748,13 +5762,17 @@ fn projected_completion_gates_blocked(
 
     projected
         .with_completion_gates()
-        .has_blocking_completion_gates()
+        .completion_gates
+        .into_iter()
+        .find(|gate| gate.state == "blocked")
+        .map(|gate| gate.summary)
 }
 
 fn contradiction_checked_final_answer(
     final_answer: &str,
     terminal_job_state: &str,
     publication_patch: &PublicationOutcomePatch,
+    projected_blocker: Option<&str>,
 ) -> String {
     if terminal_job_state != "blocked" {
         return final_answer.to_string();
@@ -5778,6 +5796,7 @@ fn contradiction_checked_final_answer(
             .publication_summary
             .as_deref()
             .filter(|summary| !summary.trim().is_empty())
+            .or(projected_blocker)
             .unwrap_or("Required daemon completion gates are unmet.")
     };
     if final_answer_is_generic_completion_claim(&normalized) {
@@ -7516,7 +7535,7 @@ Use the supported action shape that matches the previous intent:\n\
 - final_answer: {{\"kind\":\"final_answer\",\"summary\":\"brief reason the work is done\",\"final_answer\":\"user-facing answer\"}}\n\
 - tool_call: {{\"kind\":\"tool_call\",\"summary\":\"why this action is needed\",\"tool\":\"command.run\",\"args\":{{\"command\":\"sh\",\"args\":[\"-lc\",\"command text\"],\"cwd\":\"/path/if/needed\"}}}}\n\
 - progress_update: {{\"kind\":\"progress_update\",\"summary\":\"checkpoint summary\",\"detail\":\"non-terminal progress detail\"}}\n\
-- spawn_child_jobs: {{\"kind\":\"spawn_child_jobs\",\"summary\":\"why fan-out is needed\",\"jobs\":[{{\"title\":\"Focused child job\",\"prompt\":\"specific child task\",\"working_dir\":null}}]}}\n\
+- spawn_child_jobs: {{\"kind\":\"spawn_child_jobs\",\"summary\":\"why fan-out is needed\",\"jobs\":[{{\"title\":\"Focused child job\",\"prompt\":\"specific child task\",\"task_class\":\"local_project\",\"working_dir\":null}}]}}\n\
 Rules:\n\
 - If the previous response named one of the supported tool IDs above, preserve that exact tool ID.\n\
 - Do not replace a supported non-command tool with command.run.\n\
@@ -13416,6 +13435,7 @@ async fn queue_playbook_job(
         session_id: Some(session_id.clone()),
         parent_job_id: None,
         template_id: Some(playbook.playbook.id.clone()),
+        task_class: None,
         title: format!("Playbook {}", playbook.playbook.title),
         purpose: if playbook.playbook.description.is_empty() {
             playbook.playbook.title.clone()
@@ -13979,7 +13999,7 @@ Working directory: {}\n",
 {\"kind\":\"tool_call\",\"summary\":\"verify the UI in Browser\",\"tool\":\"browser.navigate\",\"args\":{\"url\":\"http://127.0.0.1:5299\"}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"read Browser refs\",\"tool\":\"browser.snapshot\",\"args\":{}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"click a Browser control by ref\",\"tool\":\"browser.click\",\"args\":{\"target_ref\":\"ref-1\"}}\n\
-{\"kind\":\"spawn_child_jobs\",\"summary\":\"why parallel exploration helps\",\"jobs\":[{\"title\":\"focused subtask\",\"prompt\":\"precise child prompt\",\"working_dir\":\"optional/path/inside/scope\"}]}\n\
+{\"kind\":\"spawn_child_jobs\",\"summary\":\"why parallel exploration helps\",\"jobs\":[{\"title\":\"focused subtask\",\"prompt\":\"precise child prompt\",\"task_class\":\"local_project\",\"working_dir\":\"optional/path/inside/scope\"}]}\n\
 {\"kind\":\"progress_update\",\"summary\":\"durable checkpoint, not done\",\"detail\":\"completed evidence and exact continuation point\"}\n\
 {\"kind\":\"wait\",\"summary\":\"park until an external condition is ready\",\"until\":{\"kind\":\"delay_seconds\",\"delay_seconds\":60},\"max_wait_seconds\":1800,\"wake_note\":\"optional wake-up context\"}\n\
 {\"kind\":\"wait\",\"summary\":\"park until memory classification finishes\",\"until\":{\"kind\":\"audit_event\",\"event_kind\":\"memory.classifier.completed\",\"target_pattern\":\"session:\",\"status\":\"success\"},\"max_wait_seconds\":1800}\n\
@@ -16265,6 +16285,7 @@ Remaining:\n\
                 session_id: Some(session_id.to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 prompt_excerpt: String::new(),
                 publication_intent_text: None,
             })
@@ -16666,6 +16687,7 @@ Cleanup status: clean";
                 session_id: Some(session_id.to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Open PR".to_string(),
                 purpose: "Session prompt".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -16875,6 +16897,93 @@ Cleanup status: clean";
 
         assert!(projected_completion_gates_blocked(
             &cleanup_job,
+            &PublicationOutcomePatch::default()
+        ));
+    }
+
+    #[test]
+    fn projected_completion_gates_block_unmet_task_class_evidence() {
+        let cases = [
+            (
+                "research",
+                vec![
+                    "fresh_sources:https://example.test/source".to_string(),
+                    "source_quality:primary source".to_string(),
+                    "contradictions:checked alternate sources".to_string(),
+                ],
+            ),
+            (
+                "automation",
+                vec!["schedule_state:task created".to_string()],
+            ),
+            (
+                "local_project",
+                vec!["validation:cargo test passed".to_string()],
+            ),
+            (
+                "deployment",
+                vec![
+                    "deployment_status:deploy command passed".to_string(),
+                    "health:post-deploy endpoint returned 200".to_string(),
+                ],
+            ),
+            (
+                "memory_session",
+                vec![
+                    "target_scope:session".to_string(),
+                    "operation_result:memory write receipt".to_string(),
+                ],
+            ),
+            (
+                "process_server",
+                vec![
+                    "process_state:restart completed".to_string(),
+                    "port_state:listener observed".to_string(),
+                ],
+            ),
+        ];
+
+        for (task_class, evidence) in cases {
+            let mut job = test_publication_job_summary(task_class);
+            job.publication_requested = false;
+            job.publication_status = "not_requested".to_string();
+            job.browser_verification_required = false;
+            job.browser_verification_status = "not_required".to_string();
+            job.cleanup_status = "unknown".to_string();
+            job.task_class = Some(task_class.to_string());
+            job.task_evidence = Vec::new();
+
+            let blocker =
+                projected_completion_gate_blocker(&job, &PublicationOutcomePatch::default())
+                    .expect("missing task evidence should block");
+            assert!(
+                contradiction_checked_final_answer(
+                    "Done.",
+                    "blocked",
+                    &PublicationOutcomePatch::default(),
+                    Some(&blocker)
+                )
+                .starts_with("Blocked:"),
+                "{task_class}"
+            );
+
+            job.task_evidence = evidence;
+            assert!(!projected_completion_gates_blocked(
+                &job,
+                &PublicationOutcomePatch::default()
+            ));
+        }
+
+        let mut ungated = test_publication_job_summary("ungated-task");
+        ungated.publication_requested = false;
+        ungated.publication_status = "not_requested".to_string();
+        ungated.browser_verification_required = false;
+        ungated.browser_verification_status = "not_required".to_string();
+        ungated.cleanup_status = "unknown".to_string();
+        ungated.task_class = None;
+
+        assert!(!projected_completion_gates_blocked(
+            &ungated,
             &PublicationOutcomePatch::default()
         ));
     }
@@ -18494,6 +18603,7 @@ Cleanup status: clean";
                 session_id: Some(session_id.to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Fix UI".to_string(),
                 purpose: "Session prompt".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -18897,6 +19007,7 @@ Cleanup status: clean";
             session_id: Some("session-1".to_string()),
             parent_job_id: None,
             template_id: None,
+            task_class: None,
             title: "UI job".to_string(),
             purpose: String::new(),
             trigger_kind: "session_prompt".to_string(),
@@ -18927,6 +19038,7 @@ Cleanup status: clean";
             validation_status: "not_performed".to_string(),
             cleanup_status: "unknown".to_string(),
             cleanup_paths: Vec::new(),
+            task_evidence: Vec::new(),
             completion_status: String::new(),
             completion_gates: Vec::new(),
             completion_blockers: Vec::new(),
@@ -18965,6 +19077,7 @@ Cleanup status: clean";
             session_id: Some("session-guard".to_string()),
             parent_job_id: None,
             template_id: None,
+            task_class: None,
             title: "Guard job".to_string(),
             purpose: String::new(),
             trigger_kind: "session_prompt".to_string(),
@@ -18995,6 +19108,7 @@ Cleanup status: clean";
             validation_status: "not_performed".to_string(),
             cleanup_status: "unknown".to_string(),
             cleanup_paths: Vec::new(),
+            task_evidence: Vec::new(),
             completion_status: String::new(),
             completion_gates: Vec::new(),
             completion_blockers: Vec::new(),
@@ -19499,6 +19613,7 @@ Cleanup status: clean";
                 session_id: Some(session_id.to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Open PR".to_string(),
                 purpose: "open a PR to merge to dev".to_string(),
                 trigger_kind: "manual".to_string(),
@@ -19583,6 +19698,7 @@ Cleanup status: clean";
                 session_id: None,
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Open PR".to_string(),
                 purpose: "open a PR to merge to dev".to_string(),
                 trigger_kind: "manual".to_string(),
@@ -19733,6 +19849,7 @@ Cleanup status: clean";
         let payload = SessionPromptRequest {
             prompt: "What is in this image?".to_string(),
             images: vec![test_image("photo.png")],
+            task_class: None,
             role: "main".to_string(),
         };
         let current = state
@@ -19825,6 +19942,7 @@ Cleanup status: clean";
         let payload = SessionPromptRequest {
             prompt: "Inspect the repo and answer.".to_string(),
             images: Vec::new(),
+            task_class: None,
             role: "main".to_string(),
         };
         let current = state
@@ -19902,6 +20020,7 @@ Cleanup status: clean";
         let payload = SessionPromptRequest {
             prompt: "Run a command.".to_string(),
             images: Vec::new(),
+            task_class: None,
             role: "main".to_string(),
         };
         let current = state
@@ -19965,6 +20084,7 @@ Cleanup status: clean";
                 session_id: None,
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Main lane guard".to_string(),
                 purpose: "test".to_string(),
                 trigger_kind: "manual".to_string(),
@@ -20100,6 +20220,7 @@ Cleanup status: clean";
                 session_id: Some(session_id.clone()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Legacy prompt job".to_string(),
                 purpose: "Session prompt".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -20249,6 +20370,7 @@ Cleanup status: clean";
         let payload = SessionPromptRequest {
             prompt: "Can you remember that I like vanilla ice cream?".to_string(),
             images: vec![],
+            task_class: None,
             role: "main".to_string(),
         };
         let current = state
@@ -20347,6 +20469,7 @@ Cleanup status: clean";
             prompt: "remember to keep the next reply concise before answering this turn"
                 .to_string(),
             images: vec![],
+            task_class: None,
             role: "main".to_string(),
         };
         let current = state
@@ -20432,6 +20555,7 @@ Cleanup status: clean";
             SessionPromptRequest {
                 prompt: "wait briefly, then finish".to_string(),
                 images: vec![],
+                task_class: None,
                 role: "main".to_string(),
             },
             current,
@@ -20640,6 +20764,7 @@ Cleanup status: clean";
             SessionPromptRequest {
                 prompt: "spawn five fanout children".to_string(),
                 images: vec![],
+                task_class: None,
                 role: "main".to_string(),
             },
             current,
@@ -20705,6 +20830,7 @@ Cleanup status: clean";
             vec![ChildJobProposal {
                 title: "Missing route".to_string(),
                 prompt: "inspect with missing route".to_string(),
+                task_class: None,
                 working_dir: None,
                 route_id: Some("missing-route".to_string()),
             }],
@@ -20759,6 +20885,7 @@ Cleanup status: clean";
             vec![ChildJobProposal {
                 title: "Disabled route".to_string(),
                 prompt: "inspect with disabled route".to_string(),
+                task_class: None,
                 working_dir: None,
                 route_id: Some("disabled-route".to_string()),
             }],
@@ -20876,6 +21003,7 @@ Cleanup status: clean";
             SessionPromptRequest {
                 prompt: "spawn routed children".to_string(),
                 images: vec![],
+                task_class: None,
                 role: "main".to_string(),
             },
             current,
@@ -21015,6 +21143,7 @@ Cleanup status: clean";
             SessionPromptRequest {
                 prompt: "spawn mixed children".to_string(),
                 images: vec![],
+                task_class: None,
                 role: "main".to_string(),
             },
             current,
@@ -21124,6 +21253,7 @@ Cleanup status: clean";
             SessionPromptRequest {
                 prompt: "spawn cancellable children".to_string(),
                 images: vec![],
+                task_class: None,
                 role: "main".to_string(),
             },
             current,
@@ -21256,6 +21386,7 @@ Cleanup status: clean";
             ChildJobProposal {
                 title: "Budget child".to_string(),
                 prompt: "run until child budget".to_string(),
+                task_class: None,
                 working_dir: None,
                 route_id: None,
             },
@@ -21316,6 +21447,7 @@ Cleanup status: clean";
                 session_id: Some(session_id),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Queued registration retry".to_string(),
                 purpose: "retry registration".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -21370,6 +21502,7 @@ Cleanup status: clean";
                 session_id: Some(session_id.clone()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Child done".to_string(),
                 purpose: "done".to_string(),
                 trigger_kind: "child_job".to_string(),
@@ -21391,6 +21524,7 @@ Cleanup status: clean";
                 session_id: Some(session_id.clone()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 prompt_excerpt: String::new(),
                 publication_intent_text: None,
             })
@@ -21407,6 +21541,7 @@ Cleanup status: clean";
                 session_id: Some(session_id.clone()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 prompt_excerpt: String::new(),
                 publication_intent_text: None,
             })
@@ -21617,6 +21752,7 @@ Cleanup status: clean";
         let payload = SessionPromptRequest {
             prompt: "remember that I prefer dark mode".to_string(),
             images: Vec::new(),
+            task_class: None,
             role: "main".to_string(),
         };
         let current = state
@@ -22443,6 +22579,7 @@ for line in sys.stdin:
                 session_id: None,
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: format!("Job {label}"),
                 purpose: "test".to_string(),
                 trigger_kind: "manual".to_string(),
@@ -22691,6 +22828,7 @@ for line in sys.stdin:
                 session_id: Some(session_id.to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Waiting job".to_string(),
                 purpose: "wait".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -22888,6 +23026,7 @@ for line in sys.stdin:
                         session_id: Some(session_id.to_string()),
                         parent_job_id: Some(parent_job_id.to_string()),
                         template_id: None,
+                        task_class: None,
                         title: format!("Manual child {index}"),
                         purpose: "wait test child".to_string(),
                         trigger_kind: "child_job".to_string(),
@@ -22967,6 +23106,7 @@ for line in sys.stdin:
                 session_id: Some(session_id.clone()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Parent fanout job".to_string(),
                 purpose: "test parent".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -23128,6 +23268,7 @@ for line in sys.stdin:
             session_id: Some(format!("{id}-session")),
             parent_job_id: None,
             template_id: None,
+            task_class: Some("github_pr".to_string()),
             title: "Prompt open a PR".to_string(),
             purpose: "Session prompt".to_string(),
             trigger_kind: "session_prompt".to_string(),
@@ -23158,6 +23299,7 @@ for line in sys.stdin:
             browser_verification_status: "not_performed".to_string(),
             cleanup_status: "unknown".to_string(),
             cleanup_paths: Vec::new(),
+            task_evidence: Vec::new(),
             completion_status: String::new(),
             completion_gates: Vec::new(),
             completion_blockers: Vec::new(),
