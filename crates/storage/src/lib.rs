@@ -7733,6 +7733,19 @@ fn apply_job_evidence_rollups(connection: &Connection, job: &mut JobSummary) -> 
         .to_ascii_lowercase();
         if event_text.contains("waiver") || event_text.contains("waived") {
             evidence.push("waiver:command_failure".to_string());
+            if contains_any(
+                &event_text,
+                &[
+                    "deploy",
+                    "deployment",
+                    "post-deploy",
+                    "health",
+                    "endpoint",
+                    "version",
+                ],
+            ) {
+                evidence.push("waiver:deployment_verification".to_string());
+            }
         }
         if event_text.contains("research") || event_text.contains("source") {
             evidence.push(format!("fresh_sources:{}", event.summary));
@@ -7871,9 +7884,13 @@ fn is_research_tool(text: &str) -> bool {
 }
 
 fn is_research_classification_tool(text: &str) -> bool {
-    ["web", "search", "fetch", "source"]
-        .iter()
-        .any(|needle| text.contains(needle))
+    matches!(text, "web" | "search" | "fetch" | "source")
+        || text.starts_with("web.")
+        || text.starts_with("search.")
+        || text.starts_with("fetch.")
+        || text.starts_with("source.")
+        || text.contains("web_search")
+        || text.contains("source_search")
 }
 
 fn is_automation_tool(text: &str) -> bool {
@@ -10716,6 +10733,17 @@ and open a pull request to dev when it is ready."
                 })
                 .expect("command session should persist");
         }
+        store
+            .append_job_event(JobEventRecord {
+                job_id: deployment_with_git_status.id.clone(),
+                worker_id: None,
+                event_type: "job.command.waiver".to_string(),
+                status: "success".to_string(),
+                summary: "command failure waived".to_string(),
+                detail: "waiver applies to an unrelated command failure".to_string(),
+                data_json: json!({}),
+            })
+            .expect("command waiver event should persist");
         let deployment_with_git_status = store
             .get_job(&deployment_with_git_status.id)
             .expect("deployment git status job should load")
@@ -10733,6 +10761,19 @@ and open a pull request to dev when it is ready."
                 .iter()
                 .any(|evidence| evidence.starts_with("health:")),
             "git status should not satisfy deployment health evidence"
+        );
+        assert!(
+            deployment_with_git_status
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence == "waiver:command_failure")
+        );
+        assert!(
+            !deployment_with_git_status
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence == "waiver:deployment_verification"),
+            "generic command waivers should not satisfy deployment verification"
         );
 
         let failed_tool_job = store
@@ -10872,6 +10913,24 @@ and open a pull request to dev when it is ready."
                 completed_at: None,
             })
             .expect("browser-only tool call should persist");
+        store
+            .create_tool_call(ToolCallRecord {
+                id: "browser-only-rg-search-tool-call".to_string(),
+                job_id: browser_only_job.id.clone(),
+                worker_id: "browser-only-worker".to_string(),
+                tool_id: "rg.search".to_string(),
+                status: "success".to_string(),
+                summary: "ripgrep search found local files".to_string(),
+                args_json: json!({}),
+                result_json: Some(json!({ "ok": true })),
+                policy_decision: None,
+                artifact_ids: Vec::new(),
+                error_class: String::new(),
+                error_detail: String::new(),
+                started_at: None,
+                completed_at: None,
+            })
+            .expect("generic search tool call should persist");
         let browser_only_job = store
             .get_job(&browser_only_job.id)
             .expect("browser-only job should load")

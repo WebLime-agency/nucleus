@@ -845,7 +845,10 @@ fn local_project_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary
 
 fn deployment_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
     let has_deployment = has_evidence(job, "deployment_status");
-    let has_verification = has_any_evidence(job, &["health", "version", "waiver"]);
+    let has_verification = has_any_evidence(
+        job,
+        &["health", "version", "waiver:deployment_verification"],
+    );
     let state = if has_deployment && has_verification {
         "done"
     } else if terminal {
@@ -868,7 +871,15 @@ fn deployment_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
         summary,
         "deployment",
         required_evidence_for("deployment", &["deployment_status", "version", "health"]),
-        evidence_for_requirements(job, &["deployment_status", "version", "health", "waiver"]),
+        evidence_for_requirements(
+            job,
+            &[
+                "deployment_status",
+                "version",
+                "health",
+                "waiver:deployment_verification",
+            ],
+        ),
     )
 }
 
@@ -2846,6 +2857,29 @@ mod tests {
                 .iter()
                 .any(|gate| gate.id == "validation" && gate.state == "blocked")
         );
+    }
+
+    #[test]
+    fn deployment_gate_requires_deploy_scoped_verification_waiver() {
+        let command_failure_waiver = task_class_job(
+            "deployment",
+            vec![
+                "deployment_status:wrangler deploy passed".to_string(),
+                "waiver:command_failure".to_string(),
+            ],
+        )
+        .with_completion_gates();
+        assert_eq!(command_failure_waiver.completion_status, "blocked");
+
+        let deployment_waiver = task_class_job(
+            "deployment",
+            vec![
+                "deployment_status:wrangler deploy passed".to_string(),
+                "waiver:deployment_verification".to_string(),
+            ],
+        )
+        .with_completion_gates();
+        assert_eq!(deployment_waiver.completion_status, "satisfied");
     }
 
     fn task_class_job(task_class: &str, task_evidence: Vec<String>) -> JobSummary {
