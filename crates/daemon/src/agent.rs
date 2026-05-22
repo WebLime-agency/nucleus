@@ -159,6 +159,9 @@ fn mentions_non_ui_image_context(prompt: &str) -> bool {
         "unrelated to ui",
         "not related to ui",
         "unrelated screenshot",
+        "what is in this image",
+        "what's in this image",
+        "describe this image",
         "receipt",
         "document scan",
     ]
@@ -5738,10 +5741,6 @@ fn projected_completion_gates_blocked(
     }
     if let Some(value) = publication_patch.cleanup_paths.as_ref() {
         projected.cleanup_paths = value.clone();
-    }
-
-    if !projected.publication_requested {
-        return false;
     }
 
     projected
@@ -16744,6 +16743,34 @@ Cleanup status: clean";
     }
 
     #[test]
+    fn projected_completion_gates_block_non_publication_browser_and_cleanup_failures() {
+        let mut browser_job = test_publication_job_summary("browser-gated");
+        browser_job.publication_requested = false;
+        browser_job.publication_status = "not_requested".to_string();
+        browser_job.pr_url = String::new();
+        browser_job.browser_verification_required = true;
+        browser_job.browser_verification_status = "failed".to_string();
+        browser_job.validation_status = "not_performed".to_string();
+        browser_job.cleanup_status = "clean".to_string();
+
+        assert!(projected_completion_gates_blocked(
+            &browser_job,
+            &PublicationOutcomePatch::default()
+        ));
+
+        let mut cleanup_job = browser_job.clone();
+        cleanup_job.browser_verification_required = false;
+        cleanup_job.browser_verification_status = "not_required".to_string();
+        cleanup_job.cleanup_status = "cleanup_required".to_string();
+        cleanup_job.cleanup_paths = vec![".tmp-playwright".to_string()];
+
+        assert!(projected_completion_gates_blocked(
+            &cleanup_job,
+            &PublicationOutcomePatch::default()
+        ));
+    }
+
+    #[test]
     fn publication_temp_paths_detect_nested_components() {
         assert!(is_publication_temp_path(
             "apps/web/.tmp-playwright/probe.js"
@@ -18698,6 +18725,10 @@ Cleanup status: clean";
         assert_eq!(
             classify_prompt_ui_renderable("Match this screenshot", 1),
             "true"
+        );
+        assert_eq!(
+            classify_prompt_ui_renderable("What is in this image?", 1),
+            "false"
         );
         assert_eq!(
             classify_prompt_ui_renderable("This receipt photo is unrelated to UI", 1),
