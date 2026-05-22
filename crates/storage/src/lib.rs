@@ -190,6 +190,33 @@ mod observability_tests {
         store
             .create_worker(worker_record("child-worker-b", "child-b", "unknown-model"))
             .expect("child worker b persists");
+        {
+            let connection = store.connection.lock().expect("storage mutex poisoned");
+            connection
+                .execute(
+                    "UPDATE sessions SET created_at = 900, updated_at = 900 WHERE id = 'session'",
+                    [],
+                )
+                .expect("session timestamp updates");
+            connection
+                .execute(
+                    "UPDATE jobs SET created_at = 1000, updated_at = 1000 WHERE id = 'parent'",
+                    [],
+                )
+                .expect("parent timestamp updates");
+            connection
+                .execute(
+                    "UPDATE jobs SET created_at = 2000, updated_at = 2000 WHERE id = 'child-a'",
+                    [],
+                )
+                .expect("child a timestamp updates");
+            connection
+                .execute(
+                    "UPDATE jobs SET created_at = 3000, updated_at = 3000 WHERE id = 'child-b'",
+                    [],
+                )
+                .expect("child b timestamp updates");
+        }
 
         store
             .record_worker_usage(
@@ -247,6 +274,7 @@ mod observability_tests {
         assert!(parent.cost_usd_estimate.is_none());
 
         let session = store.get_session("session").expect("session loads").session;
+        assert_eq!(session.last_resumed_at, Some(1000));
         assert_eq!(session.prompt_tokens, 625);
         assert_eq!(session.completion_tokens, 185);
         assert!(session.token_usage_known);
@@ -7580,7 +7608,7 @@ fn active_start_for_session(connection: &Connection, session_id: &str) -> Result
     connection
         .query_row(
             "
-            SELECT MAX(
+            SELECT MIN(
                 CASE
                     WHEN last_resumed_at IS NOT NULL AND last_resumed_at > created_at
                     THEN last_resumed_at
