@@ -147,6 +147,8 @@ export const completionGateSummarySchema = z.object({
   title: z.string(),
   state: z.enum(['done', 'pending', 'blocked']).default('pending'),
   summary: z.string(),
+  task_class: z.string().default(''),
+  required_evidence: z.array(z.string()).default([]),
   evidence: z.array(z.string()).default([])
 });
 

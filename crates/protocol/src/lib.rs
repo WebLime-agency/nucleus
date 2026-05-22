@@ -218,7 +218,26 @@ pub struct CompletionGateSummary {
     pub state: String,
     pub summary: String,
     #[serde(default)]
+    pub task_class: String,
+    #[serde(default)]
+    pub required_evidence: Vec<String>,
+    #[serde(default)]
     pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceRequirementSummary {
+    pub id: String,
+    pub title: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskEvidenceContractSummary {
+    pub task_class: String,
+    pub title: String,
+    pub summary: String,
+    pub requirements: Vec<EvidenceRequirementSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -383,6 +402,201 @@ fn derive_completion_gates(job: &JobSummary) -> Vec<CompletionGateSummary> {
     gates
 }
 
+pub fn task_evidence_contract_catalog() -> Vec<TaskEvidenceContractSummary> {
+    vec![
+        task_evidence_contract(
+            "github_pr",
+            "GitHub/PR work",
+            "Ground PR lifecycle, review, and CI claims in direct GitHub evidence.",
+            &[
+                (
+                    "pr_state",
+                    "Direct PR state",
+                    "Use direct PR state evidence for open, closed, merged, mergeability, and review-decision claims.",
+                ),
+                (
+                    "review_threads",
+                    "Thread-aware review evidence",
+                    "Use unresolved review-thread evidence before claiming no actionable PR feedback remains.",
+                ),
+                (
+                    "status_checks",
+                    "Status check evidence",
+                    "Use CI/check-suite evidence before claiming PR checks are green.",
+                ),
+            ],
+        ),
+        task_evidence_contract(
+            "research",
+            "Research",
+            "Ground research answers in source freshness, provenance, and contradiction checks.",
+            &[
+                (
+                    "fresh_sources",
+                    "Fresh direct sources",
+                    "Use direct, recent sources for time-sensitive claims.",
+                ),
+                (
+                    "source_quality",
+                    "Source quality",
+                    "Prefer primary or authoritative sources before confident conclusions.",
+                ),
+                (
+                    "contradictions",
+                    "Contradiction check",
+                    "Check for conflicting evidence before final-sounding answers.",
+                ),
+            ],
+        ),
+        task_evidence_contract(
+            "automation",
+            "Automation",
+            "Ground automation claims in actual schedule, execution, and side-effect state.",
+            &[
+                (
+                    "schedule_state",
+                    "Schedule state",
+                    "Verify the target automation schedule or monitor state.",
+                ),
+                (
+                    "execution_logs",
+                    "Execution logs",
+                    "Use run logs or exit status before claiming an automation ran successfully.",
+                ),
+                (
+                    "side_effects",
+                    "Observed side effects",
+                    "Confirm expected side effects before saying the automation completed.",
+                ),
+            ],
+        ),
+        task_evidence_contract(
+            "local_project",
+            "Local project work",
+            "Ground local project claims in cwd, branch, changed files, and validation evidence.",
+            &[
+                (
+                    "workspace_context",
+                    "Workspace context",
+                    "Verify cwd, branch, repo, and target project before using command output as evidence.",
+                ),
+                (
+                    "changed_files",
+                    "Changed files",
+                    "Use the actual changed-file set before summarizing code changes.",
+                ),
+                (
+                    "validation",
+                    "Validation evidence",
+                    "Use test, build, lint, or explicit unavailable evidence before claiming validation passed.",
+                ),
+            ],
+        ),
+        task_evidence_contract(
+            "deployment",
+            "Deployment/release work",
+            "Ground shipped/released claims in remote deployment, version, and health evidence.",
+            &[
+                (
+                    "deployment_status",
+                    "Deployment status",
+                    "Verify the remote deployment or release workflow status.",
+                ),
+                (
+                    "version",
+                    "Version evidence",
+                    "Confirm the shipped version, artifact, or commit.",
+                ),
+                (
+                    "health",
+                    "Health check",
+                    "Check service health before saying a deployment is live.",
+                ),
+            ],
+        ),
+        task_evidence_contract(
+            "memory_session",
+            "Memory/session operations",
+            "Ground memory and session claims in target scope and persisted state.",
+            &[
+                (
+                    "target_scope",
+                    "Target scope",
+                    "Verify the session, project, profile, or memory scope before mutating or reporting state.",
+                ),
+                (
+                    "operation_result",
+                    "Operation result",
+                    "Use the store operation result before claiming memory/session state changed.",
+                ),
+                (
+                    "retrieval_source",
+                    "Retrieval source",
+                    "Report or use the source of retrieved memory/session evidence.",
+                ),
+            ],
+        ),
+        task_evidence_contract(
+            "process_server",
+            "Process/server state",
+            "Ground running/stopped/server-ready claims in process, port, and health evidence.",
+            &[
+                (
+                    "process_state",
+                    "Process state",
+                    "Verify the target process or service state.",
+                ),
+                (
+                    "port_state",
+                    "Port state",
+                    "Check the expected port or listener before claiming a server is reachable.",
+                ),
+                (
+                    "health_or_logs",
+                    "Health/log evidence",
+                    "Use a health endpoint or logs before claiming a server is healthy.",
+                ),
+            ],
+        ),
+    ]
+}
+
+fn task_evidence_contract(
+    task_class: &str,
+    title: &str,
+    summary: &str,
+    requirements: &[(&str, &str, &str)],
+) -> TaskEvidenceContractSummary {
+    TaskEvidenceContractSummary {
+        task_class: task_class.to_string(),
+        title: title.to_string(),
+        summary: summary.to_string(),
+        requirements: requirements
+            .iter()
+            .map(|(id, title, summary)| EvidenceRequirementSummary {
+                id: (*id).to_string(),
+                title: (*title).to_string(),
+                summary: (*summary).to_string(),
+            })
+            .collect(),
+    }
+}
+
+fn required_evidence_for(task_class: &str, ids: &[&str]) -> Vec<String> {
+    task_evidence_contract_catalog()
+        .into_iter()
+        .find(|contract| contract.task_class == task_class)
+        .map(|contract| {
+            contract
+                .requirements
+                .into_iter()
+                .filter(|requirement| ids.contains(&requirement.id.as_str()))
+                .map(|requirement| requirement.title)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn publication_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
     let evidence = [
         non_empty_evidence("PR", &job.pr_url),
@@ -420,7 +634,15 @@ fn publication_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
         _ => job.publication_summary.clone(),
     };
 
-    completion_gate("publication", "PR publication", state, summary, evidence)
+    completion_gate(
+        "publication",
+        "PR publication",
+        state,
+        summary,
+        "github_pr",
+        required_evidence_for("github_pr", &["pr_state"]),
+        evidence,
+    )
 }
 
 fn validation_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
@@ -439,7 +661,15 @@ fn validation_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
         ),
     };
 
-    completion_gate("validation", "Validation", state, summary, Vec::new())
+    completion_gate(
+        "validation",
+        "Validation",
+        state,
+        summary,
+        "local_project",
+        required_evidence_for("local_project", &["validation"]),
+        Vec::new(),
+    )
 }
 
 fn browser_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
@@ -479,6 +709,8 @@ fn browser_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
         "Browser verification",
         state,
         summary,
+        "local_project",
+        required_evidence_for("local_project", &["validation"]),
         evidence,
     )
 }
@@ -504,7 +736,15 @@ fn cleanup_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
         _ => format!("Cleanup required for {}.", job.cleanup_paths.join(", ")),
     };
 
-    completion_gate("cleanup", "Cleanup", state, summary, evidence)
+    completion_gate(
+        "cleanup",
+        "Cleanup",
+        state,
+        summary,
+        "local_project",
+        required_evidence_for("local_project", &["workspace_context", "changed_files"]),
+        evidence,
+    )
 }
 
 fn completion_gate(
@@ -512,6 +752,8 @@ fn completion_gate(
     title: &str,
     state: &str,
     summary: String,
+    task_class: &str,
+    required_evidence: Vec<String>,
     evidence: Vec<String>,
 ) -> CompletionGateSummary {
     CompletionGateSummary {
@@ -519,6 +761,8 @@ fn completion_gate(
         title: title.to_string(),
         state: state.to_string(),
         summary,
+        task_class: task_class.to_string(),
+        required_evidence,
         evidence,
     }
 }
@@ -2226,12 +2470,42 @@ mod tests {
                 .iter()
                 .any(|gate| gate.id == "publication" && gate.state == "blocked")
         );
+        let publication_gate = summary
+            .completion_gates
+            .iter()
+            .find(|gate| gate.id == "publication")
+            .expect("publication gate should be present");
+        assert_eq!(publication_gate.task_class, "github_pr");
+        assert_eq!(
+            publication_gate.required_evidence,
+            vec!["Direct PR state".to_string()]
+        );
         assert!(
             summary
                 .completion_gates
                 .iter()
                 .any(|gate| gate.id == "validation" && gate.state == "done")
         );
+    }
+
+    #[test]
+    fn task_evidence_contract_catalog_covers_grounding_classes() {
+        let catalog = task_evidence_contract_catalog();
+        for task_class in [
+            "github_pr",
+            "research",
+            "automation",
+            "local_project",
+            "deployment",
+            "memory_session",
+            "process_server",
+        ] {
+            let contract = catalog
+                .iter()
+                .find(|contract| contract.task_class == task_class)
+                .unwrap_or_else(|| panic!("{task_class} contract should be present"));
+            assert!(contract.requirements.len() >= 3);
+        }
     }
 
     #[test]

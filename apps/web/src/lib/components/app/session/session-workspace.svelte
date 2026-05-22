@@ -4289,6 +4289,16 @@
                                           {/each}
                                         </div>
                                       {/if}
+                                      {#if gate.required_evidence.length > 0}
+                                        <div class="mt-2 flex flex-wrap gap-1.5">
+                                          {#if gate.task_class}
+                                            <span class="rounded border border-zinc-800 bg-zinc-950 px-2 py-1 text-[11px] text-zinc-600">{gate.task_class}</span>
+                                          {/if}
+                                          {#each gate.required_evidence as requirement}
+                                            <span class="rounded border border-zinc-800 bg-zinc-950 px-2 py-1 text-[11px] text-zinc-500">{requirement}</span>
+                                          {/each}
+                                        </div>
+                                      {/if}
                                     </div>
                                   {/each}
                                 </div>
