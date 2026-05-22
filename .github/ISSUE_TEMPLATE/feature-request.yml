@@ -1,0 +1,59 @@
+name: Feature request
+description: Suggest an improvement or new capability.
+title: "[Feature]: "
+labels:
+  - "type: feature"
+  - "status: needs-triage"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Share the user-visible problem and the smallest useful shape for solving it.
+  - type: input
+    id: summary
+    attributes:
+      label: Short summary
+      placeholder: Add a compact session progress drawer
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the problem in user-visible terms, not implementation terms.
+    validations:
+      required: true
+  - type: textarea
+    id: minimum-shape
+    attributes:
+      label: Minimum viable shape
+      description: What is the smallest useful version of this?
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected subsystem
+      description: This selection is mirrored into an `area:` label by the issue-form area label workflow.
+      options:
+        - "area: daemon"
+        - "area: web"
+        - "area: storage"
+        - "area: protocol"
+        - "area: memory"
+        - "area: workers"
+        - "area: vault"
+        - "area: skills"
+        - "area: mcp"
+        - "area: publication"
+        - "area: release"
+        - "area: infra"
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What other approaches did you consider?
+    validations:
+      required: true
