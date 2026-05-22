@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
+  completionGateGroups,
+  gateBadgeVariant,
   nextRuntimeTick,
   noActivity,
   childRouteLabel,
@@ -85,4 +87,21 @@ test('child route label distinguishes explicit and inherited profiles', () => {
   assert.equal(childRouteLabel({ executor_route_title: 'Developer' }), 'Developer');
   assert.equal(childRouteLabel({ executor_route_id: 'reviewer' }), 'reviewer');
   assert.equal(childRouteLabel({}), '(inherits parent)');
+});
+
+test('completion gates are grouped by daemon-provided state', () => {
+  const grouped = completionGateGroups({
+    completion_gates: [
+      { id: 'publication', state: 'blocked' },
+      { id: 'validation', state: 'done' },
+      { id: 'review', state: 'pending' }
+    ]
+  });
+
+  assert.deepEqual(grouped.blocked.map((gate) => gate.id), ['publication']);
+  assert.deepEqual(grouped.pending.map((gate) => gate.id), ['review']);
+  assert.deepEqual(grouped.done.map((gate) => gate.id), ['validation']);
+  assert.equal(gateBadgeVariant('blocked'), 'destructive');
+  assert.equal(gateBadgeVariant('pending'), 'warning');
+  assert.equal(gateBadgeVariant('done'), 'default');
 });

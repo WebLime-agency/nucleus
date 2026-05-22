@@ -439,6 +439,7 @@
       (event.event === 'job.created' ||
         event.event === 'job.updated' ||
         event.event === 'job.completed' ||
+        event.event === 'job.blocked' ||
         event.event === 'job.failed') &&
       event.data.template_id &&
       event.data.template_id === selectedPlaybookId

@@ -159,6 +159,9 @@ fn mentions_non_ui_image_context(prompt: &str) -> bool {
         "unrelated to ui",
         "not related to ui",
         "unrelated screenshot",
+        "what is in this image",
+        "what's in this image",
+        "describe this image",
         "receipt",
         "document scan",
     ]
@@ -1718,10 +1721,7 @@ fn wait_condition_satisfied(
                     return Ok(false);
                 }
                 let detail = state.store.get_job(job_id)?;
-                if !matches!(
-                    detail.job.state.as_str(),
-                    "completed" | "failed" | "canceled"
-                ) {
+                if !is_terminal_job_state(&detail.job.state) {
                     return Ok(false);
                 }
             }
@@ -1761,6 +1761,7 @@ fn event_matches_child_job_wait(event: Option<&DaemonEvent>, job_ids: &[String])
     let job = match event {
         DaemonEvent::JobUpdated(job)
         | DaemonEvent::JobCompleted(job)
+        | DaemonEvent::JobBlocked(job)
         | DaemonEvent::JobFailed(job) => job,
         _ => return false,
     };
@@ -1856,10 +1857,7 @@ async fn complete_wait_with_wall_clock_budget(
     wait: &WorkerWaitRecord,
 ) -> Result<()> {
     let detail = state.store.get_job(&worker.job_id)?;
-    if matches!(
-        detail.job.state.as_str(),
-        "completed" | "failed" | "canceled"
-    ) {
+    if is_terminal_job_state(&detail.job.state) {
         return Ok(());
     }
     let session_id = detail.job.session_id.clone().ok_or_else(|| {
@@ -1914,10 +1912,7 @@ async fn resume_waiting_worker(
     event_type: &str,
 ) -> Result<()> {
     let detail = state.store.get_job(&worker.job_id)?;
-    if matches!(
-        detail.job.state.as_str(),
-        "completed" | "failed" | "canceled"
-    ) {
+    if is_terminal_job_state(&detail.job.state) {
         return Ok(());
     }
     let session_id = detail.job.session_id.clone().ok_or_else(|| {
@@ -2356,10 +2351,7 @@ async fn run_job_loop(
         }
 
         session = state.store.get_session(&session_id)?;
-        if matches!(
-            state.store.get_job(job_id)?.job.state.as_str(),
-            "completed" | "failed" | "canceled"
-        ) {
+        if is_terminal_job_state(&state.store.get_job(job_id)?.job.state) {
             return Ok(());
         }
         if let LoopDisposition::Return = handle_pending_action(
@@ -3081,12 +3073,9 @@ async fn handle_pending_action(
             .iter()
             .map(|child_job_id| state.store.get_job(child_job_id))
             .collect::<Result<Vec<_>>>()?;
-        let all_complete = child_details.iter().all(|detail| {
-            matches!(
-                detail.job.state.as_str(),
-                "completed" | "failed" | "canceled"
-            )
-        });
+        let all_complete = child_details
+            .iter()
+            .all(|detail| is_terminal_job_state(&detail.job.state));
         if all_complete {
             let results = child_details
                 .iter()
@@ -4247,6 +4236,14 @@ async fn complete_job_with_final_answer(
 
     let completion_job = state.store.get_job(job_id)?.job;
     reconcile_publication_browser_status_with_completion(&completion_job, &mut publication_patch);
+    let terminal_job_state =
+        if projected_completion_gates_blocked(&completion_job, &publication_patch) {
+            "blocked"
+        } else {
+            "completed"
+        };
+    let visible_final_answer =
+        contradiction_checked_final_answer(final_answer, terminal_job_state, &publication_patch);
 
     let mut visible_turn_id = None;
     let mut report_artifact = None;
@@ -4275,7 +4272,7 @@ async fn complete_job_with_final_answer(
             &session.session.id,
             &final_turn_id,
             "assistant",
-            &final_answer,
+            &visible_final_answer,
             &[],
         )?;
         post_turn_memory_outcomes = crate::extract_memory_decisions_after_turn(
@@ -4304,7 +4301,7 @@ async fn complete_job_with_final_answer(
                 format!("{} report", detail.job.title),
                 "md",
                 "text/markdown",
-                final_answer.to_string(),
+                visible_final_answer.clone(),
             ),
         )?;
         report_artifact = Some(artifact);
@@ -4313,7 +4310,7 @@ async fn complete_job_with_final_answer(
     state.store.update_job(
         job_id,
         JobPatch {
-            state: Some("completed".to_string()),
+            state: Some(terminal_job_state.to_string()),
             visible_turn_id,
             result_summary: Some(summary.to_string()),
             last_error: Some(String::new()),
@@ -4340,27 +4337,34 @@ async fn complete_job_with_final_answer(
             ..WorkerPatch::default()
         },
     )?;
-    let terminal_metadata = final_answer_terminal_metadata(
+    let mut terminal_metadata = final_answer_terminal_metadata(
         summary,
-        final_answer,
+        &visible_final_answer,
         final_answer_metadata,
         &structured_artifacts,
         step_count,
         tool_call_count,
         &publication_patch,
     );
-    let terminal_status = terminal_metadata
-        .get("terminal_status")
-        .and_then(Value::as_str)
-        .unwrap_or("completed")
-        .to_string();
+    if terminal_job_state == "blocked" {
+        terminal_metadata["terminal_status"] = Value::String("blocked".to_string());
+        terminal_metadata["blocked"] = Value::Bool(true);
+    } else {
+        terminal_metadata["terminal_status"] = Value::String("completed".to_string());
+        terminal_metadata["blocked"] = Value::Bool(false);
+    }
+    let terminal_status = terminal_job_state.to_string();
     let _ = state.store.append_job_event(JobEventRecord {
         job_id: job_id.to_string(),
         worker_id: Some(worker.id.clone()),
-        event_type: "job.completed".to_string(),
+        event_type: if terminal_status == "blocked" {
+            "job.blocked".to_string()
+        } else {
+            "job.completed".to_string()
+        },
         status: terminal_status,
         summary: summary.to_string(),
-        detail: excerpt(&final_answer, 320),
+        detail: excerpt(&visible_final_answer, 320),
         data_json: terminal_metadata,
     });
     if let Some(publication_status) = publication_patch.publication_status.as_deref() {
@@ -4379,7 +4383,7 @@ async fn complete_job_with_final_answer(
                     .publication_summary
                     .clone()
                     .unwrap_or_else(|| summary.to_string()),
-                detail: excerpt(&final_answer, 320),
+                detail: excerpt(&visible_final_answer, 320),
                 data_json: json!({
                     "publication_requested": publication_patch.publication_requested.unwrap_or(true),
                     "publication_status": publication_status,
@@ -4419,13 +4423,28 @@ async fn complete_job_with_final_answer(
     let _ = try_record_audit_event(
         state,
         AuditEventRecord {
-            kind: "session.job.completed".to_string(),
+            kind: if terminal_job_state == "blocked" {
+                "session.job.blocked".to_string()
+            } else {
+                "session.job.completed".to_string()
+            },
             target: format!("job:{job_id}"),
-            status: "success".to_string(),
-            summary: format!(
-                "Completed Utility Worker job for session '{}'.",
-                session.session.title
-            ),
+            status: if terminal_job_state == "blocked" {
+                "warning".to_string()
+            } else {
+                "success".to_string()
+            },
+            summary: if terminal_job_state == "blocked" {
+                format!(
+                    "Blocked Utility Worker job for session '{}'.",
+                    session.session.title
+                )
+            } else {
+                format!(
+                    "Completed Utility Worker job for session '{}'.",
+                    session.session.title
+                )
+            },
             detail: format!(
                 "session_id={} provider={} model={} steps={} tool_calls={}",
                 session.session.id, worker.provider, worker.model, step_count, tool_call_count
@@ -4438,13 +4457,15 @@ async fn complete_job_with_final_answer(
         if let Ok(updated) = state.store.get_session(&session.session.id) {
             let _ = publish_session_event(state, updated).await;
         }
+        let (prompt_status, prompt_label, prompt_detail) =
+            terminal_prompt_status_copy(terminal_job_state);
         publish_prompt_status(
             state,
             &session.session,
             worker,
-            "completed",
-            "Utility Worker completed",
-            "Nucleus persisted a clean assistant turn from the Utility Worker result.",
+            prompt_status,
+            prompt_label,
+            prompt_detail,
             &post_turn_memory_outcomes,
         )
         .await;
@@ -4465,7 +4486,7 @@ async fn complete_job_with_final_answer(
         }
     }
 
-    publish_job_completed(state, &state.store.get_job(job_id)?.job).await;
+    publish_terminal_job_event(state, &state.store.get_job(job_id)?.job).await;
     publish_worker_updated(state, worker).await;
     let _ = publish_overview_event(state).await;
     Ok(())
@@ -5686,6 +5707,111 @@ fn publication_patch_terminal_status_is_blocked(patch: &PublicationOutcomePatch)
             .publication_status
             .as_deref()
             .is_some_and(|status| matches!(status, "blocked" | "not_opened" | "failed"))
+}
+
+fn projected_completion_gates_blocked(
+    current: &JobSummary,
+    publication_patch: &PublicationOutcomePatch,
+) -> bool {
+    let mut projected = current.clone();
+    projected.state = "completed".to_string();
+    if let Some(value) = publication_patch.publication_requested {
+        projected.publication_requested = value;
+    }
+    if let Some(value) = publication_patch.publication_status.as_ref() {
+        projected.publication_status = value.clone();
+    }
+    if let Some(value) = publication_patch.publication_summary.as_ref() {
+        projected.publication_summary = value.clone();
+    }
+    if let Some(value) = publication_patch.pr_url.as_ref() {
+        projected.pr_url = value.clone();
+    }
+    if let Some(value) = publication_patch.source_branch.as_ref() {
+        projected.source_branch = value.clone();
+    }
+    if let Some(value) = publication_patch.target_branch.as_ref() {
+        projected.target_branch = value.clone();
+    }
+    if let Some(value) = publication_patch.validation_status.as_ref() {
+        projected.validation_status = value.clone();
+    }
+    if let Some(value) = publication_patch.browser_verification_status.as_ref() {
+        projected.browser_verification_status = value.clone();
+    }
+    if let Some(value) = publication_patch.cleanup_status.as_ref() {
+        projected.cleanup_status = value.clone();
+    }
+    if let Some(value) = publication_patch.cleanup_paths.as_ref() {
+        projected.cleanup_paths = value.clone();
+    }
+
+    projected
+        .with_completion_gates()
+        .has_blocking_completion_gates()
+}
+
+fn contradiction_checked_final_answer(
+    final_answer: &str,
+    terminal_job_state: &str,
+    publication_patch: &PublicationOutcomePatch,
+) -> String {
+    if terminal_job_state != "blocked" {
+        return final_answer.to_string();
+    }
+
+    let normalized = normalize_action_item_text(final_answer);
+    if contains_blocked_terminal_result_language(&normalized) {
+        return final_answer.to_string();
+    }
+
+    let blocker = if publication_patch
+        .browser_verification_status
+        .as_deref()
+        .is_some_and(|status| matches!(status, "failed" | "unavailable" | "not_performed"))
+    {
+        "Browser verification evidence is missing or blocked."
+    } else if publication_patch.cleanup_status.as_deref() == Some("cleanup_required") {
+        "Cleanup is required before completion can be claimed."
+    } else {
+        publication_patch
+            .publication_summary
+            .as_deref()
+            .filter(|summary| !summary.trim().is_empty())
+            .unwrap_or("Required daemon completion gates are unmet.")
+    };
+    if final_answer_is_generic_completion_claim(&normalized) {
+        return format!("Blocked: {blocker}");
+    }
+
+    format!("Blocked: {blocker}\n\n{final_answer}")
+}
+
+fn terminal_prompt_status_copy(
+    terminal_job_state: &str,
+) -> (&'static str, &'static str, &'static str) {
+    if terminal_job_state == "blocked" {
+        (
+            "blocked",
+            "Utility Worker blocked",
+            "Nucleus persisted a blocked assistant turn because daemon completion gates are unmet.",
+        )
+    } else {
+        (
+            "completed",
+            "Utility Worker completed",
+            "Nucleus persisted a clean assistant turn from the Utility Worker result.",
+        )
+    }
+}
+
+fn final_answer_is_generic_completion_claim(normalized: &str) -> bool {
+    matches!(
+        normalized.trim_matches(|character: char| {
+            character.is_ascii_whitespace() || matches!(character, '.' | '!' | ':' | ';')
+        }),
+        "done" | "all set" | "complete" | "completed" | "the work is done" | "work is done"
+    )
 }
 
 fn contains_blocked_terminal_result_language(text: &str) -> bool {
@@ -8011,12 +8137,7 @@ async fn execute_pending_tool_action(
         .await?;
     }
 
-    if *cancel_rx.borrow()
-        || matches!(
-            state.store.get_job(job_id)?.job.state.as_str(),
-            "completed" | "failed" | "canceled"
-        )
-    {
+    if *cancel_rx.borrow() || is_terminal_job_state(&state.store.get_job(job_id)?.job.state) {
         let _ = state.store.update_tool_call(
             &pending.tool_call_id,
             ToolCallPatch {
@@ -12676,6 +12797,10 @@ fn is_non_terminal_job_state(state: &str) -> bool {
     matches!(state, "queued" | "running" | "paused" | "waiting")
 }
 
+fn is_terminal_job_state(state: &str) -> bool {
+    matches!(state, "completed" | "blocked" | "failed" | "canceled")
+}
+
 async fn reconcile_failed_job_command_sessions(
     state: &AppState,
     job_id: &str,
@@ -13983,6 +14108,21 @@ async fn publish_job_completed(state: &AppState, summary: &JobSummary) {
         .events
         .send(DaemonEvent::JobCompleted(publishable_job_summary(summary)));
     let _ = record_job_log(state, "info", "job.completed", summary).await;
+}
+
+async fn publish_job_blocked(state: &AppState, summary: &JobSummary) {
+    let _ = state
+        .events
+        .send(DaemonEvent::JobBlocked(publishable_job_summary(summary)));
+    let _ = record_job_log(state, "warn", "job.blocked", summary).await;
+}
+
+async fn publish_terminal_job_event(state: &AppState, summary: &JobSummary) {
+    if summary.state == "blocked" {
+        publish_job_blocked(state, summary).await;
+    } else {
+        publish_job_completed(state, summary).await;
+    }
 }
 
 async fn record_job_log(
@@ -16074,6 +16214,81 @@ Remaining:\n\
     }
 
     #[test]
+    fn terminal_prompt_status_copy_matches_persisted_terminal_state() {
+        assert_eq!(
+            terminal_prompt_status_copy("blocked"),
+            (
+                "blocked",
+                "Utility Worker blocked",
+                "Nucleus persisted a blocked assistant turn because daemon completion gates are unmet."
+            )
+        );
+        assert_eq!(
+            terminal_prompt_status_copy("completed"),
+            (
+                "completed",
+                "Utility Worker completed",
+                "Nucleus persisted a clean assistant turn from the Utility Worker result."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_terminal_publish_uses_blocked_event_type() {
+        let state_dir = test_state_dir("blocked-terminal-publish");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let session_id = "blocked-terminal-publish-session";
+        state
+            .store
+            .create_session(test_session_record(
+                session_id,
+                "Blocked publish session",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+        let job = state
+            .store
+            .create_job(JobRecord {
+                id: "blocked-terminal-publish-job".to_string(),
+                state: "blocked".to_string(),
+                title: "Blocked job".to_string(),
+                purpose: "blocked publish".to_string(),
+                requested_by: "agent".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                session_id: Some(session_id.to_string()),
+                parent_job_id: None,
+                template_id: None,
+                prompt_excerpt: String::new(),
+                publication_intent_text: None,
+            })
+            .expect("job should persist");
+        let mut events = state.events.subscribe();
+
+        publish_terminal_job_event(&state, &job).await;
+
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("blocked event should be published")
+            .expect("blocked event should be readable");
+        match event {
+            DaemonEvent::JobBlocked(summary) => {
+                assert_eq!(summary.id, "blocked-terminal-publish-job");
+                assert_eq!(summary.state, "blocked");
+            }
+            other => panic!("expected job.blocked event, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
     fn publication_outcome_patch_extracts_structured_terminal_fields() {
         let job = test_publication_job_summary("publication-extract");
         let patch = publication_outcome_patch(
@@ -16516,7 +16731,6 @@ Cleanup status: clean";
             content: "Implement the daemon-owned final-response contract.".to_string(),
             metadata: json!({"target": "issue-209"}),
         }];
-
         complete_job_with_final_answer(
             &state,
             &session,
@@ -16541,9 +16755,11 @@ Cleanup status: clean";
             .iter()
             .find(|turn| turn.role == "assistant")
             .expect("assistant turn should persist");
-        assert_eq!(assistant_turn.content, "Published the PR.");
+        assert_eq!(
+            assistant_turn.content,
+            "Blocked: Browser verification evidence is missing or blocked.\n\nPublished the PR."
+        );
         assert!(!assistant_turn.content.contains("publication_status"));
-        assert!(!assistant_turn.content.contains("Browser verification"));
         assert!(!assistant_turn.content.contains("Result:"));
         assert!(!assistant_turn.content.contains("Implementation prompt:"));
 
@@ -16556,14 +16772,16 @@ Cleanup status: clean";
         assert_eq!(detail.job.validation_status, "passed");
         assert_eq!(detail.job.browser_verification_status, "not_performed");
         assert_eq!(detail.job.cleanup_status, "clean");
+        assert_eq!(detail.job.state, "blocked");
+        assert_eq!(detail.job.completion_status, "blocked");
         assert_eq!(detail.artifacts.len(), 1);
         assert_eq!(detail.artifacts[0].kind, "implementation_prompt");
         assert_eq!(detail.artifacts[0].metadata_json["target"], "issue-209");
         let completed = detail
             .events
             .iter()
-            .find(|event| event.event_type == "job.completed")
-            .expect("completion event should persist");
+            .find(|event| event.event_type == "job.blocked")
+            .expect("blocked event should persist");
         assert_eq!(
             completed.data_json["final_response_metadata"]["publication_status"],
             "opened"
@@ -16631,6 +16849,34 @@ Cleanup status: clean";
         job.browser_verification_status = "passed".to_string();
         reconcile_publication_browser_status_with_completion(&job, &mut patch);
         assert_eq!(patch.browser_verification_status.as_deref(), Some("passed"));
+    }
+
+    #[test]
+    fn projected_completion_gates_block_non_publication_browser_and_cleanup_failures() {
+        let mut browser_job = test_publication_job_summary("browser-gated");
+        browser_job.publication_requested = false;
+        browser_job.publication_status = "not_requested".to_string();
+        browser_job.pr_url = String::new();
+        browser_job.browser_verification_required = true;
+        browser_job.browser_verification_status = "failed".to_string();
+        browser_job.validation_status = "not_performed".to_string();
+        browser_job.cleanup_status = "clean".to_string();
+
+        assert!(projected_completion_gates_blocked(
+            &browser_job,
+            &PublicationOutcomePatch::default()
+        ));
+
+        let mut cleanup_job = browser_job.clone();
+        cleanup_job.browser_verification_required = false;
+        cleanup_job.browser_verification_status = "not_required".to_string();
+        cleanup_job.cleanup_status = "cleanup_required".to_string();
+        cleanup_job.cleanup_paths = vec![".tmp-playwright".to_string()];
+
+        assert!(projected_completion_gates_blocked(
+            &cleanup_job,
+            &PublicationOutcomePatch::default()
+        ));
     }
 
     #[test]
@@ -18590,6 +18836,10 @@ Cleanup status: clean";
             "true"
         );
         assert_eq!(
+            classify_prompt_ui_renderable("What is in this image?", 1),
+            "false"
+        );
+        assert_eq!(
             classify_prompt_ui_renderable("This receipt photo is unrelated to UI", 1),
             "false"
         );
@@ -18677,6 +18927,9 @@ Cleanup status: clean";
             validation_status: "not_performed".to_string(),
             cleanup_status: "unknown".to_string(),
             cleanup_paths: Vec::new(),
+            completion_status: String::new(),
+            completion_gates: Vec::new(),
+            completion_blockers: Vec::new(),
             worker_count: 0,
             pending_approval_count: 0,
             artifact_count: 0,
@@ -18742,6 +18995,9 @@ Cleanup status: clean";
             validation_status: "not_performed".to_string(),
             cleanup_status: "unknown".to_string(),
             cleanup_paths: Vec::new(),
+            completion_status: String::new(),
+            completion_gates: Vec::new(),
+            completion_blockers: Vec::new(),
             worker_count: 0,
             pending_approval_count: 0,
             artifact_count: 0,
@@ -20944,11 +21200,11 @@ Cleanup status: clean";
             "waiting"
         );
 
-        mark_job_state(&state, &child_ids[2], "completed");
-        let event = DaemonEvent::JobCompleted(state.store.get_job(&child_ids[2]).unwrap().job);
+        mark_job_state(&state, &child_ids[2], "blocked");
+        let event = DaemonEvent::JobUpdated(state.store.get_job(&child_ids[2]).unwrap().job);
         process_waiting_workers(&state, Some(&event))
             .await
-            .expect("last terminal child should wake parent");
+            .expect("blocked terminal child should wake parent");
 
         let parent = wait_for_job_state(&state, &parent_job_id, "completed").await;
         server.await.expect("test server should finish");
@@ -21139,6 +21395,22 @@ Cleanup status: clean";
                 publication_intent_text: None,
             })
             .expect("child job should persist");
+        let child_blocked = state
+            .store
+            .create_job(JobRecord {
+                id: "child-blocked".to_string(),
+                state: "blocked".to_string(),
+                title: "Child blocked".to_string(),
+                purpose: "blocked".to_string(),
+                requested_by: "agent".to_string(),
+                trigger_kind: "child_job".to_string(),
+                session_id: Some(session_id.clone()),
+                parent_job_id: None,
+                template_id: None,
+                prompt_excerpt: String::new(),
+                publication_intent_text: None,
+            })
+            .expect("child job should persist");
         let child_artifact = state
             .store
             .create_job_artifact(JobArtifactRecord {
@@ -21190,6 +21462,17 @@ Cleanup status: clean";
                 now + WAIT_CHILD_JOB_POLL_INTERVAL_SECS as i64,
             )
             .expect("child wait should evaluate")
+        );
+        assert!(
+            wait_condition_satisfied(
+                &state,
+                &test_wait(WaitUntil::ChildJobsCompleted {
+                    job_ids: vec![child_done.id.clone(), child_blocked.id.clone()]
+                }),
+                None,
+                now + WAIT_CHILD_JOB_POLL_INTERVAL_SECS as i64,
+            )
+            .expect("blocked child wait should evaluate")
         );
         assert!(
             wait_condition_satisfied(
@@ -22875,6 +23158,9 @@ for line in sys.stdin:
             browser_verification_status: "not_performed".to_string(),
             cleanup_status: "unknown".to_string(),
             cleanup_paths: Vec::new(),
+            completion_status: String::new(),
+            completion_gates: Vec::new(),
+            completion_blockers: Vec::new(),
             worker_count: 1,
             pending_approval_count: 0,
             artifact_count: 0,
