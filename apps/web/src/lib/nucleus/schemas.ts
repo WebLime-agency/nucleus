@@ -196,6 +196,8 @@ export const workerSummarySchema = z.object({
   max_wall_clock_secs: z.number().int().nonnegative(),
   step_count: z.number().int().nonnegative(),
   tool_call_count: z.number().int().nonnegative(),
+  wait_until_json: z.unknown().nullable().default(null),
+  wait_started_at: z.number().int().nullable().default(null),
   last_error: z.string(),
   user_error: userFacingErrorSummarySchema.nullable().default(null),
   capabilities: z.array(toolCapabilitySummarySchema).default([]),
@@ -755,6 +757,8 @@ export const mcpServerSummarySchema = z.object({
   sync_status: z.string().default('pending'),
   last_error: z.string().default(''),
   last_synced_at: z.number().int().nullable().default(null),
+  invocation_status: z.string().default('unknown'),
+  invocation_message: z.string().default(''),
   tools: z.array(nucleusToolDescriptorSchema).default([]),
   resources: z.array(z.string()).default([])
 });

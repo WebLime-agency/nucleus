@@ -292,6 +292,10 @@ pub struct WorkerSummary {
     pub max_wall_clock_secs: u64,
     pub step_count: usize,
     pub tool_call_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_until_json: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_started_at: Option<i64>,
     #[serde(default)]
     pub last_error: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -651,6 +655,9 @@ fn default_mcp_auth_kind() -> String {
 fn default_mcp_sync_status() -> String {
     "pending".to_string()
 }
+fn default_mcp_invocation_status() -> String {
+    "unknown".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpServerSummary {
@@ -679,6 +686,10 @@ pub struct McpServerSummary {
     pub last_error: String,
     #[serde(default)]
     pub last_synced_at: Option<i64>,
+    #[serde(default = "default_mcp_invocation_status")]
+    pub invocation_status: String,
+    #[serde(default)]
+    pub invocation_message: String,
     #[serde(default)]
     pub tools: Vec<NucleusToolDescriptor>,
     #[serde(default)]
