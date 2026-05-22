@@ -491,6 +491,8 @@ pub struct AgentRuntime {
 struct HiddenWorkerTarget {
     provider: String,
     model: String,
+    route_id: String,
+    route_title: String,
     provider_base_url: String,
     provider_api_key: String,
 }
@@ -993,6 +995,8 @@ pub async fn start_prompt_job(
         state: "queued".to_string(),
         provider: target.provider.clone(),
         model: target.model.clone(),
+        route_id: target.route_id.clone(),
+        route_title: target.route_title.clone(),
         provider_base_url: target.provider_base_url.clone(),
         provider_api_key: target.provider_api_key.clone(),
         provider_session_id: String::new(),
@@ -3532,9 +3536,16 @@ async fn handle_child_job_proposal(
         );
     }
 
+    let mut child_plans = Vec::with_capacity(jobs.len());
+    for proposal in &jobs {
+        child_plans
+            .push(resolve_child_job_target_plan(state, &session.session, worker, proposal).await?);
+    }
+
     let mut child_job_ids = Vec::with_capacity(jobs.len());
-    for proposal in jobs {
-        let child_job_id = create_child_job(state, session, job_id, worker, proposal).await?;
+    for (proposal, target_plan) in jobs.into_iter().zip(child_plans) {
+        let child_job_id =
+            create_child_job(state, session, job_id, worker, proposal, target_plan).await?;
         child_job_ids.push(child_job_id);
     }
 
@@ -3768,6 +3779,7 @@ async fn create_child_job(
     parent_job_id: &str,
     parent_worker: &WorkerSummary,
     proposal: ChildJobProposal,
+    target_plan: ChildJobTargetPlan,
 ) -> Result<String> {
     create_child_job_with_limits(
         state,
@@ -3775,6 +3787,7 @@ async fn create_child_job(
         parent_job_id,
         parent_worker,
         proposal,
+        target_plan,
         ChildJobRunLimits {
             max_steps: configured_child_job_max_steps(),
             max_tool_calls: configured_child_job_max_tool_calls(),
@@ -3791,12 +3804,62 @@ struct ChildJobRunLimits {
     max_wall_clock_secs: u64,
 }
 
+#[derive(Debug, Clone)]
+struct ChildJobTargetPlan {
+    target: HiddenWorkerTarget,
+}
+
+async fn resolve_child_job_target_plan(
+    state: &AppState,
+    session: &SessionSummary,
+    parent_worker: &WorkerSummary,
+    proposal: &ChildJobProposal,
+) -> Result<ChildJobTargetPlan> {
+    let requested_route_id = proposal
+        .route_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if let Some(route_id) = requested_route_id {
+        let mut route_session = session.clone();
+        route_session.route_id = route_id.to_string();
+        route_session.route_title = String::new();
+        route_session.provider = String::new();
+        route_session.model = String::new();
+        route_session.provider_base_url = String::new();
+        route_session.provider_api_key = String::new();
+        let target = resolve_hidden_worker_target_with_route_override(
+            state,
+            &route_session,
+            ACTION_EXECUTOR_LANE,
+            false,
+            Some(route_id),
+        )
+        .await
+        .map_err(|error| anyhow!("worker_action.invalid: {}", error.message))?;
+        return Ok(ChildJobTargetPlan { target });
+    }
+
+    Ok(ChildJobTargetPlan {
+        target: HiddenWorkerTarget {
+            provider: parent_worker.provider.clone(),
+            model: parent_worker.model.clone(),
+            route_id: String::new(),
+            route_title: String::new(),
+            provider_base_url: parent_worker.provider_base_url.clone(),
+            provider_api_key: parent_worker.provider_api_key.clone(),
+        },
+    })
+}
+
 async fn create_child_job_with_limits(
     state: &AppState,
     session: &SessionDetail,
     parent_job_id: &str,
     parent_worker: &WorkerSummary,
     proposal: ChildJobProposal,
+    target_plan: ChildJobTargetPlan,
     limits: ChildJobRunLimits,
 ) -> Result<String> {
     let title = proposal.title.trim();
@@ -3853,10 +3916,12 @@ async fn create_child_job_with_limits(
         title: format!("Child utility worker: {}", title),
         lane: "utility".to_string(),
         state: "queued".to_string(),
-        provider: parent_worker.provider.clone(),
-        model: parent_worker.model.clone(),
-        provider_base_url: parent_worker.provider_base_url.clone(),
-        provider_api_key: parent_worker.provider_api_key.clone(),
+        provider: target_plan.target.provider,
+        model: target_plan.target.model,
+        route_id: target_plan.target.route_id,
+        route_title: target_plan.target.route_title,
+        provider_base_url: target_plan.target.provider_base_url,
+        provider_api_key: target_plan.target.provider_api_key,
         provider_session_id: String::new(),
         working_dir: child_working_dir,
         read_roots,
@@ -3872,6 +3937,9 @@ async fn create_child_job_with_limits(
             ..JobPatch::default()
         },
     )?;
+    // Per-child route selection is intentionally Option A from #262: the route
+    // controls model/provider/transport only. Tool and MCP grants still come
+    // from the parent's workspace-scoped child capability set.
     state
         .store
         .replace_tool_capability_grants(&child_worker_id, &child_worker_capabilities())?;
@@ -12675,53 +12743,84 @@ async fn resolve_hidden_worker_target(
     compiler_role: &str,
     needs_vision_tools: bool,
 ) -> Result<HiddenWorkerTarget, ApiError> {
-    if compiler_role == "main" {
-        if !session.route_id.trim().is_empty() {
-            let route_profiles = load_router_profiles(state, false).await?;
-            let route = route_profiles
-                .iter()
-                .find(|profile| profile.id == session.route_id)
-                .ok_or_else(|| {
-                    ApiError::bad_request(format!("unknown router profile '{}'", session.route_id))
-                })?;
+    resolve_hidden_worker_target_with_route_override(
+        state,
+        session,
+        compiler_role,
+        needs_vision_tools,
+        None,
+    )
+    .await
+}
 
-            if !route.enabled {
-                return Err(ApiError::bad_request(format!(
-                    "router profile '{}' is disabled",
-                    route.title
-                )));
-            }
+async fn resolve_hidden_worker_target_with_route_override(
+    state: &AppState,
+    session: &SessionSummary,
+    compiler_role: &str,
+    needs_vision_tools: bool,
+    route_override: Option<&str>,
+) -> Result<HiddenWorkerTarget, ApiError> {
+    let requested_route_id = route_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let session_route_id = (compiler_role == "main")
+        .then_some(session.route_id.trim())
+        .filter(|value| !value.is_empty());
 
-            let targets = resolve_profile_targets(state, route, false)
-                .await?
-                .into_iter()
-                .map(|target| HiddenWorkerTargetCandidate {
-                    target: HiddenWorkerTarget {
-                        provider: target.provider,
-                        model: target.model,
-                        provider_base_url: target.provider_base_url,
-                        provider_api_key: target.provider_api_key,
-                    },
-                    runtime_ready: target.runtime_ready,
-                })
-                .collect::<Vec<_>>();
-            let mut target =
-                select_hidden_worker_target(targets, needs_vision_tools).ok_or_else(|| {
-                    ApiError::bad_request(format!(
-                        "router profile '{}' has no usable targets",
-                        route.title
-                    ))
-                })?;
-            if target.provider == session.provider && !session.model.trim().is_empty() {
-                target.model = session.model.clone();
-            }
-            ensure_hidden_worker_target_ready(state, &target, needs_vision_tools).await?;
-            return Ok(target);
+    if let Some(route_id) = requested_route_id.or(session_route_id) {
+        let route_profiles = load_router_profiles(state, false).await?;
+        let route = route_profiles
+            .iter()
+            .find(|profile| profile.id == route_id)
+            .ok_or_else(|| {
+                ApiError::bad_request(format!("unknown router profile '{}'", route_id))
+            })?;
+
+        if !route.enabled {
+            return Err(ApiError::bad_request(format!(
+                "router profile '{}' is disabled",
+                route.title
+            )));
         }
 
+        let targets = resolve_profile_targets(state, route, false)
+            .await?
+            .into_iter()
+            .map(|target| HiddenWorkerTargetCandidate {
+                target: HiddenWorkerTarget {
+                    provider: target.provider,
+                    model: target.model,
+                    route_id: route.id.clone(),
+                    route_title: route.title.clone(),
+                    provider_base_url: target.provider_base_url,
+                    provider_api_key: target.provider_api_key,
+                },
+                runtime_ready: target.runtime_ready,
+            })
+            .collect::<Vec<_>>();
+        let mut target =
+            select_hidden_worker_target(targets, needs_vision_tools).ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "router profile '{}' has no usable targets",
+                    route.title
+                ))
+            })?;
+        if requested_route_id.is_none()
+            && target.provider == session.provider
+            && !session.model.trim().is_empty()
+        {
+            target.model = session.model.clone();
+        }
+        ensure_hidden_worker_target_ready(state, &target, needs_vision_tools).await?;
+        return Ok(target);
+    }
+
+    if compiler_role == "main" {
         let target = HiddenWorkerTarget {
             provider: session.provider.clone(),
             model: session.model.clone(),
+            route_id: session.route_id.clone(),
+            route_title: session.route_title.clone(),
             provider_base_url: session.provider_base_url.clone(),
             provider_api_key: session.provider_api_key.clone(),
         };
@@ -12743,6 +12842,8 @@ async fn resolve_hidden_worker_target(
     let target = HiddenWorkerTarget {
         provider: profile.utility.adapter.clone(),
         model: profile.utility.model.clone(),
+        route_id: String::new(),
+        route_title: String::new(),
         provider_base_url: profile.utility.base_url.clone(),
         provider_api_key: profile.utility.api_key.clone(),
     };
@@ -13223,6 +13324,8 @@ async fn queue_playbook_job(
         state: "queued".to_string(),
         provider: target.provider.clone(),
         model: target.model.clone(),
+        route_id: target.route_id.clone(),
+        route_title: target.route_title.clone(),
         provider_base_url: target.provider_base_url.clone(),
         provider_api_key: target.provider_api_key.clone(),
         provider_session_id: String::new(),
@@ -14530,6 +14633,8 @@ mod tests {
             state: "queued".to_string(),
             provider: "test".to_string(),
             model: "test".to_string(),
+            route_id: String::new(),
+            route_title: String::new(),
             provider_base_url: String::new(),
             provider_api_key: String::new(),
             provider_session_id: String::new(),
@@ -14599,6 +14704,8 @@ mod tests {
             state: "queued".to_string(),
             provider: "test".to_string(),
             model: "test".to_string(),
+            route_id: String::new(),
+            route_title: String::new(),
             provider_base_url: String::new(),
             provider_api_key: String::new(),
             provider_session_id: String::new(),
@@ -16364,6 +16471,8 @@ Cleanup status: clean";
                 state: "running".to_string(),
                 provider: "openai_compatible".to_string(),
                 model: "test-model".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
                 provider_base_url: String::new(),
                 provider_api_key: String::new(),
                 provider_session_id: String::new(),
@@ -18159,6 +18268,8 @@ Cleanup status: clean";
                 state: "queued".to_string(),
                 provider: "openai_compatible".to_string(),
                 model: "test-model".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
                 provider_base_url: base_url,
                 provider_api_key: String::new(),
                 provider_session_id: String::new(),
@@ -18300,6 +18411,8 @@ Cleanup status: clean";
             state: "queued".to_string(),
             provider: "claude".to_string(),
             model: "sonnet".to_string(),
+            route_id: String::new(),
+            route_title: String::new(),
             provider_base_url: String::new(),
             provider_api_key: String::new(),
             provider_session_id: String::new(),
@@ -18385,6 +18498,8 @@ Cleanup status: clean";
             state: "queued".to_string(),
             provider: "openai_compatible".to_string(),
             model: "cx/gpt-5.4".to_string(),
+            route_id: String::new(),
+            route_title: String::new(),
             provider_base_url: "http://127.0.0.1:1234/v1".to_string(),
             provider_api_key: "token".to_string(),
             provider_session_id: String::new(),
@@ -18542,6 +18657,8 @@ Cleanup status: clean";
             executor_lane: String::new(),
             executor_provider: String::new(),
             executor_model: String::new(),
+            executor_route_id: String::new(),
+            executor_route_title: String::new(),
             visible_turn_id: None,
             result_summary: String::new(),
             last_error: String::new(),
@@ -18605,6 +18722,8 @@ Cleanup status: clean";
             executor_lane: String::new(),
             executor_provider: String::new(),
             executor_model: String::new(),
+            executor_route_id: String::new(),
+            executor_route_title: String::new(),
             visible_turn_id: None,
             result_summary: String::new(),
             last_error: String::new(),
@@ -18773,6 +18892,8 @@ Cleanup status: clean";
             state: "queued".to_string(),
             provider: "openai_compatible".to_string(),
             model: "cx/gpt-5.4".to_string(),
+            route_id: String::new(),
+            route_title: String::new(),
             provider_base_url: "http://127.0.0.1:1234/v1".to_string(),
             provider_api_key: "token".to_string(),
             provider_session_id: String::new(),
@@ -18890,6 +19011,8 @@ Cleanup status: clean";
             state: "queued".to_string(),
             provider: "openai_compatible".to_string(),
             model: "cx/gpt-5.4".to_string(),
+            route_id: String::new(),
+            route_title: String::new(),
             provider_base_url: "http://127.0.0.1:1234/v1".to_string(),
             provider_api_key: "token".to_string(),
             provider_session_id: String::new(),
@@ -19140,6 +19263,8 @@ Cleanup status: clean";
                 state: "failed".to_string(),
                 provider: "openai_compatible".to_string(),
                 model: "test-model".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
                 provider_base_url: String::new(),
                 provider_api_key: String::new(),
                 provider_session_id: String::new(),
@@ -19236,6 +19361,8 @@ Cleanup status: clean";
                 target: HiddenWorkerTarget {
                     provider: "claude".to_string(),
                     model: "sonnet".to_string(),
+                    route_id: String::new(),
+                    route_title: String::new(),
                     provider_base_url: String::new(),
                     provider_api_key: String::new(),
                 },
@@ -19245,6 +19372,8 @@ Cleanup status: clean";
                 target: HiddenWorkerTarget {
                     provider: "openai_compatible".to_string(),
                     model: "gpt-5.4-mini".to_string(),
+                    route_id: String::new(),
+                    route_title: String::new(),
                     provider_base_url: "http://127.0.0.1:20128/v1".to_string(),
                     provider_api_key: "nuctk_test".to_string(),
                 },
@@ -19269,6 +19398,8 @@ Cleanup status: clean";
                 target: HiddenWorkerTarget {
                     provider: "claude".to_string(),
                     model: "sonnet".to_string(),
+                    route_id: String::new(),
+                    route_title: String::new(),
                     provider_base_url: String::new(),
                     provider_api_key: String::new(),
                 },
@@ -19278,6 +19409,8 @@ Cleanup status: clean";
                 target: HiddenWorkerTarget {
                     provider: "openai_compatible".to_string(),
                     model: "gpt-5.4-mini".to_string(),
+                    route_id: String::new(),
+                    route_title: String::new(),
                     provider_base_url: "http://127.0.0.1:20128/v1".to_string(),
                     provider_api_key: "nuctk_test".to_string(),
                 },
@@ -19596,6 +19729,8 @@ Cleanup status: clean";
                 state: "running".to_string(),
                 provider: "openai_compatible".to_string(),
                 model: "main-model".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
                 provider_base_url: String::new(),
                 provider_api_key: String::new(),
                 provider_session_id: String::new(),
@@ -19729,6 +19864,8 @@ Cleanup status: clean";
                 state: "queued".to_string(),
                 provider: "openai_compatible".to_string(),
                 model: "main-route-model".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
                 provider_base_url: "http://127.0.0.1:9/v1".to_string(),
                 provider_api_key: "main-key".to_string(),
                 provider_session_id: "legacy-provider-session".to_string(),
@@ -20283,6 +20420,411 @@ Cleanup status: clean";
     }
 
     #[tokio::test]
+    async fn spawn_child_jobs_unknown_route_fails_before_child_creation() {
+        let state_dir = test_state_dir("spawn-child-jobs-unknown-route");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let (session, job_id, mut worker) =
+            create_parent_fanout_context(&state, "unknown-route", &workspace_root, "");
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "fan out".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let mut step = 0;
+
+        let error = handle_child_job_proposal(
+            &state,
+            &session,
+            &job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            "fan out".to_string(),
+            vec![ChildJobProposal {
+                title: "Missing route".to_string(),
+                prompt: "inspect with missing route".to_string(),
+                working_dir: None,
+                route_id: Some("missing-route".to_string()),
+            }],
+        )
+        .await
+        .expect_err("unknown route should fail the spawn action");
+
+        assert!(error.to_string().contains("worker_action.invalid"));
+        assert!(error.to_string().contains("unknown router profile"));
+        assert_eq!(state.store.get_job(&job_id).unwrap().child_jobs.len(), 0);
+        assert_eq!(step, 0);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn spawn_child_jobs_disabled_route_fails_before_child_creation() {
+        let state_dir = test_state_dir("spawn-child-jobs-disabled-route");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        upsert_test_route_profile(
+            &state,
+            "disabled-route",
+            "Disabled Route",
+            false,
+            "disabled-model",
+            "http://127.0.0.1:9/v1",
+            "disabled-key",
+        );
+        let (session, job_id, mut worker) =
+            create_parent_fanout_context(&state, "disabled-route", &workspace_root, "");
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "fan out".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let mut step = 0;
+
+        let error = handle_child_job_proposal(
+            &state,
+            &session,
+            &job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            "fan out".to_string(),
+            vec![ChildJobProposal {
+                title: "Disabled route".to_string(),
+                prompt: "inspect with disabled route".to_string(),
+                working_dir: None,
+                route_id: Some("disabled-route".to_string()),
+            }],
+        )
+        .await
+        .expect_err("disabled route should fail the spawn action");
+
+        assert!(error.to_string().contains("worker_action.invalid"));
+        assert!(error.to_string().contains("is disabled"));
+        assert_eq!(state.store.get_job(&job_id).unwrap().child_jobs.len(), 0);
+        assert_eq!(step, 0);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn spawn_child_jobs_routes_each_child_to_requested_profile() {
+        let state_dir = test_state_dir("spawn-child-jobs-mixed-routes");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let spawn_action = json!({
+            "kind": "spawn_child_jobs",
+            "summary": "fan out to three routes",
+            "jobs": [
+                {"title": "Route A", "prompt": "route-a-child", "working_dir": null, "route_id": "route-a"},
+                {"title": "Route B", "prompt": "route-b-child", "working_dir": null, "route_id": "route-b"},
+                {"title": "Route C", "prompt": "route-c-child", "working_dir": null, "route_id": "route-c"}
+            ],
+        })
+        .to_string();
+        let (parent_base_url, parent_count, _parent_bodies, parent_server) =
+            spawn_dynamic_openai_server(2, move |index, _body| {
+                if index == 0 {
+                    DynamicOpenAiProviderResponse::content(spawn_action.clone())
+                } else {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"final_answer","summary":"joined","final_answer":"Joined route reports."}"#,
+                    )
+                }
+            })
+            .await;
+        let (route_a_base_url, route_a_count, route_a_bodies, route_a_server) =
+            spawn_dynamic_openai_server(1, |_index, _body| {
+                DynamicOpenAiProviderResponse::content(
+                    r#"{"kind":"final_answer","summary":"route a","final_answer":"Route A report."}"#,
+                )
+            })
+            .await;
+        let (route_b_base_url, route_b_count, route_b_bodies, route_b_server) =
+            spawn_dynamic_openai_server(1, |_index, _body| {
+                DynamicOpenAiProviderResponse::content(
+                    r#"{"kind":"final_answer","summary":"route b","final_answer":"Route B report."}"#,
+                )
+            })
+            .await;
+        let (route_c_base_url, route_c_count, route_c_bodies, route_c_server) =
+            spawn_dynamic_openai_server(1, |_index, _body| {
+                DynamicOpenAiProviderResponse::content(
+                    r#"{"kind":"final_answer","summary":"route c","final_answer":"Route C report."}"#,
+                )
+            })
+            .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "parent-model",
+            &parent_base_url,
+            "parent-key",
+        );
+        upsert_test_route_profile(
+            &state,
+            "route-a",
+            "Route A",
+            true,
+            "route-a-model",
+            &route_a_base_url,
+            "route-a-key",
+        );
+        upsert_test_route_profile(
+            &state,
+            "route-b",
+            "Route B",
+            true,
+            "route-b-model",
+            &route_b_base_url,
+            "route-b-key",
+        );
+        upsert_test_route_profile(
+            &state,
+            "route-c",
+            "Route C",
+            true,
+            "route-c-model",
+            &route_c_base_url,
+            "route-c-key",
+        );
+
+        let session_id = "spawn-child-jobs-route-session".to_string();
+        state
+            .store
+            .create_session(test_session_record(
+                &session_id,
+                "Spawn child jobs routes",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            SessionPromptRequest {
+                prompt: "spawn routed children".to_string(),
+                images: vec![],
+                role: "main".to_string(),
+            },
+            current,
+            "spawn routed children".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("prompt should queue");
+
+        let _ = wait_for_session_state(&state, &session_id, "active").await;
+        parent_server.await.expect("parent server should finish");
+        route_a_server.await.expect("route a server should finish");
+        route_b_server.await.expect("route b server should finish");
+        route_c_server.await.expect("route c server should finish");
+        assert_eq!(parent_count.load(Ordering::SeqCst), 2);
+        assert_eq!(route_a_count.load(Ordering::SeqCst), 1);
+        assert_eq!(route_b_count.load(Ordering::SeqCst), 1);
+        assert_eq!(route_c_count.load(Ordering::SeqCst), 1);
+        assert!(route_a_bodies.lock().unwrap()[0].contains("route-a-child"));
+        assert!(route_b_bodies.lock().unwrap()[0].contains("route-b-child"));
+        assert!(route_c_bodies.lock().unwrap()[0].contains("route-c-child"));
+
+        let parent = latest_job_detail(&state, &session_id);
+        assert_eq!(parent.child_jobs.len(), 3);
+        for (purpose, route_id, route_title, model, base_url, api_key) in [
+            (
+                "Route A",
+                "route-a",
+                "Route A",
+                "route-a-model",
+                route_a_base_url.as_str(),
+                "route-a-key",
+            ),
+            (
+                "Route B",
+                "route-b",
+                "Route B",
+                "route-b-model",
+                route_b_base_url.as_str(),
+                "route-b-key",
+            ),
+            (
+                "Route C",
+                "route-c",
+                "Route C",
+                "route-c-model",
+                route_c_base_url.as_str(),
+                "route-c-key",
+            ),
+        ] {
+            let child = parent
+                .child_jobs
+                .iter()
+                .find(|child| child.purpose == purpose)
+                .expect("child job should be present");
+            assert_eq!(child.executor_route_id, route_id);
+            assert_eq!(child.executor_route_title, route_title);
+            let detail = state.store.get_job(&child.id).expect("child should load");
+            assert_eq!(detail.workers[0].model, model);
+            assert_eq!(detail.workers[0].provider_base_url, base_url);
+            assert_eq!(detail.workers[0].provider_api_key, api_key);
+        }
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn spawn_child_jobs_mixes_explicit_route_and_parent_inheritance() {
+        let state_dir = test_state_dir("spawn-child-jobs-route-inherit");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let spawn_action = json!({
+            "kind": "spawn_child_jobs",
+            "summary": "fan out with mixed routing",
+            "jobs": [
+                {"title": "Explicit", "prompt": "explicit-child", "working_dir": null, "route_id": "explicit-route"},
+                {"title": "Inherited", "prompt": "inherited-child", "working_dir": null}
+            ],
+        })
+        .to_string();
+        let (parent_base_url, parent_count, parent_bodies, parent_server) =
+            spawn_dynamic_openai_server(3, move |index, _body| {
+                if index == 0 {
+                    DynamicOpenAiProviderResponse::content(spawn_action.clone())
+                } else if index == 1 {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"final_answer","summary":"inherited","final_answer":"Inherited child report."}"#,
+                    )
+                } else {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"final_answer","summary":"joined","final_answer":"Joined mixed route reports."}"#,
+                    )
+                }
+            })
+            .await;
+        let (explicit_base_url, explicit_count, explicit_bodies, explicit_server) =
+            spawn_dynamic_openai_server(1, |_index, _body| {
+                DynamicOpenAiProviderResponse::content(
+                    r#"{"kind":"final_answer","summary":"explicit","final_answer":"Explicit route report."}"#,
+                )
+            })
+            .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "parent-inherited-model",
+            &parent_base_url,
+            "parent-inherited-key",
+        );
+        upsert_test_route_profile(
+            &state,
+            "explicit-route",
+            "Explicit Route",
+            true,
+            "explicit-route-model",
+            &explicit_base_url,
+            "explicit-route-key",
+        );
+
+        let session_id = "spawn-child-jobs-inherit-session".to_string();
+        state
+            .store
+            .create_session(test_session_record(
+                &session_id,
+                "Spawn child jobs inherit",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            SessionPromptRequest {
+                prompt: "spawn mixed children".to_string(),
+                images: vec![],
+                role: "main".to_string(),
+            },
+            current,
+            "spawn mixed children".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("prompt should queue");
+
+        let _ = wait_for_session_state(&state, &session_id, "active").await;
+        parent_server.await.expect("parent server should finish");
+        explicit_server
+            .await
+            .expect("explicit route server should finish");
+        assert_eq!(parent_count.load(Ordering::SeqCst), 3);
+        assert_eq!(explicit_count.load(Ordering::SeqCst), 1);
+        assert!(parent_bodies.lock().unwrap()[1].contains("inherited-child"));
+        assert!(explicit_bodies.lock().unwrap()[0].contains("explicit-child"));
+
+        let parent = latest_job_detail(&state, &session_id);
+        let inherited = parent
+            .child_jobs
+            .iter()
+            .find(|child| child.purpose == "Inherited")
+            .expect("inherited child should exist");
+        assert_eq!(inherited.executor_model, "parent-inherited-model");
+        assert_eq!(inherited.executor_route_id, "");
+        assert_eq!(inherited.executor_route_title, "");
+        let inherited_detail = state
+            .store
+            .get_job(&inherited.id)
+            .expect("inherited child should load");
+        assert_eq!(
+            inherited_detail.workers[0].provider_base_url,
+            parent_base_url
+        );
+        assert_eq!(
+            inherited_detail.workers[0].provider_api_key,
+            "parent-inherited-key"
+        );
+
+        let explicit = parent
+            .child_jobs
+            .iter()
+            .find(|child| child.purpose == "Explicit")
+            .expect("explicit child should exist");
+        assert_eq!(explicit.executor_model, "explicit-route-model");
+        assert_eq!(explicit.executor_route_id, "explicit-route");
+        assert_eq!(explicit.executor_route_title, "Explicit Route");
+        let explicit_detail = state
+            .store
+            .get_job(&explicit.id)
+            .expect("explicit child should load");
+        assert_eq!(
+            explicit_detail.workers[0].provider_base_url,
+            explicit_base_url
+        );
+        assert_eq!(
+            explicit_detail.workers[0].provider_api_key,
+            "explicit-route-key"
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
     async fn canceling_parent_cascades_to_in_flight_children_within_bound() {
         let state_dir = test_state_dir("spawn-child-jobs-cancel-cascade");
         let state = initialize_test_state(&state_dir);
@@ -20459,6 +21001,17 @@ Cleanup status: clean";
                 title: "Budget child".to_string(),
                 prompt: "run until child budget".to_string(),
                 working_dir: None,
+                route_id: None,
+            },
+            ChildJobTargetPlan {
+                target: HiddenWorkerTarget {
+                    provider: parent_worker.provider.clone(),
+                    model: parent_worker.model.clone(),
+                    route_id: String::new(),
+                    route_title: String::new(),
+                    provider_base_url: parent_worker.provider_base_url.clone(),
+                    provider_api_key: parent_worker.provider_api_key.clone(),
+                },
             },
             ChildJobRunLimits {
                 max_steps: 10,
@@ -21351,6 +21904,33 @@ for line in sys.stdin:
             .expect("default utility profile should update");
     }
 
+    fn upsert_test_route_profile(
+        state: &AppState,
+        id: &str,
+        title: &str,
+        enabled: bool,
+        model: &str,
+        base_url: &str,
+        api_key: &str,
+    ) {
+        state
+            .store
+            .upsert_router_profile(nucleus_protocol::RouterProfileSummary {
+                id: id.to_string(),
+                title: title.to_string(),
+                summary: format!("Test route {title}"),
+                enabled,
+                state: if enabled { "ready" } else { "disabled" }.to_string(),
+                targets: vec![nucleus_protocol::RouteTarget {
+                    provider: "openai_compatible".to_string(),
+                    model: model.to_string(),
+                    base_url: base_url.to_string(),
+                    api_key: api_key.to_string(),
+                }],
+            })
+            .expect("test route profile should persist");
+    }
+
     async fn spawn_response_sequence_openai_server(
         contents: Vec<&'static str>,
     ) -> (String, tokio::task::JoinHandle<()>) {
@@ -21601,6 +22181,8 @@ for line in sys.stdin:
                 state: "running".to_string(),
                 provider: "test".to_string(),
                 model: "test".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
                 provider_base_url: String::new(),
                 provider_api_key: String::new(),
                 provider_session_id: String::new(),
@@ -21846,6 +22428,8 @@ for line in sys.stdin:
                 state: "queued".to_string(),
                 provider: "openai_compatible".to_string(),
                 model: "test-model".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
                 provider_base_url: provider_base_url.to_string(),
                 provider_api_key: "test-key".to_string(),
                 provider_session_id: String::new(),
@@ -22121,6 +22705,8 @@ for line in sys.stdin:
                 state: "running".to_string(),
                 provider: "openai_compatible".to_string(),
                 model: "test-model".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
                 provider_base_url: provider_base_url.to_string(),
                 provider_api_key: "test-key".to_string(),
                 provider_session_id: String::new(),
@@ -22192,6 +22778,8 @@ for line in sys.stdin:
             state: "running".to_string(),
             provider: "openai_compatible".to_string(),
             model: "test-model".to_string(),
+            route_id: String::new(),
+            route_title: String::new(),
             provider_base_url: String::new(),
             provider_api_key: String::new(),
             provider_session_id: String::new(),
@@ -22267,6 +22855,8 @@ for line in sys.stdin:
             executor_lane: "utility".to_string(),
             executor_provider: "openai_compatible".to_string(),
             executor_model: "gpt-5.4-mini".to_string(),
+            executor_route_id: String::new(),
+            executor_route_title: String::new(),
             visible_turn_id: None,
             result_summary: String::new(),
             last_error: String::new(),

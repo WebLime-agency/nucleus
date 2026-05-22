@@ -83,6 +83,16 @@ export function usageView(record) {
   };
 }
 
+export function childRouteLabel(record) {
+  const title = String(record?.executor_route_title ?? '').trim();
+  if (title) return title;
+
+  const id = String(record?.executor_route_id ?? '').trim();
+  if (id) return id;
+
+  return '(inherits parent)';
+}
+
 export function noActivity(record, nowSeconds) {
   return reasoningActivityView(record, nowSeconds)?.stale ?? false;
 }

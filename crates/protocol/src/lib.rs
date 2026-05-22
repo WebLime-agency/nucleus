@@ -230,6 +230,10 @@ pub struct JobSummary {
     pub executor_provider: String,
     #[serde(default)]
     pub executor_model: String,
+    #[serde(default)]
+    pub executor_route_id: String,
+    #[serde(default)]
+    pub executor_route_title: String,
     pub visible_turn_id: Option<String>,
     pub result_summary: String,
     pub last_error: String,
@@ -308,6 +312,10 @@ pub struct WorkerSummary {
     pub state: String,
     pub provider: String,
     pub model: String,
+    #[serde(default)]
+    pub route_id: String,
+    #[serde(default)]
+    pub route_title: String,
     #[serde(default)]
     pub provider_base_url: String,
     #[serde(default)]
@@ -1868,6 +1876,8 @@ mod tests {
             executor_lane: "utility".to_string(),
             executor_provider: "openai_compatible".to_string(),
             executor_model: "gpt-5.4-mini".to_string(),
+            executor_route_id: String::new(),
+            executor_route_title: String::new(),
             visible_turn_id: Some("turn-1".to_string()),
             result_summary: "done".to_string(),
             last_error: String::new(),
