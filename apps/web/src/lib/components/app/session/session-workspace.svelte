@@ -2292,6 +2292,18 @@
     return `waiting until ${condition}${remaining ? ` (woke in ${remaining})` : ''}`;
   }
 
+  function childJobActivitySummary(childJob: JobSummary) {
+    if (childJob.state === 'waiting' && childJob.last_error) return childJob.last_error;
+    if (childJob.last_error) return childJob.last_error;
+    if (childJob.result_summary) return childJob.result_summary;
+    if (childJob.prompt_excerpt) return childJob.prompt_excerpt;
+    return childJob.purpose;
+  }
+
+  function terminalChildFailures(detail: JobDetail | null) {
+    return (detail?.child_jobs ?? []).filter((childJob) => childJob.state === 'failed' || childJob.state === 'canceled');
+  }
+
   function formatWaitCondition(wait: unknown) {
     if (!wait || typeof wait !== 'object') return 'saved wake condition';
     const record = wait as {
@@ -4254,16 +4266,43 @@
                             {#if jobDetail.child_jobs.length === 0}
                               <div class="text-xs text-zinc-500">No subtasks were recorded for this job.</div>
                             {:else}
+                              <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-3">
+                                <div class="flex flex-wrap items-center justify-between gap-2">
+                                  <div class="text-sm text-zinc-100">
+                                    {jobDetail.child_jobs.length} child job{jobDetail.child_jobs.length === 1 ? '' : 's'}
+                                  </div>
+                                  <div class="flex flex-wrap gap-1.5">
+                                    {#each ['queued', 'running', 'waiting', 'completed', 'failed', 'canceled'] as state}
+                                      {@const count = jobDetail.child_jobs.filter((childJob) => childJob.state === state).length}
+                                      {#if count > 0}
+                                        <Badge variant={badgeVariantForJobState(state)}>{count} {formatState(state)}</Badge>
+                                      {/if}
+                                    {/each}
+                                  </div>
+                                </div>
+                                {#if terminalChildFailures(jobDetail).length > 0}
+                                  <div class="mt-3 space-y-2 border-t border-zinc-800 pt-3">
+                                    {#each terminalChildFailures(jobDetail) as childJob}
+                                      <div class="min-w-0">
+                                        <div class="flex items-center gap-2 text-xs text-red-200">
+                                          <span class="truncate">{childJob.title}</span>
+                                          <span class="font-mono text-[11px] text-red-300/70">{childJob.id}</span>
+                                        </div>
+                                        <div class="mt-1 text-xs leading-5 text-red-200/80">
+                                          {childJobActivitySummary(childJob)}
+                                        </div>
+                                      </div>
+                                    {/each}
+                                  </div>
+                                {/if}
+                              </div>
                               {#each jobDetail.child_jobs as childJob}
                                 <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2">
                                   <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                       <div class="truncate text-sm text-zinc-100">{childJob.title}</div>
                                       <div class="mt-1 text-xs leading-5 text-zinc-500">
-                                        {childJob.purpose}
-                                        {#if childJob.result_summary}
-                                          {' · '}{childJob.result_summary}
-                                        {/if}
+                                        {childJobActivitySummary(childJob)}
                                       </div>
                                     </div>
                                     <Badge variant={badgeVariantForJobState(childJob.state)}>
@@ -4271,6 +4310,8 @@
                                     </Badge>
                                   </div>
                                   <div class="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-zinc-600">
+                                    <span class="font-mono">{childJob.id}</span>
+                                    <span>Created {formatDateTime(childJob.created_at)}</span>
                                     <span>{childJob.worker_count} Utility Worker{childJob.worker_count === 1 ? '' : 's'}</span>
                                     <span>{childJob.artifact_count} artifact{childJob.artifact_count === 1 ? '' : 's'}</span>
                                     {#if childJob.updated_at}
