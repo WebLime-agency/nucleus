@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import {
   nextRuntimeTick,
   noActivity,
+  childRouteLabel,
   reasoningActivityView,
   runtimeBadgeView,
   usageView
@@ -78,4 +79,10 @@ test('usage display distinguishes missing prices from missing usage', () => {
     }).label,
     '150 tokens · $— (no price)'
   );
+});
+
+test('child route label distinguishes explicit and inherited profiles', () => {
+  assert.equal(childRouteLabel({ executor_route_title: 'Developer' }), 'Developer');
+  assert.equal(childRouteLabel({ executor_route_id: 'reviewer' }), 'reviewer');
+  assert.equal(childRouteLabel({}), '(inherits parent)');
 });

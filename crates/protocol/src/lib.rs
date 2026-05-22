@@ -230,6 +230,10 @@ pub struct JobSummary {
     pub executor_provider: String,
     #[serde(default)]
     pub executor_model: String,
+    #[serde(default)]
+    pub executor_route_id: String,
+    #[serde(default)]
+    pub executor_route_title: String,
     pub visible_turn_id: Option<String>,
     pub result_summary: String,
     pub last_error: String,
@@ -308,6 +312,10 @@ pub struct WorkerSummary {
     pub state: String,
     pub provider: String,
     pub model: String,
+    #[serde(default)]
+    pub route_id: String,
+    #[serde(default)]
+    pub route_title: String,
     #[serde(default)]
     pub provider_base_url: String,
     #[serde(default)]
