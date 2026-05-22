@@ -8009,9 +8009,18 @@ fn is_deployment_command_session(command: &str, args: &[String]) -> bool {
 }
 
 fn is_version_command(text: &str) -> bool {
-    ["version", "sha", "rev-parse", "tag", "artifact"]
-        .iter()
-        .any(|needle| text.contains(needle))
+    let phrase_text = command_phrase_text(text);
+    [
+        "artifact",
+        "rev parse",
+        "sha",
+        "tag",
+        "tagname",
+        "tags",
+        "version",
+    ]
+    .iter()
+    .any(|phrase| command_phrase_contains(&phrase_text, phrase))
 }
 
 fn is_health_command(text: &str) -> bool {
@@ -11393,6 +11402,23 @@ and open a pull request to dev when it is ready."
         assert!(!is_validation_command(&command_session_text(
             "cargo",
             &["build".to_string(), "--release".to_string()]
+        )));
+        assert!(!is_version_command(&command_session_text(
+            "vercel",
+            &["deploy".to_string(), "--target=staging".to_string()]
+        )));
+        assert!(is_version_command(&command_session_text(
+            "git",
+            &["rev-parse".to_string(), "HEAD".to_string()]
+        )));
+        assert!(is_version_command(&command_session_text(
+            "gh",
+            &[
+                "release".to_string(),
+                "view".to_string(),
+                "--json".to_string(),
+                "tagName".to_string()
+            ]
         )));
         assert!(is_deployment_command_session(
             "wrangler",
