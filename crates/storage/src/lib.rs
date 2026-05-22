@@ -4968,10 +4968,16 @@ fn command_phrase_text(text: &str) -> String {
     format!(" {} ", command_tokens(text).join(" "))
 }
 
-fn has_command_token(text: &str, needles: &[&str]) -> bool {
-    command_tokens(text)
-        .iter()
-        .any(|token| needles.contains(token))
+fn command_phrase_contains(phrase_text: &str, phrase: &str) -> bool {
+    phrase_text.contains(&format!(" {phrase} "))
+}
+
+fn normalized_command_name(command: &str) -> String {
+    command
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(command)
+        .to_ascii_lowercase()
 }
 
 fn task_class_from_tool_id(tool_id: &str) -> Option<&'static str> {
@@ -4995,7 +5001,7 @@ fn task_class_from_command(command: &str, args: &[String]) -> Option<&'static st
     let text = command_session_text(command, args);
     if is_deployment_command(&text) {
         Some("deployment")
-    } else if is_process_command(&text) {
+    } else if is_process_command_session(command, args) {
         Some("process_server")
     } else if is_validation_command(&text) {
         Some("local_project")
@@ -7711,7 +7717,7 @@ fn apply_job_evidence_rollups(connection: &Connection, job: &mut JobSummary) -> 
                 evidence.push(format!("health:{label}"));
                 evidence.push(format!("health_or_logs:{label}"));
             }
-            if is_process_command(&command_text) {
+            if is_process_command_session(&command_session.command, &command_session.args) {
                 evidence.push(format!("process_state:{label}"));
             }
             if command_session.port.is_some() {
@@ -7757,7 +7763,8 @@ fn apply_job_evidence_rollups(connection: &Connection, job: &mut JobSummary) -> 
             event.event_type, event.status, event.summary, event.detail
         )
         .to_ascii_lowercase();
-        if event_text.contains("waiver") || event_text.contains("waived") {
+        let event_succeeded = is_successful_evidence_status(&event.status);
+        if event_succeeded && (event_text.contains("waiver") || event_text.contains("waived")) {
             evidence.push("waiver:command_failure".to_string());
             if contains_any(
                 &event_text,
@@ -7773,41 +7780,47 @@ fn apply_job_evidence_rollups(connection: &Connection, job: &mut JobSummary) -> 
                 evidence.push("waiver:deployment_verification".to_string());
             }
         }
-        if event_text.contains("research") || event_text.contains("source") {
+        if event_succeeded && (event_text.contains("research") || event_text.contains("source")) {
             evidence.push(format!("fresh_sources:{}", event.summary));
         }
-        if event_text.contains("source quality") || event_text.contains("primary source") {
+        if event_succeeded
+            && (event_text.contains("source quality") || event_text.contains("primary source"))
+        {
             evidence.push(format!("source_quality:{}", event.summary));
         }
-        if event_text.contains("contradiction") || event_text.contains("cross-check") {
+        if event_succeeded
+            && (event_text.contains("contradiction") || event_text.contains("cross-check"))
+        {
             evidence.push(format!("contradictions:{}", event.summary));
         }
-        if event_text.contains("automation") || event_text.contains("schedule") {
+        if event_succeeded && (event_text.contains("automation") || event_text.contains("schedule"))
+        {
             evidence.push(format!("schedule_state:{}", event.summary));
         }
-        if event_text.contains("execution") || event_text.contains("run log") {
+        if event_succeeded && (event_text.contains("execution") || event_text.contains("run log")) {
             evidence.push(format!("execution_logs:{}", event.summary));
         }
-        if event_text.contains("deploy") || event_text.contains("release") {
+        if event_succeeded && (event_text.contains("deploy") || event_text.contains("release")) {
             evidence.push(format!("deployment_status:{}", event.summary));
         }
-        if event_text.contains("version") || event_text.contains("artifact") {
+        if event_succeeded && (event_text.contains("version") || event_text.contains("artifact")) {
             evidence.push(format!("version:{}", event.summary));
         }
-        if event_text.contains("health") || event_text.contains("endpoint") {
+        if event_succeeded && (event_text.contains("health") || event_text.contains("endpoint")) {
             evidence.push(format!("health:{}", event.summary));
             evidence.push(format!("health_or_logs:{}", event.summary));
         }
-        if is_memory_operation_event(&event_text) {
+        if event_succeeded && is_memory_operation_event(&event_text) {
             evidence.push(format!("operation_result:{}", event.summary));
         }
-        if event_text.contains("process")
-            || event_text.contains("server")
-            || event_text.contains("restart")
+        if event_succeeded
+            && (event_text.contains("process")
+                || event_text.contains("server")
+                || event_text.contains("restart"))
         {
             evidence.push(format!("process_state:{}", event.summary));
         }
-        if event_text.contains("port") || event_text.contains("listener") {
+        if event_succeeded && (event_text.contains("port") || event_text.contains("listener")) {
             evidence.push(format!("port_state:{}", event.summary));
         }
     }
@@ -7925,7 +7938,7 @@ fn is_validation_command(text: &str) -> bool {
         "yarn test",
     ]
     .iter()
-    .any(|phrase| phrase_text.contains(&format!(" {phrase} ")))
+    .any(|phrase| command_phrase_contains(&phrase_text, phrase))
 }
 
 fn is_deployment_command(text: &str) -> bool {
@@ -7948,26 +7961,61 @@ fn is_health_command(text: &str) -> bool {
         .any(|needle| text.contains(needle))
 }
 
-fn is_process_command(text: &str) -> bool {
-    has_command_token(
-        text,
-        &[
+fn is_process_command_session(command: &str, args: &[String]) -> bool {
+    let command_name = normalized_command_name(command);
+    if matches!(
+        command_name.as_str(),
+        "kill" | "launchctl" | "lsof" | "pm2" | "ps" | "supervisorctl" | "systemctl"
+    ) {
+        return true;
+    }
+
+    if matches!(command_name.as_str(), "bun" | "npm" | "pnpm" | "yarn") {
+        let arg_text = command_phrase_text(&args.join(" "));
+        return ["dev", "run dev", "run serve", "run start", "serve", "start"]
+            .iter()
+            .any(|phrase| command_phrase_contains(&arg_text, phrase));
+    }
+
+    if matches!(command_name.as_str(), "bash" | "fish" | "sh" | "zsh") {
+        let shell_text = command_phrase_text(&args.join(" "));
+        return [
+            "bun run dev",
+            "bun run serve",
+            "bun run start",
             "kill",
             "launchctl",
             "lsof",
+            "npm run dev",
+            "npm run serve",
+            "npm run start",
             "pm2",
+            "pnpm run dev",
+            "pnpm run serve",
+            "pnpm run start",
             "ps",
-            "restart",
-            "serve",
-            "server",
             "supervisorctl",
             "systemctl",
-        ],
-    )
+            "yarn dev",
+            "yarn run dev",
+            "yarn run serve",
+            "yarn run start",
+            "yarn serve",
+            "yarn start",
+        ]
+        .iter()
+        .any(|phrase| command_phrase_contains(&shell_text, phrase));
+    }
+
+    false
 }
 
 fn is_successful_tool_status(status: &str) -> bool {
     matches!(status, "success" | "completed")
+}
+
+fn is_successful_evidence_status(status: &str) -> bool {
+    matches!(status, "success" | "completed" | "passed")
 }
 
 fn is_research_tool(text: &str) -> bool {
@@ -10950,6 +10998,48 @@ and open a pull request to dev when it is ready."
             "generic command waivers should not satisfy deployment verification"
         );
 
+        let failed_deployment_event = store
+            .create_job(JobRecord {
+                id: "failed-deployment-event-job".to_string(),
+                session_id: Some("task-class-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("deployment".to_string()),
+                title: "Failed deployment event".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "deploy and verify".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("failed deployment event job should persist");
+        store
+            .append_job_event(JobEventRecord {
+                job_id: failed_deployment_event.id.clone(),
+                worker_id: None,
+                event_type: "deployment".to_string(),
+                status: "failed".to_string(),
+                summary: "deployment failed".to_string(),
+                detail: "deployment health endpoint version check failed".to_string(),
+                data_json: json!({}),
+            })
+            .expect("failed deployment event should persist");
+        let failed_deployment_event = store
+            .get_job(&failed_deployment_event.id)
+            .expect("failed deployment event job should load")
+            .job;
+        assert_eq!(failed_deployment_event.completion_status, "blocked");
+        assert!(
+            !failed_deployment_event
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("deployment_status:")
+                    || evidence.starts_with("health:")
+                    || evidence.starts_with("version:")),
+            "failed events should not emit positive deployment evidence"
+        );
+
         let failed_tool_job = store
             .create_job(JobRecord {
                 id: "local-project-failed-tool-job".to_string(),
@@ -11237,10 +11327,29 @@ and open a pull request to dev when it is ready."
             "npm",
             &["run".to_string(), "build:web".to_string()]
         )));
-        assert!(is_process_command(&command_session_text("ps", &[])));
+        assert!(is_process_command_session("ps", &[]));
+        assert!(is_process_command_session(
+            "npm",
+            &["run".to_string(), "start".to_string()]
+        ));
+        assert!(!is_process_command_session(
+            "cargo",
+            &["test".to_string(), "tests/server.rs".to_string()]
+        ));
+        assert!(!is_process_command_session(
+            "cargo",
+            &["test".to_string(), "tests/serve.rs".to_string()]
+        ));
         assert_eq!(
             task_class_from_command("git", &["checkout".to_string()]),
             None
+        );
+        assert_eq!(
+            task_class_from_command(
+                "cargo",
+                &["test".to_string(), "tests/server.rs".to_string()]
+            ),
+            Some("local_project")
         );
         assert_eq!(task_class_from_command("ps", &[]), Some("process_server"));
     }
