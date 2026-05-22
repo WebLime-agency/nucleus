@@ -4871,11 +4871,12 @@ fn bool_to_i64(value: bool) -> i64 {
 }
 
 fn is_terminal_non_success_job_state(state: &str) -> bool {
-    matches!(state, "failed" | "canceled")
+    matches!(state, "blocked" | "failed" | "canceled")
 }
 
 fn terminal_browser_verification_summary(state: &str) -> &'static str {
     match state {
+        "blocked" => "Job was blocked before browser verification completed.",
         "canceled" => "Job was canceled before browser verification completed.",
         _ => "Job failed before browser verification completed.",
     }
@@ -7516,6 +7517,9 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         validation_status: row.get(25)?,
         cleanup_status: row.get(26)?,
         cleanup_paths: decode_string_vec_column(row, 27)?,
+        completion_status: String::new(),
+        completion_gates: Vec::new(),
+        completion_blockers: Vec::new(),
         worker_count: 0,
         pending_approval_count: 0,
         artifact_count: 0,
@@ -7529,7 +7533,8 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         cost_usd_estimate: None,
         created_at: row.get(29)?,
         updated_at: row.get(30)?,
-    })
+    }
+    .with_completion_gates())
 }
 
 fn apply_job_observability_rollups(connection: &Connection, job: &mut JobSummary) -> Result<()> {
@@ -10289,6 +10294,63 @@ and open a pull request to dev when it is ready."
         assert_eq!(
             updated.browser_verification_summary,
             "Job was canceled before browser verification completed."
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn blocked_ui_renderable_job_uses_blocked_browser_verification_summary() {
+        let state_dir = test_state_dir("blocked-browser-verification-terminal");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let scratch_dir = store
+            .scratch_dir_for_session("browser-blocked-session")
+            .expect("scratch dir should resolve");
+
+        store
+            .create_session(test_session_record(
+                "browser-blocked-session",
+                "Browser blocked session",
+                "ad_hoc",
+                scratch_dir,
+            ))
+            .expect("session should persist");
+        store
+            .create_job(JobRecord {
+                id: "browser-blocked-job".to_string(),
+                session_id: Some("browser-blocked-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                title: "Fix UI".to_string(),
+                purpose: "Session prompt".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "running".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "fix the rendered UI".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("job should persist");
+        let updated = store
+            .update_job(
+                "browser-blocked-job",
+                JobPatch {
+                    state: Some("blocked".to_string()),
+                    ui_renderable: Some("true".to_string()),
+                    browser_verification_required: Some(true),
+                    browser_verification_status: Some("pending".to_string()),
+                    browser_verification_summary: Some(
+                        "Browser verification is required for this UI-renderable job.".to_string(),
+                    ),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("job should update");
+
+        assert_eq!(updated.state, "blocked");
+        assert_eq!(updated.browser_verification_status, "unavailable");
+        assert_eq!(
+            updated.browser_verification_summary,
+            "Job was blocked before browser verification completed."
         );
 
         let _ = fs::remove_dir_all(&state_dir);
