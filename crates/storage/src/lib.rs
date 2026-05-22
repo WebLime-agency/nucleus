@@ -7873,6 +7873,11 @@ fn command_evidence_label(command_session: &CommandSessionSummary) -> String {
 
 fn is_validation_command(text: &str) -> bool {
     let phrase_text = command_phrase_text(text);
+    if command_phrase_contains(&phrase_text, "cargo build")
+        && command_phrase_contains(&phrase_text, "release")
+    {
+        return false;
+    }
     [
         "astro check",
         "bun run build",
@@ -11385,6 +11390,10 @@ and open a pull request to dev when it is ready."
             "cargo",
             &["build".to_string(), "--release".to_string()]
         ));
+        assert!(!is_validation_command(&command_session_text(
+            "cargo",
+            &["build".to_string(), "--release".to_string()]
+        )));
         assert!(is_deployment_command_session(
             "wrangler",
             &["deploy".to_string()]
@@ -11415,7 +11424,7 @@ and open a pull request to dev when it is ready."
         );
         assert_eq!(
             task_class_from_command("cargo", &["build".to_string(), "--release".to_string()]),
-            Some("local_project")
+            None
         );
         assert_eq!(task_class_from_command("ps", &[]), Some("process_server"));
     }
