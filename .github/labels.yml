@@ -1,0 +1,87 @@
+- name: "type: bug"
+  color: d73a4a
+  description: Something is broken or behaving incorrectly.
+- name: "type: feature"
+  color: 1d76db
+  description: New functionality or an enhancement to existing behavior.
+- name: "type: docs"
+  color: 0075ca
+  description: Documentation-only work.
+- name: "type: chore"
+  color: c2e0c6
+  description: Refactor, cleanup, dependency, or tooling work.
+- name: "type: rfc"
+  color: 5319e7
+  description: A design proposal or larger plan that needs discussion.
+- name: "area: daemon"
+  color: 0052cc
+  description: Backend daemon, API, or server-side behavior.
+- name: "area: web"
+  color: 5319e7
+  description: Web client, UI, or frontend behavior.
+- name: "area: storage"
+  color: 0e8a16
+  description: Persistence, SQLite, files, or state directory behavior.
+- name: "area: protocol"
+  color: 0052cc
+  description: API contracts, wire formats, or client-server protocol behavior.
+- name: "area: memory"
+  color: 5319e7
+  description: Memory, durable context, or conversation state.
+- name: "area: workers"
+  color: c2e0c6
+  description: Utility Worker, job execution, or subworker behavior.
+- name: "area: vault"
+  color: d4c5f9
+  description: Vault, secrets, or credential storage.
+- name: "area: skills"
+  color: c5def5
+  description: Skill packages, prompts, or skill loading behavior.
+- name: "area: mcp"
+  color: 8a63d2
+  description: MCP integration, tool bridges, or external connectors.
+- name: "area: publication"
+  color: 0e8a16
+  description: Publication, release, or promotion workflow behavior.
+- name: "area: release"
+  color: fbca04
+  description: Managed release, update, or rollout behavior.
+- name: "area: infra"
+  color: 1d76db
+  description: Repository infrastructure, CI, or release plumbing.
+- name: "status: needs-triage"
+  color: fbca04
+  description: New issue that has not been reviewed yet.
+- name: "status: ready"
+  color: 0e8a16
+  description: Ready to be picked up.
+- name: "status: in-progress"
+  color: c5def5
+  description: Actively being worked on.
+- name: "status: blocked"
+  color: b60205
+  description: Work cannot move forward yet.
+- name: "status: needs-design"
+  color: 5319e7
+  description: Needs a design decision before implementation.
+- name: documentation
+  color: 0075ca
+  description: Improvements or additions to documentation.
+- name: duplicate
+  color: cfd3d7
+  description: This issue or pull request already exists.
+- name: invalid
+  color: e4e669
+  description: This does not seem right.
+- name: question
+  color: d876e3
+  description: Further information is requested.
+- name: wontfix
+  color: ffffff
+  description: This will not be worked on.
+- name: "good first issue"
+  color: 7057ff
+  description: Small, well-scoped work with clear pointers for newcomers.
+- name: "help wanted"
+  color: 008672
+  description: Community contributors are welcome to claim this.
