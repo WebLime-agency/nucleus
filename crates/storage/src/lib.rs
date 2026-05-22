@@ -7840,7 +7840,7 @@ fn is_version_command(text: &str) -> bool {
 }
 
 fn is_health_command(text: &str) -> bool {
-    ["curl", "health", "smoke", "ping", "status", "http"]
+    ["curl", "health", "smoke", "ping", "http"]
         .iter()
         .any(|needle| text.contains(needle))
 }
@@ -10634,6 +10634,106 @@ and open a pull request to dev when it is ready."
             )
             .expect("validation status should persist");
         assert_eq!(local_project.completion_status, "satisfied");
+
+        let deployment_with_git_status = store
+            .create_job(JobRecord {
+                id: "deployment-git-status-job".to_string(),
+                session_id: Some("task-class-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("deployment".to_string()),
+                title: "Deployment with git status".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "deploy and verify".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("deployment git status job should persist");
+        store
+            .create_worker(WorkerRecord {
+                id: "deployment-git-status-worker".to_string(),
+                job_id: deployment_with_git_status.id.clone(),
+                parent_worker_id: None,
+                title: "Deployment git status worker".to_string(),
+                lane: "utility".to_string(),
+                state: "completed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "cx/gpt-5.4".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: std::env::temp_dir().display().to_string(),
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                max_steps: 8,
+                max_tool_calls: 8,
+                max_wall_clock_secs: 60,
+            })
+            .expect("deployment worker should persist");
+        for (id, command, args) in [
+            (
+                "deployment-command-session",
+                "wrangler",
+                vec!["deploy".to_string()],
+            ),
+            (
+                "git-status-command-session",
+                "git",
+                vec!["status".to_string()],
+            ),
+        ] {
+            store
+                .create_command_session(CommandSessionRecord {
+                    id: id.to_string(),
+                    job_id: deployment_with_git_status.id.clone(),
+                    worker_id: "deployment-git-status-worker".to_string(),
+                    tool_call_id: None,
+                    mode: "exec".to_string(),
+                    title: id.to_string(),
+                    state: "completed".to_string(),
+                    command: command.to_string(),
+                    args,
+                    cwd: std::env::temp_dir().display().to_string(),
+                    session_id: "task-class-session".to_string(),
+                    project_id: String::new(),
+                    worktree_path: std::env::temp_dir().display().to_string(),
+                    branch: "dev".to_string(),
+                    port: None,
+                    env_json: json!({}),
+                    network_policy: "none".to_string(),
+                    timeout_secs: 60,
+                    output_limit_bytes: 1024,
+                    last_error: String::new(),
+                    exit_code: Some(0),
+                    stdout_artifact_id: None,
+                    stderr_artifact_id: None,
+                    started_at: None,
+                    completed_at: None,
+                })
+                .expect("command session should persist");
+        }
+        let deployment_with_git_status = store
+            .get_job(&deployment_with_git_status.id)
+            .expect("deployment git status job should load")
+            .job;
+        assert_eq!(deployment_with_git_status.completion_status, "blocked");
+        assert!(
+            deployment_with_git_status
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("deployment_status:"))
+        );
+        assert!(
+            !deployment_with_git_status
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("health:")),
+            "git status should not satisfy deployment health evidence"
+        );
 
         let failed_tool_job = store
             .create_job(JobRecord {

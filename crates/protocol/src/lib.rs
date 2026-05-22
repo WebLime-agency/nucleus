@@ -390,21 +390,23 @@ fn derive_completion_gates(job: &JobSummary) -> Vec<CompletionGateSummary> {
         "completed" | "blocked" | "failed" | "canceled"
     );
     let mut gates = Vec::new();
+    let task_class = normalized_task_class(job);
+    let publication_gated = job.publication_requested || task_class == Some("github_pr");
 
-    if job.publication_requested {
+    if publication_gated {
         gates.push(publication_gate(job, terminal));
         gates.push(validation_gate(job, terminal));
     }
 
-    if job.publication_requested || job.browser_verification_required {
+    if publication_gated || job.browser_verification_required {
         gates.push(browser_gate(job, terminal));
     }
 
-    if job.publication_requested || job.cleanup_status == "cleanup_required" {
+    if publication_gated || job.cleanup_status == "cleanup_required" {
         gates.push(cleanup_gate(job, terminal));
     }
 
-    if let Some(task_class) = normalized_task_class(job) {
+    if let Some(task_class) = task_class {
         if !job.publication_requested || task_class != "github_pr" {
             if let Some(gate) = task_class_gate(job, terminal, task_class) {
                 gates.push(gate);
@@ -2826,6 +2828,24 @@ mod tests {
         let ungated = ungated.with_completion_gates();
         assert_eq!(ungated.completion_status, "not_gated");
         assert!(ungated.completion_gates.is_empty());
+    }
+
+    #[test]
+    fn explicit_github_pr_task_class_derives_publication_gates() {
+        let summary = task_class_job("github_pr", Vec::new()).with_completion_gates();
+        assert_eq!(summary.completion_status, "blocked");
+        assert!(
+            summary
+                .completion_gates
+                .iter()
+                .any(|gate| gate.id == "publication" && gate.state == "blocked")
+        );
+        assert!(
+            summary
+                .completion_gates
+                .iter()
+                .any(|gate| gate.id == "validation" && gate.state == "blocked")
+        );
     }
 
     fn task_class_job(task_class: &str, task_evidence: Vec<String>) -> JobSummary {
