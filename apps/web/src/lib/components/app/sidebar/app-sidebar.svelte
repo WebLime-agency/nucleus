@@ -279,7 +279,17 @@
             turnCount: session.turn_count,
             excerpt: session.last_message_excerpt ? markdownExcerpt(session.last_message_excerpt) : null,
             stateLabel: formatState(session.state),
-            stateVariant: badgeVariantForSession(session.state)
+            stateVariant: badgeVariantForSession(session.state),
+            state: session.state,
+            created_at: session.created_at,
+            last_resumed_at: session.last_resumed_at,
+            last_reasoning: session.last_reasoning,
+            last_reasoning_at: session.last_reasoning_at,
+            token_usage_known: session.token_usage_known,
+            prompt_tokens: session.prompt_tokens,
+            completion_tokens: session.completion_tokens,
+            cached_tokens: session.cached_tokens,
+            cost_usd_estimate: session.cost_usd_estimate
           }))}
           activeSessionId={activeSidebarSessionId}
           onOpen={(sessionId) => openNavigation(`/?session=${sessionId}`)}
