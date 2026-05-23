@@ -4758,8 +4758,9 @@ fn context_integrity_patch(
     let expected_origin_url = expected_project_origin_url(state, session);
     let expected_git_branch = session.git_branch.trim().to_string();
     let base_ref = session_base_ref(session);
+    let base_ref_name = base_ref.display_ref();
     let mut patch = JobPatch {
-        worktree_base_ref: Some(base_ref.clone()),
+        worktree_base_ref: Some(base_ref_name.clone()),
         expected_origin_url: Some(expected_origin_url.clone()),
         expected_git_branch: Some(expected_git_branch.clone()),
         ..JobPatch::default()
@@ -4833,9 +4834,10 @@ fn context_integrity_patch(
         return patch;
     }
 
-    let canonical_ref = format!("refs/remotes/origin/{base_ref}");
-    let fetch_refspec = format!("+{base_ref}:{canonical_ref}");
-    let fetch = git_fetch_status(&worktree_path, &["fetch", "origin", &fetch_refspec]);
+    let canonical_display = base_ref.display_ref();
+    let canonical_ref = format!("refs/remotes/{}/{}", base_ref.remote, base_ref.branch);
+    let fetch_refspec = format!("+refs/heads/{}:{canonical_ref}", base_ref.branch);
+    let fetch = git_fetch_status(&worktree_path, &["fetch", &base_ref.remote, &fetch_refspec]);
     if let Err(error) = fetch {
         patch.worktree_base_status = Some("pending".to_string());
         patch.worktree_base_reason = Some(format!("could not reach canonical: {error}"));
@@ -4844,15 +4846,12 @@ fn context_integrity_patch(
         return patch;
     }
 
-    let canonical_sha = git_stdout(&worktree_path, &["rev-parse", &canonical_ref]).or_else(|| {
-        git_stdout(
-            &worktree_path,
-            &["rev-parse", &format!("origin/{base_ref}")],
-        )
-    });
+    let canonical_sha = git_stdout(&worktree_path, &["rev-parse", &canonical_ref])
+        .or_else(|| git_stdout(&worktree_path, &["rev-parse", &canonical_display]));
     let Some(canonical_sha) = canonical_sha else {
         patch.worktree_base_status = Some("pending".to_string());
-        patch.worktree_base_reason = Some(format!("could not resolve canonical origin/{base_ref}"));
+        patch.worktree_base_reason =
+            Some(format!("could not resolve canonical {canonical_display}"));
         patch.canonical_base_sha = Some(String::new());
         patch.worktree_behind_by = Some(None);
         return patch;
@@ -4913,30 +4912,65 @@ fn session_worktree_probe_path(session: &SessionSummary) -> Option<PathBuf> {
     .find(|path| path.is_dir())
 }
 
-fn session_base_ref(session: &SessionSummary) -> String {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SessionBaseRef {
+    remote: String,
+    branch: String,
+}
+
+impl SessionBaseRef {
+    fn origin(branch: &str) -> Self {
+        Self {
+            remote: "origin".to_string(),
+            branch: branch.to_string(),
+        }
+    }
+
+    fn display_ref(&self) -> String {
+        if self.remote == "origin" {
+            self.branch.clone()
+        } else {
+            format!("{}/{}", self.remote, self.branch)
+        }
+    }
+}
+
+fn session_base_ref(session: &SessionSummary) -> SessionBaseRef {
     let base = session.git_base_ref.trim();
     if !base.is_empty() {
-        return base
-            .strip_prefix("refs/heads/")
-            .or_else(|| strip_remote_tracking_ref(base))
-            .or_else(|| base.strip_prefix("origin/"))
-            .unwrap_or(base)
-            .to_string();
+        if let Some(branch) = base.strip_prefix("refs/heads/") {
+            return SessionBaseRef::origin(branch);
+        }
+        if let Some((remote, branch)) = parse_remote_tracking_ref(base) {
+            return SessionBaseRef {
+                remote: remote.to_string(),
+                branch: branch.to_string(),
+            };
+        }
+        if let Some(branch) = base.strip_prefix("origin/") {
+            return SessionBaseRef::origin(branch);
+        }
+        return SessionBaseRef::origin(base);
     }
     let remote = session.git_remote_tracking_branch.trim();
     if !remote.is_empty() {
-        return strip_remote_tracking_ref(remote)
-            .or_else(|| remote.split_once('/').map(|(_, branch)| branch))
-            .unwrap_or(remote)
-            .to_string();
+        if let Some((remote_name, branch)) =
+            parse_remote_tracking_ref(remote).or_else(|| remote.split_once('/'))
+        {
+            return SessionBaseRef {
+                remote: remote_name.to_string(),
+                branch: branch.to_string(),
+            };
+        }
+        return SessionBaseRef::origin(remote);
     }
-    "dev".to_string()
+    SessionBaseRef::origin("dev")
 }
 
-fn strip_remote_tracking_ref(value: &str) -> Option<&str> {
+fn parse_remote_tracking_ref(value: &str) -> Option<(&str, &str)> {
     value
         .strip_prefix("refs/remotes/")
-        .and_then(|remote_ref| remote_ref.split_once('/').map(|(_, branch)| branch))
+        .and_then(|remote_ref| remote_ref.split_once('/'))
 }
 
 fn expected_project_origin_url(state: &AppState, session: &SessionSummary) -> String {
@@ -19844,6 +19878,57 @@ Cleanup status: clean";
             Some(narrow_repo.canonical_sha.as_str())
         );
 
+        let upstream_repo = context_integrity_repo(&state_dir, "upstream-remote");
+        let stale_origin = state_dir.join("upstream-stale-origin.git");
+        run_git_test(
+            &state_dir,
+            &[
+                "clone",
+                "--bare",
+                upstream_repo.worktree.to_str().expect("worktree path utf8"),
+                stale_origin.to_str().expect("stale origin path utf8"),
+            ],
+        );
+        run_git_test(
+            &upstream_repo.worktree,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                stale_origin.to_str().expect("stale origin path utf8"),
+            ],
+        );
+        run_git_test(
+            &upstream_repo.worktree,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                upstream_repo.origin_url.as_str(),
+            ],
+        );
+        run_git_test(
+            &upstream_repo.worktree,
+            &["reset", "--hard", &upstream_repo.initial_sha],
+        );
+        let mut upstream_session = context_integrity_session(&upstream_repo);
+        upstream_session.git_base_ref = String::new();
+        upstream_session.git_remote_tracking_branch = "upstream/dev".to_string();
+        let upstream_freshness = context_integrity_patch(&state, &upstream_session, &job);
+        assert_eq!(
+            upstream_freshness.worktree_base_ref.as_deref(),
+            Some("upstream/dev")
+        );
+        assert_eq!(
+            upstream_freshness.worktree_base_status.as_deref(),
+            Some("blocked")
+        );
+        assert_eq!(upstream_freshness.worktree_behind_by, Some(Some(2)));
+        assert_eq!(
+            upstream_freshness.canonical_base_sha.as_deref(),
+            Some(upstream_repo.canonical_sha.as_str())
+        );
+
         run_git_test(
             &repo.worktree,
             &[
@@ -19972,21 +20057,45 @@ Cleanup status: clean";
     }
 
     #[test]
-    fn context_integrity_base_ref_derivation_strips_remote_tracking_prefixes() {
+    fn context_integrity_base_ref_derivation_preserves_tracking_remote() {
         let mut session =
             scope_test_session("/tmp/project", "project_root", "attached", Vec::new());
 
         session.git_remote_tracking_branch = "upstream/main".to_string();
-        assert_eq!(session_base_ref(&session), "main");
+        assert_eq!(
+            session_base_ref(&session),
+            SessionBaseRef {
+                remote: "upstream".to_string(),
+                branch: "main".to_string()
+            }
+        );
 
         session.git_remote_tracking_branch = "refs/remotes/upstream/release/2026".to_string();
-        assert_eq!(session_base_ref(&session), "release/2026");
+        assert_eq!(
+            session_base_ref(&session),
+            SessionBaseRef {
+                remote: "upstream".to_string(),
+                branch: "release/2026".to_string()
+            }
+        );
 
         session.git_base_ref = "refs/remotes/upstream/main".to_string();
-        assert_eq!(session_base_ref(&session), "main");
+        assert_eq!(
+            session_base_ref(&session),
+            SessionBaseRef {
+                remote: "upstream".to_string(),
+                branch: "main".to_string()
+            }
+        );
 
         session.git_base_ref = "release/2026".to_string();
-        assert_eq!(session_base_ref(&session), "release/2026");
+        assert_eq!(
+            session_base_ref(&session),
+            SessionBaseRef {
+                remote: "origin".to_string(),
+                branch: "release/2026".to_string()
+            }
+        );
     }
 
     #[test]
