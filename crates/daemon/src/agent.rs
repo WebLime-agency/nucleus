@@ -4782,8 +4782,9 @@ fn context_integrity_patch(
     }
 
     let observed_origin = git_stdout(&worktree_path, &["remote", "get-url", "origin"]);
-    let observed_branch =
-        git_stdout(&worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default();
+    let observed_branch = git_stdout(&worktree_path, &["symbolic-ref", "--short", "HEAD"])
+        .or_else(|| git_stdout(&worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"]))
+        .unwrap_or_default();
     let head_sha = git_stdout(&worktree_path, &["rev-parse", "HEAD"]).unwrap_or_default();
 
     patch.worktree_origin_url = Some(observed_origin.clone().unwrap_or_default());
@@ -19914,6 +19915,10 @@ Cleanup status: clean";
         assert_eq!(
             unresolved_head.worktree_base_status.as_deref(),
             Some("pending")
+        );
+        assert_eq!(
+            unresolved_head.branch_repo_status.as_deref(),
+            Some("satisfied")
         );
         assert_eq!(unresolved_head.worktree_behind_by, Some(None));
         assert!(
