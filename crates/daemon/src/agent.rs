@@ -5068,6 +5068,7 @@ fn observe_session_git_state(worktree_path: &Path) -> Result<ObservedSessionGitS
     };
     let git_branch = git_stdout(worktree_path, &["symbolic-ref", "--short", "HEAD"])
         .or_else(|| git_stdout(worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"]))
+        .filter(|branch| branch != "HEAD")
         .unwrap_or_default();
     let status = git_command_stdout(worktree_path, &["status", "--porcelain"])?;
     let git_untracked_count = status.lines().filter(|line| line.starts_with("??")).count();
@@ -21464,6 +21465,12 @@ Cleanup status: clean";
             .expect("missing worktree should be reported");
         assert_eq!(missing_evidence["status"], "blocked");
         assert_eq!(missing_evidence["reason"], "worktree missing");
+
+        run_git_test(&repo.worktree, &["checkout", "--detach", &head]);
+        let detached =
+            observe_session_git_state(&repo.worktree).expect("detached state should observe");
+        assert_eq!(detached.git_head, head);
+        assert_eq!(detached.git_branch, "");
 
         let _ = fs::remove_dir_all(&state_dir);
     }
