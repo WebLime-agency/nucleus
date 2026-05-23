@@ -462,7 +462,7 @@ pub fn task_evidence_contract_catalog() -> Vec<TaskEvidenceContractSummary> {
                 (
                     "worktree_base_evidence",
                     "Worktree base evidence",
-                    "Record worktree HEAD, canonical base SHA, and merge commits behind canonical before work begins.",
+                    "Record worktree HEAD, canonical base SHA, and commits behind canonical before work begins.",
                 ),
                 (
                     "branch_repo_evidence",
@@ -868,7 +868,7 @@ fn worktree_base_gate(job: &JobSummary) -> CompletionGateSummary {
             prefixed_reason(&job.worktree_base_reason)
         ),
         "blocked" => format!(
-            "Worktree is {behind} merge commit(s) behind {}{}.",
+            "Worktree is {behind} commit(s) behind {}{}.",
             empty_fallback(&job.worktree_base_ref, "the declared base"),
             prefixed_reason(&job.worktree_base_reason)
         ),
@@ -3004,7 +3004,7 @@ mod tests {
             worktree_head_sha: "old".to_string(),
             canonical_base_sha: "new".to_string(),
             worktree_behind_by: Some(2),
-            worktree_base_reason: "behind canonical by 2 merge commit(s)".to_string(),
+            worktree_base_reason: "behind canonical by 2 commit(s)".to_string(),
             ..task_class_job("local_project", vec!["validation".to_string()])
         }
         .with_completion_gates();

@@ -4864,12 +4864,7 @@ fn context_integrity_patch(
     } else {
         git_stdout(
             &worktree_path,
-            &[
-                "rev-list",
-                "--count",
-                "--merges",
-                &format!("HEAD..{canonical_sha}"),
-            ],
+            &["rev-list", "--count", &format!("HEAD..{canonical_sha}")],
         )
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(0)
@@ -4881,7 +4876,7 @@ fn context_integrity_patch(
     if behind_by > allowed_behind {
         patch.worktree_base_status = Some("blocked".to_string());
         patch.worktree_base_reason = Some(format!(
-            "behind canonical by {behind_by} merge commit(s); allowed threshold is {allowed_behind}"
+            "behind canonical by {behind_by} commit(s); allowed threshold is {allowed_behind}"
         ));
     } else if override_present {
         patch.worktree_base_status = Some("waived".to_string());
@@ -19713,7 +19708,7 @@ Cleanup status: clean";
         run_git_test(&repo.worktree, &["reset", "--hard", &repo.initial_sha]);
         let stale = context_integrity_patch(&state, &session, &job);
         assert_eq!(stale.worktree_base_status.as_deref(), Some("blocked"));
-        assert_eq!(stale.worktree_behind_by, Some(Some(1)));
+        assert_eq!(stale.worktree_behind_by, Some(Some(2)));
         assert_eq!(
             stale.worktree_head_sha.as_deref(),
             Some(repo.initial_sha.as_str())
