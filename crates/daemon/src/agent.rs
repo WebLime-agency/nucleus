@@ -4862,12 +4862,19 @@ fn context_integrity_patch(
     {
         0
     } else {
-        git_stdout(
+        let Some(behind_by) = git_stdout(
             &worktree_path,
             &["rev-list", "--count", &format!("HEAD..{canonical_sha}")],
         )
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(0)
+        .and_then(|value| value.parse::<i64>().ok()) else {
+            patch.worktree_base_status = Some("pending".to_string());
+            patch.worktree_base_reason =
+                Some("could not compute worktree commits behind canonical".to_string());
+            patch.canonical_base_sha = Some(canonical_sha);
+            patch.worktree_behind_by = Some(None);
+            return patch;
+        };
+        behind_by
     };
     let allowed_behind = override_allowed_behind.unwrap_or(0).max(0);
 
@@ -19852,6 +19859,28 @@ Cleanup status: clean";
                 .as_deref()
                 .unwrap_or_default()
                 .contains("could not reach canonical")
+        );
+
+        let unborn = state_dir.join("unborn-worktree");
+        fs::create_dir_all(&unborn).expect("unborn worktree dir should exist");
+        run_git_test(&unborn, &["init", "-b", "dev"]);
+        run_git_test(&unborn, &["remote", "add", "origin", &repo.origin_url]);
+        let mut unborn_session = context_integrity_session(&repo);
+        unborn_session.worktree_path = unborn.display().to_string();
+        unborn_session.working_dir = unborn.display().to_string();
+        unborn_session.git_root = unborn.display().to_string();
+        let unresolved_head = context_integrity_patch(&state, &unborn_session, &job);
+        assert_eq!(
+            unresolved_head.worktree_base_status.as_deref(),
+            Some("pending")
+        );
+        assert_eq!(unresolved_head.worktree_behind_by, Some(None));
+        assert!(
+            unresolved_head
+                .worktree_base_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("could not compute worktree commits behind canonical")
         );
 
         let _ = fs::remove_dir_all(&state_dir);
