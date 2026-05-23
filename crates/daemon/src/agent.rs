@@ -5131,7 +5131,8 @@ fn mutation_audit_explaining_session_state(
 ) -> Result<Option<nucleus_protocol::AuditEvent>> {
     let since = session
         .session_state_observed_at
-        .unwrap_or(session.created_at.saturating_sub(1));
+        .unwrap_or(session.created_at)
+        .saturating_sub(1);
     let events = state.store.list_audit_events_since(since)?;
     Ok(events.into_iter().find(|event| {
         let haystack = format!(
@@ -5178,7 +5179,7 @@ fn command_session_is_newer_than_session_state(
         .completed_at
         .or(command_session.started_at)
         .unwrap_or(command_session.updated_at)
-        > since
+        >= since
 }
 
 fn is_session_git_mutation_command_session(
@@ -21098,6 +21099,13 @@ Cleanup status: clean";
         assert!(!command_session_is_newer_than_session_state(
             &observed_session,
             &stale_command
+        ));
+        let mut same_second_command = direct_git.clone();
+        same_second_command.completed_at = Some(5);
+        same_second_command.updated_at = 5;
+        assert!(command_session_is_newer_than_session_state(
+            &observed_session,
+            &same_second_command
         ));
         let mut fresh_command = direct_git.clone();
         fresh_command.completed_at = Some(6);
