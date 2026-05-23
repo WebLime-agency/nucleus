@@ -5343,7 +5343,44 @@ fn shell_command_arg(args: &[String]) -> Option<&str> {
 }
 
 fn shell_arg_requests_command(arg: &str) -> bool {
-    arg == "-c" || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains('c'))
+    if arg == "-c" {
+        return true;
+    }
+    let Some(flags) = arg.strip_prefix('-') else {
+        return false;
+    };
+    !flags.starts_with('-')
+        && flags.contains('c')
+        && flags.chars().all(shell_short_flag_can_cluster)
+}
+
+fn shell_short_flag_can_cluster(ch: char) -> bool {
+    matches!(
+        ch,
+        'a' | 'b'
+            | 'c'
+            | 'e'
+            | 'f'
+            | 'h'
+            | 'i'
+            | 'k'
+            | 'l'
+            | 'm'
+            | 'n'
+            | 'p'
+            | 'r'
+            | 's'
+            | 't'
+            | 'u'
+            | 'v'
+            | 'x'
+            | 'B'
+            | 'C'
+            | 'E'
+            | 'H'
+            | 'P'
+            | 'T'
+    )
 }
 
 fn split_simple_shell_words(input: &str) -> Option<Vec<String>> {
@@ -21188,6 +21225,17 @@ Cleanup status: clean";
         assert!(is_session_git_mutation_command_session(
             &session,
             &shell_with_long_option
+        ));
+
+        let mut shell_with_single_dash_long_option = shell_git.clone();
+        shell_with_single_dash_long_option.args = vec![
+            "-norc".to_string(),
+            "-lc".to_string(),
+            "git commit --allow-empty".to_string(),
+        ];
+        assert!(is_session_git_mutation_command_session(
+            &session,
+            &shell_with_single_dash_long_option
         ));
 
         let mut shell_compound = shell_git.clone();
