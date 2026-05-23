@@ -5263,6 +5263,34 @@ fn parse_git_invocation_from_args(
             index += 1;
             continue;
         }
+        if arg == "--git-dir" {
+            let value = args.get(index + 1)?;
+            git_cwd = resolve_git_dir_worktree_path(&git_cwd, value);
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--git-dir=") {
+            if value.is_empty() {
+                return None;
+            }
+            git_cwd = resolve_git_dir_worktree_path(&git_cwd, value);
+            index += 1;
+            continue;
+        }
+        if arg == "--work-tree" {
+            let value = args.get(index + 1)?;
+            git_cwd = resolve_git_c_option_path(&git_cwd, value);
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--work-tree=") {
+            if value.is_empty() {
+                return None;
+            }
+            git_cwd = resolve_git_c_option_path(&git_cwd, value);
+            index += 1;
+            continue;
+        }
         if git_global_option_takes_value(arg) {
             args.get(index + 1)?;
             index += 2;
@@ -5288,12 +5316,16 @@ fn shell_command_arg(args: &[String]) -> Option<&str> {
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].as_str();
-        if arg == "-c" || (arg.starts_with('-') && arg.contains('c')) {
+        if shell_arg_requests_command(arg) {
             return args.get(index + 1).map(String::as_str);
         }
         index += 1;
     }
     None
+}
+
+fn shell_arg_requests_command(arg: &str) -> bool {
+    arg == "-c" || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains('c'))
 }
 
 fn split_simple_shell_words(input: &str) -> Option<Vec<String>> {
@@ -5351,6 +5383,15 @@ fn resolve_git_c_option_path(base_cwd: &Path, value: &str) -> PathBuf {
         path.to_path_buf()
     } else {
         base_cwd.join(path)
+    }
+}
+
+fn resolve_git_dir_worktree_path(base_cwd: &Path, value: &str) -> PathBuf {
+    let git_dir = resolve_git_c_option_path(base_cwd, value);
+    if git_dir.file_name().and_then(|name| name.to_str()) == Some(".git") {
+        git_dir.parent().map(Path::to_path_buf).unwrap_or(git_dir)
+    } else {
+        git_dir
     }
 }
 
@@ -20992,6 +21033,19 @@ Cleanup status: clean";
             &git_with_c
         ));
 
+        let mut git_with_work_tree = direct_git.clone();
+        git_with_work_tree.cwd = state_dir.display().to_string();
+        git_with_work_tree.args = vec![
+            format!("--git-dir={}", declared.join(".git").display()),
+            format!("--work-tree={}", declared.display()),
+            "commit".to_string(),
+            "--allow-empty".to_string(),
+        ];
+        assert!(is_session_git_mutation_command_session(
+            &session,
+            &git_with_work_tree
+        ));
+
         let mut git_with_global_options = direct_git.clone();
         git_with_global_options.args = vec![
             "-c".to_string(),
@@ -21065,6 +21119,17 @@ Cleanup status: clean";
         ];
         assert!(is_session_git_mutation_command_session(
             &session, &shell_git
+        ));
+
+        let mut shell_with_long_option = shell_git.clone();
+        shell_with_long_option.args = vec![
+            "--norc".to_string(),
+            "-lc".to_string(),
+            "git commit --allow-empty".to_string(),
+        ];
+        assert!(is_session_git_mutation_command_session(
+            &session,
+            &shell_with_long_option
         ));
 
         let mut shell_compound = shell_git.clone();
