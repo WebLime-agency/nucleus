@@ -4816,9 +4816,9 @@ fn context_integrity_patch(
 
     let override_value = job.metadata_json.get("worktree_base_override");
     let override_present = override_value.is_some_and(|value| !value.is_null());
-    let override_allowed_behind = override_value
-        .and_then(|value| value.get("allowed_behind_by"))
-        .and_then(Value::as_i64);
+    let override_allowed_behind_value =
+        override_value.and_then(|value| value.get("allowed_behind_by"));
+    let override_allowed_behind = override_allowed_behind_value.and_then(Value::as_i64);
     let override_reason = override_value
         .and_then(|value| value.get("reason"))
         .and_then(Value::as_str)
@@ -4826,7 +4826,7 @@ fn context_integrity_patch(
         .filter(|value| !value.is_empty())
         .unwrap_or("worktree_base_override metadata is present");
 
-    if override_present && override_allowed_behind.is_none() {
+    if override_present && override_allowed_behind_value.is_none() {
         patch.worktree_base_status = Some("waived".to_string());
         patch.worktree_base_reason = Some(override_reason.to_string());
         patch.worktree_behind_by = Some(None);
@@ -19910,6 +19910,18 @@ Cleanup status: clean";
                 .as_deref()
                 .unwrap_or_default()
                 .contains("allowed threshold is 0")
+        );
+
+        job.metadata_json = json!({
+            "worktree_base_override": {
+                "allowed_behind_by": "2",
+                "reason": "malformed backport metadata"
+            }
+        });
+        let malformed_threshold = context_integrity_patch(&state, &session, &job);
+        assert_eq!(
+            malformed_threshold.worktree_base_status.as_deref(),
+            Some("blocked")
         );
 
         job.metadata_json = json!({
