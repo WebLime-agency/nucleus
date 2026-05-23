@@ -5419,11 +5419,19 @@ fn git_global_option_takes_value(arg: &str) -> bool {
 
 fn git_inline_global_option(arg: &str) -> bool {
     arg.starts_with("-c")
+        || arg == "-p"
+        || arg == "-P"
         || arg.starts_with("--config-env=")
+        || arg.starts_with("--exec-path=")
         || arg.starts_with("--namespace=")
         || matches!(
             arg,
-            "--no-pager"
+            "--bare"
+                | "--exec-path"
+                | "--html-path"
+                | "--info-path"
+                | "--man-path"
+                | "--no-pager"
                 | "--paginate"
                 | "--no-replace-objects"
                 | "--no-optional-locks"
@@ -21075,6 +21083,14 @@ Cleanup status: clean";
         assert!(is_session_git_mutation_command_session(
             &session,
             &git_with_global_options
+        ));
+
+        let mut git_with_documented_global_flag = direct_git.clone();
+        git_with_documented_global_flag.args =
+            vec!["-P".to_string(), "checkout".to_string(), "dev".to_string()];
+        assert!(is_session_git_mutation_command_session(
+            &session,
+            &git_with_documented_global_flag
         ));
 
         let mut rebase = direct_git.clone();
