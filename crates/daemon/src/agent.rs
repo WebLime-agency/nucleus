@@ -5043,8 +5043,12 @@ fn normalize_git_origin_url(url: &str) -> String {
             }
         }
     }
-    value = value.trim_end_matches(".git").to_ascii_lowercase();
-    value
+    let value = value.trim_end_matches(".git");
+    if let Some((host, path)) = value.split_once('/') {
+        format!("{}/{}", host.to_ascii_lowercase(), path)
+    } else {
+        value.to_ascii_lowercase()
+    }
 }
 
 fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
@@ -19854,13 +19858,17 @@ Cleanup status: clean";
         );
         assert_eq!(
             normalize_git_origin_url("git@gitlab.example:Org/Repo.git"),
-            normalize_git_origin_url("https://gitlab.example/org/repo")
+            normalize_git_origin_url("https://gitlab.example/Org/Repo")
         );
         assert_eq!(
             normalize_git_origin_url("ssh://git@gitlab.example/Org/Repo.git"),
-            normalize_git_origin_url("https://gitlab.example/org/repo")
+            normalize_git_origin_url("https://gitlab.example/Org/Repo")
         );
         assert_eq!(
+            normalize_git_origin_url("ssh://git@gitlab.example:2222/Org/Repo.git"),
+            normalize_git_origin_url("https://gitlab.example/Org/Repo")
+        );
+        assert_ne!(
             normalize_git_origin_url("ssh://git@gitlab.example:2222/Org/Repo.git"),
             normalize_git_origin_url("https://gitlab.example/org/repo")
         );
