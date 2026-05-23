@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{Arc, Mutex as StdMutex},
-    time::UNIX_EPOCH,
+    time::{Instant, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -75,6 +75,7 @@ const COMMAND_PREVIEW_CHAR_LIMIT: usize = 4_000;
 const COMMAND_LABEL_CHAR_LIMIT: usize = 140;
 const COMMAND_DEFAULT_TIMEOUT_SECS: u64 = 300;
 const COMMAND_MAX_TIMEOUT_SECS: u64 = 1_800;
+const CONTEXT_INTEGRITY_FETCH_TIMEOUT_SECS: u64 = 30;
 const COMMAND_DEFAULT_OUTPUT_LIMIT_BYTES: usize = 131_072;
 const COMMAND_MAX_OUTPUT_LIMIT_BYTES: usize = 524_288;
 const COMMAND_DEFAULT_WAIT_FOR_OUTPUT_MS: u64 = 250;
@@ -2333,6 +2334,12 @@ async fn run_job_loop(
     )
     .await;
 
+    let context_job = record_context_integrity_detection(state, &session.session, job_id)?;
+    if let Some(blocker) = context_integrity_start_blocker(&context_job) {
+        block_job_for_context_integrity(state, &session, &mut worker, &blocker).await?;
+        return Ok(());
+    }
+
     let checkpoint_value = state
         .store
         .read_worker_checkpoint(&worker.id)?
@@ -4236,7 +4243,7 @@ async fn complete_job_with_final_answer(
         });
     }
 
-    let completion_job = state.store.get_job(job_id)?.job;
+    let completion_job = record_context_integrity_detection(state, &session.session, job_id)?;
     reconcile_publication_browser_status_with_completion(&completion_job, &mut publication_patch);
     let projected_blocker = projected_completion_gate_blocker(&completion_job, &publication_patch);
     let terminal_job_state = if projected_blocker.is_some() {
@@ -4703,6 +4710,590 @@ fn record_publication_git_hygiene_baseline(
         }),
     });
     Ok(())
+}
+
+fn record_context_integrity_detection(
+    state: &AppState,
+    session: &SessionSummary,
+    job_id: &str,
+) -> Result<JobSummary> {
+    let current = state.store.get_job(job_id)?.job;
+    let patch = context_integrity_patch(state, session, &current);
+    let updated = state.store.update_job(job_id, patch)?;
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: job_id.to_string(),
+        worker_id: None,
+        event_type: "job.context_integrity.checked".to_string(),
+        status: updated.completion_status.clone(),
+        summary: context_integrity_event_summary(&updated),
+        detail: context_integrity_event_detail(&updated),
+        data_json: json!({
+            "worktree_base_evidence": {
+                "status": updated.worktree_base_status.clone(),
+                "reason": updated.worktree_base_reason.clone(),
+                "base_ref": updated.worktree_base_ref.clone(),
+                "head_sha": updated.worktree_head_sha.clone(),
+                "canonical_sha": updated.canonical_base_sha.clone(),
+                "behind_by": updated.worktree_behind_by,
+            },
+            "branch_repo_evidence": {
+                "status": updated.branch_repo_status.clone(),
+                "reason": updated.branch_repo_reason.clone(),
+                "observed_origin": updated.worktree_origin_url.clone(),
+                "expected_origin": updated.expected_origin_url.clone(),
+                "observed_branch": updated.observed_git_branch.clone(),
+                "expected_branch": updated.expected_git_branch.clone(),
+            },
+        }),
+    });
+    Ok(updated)
+}
+
+fn context_integrity_patch(
+    state: &AppState,
+    session: &SessionSummary,
+    job: &JobSummary,
+) -> JobPatch {
+    let worktree_path = session_worktree_probe_path(session);
+    let expected_origin_url = expected_project_origin_url(state, session);
+    let expected_git_branch = session.git_branch.trim().to_string();
+    let base_ref = session_base_ref(session);
+    let base_ref_name = base_ref.display_ref();
+    let mut patch = JobPatch {
+        worktree_base_ref: Some(base_ref_name.clone()),
+        expected_origin_url: Some(expected_origin_url.clone()),
+        expected_git_branch: Some(expected_git_branch.clone()),
+        ..JobPatch::default()
+    };
+
+    let Some(worktree_path) = worktree_path else {
+        patch.worktree_base_status = Some("not_applicable_missing_context".to_string());
+        patch.branch_repo_status = Some("not_applicable_missing_context".to_string());
+        patch.worktree_base_reason = Some("session has no declared worktree path".to_string());
+        patch.branch_repo_reason = Some("session has no declared worktree path".to_string());
+        return patch;
+    };
+
+    if git_stdout(&worktree_path, &["rev-parse", "--show-toplevel"]).is_none() {
+        patch.worktree_base_status = Some("not_applicable_missing_context".to_string());
+        patch.branch_repo_status = Some("not_applicable_missing_context".to_string());
+        patch.worktree_base_reason =
+            Some("declared worktree path is not a git checkout".to_string());
+        patch.branch_repo_reason = Some("declared worktree path is not a git checkout".to_string());
+        return patch;
+    }
+
+    let observed_origin = git_stdout(&worktree_path, &["remote", "get-url", "origin"])
+        .map(|url| redact_git_remote_url_userinfo(&url));
+    let observed_branch = git_stdout(&worktree_path, &["symbolic-ref", "--short", "HEAD"])
+        .or_else(|| git_stdout(&worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"]))
+        .unwrap_or_default();
+    let head_sha = git_stdout(&worktree_path, &["rev-parse", "HEAD"]).unwrap_or_default();
+
+    patch.worktree_origin_url = Some(observed_origin.clone().unwrap_or_default());
+    patch.observed_git_branch = Some(observed_branch.clone());
+    patch.worktree_head_sha = Some(head_sha.clone());
+
+    patch.branch_repo_status = Some(branch_repo_status(
+        observed_origin.as_deref(),
+        &expected_origin_url,
+        &observed_branch,
+        &expected_git_branch,
+    ));
+    patch.branch_repo_reason = Some(branch_repo_reason(
+        observed_origin.as_deref(),
+        &expected_origin_url,
+        &observed_branch,
+        &expected_git_branch,
+    ));
+
+    if observed_origin.is_none() {
+        patch.worktree_base_status = Some("blocked".to_string());
+        patch.worktree_base_reason = Some("no canonical remote configured".to_string());
+        patch.canonical_base_sha = Some(String::new());
+        patch.worktree_behind_by = Some(None);
+        return patch;
+    }
+
+    let override_value = job.metadata_json.get("worktree_base_override");
+    let override_present = override_value.is_some_and(|value| !value.is_null());
+    let override_allowed_behind_value =
+        override_value.and_then(|value| value.get("allowed_behind_by"));
+    let override_allowed_behind = override_allowed_behind_value.and_then(Value::as_i64);
+    let override_reason = override_value
+        .and_then(|value| value.get("reason"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("worktree_base_override metadata is present");
+
+    if override_present && override_allowed_behind_value.is_none() {
+        patch.worktree_base_status = Some("waived".to_string());
+        patch.worktree_base_reason = Some(override_reason.to_string());
+        patch.worktree_behind_by = Some(None);
+        return patch;
+    }
+
+    let canonical_display = base_ref.display_ref();
+    let canonical_ref = format!("refs/remotes/{}/{}", base_ref.remote, base_ref.branch);
+    let fetch_refspec = format!("+refs/heads/{}:{canonical_ref}", base_ref.branch);
+    let fetch = git_fetch_status(&worktree_path, &["fetch", &base_ref.remote, &fetch_refspec]);
+    if let Err(error) = fetch {
+        patch.worktree_base_status = Some("pending".to_string());
+        patch.worktree_base_reason = Some(format!("could not reach canonical: {error}"));
+        patch.canonical_base_sha = Some(String::new());
+        patch.worktree_behind_by = Some(None);
+        return patch;
+    }
+
+    let canonical_sha = git_stdout(&worktree_path, &["rev-parse", &canonical_ref])
+        .or_else(|| git_stdout(&worktree_path, &["rev-parse", &canonical_display]));
+    let Some(canonical_sha) = canonical_sha else {
+        patch.worktree_base_status = Some("pending".to_string());
+        patch.worktree_base_reason =
+            Some(format!("could not resolve canonical {canonical_display}"));
+        patch.canonical_base_sha = Some(String::new());
+        patch.worktree_behind_by = Some(None);
+        return patch;
+    };
+
+    let behind_by = if git_status(
+        &worktree_path,
+        &["merge-base", "--is-ancestor", &canonical_sha, "HEAD"],
+    )
+    .is_ok()
+    {
+        0
+    } else {
+        let Some(behind_by) = git_stdout(
+            &worktree_path,
+            &["rev-list", "--count", &format!("HEAD..{canonical_sha}")],
+        )
+        .and_then(|value| value.parse::<i64>().ok()) else {
+            patch.worktree_base_status = Some("pending".to_string());
+            patch.worktree_base_reason =
+                Some("could not compute worktree commits behind canonical".to_string());
+            patch.canonical_base_sha = Some(canonical_sha);
+            patch.worktree_behind_by = Some(None);
+            return patch;
+        };
+        behind_by
+    };
+    let allowed_behind = override_allowed_behind.unwrap_or(0).max(0);
+
+    patch.canonical_base_sha = Some(canonical_sha);
+    patch.worktree_behind_by = Some(Some(behind_by));
+    if behind_by > allowed_behind {
+        patch.worktree_base_status = Some("blocked".to_string());
+        patch.worktree_base_reason = Some(format!(
+            "behind canonical by {behind_by} commit(s); allowed threshold is {allowed_behind}"
+        ));
+    } else if override_present {
+        patch.worktree_base_status = Some("waived".to_string());
+        patch.worktree_base_reason = Some(override_reason.to_string());
+    } else {
+        patch.worktree_base_status = Some("satisfied".to_string());
+        patch.worktree_base_reason = Some(String::new());
+    }
+
+    patch
+}
+
+fn session_worktree_probe_path(session: &SessionSummary) -> Option<PathBuf> {
+    [
+        session.worktree_path.as_str(),
+        session.working_dir.as_str(),
+        session.git_root.as_str(),
+    ]
+    .into_iter()
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .map(PathBuf::from)
+    .find(|path| path.is_dir())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SessionBaseRef {
+    remote: String,
+    branch: String,
+}
+
+impl SessionBaseRef {
+    fn origin(branch: &str) -> Self {
+        Self {
+            remote: "origin".to_string(),
+            branch: branch.to_string(),
+        }
+    }
+
+    fn display_ref(&self) -> String {
+        if self.remote == "origin" {
+            self.branch.clone()
+        } else {
+            format!("{}/{}", self.remote, self.branch)
+        }
+    }
+}
+
+fn session_base_ref(session: &SessionSummary) -> SessionBaseRef {
+    let base = session.git_base_ref.trim();
+    if !base.is_empty() {
+        if let Some(branch) = base.strip_prefix("refs/heads/") {
+            return SessionBaseRef::origin(branch);
+        }
+        if let Some((remote, branch)) = parse_remote_tracking_ref(base) {
+            return SessionBaseRef {
+                remote: remote.to_string(),
+                branch: branch.to_string(),
+            };
+        }
+        if let Some(branch) = base.strip_prefix("origin/") {
+            return SessionBaseRef::origin(branch);
+        }
+        return SessionBaseRef::origin(base);
+    }
+    let remote = session.git_remote_tracking_branch.trim();
+    if !remote.is_empty() {
+        if let Some((remote_name, branch)) =
+            parse_remote_tracking_ref(remote).or_else(|| remote.split_once('/'))
+        {
+            return SessionBaseRef {
+                remote: remote_name.to_string(),
+                branch: branch.to_string(),
+            };
+        }
+        return SessionBaseRef::origin(remote);
+    }
+    SessionBaseRef::origin("dev")
+}
+
+fn parse_remote_tracking_ref(value: &str) -> Option<(&str, &str)> {
+    value
+        .strip_prefix("refs/remotes/")
+        .and_then(|remote_ref| remote_ref.split_once('/'))
+}
+
+fn expected_project_origin_url(state: &AppState, session: &SessionSummary) -> String {
+    if !session.project_id.trim().is_empty() {
+        if let Ok(project) = state.store.resolve_project(&session.project_id) {
+            if !project.origin_url.trim().is_empty() {
+                return redact_git_remote_url_userinfo(&project.origin_url);
+            }
+        }
+    }
+    let project_path = session.project_path.trim();
+    if project_path.is_empty() {
+        return String::new();
+    }
+    git_stdout(Path::new(project_path), &["remote", "get-url", "origin"])
+        .map(|url| redact_git_remote_url_userinfo(&url))
+        .unwrap_or_default()
+}
+
+fn branch_repo_status(
+    observed_origin: Option<&str>,
+    expected_origin: &str,
+    observed_branch: &str,
+    expected_branch: &str,
+) -> String {
+    if observed_origin.is_none() {
+        return "blocked".to_string();
+    }
+    if expected_origin.trim().is_empty() && expected_branch.trim().is_empty() {
+        return "not_applicable_missing_context".to_string();
+    }
+    if branch_repo_mismatches(
+        observed_origin,
+        expected_origin,
+        observed_branch,
+        expected_branch,
+    )
+    .is_empty()
+    {
+        "satisfied".to_string()
+    } else {
+        "blocked".to_string()
+    }
+}
+
+fn branch_repo_reason(
+    observed_origin: Option<&str>,
+    expected_origin: &str,
+    observed_branch: &str,
+    expected_branch: &str,
+) -> String {
+    if observed_origin.is_none() {
+        return "no canonical remote configured".to_string();
+    }
+    if expected_origin.trim().is_empty() && expected_branch.trim().is_empty() {
+        return "session has no declared project origin or git_branch".to_string();
+    }
+    let mismatches = branch_repo_mismatches(
+        observed_origin,
+        expected_origin,
+        observed_branch,
+        expected_branch,
+    );
+    if mismatches.is_empty() {
+        String::new()
+    } else {
+        mismatches.join("; ")
+    }
+}
+
+fn branch_repo_mismatches(
+    observed_origin: Option<&str>,
+    expected_origin: &str,
+    observed_branch: &str,
+    expected_branch: &str,
+) -> Vec<String> {
+    let mut mismatches = Vec::new();
+    let observed_origin = observed_origin.unwrap_or_default();
+    if !expected_origin.trim().is_empty()
+        && normalize_git_origin_url(observed_origin) != normalize_git_origin_url(expected_origin)
+    {
+        mismatches.push("origin URL mismatch".to_string());
+    }
+    if !expected_branch.trim().is_empty() && observed_branch.trim() != expected_branch.trim() {
+        mismatches.push("branch mismatch".to_string());
+    }
+    mismatches
+}
+
+fn normalize_git_origin_url(url: &str) -> String {
+    let mut value = url.trim().trim_end_matches('/').to_string();
+    let url_form = if let Some(rest) = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+    {
+        value = rest.to_string();
+        true
+    } else if let Some(rest) = value.strip_prefix("ssh://") {
+        value = rest.to_string();
+        true
+    } else {
+        false
+    };
+    if let Some((_, rest)) = value.split_once('@') {
+        value = rest.to_string();
+    }
+    if let Some(colon_index) = value.find(':') {
+        let slash_index = value.find('/').unwrap_or(usize::MAX);
+        if colon_index < slash_index {
+            if url_form {
+                value.replace_range(colon_index..slash_index, "");
+            } else {
+                value.replace_range(colon_index..=colon_index, "/");
+            }
+        }
+    }
+    let value = value.trim_end_matches(".git");
+    if let Some((host, path)) = value.split_once('/') {
+        format!("{}/{}", host.to_ascii_lowercase(), path)
+    } else {
+        value.to_ascii_lowercase()
+    }
+}
+
+fn redact_git_remote_url_userinfo(url: &str) -> String {
+    let value = url.trim();
+    let Some(scheme_index) = value.find("://") else {
+        return value.to_string();
+    };
+    let authority_start = scheme_index + "://".len();
+    let rest = &value[authority_start..];
+    let slash_index = rest.find('/').unwrap_or(usize::MAX);
+    let Some(at_index) = rest.find('@') else {
+        return value.to_string();
+    };
+    if at_index < slash_index {
+        format!("{}{}", &value[..authority_start], &rest[at_index + 1..])
+    } else {
+        value.to_string()
+    }
+}
+
+fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let value = stdout.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn git_status(cwd: &Path, args: &[&str]) -> Result<()> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() { stderr } else { stdout };
+    if detail.is_empty() {
+        bail!("git {} failed", args.join(" "));
+    }
+    bail!("{detail}");
+}
+
+fn git_fetch_status(cwd: &Path, args: &[&str]) -> Result<()> {
+    let mut child = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "true")
+        .env("SSH_ASKPASS", "true")
+        .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+        .spawn()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+    let started = Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .with_context(|| format!("failed to poll git {}", args.join(" ")))?
+            .is_some()
+        {
+            let output = child
+                .wait_with_output()
+                .with_context(|| format!("failed to collect git {}", args.join(" ")))?;
+            if output.status.success() {
+                return Ok(());
+            }
+            bail!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        if started.elapsed() >= Duration::from_secs(CONTEXT_INTEGRITY_FETCH_TIMEOUT_SECS) {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .with_context(|| format!("failed to collect timed-out git {}", args.join(" ")))?;
+            bail!(
+                "git {} timed out after {}s: {}",
+                args.join(" "),
+                CONTEXT_INTEGRITY_FETCH_TIMEOUT_SECS,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn context_integrity_start_blocker(job: &JobSummary) -> Option<String> {
+    job.completion_gates
+        .iter()
+        .find(|gate| {
+            matches!(
+                gate.id.as_str(),
+                "worktree_base_fresh" | "branch_repo_consistent"
+            ) && gate.state == "blocked"
+        })
+        .map(|gate| gate.summary.clone())
+}
+
+async fn block_job_for_context_integrity(
+    state: &AppState,
+    session: &SessionDetail,
+    worker: &mut WorkerSummary,
+    blocker: &str,
+) -> Result<()> {
+    let summary = format!("Context integrity blocked: {blocker}");
+    state.store.update_job(
+        &worker.job_id,
+        JobPatch {
+            state: Some("blocked".to_string()),
+            result_summary: Some(summary.clone()),
+            last_error: Some(String::new()),
+            ..JobPatch::default()
+        },
+    )?;
+    *worker = state.store.update_worker(
+        &worker.id,
+        WorkerPatch {
+            state: Some("completed".to_string()),
+            last_error: Some(String::new()),
+            ..WorkerPatch::default()
+        },
+    )?;
+    state.store.update_session(
+        &session.session.id,
+        SessionPatch {
+            state: Some("active".to_string()),
+            last_error: Some(String::new()),
+            ..SessionPatch::default()
+        },
+    )?;
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: worker.job_id.clone(),
+        worker_id: Some(worker.id.clone()),
+        event_type: "job.blocked".to_string(),
+        status: "blocked".to_string(),
+        summary,
+        detail: blocker.to_string(),
+        data_json: json!({
+            "terminal_status": "blocked",
+            "blocked": true,
+            "reason": "context_integrity",
+        }),
+    });
+    publish_job_updated(state, &state.store.get_job(&worker.job_id)?.job).await;
+    publish_worker_updated(state, worker).await;
+    if let Ok(updated) = state.store.get_session(&session.session.id) {
+        let _ = publish_session_event(state, updated).await;
+    }
+    publish_terminal_job_event(state, &state.store.get_job(&worker.job_id)?.job).await;
+    let _ = publish_overview_event(state).await;
+    Ok(())
+}
+
+fn context_integrity_event_summary(job: &JobSummary) -> String {
+    match (
+        job.worktree_base_status.as_str(),
+        job.branch_repo_status.as_str(),
+    ) {
+        ("blocked", _) | (_, "blocked") => "Context integrity is blocked.".to_string(),
+        ("pending", _) | (_, "pending") => "Context integrity is pending.".to_string(),
+        ("", "") => "Context integrity did not run for this job.".to_string(),
+        _ => "Context integrity evidence recorded.".to_string(),
+    }
+}
+
+fn context_integrity_event_detail(job: &JobSummary) -> String {
+    let base = if job.worktree_base_reason.trim().is_empty() {
+        job.worktree_base_status.clone()
+    } else {
+        format!(
+            "{} ({})",
+            job.worktree_base_status, job.worktree_base_reason
+        )
+    };
+    let branch = if job.branch_repo_reason.trim().is_empty() {
+        job.branch_repo_status.clone()
+    } else {
+        format!("{} ({})", job.branch_repo_status, job.branch_repo_reason)
+    };
+    format!("worktree_base={base}; branch_repo={branch}")
 }
 
 fn add_budget_guidance(
@@ -5764,7 +6355,14 @@ fn projected_completion_gate_blocker(
         .with_completion_gates()
         .completion_gates
         .into_iter()
-        .find(|gate| gate.state == "blocked")
+        .find(|gate| {
+            gate.state == "blocked"
+                || (gate.state == "pending"
+                    && matches!(
+                        gate.id.as_str(),
+                        "worktree_base_fresh" | "branch_repo_consistent"
+                    ))
+        })
         .map(|gate| gate.summary)
 }
 
@@ -19067,6 +19665,19 @@ Cleanup status: clean";
             cleanup_status: "unknown".to_string(),
             cleanup_paths: Vec::new(),
             task_evidence: Vec::new(),
+            metadata_json: json!({}),
+            worktree_base_ref: String::new(),
+            worktree_base_status: String::new(),
+            worktree_base_reason: String::new(),
+            worktree_origin_url: String::new(),
+            expected_origin_url: String::new(),
+            observed_git_branch: String::new(),
+            expected_git_branch: String::new(),
+            worktree_head_sha: String::new(),
+            canonical_base_sha: String::new(),
+            worktree_behind_by: None,
+            branch_repo_status: String::new(),
+            branch_repo_reason: String::new(),
             completion_status: String::new(),
             completion_gates: Vec::new(),
             completion_blockers: Vec::new(),
@@ -19137,6 +19748,19 @@ Cleanup status: clean";
             cleanup_status: "unknown".to_string(),
             cleanup_paths: Vec::new(),
             task_evidence: Vec::new(),
+            metadata_json: json!({}),
+            worktree_base_ref: String::new(),
+            worktree_base_status: String::new(),
+            worktree_base_reason: String::new(),
+            worktree_origin_url: String::new(),
+            expected_origin_url: String::new(),
+            observed_git_branch: String::new(),
+            expected_git_branch: String::new(),
+            worktree_head_sha: String::new(),
+            canonical_base_sha: String::new(),
+            worktree_behind_by: None,
+            branch_repo_status: String::new(),
+            branch_repo_reason: String::new(),
             completion_status: String::new(),
             completion_gates: Vec::new(),
             completion_blockers: Vec::new(),
@@ -19198,6 +19822,361 @@ Cleanup status: clean";
             2,
             0,
         ));
+    }
+
+    #[test]
+    fn context_integrity_detection_covers_fresh_stale_and_mismatch_states() {
+        let state_dir = test_state_dir("context-integrity-detection");
+        let state = initialize_test_state(&state_dir);
+        let repo = context_integrity_repo(&state_dir, "happy-stale");
+        let mut session = context_integrity_session(&repo);
+        let mut job = test_publication_job_summary("context-happy");
+
+        run_git_test(&repo.worktree, &["pull", "--ff-only", "origin", "dev"]);
+        let fresh = context_integrity_patch(&state, &session, &job);
+        assert_eq!(fresh.worktree_base_status.as_deref(), Some("satisfied"));
+        assert_eq!(fresh.worktree_behind_by, Some(Some(0)));
+        assert_eq!(fresh.branch_repo_status.as_deref(), Some("satisfied"));
+
+        run_git_test(&repo.worktree, &["reset", "--hard", &repo.initial_sha]);
+        let stale = context_integrity_patch(&state, &session, &job);
+        assert_eq!(stale.worktree_base_status.as_deref(), Some("blocked"));
+        assert_eq!(stale.worktree_behind_by, Some(Some(2)));
+        assert_eq!(
+            stale.worktree_head_sha.as_deref(),
+            Some(repo.initial_sha.as_str())
+        );
+        assert_eq!(
+            stale.canonical_base_sha.as_deref(),
+            Some(repo.canonical_sha.as_str())
+        );
+
+        let narrow_repo = context_integrity_repo(&state_dir, "narrow-refspec");
+        run_git_test(
+            &narrow_repo.worktree,
+            &[
+                "config",
+                "--replace-all",
+                "remote.origin.fetch",
+                "+refs/heads/other:refs/remotes/origin/other",
+            ],
+        );
+        run_git_test(
+            &narrow_repo.worktree,
+            &["update-ref", "-d", "refs/remotes/origin/dev"],
+        );
+        run_git_test(
+            &narrow_repo.worktree,
+            &["reset", "--hard", &narrow_repo.initial_sha],
+        );
+        let narrow_session = context_integrity_session(&narrow_repo);
+        let narrow = context_integrity_patch(&state, &narrow_session, &job);
+        assert_eq!(narrow.worktree_base_status.as_deref(), Some("blocked"));
+        assert_eq!(narrow.worktree_behind_by, Some(Some(2)));
+        assert_eq!(
+            narrow.canonical_base_sha.as_deref(),
+            Some(narrow_repo.canonical_sha.as_str())
+        );
+
+        let upstream_repo = context_integrity_repo(&state_dir, "upstream-remote");
+        let stale_origin = state_dir.join("upstream-stale-origin.git");
+        run_git_test(
+            &state_dir,
+            &[
+                "clone",
+                "--bare",
+                upstream_repo.worktree.to_str().expect("worktree path utf8"),
+                stale_origin.to_str().expect("stale origin path utf8"),
+            ],
+        );
+        run_git_test(
+            &upstream_repo.worktree,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                stale_origin.to_str().expect("stale origin path utf8"),
+            ],
+        );
+        run_git_test(
+            &upstream_repo.worktree,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                upstream_repo.origin_url.as_str(),
+            ],
+        );
+        run_git_test(
+            &upstream_repo.worktree,
+            &["reset", "--hard", &upstream_repo.initial_sha],
+        );
+        let mut upstream_session = context_integrity_session(&upstream_repo);
+        upstream_session.git_base_ref = String::new();
+        upstream_session.git_remote_tracking_branch = "upstream/dev".to_string();
+        let upstream_freshness = context_integrity_patch(&state, &upstream_session, &job);
+        assert_eq!(
+            upstream_freshness.worktree_base_ref.as_deref(),
+            Some("upstream/dev")
+        );
+        assert_eq!(
+            upstream_freshness.worktree_base_status.as_deref(),
+            Some("blocked")
+        );
+        assert_eq!(upstream_freshness.worktree_behind_by, Some(Some(2)));
+        assert_eq!(
+            upstream_freshness.canonical_base_sha.as_deref(),
+            Some(upstream_repo.canonical_sha.as_str())
+        );
+
+        run_git_test(
+            &repo.worktree,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:other/repo.git",
+            ],
+        );
+        let origin_mismatch = context_integrity_patch(&state, &session, &job);
+        assert_eq!(
+            origin_mismatch.branch_repo_status.as_deref(),
+            Some("blocked")
+        );
+        assert!(
+            origin_mismatch
+                .branch_repo_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("origin URL mismatch")
+        );
+
+        run_git_test(
+            &repo.worktree,
+            &["remote", "set-url", "origin", &repo.origin_url],
+        );
+        run_git_test(&repo.worktree, &["checkout", "-B", "other"]);
+        session.git_branch = "dev".to_string();
+        let branch_mismatch = context_integrity_patch(&state, &session, &job);
+        assert_eq!(
+            branch_mismatch.branch_repo_status.as_deref(),
+            Some("blocked")
+        );
+        assert!(
+            branch_mismatch
+                .branch_repo_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("branch mismatch")
+        );
+
+        job.metadata_json = json!({
+            "worktree_base_override": {
+                "reason": "intentional backport"
+            }
+        });
+        let waived = context_integrity_patch(&state, &session, &job);
+        assert_eq!(waived.worktree_base_status.as_deref(), Some("waived"));
+
+        job.metadata_json = json!({
+            "worktree_base_override": {
+                "allowed_behind_by": 0,
+                "reason": "intentional backport"
+            }
+        });
+        let threshold_exceeded = context_integrity_patch(&state, &session, &job);
+        assert_eq!(
+            threshold_exceeded.worktree_base_status.as_deref(),
+            Some("blocked")
+        );
+        assert!(
+            threshold_exceeded
+                .worktree_base_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("allowed threshold is 0")
+        );
+
+        job.metadata_json = json!({
+            "worktree_base_override": {
+                "allowed_behind_by": "2",
+                "reason": "malformed backport metadata"
+            }
+        });
+        let malformed_threshold = context_integrity_patch(&state, &session, &job);
+        assert_eq!(
+            malformed_threshold.worktree_base_status.as_deref(),
+            Some("blocked")
+        );
+
+        job.metadata_json = json!({
+            "worktree_base_override": {
+                "allowed_behind_by": 2,
+                "reason": "intentional backport"
+            }
+        });
+        let threshold_allows = context_integrity_patch(&state, &session, &job);
+        assert_eq!(
+            threshold_allows.worktree_base_status.as_deref(),
+            Some("waived")
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn context_integrity_origin_normalization_handles_common_transports() {
+        assert_eq!(
+            normalize_git_origin_url("git@github.com:WebLime-agency/nucleus.git"),
+            normalize_git_origin_url("https://github.com/WebLime-agency/nucleus")
+        );
+        assert_eq!(
+            normalize_git_origin_url("git@gitlab.example:Org/Repo.git"),
+            normalize_git_origin_url("https://gitlab.example/Org/Repo")
+        );
+        assert_eq!(
+            normalize_git_origin_url("ssh://git@gitlab.example/Org/Repo.git"),
+            normalize_git_origin_url("https://gitlab.example/Org/Repo")
+        );
+        assert_eq!(
+            normalize_git_origin_url("ssh://git@gitlab.example:2222/Org/Repo.git"),
+            normalize_git_origin_url("https://gitlab.example/Org/Repo")
+        );
+        assert_ne!(
+            normalize_git_origin_url("ssh://git@gitlab.example:2222/Org/Repo.git"),
+            normalize_git_origin_url("https://gitlab.example/org/repo")
+        );
+        assert_eq!(
+            redact_git_remote_url_userinfo("https://user:token@gitlab.example/Org/Repo.git"),
+            "https://gitlab.example/Org/Repo.git"
+        );
+        assert_eq!(
+            redact_git_remote_url_userinfo("git@gitlab.example:Org/Repo.git"),
+            "git@gitlab.example:Org/Repo.git"
+        );
+    }
+
+    #[test]
+    fn context_integrity_base_ref_derivation_preserves_tracking_remote() {
+        let mut session =
+            scope_test_session("/tmp/project", "project_root", "attached", Vec::new());
+
+        session.git_remote_tracking_branch = "upstream/main".to_string();
+        assert_eq!(
+            session_base_ref(&session),
+            SessionBaseRef {
+                remote: "upstream".to_string(),
+                branch: "main".to_string()
+            }
+        );
+
+        session.git_remote_tracking_branch = "refs/remotes/upstream/release/2026".to_string();
+        assert_eq!(
+            session_base_ref(&session),
+            SessionBaseRef {
+                remote: "upstream".to_string(),
+                branch: "release/2026".to_string()
+            }
+        );
+
+        session.git_base_ref = "refs/remotes/upstream/main".to_string();
+        assert_eq!(
+            session_base_ref(&session),
+            SessionBaseRef {
+                remote: "upstream".to_string(),
+                branch: "main".to_string()
+            }
+        );
+
+        session.git_base_ref = "release/2026".to_string();
+        assert_eq!(
+            session_base_ref(&session),
+            SessionBaseRef {
+                remote: "origin".to_string(),
+                branch: "release/2026".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn context_integrity_detection_handles_no_origin_and_fetch_failure() {
+        let state_dir = test_state_dir("context-integrity-failures");
+        let state = initialize_test_state(&state_dir);
+        let repo = context_integrity_repo(&state_dir, "failure");
+        let session = context_integrity_session(&repo);
+        let job = test_publication_job_summary("context-failure");
+
+        run_git_test(&repo.worktree, &["remote", "remove", "origin"]);
+        let no_origin = context_integrity_patch(&state, &session, &job);
+        assert_eq!(no_origin.worktree_base_status.as_deref(), Some("blocked"));
+        assert_eq!(no_origin.branch_repo_status.as_deref(), Some("blocked"));
+        assert!(
+            no_origin
+                .worktree_base_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no canonical remote")
+        );
+
+        run_git_test(
+            &repo.worktree,
+            &["remote", "add", "origin", "/does/not/exist"],
+        );
+        let fetch_failure = context_integrity_patch(&state, &session, &job);
+        assert_eq!(
+            fetch_failure.worktree_base_status.as_deref(),
+            Some("pending")
+        );
+        assert!(
+            fetch_failure
+                .worktree_base_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("could not reach canonical")
+        );
+
+        let unborn = state_dir.join("unborn-worktree");
+        fs::create_dir_all(&unborn).expect("unborn worktree dir should exist");
+        run_git_test(&unborn, &["init", "-b", "dev"]);
+        run_git_test(&unborn, &["remote", "add", "origin", &repo.origin_url]);
+        let mut unborn_session = context_integrity_session(&repo);
+        unborn_session.worktree_path = unborn.display().to_string();
+        unborn_session.working_dir = unborn.display().to_string();
+        unborn_session.git_root = unborn.display().to_string();
+        let unresolved_head = context_integrity_patch(&state, &unborn_session, &job);
+        assert_eq!(
+            unresolved_head.worktree_base_status.as_deref(),
+            Some("pending")
+        );
+        assert_eq!(
+            unresolved_head.branch_repo_status.as_deref(),
+            Some("satisfied")
+        );
+        assert_eq!(unresolved_head.worktree_behind_by, Some(None));
+        assert!(
+            unresolved_head
+                .worktree_base_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("could not compute worktree commits behind canonical")
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn terminal_projection_blocks_pending_context_integrity_gate() {
+        let mut job = test_publication_job_summary("context-pending");
+        job.task_class = Some("local_project".to_string());
+        job.publication_requested = false;
+        job.publication_status = "not_requested".to_string();
+        job.browser_verification_status = "not_required".to_string();
+        job.validation_status = "passed".to_string();
+        job.worktree_base_status = "pending".to_string();
+        job.worktree_base_reason = "could not reach canonical: auth failed".to_string();
+        let blocker = projected_completion_gate_blocker(&job, &PublicationOutcomePatch::default())
+            .expect("pending context gate should block terminal projection");
+        assert!(blocker.contains("pending"));
     }
 
     #[tokio::test]
@@ -23328,6 +24307,19 @@ for line in sys.stdin:
             cleanup_status: "unknown".to_string(),
             cleanup_paths: Vec::new(),
             task_evidence: Vec::new(),
+            metadata_json: json!({}),
+            worktree_base_ref: String::new(),
+            worktree_base_status: String::new(),
+            worktree_base_reason: String::new(),
+            worktree_origin_url: String::new(),
+            expected_origin_url: String::new(),
+            observed_git_branch: String::new(),
+            expected_git_branch: String::new(),
+            worktree_head_sha: String::new(),
+            canonical_base_sha: String::new(),
+            worktree_behind_by: None,
+            branch_repo_status: String::new(),
+            branch_repo_reason: String::new(),
             completion_status: String::new(),
             completion_gates: Vec::new(),
             completion_blockers: Vec::new(),
@@ -23437,5 +24429,102 @@ for line in sys.stdin:
             "nucleus-agent-{label}-{}-{suffix}",
             std::process::id()
         ))
+    }
+
+    struct ContextIntegrityRepo {
+        source: PathBuf,
+        worktree: PathBuf,
+        origin_url: String,
+        initial_sha: String,
+        canonical_sha: String,
+    }
+
+    fn context_integrity_repo(root: &Path, label: &str) -> ContextIntegrityRepo {
+        let source = root.join(format!("{label}-source"));
+        let origin = root.join(format!("{label}-origin.git"));
+        let worktree = root.join(format!("{label}-worktree"));
+        fs::create_dir_all(&source).expect("source repo dir should exist");
+        run_git_test(&source, &["init", "-b", "dev"]);
+        run_git_test(&source, &["config", "user.email", "nucleus@example.test"]);
+        run_git_test(&source, &["config", "user.name", "Nucleus Test"]);
+        fs::write(source.join("file.txt"), "initial\n").expect("initial file should write");
+        run_git_test(&source, &["add", "file.txt"]);
+        run_git_test(&source, &["commit", "-m", "initial"]);
+        let initial_sha = git_stdout(&source, &["rev-parse", "HEAD"]).expect("initial sha");
+        run_git_test(
+            root,
+            &[
+                "clone",
+                "--bare",
+                source.to_str().expect("source path utf8"),
+                origin.to_str().expect("origin path utf8"),
+            ],
+        );
+        run_git_test(
+            root,
+            &[
+                "clone",
+                origin.to_str().expect("origin path utf8"),
+                worktree.to_str().expect("worktree path utf8"),
+            ],
+        );
+        run_git_test(
+            &source,
+            &[
+                "remote",
+                "add",
+                "origin",
+                origin.to_str().expect("origin path utf8"),
+            ],
+        );
+        run_git_test(&source, &["checkout", "-b", "topic"]);
+        fs::write(source.join("feature.txt"), "feature\n").expect("feature file should write");
+        run_git_test(&source, &["add", "feature.txt"]);
+        run_git_test(&source, &["commit", "-m", "feature"]);
+        run_git_test(&source, &["checkout", "dev"]);
+        run_git_test(&source, &["merge", "--no-ff", "topic", "-m", "merge topic"]);
+        let canonical_sha = git_stdout(&source, &["rev-parse", "HEAD"]).expect("canonical sha");
+        run_git_test(&source, &["push", "origin", "dev"]);
+
+        ContextIntegrityRepo {
+            source,
+            worktree,
+            origin_url: origin.display().to_string(),
+            initial_sha,
+            canonical_sha,
+        }
+    }
+
+    fn context_integrity_session(repo: &ContextIntegrityRepo) -> SessionSummary {
+        let mut session = scope_test_session(
+            repo.worktree.to_str().expect("worktree path utf8"),
+            "project_root",
+            "isolated_worktree",
+            Vec::new(),
+        );
+        session.project_path = repo.source.display().to_string();
+        session.source_project_path = repo.source.display().to_string();
+        session.git_root = repo.worktree.display().to_string();
+        session.worktree_path = repo.worktree.display().to_string();
+        session.git_branch = "dev".to_string();
+        session.git_base_ref = "dev".to_string();
+        session
+    }
+
+    fn run_git_test(cwd: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("git {} should run: {error}", args.join(" ")));
+        if !output.status.success() {
+            panic!(
+                "git {} failed\nstdout:\n{}\nstderr:\n{}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }
