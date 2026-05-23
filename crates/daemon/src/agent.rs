@@ -5145,7 +5145,9 @@ fn mutation_audit_explaining_session_state(
             || event.detail.contains(job_id)
             || event.summary.contains(&session.id)
             || event.summary.contains(job_id);
+        let mutation_succeeded = event.status.eq_ignore_ascii_case("success");
         mentions_scope
+            && mutation_succeeded
             && haystack.contains("git")
             && text_mentions_session_state_mutating_git(&haystack)
     }))
@@ -5159,10 +5161,24 @@ fn mutation_command_session_explaining_session_state(
     let Ok(detail) = state.store.get_job(job_id) else {
         return Ok(None);
     };
-    Ok(detail
-        .command_sessions
-        .into_iter()
-        .find(|command_session| is_session_git_mutation_command_session(session, command_session)))
+    Ok(detail.command_sessions.into_iter().find(|command_session| {
+        command_session_is_newer_than_session_state(session, command_session)
+            && is_session_git_mutation_command_session(session, command_session)
+    }))
+}
+
+fn command_session_is_newer_than_session_state(
+    session: &SessionSummary,
+    command_session: &CommandSessionSummary,
+) -> bool {
+    let since = session
+        .session_state_observed_at
+        .unwrap_or(session.created_at.saturating_sub(1));
+    command_session
+        .completed_at
+        .or(command_session.started_at)
+        .unwrap_or(command_session.updated_at)
+        > since
 }
 
 fn is_session_git_mutation_command_session(
@@ -21074,6 +21090,23 @@ Cleanup status: clean";
         status.args = vec!["status".to_string(), "--short".to_string()];
         assert!(!is_session_git_mutation_command_session(&session, &status));
 
+        let mut observed_session = session.clone();
+        observed_session.session_state_observed_at = Some(5);
+        let mut stale_command = direct_git.clone();
+        stale_command.completed_at = Some(4);
+        stale_command.updated_at = 4;
+        assert!(!command_session_is_newer_than_session_state(
+            &observed_session,
+            &stale_command
+        ));
+        let mut fresh_command = direct_git.clone();
+        fresh_command.completed_at = Some(6);
+        fresh_command.updated_at = 6;
+        assert!(command_session_is_newer_than_session_state(
+            &observed_session,
+            &fresh_command
+        ));
+
         let mut other_session = direct_git.clone();
         other_session.session_id = "other-session".to_string();
         assert!(!is_session_git_mutation_command_session(
@@ -21352,6 +21385,38 @@ Cleanup status: clean";
             .session;
         assert_eq!(refreshed.git_head, head);
         assert!(refreshed.session_state_observed_at.is_some());
+
+        state
+            .store
+            .update_session(
+                "state-session",
+                SessionPatch {
+                    git_head: Some("failed-audit-head".to_string()),
+                    session_state_observed_at: Some(Some(1)),
+                    ..SessionPatch::default()
+                },
+            )
+            .expect("failed-audit stale session should persist");
+        state
+            .store
+            .append_audit_event(AuditEventRecord {
+                kind: "worker.git.checkout".to_string(),
+                target: "job:state-job".to_string(),
+                status: "failed".to_string(),
+                summary: "Worker git checkout failed.".to_string(),
+                detail: "job_id=state-job session_id=state-session git checkout dev".to_string(),
+            })
+            .expect("failed audit event should persist");
+        let failed_audit_session = state
+            .store
+            .get_session("state-session")
+            .expect("failed-audit session should reload")
+            .session;
+        let failed_audit =
+            session_state_evidence_and_refresh(&state, &failed_audit_session, "state-job")
+                .expect("failed audit should not explain drift");
+        assert_eq!(failed_audit["status"], "blocked");
+        assert!(failed_audit["audit_event_id"].is_null());
 
         state
             .store
