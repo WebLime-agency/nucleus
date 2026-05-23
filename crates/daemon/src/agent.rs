@@ -4916,19 +4916,25 @@ fn session_base_ref(session: &SessionSummary) -> String {
     if !base.is_empty() {
         return base
             .strip_prefix("refs/heads/")
+            .or_else(|| strip_remote_tracking_ref(base))
             .or_else(|| base.strip_prefix("origin/"))
             .unwrap_or(base)
             .to_string();
     }
     let remote = session.git_remote_tracking_branch.trim();
     if !remote.is_empty() {
-        return remote
-            .strip_prefix("refs/remotes/origin/")
-            .or_else(|| remote.strip_prefix("origin/"))
+        return strip_remote_tracking_ref(remote)
+            .or_else(|| remote.split_once('/').map(|(_, branch)| branch))
             .unwrap_or(remote)
             .to_string();
     }
     "dev".to_string()
+}
+
+fn strip_remote_tracking_ref(value: &str) -> Option<&str> {
+    value
+        .strip_prefix("refs/remotes/")
+        .and_then(|remote_ref| remote_ref.split_once('/').map(|(_, branch)| branch))
 }
 
 fn expected_project_origin_url(state: &AppState, session: &SessionSummary) -> String {
@@ -19872,6 +19878,24 @@ Cleanup status: clean";
             normalize_git_origin_url("ssh://git@gitlab.example:2222/Org/Repo.git"),
             normalize_git_origin_url("https://gitlab.example/org/repo")
         );
+    }
+
+    #[test]
+    fn context_integrity_base_ref_derivation_strips_remote_tracking_prefixes() {
+        let mut session =
+            scope_test_session("/tmp/project", "project_root", "attached", Vec::new());
+
+        session.git_remote_tracking_branch = "upstream/main".to_string();
+        assert_eq!(session_base_ref(&session), "main");
+
+        session.git_remote_tracking_branch = "refs/remotes/upstream/release/2026".to_string();
+        assert_eq!(session_base_ref(&session), "release/2026");
+
+        session.git_base_ref = "refs/remotes/upstream/main".to_string();
+        assert_eq!(session_base_ref(&session), "main");
+
+        session.git_base_ref = "release/2026".to_string();
+        assert_eq!(session_base_ref(&session), "release/2026");
     }
 
     #[test]
