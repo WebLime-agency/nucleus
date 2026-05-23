@@ -4717,8 +4717,19 @@ fn record_context_integrity_detection(
     session: &SessionSummary,
     job_id: &str,
 ) -> Result<JobSummary> {
-    let current = state.store.get_job(job_id)?.job;
-    let patch = context_integrity_patch(state, session, &current);
+    let detail = state.store.get_job(job_id)?;
+    let current = detail.job;
+    let mut patch = context_integrity_patch(state, session, &current);
+    patch.command_session_cwd_evidence_json = Some(Some(
+        serde_json::to_string(&command_session_cwd_evidence(
+            session,
+            &detail.command_sessions,
+        ))
+        .unwrap_or_else(|_| "{}".to_string()),
+    ));
+    patch.metadata_json = Some(context_integrity_metadata_with_session_state(
+        state, session, &current, job_id,
+    )?);
     let updated = state.store.update_job(job_id, patch)?;
     let _ = state.store.append_job_event(JobEventRecord {
         job_id: job_id.to_string(),
@@ -4744,9 +4755,400 @@ fn record_context_integrity_detection(
                 "observed_branch": updated.observed_git_branch.clone(),
                 "expected_branch": updated.expected_git_branch.clone(),
             },
+            "cwd_evidence": updated.command_session_cwd_evidence_json.as_deref()
+                .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                .unwrap_or_else(|| json!({})),
+            "session_state_evidence": updated.metadata_json
+                .get("session_state_evidence")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
         }),
     });
     Ok(updated)
+}
+
+fn command_session_cwd_evidence(
+    session: &SessionSummary,
+    command_sessions: &[CommandSessionSummary],
+) -> Value {
+    let declared = session.working_dir.trim();
+    if declared.is_empty() {
+        return json!({
+            "status": "satisfied",
+            "reason": "session has no declared working_dir; cwd gate is trivially satisfied",
+            "declared_working_dir": "",
+            "observed_cwds": [],
+            "offending_command_session_ids": [],
+            "offending_cwds": [],
+        });
+    }
+    if command_sessions.is_empty() {
+        return json!({
+            "status": "pending",
+            "reason": "no command sessions recorded yet",
+            "declared_working_dir": declared,
+            "observed_cwds": [],
+            "offending_command_session_ids": [],
+            "offending_cwds": [],
+        });
+    }
+
+    let mut observed = Vec::new();
+    let mut offending_ids = Vec::new();
+    let mut offending_cwds = Vec::new();
+    let mut missing_ids = Vec::new();
+    let mut unresolved = Vec::new();
+    for command_session in command_sessions {
+        let cwd = command_session.cwd.trim();
+        observed.push(json!({
+            "command_session_id": command_session.id,
+            "cwd": cwd,
+            "state": command_session.state,
+        }));
+        if cwd.is_empty() {
+            missing_ids.push(command_session.id.clone());
+            continue;
+        }
+        match path_is_under_declared_root(Path::new(cwd), Path::new(declared)) {
+            Ok(true) => {}
+            Ok(false) => {
+                offending_ids.push(command_session.id.clone());
+                offending_cwds.push(cwd.to_string());
+            }
+            Err(error) => unresolved.push(format!("{}: {error}", command_session.id)),
+        }
+    }
+
+    if !offending_ids.is_empty() {
+        return json!({
+            "status": "blocked",
+            "reason": "one or more command sessions ran outside the declared working_dir",
+            "declared_working_dir": declared,
+            "observed_cwds": observed,
+            "offending_command_session_ids": offending_ids,
+            "offending_cwds": offending_cwds,
+        });
+    }
+    if !missing_ids.is_empty() {
+        return json!({
+            "status": "pending",
+            "reason": format!("cwd not recorded for command session(s): {}", missing_ids.join(", ")),
+            "declared_working_dir": declared,
+            "observed_cwds": observed,
+            "offending_command_session_ids": [],
+            "offending_cwds": [],
+        });
+    }
+    if !unresolved.is_empty() {
+        return json!({
+            "status": "pending",
+            "reason": format!("could not resolve command session cwd(s): {}", unresolved.join("; ")),
+            "declared_working_dir": declared,
+            "observed_cwds": observed,
+            "offending_command_session_ids": [],
+            "offending_cwds": [],
+        });
+    }
+
+    json!({
+        "status": "satisfied",
+        "reason": "",
+        "declared_working_dir": declared,
+        "observed_cwds": observed,
+        "offending_command_session_ids": [],
+        "offending_cwds": [],
+    })
+}
+
+fn path_is_under_declared_root(path: &Path, root: &Path) -> Result<bool> {
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("could not resolve cwd '{}'", path.display()))?;
+    let root = root.canonicalize().with_context(|| {
+        format!(
+            "could not resolve declared working_dir '{}'",
+            root.display()
+        )
+    })?;
+    Ok(path.starts_with(root))
+}
+
+fn context_integrity_metadata_with_session_state(
+    state: &AppState,
+    session: &SessionSummary,
+    job: &JobSummary,
+    job_id: &str,
+) -> Result<Value> {
+    let mut metadata = job.metadata_json.clone();
+    let existing_blocked = metadata
+        .get("session_state_evidence")
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        == Some("blocked");
+    let evidence = if existing_blocked {
+        metadata
+            .get("session_state_evidence")
+            .cloned()
+            .unwrap_or_else(|| json!({}))
+    } else {
+        session_state_evidence_and_refresh(state, session, job_id)?
+    };
+    if evidence
+        .as_object()
+        .is_some_and(|object| !object.is_empty())
+    {
+        metadata["session_state_evidence"] = evidence;
+    }
+    Ok(metadata)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedSessionGitState {
+    git_head: String,
+    git_branch: String,
+    git_dirty: bool,
+    git_untracked_count: usize,
+}
+
+fn session_state_evidence_and_refresh(
+    state: &AppState,
+    session: &SessionSummary,
+    job_id: &str,
+) -> Result<Value> {
+    let Some(worktree_path) = declared_session_git_path(session) else {
+        return Ok(json!({}));
+    };
+    if !worktree_path.is_dir() {
+        return Ok(json!({
+            "status": "blocked",
+            "reason": "worktree missing",
+            "stored": stored_session_git_state_json(session),
+            "observed": {},
+            "worktree_path": worktree_path.display().to_string(),
+            "audit_hint": "If a daemon-observed mutation explains this drift, inspect audit_events for the matching job/session."
+        }));
+    }
+    let observed = match observe_session_git_state(&worktree_path) {
+        Ok(observed) => observed,
+        Err(error) => {
+            return Ok(json!({
+                "status": "pending",
+                "reason": format!("git rev-parse failed: {error}"),
+                "stored": stored_session_git_state_json(session),
+                "observed": {},
+                "worktree_path": worktree_path.display().to_string(),
+                "audit_hint": "Retry session-state refresh once the worktree is a readable git checkout."
+            }));
+        }
+    };
+    let stored = ObservedSessionGitState {
+        git_head: session.git_head.clone(),
+        git_branch: session.git_branch.clone(),
+        git_dirty: session.git_dirty,
+        git_untracked_count: session.git_untracked_count,
+    };
+    let legacy_uninitialized =
+        stored.git_head.trim().is_empty() && stored.git_branch.trim().is_empty();
+    let drifted = !legacy_uninitialized && stored != observed;
+    let matching_audit = if drifted {
+        mutation_audit_explaining_session_state(state, session, job_id)?
+    } else {
+        None
+    };
+    let matching_command_session = if drifted && matching_audit.is_none() {
+        mutation_command_session_explaining_session_state(state, job_id)?
+    } else {
+        None
+    };
+    let observed_at = unix_timestamp();
+    let _ = state.store.update_session(
+        &session.id,
+        SessionPatch {
+            git_head: Some(observed.git_head.clone()),
+            git_branch: Some(observed.git_branch.clone()),
+            git_dirty: Some(observed.git_dirty),
+            git_untracked_count: Some(observed.git_untracked_count),
+            session_state_observed_at: Some(Some(observed_at)),
+            ..SessionPatch::default()
+        },
+    )?;
+
+    let (status, reason, audit_event_id, command_session_id) = if drifted {
+        if let Some(audit) = matching_audit {
+            (
+                "satisfied",
+                format!("drift explained by audit event {}", audit.id),
+                Some(audit.id),
+                None,
+            )
+        } else if let Some(command_session) = matching_command_session {
+            (
+                "satisfied",
+                format!("drift explained by command session {}", command_session.id),
+                None,
+                Some(command_session.id),
+            )
+        } else {
+            (
+                "blocked",
+                "stored session git metadata differed from observed disk state without a matching daemon-observed mutation".to_string(),
+                None,
+                None,
+            )
+        }
+    } else if legacy_uninitialized {
+        (
+            "satisfied",
+            "legacy session git metadata was initialized from disk".to_string(),
+            None,
+            None,
+        )
+    } else {
+        ("satisfied", String::new(), None, None)
+    };
+
+    Ok(json!({
+        "status": status,
+        "reason": reason,
+        "stored": stored_session_git_state_json_from(&stored),
+        "observed": stored_session_git_state_json_from(&observed),
+        "observed_at": observed_at,
+        "audit_event_id": audit_event_id,
+        "mutation_command_session_id": command_session_id,
+        "audit_hint": "If a daemon-observed mutation exists but was not matched, inspect audit_events around this job/session and compare the mutation target to the stored/observed values."
+    }))
+}
+
+fn declared_session_git_path(session: &SessionSummary) -> Option<PathBuf> {
+    session.session_state_observed_at?;
+    [session.worktree_path.as_str(), session.git_root.as_str()]
+        .into_iter()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            let has_stored_git_state =
+                !session.git_head.trim().is_empty() || !session.git_branch.trim().is_empty();
+            has_stored_git_state
+                .then(|| session.working_dir.trim())
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+}
+
+fn observe_session_git_state(worktree_path: &Path) -> Result<ObservedSessionGitState> {
+    let git_head = git_command_stdout(worktree_path, &["rev-parse", "HEAD"])?;
+    let git_branch = git_stdout(worktree_path, &["symbolic-ref", "--short", "HEAD"])
+        .or_else(|| git_stdout(worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"]))
+        .unwrap_or_default();
+    let status = git_command_stdout(worktree_path, &["status", "--porcelain"])?;
+    let git_untracked_count = status.lines().filter(|line| line.starts_with("??")).count();
+    Ok(ObservedSessionGitState {
+        git_head,
+        git_branch,
+        git_dirty: !status.trim().is_empty(),
+        git_untracked_count,
+    })
+}
+
+fn git_command_stdout(cwd: &Path, args: &[&str]) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        bail!("git {} failed", args.join(" "));
+    }
+    bail!("{stderr}");
+}
+
+fn stored_session_git_state_json(session: &SessionSummary) -> Value {
+    json!({
+        "git_head": session.git_head,
+        "git_branch": session.git_branch,
+        "git_dirty": session.git_dirty,
+        "git_untracked_count": session.git_untracked_count,
+    })
+}
+
+fn stored_session_git_state_json_from(state: &ObservedSessionGitState) -> Value {
+    json!({
+        "git_head": state.git_head,
+        "git_branch": state.git_branch,
+        "git_dirty": state.git_dirty,
+        "git_untracked_count": state.git_untracked_count,
+    })
+}
+
+fn mutation_audit_explaining_session_state(
+    state: &AppState,
+    session: &SessionSummary,
+    job_id: &str,
+) -> Result<Option<nucleus_protocol::AuditEvent>> {
+    let since = session
+        .session_state_observed_at
+        .unwrap_or(session.created_at.saturating_sub(1));
+    let events = state.store.list_audit_events_since(since)?;
+    Ok(events.into_iter().find(|event| {
+        let haystack = format!(
+            "{} {} {} {}",
+            event.kind, event.target, event.summary, event.detail
+        )
+        .to_ascii_lowercase();
+        let mentions_scope = event.target.contains(&session.id)
+            || event.target.contains(job_id)
+            || event.detail.contains(&session.id)
+            || event.detail.contains(job_id)
+            || event.kind.starts_with("job.")
+            || event.kind.starts_with("worker.");
+        mentions_scope
+            && haystack.contains("git")
+            && ["commit", "checkout", "switch", "merge", "pull", "reset"]
+                .iter()
+                .any(|needle| haystack.contains(needle))
+    }))
+}
+
+fn mutation_command_session_explaining_session_state(
+    state: &AppState,
+    job_id: &str,
+) -> Result<Option<CommandSessionSummary>> {
+    let Ok(detail) = state.store.get_job(job_id) else {
+        return Ok(None);
+    };
+    Ok(detail
+        .command_sessions
+        .into_iter()
+        .find(is_git_mutation_command_session))
+}
+
+fn is_git_mutation_command_session(command_session: &CommandSessionSummary) -> bool {
+    if command_session.state != "completed" || command_session.exit_code != Some(0) {
+        return false;
+    }
+    let text = std::iter::once(command_session.command.as_str())
+        .chain(command_session.args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    text.starts_with("git commit")
+        || text.starts_with("git checkout")
+        || text.starts_with("git switch")
+        || text.starts_with("git merge")
+        || text.starts_with("git pull")
+        || text.starts_with("git reset")
+        || text.contains(" git commit")
+        || text.contains(" git checkout")
+        || text.contains(" git switch")
+        || text.contains(" git merge")
+        || text.contains(" git pull")
+        || text.contains(" git reset")
 }
 
 fn context_integrity_patch(
@@ -5206,7 +5608,10 @@ fn context_integrity_start_blocker(job: &JobSummary) -> Option<String> {
         .find(|gate| {
             matches!(
                 gate.id.as_str(),
-                "worktree_base_fresh" | "branch_repo_consistent"
+                "worktree_base_fresh"
+                    | "branch_repo_consistent"
+                    | "cwd_consistent"
+                    | "session_state_consistent"
             ) && gate.state == "blocked"
         })
         .map(|gate| gate.summary.clone())
@@ -5268,13 +5673,38 @@ async fn block_job_for_context_integrity(
 }
 
 fn context_integrity_event_summary(job: &JobSummary) -> String {
+    let cwd_status = job
+        .command_session_cwd_evidence_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|value| {
+            value
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let session_state_status = job
+        .metadata_json
+        .get("session_state_evidence")
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     match (
         job.worktree_base_status.as_str(),
         job.branch_repo_status.as_str(),
+        cwd_status.as_str(),
+        session_state_status,
     ) {
-        ("blocked", _) | (_, "blocked") => "Context integrity is blocked.".to_string(),
-        ("pending", _) | (_, "pending") => "Context integrity is pending.".to_string(),
-        ("", "") => "Context integrity did not run for this job.".to_string(),
+        ("blocked", _, _, _)
+        | (_, "blocked", _, _)
+        | (_, _, "blocked", _)
+        | (_, _, _, "blocked") => "Context integrity is blocked.".to_string(),
+        ("pending", _, _, _)
+        | (_, "pending", _, _)
+        | (_, _, "pending", _)
+        | (_, _, _, "pending") => "Context integrity is pending.".to_string(),
+        ("", "", "", "") => "Context integrity did not run for this job.".to_string(),
         _ => "Context integrity evidence recorded.".to_string(),
     }
 }
@@ -5293,7 +5723,46 @@ fn context_integrity_event_detail(job: &JobSummary) -> String {
     } else {
         format!("{} ({})", job.branch_repo_status, job.branch_repo_reason)
     };
-    format!("worktree_base={base}; branch_repo={branch}")
+    let cwd = job
+        .command_session_cwd_evidence_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .map(|value| {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let reason = value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if reason.trim().is_empty() {
+                status.to_string()
+            } else {
+                format!("{status} ({reason})")
+            }
+        })
+        .unwrap_or_default();
+    let session_state = job
+        .metadata_json
+        .get("session_state_evidence")
+        .map(|value| {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let reason = value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if reason.trim().is_empty() {
+                status.to_string()
+            } else {
+                format!("{status} ({reason})")
+            }
+        })
+        .unwrap_or_default();
+    format!("worktree_base={base}; branch_repo={branch}; cwd={cwd}; session_state={session_state}")
 }
 
 fn add_budget_guidance(
@@ -6351,6 +6820,8 @@ fn projected_completion_gate_blocker(
         projected.cleanup_paths = value.clone();
     }
 
+    let publication_requested = projected.publication_requested;
+
     projected
         .with_completion_gates()
         .completion_gates
@@ -6360,8 +6831,11 @@ fn projected_completion_gate_blocker(
                 || (gate.state == "pending"
                     && matches!(
                         gate.id.as_str(),
-                        "worktree_base_fresh" | "branch_repo_consistent"
+                        "worktree_base_fresh"
+                            | "branch_repo_consistent"
+                            | "session_state_consistent"
                     ))
+                || (gate.state == "pending" && gate.id == "cwd_consistent" && publication_requested)
         })
         .map(|gate| gate.summary)
 }
@@ -8205,6 +8679,7 @@ fn build_execution_session(worker: &WorkerSummary) -> SessionSummary {
         git_dirty: false,
         git_untracked_count: 0,
         git_remote_tracking_branch: String::new(),
+        session_state_observed_at: None,
         workspace_warnings: Vec::new(),
         scope: "job".to_string(),
         approval_mode: "ask".to_string(),
@@ -8267,6 +8742,7 @@ pub(crate) async fn resolve_utility_worker_execution_session(
         git_dirty: session.git_dirty,
         git_untracked_count: session.git_untracked_count,
         git_remote_tracking_branch: session.git_remote_tracking_branch.clone(),
+        session_state_observed_at: session.session_state_observed_at,
         workspace_warnings: Vec::new(),
         scope: "job".to_string(),
         approval_mode: "ask".to_string(),
@@ -13769,6 +14245,7 @@ async fn create_playbook_session(
         git_dirty: false,
         git_untracked_count: 0,
         git_remote_tracking_branch: String::new(),
+        session_state_observed_at: None,
         workspace_warnings: Vec::new(),
         approval_mode: "ask".to_string(),
         execution_mode: "act".to_string(),
@@ -15031,6 +15508,7 @@ mod tests {
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             scope: if projects.len() > 1 {
                 "multi_project".to_string()
@@ -19678,6 +20156,8 @@ Cleanup status: clean";
             worktree_behind_by: None,
             branch_repo_status: String::new(),
             branch_repo_reason: String::new(),
+            command_session_cwd_evidence_json: None,
+            session_state_observed_at: None,
             completion_status: String::new(),
             completion_gates: Vec::new(),
             completion_blockers: Vec::new(),
@@ -19761,6 +20241,8 @@ Cleanup status: clean";
             worktree_behind_by: None,
             branch_repo_status: String::new(),
             branch_repo_reason: String::new(),
+            command_session_cwd_evidence_json: None,
+            session_state_observed_at: None,
             completion_status: String::new(),
             completion_gates: Vec::new(),
             completion_blockers: Vec::new(),
@@ -20165,6 +20647,190 @@ Cleanup status: clean";
     }
 
     #[test]
+    fn cwd_consistency_detection_covers_happy_blocked_scratch_and_missing_cwd() {
+        let state_dir = test_state_dir("cwd-consistency-detection");
+        let declared = state_dir.join("declared");
+        let nested = declared.join("nested");
+        let outside = state_dir.join("outside");
+        fs::create_dir_all(&nested).expect("nested dir should exist");
+        fs::create_dir_all(&outside).expect("outside dir should exist");
+        let mut session = scope_test_session(
+            declared.to_str().expect("declared path utf8"),
+            "project_root",
+            "shared_project_root",
+            Vec::new(),
+        );
+
+        let happy = command_session_cwd_evidence(
+            &session,
+            &[test_command_session_summary("cmd-ok", &nested)],
+        );
+        assert_eq!(happy["status"], "satisfied");
+
+        let blocked = command_session_cwd_evidence(
+            &session,
+            &[test_command_session_summary("cmd-outside", &outside)],
+        );
+        assert_eq!(blocked["status"], "blocked");
+        assert_eq!(blocked["offending_command_session_ids"][0], "cmd-outside");
+        assert_eq!(
+            blocked["declared_working_dir"],
+            declared.to_str().expect("declared path utf8")
+        );
+
+        let missing = command_session_cwd_evidence(
+            &session,
+            &[test_command_session_with_cwd("cmd-missing", "")],
+        );
+        assert_eq!(missing["status"], "pending");
+        assert!(
+            missing["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cwd not recorded")
+        );
+
+        session.working_dir = String::new();
+        let scratch = command_session_cwd_evidence(
+            &session,
+            &[test_command_session_summary("cmd-scratch", &outside)],
+        );
+        assert_eq!(scratch["status"], "satisfied");
+        assert!(
+            scratch["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("trivially satisfied")
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn session_state_detection_refreshes_and_blocks_unexplained_drift() {
+        let state_dir = test_state_dir("session-state-drift-detection");
+        let state = initialize_test_state(&state_dir);
+        let repo = context_integrity_repo(&state_dir, "session-state");
+        let head = git_stdout(&repo.worktree, &["rev-parse", "HEAD"]).expect("head sha");
+        state
+            .store
+            .create_session(SessionRecord {
+                id: "state-session".to_string(),
+                title: "State session".to_string(),
+                profile_id: String::new(),
+                profile_title: String::new(),
+                route_id: String::new(),
+                route_title: String::new(),
+                scope: "project".to_string(),
+                project_id: String::new(),
+                project_title: String::new(),
+                project_path: repo.source.display().to_string(),
+                project_ids: Vec::new(),
+                provider: "openai_compatible".to_string(),
+                model: "test-model".to_string(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                working_dir: repo.worktree.display().to_string(),
+                working_dir_kind: "project_root".to_string(),
+                workspace_mode: "isolated_worktree".to_string(),
+                source_project_path: repo.source.display().to_string(),
+                git_root: repo.worktree.display().to_string(),
+                worktree_path: repo.worktree.display().to_string(),
+                git_branch: "dev".to_string(),
+                git_base_ref: "dev".to_string(),
+                git_head: head.clone(),
+                git_dirty: false,
+                git_untracked_count: 0,
+                git_remote_tracking_branch: "origin/dev".to_string(),
+                session_state_observed_at: Some(1),
+                workspace_warnings: Vec::new(),
+                approval_mode: "ask".to_string(),
+                execution_mode: "act".to_string(),
+                run_budget_mode: "inherit".to_string(),
+            })
+            .expect("session should persist");
+
+        let session = state
+            .store
+            .get_session("state-session")
+            .expect("session should load")
+            .session;
+        let happy = session_state_evidence_and_refresh(&state, &session, "state-job")
+            .expect("session state should refresh");
+        assert_eq!(happy["status"], "satisfied");
+
+        state
+            .store
+            .update_session(
+                "state-session",
+                SessionPatch {
+                    git_head: Some("stale-head".to_string()),
+                    session_state_observed_at: Some(Some(1)),
+                    ..SessionPatch::default()
+                },
+            )
+            .expect("stale session should persist");
+        let stale_session = state
+            .store
+            .get_session("state-session")
+            .expect("session should reload")
+            .session;
+        let blocked = session_state_evidence_and_refresh(&state, &stale_session, "state-job")
+            .expect("session state should refresh stale row");
+        assert_eq!(blocked["status"], "blocked");
+        assert_eq!(blocked["stored"]["git_head"], "stale-head");
+        assert_eq!(blocked["observed"]["git_head"], head);
+        let refreshed = state
+            .store
+            .get_session("state-session")
+            .expect("session should reload after refresh")
+            .session;
+        assert_eq!(refreshed.git_head, head);
+        assert!(refreshed.session_state_observed_at.is_some());
+
+        state
+            .store
+            .update_session(
+                "state-session",
+                SessionPatch {
+                    git_head: Some("stale-again".to_string()),
+                    session_state_observed_at: Some(Some(1)),
+                    ..SessionPatch::default()
+                },
+            )
+            .expect("stale session should persist again");
+        state
+            .store
+            .append_audit_event(AuditEventRecord {
+                kind: "worker.git.checkout".to_string(),
+                target: "job:state-job".to_string(),
+                status: "success".to_string(),
+                summary: "Worker git checkout updated HEAD.".to_string(),
+                detail: "job_id=state-job session_id=state-session git checkout dev".to_string(),
+            })
+            .expect("audit event should persist");
+        let stale_session = state
+            .store
+            .get_session("state-session")
+            .expect("session should reload")
+            .session;
+        let explained = session_state_evidence_and_refresh(&state, &stale_session, "state-job")
+            .expect("session state should refresh explained drift");
+        assert_eq!(explained["status"], "satisfied");
+        assert!(explained["audit_event_id"].as_i64().is_some());
+
+        let mut missing = stale_session;
+        missing.worktree_path = state_dir.join("deleted-worktree").display().to_string();
+        missing.git_root = missing.worktree_path.clone();
+        let missing_evidence = session_state_evidence_and_refresh(&state, &missing, "state-job")
+            .expect("missing worktree should be reported");
+        assert_eq!(missing_evidence["status"], "blocked");
+        assert_eq!(missing_evidence["reason"], "worktree missing");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
     fn terminal_projection_blocks_pending_context_integrity_gate() {
         let mut job = test_publication_job_summary("context-pending");
         job.task_class = Some("local_project".to_string());
@@ -20177,6 +20843,63 @@ Cleanup status: clean";
         let blocker = projected_completion_gate_blocker(&job, &PublicationOutcomePatch::default())
             .expect("pending context gate should block terminal projection");
         assert!(blocker.contains("pending"));
+
+        let mut cwd_pending = test_publication_job_summary("cwd-pending");
+        cwd_pending.task_class = Some("local_project".to_string());
+        cwd_pending.publication_requested = false;
+        cwd_pending.publication_status = "not_requested".to_string();
+        cwd_pending.browser_verification_status = "not_required".to_string();
+        cwd_pending.validation_status = "passed".to_string();
+        cwd_pending.cleanup_status = "clean".to_string();
+        cwd_pending.command_session_cwd_evidence_json = Some(
+            json!({
+                "status": "pending",
+                "reason": "no command sessions recorded yet",
+                "declared_working_dir": "/repo",
+                "observed_cwds": [],
+                "offending_command_session_ids": [],
+                "offending_cwds": [],
+            })
+            .to_string(),
+        );
+        assert!(
+            projected_completion_gate_blocker(&cwd_pending, &PublicationOutcomePatch::default())
+                .is_none(),
+            "pending cwd evidence should not block text-only non-publication jobs"
+        );
+
+        cwd_pending.publication_requested = true;
+        cwd_pending.publication_status = "opened".to_string();
+        cwd_pending.pr_url = "https://github.com/WebLime-agency/nucleus/pull/277".to_string();
+        cwd_pending.target_branch = "dev".to_string();
+        let blocker =
+            projected_completion_gate_blocker(&cwd_pending, &PublicationOutcomePatch::default())
+                .expect("pending cwd evidence should block publication terminal projection");
+        assert!(
+            blocker.contains("cwd evidence is pending"),
+            "unexpected blocker: {blocker}"
+        );
+
+        let mut session_state_blocked = test_publication_job_summary("session-state-blocked");
+        session_state_blocked.task_class = Some("local_project".to_string());
+        session_state_blocked.publication_requested = false;
+        session_state_blocked.publication_status = "not_requested".to_string();
+        session_state_blocked.browser_verification_status = "not_required".to_string();
+        session_state_blocked.validation_status = "passed".to_string();
+        session_state_blocked.metadata_json = json!({
+            "session_state_evidence": {
+                "status": "blocked",
+                "reason": "stored session git metadata differed from observed disk state",
+                "stored": {"git_head": "old"},
+                "observed": {"git_head": "new"}
+            }
+        });
+        let blocker = projected_completion_gate_blocker(
+            &session_state_blocked,
+            &PublicationOutcomePatch::default(),
+        )
+        .expect("blocked session-state gate should block terminal projection");
+        assert!(blocker.contains("drifted"));
     }
 
     #[tokio::test]
@@ -20353,6 +21076,7 @@ Cleanup status: clean";
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             scope: "project".to_string(),
             approval_mode: "trusted".to_string(),
@@ -20465,6 +21189,7 @@ Cleanup status: clean";
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
@@ -20541,6 +21266,7 @@ Cleanup status: clean";
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
@@ -20846,6 +21572,7 @@ Cleanup status: clean";
                 git_dirty: false,
                 git_untracked_count: 0,
                 git_remote_tracking_branch: String::new(),
+                session_state_observed_at: None,
                 workspace_warnings: Vec::new(),
                 approval_mode: "ask".to_string(),
                 execution_mode: "act".to_string(),
@@ -21367,6 +22094,7 @@ Cleanup status: clean";
                 git_dirty: false,
                 git_untracked_count: 0,
                 git_remote_tracking_branch: String::new(),
+                session_state_observed_at: None,
                 workspace_warnings: Vec::new(),
                 approval_mode: "ask".to_string(),
                 execution_mode: "act".to_string(),
@@ -21465,6 +22193,7 @@ Cleanup status: clean";
                 git_dirty: false,
                 git_untracked_count: 0,
                 git_remote_tracking_branch: String::new(),
+                session_state_observed_at: None,
                 workspace_warnings: Vec::new(),
                 approval_mode: "ask".to_string(),
                 execution_mode: "act".to_string(),
@@ -22739,6 +23468,7 @@ Cleanup status: clean";
                 git_dirty: false,
                 git_untracked_count: 0,
                 git_remote_tracking_branch: String::new(),
+                session_state_observed_at: None,
                 workspace_warnings: Vec::new(),
                 approval_mode: "ask".to_string(),
                 execution_mode: "act".to_string(),
@@ -24191,6 +24921,7 @@ for line in sys.stdin:
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
@@ -24320,6 +25051,8 @@ for line in sys.stdin:
             worktree_behind_by: None,
             branch_repo_status: String::new(),
             branch_repo_reason: String::new(),
+            command_session_cwd_evidence_json: None,
+            session_state_observed_at: None,
             completion_status: String::new(),
             completion_gates: Vec::new(),
             completion_blockers: Vec::new(),
@@ -24525,6 +25258,41 @@ for line in sys.stdin:
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+        }
+    }
+
+    fn test_command_session_summary(id: &str, cwd: &Path) -> CommandSessionSummary {
+        test_command_session_with_cwd(id, cwd.to_str().expect("cwd path utf8"))
+    }
+
+    fn test_command_session_with_cwd(id: &str, cwd: &str) -> CommandSessionSummary {
+        CommandSessionSummary {
+            id: id.to_string(),
+            job_id: "job".to_string(),
+            worker_id: "worker".to_string(),
+            tool_call_id: None,
+            mode: "oneshot".to_string(),
+            title: "Test command".to_string(),
+            state: "completed".to_string(),
+            command: "pwd".to_string(),
+            args: Vec::new(),
+            cwd: cwd.to_string(),
+            session_id: "session".to_string(),
+            project_id: String::new(),
+            worktree_path: String::new(),
+            branch: String::new(),
+            port: None,
+            network_policy: "inherit".to_string(),
+            timeout_secs: 30,
+            output_limit_bytes: 1024,
+            last_error: String::new(),
+            exit_code: Some(0),
+            stdout_artifact_id: None,
+            stderr_artifact_id: None,
+            started_at: Some(1),
+            completed_at: Some(2),
+            created_at: 1,
+            updated_at: 2,
         }
     }
 }
