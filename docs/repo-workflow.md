@@ -46,6 +46,13 @@ CI expectations:
 - Rust: `cargo fmt --all --check` and `cargo test`
 - Web: `npm run check:web` and `npm run build:web`
 
+Context integrity gates:
+
+- Utility Worker jobs attached to git worktrees record daemon-observed context integrity evidence before the worker starts and again before terminal completion projection.
+- `worktree_base_fresh` compares the worktree HEAD with the fetched canonical `origin/<base_ref>` state. The default base ref is `dev` when session metadata does not declare one.
+- `branch_repo_consistent` compares the worktree `origin` URL and checked-out branch with the session's declared project origin and `git_branch`.
+- A job may carry metadata shaped as `{"worktree_base_override":{"allowed_behind_by":1,"reason":"intentional backport"}}` to relax the stale-base threshold for intentional backport work. Omitting `allowed_behind_by` treats the override as a waiver for stale-base freshness only; branch/repo mismatches and missing canonical remotes still block.
+
 Branch settings that should stay in place:
 
 - `dev` protected with required PRs and CI

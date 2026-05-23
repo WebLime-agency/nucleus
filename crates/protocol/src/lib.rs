@@ -297,6 +297,32 @@ pub struct JobSummary {
     #[serde(default)]
     pub task_evidence: Vec<String>,
     #[serde(default)]
+    pub metadata_json: Value,
+    #[serde(default)]
+    pub worktree_base_ref: String,
+    #[serde(default)]
+    pub worktree_base_status: String,
+    #[serde(default)]
+    pub worktree_base_reason: String,
+    #[serde(default)]
+    pub worktree_origin_url: String,
+    #[serde(default)]
+    pub expected_origin_url: String,
+    #[serde(default)]
+    pub observed_git_branch: String,
+    #[serde(default)]
+    pub expected_git_branch: String,
+    #[serde(default)]
+    pub worktree_head_sha: String,
+    #[serde(default)]
+    pub canonical_base_sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_behind_by: Option<i64>,
+    #[serde(default)]
+    pub branch_repo_status: String,
+    #[serde(default)]
+    pub branch_repo_reason: String,
+    #[serde(default)]
     pub completion_status: String,
     #[serde(default)]
     pub completion_gates: Vec<CompletionGateSummary>,
@@ -381,6 +407,7 @@ fn derive_completion_gates(job: &JobSummary) -> Vec<CompletionGateSummary> {
         && !job.publication_requested
         && !job.browser_verification_required
         && job.cleanup_status != "cleanup_required"
+        && !has_context_integrity_gate_state(job)
     {
         return Vec::new();
     }
@@ -406,6 +433,14 @@ fn derive_completion_gates(job: &JobSummary) -> Vec<CompletionGateSummary> {
         gates.push(cleanup_gate(job, terminal));
     }
 
+    if has_worktree_base_gate_state(job) {
+        gates.push(worktree_base_gate(job));
+    }
+
+    if has_branch_repo_gate_state(job) {
+        gates.push(branch_repo_gate(job));
+    }
+
     if let Some(task_class) = task_class {
         if !job.publication_requested || task_class != "github_pr" {
             if let Some(gate) = task_class_gate(job, terminal, task_class) {
@@ -419,6 +454,23 @@ fn derive_completion_gates(job: &JobSummary) -> Vec<CompletionGateSummary> {
 
 pub fn task_evidence_contract_catalog() -> Vec<TaskEvidenceContractSummary> {
     vec![
+        task_evidence_contract(
+            "context_integrity",
+            "Context integrity",
+            "Ground session context claims in daemon-observed worktree freshness and branch/repo consistency evidence.",
+            &[
+                (
+                    "worktree_base_evidence",
+                    "Worktree base evidence",
+                    "Record worktree HEAD, canonical base SHA, and commits behind canonical before work begins.",
+                ),
+                (
+                    "branch_repo_evidence",
+                    "Branch/repo evidence",
+                    "Record observed and expected origin URLs plus observed and expected branch names.",
+                ),
+            ],
+        ),
         task_evidence_contract(
             "github_pr",
             "GitHub/PR work",
@@ -775,6 +827,130 @@ fn task_class_gate(
         "memory_session" => Some(memory_session_gate(job, terminal)),
         "process_server" => Some(process_server_gate(job, terminal)),
         _ => None,
+    }
+}
+
+fn has_context_integrity_gate_state(job: &JobSummary) -> bool {
+    has_worktree_base_gate_state(job) || has_branch_repo_gate_state(job)
+}
+
+fn has_worktree_base_gate_state(job: &JobSummary) -> bool {
+    !matches!(
+        job.worktree_base_status.trim(),
+        "" | "not_applicable" | "not_applicable_missing_context"
+    )
+}
+
+fn has_branch_repo_gate_state(job: &JobSummary) -> bool {
+    !matches!(
+        job.branch_repo_status.trim(),
+        "" | "not_applicable" | "not_applicable_missing_context"
+    )
+}
+
+fn worktree_base_gate(job: &JobSummary) -> CompletionGateSummary {
+    let state = match job.worktree_base_status.as_str() {
+        "satisfied" | "waived" => "done",
+        "blocked" => "blocked",
+        _ => "pending",
+    };
+    let behind = job
+        .worktree_behind_by
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let summary = match job.worktree_base_status.as_str() {
+        "satisfied" => format!(
+            "Worktree base is fresh against {}.",
+            empty_fallback(&job.worktree_base_ref, "the declared base")
+        ),
+        "waived" => format!(
+            "Worktree base freshness is waived{}.",
+            prefixed_reason(&job.worktree_base_reason)
+        ),
+        "blocked" => format!(
+            "Worktree is {behind} commit(s) behind {}{}.",
+            empty_fallback(&job.worktree_base_ref, "the declared base"),
+            prefixed_reason(&job.worktree_base_reason)
+        ),
+        _ => format!(
+            "Worktree base freshness is pending{}.",
+            prefixed_reason(&job.worktree_base_reason)
+        ),
+    };
+
+    completion_gate(
+        "worktree_base_fresh",
+        "Worktree base freshness",
+        state,
+        summary,
+        "context_integrity",
+        required_evidence_for("context_integrity", &["worktree_base_evidence"]),
+        worktree_base_evidence(job),
+    )
+}
+
+fn branch_repo_gate(job: &JobSummary) -> CompletionGateSummary {
+    let state = match job.branch_repo_status.as_str() {
+        "satisfied" => "done",
+        "blocked" => "blocked",
+        _ => "pending",
+    };
+    let summary = match state {
+        "done" => "Worktree origin and branch match the declared session project.".to_string(),
+        "pending" => format!(
+            "Branch/repo consistency is pending{}.",
+            prefixed_reason(&job.branch_repo_reason)
+        ),
+        _ => format!(
+            "Worktree origin or branch does not match the declared session project{}.",
+            prefixed_reason(&job.branch_repo_reason)
+        ),
+    };
+
+    completion_gate(
+        "branch_repo_consistent",
+        "Branch/repo consistency",
+        state,
+        summary,
+        "context_integrity",
+        required_evidence_for("context_integrity", &["branch_repo_evidence"]),
+        branch_repo_evidence(job),
+    )
+}
+
+fn worktree_base_evidence(job: &JobSummary) -> Vec<String> {
+    [
+        non_empty_evidence("base_ref", &job.worktree_base_ref),
+        non_empty_evidence("head", &job.worktree_head_sha),
+        non_empty_evidence("canonical", &job.canonical_base_sha),
+        job.worktree_behind_by
+            .map(|count| format!("behind_by {count}")),
+        non_empty_evidence("origin", &job.worktree_origin_url),
+        non_empty_evidence("reason", &job.worktree_base_reason),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn branch_repo_evidence(job: &JobSummary) -> Vec<String> {
+    [
+        non_empty_evidence("observed_origin", &job.worktree_origin_url),
+        non_empty_evidence("expected_origin", &job.expected_origin_url),
+        non_empty_evidence("observed_branch", &job.observed_git_branch),
+        non_empty_evidence("expected_branch", &job.expected_git_branch),
+        non_empty_evidence("reason", &job.branch_repo_reason),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn prefixed_reason(reason: &str) -> String {
+    if reason.trim().is_empty() {
+        String::new()
+    } else {
+        format!(": {}", reason.trim())
     }
 }
 
@@ -2055,6 +2231,8 @@ pub struct ProjectSummary {
     pub slug: String,
     pub relative_path: String,
     pub absolute_path: String,
+    #[serde(default)]
+    pub origin_url: String,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -2634,6 +2812,19 @@ mod tests {
             cleanup_status: "unknown".to_string(),
             cleanup_paths: Vec::new(),
             task_evidence: Vec::new(),
+            metadata_json: json!({}),
+            worktree_base_ref: String::new(),
+            worktree_base_status: String::new(),
+            worktree_base_reason: String::new(),
+            worktree_origin_url: String::new(),
+            expected_origin_url: String::new(),
+            observed_git_branch: String::new(),
+            expected_git_branch: String::new(),
+            worktree_head_sha: String::new(),
+            canonical_base_sha: String::new(),
+            worktree_behind_by: None,
+            branch_repo_status: String::new(),
+            branch_repo_reason: String::new(),
             completion_status: String::new(),
             completion_gates: Vec::new(),
             completion_blockers: Vec::new(),
@@ -2698,6 +2889,19 @@ mod tests {
             cleanup_status: "clean".to_string(),
             cleanup_paths: Vec::new(),
             task_evidence: Vec::new(),
+            metadata_json: json!({}),
+            worktree_base_ref: String::new(),
+            worktree_base_status: String::new(),
+            worktree_base_reason: String::new(),
+            worktree_origin_url: String::new(),
+            expected_origin_url: String::new(),
+            observed_git_branch: String::new(),
+            expected_git_branch: String::new(),
+            worktree_head_sha: String::new(),
+            canonical_base_sha: String::new(),
+            worktree_behind_by: None,
+            branch_repo_status: String::new(),
+            branch_repo_reason: String::new(),
             completion_status: String::new(),
             completion_gates: Vec::new(),
             completion_blockers: Vec::new(),
@@ -2747,6 +2951,7 @@ mod tests {
     fn task_evidence_contract_catalog_covers_grounding_classes() {
         let catalog = task_evidence_contract_catalog();
         for task_class in [
+            "context_integrity",
             "github_pr",
             "research",
             "automation",
@@ -2759,8 +2964,119 @@ mod tests {
                 .iter()
                 .find(|contract| contract.task_class == task_class)
                 .unwrap_or_else(|| panic!("{task_class} contract should be present"));
-            assert!(contract.requirements.len() >= 3);
+            assert!(contract.requirements.len() >= 2);
         }
+    }
+
+    #[test]
+    fn context_integrity_gates_cover_happy_blocked_pending_and_compatibility_paths() {
+        let fresh = JobSummary {
+            worktree_base_status: "satisfied".to_string(),
+            worktree_base_ref: "dev".to_string(),
+            worktree_head_sha: "head".to_string(),
+            canonical_base_sha: "head".to_string(),
+            worktree_behind_by: Some(0),
+            branch_repo_status: "satisfied".to_string(),
+            worktree_origin_url: "git@github.com:WebLime-agency/nucleus.git".to_string(),
+            expected_origin_url: "https://github.com/WebLime-agency/nucleus".to_string(),
+            observed_git_branch: "feature".to_string(),
+            expected_git_branch: "feature".to_string(),
+            ..task_class_job("local_project", vec!["validation".to_string()])
+        }
+        .with_completion_gates();
+        assert!(
+            fresh
+                .completion_gates
+                .iter()
+                .any(|gate| { gate.id == "worktree_base_fresh" && gate.state == "done" })
+        );
+        assert!(
+            fresh
+                .completion_gates
+                .iter()
+                .any(|gate| { gate.id == "branch_repo_consistent" && gate.state == "done" })
+        );
+
+        let stale = JobSummary {
+            state: "blocked".to_string(),
+            worktree_base_status: "blocked".to_string(),
+            worktree_base_ref: "dev".to_string(),
+            worktree_head_sha: "old".to_string(),
+            canonical_base_sha: "new".to_string(),
+            worktree_behind_by: Some(2),
+            worktree_base_reason: "behind canonical by 2 commit(s)".to_string(),
+            ..task_class_job("local_project", vec!["validation".to_string()])
+        }
+        .with_completion_gates();
+        let stale_gate = stale
+            .completion_gates
+            .iter()
+            .find(|gate| gate.id == "worktree_base_fresh")
+            .expect("stale base gate should be derived");
+        assert_eq!(stale_gate.state, "blocked");
+        assert!(stale_gate.evidence.iter().any(|item| item == "head old"));
+        assert!(
+            stale_gate
+                .evidence
+                .iter()
+                .any(|item| item == "canonical new")
+        );
+        assert!(stale_gate.evidence.iter().any(|item| item == "behind_by 2"));
+
+        let mismatch = JobSummary {
+            state: "blocked".to_string(),
+            branch_repo_status: "blocked".to_string(),
+            branch_repo_reason: "origin URL mismatch; branch mismatch".to_string(),
+            worktree_origin_url: "git@github.com:other/repo.git".to_string(),
+            expected_origin_url: "https://github.com/WebLime-agency/nucleus".to_string(),
+            observed_git_branch: "other".to_string(),
+            expected_git_branch: "feature".to_string(),
+            ..task_class_job("local_project", vec!["validation".to_string()])
+        }
+        .with_completion_gates();
+        let mismatch_gate = mismatch
+            .completion_gates
+            .iter()
+            .find(|gate| gate.id == "branch_repo_consistent")
+            .expect("branch/repo gate should be derived");
+        assert_eq!(mismatch_gate.state, "blocked");
+        assert!(
+            mismatch_gate
+                .evidence
+                .iter()
+                .any(|item| item == "observed_origin git@github.com:other/repo.git")
+        );
+        assert!(
+            mismatch_gate
+                .evidence
+                .iter()
+                .any(|item| item == "expected_branch feature")
+        );
+
+        let pending = JobSummary {
+            worktree_base_status: "pending".to_string(),
+            worktree_base_reason: "could not reach canonical: auth failed".to_string(),
+            ..task_class_job("local_project", vec!["validation".to_string()])
+        }
+        .with_completion_gates();
+        assert!(
+            pending
+                .completion_gates
+                .iter()
+                .any(|gate| { gate.id == "worktree_base_fresh" && gate.state == "pending" })
+        );
+
+        let backward_compatible =
+            task_class_job("local_project", vec!["validation".to_string()]).with_completion_gates();
+        assert!(
+            !backward_compatible
+                .completion_gates
+                .iter()
+                .any(|gate| matches!(
+                    gate.id.as_str(),
+                    "worktree_base_fresh" | "branch_repo_consistent"
+                ))
+        );
     }
 
     #[test]
@@ -2920,6 +3236,19 @@ mod tests {
             cleanup_status: "unknown".to_string(),
             cleanup_paths: Vec::new(),
             task_evidence,
+            metadata_json: json!({}),
+            worktree_base_ref: String::new(),
+            worktree_base_status: String::new(),
+            worktree_base_reason: String::new(),
+            worktree_origin_url: String::new(),
+            expected_origin_url: String::new(),
+            observed_git_branch: String::new(),
+            expected_git_branch: String::new(),
+            worktree_head_sha: String::new(),
+            canonical_base_sha: String::new(),
+            worktree_behind_by: None,
+            branch_repo_status: String::new(),
+            branch_repo_reason: String::new(),
             completion_status: String::new(),
             completion_gates: Vec::new(),
             completion_blockers: Vec::new(),
