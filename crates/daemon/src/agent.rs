@@ -5020,7 +5020,6 @@ fn session_state_evidence_and_refresh(
 }
 
 fn declared_session_git_path(session: &SessionSummary) -> Option<PathBuf> {
-    session.session_state_observed_at?;
     [session.worktree_path.as_str(), session.git_root.as_str()]
         .into_iter()
         .map(str::trim)
@@ -5105,8 +5104,8 @@ fn mutation_audit_explaining_session_state(
             || event.target.contains(job_id)
             || event.detail.contains(&session.id)
             || event.detail.contains(job_id)
-            || event.kind.starts_with("job.")
-            || event.kind.starts_with("worker.");
+            || event.summary.contains(&session.id)
+            || event.summary.contains(job_id);
         mentions_scope
             && haystack.contains("git")
             && ["commit", "checkout", "switch", "merge", "pull", "reset"]
@@ -20764,12 +20763,53 @@ Cleanup status: clean";
             .update_session(
                 "state-session",
                 SessionPatch {
+                    git_head: Some("legacy-stale-head".to_string()),
+                    session_state_observed_at: Some(None),
+                    ..SessionPatch::default()
+                },
+            )
+            .expect("legacy stale session should persist");
+        let legacy_session = state
+            .store
+            .get_session("state-session")
+            .expect("legacy session should reload")
+            .session;
+        let legacy_blocked =
+            session_state_evidence_and_refresh(&state, &legacy_session, "state-job")
+                .expect("legacy session state should refresh");
+        assert_eq!(legacy_blocked["status"], "blocked");
+        assert_eq!(legacy_blocked["stored"]["git_head"], "legacy-stale-head");
+        assert!(
+            state
+                .store
+                .get_session("state-session")
+                .expect("legacy session should reload after refresh")
+                .session
+                .session_state_observed_at
+                .is_some()
+        );
+
+        state
+            .store
+            .update_session(
+                "state-session",
+                SessionPatch {
                     git_head: Some("stale-head".to_string()),
                     session_state_observed_at: Some(Some(1)),
                     ..SessionPatch::default()
                 },
             )
             .expect("stale session should persist");
+        state
+            .store
+            .append_audit_event(AuditEventRecord {
+                kind: "worker.git.checkout".to_string(),
+                target: "job:other-job".to_string(),
+                status: "success".to_string(),
+                summary: "Worker git checkout updated another job.".to_string(),
+                detail: "job_id=other-job session_id=other-session git checkout dev".to_string(),
+            })
+            .expect("unrelated audit event should persist");
         let stale_session = state
             .store
             .get_session("state-session")
@@ -20780,6 +20820,7 @@ Cleanup status: clean";
         assert_eq!(blocked["status"], "blocked");
         assert_eq!(blocked["stored"]["git_head"], "stale-head");
         assert_eq!(blocked["observed"]["git_head"], head);
+        assert!(blocked["audit_event_id"].is_null());
         let refreshed = state
             .store
             .get_session("state-session")
