@@ -4878,14 +4878,14 @@ fn context_integrity_patch(
 
     patch.canonical_base_sha = Some(canonical_sha);
     patch.worktree_behind_by = Some(Some(behind_by));
-    if override_present && behind_by > allowed_behind {
-        patch.worktree_base_status = Some("waived".to_string());
-        patch.worktree_base_reason = Some(override_reason.to_string());
-    } else if behind_by > allowed_behind {
+    if behind_by > allowed_behind {
         patch.worktree_base_status = Some("blocked".to_string());
         patch.worktree_base_reason = Some(format!(
             "behind canonical by {behind_by} merge commit(s); allowed threshold is {allowed_behind}"
         ));
+    } else if override_present {
+        patch.worktree_base_status = Some("waived".to_string());
+        patch.worktree_base_reason = Some(override_reason.to_string());
     } else {
         patch.worktree_base_status = Some("satisfied".to_string());
         patch.worktree_base_reason = Some(String::new());
@@ -5014,17 +5014,21 @@ fn branch_repo_mismatches(
 
 fn normalize_git_origin_url(url: &str) -> String {
     let mut value = url.trim().trim_end_matches('/').to_string();
-    if let Some(rest) = value.strip_prefix("git@github.com:") {
-        value = format!("github.com/{rest}");
-    } else if let Some(rest) = value.strip_prefix("ssh://git@github.com/") {
-        value = format!("github.com/{rest}");
-    } else {
-        value = value
-            .strip_prefix("https://")
-            .or_else(|| value.strip_prefix("http://"))
-            .unwrap_or(&value)
-            .trim_start_matches("git@")
-            .to_string();
+    if let Some(rest) = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+        .or_else(|| value.strip_prefix("ssh://"))
+    {
+        value = rest.to_string();
+    }
+    if let Some((_, rest)) = value.split_once('@') {
+        value = rest.to_string();
+    }
+    if let Some(colon_index) = value.find(':') {
+        let slash_index = value.find('/').unwrap_or(usize::MAX);
+        if colon_index < slash_index {
+            value.replace_range(colon_index..=colon_index, "/");
+        }
     }
     value = value.trim_end_matches(".git").to_ascii_lowercase();
     value
@@ -19768,7 +19772,54 @@ Cleanup status: clean";
         let waived = context_integrity_patch(&state, &session, &job);
         assert_eq!(waived.worktree_base_status.as_deref(), Some("waived"));
 
+        job.metadata_json = json!({
+            "worktree_base_override": {
+                "allowed_behind_by": 0,
+                "reason": "intentional backport"
+            }
+        });
+        let threshold_exceeded = context_integrity_patch(&state, &session, &job);
+        assert_eq!(
+            threshold_exceeded.worktree_base_status.as_deref(),
+            Some("blocked")
+        );
+        assert!(
+            threshold_exceeded
+                .worktree_base_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("allowed threshold is 0")
+        );
+
+        job.metadata_json = json!({
+            "worktree_base_override": {
+                "allowed_behind_by": 2,
+                "reason": "intentional backport"
+            }
+        });
+        let threshold_allows = context_integrity_patch(&state, &session, &job);
+        assert_eq!(
+            threshold_allows.worktree_base_status.as_deref(),
+            Some("waived")
+        );
+
         let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn context_integrity_origin_normalization_handles_common_transports() {
+        assert_eq!(
+            normalize_git_origin_url("git@github.com:WebLime-agency/nucleus.git"),
+            normalize_git_origin_url("https://github.com/WebLime-agency/nucleus")
+        );
+        assert_eq!(
+            normalize_git_origin_url("git@gitlab.example:Org/Repo.git"),
+            normalize_git_origin_url("https://gitlab.example/org/repo")
+        );
+        assert_eq!(
+            normalize_git_origin_url("ssh://git@gitlab.example/Org/Repo.git"),
+            normalize_git_origin_url("https://gitlab.example/org/repo")
+        );
     }
 
     #[test]
