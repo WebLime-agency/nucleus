@@ -122,6 +122,8 @@ pub struct SessionSummary {
     pub git_untracked_count: usize,
     #[serde(default)]
     pub git_remote_tracking_branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_state_observed_at: Option<i64>,
     #[serde(default)]
     pub workspace_warnings: Vec<String>,
     pub scope: String,
@@ -322,6 +324,10 @@ pub struct JobSummary {
     pub branch_repo_status: String,
     #[serde(default)]
     pub branch_repo_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_session_cwd_evidence_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_state_observed_at: Option<i64>,
     #[serde(default)]
     pub completion_status: String,
     #[serde(default)]
@@ -441,6 +447,14 @@ fn derive_completion_gates(job: &JobSummary) -> Vec<CompletionGateSummary> {
         gates.push(branch_repo_gate(job));
     }
 
+    if has_cwd_gate_state(job) {
+        gates.push(cwd_gate(job));
+    }
+
+    if has_session_state_gate_state(job) {
+        gates.push(session_state_gate(job));
+    }
+
     if let Some(task_class) = task_class {
         if !job.publication_requested || task_class != "github_pr" {
             if let Some(gate) = task_class_gate(job, terminal, task_class) {
@@ -457,7 +471,7 @@ pub fn task_evidence_contract_catalog() -> Vec<TaskEvidenceContractSummary> {
         task_evidence_contract(
             "context_integrity",
             "Context integrity",
-            "Ground session context claims in daemon-observed worktree freshness and branch/repo consistency evidence.",
+            "Ground session context claims in daemon-observed worktree freshness, branch/repo consistency, cwd, and session-state evidence.",
             &[
                 (
                     "worktree_base_evidence",
@@ -468,6 +482,16 @@ pub fn task_evidence_contract_catalog() -> Vec<TaskEvidenceContractSummary> {
                     "branch_repo_evidence",
                     "Branch/repo evidence",
                     "Record observed and expected origin URLs plus observed and expected branch names.",
+                ),
+                (
+                    "cwd_evidence",
+                    "cwd evidence",
+                    "Record the declared working directory, observed command-session cwds, and any command sessions that ran outside scope.",
+                ),
+                (
+                    "session_state_evidence",
+                    "Session-state evidence",
+                    "Record stored and freshly observed git state plus an audit-event pointer when a daemon-observed mutation explains drift.",
                 ),
             ],
         ),
@@ -831,7 +855,10 @@ fn task_class_gate(
 }
 
 fn has_context_integrity_gate_state(job: &JobSummary) -> bool {
-    has_worktree_base_gate_state(job) || has_branch_repo_gate_state(job)
+    has_worktree_base_gate_state(job)
+        || has_branch_repo_gate_state(job)
+        || has_cwd_gate_state(job)
+        || has_session_state_gate_state(job)
 }
 
 fn has_worktree_base_gate_state(job: &JobSummary) -> bool {
@@ -846,6 +873,18 @@ fn has_branch_repo_gate_state(job: &JobSummary) -> bool {
         job.branch_repo_status.trim(),
         "" | "not_applicable" | "not_applicable_missing_context"
     )
+}
+
+fn has_cwd_gate_state(job: &JobSummary) -> bool {
+    job.command_session_cwd_evidence_json
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn has_session_state_gate_state(job: &JobSummary) -> bool {
+    job.metadata_json
+        .get("session_state_evidence")
+        .is_some_and(|value| value.is_object())
 }
 
 fn worktree_base_gate(job: &JobSummary) -> CompletionGateSummary {
@@ -918,6 +957,78 @@ fn branch_repo_gate(job: &JobSummary) -> CompletionGateSummary {
     )
 }
 
+fn cwd_gate(job: &JobSummary) -> CompletionGateSummary {
+    let evidence_json = job
+        .command_session_cwd_evidence_json
+        .as_deref()
+        .and_then(parse_context_evidence_json)
+        .unwrap_or(Value::Null);
+    let status = evidence_status(&evidence_json);
+    let reason = evidence_string(&evidence_json, "reason");
+    let state = match status.as_str() {
+        "satisfied" => "done",
+        "blocked" => "blocked",
+        _ => "pending",
+    };
+    let summary = match state {
+        "done" => "Command sessions ran under the declared working directory.".to_string(),
+        "blocked" => format!(
+            "Command session cwd is outside the declared working directory{}.",
+            prefixed_reason(&reason)
+        ),
+        _ => format!(
+            "Command session cwd evidence is pending{}.",
+            prefixed_reason(&reason)
+        ),
+    };
+
+    completion_gate(
+        "cwd_consistent",
+        "cwd consistency",
+        state,
+        summary,
+        "context_integrity",
+        required_evidence_for("context_integrity", &["cwd_evidence"]),
+        cwd_evidence(&evidence_json),
+    )
+}
+
+fn session_state_gate(job: &JobSummary) -> CompletionGateSummary {
+    let evidence_json = job
+        .metadata_json
+        .get("session_state_evidence")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let status = evidence_status(&evidence_json);
+    let reason = evidence_string(&evidence_json, "reason");
+    let state = match status.as_str() {
+        "satisfied" => "done",
+        "blocked" => "blocked",
+        _ => "pending",
+    };
+    let summary = match state {
+        "done" => "Stored session git metadata matches observed worktree state.".to_string(),
+        "blocked" => format!(
+            "Stored session git metadata drifted from observed worktree state{}.",
+            prefixed_reason(&reason)
+        ),
+        _ => format!(
+            "Session git metadata refresh is pending{}.",
+            prefixed_reason(&reason)
+        ),
+    };
+
+    completion_gate(
+        "session_state_consistent",
+        "Session-state consistency",
+        state,
+        summary,
+        "context_integrity",
+        required_evidence_for("context_integrity", &["session_state_evidence"]),
+        session_state_evidence(&evidence_json),
+    )
+}
+
 fn worktree_base_evidence(job: &JobSummary) -> Vec<String> {
     [
         non_empty_evidence("base_ref", &job.worktree_base_ref),
@@ -944,6 +1055,103 @@ fn branch_repo_evidence(job: &JobSummary) -> Vec<String> {
     .into_iter()
     .flatten()
     .collect()
+}
+
+fn cwd_evidence(value: &Value) -> Vec<String> {
+    let mut evidence = Vec::new();
+    push_json_evidence(&mut evidence, "declared_working_dir", value);
+    push_json_evidence(&mut evidence, "reason", value);
+    if let Some(cwds) = value.get("observed_cwds").and_then(Value::as_array) {
+        for observed in cwds {
+            let id = evidence_string(observed, "command_session_id");
+            let cwd = evidence_string(observed, "cwd");
+            if !id.is_empty() || !cwd.is_empty() {
+                evidence.push(format!(
+                    "observed_cwd {} {}",
+                    empty_fallback(&id, "unknown_session"),
+                    empty_fallback(&cwd, "unknown_cwd")
+                ));
+            }
+        }
+    }
+    if let Some(ids) = value
+        .get("offending_command_session_ids")
+        .and_then(Value::as_array)
+    {
+        let ids = ids
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .collect::<Vec<_>>();
+        if !ids.is_empty() {
+            evidence.push(format!("offending_command_session_ids {}", ids.join(", ")));
+        }
+    }
+    if let Some(cwds) = value.get("offending_cwds").and_then(Value::as_array) {
+        let cwds = cwds
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|cwd| !cwd.trim().is_empty())
+            .collect::<Vec<_>>();
+        if !cwds.is_empty() {
+            evidence.push(format!("offending_cwds {}", cwds.join(", ")));
+        }
+    }
+    evidence
+}
+
+fn session_state_evidence(value: &Value) -> Vec<String> {
+    let mut evidence = Vec::new();
+    push_nested_json_evidence(&mut evidence, "stored", "git_head", value);
+    push_nested_json_evidence(&mut evidence, "observed", "git_head", value);
+    push_nested_json_evidence(&mut evidence, "stored", "git_branch", value);
+    push_nested_json_evidence(&mut evidence, "observed", "git_branch", value);
+    push_nested_json_evidence(&mut evidence, "stored", "git_dirty", value);
+    push_nested_json_evidence(&mut evidence, "observed", "git_dirty", value);
+    push_nested_json_evidence(&mut evidence, "stored", "git_untracked_count", value);
+    push_nested_json_evidence(&mut evidence, "observed", "git_untracked_count", value);
+    push_json_evidence(&mut evidence, "audit_event_id", value);
+    push_json_evidence(&mut evidence, "mutation_command_session_id", value);
+    push_json_evidence(&mut evidence, "audit_hint", value);
+    push_json_evidence(&mut evidence, "reason", value);
+    evidence
+}
+
+fn parse_context_evidence_json(value: &str) -> Option<Value> {
+    serde_json::from_str(value).ok()
+}
+
+fn evidence_status(value: &Value) -> String {
+    evidence_string(value, "status")
+}
+
+fn evidence_string(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|item| {
+            item.as_str()
+                .map(ToString::to_string)
+                .or_else(|| item.as_bool().map(|flag| flag.to_string()))
+                .or_else(|| item.as_i64().map(|number| number.to_string()))
+        })
+        .unwrap_or_default()
+}
+
+fn push_json_evidence(evidence: &mut Vec<String>, key: &str, value: &Value) {
+    let item = evidence_string(value, key);
+    if !item.trim().is_empty() {
+        evidence.push(format!("{key} {item}"));
+    }
+}
+
+fn push_nested_json_evidence(evidence: &mut Vec<String>, object: &str, key: &str, value: &Value) {
+    let item = value
+        .get(object)
+        .map(|nested| evidence_string(nested, key))
+        .unwrap_or_default();
+    if !item.trim().is_empty() {
+        evidence.push(format!("{object}.{key} {item}"));
+    }
 }
 
 fn prefixed_reason(reason: &str) -> String {
@@ -2825,6 +3033,8 @@ mod tests {
             worktree_behind_by: None,
             branch_repo_status: String::new(),
             branch_repo_reason: String::new(),
+            command_session_cwd_evidence_json: None,
+            session_state_observed_at: None,
             completion_status: String::new(),
             completion_gates: Vec::new(),
             completion_blockers: Vec::new(),
@@ -2902,6 +3112,8 @@ mod tests {
             worktree_behind_by: None,
             branch_repo_status: String::new(),
             branch_repo_reason: String::new(),
+            command_session_cwd_evidence_json: None,
+            session_state_observed_at: None,
             completion_status: String::new(),
             completion_gates: Vec::new(),
             completion_blockers: Vec::new(),
@@ -2996,6 +3208,26 @@ mod tests {
                 .iter()
                 .any(|gate| { gate.id == "branch_repo_consistent" && gate.state == "done" })
         );
+        let cwd_ok = JobSummary {
+            command_session_cwd_evidence_json: Some(
+                json!({
+                    "status": "satisfied",
+                    "declared_working_dir": "/repo",
+                    "observed_cwds": [{"command_session_id": "cmd-1", "cwd": "/repo/crate"}],
+                    "offending_command_session_ids": [],
+                    "offending_cwds": [],
+                })
+                .to_string(),
+            ),
+            ..task_class_job("local_project", vec!["validation".to_string()])
+        }
+        .with_completion_gates();
+        assert!(
+            cwd_ok
+                .completion_gates
+                .iter()
+                .any(|gate| gate.id == "cwd_consistent" && gate.state == "done")
+        );
 
         let stale = JobSummary {
             state: "blocked".to_string(),
@@ -3052,6 +3284,68 @@ mod tests {
                 .iter()
                 .any(|item| item == "expected_branch feature")
         );
+        let cwd_blocked = JobSummary {
+            state: "blocked".to_string(),
+            command_session_cwd_evidence_json: Some(
+                json!({
+                    "status": "blocked",
+                    "reason": "one or more command sessions ran outside the declared working_dir",
+                    "declared_working_dir": "/repo",
+                    "observed_cwds": [{"command_session_id": "cmd-1", "cwd": "/tmp/outside"}],
+                    "offending_command_session_ids": ["cmd-1"],
+                    "offending_cwds": ["/tmp/outside"],
+                })
+                .to_string(),
+            ),
+            ..task_class_job("local_project", vec!["validation".to_string()])
+        }
+        .with_completion_gates();
+        let cwd_gate = cwd_blocked
+            .completion_gates
+            .iter()
+            .find(|gate| gate.id == "cwd_consistent")
+            .expect("cwd gate should be derived");
+        assert_eq!(cwd_gate.state, "blocked");
+        assert!(
+            cwd_gate
+                .evidence
+                .iter()
+                .any(|item| { item == "offending_command_session_ids cmd-1" })
+        );
+
+        let session_state_blocked = JobSummary {
+            state: "blocked".to_string(),
+            session_state_observed_at: Some(123),
+            metadata_json: json!({
+                "session_state_evidence": {
+                    "status": "blocked",
+                    "reason": "stored session git metadata differed from observed disk state",
+                    "stored": {"git_head": "old", "git_branch": "dev", "git_dirty": false, "git_untracked_count": 0},
+                    "observed": {"git_head": "new", "git_branch": "dev", "git_dirty": false, "git_untracked_count": 0},
+                    "audit_hint": "inspect audit_events"
+                }
+            }),
+            ..task_class_job("local_project", vec!["validation".to_string()])
+        }
+        .with_completion_gates();
+        let session_state_gate = session_state_blocked
+            .completion_gates
+            .iter()
+            .find(|gate| gate.id == "session_state_consistent")
+            .expect("session-state gate should be derived");
+        assert_eq!(session_state_gate.state, "blocked");
+        assert!(
+            session_state_gate
+                .evidence
+                .iter()
+                .any(|item| item == "stored.git_head old")
+        );
+        assert!(
+            session_state_gate
+                .evidence
+                .iter()
+                .any(|item| item == "observed.git_head new")
+        );
 
         let pending = JobSummary {
             worktree_base_status: "pending".to_string(),
@@ -3074,7 +3368,10 @@ mod tests {
                 .iter()
                 .any(|gate| matches!(
                     gate.id.as_str(),
-                    "worktree_base_fresh" | "branch_repo_consistent"
+                    "worktree_base_fresh"
+                        | "branch_repo_consistent"
+                        | "cwd_consistent"
+                        | "session_state_consistent"
                 ))
         );
     }
@@ -3249,6 +3546,8 @@ mod tests {
             worktree_behind_by: None,
             branch_repo_status: String::new(),
             branch_repo_reason: String::new(),
+            command_session_cwd_evidence_json: None,
+            session_state_observed_at: None,
             completion_status: String::new(),
             completion_gates: Vec::new(),
             completion_blockers: Vec::new(),
