@@ -4798,6 +4798,7 @@ fn command_session_cwd_evidence(
     let mut offending_cwds = Vec::new();
     let mut missing_ids = Vec::new();
     let mut unresolved = Vec::new();
+    let mut stale_recorded_cwd_ids = Vec::new();
     for command_session in command_sessions {
         let cwd = command_session.cwd.trim();
         observed.push(json!({
@@ -4815,7 +4816,19 @@ fn command_session_cwd_evidence(
                 offending_ids.push(command_session.id.clone());
                 offending_cwds.push(cwd.to_string());
             }
-            Err(error) => unresolved.push(format!("{}: {error}", command_session.id)),
+            Err(error) => {
+                match lexical_path_is_under_declared_root(Path::new(cwd), Path::new(declared)) {
+                    Some(true) if command_session.state == "completed" => {
+                        stale_recorded_cwd_ids.push(command_session.id.clone());
+                    }
+                    Some(true) => unresolved.push(format!("{}: {error}", command_session.id)),
+                    Some(false) => {
+                        offending_ids.push(command_session.id.clone());
+                        offending_cwds.push(cwd.to_string());
+                    }
+                    None => unresolved.push(format!("{}: {error}", command_session.id)),
+                }
+            }
         }
     }
 
@@ -4852,11 +4865,16 @@ fn command_session_cwd_evidence(
 
     json!({
         "status": "satisfied",
-        "reason": "",
+        "reason": if stale_recorded_cwd_ids.is_empty() {
+            String::new()
+        } else {
+            format!("recorded cwd no longer exists for completed command session(s), but the recorded path remains under the declared working_dir: {}", stale_recorded_cwd_ids.join(", "))
+        },
         "declared_working_dir": declared,
         "observed_cwds": observed,
         "offending_command_session_ids": [],
         "offending_cwds": [],
+        "stale_recorded_cwd_ids": stale_recorded_cwd_ids,
     })
 }
 
@@ -4871,6 +4889,13 @@ fn path_is_under_declared_root(path: &Path, root: &Path) -> Result<bool> {
         )
     })?;
     Ok(path.starts_with(root))
+}
+
+fn lexical_path_is_under_declared_root(path: &Path, root: &Path) -> Option<bool> {
+    if !path.is_absolute() || !root.is_absolute() {
+        return None;
+    }
+    Some(normalize_lexical_path(path).starts_with(normalize_lexical_path(root)))
 }
 
 fn context_integrity_metadata_with_session_state(
@@ -5145,7 +5170,7 @@ fn is_session_git_mutation_command_session(
         return false;
     };
     if !matches!(
-        subcommand,
+        subcommand.as_str(),
         "commit" | "checkout" | "switch" | "merge" | "pull" | "reset"
     ) {
         return false;
@@ -5155,24 +5180,44 @@ fn is_session_git_mutation_command_session(
 
 fn command_session_git_invocation(
     command_session: &CommandSessionSummary,
-) -> Option<(PathBuf, &str)> {
-    let executable = Path::new(command_session.command.trim())
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(command_session.command.trim());
-    if executable != "git" {
-        return None;
-    }
+) -> Option<(PathBuf, String)> {
     let base_cwd = command_session.cwd.trim();
     if base_cwd.is_empty() {
         return None;
     }
-    let mut git_cwd = PathBuf::from(base_cwd);
+    let executable = Path::new(command_session.command.trim())
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command_session.command.trim());
+    if executable == "git" {
+        return parse_git_invocation_from_args(PathBuf::from(base_cwd), &command_session.args);
+    }
+    if !is_shell_executable(executable) {
+        return None;
+    }
+    let shell_command = shell_command_arg(&command_session.args)?;
+    let mut tokens = split_simple_shell_words(shell_command)?;
+    if tokens
+        .first()
+        .is_some_and(|token| token == "exec" || token == "command")
+    {
+        tokens.remove(0);
+    }
+    if tokens.first().is_none_or(|token| token != "git") {
+        return None;
+    }
+    parse_git_invocation_from_args(PathBuf::from(base_cwd), &tokens[1..])
+}
+
+fn parse_git_invocation_from_args(
+    mut git_cwd: PathBuf,
+    args: &[String],
+) -> Option<(PathBuf, String)> {
     let mut index = 0;
-    while index < command_session.args.len() {
-        let arg = command_session.args[index].as_str();
+    while index < args.len() {
+        let arg = args[index].as_str();
         if arg == "-C" {
-            let value = command_session.args.get(index + 1)?;
+            let value = args.get(index + 1)?;
             git_cwd = resolve_git_c_option_path(&git_cwd, value);
             index += 2;
             continue;
@@ -5186,7 +5231,7 @@ fn command_session_git_invocation(
             continue;
         }
         if git_global_option_takes_value(arg) {
-            command_session.args.get(index + 1)?;
+            args.get(index + 1)?;
             index += 2;
             continue;
         }
@@ -5197,9 +5242,74 @@ fn command_session_git_invocation(
         if arg.starts_with('-') {
             return None;
         }
-        return Some((git_cwd, arg));
+        return Some((git_cwd, arg.to_string()));
     }
     None
+}
+
+fn is_shell_executable(executable: &str) -> bool {
+    matches!(executable, "sh" | "bash" | "zsh" | "dash")
+}
+
+fn shell_command_arg(args: &[String]) -> Option<&str> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg == "-c" || (arg.starts_with('-') && arg.contains('c')) {
+            return args.get(index + 1).map(String::as_str);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn split_simple_shell_words(input: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars().peekable();
+    let mut quote = None;
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    quote = None;
+                } else {
+                    current.push(ch);
+                }
+            }
+            Some('"') => {
+                if ch == '"' {
+                    quote = None;
+                } else if ch == '\\' {
+                    current.push(chars.next()?);
+                } else {
+                    current.push(ch);
+                }
+            }
+            _ => {
+                if ch.is_whitespace() {
+                    if !current.is_empty() {
+                        words.push(std::mem::take(&mut current));
+                    }
+                } else if ch == '\'' || ch == '"' {
+                    quote = Some(ch);
+                } else if ch == '\\' {
+                    current.push(chars.next()?);
+                } else if matches!(ch, ';' | '&' | '|' | '<' | '>' | '(' | ')' | '`' | '$') {
+                    return None;
+                } else {
+                    current.push(ch);
+                }
+            }
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    Some(words)
 }
 
 fn resolve_git_c_option_path(base_cwd: &Path, value: &str) -> PathBuf {
@@ -20733,8 +20843,14 @@ Cleanup status: clean";
         let declared = state_dir.join("declared");
         let nested = declared.join("nested");
         let outside = state_dir.join("outside");
+        let stale_nested = nested.join("stale");
+        let stale_outside = outside.join("stale");
         fs::create_dir_all(&nested).expect("nested dir should exist");
         fs::create_dir_all(&outside).expect("outside dir should exist");
+        fs::create_dir_all(&stale_nested).expect("stale nested dir should exist");
+        fs::create_dir_all(&stale_outside).expect("stale outside dir should exist");
+        fs::remove_dir_all(&stale_nested).expect("stale nested dir should be removable");
+        fs::remove_dir_all(&stale_outside).expect("stale outside dir should be removable");
         let mut session = scope_test_session(
             declared.to_str().expect("declared path utf8"),
             "project_root",
@@ -20757,6 +20873,26 @@ Cleanup status: clean";
         assert_eq!(
             blocked["declared_working_dir"],
             declared.to_str().expect("declared path utf8")
+        );
+
+        let stale_inside = command_session_cwd_evidence(
+            &session,
+            &[test_command_session_summary("cmd-stale", &stale_nested)],
+        );
+        assert_eq!(stale_inside["status"], "satisfied");
+        assert_eq!(stale_inside["stale_recorded_cwd_ids"][0], "cmd-stale");
+
+        let stale_outside_evidence = command_session_cwd_evidence(
+            &session,
+            &[test_command_session_summary(
+                "cmd-stale-outside",
+                &stale_outside,
+            )],
+        );
+        assert_eq!(stale_outside_evidence["status"], "blocked");
+        assert_eq!(
+            stale_outside_evidence["offending_command_session_ids"][0],
+            "cmd-stale-outside"
         );
 
         let missing = command_session_cwd_evidence(
@@ -20871,6 +21007,26 @@ Cleanup status: clean";
         assert!(!is_session_git_mutation_command_session(
             &session,
             &shell_echo
+        ));
+
+        let mut shell_git = direct_git.clone();
+        shell_git.command = "sh".to_string();
+        shell_git.args = vec![
+            "-lc".to_string(),
+            "git -c user.name=Nucleus --no-pager commit --allow-empty".to_string(),
+        ];
+        assert!(is_session_git_mutation_command_session(
+            &session, &shell_git
+        ));
+
+        let mut shell_compound = shell_git.clone();
+        shell_compound.args = vec![
+            "-lc".to_string(),
+            "cd nested && git commit --allow-empty".to_string(),
+        ];
+        assert!(!is_session_git_mutation_command_session(
+            &session,
+            &shell_compound
         ));
 
         let mut redirected_repo = direct_git.clone();
