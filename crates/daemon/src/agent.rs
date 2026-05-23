@@ -4976,7 +4976,7 @@ fn session_state_evidence_and_refresh(
         stored.git_head.trim().is_empty() && stored.git_branch.trim().is_empty();
     let drifted = !legacy_uninitialized && stored != observed;
     let matching_audit = if drifted {
-        mutation_audit_explaining_session_state(state, session, job_id)?
+        mutation_audit_explaining_session_state(state, session, job_id, &stored, &observed)?
     } else {
         None
     };
@@ -5129,6 +5129,8 @@ fn mutation_audit_explaining_session_state(
     state: &AppState,
     session: &SessionSummary,
     job_id: &str,
+    stored: &ObservedSessionGitState,
+    observed: &ObservedSessionGitState,
 ) -> Result<Option<nucleus_protocol::AuditEvent>> {
     let since = session
         .session_state_observed_at
@@ -5152,7 +5154,54 @@ fn mutation_audit_explaining_session_state(
             && mutation_succeeded
             && haystack.contains("git")
             && text_mentions_session_state_mutating_git(&haystack)
+            && text_matches_session_state_transition(&haystack, stored, observed)
     }))
+}
+
+fn text_matches_session_state_transition(
+    text: &str,
+    stored: &ObservedSessionGitState,
+    observed: &ObservedSessionGitState,
+) -> bool {
+    if stored.git_head != observed.git_head && !text_mentions_git_head(text, &observed.git_head) {
+        return false;
+    }
+    if stored.git_branch != observed.git_branch {
+        let branch = observed.git_branch.to_ascii_lowercase();
+        if branch.is_empty() {
+            if !text.contains("branch=") && !text.contains("detached") {
+                return false;
+            }
+        } else if !branch.is_empty() && !text.contains(&branch) {
+            return false;
+        }
+    }
+    if stored.git_dirty != observed.git_dirty {
+        let expected = format!("dirty={}", observed.git_dirty);
+        let expected_alt = format!("git_dirty={}", observed.git_dirty);
+        if !text.contains(&expected) && !text.contains(&expected_alt) {
+            return false;
+        }
+    }
+    if stored.git_untracked_count != observed.git_untracked_count {
+        let expected = format!("untracked={}", observed.git_untracked_count);
+        let expected_alt = format!("git_untracked_count={}", observed.git_untracked_count);
+        if !text.contains(&expected) && !text.contains(&expected_alt) {
+            return false;
+        }
+    }
+    true
+}
+
+fn text_mentions_git_head(text: &str, head: &str) -> bool {
+    if head.trim().is_empty() {
+        return text.contains("head=") || text.contains("unborn");
+    }
+    let normalized = head.to_ascii_lowercase();
+    text.contains(&normalized)
+        || normalized
+            .get(..12)
+            .is_some_and(|short| !short.is_empty() && text.contains(short))
 }
 
 fn mutation_command_session_explaining_session_state(
@@ -21496,6 +21545,38 @@ Cleanup status: clean";
             .update_session(
                 "state-session",
                 SessionPatch {
+                    git_head: Some("generic-audit-head".to_string()),
+                    session_state_observed_at: Some(Some(1)),
+                    ..SessionPatch::default()
+                },
+            )
+            .expect("generic-audit stale session should persist");
+        state
+            .store
+            .append_audit_event(AuditEventRecord {
+                kind: "worker.git.checkout".to_string(),
+                target: "job:state-job".to_string(),
+                status: "success".to_string(),
+                summary: "Worker git checkout updated HEAD.".to_string(),
+                detail: "job_id=state-job session_id=state-session git checkout dev".to_string(),
+            })
+            .expect("generic audit event should persist");
+        let generic_audit_session = state
+            .store
+            .get_session("state-session")
+            .expect("generic-audit session should reload")
+            .session;
+        let generic_audit =
+            session_state_evidence_and_refresh(&state, &generic_audit_session, "state-job")
+                .expect("generic audit should not explain drift");
+        assert_eq!(generic_audit["status"], "blocked");
+        assert!(generic_audit["audit_event_id"].is_null());
+
+        state
+            .store
+            .update_session(
+                "state-session",
+                SessionPatch {
                     git_head: Some("stale-again".to_string()),
                     session_state_observed_at: Some(Some(1)),
                     ..SessionPatch::default()
@@ -21509,7 +21590,9 @@ Cleanup status: clean";
                 target: "job:state-job".to_string(),
                 status: "success".to_string(),
                 summary: "Worker git checkout updated HEAD.".to_string(),
-                detail: "job_id=state-job session_id=state-session git checkout dev".to_string(),
+                detail: format!(
+                    "job_id=state-job session_id=state-session git checkout dev observed_git_head={head}"
+                ),
             })
             .expect("audit event should persist");
         let stale_session = state
