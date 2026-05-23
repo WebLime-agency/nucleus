@@ -4830,7 +4830,9 @@ fn context_integrity_patch(
         return patch;
     }
 
-    let fetch = git_status(&worktree_path, &["fetch", "origin", &base_ref]);
+    let canonical_ref = format!("refs/remotes/origin/{base_ref}");
+    let fetch_refspec = format!("+{base_ref}:{canonical_ref}");
+    let fetch = git_status(&worktree_path, &["fetch", "origin", &fetch_refspec]);
     if let Err(error) = fetch {
         patch.worktree_base_status = Some("pending".to_string());
         patch.worktree_base_reason = Some(format!("could not reach canonical: {error}"));
@@ -4839,7 +4841,6 @@ fn context_integrity_patch(
         return patch;
     }
 
-    let canonical_ref = format!("refs/remotes/origin/{base_ref}");
     let canonical_sha = git_stdout(&worktree_path, &["rev-parse", &canonical_ref]).or_else(|| {
         git_stdout(
             &worktree_path,
@@ -19732,6 +19733,33 @@ Cleanup status: clean";
         assert_eq!(
             stale.canonical_base_sha.as_deref(),
             Some(repo.canonical_sha.as_str())
+        );
+
+        let narrow_repo = context_integrity_repo(&state_dir, "narrow-refspec");
+        run_git_test(
+            &narrow_repo.worktree,
+            &[
+                "config",
+                "--replace-all",
+                "remote.origin.fetch",
+                "+refs/heads/other:refs/remotes/origin/other",
+            ],
+        );
+        run_git_test(
+            &narrow_repo.worktree,
+            &["update-ref", "-d", "refs/remotes/origin/dev"],
+        );
+        run_git_test(
+            &narrow_repo.worktree,
+            &["reset", "--hard", &narrow_repo.initial_sha],
+        );
+        let narrow_session = context_integrity_session(&narrow_repo);
+        let narrow = context_integrity_patch(&state, &narrow_session, &job);
+        assert_eq!(narrow.worktree_base_status.as_deref(), Some("blocked"));
+        assert_eq!(narrow.worktree_behind_by, Some(Some(2)));
+        assert_eq!(
+            narrow.canonical_base_sha.as_deref(),
+            Some(narrow_repo.canonical_sha.as_str())
         );
 
         run_git_test(
