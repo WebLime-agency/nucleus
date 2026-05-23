@@ -500,6 +500,19 @@ pub struct JobPatch {
     pub validation_status: Option<String>,
     pub cleanup_status: Option<String>,
     pub cleanup_paths: Option<Vec<String>>,
+    pub metadata_json: Option<serde_json::Value>,
+    pub worktree_base_ref: Option<String>,
+    pub worktree_base_status: Option<String>,
+    pub worktree_base_reason: Option<String>,
+    pub worktree_origin_url: Option<String>,
+    pub expected_origin_url: Option<String>,
+    pub observed_git_branch: Option<String>,
+    pub expected_git_branch: Option<String>,
+    pub worktree_head_sha: Option<String>,
+    pub canonical_base_sha: Option<String>,
+    pub worktree_behind_by: Option<Option<i64>>,
+    pub branch_repo_status: Option<String>,
+    pub branch_repo_reason: Option<String>,
     pub last_resumed_at: Option<Option<i64>>,
 }
 
@@ -792,6 +805,7 @@ pub struct ResolvedProject {
     pub slug: String,
     pub relative_path: String,
     pub absolute_path: String,
+    pub origin_url: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -2525,6 +2539,12 @@ impl StateStore {
             .unwrap_or_else(|| current.cleanup_paths.clone());
         let cleanup_paths_json =
             serde_json::to_string(&cleanup_paths).context("failed to serialize cleanup paths")?;
+        let metadata_json = serde_json::to_string(
+            &patch
+                .metadata_json
+                .unwrap_or_else(|| current.metadata_json.clone()),
+        )
+        .context("failed to serialize job metadata")?;
         let current_task_class_cleared = job_task_class_cleared(&connection, job_id)?;
         let (next_task_class, next_task_class_cleared) = match patch.task_class {
             Some(Some(value)) => (normalize_task_class(Some(&value)), false),
@@ -2556,7 +2576,20 @@ impl StateStore {
                 validation_status = ?20,
                 cleanup_status = ?21,
                 cleanup_paths_json = ?22,
-                last_resumed_at = ?23,
+                metadata_json = ?23,
+                worktree_base_ref = ?24,
+                worktree_base_status = ?25,
+                worktree_base_reason = ?26,
+                worktree_origin_url = ?27,
+                expected_origin_url = ?28,
+                observed_git_branch = ?29,
+                expected_git_branch = ?30,
+                worktree_head_sha = ?31,
+                canonical_base_sha = ?32,
+                worktree_behind_by = ?33,
+                branch_repo_status = ?34,
+                branch_repo_reason = ?35,
+                last_resumed_at = ?36,
                 updated_at = unixepoch()
             WHERE id = ?1
             ",
@@ -2591,6 +2624,39 @@ impl StateStore {
                 patch.validation_status.unwrap_or(current.validation_status),
                 patch.cleanup_status.unwrap_or(current.cleanup_status),
                 cleanup_paths_json,
+                metadata_json,
+                patch.worktree_base_ref.unwrap_or(current.worktree_base_ref),
+                patch
+                    .worktree_base_status
+                    .unwrap_or(current.worktree_base_status),
+                patch
+                    .worktree_base_reason
+                    .unwrap_or(current.worktree_base_reason),
+                patch
+                    .worktree_origin_url
+                    .unwrap_or(current.worktree_origin_url),
+                patch
+                    .expected_origin_url
+                    .unwrap_or(current.expected_origin_url),
+                patch
+                    .observed_git_branch
+                    .unwrap_or(current.observed_git_branch),
+                patch
+                    .expected_git_branch
+                    .unwrap_or(current.expected_git_branch),
+                patch.worktree_head_sha.unwrap_or(current.worktree_head_sha),
+                patch
+                    .canonical_base_sha
+                    .unwrap_or(current.canonical_base_sha),
+                patch
+                    .worktree_behind_by
+                    .unwrap_or(current.worktree_behind_by),
+                patch
+                    .branch_repo_status
+                    .unwrap_or(current.branch_repo_status),
+                patch
+                    .branch_repo_reason
+                    .unwrap_or(current.branch_repo_reason),
                 patch.last_resumed_at.unwrap_or(current.last_resumed_at),
             ],
         )?;
@@ -3443,6 +3509,19 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             validation_status TEXT NOT NULL DEFAULT 'not_performed',
             cleanup_status TEXT NOT NULL DEFAULT 'unknown',
             cleanup_paths_json TEXT NOT NULL DEFAULT '[]',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            worktree_base_ref TEXT NOT NULL DEFAULT '',
+            worktree_base_status TEXT NOT NULL DEFAULT '',
+            worktree_base_reason TEXT NOT NULL DEFAULT '',
+            worktree_origin_url TEXT NOT NULL DEFAULT '',
+            expected_origin_url TEXT NOT NULL DEFAULT '',
+            observed_git_branch TEXT NOT NULL DEFAULT '',
+            expected_git_branch TEXT NOT NULL DEFAULT '',
+            worktree_head_sha TEXT NOT NULL DEFAULT '',
+            canonical_base_sha TEXT NOT NULL DEFAULT '',
+            worktree_behind_by INTEGER,
+            branch_repo_status TEXT NOT NULL DEFAULT '',
+            branch_repo_reason TEXT NOT NULL DEFAULT '',
             last_resumed_at INTEGER,
             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
@@ -3916,6 +3995,7 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             slug TEXT NOT NULL,
             relative_path TEXT NOT NULL UNIQUE,
             absolute_path TEXT NOT NULL UNIQUE,
+            origin_url TEXT NOT NULL DEFAULT '',
             active INTEGER NOT NULL DEFAULT 1,
             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
@@ -4053,6 +4133,12 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         connection,
         "sessions",
         "profile_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "projects",
+        "origin_url",
         "TEXT NOT NULL DEFAULT ''",
     )?;
     ensure_column(
@@ -4421,6 +4507,79 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "jobs",
         "cleanup_paths_json",
         "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "metadata_json",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "worktree_base_ref",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "worktree_base_status",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "worktree_base_reason",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "worktree_origin_url",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "expected_origin_url",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "observed_git_branch",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "expected_git_branch",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "worktree_head_sha",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "canonical_base_sha",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(connection, "jobs", "worktree_behind_by", "INTEGER")?;
+    ensure_column(
+        connection,
+        "jobs",
+        "branch_repo_status",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "branch_repo_reason",
+        "TEXT NOT NULL DEFAULT ''",
     )?;
     ensure_column(connection, "jobs", "last_resumed_at", "INTEGER")?;
 
@@ -5874,13 +6033,14 @@ fn sync_projects_with_connection(connection: &Connection) -> Result<()> {
     for project in discover_projects(&root)? {
         connection.execute(
             "
-            INSERT INTO projects (id, title, slug, relative_path, absolute_path, active)
-            VALUES (?1, ?2, ?3, ?4, ?5, 1)
+            INSERT INTO projects (id, title, slug, relative_path, absolute_path, origin_url, active)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)
             ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 slug = excluded.slug,
                 relative_path = excluded.relative_path,
                 absolute_path = excluded.absolute_path,
+                origin_url = excluded.origin_url,
                 active = 1,
                 updated_at = unixepoch()
             ",
@@ -5889,7 +6049,8 @@ fn sync_projects_with_connection(connection: &Connection) -> Result<()> {
                 project.title,
                 project.slug,
                 project.relative_path,
-                project.absolute_path
+                project.absolute_path,
+                project.origin_url
             ],
         )?;
     }
@@ -5902,7 +6063,7 @@ fn sync_projects_with_connection(connection: &Connection) -> Result<()> {
 fn list_projects_with_connection(connection: &Connection) -> Result<Vec<ProjectSummary>> {
     let mut statement = connection.prepare(
         "
-        SELECT id, title, slug, relative_path, absolute_path, created_at, updated_at
+        SELECT id, title, slug, relative_path, absolute_path, origin_url, created_at, updated_at
         FROM projects
         WHERE active = 1
         ORDER BY relative_path ASC, title ASC
@@ -5918,7 +6079,7 @@ fn load_project_summary(connection: &Connection, project_id: &str) -> Result<Pro
     connection
         .query_row(
             "
-            SELECT id, title, slug, relative_path, absolute_path, created_at, updated_at
+            SELECT id, title, slug, relative_path, absolute_path, origin_url, created_at, updated_at
             FROM projects
             WHERE id = ?1
             ",
@@ -5930,14 +6091,16 @@ fn load_project_summary(connection: &Connection, project_id: &str) -> Result<Pro
 }
 
 fn map_project_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectSummary> {
+    let origin_url: String = row.get(5)?;
     Ok(ProjectSummary {
         id: row.get(0)?,
         title: row.get(1)?,
         slug: row.get(2)?,
         relative_path: row.get(3)?,
         absolute_path: row.get(4)?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
+        origin_url: redact_git_remote_url_userinfo(&origin_url),
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
     })
 }
 
@@ -5945,18 +6108,20 @@ fn load_resolved_project(connection: &Connection, project_id: &str) -> Result<Re
     connection
         .query_row(
             "
-            SELECT id, title, slug, relative_path, absolute_path
+            SELECT id, title, slug, relative_path, absolute_path, origin_url
             FROM projects
             WHERE id = ?1
             ",
             params![project_id],
             |row| {
+                let origin_url: String = row.get(5)?;
                 Ok(ResolvedProject {
                     id: row.get(0)?,
                     title: row.get(1)?,
                     slug: row.get(2)?,
                     relative_path: row.get(3)?,
                     absolute_path: row.get(4)?,
+                    origin_url: redact_git_remote_url_userinfo(&origin_url),
                 })
             },
         )
@@ -5971,7 +6136,7 @@ fn load_resolved_project_by_path(
     connection
         .query_row(
             "
-            SELECT id, title, slug, relative_path, absolute_path
+            SELECT id, title, slug, relative_path, absolute_path, origin_url
             FROM projects
             WHERE absolute_path = ?1 OR relative_path = ?1
             ORDER BY CASE
@@ -5982,12 +6147,14 @@ fn load_resolved_project_by_path(
             ",
             params![path],
             |row| {
+                let origin_url: String = row.get(5)?;
                 Ok(ResolvedProject {
                     id: row.get(0)?,
                     title: row.get(1)?,
                     slug: row.get(2)?,
                     relative_path: row.get(3)?,
                     absolute_path: row.get(4)?,
+                    origin_url: redact_git_remote_url_userinfo(&origin_url),
                 })
             },
         )
@@ -6173,7 +6340,8 @@ fn load_primary_project_for_session(
                 projects.title,
                 projects.slug,
                 projects.relative_path,
-                projects.absolute_path
+                projects.absolute_path,
+                projects.origin_url
             FROM session_projects
             INNER JOIN projects ON projects.id = session_projects.project_id
             WHERE session_projects.session_id = ?1
@@ -6182,12 +6350,14 @@ fn load_primary_project_for_session(
             ",
             params![session_id],
             |row| {
+                let origin_url: String = row.get(5)?;
                 Ok(ResolvedProject {
                     id: row.get(0)?,
                     title: row.get(1)?,
                     slug: row.get(2)?,
                     relative_path: row.get(3)?,
                     absolute_path: row.get(4)?,
+                    origin_url: redact_git_remote_url_userinfo(&origin_url),
                 })
             },
         )
@@ -7599,6 +7769,19 @@ fn load_job_summary(connection: &Connection, job_id: &str) -> Result<JobSummary>
                 validation_status,
                 cleanup_status,
                 cleanup_paths_json,
+                metadata_json,
+                worktree_base_ref,
+                worktree_base_status,
+                worktree_base_reason,
+                worktree_origin_url,
+                expected_origin_url,
+                observed_git_branch,
+                expected_git_branch,
+                worktree_head_sha,
+                canonical_base_sha,
+                worktree_behind_by,
+                branch_repo_status,
+                branch_repo_reason,
                 last_resumed_at,
                 created_at,
                 updated_at
@@ -7677,6 +7860,19 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         validation_status: row.get(26)?,
         cleanup_status: row.get(27)?,
         cleanup_paths: decode_string_vec_column(row, 28)?,
+        metadata_json: decode_json_value(row.get(29)?)?,
+        worktree_base_ref: row.get(30)?,
+        worktree_base_status: row.get(31)?,
+        worktree_base_reason: row.get(32)?,
+        worktree_origin_url: row.get(33)?,
+        expected_origin_url: row.get(34)?,
+        observed_git_branch: row.get(35)?,
+        expected_git_branch: row.get(36)?,
+        worktree_head_sha: row.get(37)?,
+        canonical_base_sha: row.get(38)?,
+        worktree_behind_by: row.get(39)?,
+        branch_repo_status: row.get(40)?,
+        branch_repo_reason: row.get(41)?,
         task_evidence: Vec::new(),
         completion_status: String::new(),
         completion_gates: Vec::new(),
@@ -7684,7 +7880,7 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         worker_count: 0,
         pending_approval_count: 0,
         artifact_count: 0,
-        last_resumed_at: row.get(29)?,
+        last_resumed_at: row.get(42)?,
         last_reasoning: String::new(),
         last_reasoning_at: None,
         token_usage_known: false,
@@ -7692,8 +7888,8 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         completion_tokens: 0,
         cached_tokens: 0,
         cost_usd_estimate: None,
-        created_at: row.get(30)?,
-        updated_at: row.get(31)?,
+        created_at: row.get(43)?,
+        updated_at: row.get(44)?,
     })
 }
 
@@ -9162,6 +9358,7 @@ struct DiscoveredProject {
     slug: String,
     relative_path: String,
     absolute_path: String,
+    origin_url: String,
 }
 
 fn discover_projects(root: &Path) -> Result<Vec<DiscoveredProject>> {
@@ -9220,6 +9417,7 @@ fn discover_projects_recursive(
                 slug,
                 relative_path: relative,
                 absolute_path: path.display().to_string(),
+                origin_url: git_origin_url_for_path(&path).unwrap_or_default(),
             });
             continue;
         }
@@ -9228,6 +9426,43 @@ fn discover_projects_recursive(
     }
 
     Ok(())
+}
+
+fn git_origin_url_for_path(path: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(redact_git_remote_url_userinfo(value))
+    }
+}
+
+fn redact_git_remote_url_userinfo(url: &str) -> String {
+    let value = url.trim();
+    let Some(scheme_index) = value.find("://") else {
+        return value.to_string();
+    };
+    let authority_start = scheme_index + "://".len();
+    let rest = &value[authority_start..];
+    let slash_index = rest.find('/').unwrap_or(usize::MAX);
+    let Some(at_index) = rest.find('@') else {
+        return value.to_string();
+    };
+    if at_index < slash_index {
+        format!("{}{}", &value[..authority_start], &rest[at_index + 1..])
+    } else {
+        value.to_string()
+    }
 }
 
 fn is_project_dir(path: &Path) -> bool {
@@ -10117,6 +10352,22 @@ mod tests {
     }
 
     #[test]
+    fn project_origin_redacts_url_userinfo() {
+        assert_eq!(
+            redact_git_remote_url_userinfo("https://user:token@example.com/Org/Repo.git"),
+            "https://example.com/Org/Repo.git"
+        );
+        assert_eq!(
+            redact_git_remote_url_userinfo("ssh://git@example.com/Org/Repo.git"),
+            "ssh://example.com/Org/Repo.git"
+        );
+        assert_eq!(
+            redact_git_remote_url_userinfo("git@example.com:Org/Repo.git"),
+            "git@example.com:Org/Repo.git"
+        );
+    }
+
+    #[test]
     fn backfills_legacy_project_sessions_into_session_projects() {
         let state_dir = test_state_dir("legacy-session-backfill");
         let workspace_root = state_dir.join("workspace");
@@ -10544,6 +10795,87 @@ mod tests {
         assert_eq!(jobs[0].browser_verification_status, "not_required");
         assert!(jobs[0].browser_verification_summary.is_empty());
         assert!(jobs[0].browser_verification_artifact_ids.is_empty());
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn persists_context_integrity_job_evidence_fields() {
+        let state_dir = test_state_dir("context-integrity-job-evidence");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let working_dir = store
+            .scratch_dir_for_session("context-integrity")
+            .expect("scratch dir should resolve");
+        fs::create_dir_all(&working_dir).expect("scratch dir should exist");
+        store
+            .create_session(test_session_record(
+                "context-session",
+                "Context session",
+                "project",
+                working_dir.clone(),
+            ))
+            .expect("session should persist");
+        let job = store
+            .create_job(JobRecord {
+                id: "context-job".to_string(),
+                session_id: Some("context-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("local_project".to_string()),
+                title: "Context job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "running".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "test".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("job should persist");
+
+        let updated = store
+            .update_job(
+                &job.id,
+                JobPatch {
+                    metadata_json: Some(serde_json::json!({
+                        "worktree_base_override": {
+                            "allowed_behind_by": 1,
+                            "reason": "backport branch"
+                        }
+                    })),
+                    worktree_base_ref: Some("dev".to_string()),
+                    worktree_base_status: Some("blocked".to_string()),
+                    worktree_base_reason: Some("behind canonical by 2 merge commit(s)".to_string()),
+                    worktree_origin_url: Some(
+                        "git@github.com:WebLime-agency/nucleus.git".to_string(),
+                    ),
+                    expected_origin_url: Some(
+                        "https://github.com/WebLime-agency/nucleus".to_string(),
+                    ),
+                    observed_git_branch: Some("feature".to_string()),
+                    expected_git_branch: Some("feature".to_string()),
+                    worktree_head_sha: Some("old".to_string()),
+                    canonical_base_sha: Some("new".to_string()),
+                    worktree_behind_by: Some(Some(2)),
+                    branch_repo_status: Some("satisfied".to_string()),
+                    branch_repo_reason: Some(String::new()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("context evidence should persist");
+
+        assert_eq!(updated.worktree_base_ref, "dev");
+        assert_eq!(updated.worktree_behind_by, Some(2));
+        assert_eq!(updated.branch_repo_status, "satisfied");
+        assert_eq!(
+            updated.metadata_json["worktree_base_override"]["allowed_behind_by"],
+            1
+        );
+        assert!(
+            updated
+                .completion_gates
+                .iter()
+                .any(|gate| { gate.id == "worktree_base_fresh" && gate.state == "blocked" })
+        );
 
         let _ = fs::remove_dir_all(&state_dir);
     }
