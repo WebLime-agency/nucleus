@@ -5185,6 +5185,15 @@ fn command_session_git_invocation(
             index += 1;
             continue;
         }
+        if git_global_option_takes_value(arg) {
+            command_session.args.get(index + 1)?;
+            index += 2;
+            continue;
+        }
+        if git_inline_global_option(arg) {
+            index += 1;
+            continue;
+        }
         if arg.starts_with('-') {
             return None;
         }
@@ -5200,6 +5209,27 @@ fn resolve_git_c_option_path(base_cwd: &Path, value: &str) -> PathBuf {
     } else {
         base_cwd.join(path)
     }
+}
+
+fn git_global_option_takes_value(arg: &str) -> bool {
+    matches!(arg, "-c" | "--config-env" | "--namespace")
+}
+
+fn git_inline_global_option(arg: &str) -> bool {
+    arg.starts_with("-c")
+        || arg.starts_with("--config-env=")
+        || arg.starts_with("--namespace=")
+        || matches!(
+            arg,
+            "--no-pager"
+                | "--paginate"
+                | "--no-replace-objects"
+                | "--no-optional-locks"
+                | "--literal-pathspecs"
+                | "--glob-pathspecs"
+                | "--noglob-pathspecs"
+                | "--icase-pathspecs"
+        )
 }
 
 fn context_integrity_patch(
@@ -20793,6 +20823,19 @@ Cleanup status: clean";
             &git_with_c
         ));
 
+        let mut git_with_global_options = direct_git.clone();
+        git_with_global_options.args = vec![
+            "-c".to_string(),
+            "user.name=Nucleus".to_string(),
+            "--no-pager".to_string(),
+            "checkout".to_string(),
+            "dev".to_string(),
+        ];
+        assert!(is_session_git_mutation_command_session(
+            &session,
+            &git_with_global_options
+        ));
+
         let mut other_session = direct_git.clone();
         other_session.session_id = "other-session".to_string();
         assert!(!is_session_git_mutation_command_session(
@@ -20828,6 +20871,17 @@ Cleanup status: clean";
         assert!(!is_session_git_mutation_command_session(
             &session,
             &shell_echo
+        ));
+
+        let mut redirected_repo = direct_git.clone();
+        redirected_repo.args = vec![
+            "--git-dir".to_string(),
+            outside.join(".git").display().to_string(),
+            "commit".to_string(),
+        ];
+        assert!(!is_session_git_mutation_command_session(
+            &session,
+            &redirected_repo
         ));
 
         let _ = fs::remove_dir_all(&state_dir);
