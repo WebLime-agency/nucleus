@@ -5016,20 +5016,29 @@ fn branch_repo_mismatches(
 
 fn normalize_git_origin_url(url: &str) -> String {
     let mut value = url.trim().trim_end_matches('/').to_string();
-    if let Some(rest) = value
+    let url_form = if let Some(rest) = value
         .strip_prefix("https://")
         .or_else(|| value.strip_prefix("http://"))
-        .or_else(|| value.strip_prefix("ssh://"))
     {
         value = rest.to_string();
-    }
+        true
+    } else if let Some(rest) = value.strip_prefix("ssh://") {
+        value = rest.to_string();
+        true
+    } else {
+        false
+    };
     if let Some((_, rest)) = value.split_once('@') {
         value = rest.to_string();
     }
     if let Some(colon_index) = value.find(':') {
         let slash_index = value.find('/').unwrap_or(usize::MAX);
         if colon_index < slash_index {
-            value.replace_range(colon_index..=colon_index, "/");
+            if url_form {
+                value.replace_range(colon_index..slash_index, "");
+            } else {
+                value.replace_range(colon_index..=colon_index, "/");
+            }
         }
     }
     value = value.trim_end_matches(".git").to_ascii_lowercase();
@@ -19820,6 +19829,10 @@ Cleanup status: clean";
         );
         assert_eq!(
             normalize_git_origin_url("ssh://git@gitlab.example/Org/Repo.git"),
+            normalize_git_origin_url("https://gitlab.example/org/repo")
+        );
+        assert_eq!(
+            normalize_git_origin_url("ssh://git@gitlab.example:2222/Org/Repo.git"),
             normalize_git_origin_url("https://gitlab.example/org/repo")
         );
     }
