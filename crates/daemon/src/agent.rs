@@ -5061,7 +5061,11 @@ fn declared_session_git_path(session: &SessionSummary) -> Option<PathBuf> {
 }
 
 fn observe_session_git_state(worktree_path: &Path) -> Result<ObservedSessionGitState> {
-    let git_head = git_command_stdout(worktree_path, &["rev-parse", "HEAD"])?;
+    let git_head = match git_command_stdout(worktree_path, &["rev-parse", "HEAD"]) {
+        Ok(head) => head,
+        Err(_) if worktree_has_unborn_head(worktree_path) => String::new(),
+        Err(error) => return Err(error),
+    };
     let git_branch = git_stdout(worktree_path, &["symbolic-ref", "--short", "HEAD"])
         .or_else(|| git_stdout(worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"]))
         .unwrap_or_default();
@@ -5073,6 +5077,16 @@ fn observe_session_git_state(worktree_path: &Path) -> Result<ObservedSessionGitS
         git_dirty: !status.trim().is_empty(),
         git_untracked_count,
     })
+}
+
+fn worktree_has_unborn_head(worktree_path: &Path) -> bool {
+    git_stdout(worktree_path, &["rev-parse", "--is-inside-work-tree"]).as_deref() == Some("true")
+        && git_stdout(
+            worktree_path,
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        )
+        .is_some()
+        && git_status(worktree_path, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_err()
 }
 
 fn git_command_stdout(cwd: &Path, args: &[&str]) -> Result<String> {
@@ -5133,9 +5147,7 @@ fn mutation_audit_explaining_session_state(
             || event.summary.contains(job_id);
         mentions_scope
             && haystack.contains("git")
-            && ["commit", "checkout", "switch", "merge", "pull", "reset"]
-                .iter()
-                .any(|needle| haystack.contains(needle))
+            && text_mentions_session_state_mutating_git(&haystack)
     }))
 }
 
@@ -5169,14 +5181,35 @@ fn is_session_git_mutation_command_session(
     let Some((git_cwd, subcommand)) = command_session_git_invocation(command_session) else {
         return false;
     };
-    if !matches!(
-        subcommand.as_str(),
-        "commit" | "checkout" | "switch" | "merge" | "pull" | "reset"
-    ) {
+    if !GIT_SESSION_STATE_MUTATING_SUBCOMMANDS.contains(&subcommand.as_str()) {
         return false;
     }
     path_is_under_declared_root(&git_cwd, &declared_git_path).unwrap_or(false)
 }
+
+fn text_mentions_session_state_mutating_git(text: &str) -> bool {
+    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-'))
+        .any(|token| GIT_SESSION_STATE_MUTATING_SUBCOMMANDS.contains(&token))
+}
+
+const GIT_SESSION_STATE_MUTATING_SUBCOMMANDS: &[&str] = &[
+    "add",
+    "apply",
+    "checkout",
+    "cherry-pick",
+    "clean",
+    "commit",
+    "merge",
+    "mv",
+    "pull",
+    "rebase",
+    "reset",
+    "restore",
+    "revert",
+    "rm",
+    "stash",
+    "switch",
+];
 
 fn command_session_git_invocation(
     command_session: &CommandSessionSummary,
@@ -20972,6 +21005,21 @@ Cleanup status: clean";
             &git_with_global_options
         ));
 
+        let mut rebase = direct_git.clone();
+        rebase.args = vec!["rebase".to_string(), "origin/dev".to_string()];
+        assert!(is_session_git_mutation_command_session(&session, &rebase));
+
+        let mut cherry_pick = direct_git.clone();
+        cherry_pick.args = vec!["cherry-pick".to_string(), "HEAD~1".to_string()];
+        assert!(is_session_git_mutation_command_session(
+            &session,
+            &cherry_pick
+        ));
+
+        let mut status = direct_git.clone();
+        status.args = vec!["status".to_string(), "--short".to_string()];
+        assert!(!is_session_git_mutation_command_session(&session, &status));
+
         let mut other_session = direct_git.clone();
         other_session.session_id = "other-session".to_string();
         assert!(!is_session_git_mutation_command_session(
@@ -21095,6 +21143,79 @@ Cleanup status: clean";
         let happy = session_state_evidence_and_refresh(&state, &session, "state-job")
             .expect("session state should refresh");
         assert_eq!(happy["status"], "satisfied");
+
+        let unborn = state_dir.join("unborn-session-state");
+        fs::create_dir_all(&unborn).expect("unborn worktree dir should exist");
+        run_git_test(&unborn, &["init", "-b", "dev"]);
+        let mut unborn_record = SessionRecord {
+            id: "unborn-state-session".to_string(),
+            title: "Unborn state session".to_string(),
+            profile_id: String::new(),
+            profile_title: String::new(),
+            route_id: String::new(),
+            route_title: String::new(),
+            scope: "project".to_string(),
+            project_id: String::new(),
+            project_title: String::new(),
+            project_path: unborn.display().to_string(),
+            project_ids: Vec::new(),
+            provider: "openai_compatible".to_string(),
+            model: "test-model".to_string(),
+            provider_base_url: String::new(),
+            provider_api_key: String::new(),
+            working_dir: unborn.display().to_string(),
+            working_dir_kind: "project_root".to_string(),
+            workspace_mode: "isolated_worktree".to_string(),
+            source_project_path: unborn.display().to_string(),
+            git_root: unborn.display().to_string(),
+            worktree_path: unborn.display().to_string(),
+            git_branch: "dev".to_string(),
+            git_base_ref: "dev".to_string(),
+            git_head: String::new(),
+            git_dirty: false,
+            git_untracked_count: 0,
+            git_remote_tracking_branch: String::new(),
+            session_state_observed_at: Some(1),
+            workspace_warnings: Vec::new(),
+            approval_mode: "ask".to_string(),
+            execution_mode: "act".to_string(),
+            run_budget_mode: "inherit".to_string(),
+        };
+        state
+            .store
+            .create_session(unborn_record.clone())
+            .expect("unborn session should persist");
+        let unborn_session = state
+            .store
+            .get_session("unborn-state-session")
+            .expect("unborn session should load")
+            .session;
+        let unborn_evidence =
+            session_state_evidence_and_refresh(&state, &unborn_session, "state-job")
+                .expect("unborn HEAD should be observed");
+        assert_eq!(unborn_evidence["status"], "satisfied");
+        assert_eq!(unborn_evidence["observed"]["git_head"], "");
+        assert_eq!(unborn_evidence["observed"]["git_branch"], "dev");
+        unborn_record.git_head = "stale-unborn-head".to_string();
+        state
+            .store
+            .update_session(
+                "unborn-state-session",
+                SessionPatch {
+                    git_head: Some(unborn_record.git_head),
+                    ..SessionPatch::default()
+                },
+            )
+            .expect("unborn stale session should persist");
+        let unborn_stale = state
+            .store
+            .get_session("unborn-state-session")
+            .expect("unborn stale session should load")
+            .session;
+        let unborn_blocked = session_state_evidence_and_refresh(&state, &unborn_stale, "state-job")
+            .expect("unborn stale state should refresh");
+        assert_eq!(unborn_blocked["status"], "blocked");
+        assert_eq!(unborn_blocked["observed"]["git_head"], "");
 
         state
             .store
