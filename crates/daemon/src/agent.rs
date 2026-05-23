@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{Arc, Mutex as StdMutex},
-    time::UNIX_EPOCH,
+    time::{Instant, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -75,6 +75,7 @@ const COMMAND_PREVIEW_CHAR_LIMIT: usize = 4_000;
 const COMMAND_LABEL_CHAR_LIMIT: usize = 140;
 const COMMAND_DEFAULT_TIMEOUT_SECS: u64 = 300;
 const COMMAND_MAX_TIMEOUT_SECS: u64 = 1_800;
+const CONTEXT_INTEGRITY_FETCH_TIMEOUT_SECS: u64 = 30;
 const COMMAND_DEFAULT_OUTPUT_LIMIT_BYTES: usize = 131_072;
 const COMMAND_MAX_OUTPUT_LIMIT_BYTES: usize = 524_288;
 const COMMAND_DEFAULT_WAIT_FOR_OUTPUT_MS: u64 = 250;
@@ -4781,7 +4782,8 @@ fn context_integrity_patch(
         return patch;
     }
 
-    let observed_origin = git_stdout(&worktree_path, &["remote", "get-url", "origin"]);
+    let observed_origin = git_stdout(&worktree_path, &["remote", "get-url", "origin"])
+        .map(|url| redact_git_remote_url_userinfo(&url));
     let observed_branch = git_stdout(&worktree_path, &["symbolic-ref", "--short", "HEAD"])
         .or_else(|| git_stdout(&worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"]))
         .unwrap_or_default();
@@ -4833,7 +4835,7 @@ fn context_integrity_patch(
 
     let canonical_ref = format!("refs/remotes/origin/{base_ref}");
     let fetch_refspec = format!("+{base_ref}:{canonical_ref}");
-    let fetch = git_status(&worktree_path, &["fetch", "origin", &fetch_refspec]);
+    let fetch = git_fetch_status(&worktree_path, &["fetch", "origin", &fetch_refspec]);
     if let Err(error) = fetch {
         patch.worktree_base_status = Some("pending".to_string());
         patch.worktree_base_reason = Some(format!("could not reach canonical: {error}"));
@@ -4941,7 +4943,7 @@ fn expected_project_origin_url(state: &AppState, session: &SessionSummary) -> St
     if !session.project_id.trim().is_empty() {
         if let Ok(project) = state.store.resolve_project(&session.project_id) {
             if !project.origin_url.trim().is_empty() {
-                return project.origin_url;
+                return redact_git_remote_url_userinfo(&project.origin_url);
             }
         }
     }
@@ -4949,7 +4951,9 @@ fn expected_project_origin_url(state: &AppState, session: &SessionSummary) -> St
     if project_path.is_empty() {
         return String::new();
     }
-    git_stdout(Path::new(project_path), &["remote", "get-url", "origin"]).unwrap_or_default()
+    git_stdout(Path::new(project_path), &["remote", "get-url", "origin"])
+        .map(|url| redact_git_remote_url_userinfo(&url))
+        .unwrap_or_default()
 }
 
 fn branch_repo_status(
@@ -5057,6 +5061,24 @@ fn normalize_git_origin_url(url: &str) -> String {
     }
 }
 
+fn redact_git_remote_url_userinfo(url: &str) -> String {
+    let value = url.trim();
+    let Some(scheme_index) = value.find("://") else {
+        return value.to_string();
+    };
+    let authority_start = scheme_index + "://".len();
+    let rest = &value[authority_start..];
+    let slash_index = rest.find('/').unwrap_or(usize::MAX);
+    let Some(at_index) = rest.find('@') else {
+        return value.to_string();
+    };
+    if at_index < slash_index {
+        format!("{}{}", &value[..authority_start], &rest[at_index + 1..])
+    } else {
+        value.to_string()
+    }
+}
+
 fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
     let output = std::process::Command::new("git")
         .arg("-C")
@@ -5093,6 +5115,55 @@ fn git_status(cwd: &Path, args: &[&str]) -> Result<()> {
         bail!("git {} failed", args.join(" "));
     }
     bail!("{detail}");
+}
+
+fn git_fetch_status(cwd: &Path, args: &[&str]) -> Result<()> {
+    let mut child = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "true")
+        .env("SSH_ASKPASS", "true")
+        .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+        .spawn()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+    let started = Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .with_context(|| format!("failed to poll git {}", args.join(" ")))?
+            .is_some()
+        {
+            let output = child
+                .wait_with_output()
+                .with_context(|| format!("failed to collect git {}", args.join(" ")))?;
+            if output.status.success() {
+                return Ok(());
+            }
+            bail!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        if started.elapsed() >= Duration::from_secs(CONTEXT_INTEGRITY_FETCH_TIMEOUT_SECS) {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .with_context(|| format!("failed to collect timed-out git {}", args.join(" ")))?;
+            bail!(
+                "git {} timed out after {}s: {}",
+                args.join(" "),
+                CONTEXT_INTEGRITY_FETCH_TIMEOUT_SECS,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn context_integrity_start_blocker(job: &JobSummary) -> Option<String> {
@@ -19877,6 +19948,14 @@ Cleanup status: clean";
         assert_ne!(
             normalize_git_origin_url("ssh://git@gitlab.example:2222/Org/Repo.git"),
             normalize_git_origin_url("https://gitlab.example/org/repo")
+        );
+        assert_eq!(
+            redact_git_remote_url_userinfo("https://user:token@gitlab.example/Org/Repo.git"),
+            "https://gitlab.example/Org/Repo.git"
+        );
+        assert_eq!(
+            redact_git_remote_url_userinfo("git@gitlab.example:Org/Repo.git"),
+            "git@gitlab.example:Org/Repo.git"
         );
     }
 

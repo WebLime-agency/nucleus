@@ -6091,13 +6091,14 @@ fn load_project_summary(connection: &Connection, project_id: &str) -> Result<Pro
 }
 
 fn map_project_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectSummary> {
+    let origin_url: String = row.get(5)?;
     Ok(ProjectSummary {
         id: row.get(0)?,
         title: row.get(1)?,
         slug: row.get(2)?,
         relative_path: row.get(3)?,
         absolute_path: row.get(4)?,
-        origin_url: row.get(5)?,
+        origin_url: redact_git_remote_url_userinfo(&origin_url),
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
     })
@@ -6113,13 +6114,14 @@ fn load_resolved_project(connection: &Connection, project_id: &str) -> Result<Re
             ",
             params![project_id],
             |row| {
+                let origin_url: String = row.get(5)?;
                 Ok(ResolvedProject {
                     id: row.get(0)?,
                     title: row.get(1)?,
                     slug: row.get(2)?,
                     relative_path: row.get(3)?,
                     absolute_path: row.get(4)?,
-                    origin_url: row.get(5)?,
+                    origin_url: redact_git_remote_url_userinfo(&origin_url),
                 })
             },
         )
@@ -6145,13 +6147,14 @@ fn load_resolved_project_by_path(
             ",
             params![path],
             |row| {
+                let origin_url: String = row.get(5)?;
                 Ok(ResolvedProject {
                     id: row.get(0)?,
                     title: row.get(1)?,
                     slug: row.get(2)?,
                     relative_path: row.get(3)?,
                     absolute_path: row.get(4)?,
-                    origin_url: row.get(5)?,
+                    origin_url: redact_git_remote_url_userinfo(&origin_url),
                 })
             },
         )
@@ -6347,13 +6350,14 @@ fn load_primary_project_for_session(
             ",
             params![session_id],
             |row| {
+                let origin_url: String = row.get(5)?;
                 Ok(ResolvedProject {
                     id: row.get(0)?,
                     title: row.get(1)?,
                     slug: row.get(2)?,
                     relative_path: row.get(3)?,
                     absolute_path: row.get(4)?,
-                    origin_url: row.get(5)?,
+                    origin_url: redact_git_remote_url_userinfo(&origin_url),
                 })
             },
         )
@@ -9439,7 +9443,25 @@ fn git_origin_url_for_path(path: &Path) -> Option<String> {
     if value.is_empty() {
         None
     } else {
-        Some(value.to_string())
+        Some(redact_git_remote_url_userinfo(value))
+    }
+}
+
+fn redact_git_remote_url_userinfo(url: &str) -> String {
+    let value = url.trim();
+    let Some(scheme_index) = value.find("://") else {
+        return value.to_string();
+    };
+    let authority_start = scheme_index + "://".len();
+    let rest = &value[authority_start..];
+    let slash_index = rest.find('/').unwrap_or(usize::MAX);
+    let Some(at_index) = rest.find('@') else {
+        return value.to_string();
+    };
+    if at_index < slash_index {
+        format!("{}{}", &value[..authority_start], &rest[at_index + 1..])
+    } else {
+        value.to_string()
     }
 }
 
@@ -10327,6 +10349,22 @@ mod tests {
         assert_eq!(project.relative_path, "alpha");
 
         let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn project_origin_redacts_url_userinfo() {
+        assert_eq!(
+            redact_git_remote_url_userinfo("https://user:token@example.com/Org/Repo.git"),
+            "https://example.com/Org/Repo.git"
+        );
+        assert_eq!(
+            redact_git_remote_url_userinfo("ssh://git@example.com/Org/Repo.git"),
+            "ssh://example.com/Org/Repo.git"
+        );
+        assert_eq!(
+            redact_git_remote_url_userinfo("git@example.com:Org/Repo.git"),
+            "git@example.com:Org/Repo.git"
+        );
     }
 
     #[test]
