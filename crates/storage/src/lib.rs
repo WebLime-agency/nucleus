@@ -110,6 +110,7 @@ mod observability_tests {
             session_id: Some(session_id.to_string()),
             parent_job_id: parent_job_id.map(str::to_string),
             template_id: None,
+            task_class: None,
             title: id.to_string(),
             purpose: "test job".to_string(),
             trigger_kind: "session_prompt".to_string(),
@@ -467,6 +468,7 @@ pub struct JobRecord {
     pub session_id: Option<String>,
     pub parent_job_id: Option<String>,
     pub template_id: Option<String>,
+    pub task_class: Option<String>,
     pub title: String,
     pub purpose: String,
     pub trigger_kind: String,
@@ -479,6 +481,7 @@ pub struct JobRecord {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JobPatch {
     pub state: Option<String>,
+    pub task_class: Option<Option<String>>,
     pub root_worker_id: Option<String>,
     pub visible_turn_id: Option<String>,
     pub result_summary: Option<String>,
@@ -2426,6 +2429,15 @@ impl StateStore {
             .unwrap_or(&record.prompt_excerpt);
         let publication_requested =
             publication_requested_for_job(&record.title, &record.purpose, publication_prompt);
+        let task_class = normalize_task_class(record.task_class.as_deref()).or_else(|| {
+            infer_task_class_for_job(
+                publication_requested,
+                &record.trigger_kind,
+                &record.title,
+                &record.purpose,
+                publication_prompt,
+            )
+        });
         let publication_status = "not_requested";
         let browser_verification_status = if publication_requested {
             "not_performed"
@@ -2440,6 +2452,7 @@ impl StateStore {
                 session_id,
                 parent_job_id,
                 template_id,
+                task_class,
                 title,
                 purpose,
                 trigger_kind,
@@ -2453,13 +2466,14 @@ impl StateStore {
                 cleanup_status,
                 cleanup_paths_json
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'not_performed', ?13, 'unknown', '[]')
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'not_performed', ?14, 'unknown', '[]')
             ",
             params![
                 record.id,
                 record.session_id,
                 record.parent_job_id,
                 record.template_id,
+                task_class,
                 record.title,
                 record.purpose,
                 record.trigger_kind,
@@ -2511,36 +2525,46 @@ impl StateStore {
             .unwrap_or_else(|| current.cleanup_paths.clone());
         let cleanup_paths_json =
             serde_json::to_string(&cleanup_paths).context("failed to serialize cleanup paths")?;
+        let current_task_class_cleared = job_task_class_cleared(&connection, job_id)?;
+        let (next_task_class, next_task_class_cleared) = match patch.task_class {
+            Some(Some(value)) => (normalize_task_class(Some(&value)), false),
+            Some(None) => (None, true),
+            None => (current.task_class.clone(), current_task_class_cleared),
+        };
         connection.execute(
             "
             UPDATE jobs
             SET
                 state = ?2,
-                root_worker_id = ?3,
-                visible_turn_id = ?4,
-                result_summary = ?5,
-                last_error = ?6,
-                ui_renderable = ?7,
-                browser_verification_required = ?8,
-                browser_verification_status = ?9,
-                browser_verification_summary = ?10,
-                browser_verification_artifact_ids_json = ?11,
-                publication_requested = ?12,
-                publication_status = ?13,
-                publication_summary = ?14,
-                pr_url = ?15,
-                source_branch = ?16,
-                target_branch = ?17,
-                validation_status = ?18,
-                cleanup_status = ?19,
-                cleanup_paths_json = ?20,
-                last_resumed_at = ?21,
+                task_class = ?3,
+                task_class_cleared = ?4,
+                root_worker_id = ?5,
+                visible_turn_id = ?6,
+                result_summary = ?7,
+                last_error = ?8,
+                ui_renderable = ?9,
+                browser_verification_required = ?10,
+                browser_verification_status = ?11,
+                browser_verification_summary = ?12,
+                browser_verification_artifact_ids_json = ?13,
+                publication_requested = ?14,
+                publication_status = ?15,
+                publication_summary = ?16,
+                pr_url = ?17,
+                source_branch = ?18,
+                target_branch = ?19,
+                validation_status = ?20,
+                cleanup_status = ?21,
+                cleanup_paths_json = ?22,
+                last_resumed_at = ?23,
                 updated_at = unixepoch()
             WHERE id = ?1
             ",
             params![
                 job_id,
                 next_state,
+                next_task_class,
+                bool_to_i64(next_task_class_cleared),
                 patch.root_worker_id.or(current.root_worker_id),
                 patch.visible_turn_id.or(current.visible_turn_id),
                 patch.result_summary.unwrap_or(current.result_summary),
@@ -2868,6 +2892,10 @@ impl StateStore {
             ],
         )?;
 
+        if let Some(task_class) = task_class_from_tool_id(&record.tool_id) {
+            assign_task_class_if_missing(&connection, &record.job_id, task_class)?;
+        }
+
         load_tool_call_summary(&connection, &record.id)
     }
 
@@ -2931,6 +2959,10 @@ impl StateStore {
                 patch.completed_at.unwrap_or(current.completed_at),
             ],
         )?;
+
+        if let Some(task_class) = task_class_from_tool_id(&current.tool_id) {
+            assign_task_class_if_missing(&connection, &current.job_id, task_class)?;
+        }
 
         load_tool_call_summary(&connection, tool_call_id)
     }
@@ -3088,6 +3120,10 @@ impl StateStore {
                 record.completed_at,
             ],
         )?;
+
+        if let Some(task_class) = task_class_from_command(&record.command, &record.args) {
+            assign_task_class_if_missing(&connection, &record.job_id, task_class)?;
+        }
 
         load_command_session_summary(&connection, &record.id)
     }
@@ -3381,6 +3417,8 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
             parent_job_id TEXT REFERENCES jobs(id) ON DELETE CASCADE,
             template_id TEXT,
+            task_class TEXT,
+            task_class_cleared INTEGER NOT NULL DEFAULT 0,
             title TEXT NOT NULL,
             purpose TEXT NOT NULL DEFAULT '',
             trigger_kind TEXT NOT NULL DEFAULT 'session_prompt',
@@ -4298,6 +4336,13 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "metadata_json",
         "TEXT NOT NULL DEFAULT '{}'",
     )?;
+    ensure_column(connection, "jobs", "task_class", "TEXT")?;
+    ensure_column(
+        connection,
+        "jobs",
+        "task_class_cleared",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     ensure_column(
         connection,
         "jobs",
@@ -4893,6 +4938,117 @@ fn publication_requested_for_job(_title: &str, _purpose: &str, prompt_excerpt: &
     }
 
     false
+}
+
+fn normalize_task_class(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let normalized = value.replace('-', "_").to_ascii_lowercase();
+    match normalized.as_str() {
+        "github_pr" | "research" | "automation" | "local_project" | "deployment"
+        | "memory_session" | "process_server" => Some(normalized),
+        _ => None,
+    }
+}
+
+fn infer_task_class_for_job(
+    publication_requested: bool,
+    _trigger_kind: &str,
+    _title: &str,
+    _purpose: &str,
+    _prompt_excerpt: &str,
+) -> Option<String> {
+    if publication_requested {
+        return Some("github_pr".to_string());
+    }
+    None
+}
+
+fn contains_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
+fn command_tokens(text: &str) -> Vec<&str> {
+    text.split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn command_phrase_text(text: &str) -> String {
+    format!(" {} ", command_tokens(text).join(" "))
+}
+
+fn command_phrase_contains(phrase_text: &str, phrase: &str) -> bool {
+    phrase_text.contains(&format!(" {phrase} "))
+}
+
+fn normalized_command_name(command: &str) -> String {
+    command
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(command)
+        .to_ascii_lowercase()
+}
+
+fn task_class_from_tool_id(tool_id: &str) -> Option<&'static str> {
+    let tool_id = tool_id.to_ascii_lowercase();
+    if is_research_classification_tool(&tool_id) {
+        Some("research")
+    } else if is_automation_tool(&tool_id) {
+        Some("automation")
+    } else if is_memory_tool(&tool_id) {
+        Some("memory_session")
+    } else if contains_any(&tool_id, &["deploy", "release", "publish"]) {
+        Some("deployment")
+    } else if contains_any(&tool_id, &["process", "server", "daemon"]) {
+        Some("process_server")
+    } else {
+        None
+    }
+}
+
+fn task_class_from_command(command: &str, args: &[String]) -> Option<&'static str> {
+    let text = command_session_text(command, args);
+    if is_deployment_command_session(command, args) {
+        Some("deployment")
+    } else if is_process_command_session(command, args) {
+        Some("process_server")
+    } else if is_validation_command(&text) {
+        Some("local_project")
+    } else {
+        None
+    }
+}
+
+fn assign_task_class_if_missing(
+    connection: &Connection,
+    job_id: &str,
+    task_class: &str,
+) -> Result<()> {
+    connection.execute(
+        "
+        UPDATE jobs
+        SET task_class = ?2, updated_at = unixepoch()
+        WHERE id = ?1
+          AND (task_class IS NULL OR task_class = '')
+          AND COALESCE(task_class_cleared, 0) = 0
+        ",
+        params![job_id, task_class],
+    )?;
+    Ok(())
+}
+
+fn job_task_class_cleared(connection: &Connection, job_id: &str) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT COALESCE(task_class_cleared, 0) FROM jobs WHERE id = ?1",
+            params![job_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .context("failed to load job task class clear state")
 }
 
 fn publication_segment_requests_publication(text: &str) -> bool {
@@ -7418,6 +7574,7 @@ fn load_job_summary(connection: &Connection, job_id: &str) -> Result<JobSummary>
                 session_id,
                 parent_job_id,
                 template_id,
+                task_class,
                 title,
                 purpose,
                 trigger_kind,
@@ -7458,6 +7615,7 @@ fn load_job_summary(connection: &Connection, job_id: &str) -> Result<JobSummary>
     job.pending_approval_count = count_pending_approvals_for_job(connection, job_id)?;
     job.artifact_count = count_for_job(connection, "job_artifacts", job_id)?;
     apply_job_observability_rollups(connection, &mut job)?;
+    apply_job_evidence_rollups(connection, &mut job)?;
     if let Some(root_worker_id) = job.root_worker_id.as_deref() {
         if let Ok(worker) = load_worker_summary(connection, root_worker_id) {
             job.executor_lane = worker.lane;
@@ -7467,7 +7625,7 @@ fn load_job_summary(connection: &Connection, job_id: &str) -> Result<JobSummary>
             job.executor_route_title = worker.route_title;
         }
     }
-    Ok(job)
+    Ok(job.with_completion_gates())
 }
 
 fn count_jobs_for_template(connection: &Connection, template_id: &str) -> Result<usize> {
@@ -7482,48 +7640,51 @@ fn count_jobs_for_template(connection: &Connection, template_id: &str) -> Result
 }
 
 fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> {
+    let task_class = row.get::<_, Option<String>>(4)?;
     Ok(JobSummary {
         id: row.get(0)?,
         session_id: row.get(1)?,
         parent_job_id: row.get(2)?,
         template_id: row.get(3)?,
-        title: row.get(4)?,
-        purpose: row.get(5)?,
-        trigger_kind: row.get(6)?,
-        state: row.get(7)?,
-        requested_by: row.get(8)?,
-        prompt_excerpt: row.get(9)?,
-        root_worker_id: row.get(10)?,
+        task_class: normalize_task_class(task_class.as_deref()),
+        title: row.get(5)?,
+        purpose: row.get(6)?,
+        trigger_kind: row.get(7)?,
+        state: row.get(8)?,
+        requested_by: row.get(9)?,
+        prompt_excerpt: row.get(10)?,
+        root_worker_id: row.get(11)?,
         executor_lane: String::new(),
         executor_provider: String::new(),
         executor_model: String::new(),
         executor_route_id: String::new(),
         executor_route_title: String::new(),
-        visible_turn_id: row.get(11)?,
-        result_summary: row.get(12)?,
-        last_error: row.get(13)?,
+        visible_turn_id: row.get(12)?,
+        result_summary: row.get(13)?,
+        last_error: row.get(14)?,
         user_error: None,
-        ui_renderable: row.get(14)?,
-        browser_verification_required: row.get(15)?,
-        browser_verification_status: row.get(16)?,
-        browser_verification_summary: row.get(17)?,
-        browser_verification_artifact_ids: decode_string_list(row.get::<_, String>(18)?)?,
-        publication_requested: row.get::<_, i64>(19)? != 0,
-        publication_status: row.get(20)?,
-        publication_summary: row.get(21)?,
-        pr_url: row.get(22)?,
-        source_branch: row.get(23)?,
-        target_branch: row.get(24)?,
-        validation_status: row.get(25)?,
-        cleanup_status: row.get(26)?,
-        cleanup_paths: decode_string_vec_column(row, 27)?,
+        ui_renderable: row.get(15)?,
+        browser_verification_required: row.get(16)?,
+        browser_verification_status: row.get(17)?,
+        browser_verification_summary: row.get(18)?,
+        browser_verification_artifact_ids: decode_string_list(row.get::<_, String>(19)?)?,
+        publication_requested: row.get::<_, i64>(20)? != 0,
+        publication_status: row.get(21)?,
+        publication_summary: row.get(22)?,
+        pr_url: row.get(23)?,
+        source_branch: row.get(24)?,
+        target_branch: row.get(25)?,
+        validation_status: row.get(26)?,
+        cleanup_status: row.get(27)?,
+        cleanup_paths: decode_string_vec_column(row, 28)?,
+        task_evidence: Vec::new(),
         completion_status: String::new(),
         completion_gates: Vec::new(),
         completion_blockers: Vec::new(),
         worker_count: 0,
         pending_approval_count: 0,
         artifact_count: 0,
-        last_resumed_at: row.get(28)?,
+        last_resumed_at: row.get(29)?,
         last_reasoning: String::new(),
         last_reasoning_at: None,
         token_usage_known: false,
@@ -7531,10 +7692,9 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         completion_tokens: 0,
         cached_tokens: 0,
         cost_usd_estimate: None,
-        created_at: row.get(29)?,
-        updated_at: row.get(30)?,
-    }
-    .with_completion_gates())
+        created_at: row.get(30)?,
+        updated_at: row.get(31)?,
+    })
 }
 
 fn apply_job_observability_rollups(connection: &Connection, job: &mut JobSummary) -> Result<()> {
@@ -7551,6 +7711,444 @@ fn apply_job_observability_rollups(connection: &Connection, job: &mut JobSummary
     }
 
     Ok(())
+}
+
+fn apply_job_evidence_rollups(connection: &Connection, job: &mut JobSummary) -> Result<()> {
+    let mut evidence = Vec::new();
+    if job.session_id.is_some() {
+        evidence.push("target_scope:session".to_string());
+    }
+    if job.validation_status == "passed" {
+        evidence.push("validation:validation status passed".to_string());
+    }
+    if !job.browser_verification_artifact_ids.is_empty() {
+        evidence.push("health_or_logs:browser verification artifacts".to_string());
+    }
+
+    for command_session in load_command_sessions_for_job(connection, &job.id)? {
+        let command_text = command_session_text(&command_session.command, &command_session.args);
+        let label = command_evidence_label(&command_session);
+        if command_session.state == "completed" && command_session.exit_code == Some(0) {
+            let is_deployment_command =
+                is_deployment_command_session(&command_session.command, &command_session.args);
+            if is_validation_command(&command_text) {
+                evidence.push(format!("validation:{label}"));
+            }
+            if is_deployment_command {
+                evidence.push(format!("deployment_status:{label}"));
+            }
+            if !is_deployment_command && is_version_command(&command_text) {
+                evidence.push(format!("version:{label}"));
+            }
+            if is_health_command(&command_text) {
+                evidence.push(format!("health:{label}"));
+                evidence.push(format!("health_or_logs:{label}"));
+            }
+            if is_process_command_session(&command_session.command, &command_session.args) {
+                evidence.push(format!("process_state:{label}"));
+            }
+            if command_session.port.is_some() {
+                evidence.push(format!("port_state:{label}"));
+            }
+        } else if is_failed_command_session(&command_session.state, command_session.exit_code) {
+            evidence.push(format!("failed_command:{label}"));
+        }
+    }
+
+    for (tool_id, status, summary) in load_tool_call_evidence_rows(connection, &job.id)? {
+        let tool_text = format!("{} {}", tool_id, summary).to_ascii_lowercase();
+        if is_successful_tool_status(&status) {
+            if is_research_tool(&tool_text) {
+                evidence.push(format!("fresh_sources:{tool_id}"));
+                if tool_text.contains("source quality")
+                    || tool_text.contains("primary source")
+                    || tool_text.contains("quality check")
+                {
+                    evidence.push(format!("source_quality:{tool_id}"));
+                }
+                if tool_text.contains("contradiction")
+                    || tool_text.contains("cross-check")
+                    || tool_text.contains("alternate source")
+                {
+                    evidence.push(format!("contradictions:{tool_id}"));
+                }
+            }
+            if is_automation_tool(&tool_text) {
+                evidence.push(format!("schedule_state:{tool_id}"));
+            }
+            if is_memory_tool(&tool_text) {
+                evidence.push(format!("operation_result:{tool_id}"));
+            }
+        } else if status == "failed" {
+            evidence.push(format!("failed_tool:{tool_id}"));
+        }
+    }
+
+    for event in load_job_events_for_job(connection, &job.id)? {
+        let event_text = format!(
+            "{} {} {} {}",
+            event.event_type, event.status, event.summary, event.detail
+        )
+        .to_ascii_lowercase();
+        let event_succeeded = is_successful_evidence_status(&event.status);
+        if event_succeeded && (event_text.contains("waiver") || event_text.contains("waived")) {
+            evidence.push("waiver:command_failure".to_string());
+            if contains_any(
+                &event_text,
+                &[
+                    "deploy",
+                    "deployment",
+                    "post-deploy",
+                    "health",
+                    "endpoint",
+                    "version",
+                ],
+            ) {
+                evidence.push("waiver:deployment_verification".to_string());
+            }
+        }
+        if event_succeeded && (event_text.contains("research") || event_text.contains("source")) {
+            evidence.push(format!("fresh_sources:{}", event.summary));
+        }
+        if event_succeeded
+            && (event_text.contains("source quality") || event_text.contains("primary source"))
+        {
+            evidence.push(format!("source_quality:{}", event.summary));
+        }
+        if event_succeeded
+            && (event_text.contains("contradiction") || event_text.contains("cross-check"))
+        {
+            evidence.push(format!("contradictions:{}", event.summary));
+        }
+        if event_succeeded && (event_text.contains("automation") || event_text.contains("schedule"))
+        {
+            evidence.push(format!("schedule_state:{}", event.summary));
+        }
+        if event_succeeded && (event_text.contains("execution") || event_text.contains("run log")) {
+            evidence.push(format!("execution_logs:{}", event.summary));
+        }
+        if event_succeeded && (event_text.contains("deploy") || event_text.contains("release")) {
+            evidence.push(format!("deployment_status:{}", event.summary));
+        }
+        if event_succeeded && (event_text.contains("version") || event_text.contains("artifact")) {
+            evidence.push(format!("version:{}", event.summary));
+        }
+        if event_succeeded && (event_text.contains("health") || event_text.contains("endpoint")) {
+            evidence.push(format!("health:{}", event.summary));
+            evidence.push(format!("health_or_logs:{}", event.summary));
+        }
+        if event_succeeded && is_memory_operation_event(&event_text) {
+            evidence.push(format!("operation_result:{}", event.summary));
+        }
+        if event_succeeded
+            && (event_text.contains("process")
+                || event_text.contains("server")
+                || event_text.contains("restart"))
+        {
+            evidence.push(format!("process_state:{}", event.summary));
+        }
+        if event_succeeded && (event_text.contains("port") || event_text.contains("listener")) {
+            evidence.push(format!("port_state:{}", event.summary));
+        }
+    }
+
+    evidence.retain(|item| !item.trim().is_empty());
+    evidence.sort();
+    evidence.dedup();
+    job.task_evidence = evidence;
+    Ok(())
+}
+
+fn load_tool_call_evidence_rows(
+    connection: &Connection,
+    job_id: &str,
+) -> Result<Vec<(String, String, String)>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT tool_id, status, summary
+        FROM tool_calls
+        WHERE job_id = ?1
+        ORDER BY created_at ASC, id ASC
+        ",
+    )?;
+    let rows = statement.query_map(params![job_id], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load tool-call evidence rows")
+}
+
+fn is_failed_command_session(state: &str, exit_code: Option<i32>) -> bool {
+    matches!(state, "failed" | "orphaned" | "canceled") || exit_code.is_some_and(|code| code != 0)
+}
+
+fn command_session_text(command: &str, args: &[String]) -> String {
+    std::iter::once(command)
+        .chain(args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn command_evidence_label(command_session: &CommandSessionSummary) -> String {
+    if command_session.title.trim().is_empty() {
+        command_session.command.clone()
+    } else {
+        command_session.title.clone()
+    }
+}
+
+fn is_validation_command(text: &str) -> bool {
+    let phrase_text = command_phrase_text(text);
+    if command_phrase_contains(&phrase_text, "cargo build")
+        && command_phrase_contains(&phrase_text, "release")
+    {
+        return false;
+    }
+    [
+        "astro check",
+        "bun run build",
+        "bun run check",
+        "bun run lint",
+        "bun run test",
+        "bun test",
+        "cargo build",
+        "cargo check",
+        "cargo clippy",
+        "cargo fmt",
+        "cargo nextest",
+        "cargo test",
+        "dotnet build",
+        "dotnet test",
+        "eslint",
+        "git diff check",
+        "go build",
+        "go test",
+        "gradle build",
+        "gradle test",
+        "jest",
+        "just build",
+        "just check",
+        "just lint",
+        "just test",
+        "make build",
+        "make check",
+        "make lint",
+        "make test",
+        "mvn package",
+        "mvn test",
+        "next build",
+        "node test",
+        "npm run build",
+        "npm run check",
+        "npm run lint",
+        "npm run test",
+        "npm run typecheck",
+        "npm test",
+        "pnpm build",
+        "pnpm run build",
+        "pnpm run check",
+        "pnpm run lint",
+        "pnpm run test",
+        "pnpm run typecheck",
+        "pnpm test",
+        "pre commit run",
+        "prettier",
+        "pytest",
+        "svelte check",
+        "tsc",
+        "vite build",
+        "vitest",
+        "yarn build",
+        "yarn check",
+        "yarn lint",
+        "yarn run build",
+        "yarn run check",
+        "yarn run lint",
+        "yarn run test",
+        "yarn run typecheck",
+        "yarn test",
+    ]
+    .iter()
+    .any(|phrase| command_phrase_contains(&phrase_text, phrase))
+}
+
+fn is_deployment_command_session(command: &str, args: &[String]) -> bool {
+    let command_name = normalized_command_name(command);
+    if matches!(
+        command_name.as_str(),
+        "deploy" | "flyctl" | "netlify" | "publish" | "release" | "vercel" | "wrangler"
+    ) {
+        return true;
+    }
+
+    if matches!(command_name.as_str(), "bun" | "npm" | "pnpm" | "yarn") {
+        let arg_text = command_phrase_text(&args.join(" "));
+        return [
+            "deploy",
+            "publish",
+            "release",
+            "run deploy",
+            "run publish",
+            "run release",
+        ]
+        .iter()
+        .any(|phrase| command_phrase_contains(&arg_text, phrase));
+    }
+
+    if command_name == "gh" {
+        let arg_text = command_phrase_text(&args.join(" "));
+        return ["release create", "release upload"]
+            .iter()
+            .any(|phrase| command_phrase_contains(&arg_text, phrase));
+    }
+
+    if matches!(command_name.as_str(), "bash" | "fish" | "sh" | "zsh") {
+        let shell_text = command_phrase_text(&args.join(" "));
+        return [
+            "bun run deploy",
+            "bun run publish",
+            "bun run release",
+            "flyctl deploy",
+            "gh release create",
+            "gh release upload",
+            "netlify deploy",
+            "npm run deploy",
+            "npm run publish",
+            "npm run release",
+            "pnpm run deploy",
+            "pnpm run publish",
+            "pnpm run release",
+            "vercel deploy",
+            "wrangler deploy",
+            "yarn deploy",
+            "yarn publish",
+            "yarn release",
+            "yarn run deploy",
+            "yarn run publish",
+            "yarn run release",
+        ]
+        .iter()
+        .any(|phrase| command_phrase_contains(&shell_text, phrase));
+    }
+
+    false
+}
+
+fn is_version_command(text: &str) -> bool {
+    let phrase_text = command_phrase_text(text);
+    ["artifact", "rev parse", "sha", "tagname", "version"]
+        .iter()
+        .any(|phrase| command_phrase_contains(&phrase_text, phrase))
+}
+
+fn is_health_command(text: &str) -> bool {
+    ["curl", "health", "smoke", "ping", "http"]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
+fn is_process_command_session(command: &str, args: &[String]) -> bool {
+    let command_name = normalized_command_name(command);
+    if matches!(
+        command_name.as_str(),
+        "kill" | "launchctl" | "lsof" | "pm2" | "ps" | "supervisorctl" | "systemctl"
+    ) {
+        return true;
+    }
+
+    if matches!(command_name.as_str(), "bun" | "npm" | "pnpm" | "yarn") {
+        let arg_text = command_phrase_text(&args.join(" "));
+        return ["dev", "run dev", "run serve", "run start", "serve", "start"]
+            .iter()
+            .any(|phrase| command_phrase_contains(&arg_text, phrase));
+    }
+
+    if matches!(command_name.as_str(), "bash" | "fish" | "sh" | "zsh") {
+        let shell_text = command_phrase_text(&args.join(" "));
+        return [
+            "bun run dev",
+            "bun run serve",
+            "bun run start",
+            "kill",
+            "launchctl",
+            "lsof",
+            "npm run dev",
+            "npm run serve",
+            "npm run start",
+            "pm2",
+            "pnpm run dev",
+            "pnpm run serve",
+            "pnpm run start",
+            "ps",
+            "supervisorctl",
+            "systemctl",
+            "yarn dev",
+            "yarn run dev",
+            "yarn run serve",
+            "yarn run start",
+            "yarn serve",
+            "yarn start",
+        ]
+        .iter()
+        .any(|phrase| command_phrase_contains(&shell_text, phrase));
+    }
+
+    false
+}
+
+fn is_successful_tool_status(status: &str) -> bool {
+    matches!(status, "success" | "completed")
+}
+
+fn is_successful_evidence_status(status: &str) -> bool {
+    matches!(status, "success" | "completed" | "passed")
+}
+
+fn is_research_tool(text: &str) -> bool {
+    ["web", "search", "fetch", "browser", "source"]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
+fn is_research_classification_tool(text: &str) -> bool {
+    matches!(text, "web" | "search" | "fetch" | "source")
+        || text.starts_with("web.")
+        || text.starts_with("search.")
+        || text.starts_with("fetch.")
+        || text.starts_with("source.")
+        || text.contains("web_search")
+        || text.contains("source_search")
+}
+
+fn is_automation_tool(text: &str) -> bool {
+    ["automation", "schedule", "monitor", "reminder"]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
+fn is_memory_tool(text: &str) -> bool {
+    ["memory", "remember", "knowledge"]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
+fn is_memory_operation_event(text: &str) -> bool {
+    text.contains("memory")
+        && contains_any(
+            text,
+            &[
+                "accepted",
+                "created",
+                "delete",
+                "deleted",
+                "operation",
+                "receipt",
+                "saved",
+                "superseded",
+                "write",
+            ],
+        )
 }
 
 fn usage_for_session(connection: &Connection, session_id: &str) -> Result<UsageTotals> {
@@ -9908,6 +10506,7 @@ mod tests {
                 session_id: Some("session-jobs".to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Root job".to_string(),
                 purpose: "test".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -9923,6 +10522,7 @@ mod tests {
                 session_id: Some("session-jobs".to_string()),
                 parent_job_id: Some("root-job".to_string()),
                 template_id: None,
+                task_class: None,
                 title: "Child job".to_string(),
                 purpose: "test".to_string(),
                 trigger_kind: "child_job".to_string(),
@@ -9970,6 +10570,7 @@ mod tests {
                 session_id: Some("publication-session".to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Prompt open a PR".to_string(),
                 purpose: "Session prompt".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -9991,6 +10592,7 @@ mod tests {
                 session_id: Some("publication-session".to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Prompt prep work".to_string(),
                 purpose: "Session prompt".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -10012,6 +10614,7 @@ and open a pull request to dev when it is ready."
                 session_id: Some("publication-session".to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Open PR".to_string(),
                 purpose: "Publish branch".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -10185,6 +10788,775 @@ and open a pull request to dev when it is ready."
     }
 
     #[test]
+    fn task_class_jobs_persist_and_roll_up_completion_evidence() {
+        let state_dir = test_state_dir("task-class-evidence-rollups");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let scratch_dir = store
+            .scratch_dir_for_session("task-class-session")
+            .expect("scratch dir should resolve");
+        store
+            .create_session(test_session_record(
+                "task-class-session",
+                "Task class session",
+                "ad_hoc",
+                scratch_dir,
+            ))
+            .expect("session should persist");
+
+        let cases = [
+            (
+                "research",
+                "research source quality contradiction check recorded",
+            ),
+            ("automation", "automation schedule created"),
+            (
+                "deployment",
+                "deployment health endpoint version artifact recorded",
+            ),
+            ("memory_session", "memory session write receipt recorded"),
+            ("process_server", "server restart port listener observed"),
+        ];
+
+        for (task_class, evidence_text) in cases {
+            let job_id = format!("{task_class}-job");
+            store
+                .create_job(JobRecord {
+                    id: job_id.clone(),
+                    session_id: Some("task-class-session".to_string()),
+                    parent_job_id: None,
+                    template_id: None,
+                    task_class: Some(task_class.to_string()),
+                    title: format!("{task_class} job"),
+                    purpose: "test".to_string(),
+                    trigger_kind: "session_prompt".to_string(),
+                    state: "completed".to_string(),
+                    requested_by: "user".to_string(),
+                    prompt_excerpt: "prompt".to_string(),
+                    publication_intent_text: None,
+                })
+                .expect("job should persist");
+            store
+                .append_job_event(JobEventRecord {
+                    job_id: job_id.clone(),
+                    worker_id: None,
+                    event_type: format!("job.{task_class}.evidence"),
+                    status: "success".to_string(),
+                    summary: evidence_text.to_string(),
+                    detail: evidence_text.to_string(),
+                    data_json: json!({}),
+                })
+                .expect("event should persist");
+
+            let job = store.get_job(&job_id).expect("job should load").job;
+            assert_eq!(job.task_class.as_deref(), Some(task_class));
+            assert_eq!(job.completion_status, "satisfied", "{task_class}");
+            assert!(!job.task_evidence.is_empty());
+        }
+
+        let research_tool_only = store
+            .create_job(JobRecord {
+                id: "research-tool-only-job".to_string(),
+                session_id: Some("task-class-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("research".to_string()),
+                title: "Research tool only job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "research a topic".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("research tool-only job should persist");
+        store
+            .create_worker(WorkerRecord {
+                id: "research-tool-only-worker".to_string(),
+                job_id: research_tool_only.id.clone(),
+                parent_worker_id: None,
+                title: "Research tool-only worker".to_string(),
+                lane: "utility".to_string(),
+                state: "completed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "cx/gpt-5.4".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: std::env::temp_dir().display().to_string(),
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                max_steps: 8,
+                max_tool_calls: 8,
+                max_wall_clock_secs: 60,
+            })
+            .expect("research tool-only worker should persist");
+        store
+            .create_tool_call(ToolCallRecord {
+                id: "research-tool-only-call".to_string(),
+                job_id: research_tool_only.id.clone(),
+                worker_id: "research-tool-only-worker".to_string(),
+                tool_id: "web.search".to_string(),
+                status: "success".to_string(),
+                summary: "captured search results".to_string(),
+                args_json: json!({}),
+                result_json: Some(json!({ "ok": true })),
+                policy_decision: None,
+                artifact_ids: Vec::new(),
+                error_class: String::new(),
+                error_detail: String::new(),
+                started_at: None,
+                completed_at: None,
+            })
+            .expect("research tool-only call should persist");
+        let research_tool_only = store
+            .get_job(&research_tool_only.id)
+            .expect("research tool-only job should load")
+            .job;
+        assert_eq!(research_tool_only.completion_status, "blocked");
+        assert!(
+            research_tool_only
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("fresh_sources:"))
+        );
+        assert!(
+            !research_tool_only
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("source_quality:"))
+        );
+        assert!(
+            !research_tool_only
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("contradictions:"))
+        );
+
+        let local_project = store
+            .create_job(JobRecord {
+                id: "local-project-job".to_string(),
+                session_id: Some("task-class-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("local_project".to_string()),
+                title: "Local project job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "prompt".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("local project job should persist");
+        let local_project = store
+            .update_job(
+                &local_project.id,
+                JobPatch {
+                    validation_status: Some("passed".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("validation status should persist");
+        assert_eq!(local_project.completion_status, "satisfied");
+
+        let deployment_with_git_status = store
+            .create_job(JobRecord {
+                id: "deployment-git-status-job".to_string(),
+                session_id: Some("task-class-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("deployment".to_string()),
+                title: "Deployment with git status".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "deploy and verify".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("deployment git status job should persist");
+        store
+            .create_worker(WorkerRecord {
+                id: "deployment-git-status-worker".to_string(),
+                job_id: deployment_with_git_status.id.clone(),
+                parent_worker_id: None,
+                title: "Deployment git status worker".to_string(),
+                lane: "utility".to_string(),
+                state: "completed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "cx/gpt-5.4".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: std::env::temp_dir().display().to_string(),
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                max_steps: 8,
+                max_tool_calls: 8,
+                max_wall_clock_secs: 60,
+            })
+            .expect("deployment worker should persist");
+        for (id, command, args) in [
+            (
+                "deployment-command-session",
+                "wrangler",
+                vec!["deploy".to_string()],
+            ),
+            (
+                "deployment-tagged-command-session",
+                "wrangler",
+                vec![
+                    "deploy".to_string(),
+                    "--tag".to_string(),
+                    "staging".to_string(),
+                ],
+            ),
+            (
+                "git-status-command-session",
+                "git",
+                vec!["status".to_string()],
+            ),
+        ] {
+            store
+                .create_command_session(CommandSessionRecord {
+                    id: id.to_string(),
+                    job_id: deployment_with_git_status.id.clone(),
+                    worker_id: "deployment-git-status-worker".to_string(),
+                    tool_call_id: None,
+                    mode: "exec".to_string(),
+                    title: id.to_string(),
+                    state: "completed".to_string(),
+                    command: command.to_string(),
+                    args,
+                    cwd: std::env::temp_dir().display().to_string(),
+                    session_id: "task-class-session".to_string(),
+                    project_id: String::new(),
+                    worktree_path: std::env::temp_dir().display().to_string(),
+                    branch: "dev".to_string(),
+                    port: None,
+                    env_json: json!({}),
+                    network_policy: "none".to_string(),
+                    timeout_secs: 60,
+                    output_limit_bytes: 1024,
+                    last_error: String::new(),
+                    exit_code: Some(0),
+                    stdout_artifact_id: None,
+                    stderr_artifact_id: None,
+                    started_at: None,
+                    completed_at: None,
+                })
+                .expect("command session should persist");
+        }
+        store
+            .append_job_event(JobEventRecord {
+                job_id: deployment_with_git_status.id.clone(),
+                worker_id: None,
+                event_type: "job.command.waiver".to_string(),
+                status: "success".to_string(),
+                summary: "command failure waived".to_string(),
+                detail: "waiver applies to an unrelated command failure".to_string(),
+                data_json: json!({}),
+            })
+            .expect("command waiver event should persist");
+        let deployment_with_git_status = store
+            .get_job(&deployment_with_git_status.id)
+            .expect("deployment git status job should load")
+            .job;
+        assert_eq!(deployment_with_git_status.completion_status, "blocked");
+        assert!(
+            deployment_with_git_status
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("deployment_status:"))
+        );
+        assert!(
+            !deployment_with_git_status
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("health:")),
+            "git status should not satisfy deployment health evidence"
+        );
+        assert!(
+            !deployment_with_git_status
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("version:")),
+            "deploy tagging flags should not satisfy deployment version evidence"
+        );
+        assert!(
+            deployment_with_git_status
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence == "waiver:command_failure")
+        );
+        assert!(
+            !deployment_with_git_status
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence == "waiver:deployment_verification"),
+            "generic command waivers should not satisfy deployment verification"
+        );
+
+        let failed_deployment_event = store
+            .create_job(JobRecord {
+                id: "failed-deployment-event-job".to_string(),
+                session_id: Some("task-class-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("deployment".to_string()),
+                title: "Failed deployment event".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "deploy and verify".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("failed deployment event job should persist");
+        store
+            .append_job_event(JobEventRecord {
+                job_id: failed_deployment_event.id.clone(),
+                worker_id: None,
+                event_type: "deployment".to_string(),
+                status: "failed".to_string(),
+                summary: "deployment failed".to_string(),
+                detail: "deployment health endpoint version check failed".to_string(),
+                data_json: json!({}),
+            })
+            .expect("failed deployment event should persist");
+        let failed_deployment_event = store
+            .get_job(&failed_deployment_event.id)
+            .expect("failed deployment event job should load")
+            .job;
+        assert_eq!(failed_deployment_event.completion_status, "blocked");
+        assert!(
+            !failed_deployment_event
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("deployment_status:")
+                    || evidence.starts_with("health:")
+                    || evidence.starts_with("version:")),
+            "failed events should not emit positive deployment evidence"
+        );
+
+        let failed_tool_job = store
+            .create_job(JobRecord {
+                id: "local-project-failed-tool-job".to_string(),
+                session_id: Some("task-class-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("local_project".to_string()),
+                title: "Local project with failed tool".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "prompt".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("local project failed-tool job should persist");
+        store
+            .create_worker(WorkerRecord {
+                id: "local-project-failed-tool-worker".to_string(),
+                job_id: failed_tool_job.id.clone(),
+                parent_worker_id: None,
+                title: "Failed tool worker".to_string(),
+                lane: "utility".to_string(),
+                state: "completed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "cx/gpt-5.4".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: std::env::temp_dir().display().to_string(),
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                max_steps: 8,
+                max_tool_calls: 8,
+                max_wall_clock_secs: 60,
+            })
+            .expect("worker should persist");
+        store
+            .create_tool_call(ToolCallRecord {
+                id: "local-project-failed-tool-call".to_string(),
+                job_id: failed_tool_job.id.clone(),
+                worker_id: "local-project-failed-tool-worker".to_string(),
+                tool_id: "browser.snapshot".to_string(),
+                status: "failed".to_string(),
+                summary: "browser snapshot failed".to_string(),
+                args_json: json!({}),
+                result_json: None,
+                policy_decision: None,
+                artifact_ids: Vec::new(),
+                error_class: "transient".to_string(),
+                error_detail: "snapshot unavailable".to_string(),
+                started_at: None,
+                completed_at: None,
+            })
+            .expect("failed tool call should persist");
+        let failed_tool_job = store
+            .update_job(
+                &failed_tool_job.id,
+                JobPatch {
+                    validation_status: Some("passed".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("validation status should persist after failed tool");
+        assert_eq!(failed_tool_job.completion_status, "satisfied");
+        assert!(
+            failed_tool_job
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("failed_tool:"))
+        );
+        assert!(
+            !failed_tool_job
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("failed_command:"))
+        );
+
+        let browser_only_job = store
+            .create_job(JobRecord {
+                id: "browser-only-job".to_string(),
+                session_id: Some("task-class-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: None,
+                title: "Browser only job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "inspect the local UI".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("browser-only job should persist");
+        store
+            .create_worker(WorkerRecord {
+                id: "browser-only-worker".to_string(),
+                job_id: browser_only_job.id.clone(),
+                parent_worker_id: None,
+                title: "Browser only worker".to_string(),
+                lane: "utility".to_string(),
+                state: "completed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "cx/gpt-5.4".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: std::env::temp_dir().display().to_string(),
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                max_steps: 8,
+                max_tool_calls: 8,
+                max_wall_clock_secs: 60,
+            })
+            .expect("browser-only worker should persist");
+        store
+            .create_tool_call(ToolCallRecord {
+                id: "browser-only-tool-call".to_string(),
+                job_id: browser_only_job.id.clone(),
+                worker_id: "browser-only-worker".to_string(),
+                tool_id: "browser.snapshot".to_string(),
+                status: "success".to_string(),
+                summary: "captured local UI snapshot".to_string(),
+                args_json: json!({}),
+                result_json: Some(json!({ "ok": true })),
+                policy_decision: None,
+                artifact_ids: Vec::new(),
+                error_class: String::new(),
+                error_detail: String::new(),
+                started_at: None,
+                completed_at: None,
+            })
+            .expect("browser-only tool call should persist");
+        store
+            .create_tool_call(ToolCallRecord {
+                id: "browser-only-rg-search-tool-call".to_string(),
+                job_id: browser_only_job.id.clone(),
+                worker_id: "browser-only-worker".to_string(),
+                tool_id: "rg.search".to_string(),
+                status: "success".to_string(),
+                summary: "ripgrep search found local files".to_string(),
+                args_json: json!({}),
+                result_json: Some(json!({ "ok": true })),
+                policy_decision: None,
+                artifact_ids: Vec::new(),
+                error_class: String::new(),
+                error_detail: String::new(),
+                started_at: None,
+                completed_at: None,
+            })
+            .expect("generic search tool call should persist");
+        let browser_only_job = store
+            .get_job(&browser_only_job.id)
+            .expect("browser-only job should load")
+            .job;
+        assert_eq!(browser_only_job.task_class, None);
+        assert_eq!(browser_only_job.completion_status, "not_gated");
+
+        let memory_generic_session_event = store
+            .create_job(JobRecord {
+                id: "memory-generic-session-event-job".to_string(),
+                session_id: Some("task-class-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("memory_session".to_string()),
+                title: "Memory generic session event job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "prompt".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("memory generic event job should persist");
+        store
+            .append_job_event(JobEventRecord {
+                job_id: memory_generic_session_event.id.clone(),
+                worker_id: None,
+                event_type: "session.updated".to_string(),
+                status: "success".to_string(),
+                summary: "session title updated".to_string(),
+                detail: "generic session event without memory mutation".to_string(),
+                data_json: json!({}),
+            })
+            .expect("generic session event should persist");
+        let memory_generic_session_event = store
+            .get_job(&memory_generic_session_event.id)
+            .expect("memory generic event job should load")
+            .job;
+        assert_eq!(memory_generic_session_event.completion_status, "blocked");
+        assert!(
+            !memory_generic_session_event
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("operation_result:"))
+        );
+
+        let blocked = store
+            .create_job(JobRecord {
+                id: "blocked-research-job".to_string(),
+                session_id: Some("task-class-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("research".to_string()),
+                title: "Blocked research job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "prompt".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("blocked job should persist");
+        assert_eq!(blocked.completion_status, "blocked");
+
+        let ungated = store
+            .create_job(JobRecord {
+                id: "ungated-job".to_string(),
+                session_id: Some("task-class-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: None,
+                title: "Ungated job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "prompt".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("ungated job should persist");
+        assert_eq!(ungated.completion_status, "not_gated");
+
+        let cleared = store
+            .create_job(JobRecord {
+                id: "clear-task-class-job".to_string(),
+                session_id: Some("task-class-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("local_project".to_string()),
+                title: "Clear task class job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "prompt".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("clear task class job should persist");
+        assert_eq!(cleared.completion_status, "blocked");
+        let cleared = store
+            .update_job(
+                &cleared.id,
+                JobPatch {
+                    task_class: Some(None),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("task class clear should persist");
+        assert_eq!(cleared.task_class, None);
+        assert_eq!(cleared.completion_status, "not_gated");
+        store
+            .create_worker(WorkerRecord {
+                id: "clear-task-class-worker".to_string(),
+                job_id: cleared.id.clone(),
+                parent_worker_id: None,
+                title: "Clear task class worker".to_string(),
+                lane: "utility".to_string(),
+                state: "completed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "cx/gpt-5.4".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: std::env::temp_dir().display().to_string(),
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                max_steps: 8,
+                max_tool_calls: 8,
+                max_wall_clock_secs: 60,
+            })
+            .expect("clear task class worker should persist");
+        store
+            .create_command_session(CommandSessionRecord {
+                id: "clear-task-class-command".to_string(),
+                job_id: cleared.id.clone(),
+                worker_id: "clear-task-class-worker".to_string(),
+                tool_call_id: None,
+                mode: "exec".to_string(),
+                title: "cargo check".to_string(),
+                state: "completed".to_string(),
+                command: "cargo".to_string(),
+                args: vec!["check".to_string()],
+                cwd: std::env::temp_dir().display().to_string(),
+                session_id: "task-class-session".to_string(),
+                project_id: String::new(),
+                worktree_path: std::env::temp_dir().display().to_string(),
+                branch: "dev".to_string(),
+                port: None,
+                env_json: json!({}),
+                network_policy: "none".to_string(),
+                timeout_secs: 60,
+                output_limit_bytes: 1024,
+                last_error: String::new(),
+                exit_code: Some(0),
+                stdout_artifact_id: None,
+                stderr_artifact_id: None,
+                started_at: None,
+                completed_at: None,
+            })
+            .expect("clear task class command should persist");
+        let cleared = store
+            .get_job(&cleared.id)
+            .expect("cleared job should reload")
+            .job;
+        assert_eq!(cleared.task_class, None);
+        assert_eq!(cleared.completion_status, "not_gated");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn task_class_command_classifiers_use_command_scoped_tokens() {
+        assert!(!is_validation_command(&command_session_text(
+            "git",
+            &["checkout".to_string(), "check-this-branch".to_string()]
+        )));
+        assert!(!is_validation_command(&command_session_text(
+            "docker",
+            &["build".to_string(), ".".to_string()]
+        )));
+        assert!(is_validation_command(&command_session_text(
+            "cargo",
+            &["check".to_string()]
+        )));
+        assert!(is_validation_command(&command_session_text(
+            "npm",
+            &["run".to_string(), "build:web".to_string()]
+        )));
+        assert!(!is_deployment_command_session(
+            "cargo",
+            &["build".to_string(), "--release".to_string()]
+        ));
+        assert!(!is_validation_command(&command_session_text(
+            "cargo",
+            &["build".to_string(), "--release".to_string()]
+        )));
+        assert!(!is_version_command(&command_session_text(
+            "vercel",
+            &["deploy".to_string(), "--target=staging".to_string()]
+        )));
+        assert!(!is_version_command(&command_session_text(
+            "wrangler",
+            &[
+                "deploy".to_string(),
+                "--tag".to_string(),
+                "staging".to_string()
+            ]
+        )));
+        assert!(is_version_command(&command_session_text(
+            "git",
+            &["rev-parse".to_string(), "HEAD".to_string()]
+        )));
+        assert!(is_version_command(&command_session_text(
+            "gh",
+            &[
+                "release".to_string(),
+                "view".to_string(),
+                "--json".to_string(),
+                "tagName".to_string()
+            ]
+        )));
+        assert!(is_deployment_command_session(
+            "wrangler",
+            &["deploy".to_string()]
+        ));
+        assert!(is_process_command_session("ps", &[]));
+        assert!(is_process_command_session(
+            "npm",
+            &["run".to_string(), "start".to_string()]
+        ));
+        assert!(!is_process_command_session(
+            "cargo",
+            &["test".to_string(), "tests/server.rs".to_string()]
+        ));
+        assert!(!is_process_command_session(
+            "cargo",
+            &["test".to_string(), "tests/serve.rs".to_string()]
+        ));
+        assert_eq!(
+            task_class_from_command("git", &["checkout".to_string()]),
+            None
+        );
+        assert_eq!(
+            task_class_from_command(
+                "cargo",
+                &["test".to_string(), "tests/server.rs".to_string()]
+            ),
+            Some("local_project")
+        );
+        assert_eq!(
+            task_class_from_command("cargo", &["build".to_string(), "--release".to_string()]),
+            None
+        );
+        assert_eq!(task_class_from_command("ps", &[]), Some("process_server"));
+    }
+
+    #[test]
     fn failed_ui_renderable_job_terminalizes_pending_browser_verification() {
         let state_dir = test_state_dir("failed-browser-verification-terminal");
         let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
@@ -10206,6 +11578,7 @@ and open a pull request to dev when it is ready."
                 session_id: Some("browser-terminal-session".to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Fix UI".to_string(),
                 purpose: "Session prompt".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -10264,6 +11637,7 @@ and open a pull request to dev when it is ready."
                 session_id: Some("browser-canceled-session".to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Fix UI".to_string(),
                 purpose: "Session prompt".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -10321,6 +11695,7 @@ and open a pull request to dev when it is ready."
                 session_id: Some("browser-blocked-session".to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Fix UI".to_string(),
                 purpose: "Session prompt".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -10487,6 +11862,7 @@ and open a pull request to dev when it is ready."
                 session_id: Some("playbook-session".to_string()),
                 parent_job_id: None,
                 template_id: Some("playbook-1".to_string()),
+                task_class: Some("automation".to_string()),
                 title: "Playbook run".to_string(),
                 purpose: "automation".to_string(),
                 trigger_kind: "playbook_event".to_string(),
@@ -10502,6 +11878,7 @@ and open a pull request to dev when it is ready."
                 session_id: Some("playbook-session".to_string()),
                 parent_job_id: None,
                 template_id: Some("playbook-1".to_string()),
+                task_class: Some("automation".to_string()),
                 title: "Playbook run complete".to_string(),
                 purpose: "automation".to_string(),
                 trigger_kind: "playbook_manual".to_string(),
@@ -10517,6 +11894,7 @@ and open a pull request to dev when it is ready."
                 session_id: Some("playbook-session".to_string()),
                 parent_job_id: Some("playbook-job-a".to_string()),
                 template_id: Some("playbook-1".to_string()),
+                task_class: Some("automation".to_string()),
                 title: "Playbook child".to_string(),
                 purpose: "automation".to_string(),
                 trigger_kind: "child_job".to_string(),
@@ -10750,6 +12128,7 @@ and open a pull request to dev when it is ready."
                 session_id: Some("session-capabilities".to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Prompt run".to_string(),
                 purpose: "Session prompt".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -10804,6 +12183,7 @@ and open a pull request to dev when it is ready."
                 session_id: Some("session-capabilities".to_string()),
                 parent_job_id: None,
                 template_id: Some("playbook-1".to_string()),
+                task_class: Some("automation".to_string()),
                 title: "Playbook run".to_string(),
                 purpose: "automation".to_string(),
                 trigger_kind: "playbook_manual".to_string(),
@@ -10884,6 +12264,7 @@ and open a pull request to dev when it is ready."
                 session_id: Some("session-capabilities-tie".to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Prompt run 1".to_string(),
                 purpose: "Session prompt".to_string(),
                 trigger_kind: "session_prompt".to_string(),
@@ -10938,6 +12319,7 @@ and open a pull request to dev when it is ready."
                 session_id: Some("session-capabilities-tie".to_string()),
                 parent_job_id: None,
                 template_id: None,
+                task_class: None,
                 title: "Prompt run 2".to_string(),
                 purpose: "Session prompt".to_string(),
                 trigger_kind: "session_prompt".to_string(),
