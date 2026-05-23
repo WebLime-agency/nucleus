@@ -70,6 +70,8 @@ pub enum WaitUntil {
 pub struct ChildJobProposal {
     pub title: String,
     pub prompt: String,
+    #[serde(default)]
+    pub task_class: Option<String>,
     pub working_dir: Option<String>,
     #[serde(default)]
     pub route_id: Option<String>,
