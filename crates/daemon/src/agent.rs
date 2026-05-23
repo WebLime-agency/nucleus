@@ -4956,7 +4956,7 @@ fn session_state_evidence_and_refresh(
         None
     };
     let matching_command_session = if drifted && matching_audit.is_none() {
-        mutation_command_session_explaining_session_state(state, job_id)?
+        mutation_command_session_explaining_session_state(state, session, job_id)?
     } else {
         None
     };
@@ -5116,6 +5116,7 @@ fn mutation_audit_explaining_session_state(
 
 fn mutation_command_session_explaining_session_state(
     state: &AppState,
+    session: &SessionSummary,
     job_id: &str,
 ) -> Result<Option<CommandSessionSummary>> {
     let Ok(detail) = state.store.get_job(job_id) else {
@@ -5124,30 +5125,81 @@ fn mutation_command_session_explaining_session_state(
     Ok(detail
         .command_sessions
         .into_iter()
-        .find(is_git_mutation_command_session))
+        .find(|command_session| is_session_git_mutation_command_session(session, command_session)))
 }
 
-fn is_git_mutation_command_session(command_session: &CommandSessionSummary) -> bool {
+fn is_session_git_mutation_command_session(
+    session: &SessionSummary,
+    command_session: &CommandSessionSummary,
+) -> bool {
     if command_session.state != "completed" || command_session.exit_code != Some(0) {
         return false;
     }
-    let text = std::iter::once(command_session.command.as_str())
-        .chain(command_session.args.iter().map(String::as_str))
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
-    text.starts_with("git commit")
-        || text.starts_with("git checkout")
-        || text.starts_with("git switch")
-        || text.starts_with("git merge")
-        || text.starts_with("git pull")
-        || text.starts_with("git reset")
-        || text.contains(" git commit")
-        || text.contains(" git checkout")
-        || text.contains(" git switch")
-        || text.contains(" git merge")
-        || text.contains(" git pull")
-        || text.contains(" git reset")
+    if !command_session.session_id.is_empty() && command_session.session_id != session.id {
+        return false;
+    }
+    let Some(declared_git_path) = declared_session_git_path(session) else {
+        return false;
+    };
+    let Some((git_cwd, subcommand)) = command_session_git_invocation(command_session) else {
+        return false;
+    };
+    if !matches!(
+        subcommand,
+        "commit" | "checkout" | "switch" | "merge" | "pull" | "reset"
+    ) {
+        return false;
+    }
+    path_is_under_declared_root(&git_cwd, &declared_git_path).unwrap_or(false)
+}
+
+fn command_session_git_invocation(
+    command_session: &CommandSessionSummary,
+) -> Option<(PathBuf, &str)> {
+    let executable = Path::new(command_session.command.trim())
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command_session.command.trim());
+    if executable != "git" {
+        return None;
+    }
+    let base_cwd = command_session.cwd.trim();
+    if base_cwd.is_empty() {
+        return None;
+    }
+    let mut git_cwd = PathBuf::from(base_cwd);
+    let mut index = 0;
+    while index < command_session.args.len() {
+        let arg = command_session.args[index].as_str();
+        if arg == "-C" {
+            let value = command_session.args.get(index + 1)?;
+            git_cwd = resolve_git_c_option_path(&git_cwd, value);
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("-C") {
+            if value.is_empty() {
+                return None;
+            }
+            git_cwd = resolve_git_c_option_path(&git_cwd, value);
+            index += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            return None;
+        }
+        return Some((git_cwd, arg));
+    }
+    None
+}
+
+fn resolve_git_c_option_path(base_cwd: &Path, value: &str) -> PathBuf {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_cwd.join(path)
+    }
 }
 
 fn context_integrity_patch(
@@ -20701,6 +20753,82 @@ Cleanup status: clean";
                 .unwrap_or_default()
                 .contains("trivially satisfied")
         );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn session_state_command_mutation_matching_requires_direct_git_in_session_worktree() {
+        let state_dir = test_state_dir("session-state-command-mutation-matching");
+        let declared = state_dir.join("declared");
+        let nested = declared.join("nested");
+        let outside = state_dir.join("outside");
+        fs::create_dir_all(&nested).expect("nested dir should exist");
+        fs::create_dir_all(&outside).expect("outside dir should exist");
+        let session = scope_test_session(
+            declared.to_str().expect("declared path utf8"),
+            "project_root",
+            "isolated_worktree",
+            Vec::new(),
+        );
+
+        let mut direct_git = test_command_session_summary("cmd-git", &nested);
+        direct_git.command = "git".to_string();
+        direct_git.args = vec!["commit".to_string(), "--allow-empty".to_string()];
+        assert!(is_session_git_mutation_command_session(
+            &session,
+            &direct_git
+        ));
+
+        let mut git_with_c = direct_git.clone();
+        git_with_c.cwd = state_dir.display().to_string();
+        git_with_c.args = vec![
+            "-C".to_string(),
+            nested.display().to_string(),
+            "checkout".to_string(),
+            "dev".to_string(),
+        ];
+        assert!(is_session_git_mutation_command_session(
+            &session,
+            &git_with_c
+        ));
+
+        let mut other_session = direct_git.clone();
+        other_session.session_id = "other-session".to_string();
+        assert!(!is_session_git_mutation_command_session(
+            &session,
+            &other_session
+        ));
+
+        let mut outside_cwd = direct_git.clone();
+        outside_cwd.cwd = outside.display().to_string();
+        assert!(!is_session_git_mutation_command_session(
+            &session,
+            &outside_cwd
+        ));
+
+        let mut outside_git_c = direct_git.clone();
+        outside_git_c.args = vec![
+            "-C".to_string(),
+            outside.display().to_string(),
+            "switch".to_string(),
+            "dev".to_string(),
+        ];
+        assert!(!is_session_git_mutation_command_session(
+            &session,
+            &outside_git_c
+        ));
+
+        let mut shell_echo = direct_git.clone();
+        shell_echo.command = "sh".to_string();
+        shell_echo.args = vec![
+            "-lc".to_string(),
+            "echo git commit --allow-empty".to_string(),
+        ];
+        assert!(!is_session_git_mutation_command_session(
+            &session,
+            &shell_echo
+        ));
 
         let _ = fs::remove_dir_all(&state_dir);
     }
