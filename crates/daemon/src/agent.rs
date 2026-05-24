@@ -4905,9 +4905,11 @@ fn context_integrity_metadata_with_session_state(
     job_id: &str,
 ) -> Result<Value> {
     let mut metadata = job.metadata_json.clone();
-    let preserve_existing_blocked = metadata
-        .get("session_state_evidence")
-        .is_some_and(preserve_existing_session_state_blocker);
+    let has_declared_git_path = declared_session_git_path(session).is_some();
+    let preserve_existing_blocked = has_declared_git_path
+        && metadata
+            .get("session_state_evidence")
+            .is_some_and(preserve_existing_session_state_blocker);
     let evidence = if preserve_existing_blocked {
         metadata
             .get("session_state_evidence")
@@ -4921,6 +4923,11 @@ fn context_integrity_metadata_with_session_state(
         .is_some_and(|object| !object.is_empty())
     {
         metadata["session_state_evidence"] = evidence;
+    } else if metadata.get("session_state_evidence").is_some() {
+        metadata
+            .as_object_mut()
+            .expect("job metadata must be a JSON object")
+            .remove("session_state_evidence");
     }
     Ok(metadata)
 }
@@ -21610,6 +21617,23 @@ Cleanup status: clean";
         assert_eq!(
             preserved_metadata["session_state_evidence"]["status"],
             "blocked"
+        );
+        let mut no_git_session = session.clone();
+        no_git_session.worktree_path.clear();
+        no_git_session.git_root.clear();
+        no_git_session.working_dir.clear();
+        no_git_session.git_head.clear();
+        no_git_session.git_branch.clear();
+        let cleared_metadata = context_integrity_metadata_with_session_state(
+            &state,
+            &no_git_session,
+            &unexplained_blocked_job,
+            "state-job",
+        )
+        .expect("stale evidence should clear when no session git path remains");
+        assert!(
+            cleared_metadata.get("session_state_evidence").is_none(),
+            "session-state evidence should not survive when refresh has no current evidence"
         );
 
         let unborn = state_dir.join("unborn-session-state");
