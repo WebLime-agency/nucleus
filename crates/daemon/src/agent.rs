@@ -5241,6 +5241,9 @@ fn command_session_matches_session_state_transition(
     stored: &ObservedSessionGitState,
     observed: &ObservedSessionGitState,
 ) -> bool {
+    let Some((_git_cwd, subcommand)) = command_session_git_invocation(command_session) else {
+        return false;
+    };
     let mut text = format!(
         "{} {} {} {} {}",
         command_session.title,
@@ -5250,13 +5253,87 @@ fn command_session_matches_session_state_transition(
         command_session.worktree_path
     )
     .to_ascii_lowercase();
-    if let Some((git_cwd, subcommand)) = command_session_git_invocation(command_session) {
-        text.push(' ');
-        text.push_str(&git_cwd.display().to_string().to_ascii_lowercase());
-        text.push(' ');
-        text.push_str(&subcommand.to_ascii_lowercase());
+    text.push(' ');
+    text.push_str(&subcommand.to_ascii_lowercase());
+
+    if stored.git_head != observed.git_head
+        && !text_mentions_git_head(&text, &observed.git_head)
+        && !git_subcommand_can_move_head(&subcommand)
+    {
+        return false;
     }
-    text_matches_session_state_transition(&text, stored, observed)
+    if stored.git_branch != observed.git_branch {
+        let branch = observed.git_branch.to_ascii_lowercase();
+        if branch.is_empty() {
+            if !text.contains("branch=")
+                && !text.contains("detached")
+                && !git_subcommand_can_change_branch(&subcommand)
+            {
+                return false;
+            }
+        } else if !text.contains(&branch) && !git_subcommand_can_change_branch(&subcommand) {
+            return false;
+        }
+    }
+    if stored.git_dirty != observed.git_dirty
+        && !text.contains(&format!("dirty={}", observed.git_dirty))
+        && !text.contains(&format!("git_dirty={}", observed.git_dirty))
+        && !git_subcommand_can_change_worktree_status(&subcommand)
+    {
+        return false;
+    }
+    if stored.git_untracked_count != observed.git_untracked_count
+        && !text.contains(&format!("untracked={}", observed.git_untracked_count))
+        && !text.contains(&format!(
+            "git_untracked_count={}",
+            observed.git_untracked_count
+        ))
+        && !git_subcommand_can_change_worktree_status(&subcommand)
+    {
+        return false;
+    }
+    true
+}
+
+fn git_subcommand_can_move_head(subcommand: &str) -> bool {
+    matches!(
+        subcommand,
+        "checkout"
+            | "cherry-pick"
+            | "commit"
+            | "merge"
+            | "pull"
+            | "rebase"
+            | "reset"
+            | "revert"
+            | "switch"
+    )
+}
+
+fn git_subcommand_can_change_branch(subcommand: &str) -> bool {
+    matches!(subcommand, "checkout" | "switch")
+}
+
+fn git_subcommand_can_change_worktree_status(subcommand: &str) -> bool {
+    matches!(
+        subcommand,
+        "add"
+            | "apply"
+            | "checkout"
+            | "cherry-pick"
+            | "clean"
+            | "commit"
+            | "merge"
+            | "mv"
+            | "pull"
+            | "rebase"
+            | "reset"
+            | "restore"
+            | "revert"
+            | "rm"
+            | "stash"
+            | "switch"
+    )
 }
 
 fn command_session_is_newer_than_session_state(
@@ -21281,6 +21358,16 @@ Cleanup status: clean";
             ),
             "generic git mutations should not explain unrelated HEAD drift"
         );
+        let mut generic_commit = direct_git.clone();
+        generic_commit.args = vec!["commit".to_string(), "--allow-empty".to_string()];
+        assert!(
+            command_session_matches_session_state_transition(
+                &generic_commit,
+                &stored_git_state,
+                &observed_git_state
+            ),
+            "successful in-scope HEAD-moving commands can explain HEAD drift without knowing the resulting SHA"
+        );
         let mut observed_checkout = direct_git.clone();
         observed_checkout.args = vec![
             "checkout".to_string(),
@@ -21804,10 +21891,10 @@ Cleanup status: clean";
                 worker_id: "state-worker".to_string(),
                 tool_call_id: None,
                 mode: "oneshot".to_string(),
-                title: "Checkout observed HEAD".to_string(),
+                title: "Create observed commit".to_string(),
                 state: "completed".to_string(),
                 command: "git".to_string(),
-                args: vec!["checkout".to_string(), head[..12].to_string()],
+                args: vec!["commit".to_string(), "--allow-empty".to_string()],
                 cwd: repo.worktree.display().to_string(),
                 session_id: "state-session".to_string(),
                 project_id: String::new(),
