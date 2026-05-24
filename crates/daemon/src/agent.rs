@@ -4905,12 +4905,10 @@ fn context_integrity_metadata_with_session_state(
     job_id: &str,
 ) -> Result<Value> {
     let mut metadata = job.metadata_json.clone();
-    let existing_blocked = metadata
+    let preserve_existing_blocked = metadata
         .get("session_state_evidence")
-        .and_then(|value| value.get("status"))
-        .and_then(Value::as_str)
-        == Some("blocked");
-    let evidence = if existing_blocked {
+        .is_some_and(preserve_existing_session_state_blocker);
+    let evidence = if preserve_existing_blocked {
         metadata
             .get("session_state_evidence")
             .cloned()
@@ -4925,6 +4923,21 @@ fn context_integrity_metadata_with_session_state(
         metadata["session_state_evidence"] = evidence;
     }
     Ok(metadata)
+}
+
+fn preserve_existing_session_state_blocker(evidence: &Value) -> bool {
+    evidence
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status == "blocked")
+        && evidence
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| {
+                reason.contains(
+                    "stored session git metadata differed from observed disk state without a matching daemon-observed mutation",
+                )
+            })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4981,7 +4994,9 @@ fn session_state_evidence_and_refresh(
         None
     };
     let matching_command_session = if drifted && matching_audit.is_none() {
-        mutation_command_session_explaining_session_state(state, session, job_id)?
+        mutation_command_session_explaining_session_state(
+            state, session, job_id, &stored, &observed,
+        )?
     } else {
         None
     };
@@ -5208,6 +5223,8 @@ fn mutation_command_session_explaining_session_state(
     state: &AppState,
     session: &SessionSummary,
     job_id: &str,
+    stored: &ObservedSessionGitState,
+    observed: &ObservedSessionGitState,
 ) -> Result<Option<CommandSessionSummary>> {
     let Ok(detail) = state.store.get_job(job_id) else {
         return Ok(None);
@@ -5215,7 +5232,31 @@ fn mutation_command_session_explaining_session_state(
     Ok(detail.command_sessions.into_iter().find(|command_session| {
         command_session_is_newer_than_session_state(session, command_session)
             && is_session_git_mutation_command_session(session, command_session)
+            && command_session_matches_session_state_transition(command_session, stored, observed)
     }))
+}
+
+fn command_session_matches_session_state_transition(
+    command_session: &CommandSessionSummary,
+    stored: &ObservedSessionGitState,
+    observed: &ObservedSessionGitState,
+) -> bool {
+    let mut text = format!(
+        "{} {} {} {} {}",
+        command_session.title,
+        command_session.command,
+        command_session.args.join(" "),
+        command_session.branch,
+        command_session.worktree_path
+    )
+    .to_ascii_lowercase();
+    if let Some((git_cwd, subcommand)) = command_session_git_invocation(command_session) {
+        text.push(' ');
+        text.push_str(&git_cwd.display().to_string().to_ascii_lowercase());
+        text.push(' ');
+        text.push_str(&subcommand.to_ascii_lowercase());
+    }
+    text_matches_session_state_transition(&text, stored, observed)
 }
 
 fn command_session_is_newer_than_session_state(
@@ -21218,6 +21259,39 @@ Cleanup status: clean";
             &fresh_command
         ));
 
+        let stored_git_state = ObservedSessionGitState {
+            git_head: "1111111111111111111111111111111111111111".to_string(),
+            git_branch: "dev".to_string(),
+            git_dirty: false,
+            git_untracked_count: 0,
+        };
+        let observed_git_state = ObservedSessionGitState {
+            git_head: "2222222222222222222222222222222222222222".to_string(),
+            git_branch: "dev".to_string(),
+            git_dirty: false,
+            git_untracked_count: 0,
+        };
+        let mut generic_clean = direct_git.clone();
+        generic_clean.args = vec!["clean".to_string(), "-fd".to_string()];
+        assert!(
+            !command_session_matches_session_state_transition(
+                &generic_clean,
+                &stored_git_state,
+                &observed_git_state
+            ),
+            "generic git mutations should not explain unrelated HEAD drift"
+        );
+        let mut observed_checkout = direct_git.clone();
+        observed_checkout.args = vec![
+            "checkout".to_string(),
+            observed_git_state.git_head[..12].to_string(),
+        ];
+        assert!(command_session_matches_session_state_transition(
+            &observed_checkout,
+            &stored_git_state,
+            &observed_git_state
+        ));
+
         let mut other_session = direct_git.clone();
         other_session.session_id = "other-session".to_string();
         assert!(!is_session_git_mutation_command_session(
@@ -21354,6 +21428,47 @@ Cleanup status: clean";
                 run_budget_mode: "inherit".to_string(),
             })
             .expect("session should persist");
+        state
+            .store
+            .create_job(JobRecord {
+                id: "state-job".to_string(),
+                session_id: Some("state-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("local_project".to_string()),
+                title: "State job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "running".to_string(),
+                requested_by: "test".to_string(),
+                prompt_excerpt: String::new(),
+                publication_intent_text: None,
+            })
+            .expect("state job should persist");
+        state
+            .store
+            .create_worker(WorkerRecord {
+                id: "state-worker".to_string(),
+                job_id: "state-job".to_string(),
+                parent_worker_id: None,
+                title: "State worker".to_string(),
+                lane: "utility".to_string(),
+                state: "running".to_string(),
+                provider: "test".to_string(),
+                model: "test".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: repo.worktree.display().to_string(),
+                read_roots: vec![repo.worktree.display().to_string()],
+                write_roots: vec![repo.worktree.display().to_string()],
+                max_steps: 10,
+                max_tool_calls: 10,
+                max_wall_clock_secs: 30,
+            })
+            .expect("state worker should persist");
 
         let session = state
             .store
@@ -21363,6 +21478,52 @@ Cleanup status: clean";
         let happy = session_state_evidence_and_refresh(&state, &session, "state-job")
             .expect("session state should refresh");
         assert_eq!(happy["status"], "satisfied");
+        let transient_blocked_job = JobSummary {
+            id: "state-job".to_string(),
+            metadata_json: json!({
+                "session_state_evidence": {
+                    "status": "blocked",
+                    "reason": "worktree missing",
+                    "stored": {"git_head": "old"},
+                    "observed": {}
+                }
+            }),
+            ..test_publication_job_summary("state-job")
+        };
+        let refreshed_metadata = context_integrity_metadata_with_session_state(
+            &state,
+            &session,
+            &transient_blocked_job,
+            "state-job",
+        )
+        .expect("transient blocked evidence should recompute");
+        assert_eq!(
+            refreshed_metadata["session_state_evidence"]["status"],
+            "satisfied"
+        );
+        let unexplained_blocked_job = JobSummary {
+            id: "state-job".to_string(),
+            metadata_json: json!({
+                "session_state_evidence": {
+                    "status": "blocked",
+                    "reason": "stored session git metadata differed from observed disk state without a matching daemon-observed mutation",
+                    "stored": {"git_head": "old"},
+                    "observed": {"git_head": "new"}
+                }
+            }),
+            ..test_publication_job_summary("state-job")
+        };
+        let preserved_metadata = context_integrity_metadata_with_session_state(
+            &state,
+            &session,
+            &unexplained_blocked_job,
+            "state-job",
+        )
+        .expect("unexplained drift evidence should remain blocked");
+        assert_eq!(
+            preserved_metadata["session_state_evidence"]["status"],
+            "blocked"
+        );
 
         let unborn = state_dir.join("unborn-session-state");
         fs::create_dir_all(&unborn).expect("unborn worktree dir should exist");
@@ -21571,6 +21732,113 @@ Cleanup status: clean";
                 .expect("generic audit should not explain drift");
         assert_eq!(generic_audit["status"], "blocked");
         assert!(generic_audit["audit_event_id"].is_null());
+
+        state
+            .store
+            .update_session(
+                "state-session",
+                SessionPatch {
+                    git_head: Some("generic-command-head".to_string()),
+                    session_state_observed_at: Some(Some(1)),
+                    ..SessionPatch::default()
+                },
+            )
+            .expect("generic-command stale session should persist");
+        state
+            .store
+            .create_command_session(CommandSessionRecord {
+                id: "state-command-generic".to_string(),
+                job_id: "state-job".to_string(),
+                worker_id: "state-worker".to_string(),
+                tool_call_id: None,
+                mode: "oneshot".to_string(),
+                title: "Generic git clean".to_string(),
+                state: "completed".to_string(),
+                command: "git".to_string(),
+                args: vec!["clean".to_string(), "-fd".to_string()],
+                cwd: repo.worktree.display().to_string(),
+                session_id: "state-session".to_string(),
+                project_id: String::new(),
+                worktree_path: repo.worktree.display().to_string(),
+                branch: "dev".to_string(),
+                port: None,
+                env_json: json!({}),
+                network_policy: "inherit".to_string(),
+                timeout_secs: 30,
+                output_limit_bytes: 1024,
+                last_error: String::new(),
+                exit_code: Some(0),
+                stdout_artifact_id: None,
+                stderr_artifact_id: None,
+                started_at: Some(2),
+                completed_at: Some(2),
+            })
+            .expect("generic command session should persist");
+        let generic_command_session = state
+            .store
+            .get_session("state-session")
+            .expect("generic-command session should reload")
+            .session;
+        let generic_command =
+            session_state_evidence_and_refresh(&state, &generic_command_session, "state-job")
+                .expect("generic command should not explain drift");
+        assert_eq!(generic_command["status"], "blocked");
+        assert!(generic_command["mutation_command_session_id"].is_null());
+
+        state
+            .store
+            .update_session(
+                "state-session",
+                SessionPatch {
+                    git_head: Some("matching-command-head".to_string()),
+                    session_state_observed_at: Some(Some(1)),
+                    ..SessionPatch::default()
+                },
+            )
+            .expect("matching-command stale session should persist");
+        state
+            .store
+            .create_command_session(CommandSessionRecord {
+                id: "state-command-matching".to_string(),
+                job_id: "state-job".to_string(),
+                worker_id: "state-worker".to_string(),
+                tool_call_id: None,
+                mode: "oneshot".to_string(),
+                title: "Checkout observed HEAD".to_string(),
+                state: "completed".to_string(),
+                command: "git".to_string(),
+                args: vec!["checkout".to_string(), head[..12].to_string()],
+                cwd: repo.worktree.display().to_string(),
+                session_id: "state-session".to_string(),
+                project_id: String::new(),
+                worktree_path: repo.worktree.display().to_string(),
+                branch: "dev".to_string(),
+                port: None,
+                env_json: json!({}),
+                network_policy: "inherit".to_string(),
+                timeout_secs: 30,
+                output_limit_bytes: 1024,
+                last_error: String::new(),
+                exit_code: Some(0),
+                stdout_artifact_id: None,
+                stderr_artifact_id: None,
+                started_at: Some(2),
+                completed_at: Some(2),
+            })
+            .expect("matching command session should persist");
+        let matching_command_session = state
+            .store
+            .get_session("state-session")
+            .expect("matching-command session should reload")
+            .session;
+        let matching_command =
+            session_state_evidence_and_refresh(&state, &matching_command_session, "state-job")
+                .expect("matching command should explain drift");
+        assert_eq!(matching_command["status"], "satisfied");
+        assert_eq!(
+            matching_command["mutation_command_session_id"],
+            "state-command-matching"
+        );
 
         state
             .store
