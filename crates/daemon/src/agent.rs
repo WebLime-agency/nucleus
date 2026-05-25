@@ -3,7 +3,7 @@ use std::{
     env, fs,
     io::ErrorKind,
     net::TcpListener as StdTcpListener,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{Arc, Mutex as StdMutex},
     time::{Instant, UNIX_EPOCH},
@@ -5358,11 +5358,28 @@ fn verify_file_claim(session: &SessionSummary, job_started_at: i64, claim: &Cont
         });
     };
     let claimed_path = Path::new(&claim.identifier);
+    if claimed_path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        return json!({
+            "status": "blocked",
+            "reason": "claimed file path escapes the session workspace",
+            "daemon_evidence_searched": format!("session workspace root {}", root.display()),
+        });
+    }
     let path = if claimed_path.is_absolute() {
         claimed_path.to_path_buf()
     } else {
         root.join(claimed_path)
     };
+    if !path.starts_with(&root) {
+        return json!({
+            "status": "blocked",
+            "reason": "claimed file path escapes the session workspace",
+            "daemon_evidence_searched": format!("session workspace root {}", root.display()),
+        });
+    }
     let metadata = match fs::metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -5415,7 +5432,8 @@ fn verify_external_entity_claim(
             event.kind, event.target, event.summary, event.detail
         )
         .to_ascii_lowercase();
-        (haystack.contains(&needle) || haystack.contains(&compact_needle))
+        event.status == "success"
+            && (haystack.contains(&needle) || haystack.contains(&compact_needle))
             && external_audit_action_matches(&haystack, &claim.action)
     });
     if matched {
@@ -22097,6 +22115,16 @@ Cleanup status: clean";
                 detail: "job_id=other-job daemon publication evidence for PR #555".to_string(),
             })
             .expect("unrelated audit event should append");
+        state
+            .store
+            .append_audit_event(AuditEventRecord {
+                kind: "publication".to_string(),
+                target: format!("job:{}", job.id),
+                status: "failed".to_string(),
+                summary: "PR #777 opened".to_string(),
+                detail: format!("job_id={} failed publication evidence for PR #777", job.id),
+            })
+            .expect("failed audit event should append");
 
         let mut branch_command =
             test_command_session_with_cwd("cmd-branch", repo.worktree.to_str().unwrap());
@@ -22175,6 +22203,28 @@ Cleanup status: clean";
             "claimed file does not exist"
         );
 
+        let escaped_file =
+            target_entity_evidence(&state, &session, &job, &[], "created file ../outside.txt")
+                .expect("escaped file evidence should derive");
+        assert_eq!(escaped_file["status"], "blocked");
+        assert_eq!(
+            escaped_file["claims"][0]["reason"],
+            "claimed file path escapes the session workspace"
+        );
+        let absolute_escaped_file = target_entity_evidence(
+            &state,
+            &session,
+            &job,
+            &[],
+            "created file /tmp/nucleus-outside-claim.txt",
+        )
+        .expect("absolute escaped file evidence should derive");
+        assert_eq!(absolute_escaped_file["status"], "blocked");
+        assert_eq!(
+            absolute_escaped_file["claims"][0]["reason"],
+            "claimed file path escapes the session workspace"
+        );
+
         let blocked_external =
             target_entity_evidence(&state, &session, &job, &[], "issue #999 referenced")
                 .expect("external evidence should derive");
@@ -22193,6 +22243,11 @@ Cleanup status: clean";
             target_entity_evidence(&state, &session, &job, &[], "PR #123 closed")
                 .expect("external action evidence should derive");
         assert_eq!(wrong_external_action["status"], "blocked");
+
+        let failed_external_event =
+            target_entity_evidence(&state, &session, &job, &[], "PR #777 opened")
+                .expect("failed external evidence should derive");
+        assert_eq!(failed_external_event["status"], "blocked");
 
         let no_claims = target_entity_evidence(&state, &session, &job, &[], "No blockers remain.")
             .expect("no-claim evidence should derive");
