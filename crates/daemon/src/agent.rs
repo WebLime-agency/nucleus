@@ -5050,17 +5050,8 @@ fn extract_target_entity_claims(final_answer: &str) -> Vec<ContextClaim> {
     let mut claims = Vec::new();
     for sentence in claim_sentences(final_answer) {
         let lower = sentence.to_ascii_lowercase();
-        if contains_any(&lower, &["created", "merged", "checked out", "switched"])
-            && lower.contains("branch ")
-        {
-            if let Some(branch) = token_after_phrase(&sentence, "branch ") {
-                claims.push(ContextClaim {
-                    claim_text: sentence.clone(),
-                    entity_type: "branch".to_string(),
-                    identifier: branch,
-                    action: branch_action(&lower),
-                });
-            }
+        if let Some(claim) = extract_branch_claim(&sentence, &lower) {
+            claims.push(claim);
         }
         for phrase in ["created file ", "modified file ", "updated file "] {
             if let Some(path) = token_after_phrase(&sentence, phrase) {
@@ -5102,6 +5093,7 @@ fn extract_process_state_claims(final_answer: &str) -> Vec<ContextClaim> {
         let lower = sentence.to_ascii_lowercase();
         if lower.contains("browser")
             && contains_any(&lower, &["ready", "healthy", "running", "available"])
+            && !is_negated_browser_health_claim(&lower)
         {
             claims.push(ContextClaim {
                 claim_text: sentence.clone(),
@@ -5267,14 +5259,62 @@ fn number_after_marker(text: &str, marker: &str) -> Option<String> {
     (!number.is_empty()).then_some(number)
 }
 
-fn branch_action(lower: &str) -> String {
-    if lower.contains("merged") {
-        "merged".to_string()
-    } else if lower.contains("checked out") || lower.contains("switched") {
-        "checked_out".to_string()
-    } else {
-        "created".to_string()
+fn extract_branch_claim(sentence: &str, lower: &str) -> Option<ContextClaim> {
+    for (phrase, action) in [
+        ("created branch ", "created"),
+        ("merged branch ", "merged"),
+        ("checked out branch ", "checked_out"),
+        ("switched to branch ", "checked_out"),
+        ("switched branch ", "checked_out"),
+    ] {
+        if let Some(branch) = token_after_phrase(sentence, phrase) {
+            return Some(ContextClaim {
+                claim_text: sentence.to_string(),
+                entity_type: "branch".to_string(),
+                identifier: branch,
+                action: action.to_string(),
+            });
+        }
     }
+
+    let branch = token_after_phrase(sentence, "branch ")?;
+    let branch_lower = branch.to_ascii_lowercase();
+    for (suffix, action) in [
+        ("created", "created"),
+        ("merged", "merged"),
+        ("checked out", "checked_out"),
+        ("switched", "checked_out"),
+    ] {
+        if lower.contains(&format!("branch {branch_lower} {suffix}")) {
+            return Some(ContextClaim {
+                claim_text: sentence.to_string(),
+                entity_type: "branch".to_string(),
+                identifier: branch,
+                action: action.to_string(),
+            });
+        }
+    }
+    None
+}
+
+fn is_negated_browser_health_claim(lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "not ready",
+            "not healthy",
+            "not running",
+            "not available",
+            "isn't ready",
+            "isn't healthy",
+            "isn't running",
+            "isn't available",
+            "unavailable",
+            "unhealthy",
+            "failed",
+            "failure",
+        ],
+    )
 }
 
 fn external_action(lower: &str) -> String {
@@ -22150,6 +22190,22 @@ Cleanup status: clean";
                 .iter()
                 .any(|claim| claim["identifier"] == "existing-branch")
         );
+        let file_on_branch = target_entity_evidence(
+            &state,
+            &session,
+            &job,
+            &[],
+            "created file created.txt on branch existing-branch.",
+        )
+        .expect("file-on-branch evidence should derive");
+        assert_eq!(file_on_branch["status"], "satisfied");
+        assert!(
+            !file_on_branch["claims"]
+                .as_array()
+                .expect("claims should be array")
+                .iter()
+                .any(|claim| claim["entity_type"] == "branch")
+        );
 
         let mut merge_command =
             test_command_session_with_cwd("cmd-merge", repo.worktree.to_str().unwrap());
@@ -22285,6 +22341,12 @@ Cleanup status: clean";
             .expect("truthful failure evidence should derive");
         assert_eq!(truthful_failure["status"], "satisfied");
         assert!(truthful_failure["claims"].as_array().unwrap().is_empty());
+
+        let negated_browser = process_state_evidence(&state, &[], "Browser is not running.")
+            .await
+            .expect("negated browser evidence should derive");
+        assert_eq!(negated_browser["status"], "satisfied");
+        assert!(negated_browser["claims"].as_array().unwrap().is_empty());
 
         let browser = verify_browser_claim(
             &Some(crate::browser::BrowserSidecarObservation {
