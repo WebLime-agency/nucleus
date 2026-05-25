@@ -327,6 +327,10 @@ pub struct JobSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_session_cwd_evidence_json: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_entity_evidence_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_state_evidence_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_state_observed_at: Option<i64>,
     #[serde(default)]
     pub completion_status: String,
@@ -455,6 +459,14 @@ fn derive_completion_gates(job: &JobSummary) -> Vec<CompletionGateSummary> {
         gates.push(session_state_gate(job));
     }
 
+    if has_target_entity_gate_state(job) {
+        gates.push(target_entity_gate(job));
+    }
+
+    if has_process_state_gate_state(job) {
+        gates.push(process_state_gate(job));
+    }
+
     if let Some(task_class) = task_class {
         if !job.publication_requested || task_class != "github_pr" {
             if let Some(gate) = task_class_gate(job, terminal, task_class) {
@@ -471,7 +483,7 @@ pub fn task_evidence_contract_catalog() -> Vec<TaskEvidenceContractSummary> {
         task_evidence_contract(
             "context_integrity",
             "Context integrity",
-            "Ground session context claims in daemon-observed worktree freshness, branch/repo consistency, cwd, and session-state evidence.",
+            "Ground session context claims in daemon-observed worktree freshness, branch/repo consistency, cwd, session-state, target-entity, and process/port evidence.",
             &[
                 (
                     "worktree_base_evidence",
@@ -492,6 +504,16 @@ pub fn task_evidence_contract_catalog() -> Vec<TaskEvidenceContractSummary> {
                     "session_state_evidence",
                     "Session-state evidence",
                     "Record stored and freshly observed git state plus an audit-event pointer when a daemon-observed mutation explains drift.",
+                ),
+                (
+                    "target_entity_evidence",
+                    "Target-entity evidence",
+                    "Record extracted entity claims, entity type, daemon evidence searched, and match/no-match results.",
+                ),
+                (
+                    "process_state_evidence",
+                    "Process-state evidence",
+                    "Record extracted process or port claims, daemon-managed identifier, last-observed state, and observation timestamp.",
                 ),
             ],
         ),
@@ -859,6 +881,8 @@ fn has_context_integrity_gate_state(job: &JobSummary) -> bool {
         || has_branch_repo_gate_state(job)
         || has_cwd_gate_state(job)
         || has_session_state_gate_state(job)
+        || has_target_entity_gate_state(job)
+        || has_process_state_gate_state(job)
 }
 
 fn has_worktree_base_gate_state(job: &JobSummary) -> bool {
@@ -885,6 +909,18 @@ fn has_session_state_gate_state(job: &JobSummary) -> bool {
     job.metadata_json
         .get("session_state_evidence")
         .is_some_and(|value| value.is_object())
+}
+
+fn has_target_entity_gate_state(job: &JobSummary) -> bool {
+    job.target_entity_evidence_json
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn has_process_state_gate_state(job: &JobSummary) -> bool {
+    job.process_state_evidence_json
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn worktree_base_gate(job: &JobSummary) -> CompletionGateSummary {
@@ -1029,6 +1065,84 @@ fn session_state_gate(job: &JobSummary) -> CompletionGateSummary {
     )
 }
 
+fn target_entity_gate(job: &JobSummary) -> CompletionGateSummary {
+    let evidence_json = job
+        .target_entity_evidence_json
+        .as_deref()
+        .and_then(parse_context_evidence_json)
+        .unwrap_or(Value::Null);
+    let status = evidence_status(&evidence_json);
+    let reason = evidence_string(&evidence_json, "reason");
+    let state = match status.as_str() {
+        "satisfied" => "done",
+        "blocked" => "blocked",
+        _ => "pending",
+    };
+    let summary = match state {
+        "done" => format!(
+            "Target-entity claims match daemon evidence{}.",
+            prefixed_reason(&reason)
+        ),
+        "blocked" => format!(
+            "Target-entity claim has no matching daemon evidence{}.",
+            prefixed_reason(&reason)
+        ),
+        _ => format!(
+            "Target-entity evidence is pending{}.",
+            prefixed_reason(&reason)
+        ),
+    };
+
+    completion_gate(
+        "target_entity_consistent",
+        "Target-entity consistency",
+        state,
+        summary,
+        "context_integrity",
+        required_evidence_for("context_integrity", &["target_entity_evidence"]),
+        target_entity_evidence(&evidence_json),
+    )
+}
+
+fn process_state_gate(job: &JobSummary) -> CompletionGateSummary {
+    let evidence_json = job
+        .process_state_evidence_json
+        .as_deref()
+        .and_then(parse_context_evidence_json)
+        .unwrap_or(Value::Null);
+    let status = evidence_status(&evidence_json);
+    let reason = evidence_string(&evidence_json, "reason");
+    let state = match status.as_str() {
+        "satisfied" => "done",
+        "blocked" => "blocked",
+        _ => "pending",
+    };
+    let summary = match state {
+        "done" => format!(
+            "Process and port claims match daemon observations{}.",
+            prefixed_reason(&reason)
+        ),
+        "blocked" => format!(
+            "Process or port claim contradicts daemon observation{}.",
+            prefixed_reason(&reason)
+        ),
+        _ => format!(
+            "Process and port evidence is pending{}.",
+            prefixed_reason(&reason)
+        ),
+    };
+
+    completion_gate(
+        "process_state_consistent",
+        "Process-state consistency",
+        state,
+        summary,
+        "context_integrity",
+        required_evidence_for("context_integrity", &["process_state_evidence"]),
+        process_state_evidence(&evidence_json),
+    )
+}
+
 fn worktree_base_evidence(job: &JobSummary) -> Vec<String> {
     [
         non_empty_evidence("base_ref", &job.worktree_base_ref),
@@ -1115,6 +1229,60 @@ fn session_state_evidence(value: &Value) -> Vec<String> {
     push_json_evidence(&mut evidence, "audit_hint", value);
     push_json_evidence(&mut evidence, "reason", value);
     evidence
+}
+
+fn target_entity_evidence(value: &Value) -> Vec<String> {
+    let mut evidence = Vec::new();
+    push_json_evidence(&mut evidence, "reason", value);
+    push_claim_evidence(&mut evidence, value);
+    evidence
+}
+
+fn process_state_evidence(value: &Value) -> Vec<String> {
+    let mut evidence = Vec::new();
+    push_json_evidence(&mut evidence, "reason", value);
+    push_claim_evidence(&mut evidence, value);
+    evidence
+}
+
+fn push_claim_evidence(evidence: &mut Vec<String>, value: &Value) {
+    if let Some(claims) = value.get("claims").and_then(Value::as_array) {
+        for claim in claims {
+            let claim_text = evidence_string(claim, "claim_text");
+            let entity_type = evidence_string(claim, "entity_type");
+            let identifier = evidence_string(claim, "identifier");
+            let searched = evidence_string(claim, "daemon_evidence_searched");
+            let result = evidence_string(claim, "result");
+            let reason = evidence_string(claim, "reason");
+            let observed = evidence_string(claim, "last_observed_state");
+            let observed_at = evidence_string(claim, "observation_timestamp");
+            if !claim_text.trim().is_empty() {
+                evidence.push(format!("claim_text {claim_text}"));
+            }
+            if !entity_type.trim().is_empty() || !identifier.trim().is_empty() {
+                evidence.push(format!(
+                    "entity {} {}",
+                    empty_fallback(&entity_type, "unknown"),
+                    empty_fallback(&identifier, "unknown")
+                ));
+            }
+            if !searched.trim().is_empty() {
+                evidence.push(format!("daemon_evidence_searched {searched}"));
+            }
+            if !result.trim().is_empty() {
+                evidence.push(format!("result {result}"));
+            }
+            if !reason.trim().is_empty() {
+                evidence.push(format!("reason {reason}"));
+            }
+            if !observed.trim().is_empty() {
+                evidence.push(format!("last_observed_state {observed}"));
+            }
+            if !observed_at.trim().is_empty() {
+                evidence.push(format!("observation_timestamp {observed_at}"));
+            }
+        }
+    }
 }
 
 fn parse_context_evidence_json(value: &str) -> Option<Value> {
@@ -3034,6 +3202,8 @@ mod tests {
             branch_repo_status: String::new(),
             branch_repo_reason: String::new(),
             command_session_cwd_evidence_json: None,
+            target_entity_evidence_json: None,
+            process_state_evidence_json: None,
             session_state_observed_at: None,
             completion_status: String::new(),
             completion_gates: Vec::new(),
@@ -3113,6 +3283,8 @@ mod tests {
             branch_repo_status: String::new(),
             branch_repo_reason: String::new(),
             command_session_cwd_evidence_json: None,
+            target_entity_evidence_json: None,
+            process_state_evidence_json: None,
             session_state_observed_at: None,
             completion_status: String::new(),
             completion_gates: Vec::new(),
@@ -3347,6 +3519,83 @@ mod tests {
                 .any(|item| item == "observed.git_head new")
         );
 
+        let target_entity_blocked = JobSummary {
+            state: "blocked".to_string(),
+            target_entity_evidence_json: Some(
+                json!({
+                    "status": "blocked",
+                    "reason": "one or more target-entity claims have no daemon evidence",
+                    "claims": [{
+                        "claim_text": "created file missing.txt",
+                        "entity_type": "file",
+                        "identifier": "missing.txt",
+                        "result": "blocked",
+                        "daemon_evidence_searched": "filesystem metadata",
+                        "reason": "claimed file does not exist"
+                    }]
+                })
+                .to_string(),
+            ),
+            ..task_class_job("local_project", vec!["validation".to_string()])
+        }
+        .with_completion_gates();
+        let target_gate = target_entity_blocked
+            .completion_gates
+            .iter()
+            .find(|gate| gate.id == "target_entity_consistent")
+            .expect("target-entity gate should be derived");
+        assert_eq!(target_gate.state, "blocked");
+        assert!(
+            target_gate
+                .required_evidence
+                .iter()
+                .any(|item| item == "Target-entity evidence")
+        );
+        assert!(
+            target_gate
+                .evidence
+                .iter()
+                .any(|item| item == "claim_text created file missing.txt")
+        );
+        assert!(
+            target_gate
+                .evidence
+                .iter()
+                .any(|item| item == "entity file missing.txt")
+        );
+
+        let process_state_pending = JobSummary {
+            process_state_evidence_json: Some(
+                json!({
+                    "status": "pending",
+                    "reason": "process or port evidence is still pending",
+                    "claims": [{
+                        "claim_text": "Browser is ready",
+                        "entity_type": "browser_sidecar",
+                        "identifier": "browser_sidecar",
+                        "result": "pending",
+                        "daemon_evidence_searched": "browser sidecar process handle",
+                        "reason": "no observation recorded"
+                    }]
+                })
+                .to_string(),
+            ),
+            ..task_class_job("local_project", vec!["validation".to_string()])
+        }
+        .with_completion_gates();
+        let process_gate = process_state_pending
+            .completion_gates
+            .iter()
+            .find(|gate| gate.id == "process_state_consistent")
+            .expect("process-state gate should be derived");
+        assert_eq!(process_gate.state, "pending");
+        assert!(
+            process_gate
+                .required_evidence
+                .iter()
+                .any(|item| item == "Process-state evidence")
+        );
+
         let pending = JobSummary {
             worktree_base_status: "pending".to_string(),
             worktree_base_reason: "could not reach canonical: auth failed".to_string(),
@@ -3372,6 +3621,8 @@ mod tests {
                         | "branch_repo_consistent"
                         | "cwd_consistent"
                         | "session_state_consistent"
+                        | "target_entity_consistent"
+                        | "process_state_consistent"
                 ))
         );
     }
@@ -3547,6 +3798,8 @@ mod tests {
             branch_repo_status: String::new(),
             branch_repo_reason: String::new(),
             command_session_cwd_evidence_json: None,
+            target_entity_evidence_json: None,
+            process_state_evidence_json: None,
             session_state_observed_at: None,
             completion_status: String::new(),
             completion_gates: Vec::new(),

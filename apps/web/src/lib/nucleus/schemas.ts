@@ -206,6 +206,8 @@ export const jobSummarySchema = z.object({
   branch_repo_status: z.string().default(''),
   branch_repo_reason: z.string().default(''),
   command_session_cwd_evidence_json: z.string().nullable().default(null),
+  target_entity_evidence_json: z.string().nullable().default(null),
+  process_state_evidence_json: z.string().nullable().default(null),
   session_state_observed_at: z.number().int().nullable().default(null),
   completion_status: z.enum(['not_gated', 'pending', 'satisfied', 'blocked']).default('not_gated'),
   completion_gates: z.array(completionGateSummarySchema).default([]),
