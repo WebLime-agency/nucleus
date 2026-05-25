@@ -2334,7 +2334,8 @@ async fn run_job_loop(
     )
     .await;
 
-    let context_job = record_context_integrity_detection(state, &session.session, job_id)?;
+    let context_job =
+        record_context_integrity_detection(state, &session.session, job_id, None).await?;
     if let Some(blocker) = context_integrity_start_blocker(&context_job) {
         block_job_for_context_integrity(state, &session, &mut worker, &blocker).await?;
         return Ok(());
@@ -4243,7 +4244,9 @@ async fn complete_job_with_final_answer(
         });
     }
 
-    let completion_job = record_context_integrity_detection(state, &session.session, job_id)?;
+    let completion_job =
+        record_context_integrity_detection(state, &session.session, job_id, Some(final_answer))
+            .await?;
     reconcile_publication_browser_status_with_completion(&completion_job, &mut publication_patch);
     let projected_blocker = projected_completion_gate_blocker(&completion_job, &publication_patch);
     let terminal_job_state = if projected_blocker.is_some() {
@@ -4712,10 +4715,11 @@ fn record_publication_git_hygiene_baseline(
     Ok(())
 }
 
-fn record_context_integrity_detection(
+async fn record_context_integrity_detection(
     state: &AppState,
     session: &SessionSummary,
     job_id: &str,
+    final_answer: Option<&str>,
 ) -> Result<JobSummary> {
     let detail = state.store.get_job(job_id)?;
     let current = detail.job;
@@ -4730,6 +4734,24 @@ fn record_context_integrity_detection(
     patch.metadata_json = Some(context_integrity_metadata_with_session_state(
         state, session, &current, job_id,
     )?);
+    if let Some(final_answer) = final_answer {
+        patch.target_entity_evidence_json = Some(Some(
+            serde_json::to_string(&target_entity_evidence(
+                state,
+                session,
+                &current,
+                &detail.command_sessions,
+                final_answer,
+            )?)
+            .unwrap_or_else(|_| "{}".to_string()),
+        ));
+        patch.process_state_evidence_json = Some(Some(
+            serde_json::to_string(
+                &process_state_evidence(state, &detail.command_sessions, final_answer).await?,
+            )
+            .unwrap_or_else(|_| "{}".to_string()),
+        ));
+    }
     let updated = state.store.update_job(job_id, patch)?;
     let _ = state.store.append_job_event(JobEventRecord {
         job_id: job_id.to_string(),
@@ -4761,6 +4783,12 @@ fn record_context_integrity_detection(
             "session_state_evidence": updated.metadata_json
                 .get("session_state_evidence")
                 .cloned()
+                .unwrap_or_else(|| json!({})),
+            "target_entity_evidence": updated.target_entity_evidence_json.as_deref()
+                .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                .unwrap_or_else(|| json!({})),
+            "process_state_evidence": updated.process_state_evidence_json.as_deref()
+                .and_then(|value| serde_json::from_str::<Value>(value).ok())
                 .unwrap_or_else(|| json!({})),
         }),
     });
@@ -4875,6 +4903,679 @@ fn command_session_cwd_evidence(
         "offending_command_session_ids": [],
         "offending_cwds": [],
         "stale_recorded_cwd_ids": stale_recorded_cwd_ids,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContextClaim {
+    claim_text: String,
+    entity_type: String,
+    identifier: String,
+    action: String,
+}
+
+fn target_entity_evidence(
+    state: &AppState,
+    session: &SessionSummary,
+    job: &JobSummary,
+    command_sessions: &[CommandSessionSummary],
+    final_answer: &str,
+) -> Result<Value> {
+    let claims = extract_target_entity_claims(final_answer);
+    if claims.is_empty() {
+        return Ok(json!({
+            "status": "satisfied",
+            "reason": "no extractable target-entity claims; gate is trivially satisfied",
+            "claims": [],
+        }));
+    }
+
+    let audit_events = state
+        .store
+        .list_audit_events_since(job.created_at.saturating_sub(1))?;
+    let mut verified = Vec::new();
+    for claim in claims {
+        let result = match claim.entity_type.as_str() {
+            "branch" => verify_branch_claim(session, command_sessions, &claim),
+            "file" => verify_file_claim(session, job.created_at, &claim),
+            "external_entity" => verify_external_entity_claim(&audit_events, &claim),
+            _ => json!({
+                "status": "pending",
+                "reason": "unsupported claim type",
+                "daemon_evidence_searched": "none",
+            }),
+        };
+        verified.push(claim_result_json(&claim, result));
+    }
+
+    Ok(evidence_rollup(
+        verified,
+        "all extractable target-entity claims match daemon evidence",
+        "one or more target-entity claims have no daemon evidence",
+        "target-entity evidence is still pending",
+    ))
+}
+
+async fn process_state_evidence(
+    state: &AppState,
+    command_sessions: &[CommandSessionSummary],
+    final_answer: &str,
+) -> Result<Value> {
+    let claims = extract_process_state_claims(final_answer);
+    if claims.is_empty() {
+        return Ok(json!({
+            "status": "satisfied",
+            "reason": "no extractable process or port claims; gate is trivially satisfied",
+            "claims": [],
+        }));
+    }
+
+    let browser_observation = state.browser.observe_sidecar().await?;
+    let mut verified = Vec::new();
+    for claim in claims {
+        let result = match claim.entity_type.as_str() {
+            "browser_sidecar" => verify_browser_claim(&browser_observation, &claim),
+            "command_session" => verify_command_success_claim(command_sessions, &claim),
+            "port" => verify_port_claim(command_sessions, &claim),
+            _ => json!({
+                "status": "pending",
+                "reason": "unsupported process claim type",
+                "daemon_evidence_searched": "none",
+            }),
+        };
+        verified.push(claim_result_json(&claim, result));
+    }
+
+    Ok(evidence_rollup(
+        verified,
+        "all extractable process and port claims match daemon observations",
+        "one or more process or port claims contradict daemon observations",
+        "process or port evidence is still pending",
+    ))
+}
+
+fn claim_result_json(claim: &ContextClaim, result: Value) -> Value {
+    json!({
+        "claim_text": claim.claim_text,
+        "entity_type": claim.entity_type,
+        "identifier": claim.identifier,
+        "action": claim.action,
+        "result": result.get("status").and_then(Value::as_str).unwrap_or("pending"),
+        "reason": result.get("reason").and_then(Value::as_str).unwrap_or_default(),
+        "daemon_evidence_searched": result
+            .get("daemon_evidence_searched")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        "last_observed_state": result
+            .get("last_observed_state")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        "observation_timestamp": result
+            .get("observation_timestamp")
+            .and_then(Value::as_i64),
+        "matched": result.get("matched").and_then(Value::as_bool).unwrap_or(false),
+    })
+}
+
+fn evidence_rollup(
+    claims: Vec<Value>,
+    satisfied_reason: &str,
+    blocked_reason: &str,
+    pending_reason: &str,
+) -> Value {
+    let has_blocked = claims
+        .iter()
+        .any(|claim| claim.get("result").and_then(Value::as_str) == Some("blocked"));
+    let has_pending = claims
+        .iter()
+        .any(|claim| claim.get("result").and_then(Value::as_str) == Some("pending"));
+    let (status, reason) = if has_blocked {
+        ("blocked", blocked_reason)
+    } else if has_pending {
+        ("pending", pending_reason)
+    } else {
+        ("satisfied", satisfied_reason)
+    };
+    json!({
+        "status": status,
+        "reason": reason,
+        "claims": claims,
+    })
+}
+
+fn extract_target_entity_claims(final_answer: &str) -> Vec<ContextClaim> {
+    let mut claims = Vec::new();
+    for sentence in claim_sentences(final_answer) {
+        let lower = sentence.to_ascii_lowercase();
+        if contains_any(&lower, &["created", "merged", "checked out", "switched"])
+            && lower.contains("branch ")
+        {
+            if let Some(branch) = token_after_phrase(&sentence, "branch ") {
+                claims.push(ContextClaim {
+                    claim_text: sentence.clone(),
+                    entity_type: "branch".to_string(),
+                    identifier: branch,
+                    action: branch_action(&lower),
+                });
+            }
+        }
+        for phrase in ["created file ", "modified file ", "updated file "] {
+            if let Some(path) = token_after_phrase(&sentence, phrase) {
+                claims.push(ContextClaim {
+                    claim_text: sentence.clone(),
+                    entity_type: "file".to_string(),
+                    identifier: path,
+                    action: phrase.trim().replace(' ', "_"),
+                });
+            }
+        }
+        if contains_any(
+            &lower,
+            &["opened", "created", "published", "referenced", "closed"],
+        ) {
+            for (marker, entity) in [
+                ("pr #", "pr"),
+                ("pull request #", "pr"),
+                ("issue #", "issue"),
+            ] {
+                if let Some(number) = number_after_marker(&lower, marker) {
+                    claims.push(ContextClaim {
+                        claim_text: sentence.clone(),
+                        entity_type: "external_entity".to_string(),
+                        identifier: format!("{entity}#{number}"),
+                        action: external_action(&lower),
+                    });
+                    break;
+                }
+            }
+        }
+    }
+    dedupe_claims(claims)
+}
+
+fn extract_process_state_claims(final_answer: &str) -> Vec<ContextClaim> {
+    let mut claims = Vec::new();
+    for sentence in claim_sentences(final_answer) {
+        let lower = sentence.to_ascii_lowercase();
+        if lower.contains("browser")
+            && contains_any(&lower, &["ready", "healthy", "running", "available"])
+        {
+            claims.push(ContextClaim {
+                claim_text: sentence.clone(),
+                entity_type: "browser_sidecar".to_string(),
+                identifier: "browser_sidecar".to_string(),
+                action: "healthy".to_string(),
+            });
+        }
+        if contains_any(
+            &lower,
+            &[
+                "tests passed",
+                "test passed",
+                "tests succeeded",
+                "test succeeded",
+                "tests showed",
+                "test showed",
+                "command succeeded",
+                "command passed",
+                "cargo test passed",
+                "npm test passed",
+                "npm run check passed",
+            ],
+        ) {
+            claims.push(ContextClaim {
+                claim_text: sentence.clone(),
+                entity_type: "command_session".to_string(),
+                identifier: command_claim_identifier(&lower),
+                action: "succeeded".to_string(),
+            });
+        }
+        if lower.contains("port ")
+            && contains_any(
+                &lower,
+                &["ready", "healthy", "running", "listening", "available"],
+            )
+        {
+            if let Some(port) = number_after_marker(&lower, "port ") {
+                claims.push(ContextClaim {
+                    claim_text: sentence.clone(),
+                    entity_type: "port".to_string(),
+                    identifier: port,
+                    action: "healthy".to_string(),
+                });
+            }
+        }
+    }
+    dedupe_claims(claims)
+}
+
+fn claim_sentences(text: &str) -> Vec<String> {
+    text.lines()
+        .flat_map(|line| line.split([';', '!', '?']))
+        .map(|item| {
+            item.trim()
+                .trim_start_matches(['-', '*', ' '])
+                .trim()
+                .to_string()
+        })
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+fn contains_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
+fn command_session_text(command: &str, args: &[String]) -> String {
+    std::iter::once(command)
+        .chain(args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn is_validation_command(text: &str) -> bool {
+    contains_any(
+        text,
+        &[
+            "cargo test",
+            "cargo nextest",
+            "npm test",
+            "npm run test",
+            "npm run check",
+            "npm run build",
+            "pnpm test",
+            "pnpm check",
+            "pnpm build",
+            "bun test",
+            "bun run test",
+            "bun run check",
+            "bun run build",
+            "node --test",
+        ],
+    )
+}
+
+fn dedupe_claims(claims: Vec<ContextClaim>) -> Vec<ContextClaim> {
+    let mut seen = BTreeSet::new();
+    claims
+        .into_iter()
+        .filter(|claim| {
+            seen.insert(format!(
+                "{}:{}:{}",
+                claim.entity_type, claim.identifier, claim.claim_text
+            ))
+        })
+        .collect()
+}
+
+fn token_after_phrase(sentence: &str, phrase: &str) -> Option<String> {
+    let lower = sentence.to_ascii_lowercase();
+    let start = lower.find(phrase)? + phrase.len();
+    sanitize_claim_token(sentence.get(start..)?.trim())
+}
+
+fn sanitize_claim_token(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let token = if let Some(quote) = trimmed
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '`' | '"' | '\''))
+    {
+        let rest = trimmed.get(quote.len_utf8()..).unwrap_or_default();
+        rest.find(quote)
+            .and_then(|end| rest.get(..end))
+            .unwrap_or(rest)
+            .to_string()
+    } else {
+        trimmed
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let token = token
+        .trim_matches(|c: char| matches!(c, '`' | '"' | '\'' | ',' | ':' | ')' | '(' | '[' | ']'))
+        .to_string();
+    (!token.is_empty()).then_some(token)
+}
+
+fn number_after_marker(text: &str, marker: &str) -> Option<String> {
+    let start = text.find(marker)? + marker.len();
+    let number = text
+        .get(start..)?
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>();
+    (!number.is_empty()).then_some(number)
+}
+
+fn branch_action(lower: &str) -> String {
+    if lower.contains("merged") {
+        "merged".to_string()
+    } else if lower.contains("checked out") || lower.contains("switched") {
+        "checked_out".to_string()
+    } else {
+        "created".to_string()
+    }
+}
+
+fn external_action(lower: &str) -> String {
+    for action in ["opened", "created", "published", "referenced", "closed"] {
+        if lower.contains(action) {
+            return action.to_string();
+        }
+    }
+    "referenced".to_string()
+}
+
+fn command_claim_identifier(lower: &str) -> String {
+    if lower.contains("cargo test") {
+        "cargo test".to_string()
+    } else if lower.contains("npm run check") {
+        "npm run check".to_string()
+    } else if lower.contains("npm test") {
+        "npm test".to_string()
+    } else {
+        "test".to_string()
+    }
+}
+
+fn verify_branch_claim(
+    session: &SessionSummary,
+    command_sessions: &[CommandSessionSummary],
+    claim: &ContextClaim,
+) -> Value {
+    let Some(worktree_path) = declared_session_git_path(session) else {
+        return json!({
+            "status": "pending",
+            "reason": "session has no declared git worktree path",
+            "daemon_evidence_searched": "session worktree local refs and command_sessions",
+        });
+    };
+    let branch_ref = format!("refs/heads/{}", claim.identifier);
+    if git_status(
+        &worktree_path,
+        &["show-ref", "--verify", "--quiet", &branch_ref],
+    )
+    .is_ok()
+    {
+        return json!({
+            "status": "satisfied",
+            "reason": "branch found in local refs",
+            "daemon_evidence_searched": format!("git show-ref --verify --quiet {branch_ref}"),
+            "matched": true,
+        });
+    }
+    if successful_command_mentions(command_sessions, &["git", &claim.action, &claim.identifier]) {
+        return json!({
+            "status": "satisfied",
+            "reason": "daemon-recorded command session mentions the branch action",
+            "daemon_evidence_searched": "command_sessions command/args",
+            "matched": true,
+        });
+    }
+    json!({
+        "status": "blocked",
+        "reason": "branch not found and no daemon-recorded branch operation matched the claim",
+        "daemon_evidence_searched": format!("local refs via git show-ref plus command_sessions for {}", claim.identifier),
+    })
+}
+
+fn verify_file_claim(session: &SessionSummary, job_started_at: i64, claim: &ContextClaim) -> Value {
+    let Some(root) = session_worktree_probe_path(session) else {
+        return json!({
+            "status": "pending",
+            "reason": "session has no declared filesystem root",
+            "daemon_evidence_searched": "session worktree_path, working_dir, git_root",
+        });
+    };
+    let claimed_path = Path::new(&claim.identifier);
+    let path = if claimed_path.is_absolute() {
+        claimed_path.to_path_buf()
+    } else {
+        root.join(claimed_path)
+    };
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return json!({
+                "status": "blocked",
+                "reason": "claimed file does not exist",
+                "daemon_evidence_searched": format!("filesystem metadata for {}", path.display()),
+            });
+        }
+        Err(error) => {
+            return json!({
+                "status": "pending",
+                "reason": format!("filesystem check failed: {error}"),
+                "daemon_evidence_searched": format!("filesystem metadata for {}", path.display()),
+            });
+        }
+    };
+    let modified_at = metadata
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64);
+    if modified_at.is_some_and(|mtime| mtime >= job_started_at) {
+        json!({
+            "status": "satisfied",
+            "reason": "claimed file exists and was modified during or after the job start",
+            "daemon_evidence_searched": format!("filesystem metadata for {}", path.display()),
+            "matched": true,
+            "observation_timestamp": modified_at,
+        })
+    } else {
+        json!({
+            "status": "blocked",
+            "reason": "claimed file exists but mtime is older than the job start",
+            "daemon_evidence_searched": format!("filesystem metadata for {}", path.display()),
+            "observation_timestamp": modified_at,
+        })
+    }
+}
+
+fn verify_external_entity_claim(
+    audit_events: &[nucleus_protocol::AuditEvent],
+    claim: &ContextClaim,
+) -> Value {
+    let needle = claim.identifier.replace('#', " #").to_ascii_lowercase();
+    let compact_needle = claim.identifier.to_ascii_lowercase();
+    let matched = audit_events.iter().any(|event| {
+        let haystack = format!(
+            "{} {} {} {}",
+            event.kind, event.target, event.summary, event.detail
+        )
+        .to_ascii_lowercase();
+        haystack.contains(&needle) || haystack.contains(&compact_needle)
+    });
+    if matched {
+        json!({
+            "status": "satisfied",
+            "reason": "matching daemon audit event recorded",
+            "daemon_evidence_searched": "audit_events kind/target/summary/detail since job start",
+            "matched": true,
+        })
+    } else {
+        json!({
+            "status": "blocked",
+            "reason": "claim references external entity with no daemon evidence",
+            "daemon_evidence_searched": "audit_events kind/target/summary/detail since job start",
+        })
+    }
+}
+
+fn verify_browser_claim(
+    observation: &Option<crate::browser::BrowserSidecarObservation>,
+    _claim: &ContextClaim,
+) -> Value {
+    let Some(observation) = observation else {
+        return json!({
+            "status": "pending",
+            "reason": "no observation recorded",
+            "daemon_evidence_searched": "browser sidecar process handle",
+        });
+    };
+    if observation.state == "running" {
+        json!({
+            "status": "satisfied",
+            "reason": "browser sidecar process is running",
+            "daemon_evidence_searched": "browser sidecar process handle",
+            "last_observed_state": observation.state,
+            "observation_timestamp": observation.observed_at,
+            "matched": true,
+        })
+    } else {
+        json!({
+            "status": "blocked",
+            "reason": "worker claimed Browser ready but daemon observation is not running",
+            "daemon_evidence_searched": "browser sidecar process handle",
+            "last_observed_state": observation.state,
+            "observation_timestamp": observation.observed_at,
+        })
+    }
+}
+
+fn verify_command_success_claim(
+    command_sessions: &[CommandSessionSummary],
+    claim: &ContextClaim,
+) -> Value {
+    let identifier = claim.identifier.to_ascii_lowercase();
+    let mut matching = command_sessions
+        .iter()
+        .filter(|command_session| command_claim_matches_session(&identifier, command_session))
+        .collect::<Vec<_>>();
+    matching.sort_by_key(|command_session| {
+        (
+            command_session
+                .completed_at
+                .unwrap_or(command_session.updated_at),
+            command_session.updated_at,
+            command_session.created_at,
+        )
+    });
+    let Some(command_session) = matching.pop() else {
+        return json!({
+            "status": "pending",
+            "reason": "no observation recorded",
+            "daemon_evidence_searched": format!("command_sessions matching {identifier}"),
+        });
+    };
+    let observed = format!(
+        "state={} exit_code={}",
+        command_session.state,
+        command_session
+            .exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    if command_session.state == "completed" && command_session.exit_code == Some(0) {
+        json!({
+            "status": "satisfied",
+            "reason": format!("matching command session {} succeeded", command_session.id),
+            "daemon_evidence_searched": format!("command_sessions matching {identifier}"),
+            "last_observed_state": observed,
+            "observation_timestamp": command_session.completed_at.or(Some(command_session.updated_at)),
+            "matched": true,
+        })
+    } else {
+        json!({
+            "status": "blocked",
+            "reason": format!("matching command session {} did not succeed", command_session.id),
+            "daemon_evidence_searched": format!("command_sessions matching {identifier}"),
+            "last_observed_state": observed,
+            "observation_timestamp": command_session.completed_at.or(Some(command_session.updated_at)),
+        })
+    }
+}
+
+fn verify_port_claim(command_sessions: &[CommandSessionSummary], claim: &ContextClaim) -> Value {
+    let port = claim.identifier.parse::<u16>().ok();
+    let mut matching = command_sessions
+        .iter()
+        .filter(|command_session| command_session.port == port)
+        .collect::<Vec<_>>();
+    matching.sort_by_key(|command_session| {
+        (
+            command_session
+                .completed_at
+                .unwrap_or(command_session.updated_at),
+            command_session.updated_at,
+            command_session.created_at,
+        )
+    });
+    let Some(command_session) = matching.pop() else {
+        return json!({
+            "status": "pending",
+            "reason": "no observation recorded",
+            "daemon_evidence_searched": format!("command_sessions with recorded port {}", claim.identifier),
+        });
+    };
+    let observed = format!(
+        "state={} exit_code={}",
+        command_session.state,
+        command_session
+            .exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    if command_session.state == "running"
+        || (command_session.state == "completed" && command_session.exit_code == Some(0))
+    {
+        json!({
+            "status": "satisfied",
+            "reason": format!(
+                "matching command session {} recorded port {}",
+                command_session.id, claim.identifier
+            ),
+            "daemon_evidence_searched": format!("command_sessions with recorded port {}", claim.identifier),
+            "last_observed_state": observed,
+            "observation_timestamp": command_session.completed_at.or(Some(command_session.updated_at)),
+            "matched": true,
+        })
+    } else {
+        json!({
+            "status": "blocked",
+            "reason": format!(
+                "matching command session {} for port {} is not healthy",
+                command_session.id, claim.identifier
+            ),
+            "daemon_evidence_searched": format!("command_sessions with recorded port {}", claim.identifier),
+            "last_observed_state": observed,
+            "observation_timestamp": command_session.completed_at.or(Some(command_session.updated_at)),
+        })
+    }
+}
+
+fn command_claim_matches_session(
+    identifier: &str,
+    command_session: &CommandSessionSummary,
+) -> bool {
+    let text = command_session_text(&command_session.command, &command_session.args);
+    if identifier == "test" {
+        return is_validation_command(&text) && text.contains("test");
+    }
+    identifier
+        .split_whitespace()
+        .all(|token| text.contains(token))
+}
+
+fn successful_command_mentions(
+    command_sessions: &[CommandSessionSummary],
+    needles: &[&str],
+) -> bool {
+    command_sessions.iter().any(|command_session| {
+        if command_session.state != "completed" || command_session.exit_code != Some(0) {
+            return false;
+        }
+        let text = command_session_text(&command_session.command, &command_session.args);
+        needles
+            .iter()
+            .all(|needle| text.contains(&needle.to_ascii_lowercase()))
     })
 }
 
@@ -6114,6 +6815,8 @@ fn context_integrity_start_blocker(job: &JobSummary) -> Option<String> {
                     | "branch_repo_consistent"
                     | "cwd_consistent"
                     | "session_state_consistent"
+                    | "target_entity_consistent"
+                    | "process_state_consistent"
             ) && gate.state == "blocked"
         })
         .map(|gate| gate.summary.clone())
@@ -6192,23 +6895,45 @@ fn context_integrity_event_summary(job: &JobSummary) -> String {
         .and_then(|value| value.get("status"))
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let target_entity_status =
+        evidence_status_from_json(job.target_entity_evidence_json.as_deref());
+    let process_state_status =
+        evidence_status_from_json(job.process_state_evidence_json.as_deref());
     match (
         job.worktree_base_status.as_str(),
         job.branch_repo_status.as_str(),
         cwd_status.as_str(),
         session_state_status,
+        target_entity_status.as_str(),
+        process_state_status.as_str(),
     ) {
-        ("blocked", _, _, _)
-        | (_, "blocked", _, _)
-        | (_, _, "blocked", _)
-        | (_, _, _, "blocked") => "Context integrity is blocked.".to_string(),
-        ("pending", _, _, _)
-        | (_, "pending", _, _)
-        | (_, _, "pending", _)
-        | (_, _, _, "pending") => "Context integrity is pending.".to_string(),
-        ("", "", "", "") => "Context integrity did not run for this job.".to_string(),
+        ("blocked", _, _, _, _, _)
+        | (_, "blocked", _, _, _, _)
+        | (_, _, "blocked", _, _, _)
+        | (_, _, _, "blocked", _, _)
+        | (_, _, _, _, "blocked", _)
+        | (_, _, _, _, _, "blocked") => "Context integrity is blocked.".to_string(),
+        ("pending", _, _, _, _, _)
+        | (_, "pending", _, _, _, _)
+        | (_, _, "pending", _, _, _)
+        | (_, _, _, "pending", _, _)
+        | (_, _, _, _, "pending", _)
+        | (_, _, _, _, _, "pending") => "Context integrity is pending.".to_string(),
+        ("", "", "", "", "", "") => "Context integrity did not run for this job.".to_string(),
         _ => "Context integrity evidence recorded.".to_string(),
     }
+}
+
+fn evidence_status_from_json(value: Option<&str>) -> String {
+    value
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|value| {
+            value
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
 }
 
 fn context_integrity_event_detail(job: &JobSummary) -> String {
@@ -6264,7 +6989,32 @@ fn context_integrity_event_detail(job: &JobSummary) -> String {
             }
         })
         .unwrap_or_default();
-    format!("worktree_base={base}; branch_repo={branch}; cwd={cwd}; session_state={session_state}")
+    let target_entity = evidence_detail_from_json(job.target_entity_evidence_json.as_deref());
+    let process_state = evidence_detail_from_json(job.process_state_evidence_json.as_deref());
+    format!(
+        "worktree_base={base}; branch_repo={branch}; cwd={cwd}; session_state={session_state}; target_entity={target_entity}; process_state={process_state}"
+    )
+}
+
+fn evidence_detail_from_json(value: Option<&str>) -> String {
+    value
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .map(|value| {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let reason = value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if reason.trim().is_empty() {
+                status.to_string()
+            } else {
+                format!("{status} ({reason})")
+            }
+        })
+        .unwrap_or_default()
 }
 
 fn add_budget_guidance(
@@ -7336,6 +8086,8 @@ fn projected_completion_gate_blocker(
                         "worktree_base_fresh"
                             | "branch_repo_consistent"
                             | "session_state_consistent"
+                            | "target_entity_consistent"
+                            | "process_state_consistent"
                     ))
                 || (gate.state == "pending" && gate.id == "cwd_consistent" && publication_requested)
         })
@@ -20659,6 +21411,8 @@ Cleanup status: clean";
             branch_repo_status: String::new(),
             branch_repo_reason: String::new(),
             command_session_cwd_evidence_json: None,
+            target_entity_evidence_json: None,
+            process_state_evidence_json: None,
             session_state_observed_at: None,
             completion_status: String::new(),
             completion_gates: Vec::new(),
@@ -20744,6 +21498,8 @@ Cleanup status: clean";
             branch_repo_status: String::new(),
             branch_repo_reason: String::new(),
             command_session_cwd_evidence_json: None,
+            target_entity_evidence_json: None,
+            process_state_evidence_json: None,
             session_state_observed_at: None,
             completion_status: String::new(),
             completion_gates: Vec::new(),
@@ -21230,6 +21986,149 @@ Cleanup status: clean";
                 .unwrap_or_default()
                 .contains("trivially satisfied")
         );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn target_entity_detection_covers_happy_blocked_and_no_claim_paths() {
+        let state_dir = test_state_dir("target-entity-detection");
+        let state = initialize_test_state(&state_dir);
+        let repo = context_integrity_repo(&state_dir, "target-entity");
+        let session = context_integrity_session(&repo);
+        let mut job = test_publication_job_summary("target-entity-job");
+        job.created_at = 0;
+        run_git_test(&repo.worktree, &["branch", "existing-branch"]);
+        fs::write(repo.worktree.join("created.txt"), "created\n").expect("file should write");
+        state
+            .store
+            .append_audit_event(AuditEventRecord {
+                kind: "publication".to_string(),
+                target: "pr #123".to_string(),
+                status: "success".to_string(),
+                summary: "PR #123 opened".to_string(),
+                detail: "daemon publication evidence for PR #123".to_string(),
+            })
+            .expect("audit event should append");
+
+        let happy = target_entity_evidence(
+            &state,
+            &session,
+            &job,
+            &[],
+            "created file created.txt\nbranch existing-branch created\nPR #123 opened",
+        )
+        .expect("target evidence should derive");
+        assert_eq!(happy["status"], "satisfied");
+
+        let blocked_branch =
+            target_entity_evidence(&state, &session, &job, &[], "branch missing-branch created")
+                .expect("branch evidence should derive");
+        assert_eq!(blocked_branch["status"], "blocked");
+        assert_eq!(blocked_branch["claims"][0]["entity_type"], "branch");
+        assert!(
+            blocked_branch["claims"][0]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("branch not found")
+        );
+
+        let blocked_file =
+            target_entity_evidence(&state, &session, &job, &[], "created file missing.txt")
+                .expect("file evidence should derive");
+        assert_eq!(blocked_file["status"], "blocked");
+        assert_eq!(blocked_file["claims"][0]["entity_type"], "file");
+        assert_eq!(
+            blocked_file["claims"][0]["reason"],
+            "claimed file does not exist"
+        );
+
+        let blocked_external =
+            target_entity_evidence(&state, &session, &job, &[], "issue #999 referenced")
+                .expect("external evidence should derive");
+        assert_eq!(blocked_external["status"], "blocked");
+        assert_eq!(
+            blocked_external["claims"][0]["reason"],
+            "claim references external entity with no daemon evidence"
+        );
+
+        let no_claims = target_entity_evidence(&state, &session, &job, &[], "No blockers remain.")
+            .expect("no-claim evidence should derive");
+        assert_eq!(no_claims["status"], "satisfied");
+        assert!(no_claims["claims"].as_array().unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn process_state_detection_covers_command_failure_browser_mismatch_and_no_claims() {
+        let state_dir = test_state_dir("process-state-detection");
+        let state = initialize_test_state(&state_dir);
+        let mut failed = test_command_session_with_cwd("cmd-test", "/tmp");
+        failed.command = "cargo".to_string();
+        failed.args = vec!["test".to_string()];
+        failed.exit_code = Some(1);
+        failed.completed_at = Some(42);
+        failed.updated_at = 42;
+
+        let blocked = process_state_evidence(&state, &[failed], "Tests passed.")
+            .await
+            .expect("process evidence should derive");
+        assert_eq!(blocked["status"], "blocked");
+        assert_eq!(blocked["claims"][0]["entity_type"], "command_session");
+        assert!(
+            blocked["claims"][0]["last_observed_state"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("exit_code=1")
+        );
+
+        let browser = verify_browser_claim(
+            &Some(crate::browser::BrowserSidecarObservation {
+                base_url: "http://127.0.0.1:65535".to_string(),
+                state: "exited_failed".to_string(),
+                observed_at: 99,
+            }),
+            &ContextClaim {
+                claim_text: "Browser is ready".to_string(),
+                entity_type: "browser_sidecar".to_string(),
+                identifier: "browser_sidecar".to_string(),
+                action: "healthy".to_string(),
+            },
+        );
+        assert_eq!(browser["status"], "blocked");
+        assert_eq!(browser["last_observed_state"], "exited_failed");
+        assert_eq!(browser["observation_timestamp"], 99);
+
+        let pending = process_state_evidence(&state, &[], "Browser is ready.")
+            .await
+            .expect("pending browser evidence should derive");
+        assert_eq!(pending["status"], "pending");
+        assert_eq!(pending["claims"][0]["reason"], "no observation recorded");
+
+        let mut failed_port = test_command_session_with_cwd("cmd-port", "/tmp");
+        failed_port.state = "failed".to_string();
+        failed_port.exit_code = Some(1);
+        failed_port.port = Some(4321);
+        failed_port.completed_at = Some(77);
+        failed_port.updated_at = 77;
+        let port_blocked = process_state_evidence(&state, &[failed_port], "Port 4321 is ready.")
+            .await
+            .expect("port evidence should derive");
+        assert_eq!(port_blocked["status"], "blocked");
+        assert_eq!(port_blocked["claims"][0]["entity_type"], "port");
+        assert!(
+            port_blocked["claims"][0]["last_observed_state"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("state=failed")
+        );
+
+        let no_claims = process_state_evidence(&state, &[], "No process claims here.")
+            .await
+            .expect("no-claim process evidence should derive");
+        assert_eq!(no_claims["status"], "satisfied");
+        assert!(no_claims["claims"].as_array().unwrap().is_empty());
 
         let _ = fs::remove_dir_all(&state_dir);
     }
@@ -22071,6 +22970,46 @@ Cleanup status: clean";
         )
         .expect("blocked session-state gate should block terminal projection");
         assert!(blocker.contains("drifted"));
+
+        let mut target_blocked = test_publication_job_summary("target-entity-blocked");
+        target_blocked.task_class = Some("local_project".to_string());
+        target_blocked.publication_requested = false;
+        target_blocked.publication_status = "not_requested".to_string();
+        target_blocked.browser_verification_status = "not_required".to_string();
+        target_blocked.validation_status = "passed".to_string();
+        target_blocked.target_entity_evidence_json = Some(
+            json!({
+                "status": "blocked",
+                "reason": "one or more target-entity claims have no daemon evidence",
+                "claims": [{"claim_text": "created file missing.txt", "entity_type": "file", "identifier": "missing.txt", "result": "blocked"}]
+            })
+            .to_string(),
+        );
+        let blocker =
+            projected_completion_gate_blocker(&target_blocked, &PublicationOutcomePatch::default())
+                .expect("blocked target-entity gate should block terminal projection");
+        assert!(blocker.contains("Target-entity"));
+
+        let mut process_pending = test_publication_job_summary("process-state-pending");
+        process_pending.task_class = Some("local_project".to_string());
+        process_pending.publication_requested = false;
+        process_pending.publication_status = "not_requested".to_string();
+        process_pending.browser_verification_status = "not_required".to_string();
+        process_pending.validation_status = "passed".to_string();
+        process_pending.process_state_evidence_json = Some(
+            json!({
+                "status": "pending",
+                "reason": "process or port evidence is still pending",
+                "claims": [{"claim_text": "Browser is ready", "entity_type": "browser_sidecar", "identifier": "browser_sidecar", "result": "pending"}]
+            })
+            .to_string(),
+        );
+        let blocker = projected_completion_gate_blocker(
+            &process_pending,
+            &PublicationOutcomePatch::default(),
+        )
+        .expect("pending process-state gate should block terminal projection");
+        assert!(blocker.contains("Process and port evidence is pending"));
     }
 
     #[tokio::test]
@@ -26223,6 +27162,8 @@ for line in sys.stdin:
             branch_repo_status: String::new(),
             branch_repo_reason: String::new(),
             command_session_cwd_evidence_json: None,
+            target_entity_evidence_json: None,
+            process_state_evidence_json: None,
             session_state_observed_at: None,
             completion_status: String::new(),
             completion_gates: Vec::new(),
