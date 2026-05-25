@@ -33,7 +33,16 @@ struct BrowserStreamHandle {
 
 struct BrowserSidecar {
     base_url: String,
-    _child: Child,
+    child: Child,
+    last_observed_at: i64,
+    last_observed_state: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserSidecarObservation {
+    pub base_url: String,
+    pub state: String,
+    pub observed_at: i64,
 }
 
 #[derive(serde::Deserialize)]
@@ -136,6 +145,37 @@ impl BrowserRuntime {
                 pages: Vec::new(),
             });
         state.summary()
+    }
+
+    pub async fn observe_sidecar(&self) -> anyhow::Result<Option<BrowserSidecarObservation>> {
+        let mut sidecar = self.sidecar.lock().await;
+        let Some(sidecar) = sidecar.as_mut() else {
+            return Ok(None);
+        };
+        let observed_at = now_ts();
+        let state = match sidecar.child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    "exited_success"
+                } else {
+                    "exited_failed"
+                }
+            }
+            Ok(None) => "running",
+            Err(error) => {
+                sidecar.last_observed_at = observed_at;
+                sidecar.last_observed_state = format!("observation_error: {error}");
+                return Err(error).context("failed to observe browser sidecar process");
+            }
+        }
+        .to_string();
+        sidecar.last_observed_at = observed_at;
+        sidecar.last_observed_state = state.clone();
+        Ok(Some(BrowserSidecarObservation {
+            base_url: sidecar.base_url.clone(),
+            state,
+            observed_at,
+        }))
     }
 
     pub async fn navigate(
@@ -303,7 +343,9 @@ impl BrowserRuntime {
             serde_json::from_str(&line).context("invalid browser sidecar startup payload")?;
         let handle = BrowserSidecar {
             base_url: format!("http://127.0.0.1:{}", ready.port),
-            _child: child,
+            child,
+            last_observed_at: now_ts(),
+            last_observed_state: "running".to_string(),
         };
         let base_url = handle.base_url.clone();
         *sidecar = Some(handle);
