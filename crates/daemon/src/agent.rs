@@ -5312,20 +5312,6 @@ fn verify_branch_claim(
             "daemon_evidence_searched": "session worktree local refs and command_sessions",
         });
     };
-    let branch_ref = format!("refs/heads/{}", claim.identifier);
-    if git_status(
-        &worktree_path,
-        &["show-ref", "--verify", "--quiet", &branch_ref],
-    )
-    .is_ok()
-    {
-        return json!({
-            "status": "satisfied",
-            "reason": "branch found in local refs",
-            "daemon_evidence_searched": format!("git show-ref --verify --quiet {branch_ref}"),
-            "matched": true,
-        });
-    }
     if successful_branch_command_mentions(command_sessions, claim) {
         return json!({
             "status": "satisfied",
@@ -5334,9 +5320,31 @@ fn verify_branch_claim(
             "matched": true,
         });
     }
+    let branch_ref = format!("refs/heads/{}", claim.identifier);
+    let branch_exists = git_status(
+        &worktree_path,
+        &["show-ref", "--verify", "--quiet", &branch_ref],
+    )
+    .is_ok();
+    if claim.action == "checked_out"
+        && observe_session_git_state(&worktree_path)
+            .map(|state| state.git_branch == claim.identifier)
+            .unwrap_or(false)
+    {
+        return json!({
+            "status": "satisfied",
+            "reason": "worktree HEAD is on the claimed branch",
+            "daemon_evidence_searched": format!("git symbolic-ref --short HEAD plus command_sessions command/args for {}", claim.identifier),
+            "matched": true,
+        });
+    }
     json!({
         "status": "blocked",
-        "reason": "branch not found and no daemon-recorded branch operation matched the claim",
+        "reason": if branch_exists {
+            "branch found, but no daemon-recorded branch operation matched the claimed action"
+        } else {
+            "branch not found and no daemon-recorded branch operation matched the claim"
+        },
         "daemon_evidence_searched": format!("local refs via git show-ref plus command_sessions for {}", claim.identifier),
     })
 }
@@ -5407,7 +5415,8 @@ fn verify_external_entity_claim(
             event.kind, event.target, event.summary, event.detail
         )
         .to_ascii_lowercase();
-        haystack.contains(&needle) || haystack.contains(&compact_needle)
+        (haystack.contains(&needle) || haystack.contains(&compact_needle))
+            && external_audit_action_matches(&haystack, &claim.action)
     });
     if matched {
         json!({
@@ -5422,6 +5431,17 @@ fn verify_external_entity_claim(
             "reason": "claim references external entity with no daemon evidence",
             "daemon_evidence_searched": "current job audit_events kind/target/summary/detail since job start",
         })
+    }
+}
+
+fn external_audit_action_matches(haystack: &str, action: &str) -> bool {
+    match action {
+        "referenced" => contains_any(haystack, &["referenced", "reference"]),
+        "created" => contains_any(haystack, &["created", "opened", "published"]),
+        "opened" => haystack.contains("opened"),
+        "published" => haystack.contains("published"),
+        "closed" => haystack.contains("closed"),
+        _ => haystack.contains(action),
     }
 }
 
@@ -22078,11 +22098,15 @@ Cleanup status: clean";
             })
             .expect("unrelated audit event should append");
 
+        let mut branch_command =
+            test_command_session_with_cwd("cmd-branch", repo.worktree.to_str().unwrap());
+        branch_command.command = "git".to_string();
+        branch_command.args = vec!["branch".to_string(), "existing-branch".to_string()];
         let happy = target_entity_evidence(
             &state,
             &session,
             &job,
-            &[],
+            &[branch_command],
             "created file created.txt.\nbranch existing-branch created.\nPR #123 opened.",
         )
         .expect("target evidence should derive");
@@ -22112,6 +22136,22 @@ Cleanup status: clean";
         )
         .expect("branch command evidence should derive");
         assert_eq!(branch_command_happy["status"], "satisfied");
+
+        let preexisting_branch_without_action = target_entity_evidence(
+            &state,
+            &session,
+            &job,
+            &[],
+            "branch existing-branch created.",
+        )
+        .expect("preexisting branch evidence should derive");
+        assert_eq!(preexisting_branch_without_action["status"], "blocked");
+        assert!(
+            preexisting_branch_without_action["claims"][0]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("branch found")
+        );
 
         let blocked_branch =
             target_entity_evidence(&state, &session, &job, &[], "branch missing-branch created")
@@ -22148,6 +22188,11 @@ Cleanup status: clean";
             target_entity_evidence(&state, &session, &job, &[], "PR #555 opened")
                 .expect("external evidence should derive");
         assert_eq!(unrelated_external["status"], "blocked");
+
+        let wrong_external_action =
+            target_entity_evidence(&state, &session, &job, &[], "PR #123 closed")
+                .expect("external action evidence should derive");
+        assert_eq!(wrong_external_action["status"], "blocked");
 
         let no_claims = target_entity_evidence(&state, &session, &job, &[], "No blockers remain.")
             .expect("no-claim evidence should derive");
