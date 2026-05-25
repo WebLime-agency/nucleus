@@ -5477,6 +5477,13 @@ fn verify_file_claim(session: &SessionSummary, job_started_at: i64, claim: &Cont
             });
         }
     };
+    if !metadata.is_file() {
+        return json!({
+            "status": "blocked",
+            "reason": "claimed file path is not a regular file",
+            "daemon_evidence_searched": format!("filesystem metadata for {}", path.display()),
+        });
+    }
     let modified_at = metadata
         .modified()
         .ok()
@@ -5504,8 +5511,6 @@ fn verify_external_entity_claim(
     audit_events: &[nucleus_protocol::AuditEvent],
     claim: &ContextClaim,
 ) -> Value {
-    let needle = claim.identifier.replace('#', " #").to_ascii_lowercase();
-    let compact_needle = claim.identifier.to_ascii_lowercase();
     let matched = audit_events.iter().any(|event| {
         let haystack = format!(
             "{} {} {} {}",
@@ -5513,7 +5518,7 @@ fn verify_external_entity_claim(
         )
         .to_ascii_lowercase();
         event.status == "success"
-            && (haystack.contains(&needle) || haystack.contains(&compact_needle))
+            && external_entity_id_matches(&haystack, &claim.identifier)
             && external_audit_action_matches(&haystack, &claim.action)
     });
     if matched {
@@ -5541,6 +5546,27 @@ fn external_audit_action_matches(haystack: &str, action: &str) -> bool {
         "closed" => haystack.contains("closed"),
         _ => haystack.contains(action),
     }
+}
+
+fn external_entity_id_matches(haystack: &str, identifier: &str) -> bool {
+    let Some((entity_type, number)) = identifier.split_once('#') else {
+        return false;
+    };
+    let spaced = format!("{entity_type} #{number}");
+    let compact = format!("{entity_type}#{number}");
+    if contains_entity_id_token(haystack, &spaced) || contains_entity_id_token(haystack, &compact) {
+        return true;
+    }
+    entity_type == "pr" && contains_entity_id_token(haystack, &format!("pull request #{number}"))
+}
+
+fn contains_entity_id_token(haystack: &str, needle: &str) -> bool {
+    haystack.match_indices(needle).any(|(index, _)| {
+        let before = haystack[..index].chars().next_back();
+        let after = haystack[index + needle.len()..].chars().next();
+        before.is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '#')
+            && after.is_none_or(|ch| !ch.is_ascii_alphanumeric())
+    })
 }
 
 fn verify_browser_claim(
@@ -22175,6 +22201,7 @@ Cleanup status: clean";
         job.created_at = 0;
         run_git_test(&repo.worktree, &["branch", "existing-branch"]);
         fs::write(repo.worktree.join("created.txt"), "created\n").expect("file should write");
+        fs::create_dir_all(repo.worktree.join("docs")).expect("docs dir should create");
         state
             .store
             .append_audit_event(AuditEventRecord {
@@ -22298,6 +22325,14 @@ Cleanup status: clean";
             blocked_file["claims"][0]["reason"],
             "claimed file does not exist"
         );
+        let blocked_directory =
+            target_entity_evidence(&state, &session, &job, &[], "created file docs")
+                .expect("directory file evidence should derive");
+        assert_eq!(blocked_directory["status"], "blocked");
+        assert_eq!(
+            blocked_directory["claims"][0]["reason"],
+            "claimed file path is not a regular file"
+        );
 
         let escaped_file =
             target_entity_evidence(&state, &session, &job, &[], "created file ../outside.txt")
@@ -22339,6 +22374,11 @@ Cleanup status: clean";
             target_entity_evidence(&state, &session, &job, &[], "PR #123 closed")
                 .expect("external action evidence should derive");
         assert_eq!(wrong_external_action["status"], "blocked");
+
+        let external_prefix_mismatch =
+            target_entity_evidence(&state, &session, &job, &[], "PR #12 opened")
+                .expect("external prefix evidence should derive");
+        assert_eq!(external_prefix_mismatch["status"], "blocked");
 
         let failed_external_event =
             target_entity_evidence(&state, &session, &job, &[], "PR #777 opened")
