@@ -4717,8 +4717,19 @@ fn record_context_integrity_detection(
     session: &SessionSummary,
     job_id: &str,
 ) -> Result<JobSummary> {
-    let current = state.store.get_job(job_id)?.job;
-    let patch = context_integrity_patch(state, session, &current);
+    let detail = state.store.get_job(job_id)?;
+    let current = detail.job;
+    let mut patch = context_integrity_patch(state, session, &current);
+    patch.command_session_cwd_evidence_json = Some(Some(
+        serde_json::to_string(&command_session_cwd_evidence(
+            session,
+            &detail.command_sessions,
+        ))
+        .unwrap_or_else(|_| "{}".to_string()),
+    ));
+    patch.metadata_json = Some(context_integrity_metadata_with_session_state(
+        state, session, &current, job_id,
+    )?);
     let updated = state.store.update_job(job_id, patch)?;
     let _ = state.store.append_job_event(JobEventRecord {
         job_id: job_id.to_string(),
@@ -4744,9 +4755,902 @@ fn record_context_integrity_detection(
                 "observed_branch": updated.observed_git_branch.clone(),
                 "expected_branch": updated.expected_git_branch.clone(),
             },
+            "cwd_evidence": updated.command_session_cwd_evidence_json.as_deref()
+                .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                .unwrap_or_else(|| json!({})),
+            "session_state_evidence": updated.metadata_json
+                .get("session_state_evidence")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
         }),
     });
     Ok(updated)
+}
+
+fn command_session_cwd_evidence(
+    session: &SessionSummary,
+    command_sessions: &[CommandSessionSummary],
+) -> Value {
+    let declared = session.working_dir.trim();
+    if declared.is_empty() {
+        return json!({
+            "status": "satisfied",
+            "reason": "session has no declared working_dir; cwd gate is trivially satisfied",
+            "declared_working_dir": "",
+            "observed_cwds": [],
+            "offending_command_session_ids": [],
+            "offending_cwds": [],
+        });
+    }
+    if command_sessions.is_empty() {
+        return json!({
+            "status": "pending",
+            "reason": "no command sessions recorded yet",
+            "declared_working_dir": declared,
+            "observed_cwds": [],
+            "offending_command_session_ids": [],
+            "offending_cwds": [],
+        });
+    }
+
+    let mut observed = Vec::new();
+    let mut offending_ids = Vec::new();
+    let mut offending_cwds = Vec::new();
+    let mut missing_ids = Vec::new();
+    let mut unresolved = Vec::new();
+    let mut stale_recorded_cwd_ids = Vec::new();
+    for command_session in command_sessions {
+        let cwd = command_session.cwd.trim();
+        observed.push(json!({
+            "command_session_id": command_session.id,
+            "cwd": cwd,
+            "state": command_session.state,
+        }));
+        if cwd.is_empty() {
+            missing_ids.push(command_session.id.clone());
+            continue;
+        }
+        match path_is_under_declared_root(Path::new(cwd), Path::new(declared)) {
+            Ok(true) => {}
+            Ok(false) => {
+                offending_ids.push(command_session.id.clone());
+                offending_cwds.push(cwd.to_string());
+            }
+            Err(error) => {
+                match lexical_path_is_under_declared_root(Path::new(cwd), Path::new(declared)) {
+                    Some(true) if command_session.state == "completed" => {
+                        stale_recorded_cwd_ids.push(command_session.id.clone());
+                    }
+                    Some(true) => unresolved.push(format!("{}: {error}", command_session.id)),
+                    Some(false) => {
+                        offending_ids.push(command_session.id.clone());
+                        offending_cwds.push(cwd.to_string());
+                    }
+                    None => unresolved.push(format!("{}: {error}", command_session.id)),
+                }
+            }
+        }
+    }
+
+    if !offending_ids.is_empty() {
+        return json!({
+            "status": "blocked",
+            "reason": "one or more command sessions ran outside the declared working_dir",
+            "declared_working_dir": declared,
+            "observed_cwds": observed,
+            "offending_command_session_ids": offending_ids,
+            "offending_cwds": offending_cwds,
+        });
+    }
+    if !missing_ids.is_empty() {
+        return json!({
+            "status": "pending",
+            "reason": format!("cwd not recorded for command session(s): {}", missing_ids.join(", ")),
+            "declared_working_dir": declared,
+            "observed_cwds": observed,
+            "offending_command_session_ids": [],
+            "offending_cwds": [],
+        });
+    }
+    if !unresolved.is_empty() {
+        return json!({
+            "status": "pending",
+            "reason": format!("could not resolve command session cwd(s): {}", unresolved.join("; ")),
+            "declared_working_dir": declared,
+            "observed_cwds": observed,
+            "offending_command_session_ids": [],
+            "offending_cwds": [],
+        });
+    }
+
+    json!({
+        "status": "satisfied",
+        "reason": if stale_recorded_cwd_ids.is_empty() {
+            String::new()
+        } else {
+            format!("recorded cwd no longer exists for completed command session(s), but the recorded path remains under the declared working_dir: {}", stale_recorded_cwd_ids.join(", "))
+        },
+        "declared_working_dir": declared,
+        "observed_cwds": observed,
+        "offending_command_session_ids": [],
+        "offending_cwds": [],
+        "stale_recorded_cwd_ids": stale_recorded_cwd_ids,
+    })
+}
+
+fn path_is_under_declared_root(path: &Path, root: &Path) -> Result<bool> {
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("could not resolve cwd '{}'", path.display()))?;
+    let root = root.canonicalize().with_context(|| {
+        format!(
+            "could not resolve declared working_dir '{}'",
+            root.display()
+        )
+    })?;
+    Ok(path.starts_with(root))
+}
+
+fn lexical_path_is_under_declared_root(path: &Path, root: &Path) -> Option<bool> {
+    if !path.is_absolute() || !root.is_absolute() {
+        return None;
+    }
+    Some(normalize_lexical_path(path).starts_with(normalize_lexical_path(root)))
+}
+
+fn context_integrity_metadata_with_session_state(
+    state: &AppState,
+    session: &SessionSummary,
+    job: &JobSummary,
+    job_id: &str,
+) -> Result<Value> {
+    let mut metadata = job.metadata_json.clone();
+    let has_declared_git_path = declared_session_git_path(session).is_some();
+    let preserve_existing_blocked = has_declared_git_path
+        && metadata
+            .get("session_state_evidence")
+            .is_some_and(preserve_existing_session_state_blocker);
+    let evidence = if preserve_existing_blocked {
+        metadata
+            .get("session_state_evidence")
+            .cloned()
+            .unwrap_or_else(|| json!({}))
+    } else {
+        session_state_evidence_and_refresh(state, session, job_id)?
+    };
+    if evidence
+        .as_object()
+        .is_some_and(|object| !object.is_empty())
+    {
+        metadata["session_state_evidence"] = evidence;
+    } else if metadata.get("session_state_evidence").is_some() {
+        metadata
+            .as_object_mut()
+            .expect("job metadata must be a JSON object")
+            .remove("session_state_evidence");
+    }
+    Ok(metadata)
+}
+
+fn preserve_existing_session_state_blocker(evidence: &Value) -> bool {
+    evidence
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status == "blocked")
+        && evidence
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| {
+                reason.contains(
+                    "stored session git metadata differed from observed disk state without a matching daemon-observed mutation",
+                )
+            })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedSessionGitState {
+    git_head: String,
+    git_branch: String,
+    git_dirty: bool,
+    git_untracked_count: usize,
+}
+
+fn session_state_evidence_and_refresh(
+    state: &AppState,
+    session: &SessionSummary,
+    job_id: &str,
+) -> Result<Value> {
+    let Some(worktree_path) = declared_session_git_path(session) else {
+        return Ok(json!({}));
+    };
+    if !worktree_path.is_dir() {
+        return Ok(json!({
+            "status": "blocked",
+            "reason": "worktree missing",
+            "stored": stored_session_git_state_json(session),
+            "observed": {},
+            "worktree_path": worktree_path.display().to_string(),
+            "audit_hint": "If a daemon-observed mutation explains this drift, inspect audit_events for the matching job/session."
+        }));
+    }
+    let observed = match observe_session_git_state(&worktree_path) {
+        Ok(observed) => observed,
+        Err(error) => {
+            return Ok(json!({
+                "status": "pending",
+                "reason": format!("git rev-parse failed: {error}"),
+                "stored": stored_session_git_state_json(session),
+                "observed": {},
+                "worktree_path": worktree_path.display().to_string(),
+                "audit_hint": "Retry session-state refresh once the worktree is a readable git checkout."
+            }));
+        }
+    };
+    let stored = ObservedSessionGitState {
+        git_head: session.git_head.clone(),
+        git_branch: session.git_branch.clone(),
+        git_dirty: session.git_dirty,
+        git_untracked_count: session.git_untracked_count,
+    };
+    let legacy_uninitialized =
+        stored.git_head.trim().is_empty() && stored.git_branch.trim().is_empty();
+    let drifted = !legacy_uninitialized && stored != observed;
+    let matching_audit = if drifted {
+        mutation_audit_explaining_session_state(state, session, job_id, &stored, &observed)?
+    } else {
+        None
+    };
+    let matching_command_session = if drifted && matching_audit.is_none() {
+        mutation_command_session_explaining_session_state(
+            state, session, job_id, &stored, &observed,
+        )?
+    } else {
+        None
+    };
+    let observed_at = unix_timestamp();
+    let _ = state.store.update_session(
+        &session.id,
+        SessionPatch {
+            git_head: Some(observed.git_head.clone()),
+            git_branch: Some(observed.git_branch.clone()),
+            git_dirty: Some(observed.git_dirty),
+            git_untracked_count: Some(observed.git_untracked_count),
+            session_state_observed_at: Some(Some(observed_at)),
+            ..SessionPatch::default()
+        },
+    )?;
+
+    let (status, reason, audit_event_id, command_session_id) = if drifted {
+        if let Some(audit) = matching_audit {
+            (
+                "satisfied",
+                format!("drift explained by audit event {}", audit.id),
+                Some(audit.id),
+                None,
+            )
+        } else if let Some(command_session) = matching_command_session {
+            (
+                "satisfied",
+                format!("drift explained by command session {}", command_session.id),
+                None,
+                Some(command_session.id),
+            )
+        } else {
+            (
+                "blocked",
+                "stored session git metadata differed from observed disk state without a matching daemon-observed mutation".to_string(),
+                None,
+                None,
+            )
+        }
+    } else if legacy_uninitialized {
+        (
+            "satisfied",
+            "legacy session git metadata was initialized from disk".to_string(),
+            None,
+            None,
+        )
+    } else {
+        ("satisfied", String::new(), None, None)
+    };
+
+    Ok(json!({
+        "status": status,
+        "reason": reason,
+        "stored": stored_session_git_state_json_from(&stored),
+        "observed": stored_session_git_state_json_from(&observed),
+        "observed_at": observed_at,
+        "audit_event_id": audit_event_id,
+        "mutation_command_session_id": command_session_id,
+        "audit_hint": "If a daemon-observed mutation exists but was not matched, inspect audit_events around this job/session and compare the mutation target to the stored/observed values."
+    }))
+}
+
+fn declared_session_git_path(session: &SessionSummary) -> Option<PathBuf> {
+    [session.worktree_path.as_str(), session.git_root.as_str()]
+        .into_iter()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            let has_stored_git_state =
+                !session.git_head.trim().is_empty() || !session.git_branch.trim().is_empty();
+            has_stored_git_state
+                .then(|| session.working_dir.trim())
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+}
+
+fn observe_session_git_state(worktree_path: &Path) -> Result<ObservedSessionGitState> {
+    let git_head = match git_command_stdout(worktree_path, &["rev-parse", "HEAD"]) {
+        Ok(head) => head,
+        Err(_) if worktree_has_unborn_head(worktree_path) => String::new(),
+        Err(error) => return Err(error),
+    };
+    let git_branch = git_stdout(worktree_path, &["symbolic-ref", "--short", "HEAD"])
+        .or_else(|| git_stdout(worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"]))
+        .filter(|branch| branch != "HEAD")
+        .unwrap_or_default();
+    let status = git_command_stdout(worktree_path, &["status", "--porcelain"])?;
+    let git_untracked_count = status.lines().filter(|line| line.starts_with("??")).count();
+    Ok(ObservedSessionGitState {
+        git_head,
+        git_branch,
+        git_dirty: !status.trim().is_empty(),
+        git_untracked_count,
+    })
+}
+
+fn worktree_has_unborn_head(worktree_path: &Path) -> bool {
+    git_stdout(worktree_path, &["rev-parse", "--is-inside-work-tree"]).as_deref() == Some("true")
+        && git_stdout(
+            worktree_path,
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        )
+        .is_some()
+        && git_status(worktree_path, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_err()
+}
+
+fn git_command_stdout(cwd: &Path, args: &[&str]) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        bail!("git {} failed", args.join(" "));
+    }
+    bail!("{stderr}");
+}
+
+fn stored_session_git_state_json(session: &SessionSummary) -> Value {
+    json!({
+        "git_head": session.git_head,
+        "git_branch": session.git_branch,
+        "git_dirty": session.git_dirty,
+        "git_untracked_count": session.git_untracked_count,
+    })
+}
+
+fn stored_session_git_state_json_from(state: &ObservedSessionGitState) -> Value {
+    json!({
+        "git_head": state.git_head,
+        "git_branch": state.git_branch,
+        "git_dirty": state.git_dirty,
+        "git_untracked_count": state.git_untracked_count,
+    })
+}
+
+fn mutation_audit_explaining_session_state(
+    state: &AppState,
+    session: &SessionSummary,
+    job_id: &str,
+    stored: &ObservedSessionGitState,
+    observed: &ObservedSessionGitState,
+) -> Result<Option<nucleus_protocol::AuditEvent>> {
+    let since = session
+        .session_state_observed_at
+        .unwrap_or(session.created_at)
+        .saturating_sub(1);
+    let events = state.store.list_audit_events_since(since)?;
+    Ok(events.into_iter().find(|event| {
+        let haystack = format!(
+            "{} {} {} {}",
+            event.kind, event.target, event.summary, event.detail
+        )
+        .to_ascii_lowercase();
+        let mentions_scope = event.target.contains(&session.id)
+            || event.target.contains(job_id)
+            || event.detail.contains(&session.id)
+            || event.detail.contains(job_id)
+            || event.summary.contains(&session.id)
+            || event.summary.contains(job_id);
+        let mutation_succeeded = event.status.eq_ignore_ascii_case("success");
+        mentions_scope
+            && mutation_succeeded
+            && haystack.contains("git")
+            && text_mentions_session_state_mutating_git(&haystack)
+            && text_matches_session_state_transition(&haystack, stored, observed)
+    }))
+}
+
+fn text_matches_session_state_transition(
+    text: &str,
+    stored: &ObservedSessionGitState,
+    observed: &ObservedSessionGitState,
+) -> bool {
+    if stored.git_head != observed.git_head && !text_mentions_git_head(text, &observed.git_head) {
+        return false;
+    }
+    if stored.git_branch != observed.git_branch {
+        let branch = observed.git_branch.to_ascii_lowercase();
+        if branch.is_empty() {
+            if !text.contains("branch=") && !text.contains("detached") {
+                return false;
+            }
+        } else if !branch.is_empty() && !text.contains(&branch) {
+            return false;
+        }
+    }
+    if stored.git_dirty != observed.git_dirty {
+        let expected = format!("dirty={}", observed.git_dirty);
+        let expected_alt = format!("git_dirty={}", observed.git_dirty);
+        if !text.contains(&expected) && !text.contains(&expected_alt) {
+            return false;
+        }
+    }
+    if stored.git_untracked_count != observed.git_untracked_count {
+        let expected = format!("untracked={}", observed.git_untracked_count);
+        let expected_alt = format!("git_untracked_count={}", observed.git_untracked_count);
+        if !text.contains(&expected) && !text.contains(&expected_alt) {
+            return false;
+        }
+    }
+    true
+}
+
+fn text_mentions_git_head(text: &str, head: &str) -> bool {
+    if head.trim().is_empty() {
+        return text.contains("head=") || text.contains("unborn");
+    }
+    let normalized = head.to_ascii_lowercase();
+    text.contains(&normalized)
+        || normalized
+            .get(..12)
+            .is_some_and(|short| !short.is_empty() && text.contains(short))
+}
+
+fn mutation_command_session_explaining_session_state(
+    state: &AppState,
+    session: &SessionSummary,
+    job_id: &str,
+    stored: &ObservedSessionGitState,
+    observed: &ObservedSessionGitState,
+) -> Result<Option<CommandSessionSummary>> {
+    let Ok(detail) = state.store.get_job(job_id) else {
+        return Ok(None);
+    };
+    Ok(detail.command_sessions.into_iter().find(|command_session| {
+        command_session_is_newer_than_session_state(session, command_session)
+            && is_session_git_mutation_command_session(session, command_session)
+            && command_session_matches_session_state_transition(command_session, stored, observed)
+    }))
+}
+
+fn command_session_matches_session_state_transition(
+    command_session: &CommandSessionSummary,
+    stored: &ObservedSessionGitState,
+    observed: &ObservedSessionGitState,
+) -> bool {
+    let Some((_git_cwd, subcommand)) = command_session_git_invocation(command_session) else {
+        return false;
+    };
+    let mut text = format!(
+        "{} {} {} {} {}",
+        command_session.title,
+        command_session.command,
+        command_session.args.join(" "),
+        command_session.branch,
+        command_session.worktree_path
+    )
+    .to_ascii_lowercase();
+    text.push(' ');
+    text.push_str(&subcommand.to_ascii_lowercase());
+
+    if stored.git_head != observed.git_head
+        && !text_mentions_git_head(&text, &observed.git_head)
+        && !git_subcommand_can_move_head(&subcommand)
+    {
+        return false;
+    }
+    if stored.git_branch != observed.git_branch {
+        let branch = observed.git_branch.to_ascii_lowercase();
+        if branch.is_empty() {
+            if !text.contains("branch=")
+                && !text.contains("detached")
+                && !git_subcommand_can_change_branch(&subcommand)
+            {
+                return false;
+            }
+        } else if !text.contains(&branch) && !git_subcommand_can_change_branch(&subcommand) {
+            return false;
+        }
+    }
+    if stored.git_dirty != observed.git_dirty
+        && !text.contains(&format!("dirty={}", observed.git_dirty))
+        && !text.contains(&format!("git_dirty={}", observed.git_dirty))
+        && !git_subcommand_can_change_worktree_status(&subcommand)
+    {
+        return false;
+    }
+    if stored.git_untracked_count != observed.git_untracked_count
+        && !text.contains(&format!("untracked={}", observed.git_untracked_count))
+        && !text.contains(&format!(
+            "git_untracked_count={}",
+            observed.git_untracked_count
+        ))
+        && !git_subcommand_can_change_worktree_status(&subcommand)
+    {
+        return false;
+    }
+    true
+}
+
+fn git_subcommand_can_move_head(subcommand: &str) -> bool {
+    matches!(
+        subcommand,
+        "checkout"
+            | "cherry-pick"
+            | "commit"
+            | "merge"
+            | "pull"
+            | "rebase"
+            | "reset"
+            | "revert"
+            | "switch"
+    )
+}
+
+fn git_subcommand_can_change_branch(subcommand: &str) -> bool {
+    matches!(subcommand, "checkout" | "switch")
+}
+
+fn git_subcommand_can_change_worktree_status(subcommand: &str) -> bool {
+    matches!(
+        subcommand,
+        "add"
+            | "apply"
+            | "checkout"
+            | "cherry-pick"
+            | "clean"
+            | "commit"
+            | "merge"
+            | "mv"
+            | "pull"
+            | "rebase"
+            | "reset"
+            | "restore"
+            | "revert"
+            | "rm"
+            | "stash"
+            | "switch"
+    )
+}
+
+fn command_session_is_newer_than_session_state(
+    session: &SessionSummary,
+    command_session: &CommandSessionSummary,
+) -> bool {
+    let since = session
+        .session_state_observed_at
+        .unwrap_or(session.created_at.saturating_sub(1));
+    command_session
+        .completed_at
+        .or(command_session.started_at)
+        .unwrap_or(command_session.updated_at)
+        >= since
+}
+
+fn is_session_git_mutation_command_session(
+    session: &SessionSummary,
+    command_session: &CommandSessionSummary,
+) -> bool {
+    if command_session.state != "completed" || command_session.exit_code != Some(0) {
+        return false;
+    }
+    if !command_session.session_id.is_empty() && command_session.session_id != session.id {
+        return false;
+    }
+    let Some(declared_git_path) = declared_session_git_path(session) else {
+        return false;
+    };
+    let Some((git_cwd, subcommand)) = command_session_git_invocation(command_session) else {
+        return false;
+    };
+    if !GIT_SESSION_STATE_MUTATING_SUBCOMMANDS.contains(&subcommand.as_str()) {
+        return false;
+    }
+    path_is_under_declared_root(&git_cwd, &declared_git_path).unwrap_or(false)
+}
+
+fn text_mentions_session_state_mutating_git(text: &str) -> bool {
+    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-'))
+        .any(|token| GIT_SESSION_STATE_MUTATING_SUBCOMMANDS.contains(&token))
+}
+
+const GIT_SESSION_STATE_MUTATING_SUBCOMMANDS: &[&str] = &[
+    "add",
+    "apply",
+    "checkout",
+    "cherry-pick",
+    "clean",
+    "commit",
+    "merge",
+    "mv",
+    "pull",
+    "rebase",
+    "reset",
+    "restore",
+    "revert",
+    "rm",
+    "stash",
+    "switch",
+];
+
+fn command_session_git_invocation(
+    command_session: &CommandSessionSummary,
+) -> Option<(PathBuf, String)> {
+    let base_cwd = command_session.cwd.trim();
+    if base_cwd.is_empty() {
+        return None;
+    }
+    let executable = Path::new(command_session.command.trim())
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command_session.command.trim());
+    if executable == "git" {
+        return parse_git_invocation_from_args(PathBuf::from(base_cwd), &command_session.args);
+    }
+    if !is_shell_executable(executable) {
+        return None;
+    }
+    let shell_command = shell_command_arg(&command_session.args)?;
+    let mut tokens = split_simple_shell_words(shell_command)?;
+    if tokens
+        .first()
+        .is_some_and(|token| token == "exec" || token == "command")
+    {
+        tokens.remove(0);
+    }
+    if tokens.first().is_none_or(|token| token != "git") {
+        return None;
+    }
+    parse_git_invocation_from_args(PathBuf::from(base_cwd), &tokens[1..])
+}
+
+fn parse_git_invocation_from_args(
+    mut git_cwd: PathBuf,
+    args: &[String],
+) -> Option<(PathBuf, String)> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg == "-C" {
+            let value = args.get(index + 1)?;
+            git_cwd = resolve_git_c_option_path(&git_cwd, value);
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("-C") {
+            if value.is_empty() {
+                return None;
+            }
+            git_cwd = resolve_git_c_option_path(&git_cwd, value);
+            index += 1;
+            continue;
+        }
+        if arg == "--git-dir" {
+            let value = args.get(index + 1)?;
+            git_cwd = resolve_git_dir_worktree_path(&git_cwd, value);
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--git-dir=") {
+            if value.is_empty() {
+                return None;
+            }
+            git_cwd = resolve_git_dir_worktree_path(&git_cwd, value);
+            index += 1;
+            continue;
+        }
+        if arg == "--work-tree" {
+            let value = args.get(index + 1)?;
+            git_cwd = resolve_git_c_option_path(&git_cwd, value);
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--work-tree=") {
+            if value.is_empty() {
+                return None;
+            }
+            git_cwd = resolve_git_c_option_path(&git_cwd, value);
+            index += 1;
+            continue;
+        }
+        if git_global_option_takes_value(arg) {
+            args.get(index + 1)?;
+            index += 2;
+            continue;
+        }
+        if git_inline_global_option(arg) {
+            index += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            return None;
+        }
+        return Some((git_cwd, arg.to_string()));
+    }
+    None
+}
+
+fn is_shell_executable(executable: &str) -> bool {
+    matches!(executable, "sh" | "bash" | "zsh" | "dash")
+}
+
+fn shell_command_arg(args: &[String]) -> Option<&str> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if shell_arg_requests_command(arg) {
+            return args.get(index + 1).map(String::as_str);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn shell_arg_requests_command(arg: &str) -> bool {
+    if arg == "-c" {
+        return true;
+    }
+    let Some(flags) = arg.strip_prefix('-') else {
+        return false;
+    };
+    !flags.starts_with('-')
+        && flags.contains('c')
+        && flags.chars().all(shell_short_flag_can_cluster)
+}
+
+fn shell_short_flag_can_cluster(ch: char) -> bool {
+    matches!(
+        ch,
+        'a' | 'b'
+            | 'c'
+            | 'e'
+            | 'f'
+            | 'h'
+            | 'i'
+            | 'k'
+            | 'l'
+            | 'm'
+            | 'n'
+            | 'p'
+            | 'r'
+            | 's'
+            | 't'
+            | 'u'
+            | 'v'
+            | 'x'
+            | 'B'
+            | 'C'
+            | 'E'
+            | 'H'
+            | 'P'
+            | 'T'
+    )
+}
+
+fn split_simple_shell_words(input: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars().peekable();
+    let mut quote = None;
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    quote = None;
+                } else {
+                    current.push(ch);
+                }
+            }
+            Some('"') => {
+                if ch == '"' {
+                    quote = None;
+                } else if ch == '\\' {
+                    current.push(chars.next()?);
+                } else {
+                    current.push(ch);
+                }
+            }
+            _ => {
+                if ch.is_whitespace() {
+                    if !current.is_empty() {
+                        words.push(std::mem::take(&mut current));
+                    }
+                } else if ch == '\'' || ch == '"' {
+                    quote = Some(ch);
+                } else if ch == '\\' {
+                    current.push(chars.next()?);
+                } else if matches!(ch, ';' | '&' | '|' | '<' | '>' | '(' | ')' | '`' | '$') {
+                    return None;
+                } else {
+                    current.push(ch);
+                }
+            }
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    Some(words)
+}
+
+fn resolve_git_c_option_path(base_cwd: &Path, value: &str) -> PathBuf {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_cwd.join(path)
+    }
+}
+
+fn resolve_git_dir_worktree_path(base_cwd: &Path, value: &str) -> PathBuf {
+    let git_dir = resolve_git_c_option_path(base_cwd, value);
+    if git_dir.file_name().and_then(|name| name.to_str()) == Some(".git") {
+        git_dir.parent().map(Path::to_path_buf).unwrap_or(git_dir)
+    } else {
+        git_dir
+    }
+}
+
+fn git_global_option_takes_value(arg: &str) -> bool {
+    matches!(arg, "-c" | "--config-env" | "--namespace")
+}
+
+fn git_inline_global_option(arg: &str) -> bool {
+    arg.starts_with("-c")
+        || arg == "-p"
+        || arg == "-P"
+        || arg.starts_with("--config-env=")
+        || arg.starts_with("--exec-path=")
+        || arg.starts_with("--namespace=")
+        || matches!(
+            arg,
+            "--bare"
+                | "--exec-path"
+                | "--html-path"
+                | "--info-path"
+                | "--man-path"
+                | "--no-pager"
+                | "--paginate"
+                | "--no-replace-objects"
+                | "--no-optional-locks"
+                | "--literal-pathspecs"
+                | "--glob-pathspecs"
+                | "--noglob-pathspecs"
+                | "--icase-pathspecs"
+        )
 }
 
 fn context_integrity_patch(
@@ -5206,7 +6110,10 @@ fn context_integrity_start_blocker(job: &JobSummary) -> Option<String> {
         .find(|gate| {
             matches!(
                 gate.id.as_str(),
-                "worktree_base_fresh" | "branch_repo_consistent"
+                "worktree_base_fresh"
+                    | "branch_repo_consistent"
+                    | "cwd_consistent"
+                    | "session_state_consistent"
             ) && gate.state == "blocked"
         })
         .map(|gate| gate.summary.clone())
@@ -5268,13 +6175,38 @@ async fn block_job_for_context_integrity(
 }
 
 fn context_integrity_event_summary(job: &JobSummary) -> String {
+    let cwd_status = job
+        .command_session_cwd_evidence_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|value| {
+            value
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let session_state_status = job
+        .metadata_json
+        .get("session_state_evidence")
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     match (
         job.worktree_base_status.as_str(),
         job.branch_repo_status.as_str(),
+        cwd_status.as_str(),
+        session_state_status,
     ) {
-        ("blocked", _) | (_, "blocked") => "Context integrity is blocked.".to_string(),
-        ("pending", _) | (_, "pending") => "Context integrity is pending.".to_string(),
-        ("", "") => "Context integrity did not run for this job.".to_string(),
+        ("blocked", _, _, _)
+        | (_, "blocked", _, _)
+        | (_, _, "blocked", _)
+        | (_, _, _, "blocked") => "Context integrity is blocked.".to_string(),
+        ("pending", _, _, _)
+        | (_, "pending", _, _)
+        | (_, _, "pending", _)
+        | (_, _, _, "pending") => "Context integrity is pending.".to_string(),
+        ("", "", "", "") => "Context integrity did not run for this job.".to_string(),
         _ => "Context integrity evidence recorded.".to_string(),
     }
 }
@@ -5293,7 +6225,46 @@ fn context_integrity_event_detail(job: &JobSummary) -> String {
     } else {
         format!("{} ({})", job.branch_repo_status, job.branch_repo_reason)
     };
-    format!("worktree_base={base}; branch_repo={branch}")
+    let cwd = job
+        .command_session_cwd_evidence_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .map(|value| {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let reason = value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if reason.trim().is_empty() {
+                status.to_string()
+            } else {
+                format!("{status} ({reason})")
+            }
+        })
+        .unwrap_or_default();
+    let session_state = job
+        .metadata_json
+        .get("session_state_evidence")
+        .map(|value| {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let reason = value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if reason.trim().is_empty() {
+                status.to_string()
+            } else {
+                format!("{status} ({reason})")
+            }
+        })
+        .unwrap_or_default();
+    format!("worktree_base={base}; branch_repo={branch}; cwd={cwd}; session_state={session_state}")
 }
 
 fn add_budget_guidance(
@@ -6351,6 +7322,8 @@ fn projected_completion_gate_blocker(
         projected.cleanup_paths = value.clone();
     }
 
+    let publication_requested = projected.publication_requested;
+
     projected
         .with_completion_gates()
         .completion_gates
@@ -6360,8 +7333,11 @@ fn projected_completion_gate_blocker(
                 || (gate.state == "pending"
                     && matches!(
                         gate.id.as_str(),
-                        "worktree_base_fresh" | "branch_repo_consistent"
+                        "worktree_base_fresh"
+                            | "branch_repo_consistent"
+                            | "session_state_consistent"
                     ))
+                || (gate.state == "pending" && gate.id == "cwd_consistent" && publication_requested)
         })
         .map(|gate| gate.summary)
 }
@@ -8205,6 +9181,7 @@ fn build_execution_session(worker: &WorkerSummary) -> SessionSummary {
         git_dirty: false,
         git_untracked_count: 0,
         git_remote_tracking_branch: String::new(),
+        session_state_observed_at: None,
         workspace_warnings: Vec::new(),
         scope: "job".to_string(),
         approval_mode: "ask".to_string(),
@@ -8267,6 +9244,7 @@ pub(crate) async fn resolve_utility_worker_execution_session(
         git_dirty: session.git_dirty,
         git_untracked_count: session.git_untracked_count,
         git_remote_tracking_branch: session.git_remote_tracking_branch.clone(),
+        session_state_observed_at: session.session_state_observed_at,
         workspace_warnings: Vec::new(),
         scope: "job".to_string(),
         approval_mode: "ask".to_string(),
@@ -13769,6 +14747,7 @@ async fn create_playbook_session(
         git_dirty: false,
         git_untracked_count: 0,
         git_remote_tracking_branch: String::new(),
+        session_state_observed_at: None,
         workspace_warnings: Vec::new(),
         approval_mode: "ask".to_string(),
         execution_mode: "act".to_string(),
@@ -15031,6 +16010,7 @@ mod tests {
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             scope: if projects.len() > 1 {
                 "multi_project".to_string()
@@ -19678,6 +20658,8 @@ Cleanup status: clean";
             worktree_behind_by: None,
             branch_repo_status: String::new(),
             branch_repo_reason: String::new(),
+            command_session_cwd_evidence_json: None,
+            session_state_observed_at: None,
             completion_status: String::new(),
             completion_gates: Vec::new(),
             completion_blockers: Vec::new(),
@@ -19761,6 +20743,8 @@ Cleanup status: clean";
             worktree_behind_by: None,
             branch_repo_status: String::new(),
             branch_repo_reason: String::new(),
+            command_session_cwd_evidence_json: None,
+            session_state_observed_at: None,
             completion_status: String::new(),
             completion_gates: Vec::new(),
             completion_blockers: Vec::new(),
@@ -20165,6 +21149,859 @@ Cleanup status: clean";
     }
 
     #[test]
+    fn cwd_consistency_detection_covers_happy_blocked_scratch_and_missing_cwd() {
+        let state_dir = test_state_dir("cwd-consistency-detection");
+        let declared = state_dir.join("declared");
+        let nested = declared.join("nested");
+        let outside = state_dir.join("outside");
+        let stale_nested = nested.join("stale");
+        let stale_outside = outside.join("stale");
+        fs::create_dir_all(&nested).expect("nested dir should exist");
+        fs::create_dir_all(&outside).expect("outside dir should exist");
+        fs::create_dir_all(&stale_nested).expect("stale nested dir should exist");
+        fs::create_dir_all(&stale_outside).expect("stale outside dir should exist");
+        fs::remove_dir_all(&stale_nested).expect("stale nested dir should be removable");
+        fs::remove_dir_all(&stale_outside).expect("stale outside dir should be removable");
+        let mut session = scope_test_session(
+            declared.to_str().expect("declared path utf8"),
+            "project_root",
+            "shared_project_root",
+            Vec::new(),
+        );
+
+        let happy = command_session_cwd_evidence(
+            &session,
+            &[test_command_session_summary("cmd-ok", &nested)],
+        );
+        assert_eq!(happy["status"], "satisfied");
+
+        let blocked = command_session_cwd_evidence(
+            &session,
+            &[test_command_session_summary("cmd-outside", &outside)],
+        );
+        assert_eq!(blocked["status"], "blocked");
+        assert_eq!(blocked["offending_command_session_ids"][0], "cmd-outside");
+        assert_eq!(
+            blocked["declared_working_dir"],
+            declared.to_str().expect("declared path utf8")
+        );
+
+        let stale_inside = command_session_cwd_evidence(
+            &session,
+            &[test_command_session_summary("cmd-stale", &stale_nested)],
+        );
+        assert_eq!(stale_inside["status"], "satisfied");
+        assert_eq!(stale_inside["stale_recorded_cwd_ids"][0], "cmd-stale");
+
+        let stale_outside_evidence = command_session_cwd_evidence(
+            &session,
+            &[test_command_session_summary(
+                "cmd-stale-outside",
+                &stale_outside,
+            )],
+        );
+        assert_eq!(stale_outside_evidence["status"], "blocked");
+        assert_eq!(
+            stale_outside_evidence["offending_command_session_ids"][0],
+            "cmd-stale-outside"
+        );
+
+        let missing = command_session_cwd_evidence(
+            &session,
+            &[test_command_session_with_cwd("cmd-missing", "")],
+        );
+        assert_eq!(missing["status"], "pending");
+        assert!(
+            missing["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cwd not recorded")
+        );
+
+        session.working_dir = String::new();
+        let scratch = command_session_cwd_evidence(
+            &session,
+            &[test_command_session_summary("cmd-scratch", &outside)],
+        );
+        assert_eq!(scratch["status"], "satisfied");
+        assert!(
+            scratch["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("trivially satisfied")
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn session_state_command_mutation_matching_requires_direct_git_in_session_worktree() {
+        let state_dir = test_state_dir("session-state-command-mutation-matching");
+        let declared = state_dir.join("declared");
+        let nested = declared.join("nested");
+        let outside = state_dir.join("outside");
+        fs::create_dir_all(&nested).expect("nested dir should exist");
+        fs::create_dir_all(&outside).expect("outside dir should exist");
+        let session = scope_test_session(
+            declared.to_str().expect("declared path utf8"),
+            "project_root",
+            "isolated_worktree",
+            Vec::new(),
+        );
+
+        let mut direct_git = test_command_session_summary("cmd-git", &nested);
+        direct_git.command = "git".to_string();
+        direct_git.args = vec!["commit".to_string(), "--allow-empty".to_string()];
+        assert!(is_session_git_mutation_command_session(
+            &session,
+            &direct_git
+        ));
+
+        let mut git_with_c = direct_git.clone();
+        git_with_c.cwd = state_dir.display().to_string();
+        git_with_c.args = vec![
+            "-C".to_string(),
+            nested.display().to_string(),
+            "checkout".to_string(),
+            "dev".to_string(),
+        ];
+        assert!(is_session_git_mutation_command_session(
+            &session,
+            &git_with_c
+        ));
+
+        let mut git_with_work_tree = direct_git.clone();
+        git_with_work_tree.cwd = state_dir.display().to_string();
+        git_with_work_tree.args = vec![
+            format!("--git-dir={}", declared.join(".git").display()),
+            format!("--work-tree={}", declared.display()),
+            "commit".to_string(),
+            "--allow-empty".to_string(),
+        ];
+        assert!(is_session_git_mutation_command_session(
+            &session,
+            &git_with_work_tree
+        ));
+
+        let mut git_with_global_options = direct_git.clone();
+        git_with_global_options.args = vec![
+            "-c".to_string(),
+            "user.name=Nucleus".to_string(),
+            "--no-pager".to_string(),
+            "checkout".to_string(),
+            "dev".to_string(),
+        ];
+        assert!(is_session_git_mutation_command_session(
+            &session,
+            &git_with_global_options
+        ));
+
+        let mut git_with_documented_global_flag = direct_git.clone();
+        git_with_documented_global_flag.args =
+            vec!["-P".to_string(), "checkout".to_string(), "dev".to_string()];
+        assert!(is_session_git_mutation_command_session(
+            &session,
+            &git_with_documented_global_flag
+        ));
+
+        let mut rebase = direct_git.clone();
+        rebase.args = vec!["rebase".to_string(), "origin/dev".to_string()];
+        assert!(is_session_git_mutation_command_session(&session, &rebase));
+
+        let mut cherry_pick = direct_git.clone();
+        cherry_pick.args = vec!["cherry-pick".to_string(), "HEAD~1".to_string()];
+        assert!(is_session_git_mutation_command_session(
+            &session,
+            &cherry_pick
+        ));
+
+        let mut status = direct_git.clone();
+        status.args = vec!["status".to_string(), "--short".to_string()];
+        assert!(!is_session_git_mutation_command_session(&session, &status));
+
+        let mut observed_session = session.clone();
+        observed_session.session_state_observed_at = Some(5);
+        let mut stale_command = direct_git.clone();
+        stale_command.completed_at = Some(4);
+        stale_command.updated_at = 4;
+        assert!(!command_session_is_newer_than_session_state(
+            &observed_session,
+            &stale_command
+        ));
+        let mut same_second_command = direct_git.clone();
+        same_second_command.completed_at = Some(5);
+        same_second_command.updated_at = 5;
+        assert!(command_session_is_newer_than_session_state(
+            &observed_session,
+            &same_second_command
+        ));
+        let mut fresh_command = direct_git.clone();
+        fresh_command.completed_at = Some(6);
+        fresh_command.updated_at = 6;
+        assert!(command_session_is_newer_than_session_state(
+            &observed_session,
+            &fresh_command
+        ));
+
+        let stored_git_state = ObservedSessionGitState {
+            git_head: "1111111111111111111111111111111111111111".to_string(),
+            git_branch: "dev".to_string(),
+            git_dirty: false,
+            git_untracked_count: 0,
+        };
+        let observed_git_state = ObservedSessionGitState {
+            git_head: "2222222222222222222222222222222222222222".to_string(),
+            git_branch: "dev".to_string(),
+            git_dirty: false,
+            git_untracked_count: 0,
+        };
+        let mut generic_clean = direct_git.clone();
+        generic_clean.args = vec!["clean".to_string(), "-fd".to_string()];
+        assert!(
+            !command_session_matches_session_state_transition(
+                &generic_clean,
+                &stored_git_state,
+                &observed_git_state
+            ),
+            "generic git mutations should not explain unrelated HEAD drift"
+        );
+        let mut generic_commit = direct_git.clone();
+        generic_commit.args = vec!["commit".to_string(), "--allow-empty".to_string()];
+        assert!(
+            command_session_matches_session_state_transition(
+                &generic_commit,
+                &stored_git_state,
+                &observed_git_state
+            ),
+            "successful in-scope HEAD-moving commands can explain HEAD drift without knowing the resulting SHA"
+        );
+        let mut observed_checkout = direct_git.clone();
+        observed_checkout.args = vec![
+            "checkout".to_string(),
+            observed_git_state.git_head[..12].to_string(),
+        ];
+        assert!(command_session_matches_session_state_transition(
+            &observed_checkout,
+            &stored_git_state,
+            &observed_git_state
+        ));
+
+        let mut other_session = direct_git.clone();
+        other_session.session_id = "other-session".to_string();
+        assert!(!is_session_git_mutation_command_session(
+            &session,
+            &other_session
+        ));
+
+        let mut outside_cwd = direct_git.clone();
+        outside_cwd.cwd = outside.display().to_string();
+        assert!(!is_session_git_mutation_command_session(
+            &session,
+            &outside_cwd
+        ));
+
+        let mut outside_git_c = direct_git.clone();
+        outside_git_c.args = vec![
+            "-C".to_string(),
+            outside.display().to_string(),
+            "switch".to_string(),
+            "dev".to_string(),
+        ];
+        assert!(!is_session_git_mutation_command_session(
+            &session,
+            &outside_git_c
+        ));
+
+        let mut shell_echo = direct_git.clone();
+        shell_echo.command = "sh".to_string();
+        shell_echo.args = vec![
+            "-lc".to_string(),
+            "echo git commit --allow-empty".to_string(),
+        ];
+        assert!(!is_session_git_mutation_command_session(
+            &session,
+            &shell_echo
+        ));
+
+        let mut shell_git = direct_git.clone();
+        shell_git.command = "sh".to_string();
+        shell_git.args = vec![
+            "-lc".to_string(),
+            "git -c user.name=Nucleus --no-pager commit --allow-empty".to_string(),
+        ];
+        assert!(is_session_git_mutation_command_session(
+            &session, &shell_git
+        ));
+
+        let mut shell_with_long_option = shell_git.clone();
+        shell_with_long_option.args = vec![
+            "--norc".to_string(),
+            "-lc".to_string(),
+            "git commit --allow-empty".to_string(),
+        ];
+        assert!(is_session_git_mutation_command_session(
+            &session,
+            &shell_with_long_option
+        ));
+
+        let mut shell_with_single_dash_long_option = shell_git.clone();
+        shell_with_single_dash_long_option.args = vec![
+            "-norc".to_string(),
+            "-lc".to_string(),
+            "git commit --allow-empty".to_string(),
+        ];
+        assert!(is_session_git_mutation_command_session(
+            &session,
+            &shell_with_single_dash_long_option
+        ));
+
+        let mut shell_compound = shell_git.clone();
+        shell_compound.args = vec![
+            "-lc".to_string(),
+            "cd nested && git commit --allow-empty".to_string(),
+        ];
+        assert!(!is_session_git_mutation_command_session(
+            &session,
+            &shell_compound
+        ));
+
+        let mut redirected_repo = direct_git.clone();
+        redirected_repo.args = vec![
+            "--git-dir".to_string(),
+            outside.join(".git").display().to_string(),
+            "commit".to_string(),
+        ];
+        assert!(!is_session_git_mutation_command_session(
+            &session,
+            &redirected_repo
+        ));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn session_state_detection_refreshes_and_blocks_unexplained_drift() {
+        let state_dir = test_state_dir("session-state-drift-detection");
+        let state = initialize_test_state(&state_dir);
+        let repo = context_integrity_repo(&state_dir, "session-state");
+        let head = git_stdout(&repo.worktree, &["rev-parse", "HEAD"]).expect("head sha");
+        state
+            .store
+            .create_session(SessionRecord {
+                id: "state-session".to_string(),
+                title: "State session".to_string(),
+                profile_id: String::new(),
+                profile_title: String::new(),
+                route_id: String::new(),
+                route_title: String::new(),
+                scope: "project".to_string(),
+                project_id: String::new(),
+                project_title: String::new(),
+                project_path: repo.source.display().to_string(),
+                project_ids: Vec::new(),
+                provider: "openai_compatible".to_string(),
+                model: "test-model".to_string(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                working_dir: repo.worktree.display().to_string(),
+                working_dir_kind: "project_root".to_string(),
+                workspace_mode: "isolated_worktree".to_string(),
+                source_project_path: repo.source.display().to_string(),
+                git_root: repo.worktree.display().to_string(),
+                worktree_path: repo.worktree.display().to_string(),
+                git_branch: "dev".to_string(),
+                git_base_ref: "dev".to_string(),
+                git_head: head.clone(),
+                git_dirty: false,
+                git_untracked_count: 0,
+                git_remote_tracking_branch: "origin/dev".to_string(),
+                session_state_observed_at: Some(1),
+                workspace_warnings: Vec::new(),
+                approval_mode: "ask".to_string(),
+                execution_mode: "act".to_string(),
+                run_budget_mode: "inherit".to_string(),
+            })
+            .expect("session should persist");
+        state
+            .store
+            .create_job(JobRecord {
+                id: "state-job".to_string(),
+                session_id: Some("state-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("local_project".to_string()),
+                title: "State job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "running".to_string(),
+                requested_by: "test".to_string(),
+                prompt_excerpt: String::new(),
+                publication_intent_text: None,
+            })
+            .expect("state job should persist");
+        state
+            .store
+            .create_worker(WorkerRecord {
+                id: "state-worker".to_string(),
+                job_id: "state-job".to_string(),
+                parent_worker_id: None,
+                title: "State worker".to_string(),
+                lane: "utility".to_string(),
+                state: "running".to_string(),
+                provider: "test".to_string(),
+                model: "test".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: repo.worktree.display().to_string(),
+                read_roots: vec![repo.worktree.display().to_string()],
+                write_roots: vec![repo.worktree.display().to_string()],
+                max_steps: 10,
+                max_tool_calls: 10,
+                max_wall_clock_secs: 30,
+            })
+            .expect("state worker should persist");
+
+        let session = state
+            .store
+            .get_session("state-session")
+            .expect("session should load")
+            .session;
+        let happy = session_state_evidence_and_refresh(&state, &session, "state-job")
+            .expect("session state should refresh");
+        assert_eq!(happy["status"], "satisfied");
+        let transient_blocked_job = JobSummary {
+            id: "state-job".to_string(),
+            metadata_json: json!({
+                "session_state_evidence": {
+                    "status": "blocked",
+                    "reason": "worktree missing",
+                    "stored": {"git_head": "old"},
+                    "observed": {}
+                }
+            }),
+            ..test_publication_job_summary("state-job")
+        };
+        let refreshed_metadata = context_integrity_metadata_with_session_state(
+            &state,
+            &session,
+            &transient_blocked_job,
+            "state-job",
+        )
+        .expect("transient blocked evidence should recompute");
+        assert_eq!(
+            refreshed_metadata["session_state_evidence"]["status"],
+            "satisfied"
+        );
+        let unexplained_blocked_job = JobSummary {
+            id: "state-job".to_string(),
+            metadata_json: json!({
+                "session_state_evidence": {
+                    "status": "blocked",
+                    "reason": "stored session git metadata differed from observed disk state without a matching daemon-observed mutation",
+                    "stored": {"git_head": "old"},
+                    "observed": {"git_head": "new"}
+                }
+            }),
+            ..test_publication_job_summary("state-job")
+        };
+        let preserved_metadata = context_integrity_metadata_with_session_state(
+            &state,
+            &session,
+            &unexplained_blocked_job,
+            "state-job",
+        )
+        .expect("unexplained drift evidence should remain blocked");
+        assert_eq!(
+            preserved_metadata["session_state_evidence"]["status"],
+            "blocked"
+        );
+        let mut no_git_session = session.clone();
+        no_git_session.worktree_path.clear();
+        no_git_session.git_root.clear();
+        no_git_session.working_dir.clear();
+        no_git_session.git_head.clear();
+        no_git_session.git_branch.clear();
+        let cleared_metadata = context_integrity_metadata_with_session_state(
+            &state,
+            &no_git_session,
+            &unexplained_blocked_job,
+            "state-job",
+        )
+        .expect("stale evidence should clear when no session git path remains");
+        assert!(
+            cleared_metadata.get("session_state_evidence").is_none(),
+            "session-state evidence should not survive when refresh has no current evidence"
+        );
+
+        let unborn = state_dir.join("unborn-session-state");
+        fs::create_dir_all(&unborn).expect("unborn worktree dir should exist");
+        run_git_test(&unborn, &["init", "-b", "dev"]);
+        let mut unborn_record = SessionRecord {
+            id: "unborn-state-session".to_string(),
+            title: "Unborn state session".to_string(),
+            profile_id: String::new(),
+            profile_title: String::new(),
+            route_id: String::new(),
+            route_title: String::new(),
+            scope: "project".to_string(),
+            project_id: String::new(),
+            project_title: String::new(),
+            project_path: unborn.display().to_string(),
+            project_ids: Vec::new(),
+            provider: "openai_compatible".to_string(),
+            model: "test-model".to_string(),
+            provider_base_url: String::new(),
+            provider_api_key: String::new(),
+            working_dir: unborn.display().to_string(),
+            working_dir_kind: "project_root".to_string(),
+            workspace_mode: "isolated_worktree".to_string(),
+            source_project_path: unborn.display().to_string(),
+            git_root: unborn.display().to_string(),
+            worktree_path: unborn.display().to_string(),
+            git_branch: "dev".to_string(),
+            git_base_ref: "dev".to_string(),
+            git_head: String::new(),
+            git_dirty: false,
+            git_untracked_count: 0,
+            git_remote_tracking_branch: String::new(),
+            session_state_observed_at: Some(1),
+            workspace_warnings: Vec::new(),
+            approval_mode: "ask".to_string(),
+            execution_mode: "act".to_string(),
+            run_budget_mode: "inherit".to_string(),
+        };
+        state
+            .store
+            .create_session(unborn_record.clone())
+            .expect("unborn session should persist");
+        let unborn_session = state
+            .store
+            .get_session("unborn-state-session")
+            .expect("unborn session should load")
+            .session;
+        let unborn_evidence =
+            session_state_evidence_and_refresh(&state, &unborn_session, "state-job")
+                .expect("unborn HEAD should be observed");
+        assert_eq!(unborn_evidence["status"], "satisfied");
+        assert_eq!(unborn_evidence["observed"]["git_head"], "");
+        assert_eq!(unborn_evidence["observed"]["git_branch"], "dev");
+        unborn_record.git_head = "stale-unborn-head".to_string();
+        state
+            .store
+            .update_session(
+                "unborn-state-session",
+                SessionPatch {
+                    git_head: Some(unborn_record.git_head),
+                    ..SessionPatch::default()
+                },
+            )
+            .expect("unborn stale session should persist");
+        let unborn_stale = state
+            .store
+            .get_session("unborn-state-session")
+            .expect("unborn stale session should load")
+            .session;
+        let unborn_blocked = session_state_evidence_and_refresh(&state, &unborn_stale, "state-job")
+            .expect("unborn stale state should refresh");
+        assert_eq!(unborn_blocked["status"], "blocked");
+        assert_eq!(unborn_blocked["observed"]["git_head"], "");
+
+        state
+            .store
+            .update_session(
+                "state-session",
+                SessionPatch {
+                    git_head: Some("legacy-stale-head".to_string()),
+                    session_state_observed_at: Some(None),
+                    ..SessionPatch::default()
+                },
+            )
+            .expect("legacy stale session should persist");
+        let legacy_session = state
+            .store
+            .get_session("state-session")
+            .expect("legacy session should reload")
+            .session;
+        let legacy_blocked =
+            session_state_evidence_and_refresh(&state, &legacy_session, "state-job")
+                .expect("legacy session state should refresh");
+        assert_eq!(legacy_blocked["status"], "blocked");
+        assert_eq!(legacy_blocked["stored"]["git_head"], "legacy-stale-head");
+        assert!(
+            state
+                .store
+                .get_session("state-session")
+                .expect("legacy session should reload after refresh")
+                .session
+                .session_state_observed_at
+                .is_some()
+        );
+
+        state
+            .store
+            .update_session(
+                "state-session",
+                SessionPatch {
+                    git_head: Some("stale-head".to_string()),
+                    session_state_observed_at: Some(Some(1)),
+                    ..SessionPatch::default()
+                },
+            )
+            .expect("stale session should persist");
+        state
+            .store
+            .append_audit_event(AuditEventRecord {
+                kind: "worker.git.checkout".to_string(),
+                target: "job:other-job".to_string(),
+                status: "success".to_string(),
+                summary: "Worker git checkout updated another job.".to_string(),
+                detail: "job_id=other-job session_id=other-session git checkout dev".to_string(),
+            })
+            .expect("unrelated audit event should persist");
+        let stale_session = state
+            .store
+            .get_session("state-session")
+            .expect("session should reload")
+            .session;
+        let blocked = session_state_evidence_and_refresh(&state, &stale_session, "state-job")
+            .expect("session state should refresh stale row");
+        assert_eq!(blocked["status"], "blocked");
+        assert_eq!(blocked["stored"]["git_head"], "stale-head");
+        assert_eq!(blocked["observed"]["git_head"], head);
+        assert!(blocked["audit_event_id"].is_null());
+        let refreshed = state
+            .store
+            .get_session("state-session")
+            .expect("session should reload after refresh")
+            .session;
+        assert_eq!(refreshed.git_head, head);
+        assert!(refreshed.session_state_observed_at.is_some());
+
+        state
+            .store
+            .update_session(
+                "state-session",
+                SessionPatch {
+                    git_head: Some("failed-audit-head".to_string()),
+                    session_state_observed_at: Some(Some(1)),
+                    ..SessionPatch::default()
+                },
+            )
+            .expect("failed-audit stale session should persist");
+        state
+            .store
+            .append_audit_event(AuditEventRecord {
+                kind: "worker.git.checkout".to_string(),
+                target: "job:state-job".to_string(),
+                status: "failed".to_string(),
+                summary: "Worker git checkout failed.".to_string(),
+                detail: "job_id=state-job session_id=state-session git checkout dev".to_string(),
+            })
+            .expect("failed audit event should persist");
+        let failed_audit_session = state
+            .store
+            .get_session("state-session")
+            .expect("failed-audit session should reload")
+            .session;
+        let failed_audit =
+            session_state_evidence_and_refresh(&state, &failed_audit_session, "state-job")
+                .expect("failed audit should not explain drift");
+        assert_eq!(failed_audit["status"], "blocked");
+        assert!(failed_audit["audit_event_id"].is_null());
+
+        state
+            .store
+            .update_session(
+                "state-session",
+                SessionPatch {
+                    git_head: Some("generic-audit-head".to_string()),
+                    session_state_observed_at: Some(Some(1)),
+                    ..SessionPatch::default()
+                },
+            )
+            .expect("generic-audit stale session should persist");
+        state
+            .store
+            .append_audit_event(AuditEventRecord {
+                kind: "worker.git.checkout".to_string(),
+                target: "job:state-job".to_string(),
+                status: "success".to_string(),
+                summary: "Worker git checkout updated HEAD.".to_string(),
+                detail: "job_id=state-job session_id=state-session git checkout dev".to_string(),
+            })
+            .expect("generic audit event should persist");
+        let generic_audit_session = state
+            .store
+            .get_session("state-session")
+            .expect("generic-audit session should reload")
+            .session;
+        let generic_audit =
+            session_state_evidence_and_refresh(&state, &generic_audit_session, "state-job")
+                .expect("generic audit should not explain drift");
+        assert_eq!(generic_audit["status"], "blocked");
+        assert!(generic_audit["audit_event_id"].is_null());
+
+        state
+            .store
+            .update_session(
+                "state-session",
+                SessionPatch {
+                    git_head: Some("generic-command-head".to_string()),
+                    session_state_observed_at: Some(Some(1)),
+                    ..SessionPatch::default()
+                },
+            )
+            .expect("generic-command stale session should persist");
+        state
+            .store
+            .create_command_session(CommandSessionRecord {
+                id: "state-command-generic".to_string(),
+                job_id: "state-job".to_string(),
+                worker_id: "state-worker".to_string(),
+                tool_call_id: None,
+                mode: "oneshot".to_string(),
+                title: "Generic git clean".to_string(),
+                state: "completed".to_string(),
+                command: "git".to_string(),
+                args: vec!["clean".to_string(), "-fd".to_string()],
+                cwd: repo.worktree.display().to_string(),
+                session_id: "state-session".to_string(),
+                project_id: String::new(),
+                worktree_path: repo.worktree.display().to_string(),
+                branch: "dev".to_string(),
+                port: None,
+                env_json: json!({}),
+                network_policy: "inherit".to_string(),
+                timeout_secs: 30,
+                output_limit_bytes: 1024,
+                last_error: String::new(),
+                exit_code: Some(0),
+                stdout_artifact_id: None,
+                stderr_artifact_id: None,
+                started_at: Some(2),
+                completed_at: Some(2),
+            })
+            .expect("generic command session should persist");
+        let generic_command_session = state
+            .store
+            .get_session("state-session")
+            .expect("generic-command session should reload")
+            .session;
+        let generic_command =
+            session_state_evidence_and_refresh(&state, &generic_command_session, "state-job")
+                .expect("generic command should not explain drift");
+        assert_eq!(generic_command["status"], "blocked");
+        assert!(generic_command["mutation_command_session_id"].is_null());
+
+        state
+            .store
+            .update_session(
+                "state-session",
+                SessionPatch {
+                    git_head: Some("matching-command-head".to_string()),
+                    session_state_observed_at: Some(Some(1)),
+                    ..SessionPatch::default()
+                },
+            )
+            .expect("matching-command stale session should persist");
+        state
+            .store
+            .create_command_session(CommandSessionRecord {
+                id: "state-command-matching".to_string(),
+                job_id: "state-job".to_string(),
+                worker_id: "state-worker".to_string(),
+                tool_call_id: None,
+                mode: "oneshot".to_string(),
+                title: "Create observed commit".to_string(),
+                state: "completed".to_string(),
+                command: "git".to_string(),
+                args: vec!["commit".to_string(), "--allow-empty".to_string()],
+                cwd: repo.worktree.display().to_string(),
+                session_id: "state-session".to_string(),
+                project_id: String::new(),
+                worktree_path: repo.worktree.display().to_string(),
+                branch: "dev".to_string(),
+                port: None,
+                env_json: json!({}),
+                network_policy: "inherit".to_string(),
+                timeout_secs: 30,
+                output_limit_bytes: 1024,
+                last_error: String::new(),
+                exit_code: Some(0),
+                stdout_artifact_id: None,
+                stderr_artifact_id: None,
+                started_at: Some(2),
+                completed_at: Some(2),
+            })
+            .expect("matching command session should persist");
+        let matching_command_session = state
+            .store
+            .get_session("state-session")
+            .expect("matching-command session should reload")
+            .session;
+        let matching_command =
+            session_state_evidence_and_refresh(&state, &matching_command_session, "state-job")
+                .expect("matching command should explain drift");
+        assert_eq!(matching_command["status"], "satisfied");
+        assert_eq!(
+            matching_command["mutation_command_session_id"],
+            "state-command-matching"
+        );
+
+        state
+            .store
+            .update_session(
+                "state-session",
+                SessionPatch {
+                    git_head: Some("stale-again".to_string()),
+                    session_state_observed_at: Some(Some(1)),
+                    ..SessionPatch::default()
+                },
+            )
+            .expect("stale session should persist again");
+        state
+            .store
+            .append_audit_event(AuditEventRecord {
+                kind: "worker.git.checkout".to_string(),
+                target: "job:state-job".to_string(),
+                status: "success".to_string(),
+                summary: "Worker git checkout updated HEAD.".to_string(),
+                detail: format!(
+                    "job_id=state-job session_id=state-session git checkout dev observed_git_head={head}"
+                ),
+            })
+            .expect("audit event should persist");
+        let stale_session = state
+            .store
+            .get_session("state-session")
+            .expect("session should reload")
+            .session;
+        let explained = session_state_evidence_and_refresh(&state, &stale_session, "state-job")
+            .expect("session state should refresh explained drift");
+        assert_eq!(explained["status"], "satisfied");
+        assert!(explained["audit_event_id"].as_i64().is_some());
+
+        let mut missing = stale_session;
+        missing.worktree_path = state_dir.join("deleted-worktree").display().to_string();
+        missing.git_root = missing.worktree_path.clone();
+        let missing_evidence = session_state_evidence_and_refresh(&state, &missing, "state-job")
+            .expect("missing worktree should be reported");
+        assert_eq!(missing_evidence["status"], "blocked");
+        assert_eq!(missing_evidence["reason"], "worktree missing");
+
+        run_git_test(&repo.worktree, &["checkout", "--detach", &head]);
+        let detached =
+            observe_session_git_state(&repo.worktree).expect("detached state should observe");
+        assert_eq!(detached.git_head, head);
+        assert_eq!(detached.git_branch, "");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
     fn terminal_projection_blocks_pending_context_integrity_gate() {
         let mut job = test_publication_job_summary("context-pending");
         job.task_class = Some("local_project".to_string());
@@ -20177,6 +22014,63 @@ Cleanup status: clean";
         let blocker = projected_completion_gate_blocker(&job, &PublicationOutcomePatch::default())
             .expect("pending context gate should block terminal projection");
         assert!(blocker.contains("pending"));
+
+        let mut cwd_pending = test_publication_job_summary("cwd-pending");
+        cwd_pending.task_class = Some("local_project".to_string());
+        cwd_pending.publication_requested = false;
+        cwd_pending.publication_status = "not_requested".to_string();
+        cwd_pending.browser_verification_status = "not_required".to_string();
+        cwd_pending.validation_status = "passed".to_string();
+        cwd_pending.cleanup_status = "clean".to_string();
+        cwd_pending.command_session_cwd_evidence_json = Some(
+            json!({
+                "status": "pending",
+                "reason": "no command sessions recorded yet",
+                "declared_working_dir": "/repo",
+                "observed_cwds": [],
+                "offending_command_session_ids": [],
+                "offending_cwds": [],
+            })
+            .to_string(),
+        );
+        assert!(
+            projected_completion_gate_blocker(&cwd_pending, &PublicationOutcomePatch::default())
+                .is_none(),
+            "pending cwd evidence should not block text-only non-publication jobs"
+        );
+
+        cwd_pending.publication_requested = true;
+        cwd_pending.publication_status = "opened".to_string();
+        cwd_pending.pr_url = "https://github.com/WebLime-agency/nucleus/pull/277".to_string();
+        cwd_pending.target_branch = "dev".to_string();
+        let blocker =
+            projected_completion_gate_blocker(&cwd_pending, &PublicationOutcomePatch::default())
+                .expect("pending cwd evidence should block publication terminal projection");
+        assert!(
+            blocker.contains("cwd evidence is pending"),
+            "unexpected blocker: {blocker}"
+        );
+
+        let mut session_state_blocked = test_publication_job_summary("session-state-blocked");
+        session_state_blocked.task_class = Some("local_project".to_string());
+        session_state_blocked.publication_requested = false;
+        session_state_blocked.publication_status = "not_requested".to_string();
+        session_state_blocked.browser_verification_status = "not_required".to_string();
+        session_state_blocked.validation_status = "passed".to_string();
+        session_state_blocked.metadata_json = json!({
+            "session_state_evidence": {
+                "status": "blocked",
+                "reason": "stored session git metadata differed from observed disk state",
+                "stored": {"git_head": "old"},
+                "observed": {"git_head": "new"}
+            }
+        });
+        let blocker = projected_completion_gate_blocker(
+            &session_state_blocked,
+            &PublicationOutcomePatch::default(),
+        )
+        .expect("blocked session-state gate should block terminal projection");
+        assert!(blocker.contains("drifted"));
     }
 
     #[tokio::test]
@@ -20353,6 +22247,7 @@ Cleanup status: clean";
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             scope: "project".to_string(),
             approval_mode: "trusted".to_string(),
@@ -20465,6 +22360,7 @@ Cleanup status: clean";
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
@@ -20541,6 +22437,7 @@ Cleanup status: clean";
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
@@ -20846,6 +22743,7 @@ Cleanup status: clean";
                 git_dirty: false,
                 git_untracked_count: 0,
                 git_remote_tracking_branch: String::new(),
+                session_state_observed_at: None,
                 workspace_warnings: Vec::new(),
                 approval_mode: "ask".to_string(),
                 execution_mode: "act".to_string(),
@@ -21367,6 +23265,7 @@ Cleanup status: clean";
                 git_dirty: false,
                 git_untracked_count: 0,
                 git_remote_tracking_branch: String::new(),
+                session_state_observed_at: None,
                 workspace_warnings: Vec::new(),
                 approval_mode: "ask".to_string(),
                 execution_mode: "act".to_string(),
@@ -21465,6 +23364,7 @@ Cleanup status: clean";
                 git_dirty: false,
                 git_untracked_count: 0,
                 git_remote_tracking_branch: String::new(),
+                session_state_observed_at: None,
                 workspace_warnings: Vec::new(),
                 approval_mode: "ask".to_string(),
                 execution_mode: "act".to_string(),
@@ -22739,6 +24639,7 @@ Cleanup status: clean";
                 git_dirty: false,
                 git_untracked_count: 0,
                 git_remote_tracking_branch: String::new(),
+                session_state_observed_at: None,
                 workspace_warnings: Vec::new(),
                 approval_mode: "ask".to_string(),
                 execution_mode: "act".to_string(),
@@ -24191,6 +26092,7 @@ for line in sys.stdin:
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
@@ -24320,6 +26222,8 @@ for line in sys.stdin:
             worktree_behind_by: None,
             branch_repo_status: String::new(),
             branch_repo_reason: String::new(),
+            command_session_cwd_evidence_json: None,
+            session_state_observed_at: None,
             completion_status: String::new(),
             completion_gates: Vec::new(),
             completion_blockers: Vec::new(),
@@ -24525,6 +26429,41 @@ for line in sys.stdin:
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+        }
+    }
+
+    fn test_command_session_summary(id: &str, cwd: &Path) -> CommandSessionSummary {
+        test_command_session_with_cwd(id, cwd.to_str().expect("cwd path utf8"))
+    }
+
+    fn test_command_session_with_cwd(id: &str, cwd: &str) -> CommandSessionSummary {
+        CommandSessionSummary {
+            id: id.to_string(),
+            job_id: "job".to_string(),
+            worker_id: "worker".to_string(),
+            tool_call_id: None,
+            mode: "oneshot".to_string(),
+            title: "Test command".to_string(),
+            state: "completed".to_string(),
+            command: "pwd".to_string(),
+            args: Vec::new(),
+            cwd: cwd.to_string(),
+            session_id: "session".to_string(),
+            project_id: String::new(),
+            worktree_path: String::new(),
+            branch: String::new(),
+            port: None,
+            network_policy: "inherit".to_string(),
+            timeout_secs: 30,
+            output_limit_bytes: 1024,
+            last_error: String::new(),
+            exit_code: Some(0),
+            stdout_artifact_id: None,
+            stderr_artifact_id: None,
+            started_at: Some(1),
+            completed_at: Some(2),
+            created_at: 1,
+            updated_at: 2,
         }
     }
 }

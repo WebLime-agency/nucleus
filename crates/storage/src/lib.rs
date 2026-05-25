@@ -97,6 +97,7 @@ mod observability_tests {
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
@@ -376,6 +377,7 @@ pub struct SessionRecord {
     pub git_dirty: bool,
     pub git_untracked_count: usize,
     pub git_remote_tracking_branch: String,
+    pub session_state_observed_at: Option<i64>,
     pub workspace_warnings: Vec<String>,
     pub approval_mode: String,
     pub execution_mode: String,
@@ -410,6 +412,7 @@ pub struct SessionPatch {
     pub git_dirty: Option<bool>,
     pub git_untracked_count: Option<usize>,
     pub git_remote_tracking_branch: Option<String>,
+    pub session_state_observed_at: Option<Option<i64>>,
     pub workspace_warnings: Option<Vec<String>>,
     pub approval_mode: Option<String>,
     pub execution_mode: Option<String>,
@@ -513,6 +516,7 @@ pub struct JobPatch {
     pub worktree_behind_by: Option<Option<i64>>,
     pub branch_repo_status: Option<String>,
     pub branch_repo_reason: Option<String>,
+    pub command_session_cwd_evidence_json: Option<Option<String>>,
     pub last_resumed_at: Option<Option<i64>>,
 }
 
@@ -1899,7 +1903,7 @@ impl StateStore {
                 provider_api_key,
                 working_dir,
                 working_dir_kind,
-                workspace_mode, source_project_path, git_root, worktree_path, git_branch, git_base_ref, git_head, git_dirty, git_untracked_count, git_remote_tracking_branch, workspace_warnings_json,
+                workspace_mode, source_project_path, git_root, worktree_path, git_branch, git_base_ref, git_head, git_dirty, git_untracked_count, git_remote_tracking_branch, session_state_observed_at, workspace_warnings_json,
                 approval_mode,
                 execution_mode,
                 run_budget_mode,
@@ -1909,7 +1913,7 @@ impl StateStore {
                 last_message_excerpt,
                 turn_count
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, 'active', '', '', '', 0)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, 'active', '', '', '', 0)
             ",
             params![
                 record.id,
@@ -1938,6 +1942,7 @@ impl StateStore {
                 record.git_dirty,
                 record.git_untracked_count,
                 record.git_remote_tracking_branch,
+                record.session_state_observed_at,
                 serde_json::to_string(&record.workspace_warnings).unwrap_or_else(|_| "[]".to_string()),
                 record.approval_mode,
                 record.execution_mode,
@@ -1989,6 +1994,9 @@ impl StateStore {
         let next_git_remote_tracking_branch = patch
             .git_remote_tracking_branch
             .unwrap_or(current.git_remote_tracking_branch);
+        let next_session_state_observed_at = patch
+            .session_state_observed_at
+            .unwrap_or(current.session_state_observed_at);
         let next_workspace_warnings = patch
             .workspace_warnings
             .unwrap_or(current.workspace_warnings);
@@ -2030,13 +2038,14 @@ impl StateStore {
                 git_dirty = ?24,
                 git_untracked_count = ?25,
                 git_remote_tracking_branch = ?26,
-                workspace_warnings_json = ?27,
-                approval_mode = ?28,
-                execution_mode = ?29,
-                run_budget_mode = ?30,
-                state = ?31,
-                provider_session_id = ?32,
-                last_error = ?33,
+                session_state_observed_at = ?27,
+                workspace_warnings_json = ?28,
+                approval_mode = ?29,
+                execution_mode = ?30,
+                run_budget_mode = ?31,
+                state = ?32,
+                provider_session_id = ?33,
+                last_error = ?34,
                 updated_at = unixepoch()
             WHERE id = ?1
             ",
@@ -2067,6 +2076,7 @@ impl StateStore {
                 next_git_dirty,
                 next_git_untracked_count,
                 next_git_remote_tracking_branch,
+                next_session_state_observed_at,
                 serde_json::to_string(&next_workspace_warnings)
                     .unwrap_or_else(|_| "[]".to_string()),
                 next_approval_mode,
@@ -2589,7 +2599,8 @@ impl StateStore {
                 worktree_behind_by = ?33,
                 branch_repo_status = ?34,
                 branch_repo_reason = ?35,
-                last_resumed_at = ?36,
+                command_session_cwd_evidence_json = ?36,
+                last_resumed_at = ?37,
                 updated_at = unixepoch()
             WHERE id = ?1
             ",
@@ -2657,6 +2668,9 @@ impl StateStore {
                 patch
                     .branch_repo_reason
                     .unwrap_or(current.branch_repo_reason),
+                patch
+                    .command_session_cwd_evidence_json
+                    .unwrap_or(current.command_session_cwd_evidence_json),
                 patch.last_resumed_at.unwrap_or(current.last_resumed_at),
             ],
         )?;
@@ -3522,6 +3536,7 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             worktree_behind_by INTEGER,
             branch_repo_status TEXT NOT NULL DEFAULT '',
             branch_repo_reason TEXT NOT NULL DEFAULT '',
+            command_session_cwd_evidence_json TEXT,
             last_resumed_at INTEGER,
             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
@@ -4271,6 +4286,12 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
     ensure_column(
         connection,
         "sessions",
+        "session_state_observed_at",
+        "INTEGER",
+    )?;
+    ensure_column(
+        connection,
+        "sessions",
         "workspace_warnings_json",
         "TEXT NOT NULL DEFAULT '[]'",
     )?;
@@ -4580,6 +4601,12 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "jobs",
         "branch_repo_reason",
         "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "jobs",
+        "command_session_cwd_evidence_json",
+        "TEXT",
     )?;
     ensure_column(connection, "jobs", "last_resumed_at", "INTEGER")?;
 
@@ -7139,7 +7166,7 @@ fn load_session_summary(connection: &Connection, session_id: &str) -> Result<Ses
                 provider_api_key,
                 working_dir,
                 working_dir_kind,
-                workspace_mode, source_project_path, git_root, worktree_path, git_branch, git_base_ref, git_head, git_dirty, git_untracked_count, git_remote_tracking_branch, workspace_warnings_json,
+                workspace_mode, source_project_path, git_root, worktree_path, git_branch, git_base_ref, git_head, git_dirty, git_untracked_count, git_remote_tracking_branch, session_state_observed_at, workspace_warnings_json,
                 approval_mode,
                 execution_mode,
                 run_budget_mode,
@@ -7205,20 +7232,21 @@ fn map_session_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionS
         git_dirty: row.get::<_, i64>(23)? != 0,
         git_untracked_count: row.get::<_, i64>(24)? as usize,
         git_remote_tracking_branch: row.get(25)?,
-        workspace_warnings: serde_json::from_str(&row.get::<_, String>(26)?).unwrap_or_default(),
-        approval_mode: row.get(27)?,
-        execution_mode: row.get(28)?,
-        run_budget_mode: row.get(29)?,
+        session_state_observed_at: row.get(26)?,
+        workspace_warnings: serde_json::from_str(&row.get::<_, String>(27)?).unwrap_or_default(),
+        approval_mode: row.get(28)?,
+        execution_mode: row.get(29)?,
+        run_budget_mode: row.get(30)?,
         run_budget: RunBudgetSummary::default(),
         project_count: 0,
         projects: Vec::new(),
-        state: row.get(30)?,
-        provider_session_id: row.get(31)?,
-        last_error: row.get(32)?,
+        state: row.get(31)?,
+        provider_session_id: row.get(32)?,
+        last_error: row.get(33)?,
         user_error: None,
         capabilities: Vec::new(),
-        last_message_excerpt: row.get(33)?,
-        turn_count: row.get(34)?,
+        last_message_excerpt: row.get(34)?,
+        turn_count: row.get(35)?,
         last_resumed_at: None,
         last_reasoning: String::new(),
         last_reasoning_at: None,
@@ -7227,8 +7255,8 @@ fn map_session_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionS
         completion_tokens: 0,
         cached_tokens: 0,
         cost_usd_estimate: None,
-        created_at: row.get(35)?,
-        updated_at: row.get(36)?,
+        created_at: row.get(36)?,
+        updated_at: row.get(37)?,
     })
 }
 
@@ -7782,6 +7810,12 @@ fn load_job_summary(connection: &Connection, job_id: &str) -> Result<JobSummary>
                 worktree_behind_by,
                 branch_repo_status,
                 branch_repo_reason,
+                command_session_cwd_evidence_json,
+                (
+                    SELECT session_state_observed_at
+                    FROM sessions
+                    WHERE sessions.id = jobs.session_id
+                ) AS session_state_observed_at,
                 last_resumed_at,
                 created_at,
                 updated_at
@@ -7873,6 +7907,8 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         worktree_behind_by: row.get(39)?,
         branch_repo_status: row.get(40)?,
         branch_repo_reason: row.get(41)?,
+        command_session_cwd_evidence_json: row.get(42)?,
+        session_state_observed_at: row.get(43)?,
         task_evidence: Vec::new(),
         completion_status: String::new(),
         completion_gates: Vec::new(),
@@ -7880,7 +7916,7 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         worker_count: 0,
         pending_approval_count: 0,
         artifact_count: 0,
-        last_resumed_at: row.get(42)?,
+        last_resumed_at: row.get(44)?,
         last_reasoning: String::new(),
         last_reasoning_at: None,
         token_usage_known: false,
@@ -7888,8 +7924,8 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         completion_tokens: 0,
         cached_tokens: 0,
         cost_usd_estimate: None,
-        created_at: row.get(43)?,
-        updated_at: row.get(44)?,
+        created_at: row.get(45)?,
+        updated_at: row.get(46)?,
     })
 }
 
@@ -10617,6 +10653,7 @@ mod tests {
                 git_dirty: false,
                 git_untracked_count: 0,
                 git_remote_tracking_branch: String::new(),
+                session_state_observed_at: None,
                 workspace_warnings: Vec::new(),
                 approval_mode: "ask".to_string(),
                 execution_mode: "act".to_string(),
@@ -10744,6 +10781,7 @@ mod tests {
                 git_dirty: false,
                 git_untracked_count: 0,
                 git_remote_tracking_branch: String::new(),
+                session_state_observed_at: None,
                 workspace_warnings: Vec::new(),
                 approval_mode: "ask".to_string(),
                 execution_mode: "act".to_string(),
@@ -10832,7 +10870,7 @@ mod tests {
             })
             .expect("job should persist");
 
-        let updated = store
+        store
             .update_job(
                 &job.id,
                 JobPatch {
@@ -10858,14 +10896,45 @@ mod tests {
                     worktree_behind_by: Some(Some(2)),
                     branch_repo_status: Some("satisfied".to_string()),
                     branch_repo_reason: Some(String::new()),
+                    command_session_cwd_evidence_json: Some(Some(
+                        serde_json::json!({
+                            "status": "blocked",
+                            "declared_working_dir": working_dir,
+                            "observed_cwds": [{"command_session_id": "cmd-1", "cwd": "/tmp/outside"}],
+                            "offending_command_session_ids": ["cmd-1"],
+                            "offending_cwds": ["/tmp/outside"]
+                        })
+                        .to_string(),
+                    )),
                     ..JobPatch::default()
                 },
             )
             .expect("context evidence should persist");
+        let _ = store
+            .update_session(
+                "context-session",
+                SessionPatch {
+                    session_state_observed_at: Some(Some(1234)),
+                    ..SessionPatch::default()
+                },
+            )
+            .expect("session observed timestamp should persist");
+        let updated = store
+            .get_job(&job.id)
+            .expect("job should reload with session timestamp")
+            .job;
 
         assert_eq!(updated.worktree_base_ref, "dev");
         assert_eq!(updated.worktree_behind_by, Some(2));
         assert_eq!(updated.branch_repo_status, "satisfied");
+        assert_eq!(updated.session_state_observed_at, Some(1234));
+        assert!(
+            updated
+                .command_session_cwd_evidence_json
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cmd-1")
+        );
         assert_eq!(
             updated.metadata_json["worktree_base_override"]["allowed_behind_by"],
             1
@@ -12768,6 +12837,7 @@ and open a pull request to dev when it is ready."
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
