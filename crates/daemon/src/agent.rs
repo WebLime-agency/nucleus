@@ -5150,6 +5150,7 @@ fn extract_process_state_claims(final_answer: &str) -> Vec<ContextClaim> {
 fn claim_sentences(text: &str) -> Vec<String> {
     text.lines()
         .flat_map(|line| line.split([';', '!', '?']))
+        .flat_map(|item| item.split(". "))
         .map(|item| {
             item.trim()
                 .trim_start_matches(['-', '*', ' '])
@@ -5722,15 +5723,16 @@ fn command_claim_matches_session(
     command_session: &CommandSessionSummary,
 ) -> bool {
     let text = command_session_text(&command_session.command, &command_session.args);
+    let tokens = command_session_tokens(&command_session.command, &command_session.args);
     if identifier == "command" {
         return !text.trim().is_empty();
     }
     if identifier == "test" {
-        return is_validation_command(&text) && text.contains("test");
+        return is_validation_command(&text) && tokens.iter().any(|token| token == "test");
     }
     identifier
         .split_whitespace()
-        .all(|token| text.contains(token))
+        .all(|token| tokens.iter().any(|candidate| candidate == token))
 }
 
 fn audit_event_matches_job(event: &nucleus_protocol::AuditEvent, job: &JobSummary) -> bool {
@@ -5753,11 +5755,25 @@ fn successful_command_mentions(
         if command_session.state != "completed" || command_session.exit_code != Some(0) {
             return false;
         }
-        let text = command_session_text(&command_session.command, &command_session.args);
-        needles
-            .iter()
-            .all(|needle| text.contains(&needle.to_ascii_lowercase()))
+        let tokens = command_session_tokens(&command_session.command, &command_session.args);
+        needles.iter().all(|needle| {
+            let needle = needle.to_ascii_lowercase();
+            tokens.iter().any(|token| token == &needle)
+        })
     })
+}
+
+fn command_session_tokens(command: &str, args: &[String]) -> Vec<String> {
+    std::iter::once(command)
+        .chain(args.iter().map(String::as_str))
+        .flat_map(|value| value.split_whitespace())
+        .map(|value| {
+            value
+                .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`'))
+                .to_ascii_lowercase()
+        })
+        .filter(|value| !value.is_empty())
+        .collect()
 }
 
 fn path_is_under_declared_root(path: &Path, root: &Path) -> Result<bool> {
@@ -22288,6 +22304,20 @@ Cleanup status: clean";
         .expect("branch command evidence should derive");
         assert_eq!(branch_command_happy["status"], "satisfied");
 
+        let mut branch_prefix_command =
+            test_command_session_with_cwd("cmd-branch-prefix", repo.worktree.to_str().unwrap());
+        branch_prefix_command.command = "git".to_string();
+        branch_prefix_command.args = vec!["branch".to_string(), "development".to_string()];
+        let branch_prefix_mismatch = target_entity_evidence(
+            &state,
+            &session,
+            &job,
+            &[branch_prefix_command],
+            "branch dev created.",
+        )
+        .expect("branch prefix evidence should derive");
+        assert_eq!(branch_prefix_mismatch["status"], "blocked");
+
         let preexisting_branch_without_action = target_entity_evidence(
             &state,
             &session,
@@ -22369,6 +22399,23 @@ Cleanup status: clean";
             target_entity_evidence(&state, &session, &job, &[], "PR #555 opened")
                 .expect("external evidence should derive");
         assert_eq!(unrelated_external["status"], "blocked");
+
+        let missing_second_external = target_entity_evidence(
+            &state,
+            &session,
+            &job,
+            &[],
+            "PR #123 opened. PR #124 opened.",
+        )
+        .expect("period-delimited external evidence should derive");
+        assert_eq!(missing_second_external["status"], "blocked");
+        assert!(
+            missing_second_external["claims"]
+                .as_array()
+                .expect("claims should be array")
+                .iter()
+                .any(|claim| claim["identifier"] == "pr#124")
+        );
 
         let wrong_external_action =
             target_entity_evidence(&state, &session, &job, &[], "PR #123 closed")
@@ -22497,6 +22544,17 @@ Cleanup status: clean";
             .expect("generic command evidence should derive");
         assert_eq!(generic_command["status"], "satisfied");
         assert_eq!(generic_command["claims"][0]["identifier"], "command");
+
+        let mut nextest = test_command_session_with_cwd("cmd-nextest", "/tmp");
+        nextest.command = "cargo".to_string();
+        nextest.args = vec!["nextest".to_string(), "run".to_string()];
+        nextest.exit_code = Some(0);
+        nextest.completed_at = Some(43);
+        nextest.updated_at = 43;
+        let command_prefix = process_state_evidence(&state, &[nextest], "cargo test passed.")
+            .await
+            .expect("command prefix evidence should derive");
+        assert_eq!(command_prefix["status"], "pending");
 
         let no_claims = process_state_evidence(&state, &[], "No process claims here.")
             .await
