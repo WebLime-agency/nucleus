@@ -4071,6 +4071,7 @@ async fn create_session(
         git_dirty: workspace.git_dirty,
         git_untracked_count: workspace.git_untracked_count,
         git_remote_tracking_branch: workspace.git_remote_tracking_branch.clone(),
+        session_state_observed_at: Some(unix_timestamp()),
         workspace_warnings: workspace.workspace_warnings.clone(),
         approval_mode,
         execution_mode,
@@ -4269,6 +4270,7 @@ async fn update_session(
         git_remote_tracking_branch: prepared_workspace
             .as_ref()
             .map(|workspace| workspace.git_remote_tracking_branch.clone()),
+        session_state_observed_at: prepared_workspace.as_ref().map(|_| Some(unix_timestamp())),
         workspace_warnings: prepared_workspace
             .as_ref()
             .map(|workspace| workspace.workspace_warnings.clone()),
@@ -4294,6 +4296,7 @@ async fn update_session(
             None
         },
         last_error: None,
+        ..SessionPatch::default()
     };
 
     state.store.update_session(&session_id, patch)?;
@@ -9558,6 +9561,7 @@ mod tests {
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
@@ -9761,6 +9765,7 @@ mod tests {
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             scope: "workspace".to_string(),
             approval_mode: "ask".to_string(),
@@ -9989,6 +9994,7 @@ mod tests {
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
@@ -10392,6 +10398,7 @@ mod tests {
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
@@ -10483,6 +10490,7 @@ mod tests {
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             approval_mode: "ask".to_string(),
             execution_mode: "act".to_string(),
@@ -11203,6 +11211,7 @@ mod tests {
                 git_dirty: false,
                 git_untracked_count: 0,
                 git_remote_tracking_branch: String::new(),
+                session_state_observed_at: None,
                 workspace_warnings: Vec::new(),
                 approval_mode: "ask".to_string(),
                 execution_mode: "act".to_string(),
@@ -12811,6 +12820,7 @@ mod tests {
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             scope: "workspace".to_string(),
             approval_mode: "ask".to_string(),
