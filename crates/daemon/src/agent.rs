@@ -5089,12 +5089,14 @@ fn extract_target_entity_claims(final_answer: &str) -> Vec<ContextClaim> {
                 ("pull request #", "pr"),
                 ("issue #", "issue"),
             ] {
-                for number in numbers_after_marker(&lower, marker) {
+                for (number, marker_start, number_end) in
+                    number_mentions_after_marker(&lower, marker)
+                {
                     claims.push(ContextClaim {
                         claim_text: sentence.clone(),
                         entity_type: "external_entity".to_string(),
                         identifier: format!("{entity}#{number}"),
-                        action: external_action(&lower),
+                        action: external_action_near(&lower, marker_start, number_end),
                     });
                 }
             }
@@ -5272,10 +5274,18 @@ fn number_after_marker(text: &str, marker: &str) -> Option<String> {
 }
 
 fn numbers_after_marker(text: &str, marker: &str) -> Vec<String> {
+    number_mentions_after_marker(text, marker)
+        .into_iter()
+        .map(|(number, _, _)| number)
+        .collect()
+}
+
+fn number_mentions_after_marker(text: &str, marker: &str) -> Vec<(String, usize, usize)> {
     let mut numbers = Vec::new();
     let mut offset = 0;
     while let Some(relative_start) = text.get(offset..).and_then(|rest| rest.find(marker)) {
-        let number_start = offset + relative_start + marker.len();
+        let marker_start = offset + relative_start;
+        let number_start = marker_start + marker.len();
         let Some(rest) = text.get(number_start..) else {
             break;
         };
@@ -5285,7 +5295,8 @@ fn numbers_after_marker(text: &str, marker: &str) -> Vec<String> {
             .collect::<String>();
         let advance = marker.len() + number.len().max(1);
         if !number.is_empty() {
-            numbers.push(number);
+            let number_end = number_start + number.len();
+            numbers.push((number, marker_start, number_end));
         }
         offset += relative_start + advance;
     }
@@ -5298,6 +5309,7 @@ fn extract_branch_claim(sentence: &str, lower: &str) -> Option<ContextClaim> {
         ("merged branch ", "merged"),
         ("checked out branch ", "checked_out"),
         ("switched to branch ", "checked_out"),
+        ("switched branch to ", "checked_out"),
         ("switched branch ", "checked_out"),
     ] {
         if let Some(branch) = token_after_phrase(sentence, phrase) {
@@ -5379,6 +5391,29 @@ fn external_action(lower: &str) -> String {
         }
     }
     "referenced".to_string()
+}
+
+fn external_action_near(lower: &str, marker_start: usize, number_end: usize) -> String {
+    let actions = ["opened", "created", "published", "referenced", "closed"];
+    let mut best: Option<(usize, &str)> = None;
+    for action in actions {
+        let mut offset = 0;
+        while let Some(relative_start) = lower.get(offset..).and_then(|rest| rest.find(action)) {
+            let action_start = offset + relative_start;
+            let action_end = action_start + action.len();
+            let distance = if action_end <= marker_start {
+                marker_start - action_end
+            } else {
+                action_start.saturating_sub(number_end)
+            };
+            if best.map_or(true, |(best_distance, _)| distance < best_distance) {
+                best = Some((distance, action));
+            }
+            offset = action_end;
+        }
+    }
+    best.map(|(_, action)| action.to_string())
+        .unwrap_or_else(|| external_action(lower))
 }
 
 fn command_claim_identifier(lower: &str) -> String {
@@ -22435,6 +22470,32 @@ Cleanup status: clean";
                 detail: format!("job_id={} failed publication evidence for PR #777", job.id),
             })
             .expect("failed audit event should append");
+        state
+            .store
+            .append_audit_event(AuditEventRecord {
+                kind: "publication".to_string(),
+                target: format!("job:{}", job.id),
+                status: "success".to_string(),
+                summary: "issue #12 closed".to_string(),
+                detail: format!(
+                    "job_id={} daemon publication evidence for issue #12 closed",
+                    job.id
+                ),
+            })
+            .expect("closed issue audit event should append");
+        state
+            .store
+            .append_audit_event(AuditEventRecord {
+                kind: "publication".to_string(),
+                target: format!("job:{}", job.id),
+                status: "success".to_string(),
+                summary: "PR #34 opened".to_string(),
+                detail: format!(
+                    "job_id={} daemon publication evidence for PR #34 opened",
+                    job.id
+                ),
+            })
+            .expect("opened pr audit event should append");
 
         let mut branch_command =
             test_command_session_with_cwd("cmd-branch", repo.worktree.to_str().unwrap());
@@ -22490,6 +22551,20 @@ Cleanup status: clean";
         )
         .expect("branch command evidence should derive");
         assert_eq!(branch_command_happy["status"], "satisfied");
+
+        let mut switch_command =
+            test_command_session_with_cwd("cmd-switch", repo.worktree.to_str().unwrap());
+        switch_command.command = "git".to_string();
+        switch_command.args = vec!["switch".to_string(), "existing-branch".to_string()];
+        let switched_branch_to = target_entity_evidence(
+            &state,
+            &session,
+            &job,
+            &[switch_command],
+            "switched branch to existing-branch.",
+        )
+        .expect("switched branch evidence should derive");
+        assert_eq!(switched_branch_to["status"], "satisfied");
 
         let mut branch_prefix_command =
             test_command_session_with_cwd("cmd-branch-prefix", repo.worktree.to_str().unwrap());
@@ -22615,6 +22690,16 @@ Cleanup status: clean";
                 .iter()
                 .any(|claim| claim["identifier"] == "pr#124")
         );
+
+        let mixed_external_actions = target_entity_evidence(
+            &state,
+            &session,
+            &job,
+            &[],
+            "closed issue #12 and opened PR #34.",
+        )
+        .expect("mixed external action evidence should derive");
+        assert_eq!(mixed_external_actions["status"], "satisfied");
 
         let wrong_external_action =
             target_entity_evidence(&state, &session, &job, &[], "PR #123 closed")
