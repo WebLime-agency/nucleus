@@ -4204,15 +4204,6 @@ async fn complete_job_with_final_answer(
         &session.session.working_dir,
         &mut publication_patch,
     );
-    state
-        .agent
-        .terminate_job_command_sessions(
-            job_id,
-            "The job completed and closed any remaining Nucleus-owned command sessions.",
-            "closed",
-        )
-        .await;
-
     if detail.job.browser_verification_required
         && matches!(
             detail.job.browser_verification_status.as_str(),
@@ -4244,9 +4235,18 @@ async fn complete_job_with_final_answer(
         });
     }
 
-    let completion_job =
+    let completion_job_result =
         record_context_integrity_detection(state, &session.session, job_id, Some(final_answer))
-            .await?;
+            .await;
+    state
+        .agent
+        .terminate_job_command_sessions(
+            job_id,
+            "The job completed and closed any remaining Nucleus-owned command sessions.",
+            "closed",
+        )
+        .await;
+    let completion_job = completion_job_result?;
     reconcile_publication_browser_status_with_completion(&completion_job, &mut publication_patch);
     let projected_blocker = projected_completion_gate_blocker(&completion_job, &publication_patch);
     let terminal_job_state = if projected_blocker.is_some() {
@@ -19390,6 +19390,167 @@ Cleanup status: clean";
         assert_eq!(
             completed.data_json["final_response_artifacts"][0]["metadata_json"]["target"],
             "issue-209"
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn terminal_projection_uses_process_observation_before_command_cleanup() {
+        let state_dir = test_state_dir("terminal-process-before-cleanup");
+        let state = initialize_test_state(&state_dir);
+        let repo = context_integrity_repo(&state_dir, "terminal-process");
+        run_git_test(&repo.worktree, &["fetch", "origin", "dev"]);
+        run_git_test(&repo.worktree, &["reset", "--hard", "origin/dev"]);
+        let working_dir = repo.worktree.clone();
+        let session_id = "session-terminal-process-before-cleanup";
+        let job_id = "job-terminal-process-before-cleanup";
+        let worker_id = "worker-terminal-process-before-cleanup";
+
+        let mut session_record =
+            test_session_record(session_id, "Terminal process before cleanup", &working_dir);
+        session_record.working_dir_kind = "project_root".to_string();
+        session_record.workspace_mode = "isolated_worktree".to_string();
+        session_record.project_path = repo.source.display().to_string();
+        session_record.source_project_path = repo.source.display().to_string();
+        session_record.git_root = repo.worktree.display().to_string();
+        session_record.worktree_path = repo.worktree.display().to_string();
+        session_record.git_branch = "dev".to_string();
+        session_record.git_base_ref = "dev".to_string();
+        session_record.git_head = repo.canonical_sha.clone();
+        state
+            .store
+            .create_session(session_record)
+            .expect("session should persist");
+        state
+            .store
+            .create_job(JobRecord {
+                id: job_id.to_string(),
+                session_id: Some(session_id.to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("process_server".to_string()),
+                title: "Complete with running port".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "manual".to_string(),
+                state: "running".to_string(),
+                requested_by: "test".to_string(),
+                prompt_excerpt: String::new(),
+                publication_intent_text: None,
+            })
+            .expect("job should persist");
+        let mut worker = state
+            .store
+            .create_worker(WorkerRecord {
+                id: worker_id.to_string(),
+                job_id: job_id.to_string(),
+                parent_worker_id: None,
+                title: "Root utility worker".to_string(),
+                lane: "utility".to_string(),
+                state: "running".to_string(),
+                provider: "test".to_string(),
+                model: "test".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: working_dir.display().to_string(),
+                read_roots: vec![working_dir.display().to_string()],
+                write_roots: vec![working_dir.display().to_string()],
+                max_steps: 10,
+                max_tool_calls: 10,
+                max_wall_clock_secs: 30,
+            })
+            .expect("worker should persist");
+        state
+            .store
+            .update_job(
+                job_id,
+                JobPatch {
+                    root_worker_id: Some(worker_id.to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("job should update");
+        state
+            .store
+            .create_command_session(CommandSessionRecord {
+                id: "cmd-running-port".to_string(),
+                job_id: job_id.to_string(),
+                worker_id: worker_id.to_string(),
+                tool_call_id: None,
+                mode: "interactive".to_string(),
+                title: "Dev server".to_string(),
+                state: "running".to_string(),
+                command: "npm".to_string(),
+                args: vec!["run".to_string(), "dev".to_string()],
+                cwd: working_dir.display().to_string(),
+                session_id: session_id.to_string(),
+                project_id: String::new(),
+                worktree_path: working_dir.display().to_string(),
+                branch: String::new(),
+                port: Some(4321),
+                env_json: json!({}),
+                network_policy: "inherit".to_string(),
+                timeout_secs: 30,
+                output_limit_bytes: 1024,
+                last_error: String::new(),
+                exit_code: None,
+                stdout_artifact_id: None,
+                stderr_artifact_id: None,
+                started_at: Some(7),
+                completed_at: None,
+            })
+            .expect("command session should persist");
+        state
+            .store
+            .append_job_event(JobEventRecord {
+                job_id: job_id.to_string(),
+                worker_id: Some(worker_id.to_string()),
+                event_type: "job.process.observed".to_string(),
+                status: "success".to_string(),
+                summary: "Server process running and port listener observed".to_string(),
+                detail: "Daemon recorded process state and port listener evidence.".to_string(),
+                data_json: json!({}),
+            })
+            .expect("process evidence event should persist");
+
+        let session = state
+            .store
+            .get_session(session_id)
+            .expect("session should load");
+        complete_job_with_final_answer(
+            &state,
+            &session,
+            job_id,
+            &mut worker,
+            2,
+            1,
+            "Port ready",
+            "Port 4321 is ready.",
+            &json!({}),
+            &[],
+        )
+        .await
+        .expect("job should complete");
+
+        let detail = state.store.get_job(job_id).expect("job should load");
+        assert_eq!(detail.job.state, "completed");
+        let process_evidence: Value = serde_json::from_str(
+            detail
+                .job
+                .process_state_evidence_json
+                .as_deref()
+                .expect("process evidence should persist"),
+        )
+        .expect("process evidence should parse");
+        assert_eq!(process_evidence["status"], "satisfied");
+        assert!(
+            process_evidence["claims"][0]["last_observed_state"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("state=running")
         );
 
         let _ = fs::remove_dir_all(&state_dir);
