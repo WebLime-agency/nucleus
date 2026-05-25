@@ -4932,7 +4932,10 @@ fn target_entity_evidence(
 
     let audit_events = state
         .store
-        .list_audit_events_since(job.created_at.saturating_sub(1))?;
+        .list_audit_events_since(job.created_at.saturating_sub(1))?
+        .into_iter()
+        .filter(|event| audit_event_matches_job(event, job))
+        .collect::<Vec<_>>();
     let mut verified = Vec::new();
     for claim in claims {
         let result = match claim.entity_type.as_str() {
@@ -5287,6 +5290,8 @@ fn command_claim_identifier(lower: &str) -> String {
         "npm run check".to_string()
     } else if lower.contains("npm test") {
         "npm test".to_string()
+    } else if lower.contains("command succeeded") || lower.contains("command passed") {
+        "command".to_string()
     } else {
         "test".to_string()
     }
@@ -5405,14 +5410,14 @@ fn verify_external_entity_claim(
         json!({
             "status": "satisfied",
             "reason": "matching daemon audit event recorded",
-            "daemon_evidence_searched": "audit_events kind/target/summary/detail since job start",
+            "daemon_evidence_searched": "current job audit_events kind/target/summary/detail since job start",
             "matched": true,
         })
     } else {
         json!({
             "status": "blocked",
             "reason": "claim references external entity with no daemon evidence",
-            "daemon_evidence_searched": "audit_events kind/target/summary/detail since job start",
+            "daemon_evidence_searched": "current job audit_events kind/target/summary/detail since job start",
         })
     }
 }
@@ -5570,12 +5575,27 @@ fn command_claim_matches_session(
     command_session: &CommandSessionSummary,
 ) -> bool {
     let text = command_session_text(&command_session.command, &command_session.args);
+    if identifier == "command" {
+        return !text.trim().is_empty();
+    }
     if identifier == "test" {
         return is_validation_command(&text) && text.contains("test");
     }
     identifier
         .split_whitespace()
         .all(|token| text.contains(token))
+}
+
+fn audit_event_matches_job(event: &nucleus_protocol::AuditEvent, job: &JobSummary) -> bool {
+    let job_target = format!("job:{}", job.id);
+    if event.target == job_target {
+        return true;
+    }
+    let job_id_field = format!("job_id={}", job.id);
+    let job_id_json = format!("\"job_id\":\"{}\"", job.id);
+    [&event.target, &event.summary, &event.detail]
+        .iter()
+        .any(|value| value.contains(&job_id_field) || value.contains(&job_id_json))
 }
 
 fn successful_command_mentions(
@@ -22040,12 +22060,22 @@ Cleanup status: clean";
             .store
             .append_audit_event(AuditEventRecord {
                 kind: "publication".to_string(),
-                target: "pr #123".to_string(),
+                target: format!("job:{}", job.id),
                 status: "success".to_string(),
                 summary: "PR #123 opened".to_string(),
-                detail: "daemon publication evidence for PR #123".to_string(),
+                detail: format!("job_id={} daemon publication evidence for PR #123", job.id),
             })
             .expect("audit event should append");
+        state
+            .store
+            .append_audit_event(AuditEventRecord {
+                kind: "publication".to_string(),
+                target: "job:other-job".to_string(),
+                status: "success".to_string(),
+                summary: "PR #555 opened".to_string(),
+                detail: "job_id=other-job daemon publication evidence for PR #555".to_string(),
+            })
+            .expect("unrelated audit event should append");
 
         let happy = target_entity_evidence(
             &state,
@@ -22112,6 +22142,11 @@ Cleanup status: clean";
             blocked_external["claims"][0]["reason"],
             "claim references external entity with no daemon evidence"
         );
+
+        let unrelated_external =
+            target_entity_evidence(&state, &session, &job, &[], "PR #555 opened")
+                .expect("external evidence should derive");
+        assert_eq!(unrelated_external["status"], "blocked");
 
         let no_claims = target_entity_evidence(&state, &session, &job, &[], "No blockers remain.")
             .expect("no-claim evidence should derive");
@@ -22195,6 +22230,18 @@ Cleanup status: clean";
             invalid_port_pending["claims"][0]["reason"],
             "port claim is not a valid u16"
         );
+
+        let mut build = test_command_session_with_cwd("cmd-build", "/tmp");
+        build.command = "cargo".to_string();
+        build.args = vec!["build".to_string()];
+        build.exit_code = Some(0);
+        build.completed_at = Some(88);
+        build.updated_at = 88;
+        let generic_command = process_state_evidence(&state, &[build], "The command succeeded.")
+            .await
+            .expect("generic command evidence should derive");
+        assert_eq!(generic_command["status"], "satisfied");
+        assert_eq!(generic_command["claims"][0]["identifier"], "command");
 
         let no_claims = process_state_evidence(&state, &[], "No process claims here.")
             .await
