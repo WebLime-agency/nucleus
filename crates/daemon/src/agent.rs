@@ -4973,11 +4973,28 @@ async fn process_state_evidence(
         }));
     }
 
-    let browser_observation = state.browser.observe_sidecar().await?;
+    let browser_observation = if claims
+        .iter()
+        .any(|claim| claim.entity_type == "browser_sidecar")
+    {
+        Some(state.browser.observe_sidecar().await.map_err(|error| {
+            json!({
+                "status": "pending",
+                "reason": format!("browser observation failed: {error}"),
+                "daemon_evidence_searched": "browser sidecar process handle",
+            })
+        }))
+    } else {
+        None
+    };
     let mut verified = Vec::new();
     for claim in claims {
         let result = match claim.entity_type.as_str() {
-            "browser_sidecar" => verify_browser_claim(&browser_observation, &claim),
+            "browser_sidecar" => match &browser_observation {
+                Some(Ok(observation)) => verify_browser_claim(observation, &claim),
+                Some(Err(error_result)) => error_result.clone(),
+                None => verify_browser_claim(&None, &claim),
+            },
             "command_session" => verify_command_success_claim(command_sessions, &claim),
             "port" => verify_port_claim(command_sessions, &claim),
             _ => json!({
@@ -5115,6 +5132,7 @@ fn extract_process_state_claims(final_answer: &str) -> Vec<ContextClaim> {
                 &lower,
                 &["ready", "healthy", "running", "listening", "available"],
             )
+            && !is_negated_port_health_claim(&lower)
         {
             if let Some(port) = number_after_marker(&lower, "port ") {
                 claims.push(ContextClaim {
@@ -5308,6 +5326,28 @@ fn is_negated_browser_health_claim(lower: &str) -> bool {
             "isn't ready",
             "isn't healthy",
             "isn't running",
+            "isn't available",
+            "unavailable",
+            "unhealthy",
+            "failed",
+            "failure",
+        ],
+    )
+}
+
+fn is_negated_port_health_claim(lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "not ready",
+            "not healthy",
+            "not running",
+            "not listening",
+            "not available",
+            "isn't ready",
+            "isn't healthy",
+            "isn't running",
+            "isn't listening",
             "isn't available",
             "unavailable",
             "unhealthy",
@@ -22347,6 +22387,12 @@ Cleanup status: clean";
             .expect("negated browser evidence should derive");
         assert_eq!(negated_browser["status"], "satisfied");
         assert!(negated_browser["claims"].as_array().unwrap().is_empty());
+
+        let negated_port = process_state_evidence(&state, &[], "Port 3000 is not running.")
+            .await
+            .expect("negated port evidence should derive");
+        assert_eq!(negated_port["status"], "satisfied");
+        assert!(negated_port["claims"].as_array().unwrap().is_empty());
 
         let browser = verify_browser_claim(
             &Some(crate::browser::BrowserSidecarObservation {
