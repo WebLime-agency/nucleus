@@ -5238,7 +5238,15 @@ fn sanitize_claim_token(value: &str) -> Option<String> {
             .to_string()
     };
     let token = token
-        .trim_matches(|c: char| matches!(c, '`' | '"' | '\'' | ',' | ':' | ')' | '(' | '[' | ']'))
+        .trim_start_matches(|c: char| {
+            matches!(c, '`' | '"' | '\'' | ',' | ':' | ')' | '(' | '[' | ']')
+        })
+        .trim_end_matches(|c: char| {
+            matches!(
+                c,
+                '`' | '"' | '\'' | ',' | ':' | '.' | ')' | '(' | '[' | ']'
+            )
+        })
         .to_string();
     (!token.is_empty()).then_some(token)
 }
@@ -5310,7 +5318,7 @@ fn verify_branch_claim(
             "matched": true,
         });
     }
-    if successful_command_mentions(command_sessions, &["git", &claim.action, &claim.identifier]) {
+    if successful_branch_command_mentions(command_sessions, claim) {
         return json!({
             "status": "satisfied",
             "reason": "daemon-recorded command session mentions the branch action",
@@ -5494,10 +5502,16 @@ fn verify_command_success_claim(
 }
 
 fn verify_port_claim(command_sessions: &[CommandSessionSummary], claim: &ContextClaim) -> Value {
-    let port = claim.identifier.parse::<u16>().ok();
+    let Ok(port) = claim.identifier.parse::<u16>() else {
+        return json!({
+            "status": "pending",
+            "reason": "port claim is not a valid u16",
+            "daemon_evidence_searched": format!("command_sessions with recorded port {}", claim.identifier),
+        });
+    };
     let mut matching = command_sessions
         .iter()
-        .filter(|command_session| command_session.port == port)
+        .filter(|command_session| command_session.port == Some(port))
         .collect::<Vec<_>>();
     matching.sort_by_key(|command_session| {
         (
@@ -7601,6 +7615,28 @@ fn has_thread_aware_pr_review_evidence(
                 })
         })
     })
+}
+
+fn successful_branch_command_mentions(
+    command_sessions: &[CommandSessionSummary],
+    claim: &ContextClaim,
+) -> bool {
+    let branch = claim.identifier.as_str();
+    let variants: Vec<Vec<&str>> = match claim.action.as_str() {
+        "merged" => vec![vec!["git", "merge", branch]],
+        "checked_out" => vec![
+            vec!["git", "checkout", branch],
+            vec!["git", "switch", branch],
+        ],
+        _ => vec![
+            vec!["git", "branch", branch],
+            vec!["git", "checkout", "-b", branch],
+            vec!["git", "switch", "-c", branch],
+        ],
+    };
+    variants
+        .iter()
+        .any(|needles| successful_command_mentions(command_sessions, needles))
 }
 
 fn has_test_validation_evidence(
@@ -22016,10 +22052,35 @@ Cleanup status: clean";
             &session,
             &job,
             &[],
-            "created file created.txt\nbranch existing-branch created\nPR #123 opened",
+            "created file created.txt.\nbranch existing-branch created.\nPR #123 opened.",
         )
         .expect("target evidence should derive");
         assert_eq!(happy["status"], "satisfied");
+        let happy_claims = happy["claims"].as_array().expect("claims should be array");
+        assert!(
+            happy_claims
+                .iter()
+                .any(|claim| claim["identifier"] == "created.txt")
+        );
+        assert!(
+            happy_claims
+                .iter()
+                .any(|claim| claim["identifier"] == "existing-branch")
+        );
+
+        let mut merge_command =
+            test_command_session_with_cwd("cmd-merge", repo.worktree.to_str().unwrap());
+        merge_command.command = "git".to_string();
+        merge_command.args = vec!["merge".to_string(), "merged-away".to_string()];
+        let branch_command_happy = target_entity_evidence(
+            &state,
+            &session,
+            &job,
+            &[merge_command],
+            "branch merged-away merged.",
+        )
+        .expect("branch command evidence should derive");
+        assert_eq!(branch_command_happy["status"], "satisfied");
 
         let blocked_branch =
             target_entity_evidence(&state, &session, &job, &[], "branch missing-branch created")
@@ -22122,6 +22183,17 @@ Cleanup status: clean";
                 .as_str()
                 .unwrap_or_default()
                 .contains("state=failed")
+        );
+
+        let invalid_port = test_command_session_with_cwd("cmd-no-port", "/tmp");
+        let invalid_port_pending =
+            process_state_evidence(&state, &[invalid_port], "Port 99999 is ready.")
+                .await
+                .expect("invalid port evidence should derive");
+        assert_eq!(invalid_port_pending["status"], "pending");
+        assert_eq!(
+            invalid_port_pending["claims"][0]["reason"],
+            "port claim is not a valid u16"
         );
 
         let no_claims = process_state_evidence(&state, &[], "No process claims here.")
