@@ -5110,22 +5110,7 @@ fn extract_process_state_claims(final_answer: &str) -> Vec<ContextClaim> {
                 action: "healthy".to_string(),
             });
         }
-        if contains_any(
-            &lower,
-            &[
-                "tests passed",
-                "test passed",
-                "tests succeeded",
-                "test succeeded",
-                "tests showed",
-                "test showed",
-                "command succeeded",
-                "command passed",
-                "cargo test passed",
-                "npm test passed",
-                "npm run check passed",
-            ],
-        ) {
+        if is_process_success_claim(&lower) {
             claims.push(ContextClaim {
                 claim_text: sentence.clone(),
                 entity_type: "command_session".to_string(),
@@ -5167,6 +5152,24 @@ fn claim_sentences(text: &str) -> Vec<String> {
 
 fn contains_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
+}
+
+fn is_process_success_claim(lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "tests passed",
+            "test passed",
+            "tests succeeded",
+            "test succeeded",
+            "command succeeded",
+            "command passed",
+            "cargo test passed",
+            "npm test passed",
+            "npm run check passed",
+        ],
+    ) || ((lower.contains("tests showed") || lower.contains("test showed"))
+        && contains_any(lower, &["pass", "passing", "succeed", "success"]))
 }
 
 fn command_session_text(command: &str, args: &[String]) -> String {
@@ -6849,8 +6852,6 @@ fn context_integrity_start_blocker(job: &JobSummary) -> Option<String> {
                     | "branch_repo_consistent"
                     | "cwd_consistent"
                     | "session_state_consistent"
-                    | "target_entity_consistent"
-                    | "process_state_consistent"
             ) && gate.state == "blocked"
         })
         .map(|gate| gate.summary.clone())
@@ -22179,6 +22180,12 @@ Cleanup status: clean";
                 .contains("exit_code=1")
         );
 
+        let truthful_failure = process_state_evidence(&state, &[], "Tests showed failures.")
+            .await
+            .expect("truthful failure evidence should derive");
+        assert_eq!(truthful_failure["status"], "satisfied");
+        assert!(truthful_failure["claims"].as_array().unwrap().is_empty());
+
         let browser = verify_browser_claim(
             &Some(crate::browser::BrowserSidecarObservation {
                 base_url: "http://127.0.0.1:65535".to_string(),
@@ -23129,6 +23136,32 @@ Cleanup status: clean";
         )
         .expect("pending process-state gate should block terminal projection");
         assert!(blocker.contains("Process and port evidence is pending"));
+
+        let mut stale_terminal_claims = test_publication_job_summary("stale-terminal-claims");
+        stale_terminal_claims.completion_gates = vec![
+            nucleus_protocol::CompletionGateSummary {
+                id: "target_entity_consistent".to_string(),
+                title: "Target entity evidence".to_string(),
+                state: "blocked".to_string(),
+                summary: "Target-entity evidence is blocked: stale claim".to_string(),
+                task_class: "local_project".to_string(),
+                required_evidence: Vec::new(),
+                evidence: Vec::new(),
+            },
+            nucleus_protocol::CompletionGateSummary {
+                id: "process_state_consistent".to_string(),
+                title: "Process and port evidence".to_string(),
+                state: "blocked".to_string(),
+                summary: "Process and port evidence is blocked: stale claim".to_string(),
+                task_class: "local_project".to_string(),
+                required_evidence: Vec::new(),
+                evidence: Vec::new(),
+            },
+        ];
+        assert!(
+            context_integrity_start_blocker(&stale_terminal_claims).is_none(),
+            "terminal-only claim evidence should not block the next start projection"
+        );
     }
 
     #[tokio::test]
