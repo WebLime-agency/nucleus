@@ -5089,14 +5089,13 @@ fn extract_target_entity_claims(final_answer: &str) -> Vec<ContextClaim> {
                 ("pull request #", "pr"),
                 ("issue #", "issue"),
             ] {
-                if let Some(number) = number_after_marker(&lower, marker) {
+                for number in numbers_after_marker(&lower, marker) {
                     claims.push(ContextClaim {
                         claim_text: sentence.clone(),
                         entity_type: "external_entity".to_string(),
                         identifier: format!("{entity}#{number}"),
                         action: external_action(&lower),
                     });
-                    break;
                 }
             }
         }
@@ -5269,13 +5268,28 @@ fn sanitize_claim_token(value: &str) -> Option<String> {
 }
 
 fn number_after_marker(text: &str, marker: &str) -> Option<String> {
-    let start = text.find(marker)? + marker.len();
-    let number = text
-        .get(start..)?
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>();
-    (!number.is_empty()).then_some(number)
+    numbers_after_marker(text, marker).into_iter().next()
+}
+
+fn numbers_after_marker(text: &str, marker: &str) -> Vec<String> {
+    let mut numbers = Vec::new();
+    let mut offset = 0;
+    while let Some(relative_start) = text.get(offset..).and_then(|rest| rest.find(marker)) {
+        let number_start = offset + relative_start + marker.len();
+        let Some(rest) = text.get(number_start..) else {
+            break;
+        };
+        let number = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>();
+        let advance = marker.len() + number.len().max(1);
+        if !number.is_empty() {
+            numbers.push(number);
+        }
+        offset += relative_start + advance;
+    }
+    numbers
 }
 
 fn extract_branch_claim(sentence: &str, lower: &str) -> Option<ContextClaim> {
@@ -5728,11 +5742,23 @@ fn command_claim_matches_session(
         return !text.trim().is_empty();
     }
     if identifier == "test" {
-        return is_validation_command(&text) && tokens.iter().any(|token| token == "test");
+        return is_validation_command(&text)
+            && tokens
+                .iter()
+                .any(|token| command_claim_token_matches("test", token));
     }
-    identifier
-        .split_whitespace()
-        .all(|token| tokens.iter().any(|candidate| candidate == token))
+    identifier.split_whitespace().all(|token| {
+        tokens
+            .iter()
+            .any(|candidate| command_claim_token_matches(token, candidate))
+    })
+}
+
+fn command_claim_token_matches(required: &str, candidate: &str) -> bool {
+    candidate == required
+        || candidate
+            .strip_prefix(required)
+            .is_some_and(|suffix| suffix.starts_with(':'))
 }
 
 fn audit_event_matches_job(event: &nucleus_protocol::AuditEvent, job: &JobSummary) -> bool {
@@ -22578,6 +22604,18 @@ Cleanup status: clean";
                 .any(|claim| claim["identifier"] == "pr#124")
         );
 
+        let missing_second_inline_external =
+            target_entity_evidence(&state, &session, &job, &[], "Opened PR #123 and PR #124.")
+                .expect("inline external evidence should derive");
+        assert_eq!(missing_second_inline_external["status"], "blocked");
+        assert!(
+            missing_second_inline_external["claims"]
+                .as_array()
+                .expect("claims should be array")
+                .iter()
+                .any(|claim| claim["identifier"] == "pr#124")
+        );
+
         let wrong_external_action =
             target_entity_evidence(&state, &session, &job, &[], "PR #123 closed")
                 .expect("external action evidence should derive");
@@ -22716,6 +22754,17 @@ Cleanup status: clean";
             .await
             .expect("command prefix evidence should derive");
         assert_eq!(command_prefix["status"], "pending");
+
+        let mut check_web = test_command_session_with_cwd("cmd-check-web", "/tmp");
+        check_web.command = "npm".to_string();
+        check_web.args = vec!["run".to_string(), "check:web".to_string()];
+        check_web.exit_code = Some(0);
+        check_web.completed_at = Some(44);
+        check_web.updated_at = 44;
+        let colon_script = process_state_evidence(&state, &[check_web], "npm run check passed.")
+            .await
+            .expect("colon script evidence should derive");
+        assert_eq!(colon_script["status"], "satisfied");
 
         let no_claims = process_state_evidence(&state, &[], "No process claims here.")
             .await
