@@ -301,6 +301,7 @@ jobs:
           test -d "${install_root}/current/node_modules/playwright-core"
 
       - name: Push stable version bump and tag
+        id: stable_source_push
         if: steps.release.outputs.channel == 'stable'
         env:
           VERSION: ${{ steps.release.outputs.version }}
@@ -319,10 +320,16 @@ jobs:
           git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
 
           push_url="https://x-access-token:${RELEASE_PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          previous_main="$(git ls-remote "${push_url}" refs/heads/main | awk '{ print $1 }')"
+          if [ -z "${previous_main}" ]; then
+            echo "::error::Could not resolve current origin/main before stable source push."
+            exit 1
+          fi
 
           git fetch --tags origin
           version_tag="v${VERSION}"
           push_refs=(HEAD:main)
+          tag_created=false
           if git rev-parse -q --verify "refs/tags/${version_tag}" >/dev/null; then
             tag_target="$(git rev-list -n 1 "${version_tag}")"
             if [ "${tag_target}" != "${SOURCE_SHA}" ]; then
@@ -333,6 +340,7 @@ jobs:
           else
             git tag -a "${version_tag}" "${SOURCE_SHA}" -m "Release ${version_tag}"
             push_refs+=("refs/tags/${version_tag}")
+            tag_created=true
           fi
 
           if ! git push --atomic "${push_url}" "${push_refs[@]}"; then
@@ -344,7 +352,15 @@ jobs:
             exit 1
           fi
 
+          {
+            echo "pushed=true"
+            echo "previous_main=${previous_main}"
+            echo "version_tag=${version_tag}"
+            echo "tag_created=${tag_created}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Publish channel release
+        id: publish_channel
         env:
           GH_TOKEN: ${{ github.token }}
           CHANNEL: ${{ steps.release.outputs.channel }}
@@ -408,6 +424,52 @@ jobs:
           done <<EOF
           ${PRUNED_ASSETS}
           EOF
+
+      - name: Roll back stable source refs after publish failure
+        if: ${{ failure() && steps.publish_channel.outcome == 'failure' && steps.release.outputs.channel == 'stable' && steps.stable_source_push.outputs.pushed == 'true' }}
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          SOURCE_SHA: ${{ steps.release.outputs.source_sha }}
+          PREVIOUS_MAIN: ${{ steps.stable_source_push.outputs.previous_main }}
+          VERSION_TAG: ${{ steps.stable_source_push.outputs.version_tag }}
+          TAG_CREATED: ${{ steps.stable_source_push.outputs.tag_created }}
+          RELEASE_PUSH_TOKEN: ${{ secrets.RELEASE_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
+          HAS_RELEASE_PUSH_TOKEN: ${{ secrets.RELEASE_PUSH_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+
+          push_url="https://x-access-token:${RELEASE_PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          rollback_refs=()
+
+          current_main="$(git ls-remote "${push_url}" refs/heads/main | awk '{ print $1 }')"
+          if [ "${current_main}" = "${SOURCE_SHA}" ]; then
+            rollback_refs+=("+${PREVIOUS_MAIN}:refs/heads/main")
+          else
+            echo "::warning::Skipping origin/main rollback because it moved from ${SOURCE_SHA} to ${current_main:-unknown}."
+          fi
+
+          if [ "${TAG_CREATED}" = "true" ]; then
+            tag_target="$(git ls-remote "${push_url}" "refs/tags/${VERSION_TAG}^{}" | awk '{ print $1 }')"
+            if [ "${tag_target}" = "${SOURCE_SHA}" ]; then
+              rollback_refs+=(":refs/tags/${VERSION_TAG}")
+            else
+              echo "::warning::Skipping ${VERSION_TAG} rollback because it no longer points at ${SOURCE_SHA}."
+            fi
+          fi
+
+          if [ "${#rollback_refs[@]}" -eq 0 ]; then
+            echo "No stable source refs needed rollback."
+            exit 0
+          fi
+
+          if ! git push --atomic "${push_url}" "${rollback_refs[@]}"; then
+            if [ "${HAS_RELEASE_PUSH_TOKEN}" != "true" ]; then
+              echo "::error::Publish failed after the stable source push, and rollback failed with the default GITHUB_TOKEN. Add a RELEASE_PUSH_TOKEN repo secret with contents: write permission scoped to allow push-to-main and tag pushes, then repair main/${VERSION_TAG} manually."
+            else
+              echo "::error::Publish failed after the stable source push, and rollback failed. Verify RELEASE_PUSH_TOKEN can update main and release tags, then repair main/${VERSION_TAG} manually."
+            fi
+            exit 1
+          fi
 
       - name: Validate published install
         env:
