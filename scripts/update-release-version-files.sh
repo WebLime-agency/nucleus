@@ -17,6 +17,10 @@ fi
 
 cd "${repo_root}"
 
+if [ -f Cargo.lock ]; then
+  cargo fetch --locked
+fi
+
 tmp_cargo="$(mktemp)"
 awk -v target="${version}" '
   BEGIN {
