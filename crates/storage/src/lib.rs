@@ -5138,8 +5138,7 @@ fn set_session_attachment(
         "
         UPDATE sessions
         SET attachment_mode = ?2,
-            worktree_id = ?3,
-            updated_at = unixepoch()
+            worktree_id = ?3
         WHERE id = ?1
           AND (attachment_mode <> ?2 OR worktree_id <> ?3)
         ",
@@ -10895,12 +10894,21 @@ mod tests {
         let (mode, worktree_id) = session_attachment(&connection, "alpha-worktree-session");
         assert_eq!(mode, "new_worktree");
         assert_eq!(worktree_id, alpha_worktrees[0].id);
+        assert_eq!(
+            session_updated_at(&connection, "alpha-worktree-session"),
+            100
+        );
         let (mode, worktree_id) = session_attachment(&connection, "alpha-project-root-session");
         assert_eq!(mode, "project_root");
         assert_eq!(worktree_id, "");
+        assert_eq!(
+            session_updated_at(&connection, "alpha-project-root-session"),
+            100
+        );
         let (mode, worktree_id) = session_attachment(&connection, "scratch-session");
         assert_eq!(mode, "scratch");
         assert_eq!(worktree_id, "");
+        assert_eq!(session_updated_at(&connection, "scratch-session"), 100);
         drop(connection);
 
         let _ = fs::remove_dir_all(&state_dir);
@@ -13579,6 +13587,13 @@ and open a pull request to dev when it is ready."
                 )
                 .expect("legacy session project row should insert");
         }
+
+        connection
+            .execute(
+                "UPDATE sessions SET created_at = 100, updated_at = 100 WHERE id = ?1",
+                params![session_id],
+            )
+            .expect("legacy session timestamps should update");
     }
 
     fn session_attachment(connection: &Connection, session_id: &str) -> (String, String) {
@@ -13589,6 +13604,16 @@ and open a pull request to dev when it is ready."
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("session attachment should load")
+    }
+
+    fn session_updated_at(connection: &Connection, session_id: &str) -> i64 {
+        connection
+            .query_row(
+                "SELECT updated_at FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .expect("session timestamp should load")
     }
 
     fn worktree_state_rows(store: &StateStore) -> Vec<(String, String, String, String)> {
