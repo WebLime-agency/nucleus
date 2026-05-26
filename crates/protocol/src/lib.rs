@@ -71,6 +71,21 @@ pub struct SessionProjectSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeSummary {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    pub path: String,
+    pub branch: String,
+    pub base_ref: String,
+    pub base_commit: String,
+    pub origin_url: String,
+    pub status: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserFacingErrorSummary {
     pub code: String,
     pub title: String,
@@ -467,12 +482,11 @@ fn derive_completion_gates(job: &JobSummary) -> Vec<CompletionGateSummary> {
         gates.push(process_state_gate(job));
     }
 
-    if let Some(task_class) = task_class {
-        if !job.publication_requested || task_class != "github_pr" {
-            if let Some(gate) = task_class_gate(job, terminal, task_class) {
-                gates.push(gate);
-            }
-        }
+    if let Some(task_class) = task_class
+        && (!job.publication_requested || task_class != "github_pr")
+        && let Some(gate) = task_class_gate(job, terminal, task_class)
+    {
+        gates.push(gate);
     }
 
     gates
@@ -1463,6 +1477,7 @@ fn process_server_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummar
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evidence_contract_gate(
     id: &str,
     title: &str,
