@@ -517,6 +517,8 @@ pub struct JobPatch {
     pub branch_repo_status: Option<String>,
     pub branch_repo_reason: Option<String>,
     pub command_session_cwd_evidence_json: Option<Option<String>>,
+    pub target_entity_evidence_json: Option<Option<String>>,
+    pub process_state_evidence_json: Option<Option<String>>,
     pub last_resumed_at: Option<Option<i64>>,
 }
 
@@ -2600,7 +2602,9 @@ impl StateStore {
                 branch_repo_status = ?34,
                 branch_repo_reason = ?35,
                 command_session_cwd_evidence_json = ?36,
-                last_resumed_at = ?37,
+                target_entity_evidence_json = ?37,
+                process_state_evidence_json = ?38,
+                last_resumed_at = ?39,
                 updated_at = unixepoch()
             WHERE id = ?1
             ",
@@ -2671,6 +2675,12 @@ impl StateStore {
                 patch
                     .command_session_cwd_evidence_json
                     .unwrap_or(current.command_session_cwd_evidence_json),
+                patch
+                    .target_entity_evidence_json
+                    .unwrap_or(current.target_entity_evidence_json),
+                patch
+                    .process_state_evidence_json
+                    .unwrap_or(current.process_state_evidence_json),
                 patch.last_resumed_at.unwrap_or(current.last_resumed_at),
             ],
         )?;
@@ -3537,6 +3547,8 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             branch_repo_status TEXT NOT NULL DEFAULT '',
             branch_repo_reason TEXT NOT NULL DEFAULT '',
             command_session_cwd_evidence_json TEXT,
+            target_entity_evidence_json TEXT,
+            process_state_evidence_json TEXT,
             last_resumed_at INTEGER,
             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
@@ -4608,6 +4620,8 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "command_session_cwd_evidence_json",
         "TEXT",
     )?;
+    ensure_column(connection, "jobs", "target_entity_evidence_json", "TEXT")?;
+    ensure_column(connection, "jobs", "process_state_evidence_json", "TEXT")?;
     ensure_column(connection, "jobs", "last_resumed_at", "INTEGER")?;
 
     for (column, definition) in [
@@ -7811,6 +7825,8 @@ fn load_job_summary(connection: &Connection, job_id: &str) -> Result<JobSummary>
                 branch_repo_status,
                 branch_repo_reason,
                 command_session_cwd_evidence_json,
+                target_entity_evidence_json,
+                process_state_evidence_json,
                 (
                     SELECT session_state_observed_at
                     FROM sessions
@@ -7908,7 +7924,9 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         branch_repo_status: row.get(40)?,
         branch_repo_reason: row.get(41)?,
         command_session_cwd_evidence_json: row.get(42)?,
-        session_state_observed_at: row.get(43)?,
+        target_entity_evidence_json: row.get(43)?,
+        process_state_evidence_json: row.get(44)?,
+        session_state_observed_at: row.get(45)?,
         task_evidence: Vec::new(),
         completion_status: String::new(),
         completion_gates: Vec::new(),
@@ -7916,7 +7934,7 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         worker_count: 0,
         pending_approval_count: 0,
         artifact_count: 0,
-        last_resumed_at: row.get(44)?,
+        last_resumed_at: row.get(46)?,
         last_reasoning: String::new(),
         last_reasoning_at: None,
         token_usage_known: false,
@@ -7924,8 +7942,8 @@ fn map_job_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobSummary> 
         completion_tokens: 0,
         cached_tokens: 0,
         cost_usd_estimate: None,
-        created_at: row.get(45)?,
-        updated_at: row.get(46)?,
+        created_at: row.get(47)?,
+        updated_at: row.get(48)?,
     })
 }
 
@@ -10906,6 +10924,22 @@ mod tests {
                         })
                         .to_string(),
                     )),
+                    target_entity_evidence_json: Some(Some(
+                        serde_json::json!({
+                            "status": "blocked",
+                            "reason": "one or more target-entity claims have no daemon evidence",
+                            "claims": [{"claim_text": "created file missing.txt", "entity_type": "file", "identifier": "missing.txt", "result": "blocked"}]
+                        })
+                        .to_string(),
+                    )),
+                    process_state_evidence_json: Some(Some(
+                        serde_json::json!({
+                            "status": "blocked",
+                            "reason": "one or more process or port claims contradict daemon observations",
+                            "claims": [{"claim_text": "Tests passed", "entity_type": "command_session", "identifier": "test", "result": "blocked"}]
+                        })
+                        .to_string(),
+                    )),
                     ..JobPatch::default()
                 },
             )
@@ -10935,6 +10969,20 @@ mod tests {
                 .unwrap_or_default()
                 .contains("cmd-1")
         );
+        assert!(
+            updated
+                .target_entity_evidence_json
+                .as_deref()
+                .unwrap_or_default()
+                .contains("missing.txt")
+        );
+        assert!(
+            updated
+                .process_state_evidence_json
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Tests passed")
+        );
         assert_eq!(
             updated.metadata_json["worktree_base_override"]["allowed_behind_by"],
             1
@@ -10944,6 +10992,18 @@ mod tests {
                 .completion_gates
                 .iter()
                 .any(|gate| { gate.id == "worktree_base_fresh" && gate.state == "blocked" })
+        );
+        assert!(
+            updated
+                .completion_gates
+                .iter()
+                .any(|gate| { gate.id == "target_entity_consistent" && gate.state == "blocked" })
+        );
+        assert!(
+            updated
+                .completion_gates
+                .iter()
+                .any(|gate| { gate.id == "process_state_consistent" && gate.state == "blocked" })
         );
 
         let _ = fs::remove_dir_all(&state_dir);
