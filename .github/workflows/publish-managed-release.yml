@@ -20,8 +20,25 @@ on:
         description: Optional release identifier. Defaults to channel, version, timestamp, and source SHA.
         required: false
         type: string
+      version_mode:
+        description: How to resolve stable release versions.
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - explicit
+      bump:
+        description: Semver component to bump when version_mode=auto.
+        required: false
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
       version:
-        description: Optional product version override. Defaults to the workspace package version.
+        description: Explicit semantic version. Required when version_mode=explicit; ignored when version_mode=auto.
         required: false
         type: string
       retention_count:
@@ -62,8 +79,12 @@ jobs:
           INPUT_CHANNEL: ${{ github.event.inputs.channel || '' }}
           INPUT_SOURCE_REF: ${{ github.event.inputs.source_ref || '' }}
           INPUT_RELEASE_ID: ${{ github.event.inputs.release_id || '' }}
+          INPUT_VERSION_MODE: ${{ github.event.inputs.version_mode || 'auto' }}
+          INPUT_BUMP: ${{ github.event.inputs.bump || 'patch' }}
           INPUT_VERSION: ${{ github.event.inputs.version || '' }}
           INPUT_RETENTION_COUNT: ${{ github.event.inputs.retention_count || '' }}
+          RELEASE_PUSH_TOKEN: ${{ secrets.RELEASE_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
+          HAS_RELEASE_PUSH_TOKEN: ${{ secrets.RELEASE_PUSH_TOKEN != '' }}
         run: |
           set -euo pipefail
 
@@ -96,8 +117,67 @@ jobs:
             git checkout --detach "${source_ref}"
           fi
 
-          source_sha="$(git rev-parse HEAD)"
-          version="${INPUT_VERSION:-$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "nucleus-daemon") | .version')}"
+          if [ "${channel}" = "stable" ]; then
+            resolved_version="$(
+              VERSION_MODE="${INPUT_VERSION_MODE}" \
+              BUMP="${INPUT_BUMP}" \
+              VERSION="${INPUT_VERSION}" \
+              scripts/compute-release-version.sh
+            )"
+
+            scripts/update-release-version-files.sh "${resolved_version}"
+
+            git config user.name "${GITHUB_ACTOR}"
+            git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
+
+            push_url="https://x-access-token:${RELEASE_PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+            if git diff --quiet -- Cargo.toml Cargo.lock apps/web/package.json; then
+              echo "Version files already at ${resolved_version}; skipping release bump commit."
+            else
+              git add Cargo.toml Cargo.lock apps/web/package.json
+              git commit -m "chore(release): bump to v${resolved_version}"
+              if ! git push "${push_url}" HEAD:main; then
+                if [ "${HAS_RELEASE_PUSH_TOKEN}" != "true" ]; then
+                  echo "::error::Pushing the stable release bump to main failed with the default GITHUB_TOKEN. Add a RELEASE_PUSH_TOKEN repo secret with contents: write permission scoped to allow push-to-main, then rerun the workflow."
+                else
+                  echo "::error::Pushing the stable release bump to main failed. Verify RELEASE_PUSH_TOKEN has contents: write permission and can push to main."
+                fi
+                exit 1
+              fi
+            fi
+
+            source_sha="$(git rev-parse HEAD)"
+            version_tag="v${resolved_version}"
+            if git rev-parse -q --verify "refs/tags/${version_tag}" >/dev/null; then
+              tag_target="$(git rev-list -n 1 "${version_tag}")"
+              if [ "${tag_target}" != "${source_sha}" ]; then
+                echo "::error::Release tag ${version_tag} already exists at ${tag_target}, not current source ${source_sha}."
+                exit 1
+              fi
+              echo "Release tag ${version_tag} already exists at current source; skipping tag creation."
+            else
+              git tag -a "${version_tag}" -m "Release ${version_tag}"
+              if ! git push "${push_url}" "refs/tags/${version_tag}"; then
+                if [ "${HAS_RELEASE_PUSH_TOKEN}" != "true" ]; then
+                  echo "::error::Pushing ${version_tag} failed with the default GITHUB_TOKEN. Add a RELEASE_PUSH_TOKEN repo secret with contents: write permission scoped to allow tag pushes, then rerun the workflow."
+                else
+                  echo "::error::Pushing ${version_tag} failed. Verify RELEASE_PUSH_TOKEN has contents: write permission and can push release tags."
+                fi
+                exit 1
+              fi
+            fi
+
+            version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "nucleus-daemon") | .version')"
+            if [ "${version}" != "${resolved_version}" ]; then
+              echo "::error::cargo metadata resolved version ${version}, expected ${resolved_version}"
+              exit 1
+            fi
+          else
+            source_sha="$(git rev-parse HEAD)"
+            version="${INPUT_VERSION:-$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "nucleus-daemon") | .version')}"
+          fi
+
           timestamp="$(date -u +%Y%m%d%H%M%S)"
           release_id="${INPUT_RELEASE_ID:-nucleus-${channel}-${version}-${timestamp}-${source_sha:0:12}}"
           retention_count="${INPUT_RETENTION_COUNT:-10}"
@@ -116,6 +196,7 @@ jobs:
             echo "source_sha=${source_sha}"
             echo "source_short=${source_sha:0:12}"
             echo "version=${version}"
+            echo "resolved_version=${version}"
             echo "release_id=${release_id}"
             echo "retention_count=${retention_count}"
             echo "channel_tag=${channel_tag}"
