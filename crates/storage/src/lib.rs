@@ -19,7 +19,7 @@ use nucleus_protocol::{
     RunBudgetSummary, RuntimeSummary, SessionDetail, SessionProjectSummary, SessionSummary,
     SessionTurn, SessionTurnImage, SkillManifest, StorageSummary, ToolCallSummary,
     ToolCapabilitySummary, WorkerSummary, WorkspaceModelConfig, WorkspaceProfileSummary,
-    WorkspaceSummary,
+    WorkspaceSummary, WorktreeSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -932,6 +932,7 @@ impl StateStore {
         archive_bogus_interrogative_memory_fragments(&connection)?;
         ensure_local_auth_token_with_connection(&plan, &connection)?;
         sync_projects_with_connection(&connection)?;
+        backfill_session_worktrees_with_connection(&connection)?;
 
         Ok(Self {
             plan,
@@ -1138,11 +1139,10 @@ impl StateStore {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         update_workspace_profile_with_connection(&connection, profile_id, &patch)?;
 
-        if patch.is_default {
-            set_workspace_default_profile_id(&connection, profile_id)?;
-        } else if workspace_default_profile_id_optional(&connection)?
-            .as_deref()
-            .is_some_and(|current| current == profile_id)
+        if patch.is_default
+            || workspace_default_profile_id_optional(&connection)?
+                .as_deref()
+                .is_some_and(|current| current == profile_id)
         {
             set_workspace_default_profile_id(&connection, profile_id)?;
         }
@@ -1830,6 +1830,16 @@ impl StateStore {
     pub fn resolve_projects(&self, project_ids: &[String]) -> Result<Vec<ResolvedProject>> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         resolve_projects_with_connection(&connection, project_ids)
+    }
+
+    pub fn list_worktrees(&self, project_id: &str) -> Result<Vec<WorktreeSummary>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_worktrees_with_connection(&connection, project_id)
+    }
+
+    pub fn get_worktree(&self, id: &str) -> Result<Option<WorktreeSummary>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        load_worktree_summary_optional(&connection, id)
     }
 
     pub fn scratch_dir_for_session(&self, session_id: &str) -> Result<String> {
@@ -4028,6 +4038,23 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
 
+        CREATE TABLE IF NOT EXISTS worktrees (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            path TEXT NOT NULL UNIQUE,
+            branch TEXT NOT NULL DEFAULT '',
+            base_ref TEXT NOT NULL DEFAULT '',
+            base_commit TEXT NOT NULL DEFAULT '',
+            origin_url TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'archived')),
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_worktrees_project_id_status
+            ON worktrees(project_id, status);
+
         CREATE TABLE IF NOT EXISTS router_profiles (
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
@@ -4306,6 +4333,18 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "sessions",
         "workspace_warnings_json",
         "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column(
+        connection,
+        "sessions",
+        "attachment_mode",
+        "TEXT NOT NULL DEFAULT 'project_root' CHECK (attachment_mode IN ('new_worktree', 'project_root', 'scratch'))",
+    )?;
+    ensure_column(
+        connection,
+        "sessions",
+        "worktree_id",
+        "TEXT NOT NULL DEFAULT ''",
     )?;
     ensure_column(
         connection,
@@ -4944,6 +4983,199 @@ fn migrate_seeded_cli_defaults_to_protocol(connection: &Connection) -> Result<()
     Ok(())
 }
 
+fn backfill_session_worktrees_with_connection(connection: &Connection) -> Result<()> {
+    #[derive(Debug)]
+    struct SessionWorktreeBackfillRecord {
+        session_id: String,
+        project_id: Option<String>,
+        project_absolute_path: Option<String>,
+        project_origin_url: Option<String>,
+        worktree_path: String,
+        git_branch: String,
+        git_base_ref: String,
+        attachment_mode: String,
+        worktree_id: String,
+    }
+
+    let mut statement = connection.prepare(
+        "
+        SELECT
+            sessions.id,
+            projects.id,
+            projects.absolute_path,
+            projects.origin_url,
+            sessions.worktree_path,
+            sessions.git_branch,
+            sessions.git_base_ref,
+            sessions.attachment_mode,
+            sessions.worktree_id
+        FROM sessions
+        LEFT JOIN projects ON projects.id = COALESCE(
+            (
+                SELECT session_projects.project_id
+                FROM session_projects
+                WHERE session_projects.session_id = sessions.id
+                ORDER BY session_projects.is_primary DESC,
+                    session_projects.sort_order ASC,
+                    session_projects.project_id ASC
+                LIMIT 1
+            ),
+            NULLIF(sessions.project_id, '')
+        )
+        ORDER BY sessions.created_at ASC, sessions.id ASC
+        ",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(SessionWorktreeBackfillRecord {
+            session_id: row.get(0)?,
+            project_id: row.get(1)?,
+            project_absolute_path: row.get(2)?,
+            project_origin_url: row.get(3)?,
+            worktree_path: row.get(4)?,
+            git_branch: row.get(5)?,
+            git_base_ref: row.get(6)?,
+            attachment_mode: row.get(7)?,
+            worktree_id: row.get(8)?,
+        })
+    })?;
+    let records = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to inspect legacy session worktree rows")?;
+    drop(statement);
+
+    for record in records {
+        if record.attachment_mode != "project_root" || !record.worktree_id.trim().is_empty() {
+            continue;
+        }
+
+        let worktree_path = record.worktree_path.trim();
+        let Some(project_id) = record.project_id else {
+            if worktree_path.is_empty() {
+                set_session_attachment(connection, &record.session_id, "scratch", "")?;
+            } else {
+                tracing::warn!(
+                    session_id = %record.session_id,
+                    worktree_path = %worktree_path,
+                    "skipping session worktree backfill because no project is attached"
+                );
+            }
+            continue;
+        };
+        let project_absolute_path = record.project_absolute_path.unwrap_or_default();
+
+        if worktree_path.is_empty() || paths_match(worktree_path, &project_absolute_path) {
+            set_session_attachment(connection, &record.session_id, "project_root", "")?;
+            continue;
+        }
+
+        if !Path::new(worktree_path).exists() {
+            tracing::warn!(
+                session_id = %record.session_id,
+                worktree_path = %worktree_path,
+                project_id = %project_id,
+                "skipping session worktree backfill because the worktree path does not exist"
+            );
+            continue;
+        }
+
+        let worktree_id = stable_worktree_id(&project_id, worktree_path);
+        connection.execute(
+            "
+            INSERT INTO worktrees (
+                id,
+                project_id,
+                name,
+                path,
+                branch,
+                base_ref,
+                base_commit,
+                origin_url,
+                status
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', ?7, 'active')
+            ON CONFLICT(path) DO NOTHING
+            ",
+            params![
+                worktree_id,
+                project_id,
+                worktree_name_from_path(worktree_path),
+                worktree_path,
+                record.git_branch,
+                record.git_base_ref,
+                record
+                    .project_origin_url
+                    .as_deref()
+                    .map(redact_git_remote_url_userinfo)
+                    .unwrap_or_default(),
+            ],
+        )?;
+
+        let existing = load_worktree_summary_by_path(connection, worktree_path)?;
+        if existing.project_id != project_id {
+            tracing::warn!(
+                session_id = %record.session_id,
+                worktree_path = %worktree_path,
+                project_id = %project_id,
+                existing_project_id = %existing.project_id,
+                "skipping session worktree backfill because the path belongs to another project"
+            );
+            continue;
+        }
+
+        set_session_attachment(connection, &record.session_id, "new_worktree", &existing.id)?;
+    }
+
+    Ok(())
+}
+
+fn set_session_attachment(
+    connection: &Connection,
+    session_id: &str,
+    attachment_mode: &str,
+    worktree_id: &str,
+) -> Result<()> {
+    connection.execute(
+        "
+        UPDATE sessions
+        SET attachment_mode = ?2,
+            worktree_id = ?3
+        WHERE id = ?1
+          AND (attachment_mode <> ?2 OR worktree_id <> ?3)
+        ",
+        params![session_id, attachment_mode, worktree_id],
+    )?;
+    Ok(())
+}
+
+fn stable_worktree_id(project_id: &str, path: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(project_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(path.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+
+    format!("worktree-{}", &hex[..24])
+}
+
+fn worktree_name_from_path(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("worktree")
+        .to_string()
+}
+
+fn paths_match(left: &str, right: &str) -> bool {
+    Path::new(left) == Path::new(right)
+}
+
 fn is_seeded_cli_model(config: &WorkspaceModelConfig) -> bool {
     matches!(config.adapter.as_str(), "claude" | "codex")
         && config.base_url.trim().is_empty()
@@ -5299,7 +5531,7 @@ fn publication_phrase_is_negated(text: &str, phrase_index: usize) -> bool {
         character.is_ascii_whitespace()
             || matches!(character, ':' | '-' | ',' | ';' | '(' | '[' | '"' | '\'')
     });
-    let normalized_prefix = prefix.replace('\u{2018}', "'").replace('\u{2019}', "'");
+    let normalized_prefix = prefix.replace(['\u{2018}', '\u{2019}'], "'");
 
     [
         "do not", "don't", "dont", "never", "no", "not", "not to", "without",
@@ -5584,10 +5816,10 @@ fn set_workspace_default_profile_id(connection: &Connection, profile_id: &str) -
 
 fn ensure_workspace_default_profile(connection: &Connection) -> Result<()> {
     let candidate = workspace_default_profile_id_optional(connection)?;
-    if let Some(profile_id) = candidate {
-        if load_workspace_profile_summary(connection, &profile_id).is_ok() {
-            return Ok(());
-        }
+    if let Some(profile_id) = candidate
+        && load_workspace_profile_summary(connection, &profile_id).is_ok()
+    {
+        return Ok(());
     }
 
     let fallback = list_workspace_profile_ids(connection)?
@@ -6145,6 +6377,75 @@ fn map_project_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectSumma
     })
 }
 
+fn list_worktrees_with_connection(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<Vec<WorktreeSummary>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id, project_id, name, path, branch, base_ref, base_commit, origin_url, status, created_at, updated_at
+        FROM worktrees
+        WHERE project_id = ?1
+          AND status = 'active'
+        ORDER BY updated_at DESC, created_at DESC, name ASC, id ASC
+        ",
+    )?;
+
+    let rows = statement.query_map(params![project_id], map_worktree_summary)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to list worktrees")
+}
+
+fn load_worktree_summary_optional(
+    connection: &Connection,
+    id: &str,
+) -> Result<Option<WorktreeSummary>> {
+    connection
+        .query_row(
+            "
+            SELECT id, project_id, name, path, branch, base_ref, base_commit, origin_url, status, created_at, updated_at
+            FROM worktrees
+            WHERE id = ?1
+            ",
+            params![id],
+            map_worktree_summary,
+        )
+        .optional()
+        .context("failed to load worktree")
+}
+
+fn load_worktree_summary_by_path(connection: &Connection, path: &str) -> Result<WorktreeSummary> {
+    connection
+        .query_row(
+            "
+            SELECT id, project_id, name, path, branch, base_ref, base_commit, origin_url, status, created_at, updated_at
+            FROM worktrees
+            WHERE path = ?1
+            ",
+            params![path],
+            map_worktree_summary,
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("worktree path '{path}' was not found"))
+}
+
+fn map_worktree_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorktreeSummary> {
+    let origin_url: String = row.get(7)?;
+    Ok(WorktreeSummary {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        name: row.get(2)?,
+        path: row.get(3)?,
+        branch: row.get(4)?,
+        base_ref: row.get(5)?,
+        base_commit: row.get(6)?,
+        origin_url: redact_git_remote_url_userinfo(&origin_url),
+        status: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
 fn load_resolved_project(connection: &Connection, project_id: &str) -> Result<ResolvedProject> {
     connection
         .query_row(
@@ -6354,16 +6655,16 @@ fn resolve_legacy_session_project(
     project_id: &str,
     project_path: &str,
 ) -> Result<Option<ResolvedProject>> {
-    if !project_id.is_empty() {
-        if let Ok(project) = load_resolved_project(connection, project_id) {
-            return Ok(Some(project));
-        }
+    if !project_id.is_empty()
+        && let Ok(project) = load_resolved_project(connection, project_id)
+    {
+        return Ok(Some(project));
     }
 
-    if !project_path.is_empty() {
-        if let Some(project) = load_resolved_project_by_path(connection, project_path)? {
-            return Ok(Some(project));
-        }
+    if !project_path.is_empty()
+        && let Some(project) = load_resolved_project_by_path(connection, project_path)?
+    {
+        return Ok(Some(project));
     }
 
     Ok(None)
@@ -7206,12 +7507,12 @@ fn load_session_summary(connection: &Connection, session_id: &str) -> Result<Ses
     session.run_budget = session_run_budget(connection, &session.run_budget_mode)?;
     session.capabilities = load_session_capabilities(connection, session_id)?;
 
-    if session.project_id.is_empty() {
-        if let Some(primary) = session.projects.iter().find(|project| project.is_primary) {
-            session.project_id = primary.id.clone();
-            session.project_title = primary.title.clone();
-            session.project_path = primary.absolute_path.clone();
-        }
+    if session.project_id.is_empty()
+        && let Some(primary) = session.projects.iter().find(|project| project.is_primary)
+    {
+        session.project_id = primary.id.clone();
+        session.project_title = primary.title.clone();
+        session.project_path = primary.absolute_path.clone();
     }
     apply_session_observability_rollups(connection, &mut session)?;
 
@@ -7849,14 +8150,14 @@ fn load_job_summary(connection: &Connection, job_id: &str) -> Result<JobSummary>
     job.artifact_count = count_for_job(connection, "job_artifacts", job_id)?;
     apply_job_observability_rollups(connection, &mut job)?;
     apply_job_evidence_rollups(connection, &mut job)?;
-    if let Some(root_worker_id) = job.root_worker_id.as_deref() {
-        if let Ok(worker) = load_worker_summary(connection, root_worker_id) {
-            job.executor_lane = worker.lane;
-            job.executor_provider = worker.provider;
-            job.executor_model = worker.model;
-            job.executor_route_id = worker.route_id;
-            job.executor_route_title = worker.route_title;
-        }
+    if let Some(root_worker_id) = job.root_worker_id.as_deref()
+        && let Ok(worker) = load_worker_summary(connection, root_worker_id)
+    {
+        job.executor_lane = worker.lane;
+        job.executor_provider = worker.provider;
+        job.executor_model = worker.model;
+        job.executor_route_id = worker.route_id;
+        job.executor_route_title = worker.route_title;
     }
     Ok(job.with_completion_gates())
 }
@@ -9575,11 +9876,62 @@ mod tests {
     use rusqlite::Connection;
     use std::{
         env, fs,
+        io::{self, Write},
         sync::{Arc, Mutex},
         time::{SystemTime, UNIX_EPOCH},
     };
+    use tracing_subscriber::fmt::MakeWriter;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[derive(Clone)]
+    struct CapturedLogs {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct CapturedLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
+
+    impl Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("log capture mutex poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_warning_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let writer = CapturedLogs {
+            buffer: Arc::clone(&logs),
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(writer)
+            .with_ansi(false)
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let output = String::from_utf8(logs.lock().expect("log capture mutex poisoned").clone())
+            .expect("captured logs should be utf-8");
+        (result, output)
+    }
 
     #[test]
     fn persists_and_lists_audit_events() {
@@ -10419,6 +10771,284 @@ mod tests {
             redact_git_remote_url_userinfo("git@example.com:Org/Repo.git"),
             "git@example.com:Org/Repo.git"
         );
+    }
+
+    #[test]
+    fn initializes_worktrees_table_empty_without_warnings() {
+        let state_dir = test_state_dir("worktrees-fresh-install");
+        let (store, logs) = capture_warning_logs(|| {
+            StateStore::initialize_at(&state_dir).expect("store should initialize")
+        });
+        let connection = store.connection.lock().expect("storage mutex poisoned");
+        let worktree_columns = table_columns(&connection, "worktrees").expect("columns load");
+        let session_columns = table_columns(&connection, "sessions").expect("columns load");
+        let worktree_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM worktrees", [], |row| row.get(0))
+            .expect("worktree count should load");
+        drop(connection);
+
+        assert!(logs.trim().is_empty(), "unexpected warnings: {logs}");
+        for column in [
+            "id",
+            "project_id",
+            "name",
+            "path",
+            "branch",
+            "base_ref",
+            "base_commit",
+            "origin_url",
+            "status",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(worktree_columns.contains(column), "missing {column}");
+        }
+        assert!(session_columns.contains("attachment_mode"));
+        assert!(session_columns.contains("worktree_id"));
+        assert_eq!(worktree_count, 0);
+        assert!(
+            store
+                .list_worktrees("missing-project")
+                .expect("worktrees should list")
+                .is_empty()
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn backfills_legacy_sessions_into_worktrees_and_attachment_modes() {
+        let state_dir = test_state_dir("worktree-backfill");
+        let (alpha, beta) = prepare_two_projects(&state_dir);
+        let alpha_worktree = state_dir.join("alpha-feature");
+        let beta_worktree = state_dir.join("beta-feature");
+        fs::create_dir_all(&alpha_worktree).expect("alpha worktree path should exist");
+        fs::create_dir_all(&beta_worktree).expect("beta worktree path should exist");
+
+        {
+            let plan = StoragePlan::from_state_dir(&state_dir);
+            let connection =
+                Connection::open(&plan.database_path).expect("legacy database should open");
+            insert_legacy_session(
+                &connection,
+                "alpha-worktree-session",
+                Some(&alpha),
+                alpha_worktree
+                    .to_str()
+                    .expect("worktree path should be utf-8"),
+                "work/alpha",
+                "dev",
+            );
+            insert_legacy_session(
+                &connection,
+                "alpha-project-root-session",
+                Some(&alpha),
+                &alpha.absolute_path,
+                "dev",
+                "dev",
+            );
+            insert_legacy_session(&connection, "scratch-session", None, "", "", "");
+            insert_legacy_session(
+                &connection,
+                "beta-worktree-session",
+                Some(&beta),
+                beta_worktree
+                    .to_str()
+                    .expect("worktree path should be utf-8"),
+                "work/beta",
+                "main",
+            );
+        }
+
+        let (store, logs) = capture_warning_logs(|| {
+            StateStore::initialize_at(&state_dir).expect("store should reinitialize")
+        });
+        assert!(logs.trim().is_empty(), "unexpected warnings: {logs}");
+
+        let alpha_worktrees = store
+            .list_worktrees(&alpha.id)
+            .expect("alpha worktrees should list");
+        let beta_worktrees = store
+            .list_worktrees(&beta.id)
+            .expect("beta worktrees should list");
+        assert_eq!(alpha_worktrees.len(), 1);
+        assert_eq!(beta_worktrees.len(), 1);
+        assert_eq!(alpha_worktrees[0].project_id, alpha.id);
+        assert_eq!(alpha_worktrees[0].name, "alpha-feature");
+        assert_eq!(
+            alpha_worktrees[0].path,
+            alpha_worktree.display().to_string()
+        );
+        assert_eq!(alpha_worktrees[0].branch, "work/alpha");
+        assert_eq!(alpha_worktrees[0].base_ref, "dev");
+        assert_eq!(alpha_worktrees[0].base_commit, "");
+        assert_eq!(alpha_worktrees[0].status, "active");
+
+        let loaded = store
+            .get_worktree(&alpha_worktrees[0].id)
+            .expect("worktree lookup should succeed")
+            .expect("worktree should exist");
+        assert_eq!(loaded, alpha_worktrees[0]);
+
+        let connection = store.connection.lock().expect("storage mutex poisoned");
+        let (mode, worktree_id) = session_attachment(&connection, "alpha-worktree-session");
+        assert_eq!(mode, "new_worktree");
+        assert_eq!(worktree_id, alpha_worktrees[0].id);
+        assert_eq!(
+            session_updated_at(&connection, "alpha-worktree-session"),
+            100
+        );
+        let (mode, worktree_id) = session_attachment(&connection, "alpha-project-root-session");
+        assert_eq!(mode, "project_root");
+        assert_eq!(worktree_id, "");
+        assert_eq!(
+            session_updated_at(&connection, "alpha-project-root-session"),
+            100
+        );
+        let (mode, worktree_id) = session_attachment(&connection, "scratch-session");
+        assert_eq!(mode, "scratch");
+        assert_eq!(worktree_id, "");
+        assert_eq!(session_updated_at(&connection, "scratch-session"), 100);
+        drop(connection);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn worktree_backfill_is_noop_on_reinitialization() {
+        let state_dir = test_state_dir("worktree-backfill-noop");
+        let (alpha, _) = prepare_two_projects(&state_dir);
+        let alpha_worktree = state_dir.join("alpha-noop");
+        fs::create_dir_all(&alpha_worktree).expect("alpha worktree path should exist");
+
+        {
+            let plan = StoragePlan::from_state_dir(&state_dir);
+            let connection =
+                Connection::open(&plan.database_path).expect("legacy database should open");
+            insert_legacy_session(
+                &connection,
+                "noop-worktree-session",
+                Some(&alpha),
+                alpha_worktree
+                    .to_str()
+                    .expect("worktree path should be utf-8"),
+                "work/noop",
+                "dev",
+            );
+        }
+
+        let (store, first_logs) = capture_warning_logs(|| {
+            StateStore::initialize_at(&state_dir).expect("store should reinitialize")
+        });
+        assert!(
+            first_logs.trim().is_empty(),
+            "unexpected warnings: {first_logs}"
+        );
+        let first_state = worktree_state_rows(&store);
+        drop(store);
+
+        let (store, second_logs) = capture_warning_logs(|| {
+            StateStore::initialize_at(&state_dir).expect("store should reinitialize again")
+        });
+        assert!(
+            second_logs.trim().is_empty(),
+            "unexpected warnings: {second_logs}"
+        );
+        assert_eq!(worktree_state_rows(&store), first_state);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn orphaned_worktree_path_warns_and_leaves_session_unchanged() {
+        let state_dir = test_state_dir("worktree-backfill-orphan");
+        let (alpha, _) = prepare_two_projects(&state_dir);
+        let missing_worktree = state_dir.join("missing-worktree");
+
+        {
+            let plan = StoragePlan::from_state_dir(&state_dir);
+            let connection =
+                Connection::open(&plan.database_path).expect("legacy database should open");
+            insert_legacy_session(
+                &connection,
+                "orphan-worktree-session",
+                Some(&alpha),
+                missing_worktree
+                    .to_str()
+                    .expect("worktree path should be utf-8"),
+                "work/orphan",
+                "dev",
+            );
+        }
+
+        let (store, logs) = capture_warning_logs(|| {
+            StateStore::initialize_at(&state_dir).expect("store should reinitialize")
+        });
+        assert!(logs.contains("orphan-worktree-session"));
+        assert!(logs.contains(&missing_worktree.display().to_string()));
+
+        let connection = store.connection.lock().expect("storage mutex poisoned");
+        let worktree_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM worktrees", [], |row| row.get(0))
+            .expect("worktree count should load");
+        let (mode, worktree_id) = session_attachment(&connection, "orphan-worktree-session");
+        assert_eq!(worktree_count, 0);
+        assert_eq!(mode, "project_root");
+        assert_eq!(worktree_id, "");
+        drop(connection);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn list_worktrees_filters_project_and_archived_status() {
+        let state_dir = test_state_dir("worktree-list-filter");
+        let (alpha, beta) = prepare_two_projects(&state_dir);
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let archived_id = "archived-alpha-worktree";
+        let active_alpha_id = "active-alpha-worktree";
+        let active_beta_id = "active-beta-worktree";
+
+        {
+            let connection = store.connection.lock().expect("storage mutex poisoned");
+            connection
+                .execute(
+                    "
+                    INSERT INTO worktrees (id, project_id, name, path, status)
+                    VALUES
+                        (?1, ?2, 'archived alpha', ?3, 'archived'),
+                        (?4, ?2, 'active alpha', ?5, 'active'),
+                        (?6, ?7, 'active beta', ?8, 'active')
+                    ",
+                    params![
+                        archived_id,
+                        alpha.id,
+                        state_dir.join("archived-alpha").display().to_string(),
+                        active_alpha_id,
+                        state_dir.join("active-alpha").display().to_string(),
+                        active_beta_id,
+                        beta.id,
+                        state_dir.join("active-beta").display().to_string(),
+                    ],
+                )
+                .expect("worktrees should insert");
+        }
+
+        let alpha_worktrees = store
+            .list_worktrees(&alpha.id)
+            .expect("alpha worktrees should list");
+        assert_eq!(alpha_worktrees.len(), 1);
+        assert_eq!(alpha_worktrees[0].id, active_alpha_id);
+        assert_eq!(
+            store
+                .get_worktree(archived_id)
+                .expect("archived worktree lookup should succeed")
+                .expect("archived worktree should load")
+                .status,
+            "archived"
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
     }
 
     #[test]
@@ -12308,7 +12938,7 @@ and open a pull request to dev when it is ready."
             )
             .expect("playbook should update");
         assert_eq!(updated.playbook.title, "Workspace sync and test");
-        assert_eq!(updated.playbook.enabled, false);
+        assert!(!updated.playbook.enabled);
         assert_eq!(updated.playbook.trigger_kind, "event");
         assert_eq!(updated.playbook.schedule_interval_secs, None);
         assert_eq!(
@@ -12853,6 +13483,163 @@ and open a pull request to dev when it is ready."
         assert_eq!(session.session.capabilities[0].tool_id, "browser.navigate");
 
         let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    fn prepare_two_projects(state_dir: &Path) -> (ProjectSummary, ProjectSummary) {
+        let workspace_root = state_dir.join("workspace");
+        let alpha = workspace_root.join("alpha");
+        let beta = workspace_root.join("beta");
+        fs::create_dir_all(alpha.join(".git")).expect("alpha project marker should be created");
+        fs::create_dir_all(beta.join(".git")).expect("beta project marker should be created");
+
+        let store = StateStore::initialize_at(state_dir).expect("store should initialize");
+        let workspace = store
+            .update_workspace(
+                Some(
+                    workspace_root
+                        .to_str()
+                        .expect("workspace root should be utf-8"),
+                ),
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("workspace root should update");
+        let alpha = workspace
+            .projects
+            .iter()
+            .find(|project| project.relative_path == "alpha")
+            .expect("alpha project should be discovered")
+            .clone();
+        let beta = workspace
+            .projects
+            .iter()
+            .find(|project| project.relative_path == "beta")
+            .expect("beta project should be discovered")
+            .clone();
+        drop(store);
+
+        (alpha, beta)
+    }
+
+    fn insert_legacy_session(
+        connection: &Connection,
+        session_id: &str,
+        project: Option<&ProjectSummary>,
+        worktree_path: &str,
+        git_branch: &str,
+        git_base_ref: &str,
+    ) {
+        let project_id = project.map(|project| project.id.as_str()).unwrap_or("");
+        let project_title = project.map(|project| project.title.as_str()).unwrap_or("");
+        let project_path = project
+            .map(|project| project.absolute_path.as_str())
+            .unwrap_or("");
+
+        connection
+            .execute(
+                "
+                INSERT INTO sessions (
+                    id,
+                    title,
+                    scope,
+                    project_id,
+                    project_title,
+                    project_path,
+                    provider,
+                    model,
+                    working_dir,
+                    working_dir_kind,
+                    worktree_path,
+                    git_branch,
+                    git_base_ref,
+                    state
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'codex', 'gpt-5.4', ?6, 'project_root', ?7, ?8, ?9, 'active')
+                ",
+                params![
+                    session_id,
+                    session_id,
+                    if project.is_some() {
+                        "project"
+                    } else {
+                        "ad_hoc"
+                    },
+                    project_id,
+                    project_title,
+                    project_path,
+                    worktree_path,
+                    git_branch,
+                    git_base_ref,
+                ],
+            )
+            .expect("legacy session row should insert");
+
+        if let Some(project) = project {
+            connection
+                .execute(
+                    "
+                    INSERT INTO session_projects (session_id, project_id, sort_order, is_primary)
+                    VALUES (?1, ?2, 0, 1)
+                    ",
+                    params![session_id, project.id],
+                )
+                .expect("legacy session project row should insert");
+        }
+
+        connection
+            .execute(
+                "UPDATE sessions SET created_at = 100, updated_at = 100 WHERE id = ?1",
+                params![session_id],
+            )
+            .expect("legacy session timestamps should update");
+    }
+
+    fn session_attachment(connection: &Connection, session_id: &str) -> (String, String) {
+        connection
+            .query_row(
+                "SELECT attachment_mode, worktree_id FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("session attachment should load")
+    }
+
+    fn session_updated_at(connection: &Connection, session_id: &str) -> i64 {
+        connection
+            .query_row(
+                "SELECT updated_at FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .expect("session timestamp should load")
+    }
+
+    fn worktree_state_rows(store: &StateStore) -> Vec<(String, String, String, String)> {
+        let connection = store.connection.lock().expect("storage mutex poisoned");
+        let mut statement = connection
+            .prepare(
+                "
+                SELECT sessions.id, sessions.attachment_mode, sessions.worktree_id, worktrees.path
+                FROM sessions
+                LEFT JOIN worktrees ON worktrees.id = sessions.worktree_id
+                ORDER BY sessions.id ASC
+                ",
+            )
+            .expect("worktree state query should prepare");
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                ))
+            })
+            .expect("worktree state rows should query");
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .expect("worktree state rows should collect")
     }
 
     fn test_state_dir(label: &str) -> PathBuf {
