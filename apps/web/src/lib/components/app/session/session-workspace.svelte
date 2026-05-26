@@ -69,8 +69,8 @@
     stopBrowserStream,
     updateSession
   } from '$lib/nucleus/client';
-  import { compactPath, formatDateTime, formatState } from '$lib/nucleus/format';
-  import { childRouteLabel, completionGateGroups, gateBadgeVariant, noActivity, usageView } from '$lib/nucleus/session-ux.js';
+  import { compactPath, formatCount, formatDateTime, formatState } from '$lib/nucleus/format';
+  import { childRouteLabel, completionGateGroups, gateBadgeVariant, noActivity, runtimeStartSeconds, usageView } from '$lib/nucleus/session-ux.js';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
   import type {
     ActionSummary,
@@ -100,6 +100,17 @@
   const MAX_IMAGES = 5;
   const MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024;
   const MAX_TOTAL_IMAGE_SIZE_BYTES = 50 * 1024 * 1024;
+  const TERMINAL_JOB_STATES = new Set([
+    'approved',
+    'blocked',
+    'canceled',
+    'closed',
+    'completed',
+    'denied',
+    'error',
+    'failed',
+    'orphaned'
+  ]);
 
   type ComposerImage = SessionTurnImage & {
     id: string;
@@ -113,6 +124,23 @@
   type BrowserAnnotationDraft = { page_id: string; x: number; y: number };
   type JobOutcomeRow = { label: string; value: string; href?: string };
   type CompletionGateSection = { key: string; label: string; gates: JobSummary['completion_gates'] };
+  type ActivityMetric = { label: string; title?: string };
+  type UtilityRunSnapshot = {
+    sessionId: string;
+    jobId: string;
+    title: string;
+    detail: string;
+    state: string;
+    durationSeconds: number;
+    tokenUsageKnown: boolean;
+    promptTokens: number;
+    completionTokens: number;
+    cachedTokens: number;
+    costUsdEstimate: number | null;
+    outcomeLabel: string;
+    blockedReason: string;
+    updatedAt: number;
+  };
 
   const COMPOSER_MODES: SessionComposerMode[] = ['plan', 'ask', 'trusted'];
   const RUN_BUDGET_MODES: SessionRunBudgetMode[] = [
@@ -191,6 +219,7 @@
   let runBudgetMenuOpen = $state(false);
   let activityJobDetail = $state<JobDetail | null>(null);
   let activityJobRequestInFlight = $state('');
+  let lastCompletedUtilityRun = $state<UtilityRunSnapshot | null>(null);
   let transcriptAnchor = $state('');
   let observabilityNow = $state(Math.floor(Date.now() / 1000));
 
@@ -370,10 +399,7 @@
     if (activityJobDetail) {
       return {
         title: activityJobDetail.job.title,
-        detail:
-          activityJobDetail.job.result_summary ||
-          activityJobDetail.job.prompt_excerpt ||
-          activityJobDetail.job.purpose,
+        detail: utilityRunDetail(activityJobDetail.job, jobIsActive(activityJobDetail.job.state)),
         state: activityJobDetail.job.state
       };
     }
@@ -381,10 +407,7 @@
     if (composerActivityJobSummary) {
       return {
         title: composerActivityJobSummary.title,
-        detail:
-          composerActivityJobSummary.result_summary ||
-          composerActivityJobSummary.prompt_excerpt ||
-          composerActivityJobSummary.purpose,
+        detail: utilityRunDetail(composerActivityJobSummary, jobIsActive(composerActivityJobSummary.state)),
         state: composerActivityJobSummary.state
       };
     }
@@ -399,9 +422,47 @@
 
     return null;
   });
+  let composerActivityRunMetrics = $derived.by(() => {
+    if (composerActivityJobSummary) {
+      return utilityRunMetricLabels(composerActivityJobSummary, jobIsActive(composerActivityJobSummary.state));
+    }
+
+    if (lastCompletedUtilityRun?.sessionId === selectedSessionId) {
+      return utilitySnapshotMetricLabels(lastCompletedUtilityRun);
+    }
+
+    return [];
+  });
+  let composerActivityBlockedReason = $derived.by(() => {
+    if (composerActivityJobSummary) {
+      return utilityRunBlockedReason(composerActivityJobSummary);
+    }
+
+    if (lastCompletedUtilityRun?.sessionId === selectedSessionId) {
+      return lastCompletedUtilityRun.blockedReason;
+    }
+
+    return '';
+  });
   let composerActivityDisplay = $derived.by(() => {
     if (composerActivitySummary) {
-      return composerActivitySummary;
+      return {
+        ...composerActivitySummary,
+        metrics: composerActivityRunMetrics,
+        blockedReason: composerActivityBlockedReason,
+        persisted: false
+      };
+    }
+
+    if (lastCompletedUtilityRun?.sessionId === selectedSessionId) {
+      return {
+        title: lastCompletedUtilityRun.title,
+        detail: lastCompletedUtilityRun.detail,
+        state: lastCompletedUtilityRun.state,
+        metrics: composerActivityRunMetrics,
+        blockedReason: composerActivityBlockedReason,
+        persisted: true
+      };
     }
 
     if (!selectedSession) {
@@ -411,8 +472,30 @@
     return {
       title: 'Utility Worker activity',
       detail: 'No active background work for this session.',
-      state: 'idle'
+      state: 'idle',
+      metrics: [],
+      blockedReason: '',
+      persisted: false
     };
+  });
+
+  $effect(() => {
+    const job = composerActivityJobSummary;
+
+    if (!selectedSessionId || !job || job.session_id !== selectedSessionId) {
+      return;
+    }
+
+    if (jobIsActive(job.state)) {
+      if (lastCompletedUtilityRun?.sessionId === selectedSessionId && lastCompletedUtilityRun.jobId !== job.id) {
+        lastCompletedUtilityRun = null;
+      }
+      return;
+    }
+
+    if (jobIsTerminal(job.state)) {
+      lastCompletedUtilityRun = captureUtilityRunSnapshot(job);
+    }
   });
 
   function uniqueId() {
@@ -607,7 +690,124 @@
   }
 
   function jobIsActive(state: string) {
-    return state === 'running' || state === 'queued' || state === 'paused';
+    return state === 'running' || state === 'queued' || state === 'paused' || state === 'waiting';
+  }
+
+  function jobIsTerminal(state: string) {
+    return TERMINAL_JOB_STATES.has(state);
+  }
+
+  function utilityRunStartedAt(job: JobSummary) {
+    return runtimeStartSeconds(job);
+  }
+
+  function utilityRunDurationSeconds(job: JobSummary, active: boolean) {
+    const startedAt = utilityRunStartedAt(job);
+    const endedAt = active ? observabilityNow : job.updated_at;
+    return Math.max(0, endedAt - startedAt);
+  }
+
+  function utilityRunTotalTokens(record: Pick<JobSummary, 'prompt_tokens' | 'completion_tokens' | 'cached_tokens'>) {
+    return Number(record.prompt_tokens ?? 0) + Number(record.completion_tokens ?? 0) + Number(record.cached_tokens ?? 0);
+  }
+
+  function formatCostEstimate(value: number | null) {
+    if (typeof value !== 'number') return '$—';
+    if (value > 0 && value < 0.01) return `$${value.toFixed(4)}`;
+    return `$${value.toFixed(2)}`;
+  }
+
+  function utilityRunOutcomeLabel(job: JobSummary) {
+    if (job.completion_status === 'blocked' || job.completion_blockers.length > 0) return 'blocked';
+    if (job.state === 'completed' || job.state === 'approved') return 'success';
+    if (job.state === 'canceled' || job.state === 'closed' || job.state === 'denied' || job.state === 'orphaned') {
+      return 'canceled';
+    }
+    if (job.state === 'failed' || job.state === 'error') return 'error';
+    return formatState(job.state).toLowerCase();
+  }
+
+  function utilityRunBlockedReason(job: JobSummary) {
+    if (job.completion_blockers.length > 0) return job.completion_blockers.join(' · ');
+    if (job.publication_status === 'blocked' && job.publication_summary) return job.publication_summary;
+    if (job.user_error) return `${job.user_error.title}: ${job.user_error.message}`;
+    if (job.last_error) return job.last_error;
+    return '';
+  }
+
+  function utilityRunDetail(job: JobSummary, active: boolean) {
+    const summary = job.result_summary || job.prompt_excerpt || job.purpose;
+    if (active) return summary;
+
+    return `${utilityRunOutcomeLabel(job)} · ${formatDuration(utilityRunDurationSeconds(job, false))} · ${formatCount(utilityRunTotalTokens(job))} tokens · ${formatCostEstimate(job.cost_usd_estimate)}`;
+  }
+
+  function utilityRunMetricLabels(job: JobSummary, active: boolean): ActivityMetric[] {
+    const usage = usageView(job);
+    const totalTokens = utilityRunTotalTokens(job);
+
+    return [
+      {
+        label: `${active ? 'Elapsed' : 'Duration'} ${formatDuration(utilityRunDurationSeconds(job, active))}`,
+        title: `Started ${formatDateTime(utilityRunStartedAt(job))}${active ? '' : ` · Ended ${formatDateTime(job.updated_at)}`}`
+      },
+      {
+        label: job.token_usage_known
+          ? `${formatCount(totalTokens)} tokens`
+          : usage.label,
+        title: job.token_usage_known
+          ? `${usage.title} · Total with cached: ${formatCount(totalTokens)}`
+          : usage.title
+      },
+      {
+        label: `P ${formatCount(job.prompt_tokens)} / C ${formatCount(job.completion_tokens)} / cached ${formatCount(job.cached_tokens)}`,
+        title: 'Prompt / completion / cached tokens'
+      },
+      {
+        label: `Cost ${formatCostEstimate(job.cost_usd_estimate)}`,
+        title: typeof job.cost_usd_estimate === 'number' ? 'Estimated model cost' : 'No price available for this model'
+      }
+    ];
+  }
+
+  function utilitySnapshotMetricLabels(snapshot: UtilityRunSnapshot): ActivityMetric[] {
+    return [
+      {
+        label: `Duration ${formatDuration(snapshot.durationSeconds)}`,
+        title: `Completed ${formatDateTime(snapshot.updatedAt)}`
+      },
+      {
+        label: snapshot.tokenUsageKnown ? `${formatCount(snapshot.promptTokens + snapshot.completionTokens + snapshot.cachedTokens)} tokens` : 'tokens unknown',
+        title: `Prompt: ${formatCount(snapshot.promptTokens)} · Completion: ${formatCount(snapshot.completionTokens)} · Cached: ${formatCount(snapshot.cachedTokens)}`
+      },
+      {
+        label: `P ${formatCount(snapshot.promptTokens)} / C ${formatCount(snapshot.completionTokens)} / cached ${formatCount(snapshot.cachedTokens)}`,
+        title: 'Prompt / completion / cached tokens'
+      },
+      {
+        label: `Cost ${formatCostEstimate(snapshot.costUsdEstimate)}`,
+        title: typeof snapshot.costUsdEstimate === 'number' ? 'Estimated model cost' : 'No price available for this model'
+      }
+    ];
+  }
+
+  function captureUtilityRunSnapshot(job: JobSummary): UtilityRunSnapshot {
+    return {
+      sessionId: job.session_id ?? '',
+      jobId: job.id,
+      title: job.title || 'Utility Worker run complete',
+      detail: utilityRunDetail(job, false),
+      state: job.state,
+      durationSeconds: utilityRunDurationSeconds(job, false),
+      tokenUsageKnown: job.token_usage_known,
+      promptTokens: job.prompt_tokens,
+      completionTokens: job.completion_tokens,
+      cachedTokens: job.cached_tokens,
+      costUsdEstimate: job.cost_usd_estimate,
+      outcomeLabel: utilityRunOutcomeLabel(job),
+      blockedReason: utilityRunBlockedReason(job),
+      updatedAt: job.updated_at
+    };
   }
 
   function lastItem<T>(items: T[]) {
@@ -2823,7 +3023,7 @@
     void loadAll();
     const observabilityInterval = window.setInterval(() => {
       observabilityNow = Math.floor(Date.now() / 1000);
-    }, 10_000);
+    }, 1_000);
 
     const disconnect = connectDaemonStream({
       onEvent: applyStreamEvent,
@@ -3129,6 +3329,9 @@
                     </div>
 
                     <div class="hidden shrink-0 flex-wrap justify-end gap-x-3 gap-y-1 text-[11px] text-zinc-600 md:flex">
+                      {#each composerActivityDisplay.metrics as metric}
+                        <span title={metric.title}>{metric.label}</span>
+                      {/each}
                       {#if composerActivityJobSummary}
                         <span>{composerActivityJobSummary.worker_count} Utility Worker{composerActivityJobSummary.worker_count === 1 ? '' : 's'}</span>
                         <span>{composerActivityJobSummary.pending_approval_count} approvals</span>
@@ -3181,7 +3384,32 @@
                 {#if composerActivityExpanded}
                   <div class="border-t border-zinc-800 px-3 pb-3 pt-3">
                     <div class="max-h-[min(24rem,38vh)] space-y-4 overflow-y-auto pr-1">
-                      {#if promptProgress.length === 0 && !activityJobDetail}
+                      {#if composerActivityDisplay.metrics.length > 0 || composerActivityDisplay.blockedReason}
+                        <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
+                          <div class="flex items-start justify-between gap-3">
+                            <div class="min-w-0">
+                              <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">
+                                {composerActivityDisplay.persisted ? 'Most Recent Run' : 'Current Run'}
+                              </div>
+                              <div class="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-zinc-400">
+                                {#each composerActivityDisplay.metrics as metric}
+                                  <span title={metric.title}>{metric.label}</span>
+                                {/each}
+                              </div>
+                              {#if composerActivityDisplay.blockedReason}
+                                <div class="mt-2 text-xs leading-5 text-red-200">
+                                  {composerActivityDisplay.blockedReason}
+                                </div>
+                              {/if}
+                            </div>
+                            <Badge variant={badgeVariantForActivityState(composerActivityDisplay.state)}>
+                              {formatPromptProgressStatus(composerActivityDisplay.state)}
+                            </Badge>
+                          </div>
+                        </div>
+                      {/if}
+
+                      {#if promptProgress.length === 0 && !activityJobDetail && composerActivityDisplay.metrics.length === 0}
                         <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3 text-sm text-zinc-500">
                           Utility Worker activity will appear here when Nucleus starts work for this session.
                         </div>
