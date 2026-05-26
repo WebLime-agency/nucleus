@@ -20,8 +20,25 @@ on:
         description: Optional release identifier. Defaults to channel, version, timestamp, and source SHA.
         required: false
         type: string
+      version_mode:
+        description: How to resolve stable release versions.
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - explicit
+      bump:
+        description: Semver component to bump when version_mode=auto.
+        required: false
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
       version:
-        description: Optional product version override. Defaults to the workspace package version.
+        description: Explicit semantic version. Required when version_mode=explicit; ignored when version_mode=auto.
         required: false
         type: string
       retention_count:
@@ -62,6 +79,8 @@ jobs:
           INPUT_CHANNEL: ${{ github.event.inputs.channel || '' }}
           INPUT_SOURCE_REF: ${{ github.event.inputs.source_ref || '' }}
           INPUT_RELEASE_ID: ${{ github.event.inputs.release_id || '' }}
+          INPUT_VERSION_MODE: ${{ github.event.inputs.version_mode || 'auto' }}
+          INPUT_BUMP: ${{ github.event.inputs.bump || 'patch' }}
           INPUT_VERSION: ${{ github.event.inputs.version || '' }}
           INPUT_RETENTION_COUNT: ${{ github.event.inputs.retention_count || '' }}
         run: |
@@ -96,8 +115,45 @@ jobs:
             git checkout --detach "${source_ref}"
           fi
 
-          source_sha="$(git rev-parse HEAD)"
-          version="${INPUT_VERSION:-$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "nucleus-daemon") | .version')}"
+          if [ "${channel}" = "stable" ]; then
+            origin_main_sha="$(git rev-parse origin/main)"
+            selected_source_sha="$(git rev-parse HEAD)"
+            if [ "${selected_source_sha}" != "${origin_main_sha}" ]; then
+              echo "::error::Stable releases must publish current origin/main. Promote the desired source to main before running the stable publish workflow."
+              exit 1
+            fi
+
+            resolved_version="$(
+              VERSION_MODE="${INPUT_VERSION_MODE}" \
+              BUMP="${INPUT_BUMP}" \
+              VERSION="${INPUT_VERSION}" \
+              scripts/compute-release-version.sh
+            )"
+
+            scripts/update-release-version-files.sh "${resolved_version}"
+
+            git config user.name "${GITHUB_ACTOR}"
+            git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
+
+            if git diff --quiet -- Cargo.toml Cargo.lock apps/web/package.json; then
+              echo "Version files already at ${resolved_version}; skipping release bump commit."
+            else
+              git add Cargo.toml Cargo.lock apps/web/package.json
+              git commit -m "chore(release): bump to v${resolved_version}"
+            fi
+
+            source_sha="$(git rev-parse HEAD)"
+
+            version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "nucleus-daemon") | .version')"
+            if [ "${version}" != "${resolved_version}" ]; then
+              echo "::error::cargo metadata resolved version ${version}, expected ${resolved_version}"
+              exit 1
+            fi
+          else
+            source_sha="$(git rev-parse HEAD)"
+            version="${INPUT_VERSION:-$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "nucleus-daemon") | .version')}"
+          fi
+
           timestamp="$(date -u +%Y%m%d%H%M%S)"
           release_id="${INPUT_RELEASE_ID:-nucleus-${channel}-${version}-${timestamp}-${source_sha:0:12}}"
           retention_count="${INPUT_RETENTION_COUNT:-10}"
@@ -116,6 +172,7 @@ jobs:
             echo "source_sha=${source_sha}"
             echo "source_short=${source_sha:0:12}"
             echo "version=${version}"
+            echo "resolved_version=${version}"
             echo "release_id=${release_id}"
             echo "retention_count=${retention_count}"
             echo "channel_tag=${channel_tag}"
@@ -250,7 +307,67 @@ jobs:
           test -d "${install_root}/current/node_modules/playwright"
           test -d "${install_root}/current/node_modules/playwright-core"
 
+      - name: Push stable version bump and tag
+        id: stable_source_push
+        if: steps.release.outputs.channel == 'stable'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          SOURCE_SHA: ${{ steps.release.outputs.source_sha }}
+          RELEASE_PUSH_TOKEN: ${{ secrets.RELEASE_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
+          HAS_RELEASE_PUSH_TOKEN: ${{ secrets.RELEASE_PUSH_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+
+          if [ "$(git rev-parse HEAD)" != "${SOURCE_SHA}" ]; then
+            echo "::error::Local release source does not match resolved source ${SOURCE_SHA}"
+            exit 1
+          fi
+
+          git config user.name "${GITHUB_ACTOR}"
+          git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
+
+          push_url="https://x-access-token:${RELEASE_PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          previous_main="$(git ls-remote "${push_url}" refs/heads/main | awk '{ print $1 }')"
+          if [ -z "${previous_main}" ]; then
+            echo "::error::Could not resolve current origin/main before stable source push."
+            exit 1
+          fi
+
+          git fetch --tags origin
+          version_tag="v${VERSION}"
+          push_refs=(HEAD:main)
+          tag_created=false
+          if git rev-parse -q --verify "refs/tags/${version_tag}" >/dev/null; then
+            tag_target="$(git rev-list -n 1 "${version_tag}")"
+            if [ "${tag_target}" != "${SOURCE_SHA}" ]; then
+              echo "::error::Release tag ${version_tag} already exists at ${tag_target}, not current source ${SOURCE_SHA}."
+              exit 1
+            fi
+            echo "Release tag ${version_tag} already exists at current source; skipping tag creation."
+          else
+            git tag -a "${version_tag}" "${SOURCE_SHA}" -m "Release ${version_tag}"
+            push_refs+=("refs/tags/${version_tag}")
+            tag_created=true
+          fi
+
+          if ! git push --atomic "${push_url}" "${push_refs[@]}"; then
+            if [ "${HAS_RELEASE_PUSH_TOKEN}" != "true" ]; then
+              echo "::error::Pushing the stable release bump and source tag failed with the default GITHUB_TOKEN. Add a RELEASE_PUSH_TOKEN repo secret with contents: write permission scoped to allow push-to-main and tag pushes, then rerun the workflow."
+            else
+              echo "::error::Pushing the stable release bump and source tag failed. Verify RELEASE_PUSH_TOKEN has contents: write permission and can push to main and push release tags."
+            fi
+            exit 1
+          fi
+
+          {
+            echo "pushed=true"
+            echo "previous_main=${previous_main}"
+            echo "version_tag=${version_tag}"
+            echo "tag_created=${tag_created}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Publish channel release
+        id: publish_channel
         env:
           GH_TOKEN: ${{ github.token }}
           CHANNEL: ${{ steps.release.outputs.channel }}
@@ -314,6 +431,52 @@ jobs:
           done <<EOF
           ${PRUNED_ASSETS}
           EOF
+
+      - name: Roll back stable source refs after publish failure
+        if: ${{ failure() && steps.publish_channel.outcome == 'failure' && steps.release.outputs.channel == 'stable' && steps.stable_source_push.outputs.pushed == 'true' }}
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          SOURCE_SHA: ${{ steps.release.outputs.source_sha }}
+          PREVIOUS_MAIN: ${{ steps.stable_source_push.outputs.previous_main }}
+          VERSION_TAG: ${{ steps.stable_source_push.outputs.version_tag }}
+          TAG_CREATED: ${{ steps.stable_source_push.outputs.tag_created }}
+          RELEASE_PUSH_TOKEN: ${{ secrets.RELEASE_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
+          HAS_RELEASE_PUSH_TOKEN: ${{ secrets.RELEASE_PUSH_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+
+          push_url="https://x-access-token:${RELEASE_PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          rollback_refs=()
+
+          current_main="$(git ls-remote "${push_url}" refs/heads/main | awk '{ print $1 }')"
+          if [ "${current_main}" = "${SOURCE_SHA}" ]; then
+            rollback_refs+=("+${PREVIOUS_MAIN}:refs/heads/main")
+          else
+            echo "::warning::Skipping origin/main rollback because it moved from ${SOURCE_SHA} to ${current_main:-unknown}."
+          fi
+
+          if [ "${TAG_CREATED}" = "true" ]; then
+            tag_target="$(git ls-remote "${push_url}" "refs/tags/${VERSION_TAG}^{}" | awk '{ print $1 }')"
+            if [ "${tag_target}" = "${SOURCE_SHA}" ]; then
+              rollback_refs+=(":refs/tags/${VERSION_TAG}")
+            else
+              echo "::warning::Skipping ${VERSION_TAG} rollback because it no longer points at ${SOURCE_SHA}."
+            fi
+          fi
+
+          if [ "${#rollback_refs[@]}" -eq 0 ]; then
+            echo "No stable source refs needed rollback."
+            exit 0
+          fi
+
+          if ! git push --atomic "${push_url}" "${rollback_refs[@]}"; then
+            if [ "${HAS_RELEASE_PUSH_TOKEN}" != "true" ]; then
+              echo "::error::Publish failed after the stable source push, and rollback failed with the default GITHUB_TOKEN. Add a RELEASE_PUSH_TOKEN repo secret with contents: write permission scoped to allow push-to-main and tag pushes, then repair main/${VERSION_TAG} manually."
+            else
+              echo "::error::Publish failed after the stable source push, and rollback failed. Verify RELEASE_PUSH_TOKEN can update main and release tags, then repair main/${VERSION_TAG} manually."
+            fi
+            exit 1
+          fi
 
       - name: Validate published install
         env:
