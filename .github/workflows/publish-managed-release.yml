@@ -83,8 +83,6 @@ jobs:
           INPUT_BUMP: ${{ github.event.inputs.bump || 'patch' }}
           INPUT_VERSION: ${{ github.event.inputs.version || '' }}
           INPUT_RETENTION_COUNT: ${{ github.event.inputs.retention_count || '' }}
-          RELEASE_PUSH_TOKEN: ${{ secrets.RELEASE_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
-          HAS_RELEASE_PUSH_TOKEN: ${{ secrets.RELEASE_PUSH_TOKEN != '' }}
         run: |
           set -euo pipefail
 
@@ -130,43 +128,14 @@ jobs:
             git config user.name "${GITHUB_ACTOR}"
             git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
 
-            push_url="https://x-access-token:${RELEASE_PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-
             if git diff --quiet -- Cargo.toml Cargo.lock apps/web/package.json; then
               echo "Version files already at ${resolved_version}; skipping release bump commit."
             else
               git add Cargo.toml Cargo.lock apps/web/package.json
               git commit -m "chore(release): bump to v${resolved_version}"
-              if ! git push "${push_url}" HEAD:main; then
-                if [ "${HAS_RELEASE_PUSH_TOKEN}" != "true" ]; then
-                  echo "::error::Pushing the stable release bump to main failed with the default GITHUB_TOKEN. Add a RELEASE_PUSH_TOKEN repo secret with contents: write permission scoped to allow push-to-main, then rerun the workflow."
-                else
-                  echo "::error::Pushing the stable release bump to main failed. Verify RELEASE_PUSH_TOKEN has contents: write permission and can push to main."
-                fi
-                exit 1
-              fi
             fi
 
             source_sha="$(git rev-parse HEAD)"
-            version_tag="v${resolved_version}"
-            if git rev-parse -q --verify "refs/tags/${version_tag}" >/dev/null; then
-              tag_target="$(git rev-list -n 1 "${version_tag}")"
-              if [ "${tag_target}" != "${source_sha}" ]; then
-                echo "::error::Release tag ${version_tag} already exists at ${tag_target}, not current source ${source_sha}."
-                exit 1
-              fi
-              echo "Release tag ${version_tag} already exists at current source; skipping tag creation."
-            else
-              git tag -a "${version_tag}" -m "Release ${version_tag}"
-              if ! git push "${push_url}" "refs/tags/${version_tag}"; then
-                if [ "${HAS_RELEASE_PUSH_TOKEN}" != "true" ]; then
-                  echo "::error::Pushing ${version_tag} failed with the default GITHUB_TOKEN. Add a RELEASE_PUSH_TOKEN repo secret with contents: write permission scoped to allow tag pushes, then rerun the workflow."
-                else
-                  echo "::error::Pushing ${version_tag} failed. Verify RELEASE_PUSH_TOKEN has contents: write permission and can push release tags."
-                fi
-                exit 1
-              fi
-            fi
 
             version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "nucleus-daemon") | .version')"
             if [ "${version}" != "${resolved_version}" ]; then
@@ -330,6 +299,56 @@ jobs:
           test -f "${install_root}/current/scripts/browser-sidecar.mjs"
           test -d "${install_root}/current/node_modules/playwright"
           test -d "${install_root}/current/node_modules/playwright-core"
+
+      - name: Push stable version bump and tag
+        if: steps.release.outputs.channel == 'stable'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          SOURCE_SHA: ${{ steps.release.outputs.source_sha }}
+          RELEASE_PUSH_TOKEN: ${{ secrets.RELEASE_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
+          HAS_RELEASE_PUSH_TOKEN: ${{ secrets.RELEASE_PUSH_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+
+          if [ "$(git rev-parse HEAD)" != "${SOURCE_SHA}" ]; then
+            echo "::error::Local release source does not match resolved source ${SOURCE_SHA}"
+            exit 1
+          fi
+
+          git config user.name "${GITHUB_ACTOR}"
+          git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
+
+          push_url="https://x-access-token:${RELEASE_PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          if ! git push "${push_url}" HEAD:main; then
+            if [ "${HAS_RELEASE_PUSH_TOKEN}" != "true" ]; then
+              echo "::error::Pushing the stable release bump to main failed with the default GITHUB_TOKEN. Add a RELEASE_PUSH_TOKEN repo secret with contents: write permission scoped to allow push-to-main, then rerun the workflow."
+            else
+              echo "::error::Pushing the stable release bump to main failed. Verify RELEASE_PUSH_TOKEN has contents: write permission and can push to main."
+            fi
+            exit 1
+          fi
+
+          git fetch --tags origin
+          version_tag="v${VERSION}"
+          if git rev-parse -q --verify "refs/tags/${version_tag}" >/dev/null; then
+            tag_target="$(git rev-list -n 1 "${version_tag}")"
+            if [ "${tag_target}" != "${SOURCE_SHA}" ]; then
+              echo "::error::Release tag ${version_tag} already exists at ${tag_target}, not current source ${SOURCE_SHA}."
+              exit 1
+            fi
+            echo "Release tag ${version_tag} already exists at current source; skipping tag creation."
+          else
+            git tag -a "${version_tag}" "${SOURCE_SHA}" -m "Release ${version_tag}"
+            if ! git push "${push_url}" "refs/tags/${version_tag}"; then
+              if [ "${HAS_RELEASE_PUSH_TOKEN}" != "true" ]; then
+                echo "::error::Pushing ${version_tag} failed with the default GITHUB_TOKEN. Add a RELEASE_PUSH_TOKEN repo secret with contents: write permission scoped to allow tag pushes, then rerun the workflow."
+              else
+                echo "::error::Pushing ${version_tag} failed. Verify RELEASE_PUSH_TOKEN has contents: write permission and can push release tags."
+              fi
+              exit 1
+            fi
+          fi
 
       - name: Publish channel release
         env:

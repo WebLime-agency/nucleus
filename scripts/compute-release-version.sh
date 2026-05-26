@@ -45,7 +45,7 @@ if [ "${version_mode}" = "explicit" ]; then
   fi
 fi
 
-latest_tag="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | head -n 1)"
+latest_tag="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { print; exit }')"
 if [ -z "${latest_tag}" ]; then
   bootstrap_error
   exit 1

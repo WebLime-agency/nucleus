@@ -52,6 +52,13 @@ run_compute_case "v0.1.0" "minor" "0.2.0" "auto-minor-010"
 run_compute_case "v0.1.0" "major" "1.0.0" "auto-major-010"
 run_compute_case "v0.4.7" "patch" "0.4.8" "auto-patch-047"
 
+exact_tag_dir="${tmpdir}/exact-tag-filter"
+make_git_repo "${exact_tag_dir}"
+git -C "${exact_tag_dir}" tag -a "v0.4.7" -m "Release v0.4.7"
+git -C "${exact_tag_dir}" tag -a "v9.9.9-rc1" -m "Release v9.9.9-rc1"
+exact_tag_actual="$(cd "${exact_tag_dir}" && VERSION_MODE=auto BUMP=patch "${compute}")"
+assert_eq "0.4.8" "${exact_tag_actual}" "exact-tag-filter"
+
 no_tag_dir="${tmpdir}/no-tag"
 make_git_repo "${no_tag_dir}"
 if (cd "${no_tag_dir}" && VERSION_MODE=auto BUMP=patch "${compute}") >"${tmpdir}/no-tag.out" 2>"${tmpdir}/no-tag.err"; then
