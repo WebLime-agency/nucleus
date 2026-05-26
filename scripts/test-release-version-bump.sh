@@ -59,6 +59,19 @@ git -C "${exact_tag_dir}" tag -a "v9.9.9-rc1" -m "Release v9.9.9-rc1"
 exact_tag_actual="$(cd "${exact_tag_dir}" && VERSION_MODE=auto BUMP=patch "${compute}")"
 assert_eq "0.4.8" "${exact_tag_actual}" "exact-tag-filter"
 
+merged_tag_dir="${tmpdir}/merged-tag-filter"
+make_git_repo "${merged_tag_dir}"
+merged_base_branch="$(git -C "${merged_tag_dir}" branch --show-current)"
+git -C "${merged_tag_dir}" tag -a "v0.4.7" -m "Release v0.4.7"
+git -C "${merged_tag_dir}" switch -q -c unrelated
+printf 'unrelated\n' > "${merged_tag_dir}/UNRELATED.md"
+git -C "${merged_tag_dir}" add UNRELATED.md
+git -C "${merged_tag_dir}" commit -q -m "unrelated"
+git -C "${merged_tag_dir}" tag -a "v9.9.9" -m "Release v9.9.9"
+git -C "${merged_tag_dir}" switch -q "${merged_base_branch}"
+merged_tag_actual="$(cd "${merged_tag_dir}" && VERSION_MODE=auto BUMP=patch "${compute}")"
+assert_eq "0.4.8" "${merged_tag_actual}" "merged-tag-filter"
+
 no_tag_dir="${tmpdir}/no-tag"
 make_git_repo "${no_tag_dir}"
 if (cd "${no_tag_dir}" && VERSION_MODE=auto BUMP=patch "${compute}") >"${tmpdir}/no-tag.out" 2>"${tmpdir}/no-tag.err"; then
