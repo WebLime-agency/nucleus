@@ -116,6 +116,13 @@ jobs:
           fi
 
           if [ "${channel}" = "stable" ]; then
+            origin_main_sha="$(git rev-parse origin/main)"
+            selected_source_sha="$(git rev-parse HEAD)"
+            if [ "${selected_source_sha}" != "${origin_main_sha}" ]; then
+              echo "::error::Stable releases must publish current origin/main. Promote the desired source to main before running the stable publish workflow."
+              exit 1
+            fi
+
             resolved_version="$(
               VERSION_MODE="${INPUT_VERSION_MODE}" \
               BUMP="${INPUT_BUMP}" \
