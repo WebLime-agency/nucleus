@@ -119,6 +119,10 @@ pub struct SessionSummary {
     pub working_dir_kind: String,
     #[serde(default = "default_workspace_mode")]
     pub workspace_mode: String,
+    #[serde(default = "default_attachment_mode")]
+    pub attachment_mode: String,
+    #[serde(default)]
+    pub worktree_id: String,
     #[serde(default)]
     pub source_project_path: String,
     #[serde(default)]
@@ -137,6 +141,12 @@ pub struct SessionSummary {
     pub git_untracked_count: usize,
     #[serde(default)]
     pub git_remote_tracking_branch: String,
+    #[serde(default)]
+    pub base_ref: String,
+    #[serde(default)]
+    pub base_commit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind_by: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_state_observed_at: Option<i64>,
     #[serde(default)]
@@ -1846,6 +1856,20 @@ pub struct PromptProgressUpdate {
     pub created_at: i64,
 }
 
+/// Request to create a session.
+///
+/// New clients should send `attachment_mode`:
+/// - `new_worktree`
+/// - `project_root`
+/// - `scratch`
+///
+/// `workspace_mode` is retained for legacy clients and maps as follows:
+/// - `isolated_worktree` <-> `new_worktree`
+/// - `shared_project_root` <-> `project_root`
+/// - `scratch_only` <-> `scratch`
+///
+/// When both fields are present, the daemon rejects requests whose values do
+/// not describe the same mode.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateSessionRequest {
     pub profile_id: Option<String>,
@@ -1859,12 +1883,17 @@ pub struct CreateSessionRequest {
     pub approval_mode: Option<String>,
     pub execution_mode: Option<String>,
     pub run_budget_mode: Option<String>,
+    pub attachment_mode: Option<String>,
     pub workspace_mode: Option<String>,
     pub branch_name: Option<String>,
 }
 
 fn default_workspace_mode() -> String {
     "shared_project_root".to_string()
+}
+
+fn default_attachment_mode() -> String {
+    "project_root".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -88,6 +88,8 @@ mod observability_tests {
             working_dir: std::env::temp_dir().display().to_string(),
             working_dir_kind: "workspace_scratch".to_string(),
             workspace_mode: "scratch_only".to_string(),
+            attachment_mode: "scratch".to_string(),
+            worktree_id: String::new(),
             source_project_path: String::new(),
             git_root: String::new(),
             worktree_path: String::new(),
@@ -368,6 +370,8 @@ pub struct SessionRecord {
     pub working_dir: String,
     pub working_dir_kind: String,
     pub workspace_mode: String,
+    pub attachment_mode: String,
+    pub worktree_id: String,
     pub source_project_path: String,
     pub git_root: String,
     pub worktree_path: String,
@@ -382,6 +386,19 @@ pub struct SessionRecord {
     pub approval_mode: String,
     pub execution_mode: String,
     pub run_budget_mode: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeRecord {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    pub path: String,
+    pub branch: String,
+    pub base_ref: String,
+    pub base_commit: String,
+    pub origin_url: String,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1842,6 +1859,72 @@ impl StateStore {
         load_worktree_summary_optional(&connection, id)
     }
 
+    pub fn insert_worktree(&self, record: WorktreeRecord) -> Result<()> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        connection
+            .execute(
+                "
+                INSERT INTO worktrees (
+                    id,
+                    project_id,
+                    name,
+                    path,
+                    branch,
+                    base_ref,
+                    base_commit,
+                    origin_url,
+                    status
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT(id) DO UPDATE SET
+                    project_id = excluded.project_id,
+                    name = excluded.name,
+                    path = excluded.path,
+                    branch = excluded.branch,
+                    base_ref = excluded.base_ref,
+                    base_commit = excluded.base_commit,
+                    origin_url = excluded.origin_url,
+                    status = excluded.status,
+                    updated_at = unixepoch()
+                ",
+                params![
+                    record.id,
+                    record.project_id,
+                    record.name,
+                    record.path,
+                    record.branch,
+                    record.base_ref,
+                    record.base_commit,
+                    record.origin_url,
+                    record.status,
+                ],
+            )
+            .with_context(|| {
+                "failed to insert worktree; another worktree may already use this path".to_string()
+            })?;
+        Ok(())
+    }
+
+    pub fn set_session_worktree(
+        &self,
+        session_id: &str,
+        attachment_mode: &str,
+        worktree_id: &str,
+    ) -> Result<()> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        connection.execute(
+            "
+            UPDATE sessions
+            SET attachment_mode = ?2,
+                worktree_id = ?3,
+                updated_at = unixepoch()
+            WHERE id = ?1
+            ",
+            params![session_id, attachment_mode, worktree_id],
+        )?;
+        Ok(())
+    }
+
     pub fn scratch_dir_for_session(&self, session_id: &str) -> Result<String> {
         let path = self.plan.scratch_dir.join(session_id);
         fs::create_dir_all(&path)
@@ -1915,7 +1998,7 @@ impl StateStore {
                 provider_api_key,
                 working_dir,
                 working_dir_kind,
-                workspace_mode, source_project_path, git_root, worktree_path, git_branch, git_base_ref, git_head, git_dirty, git_untracked_count, git_remote_tracking_branch, session_state_observed_at, workspace_warnings_json,
+                workspace_mode, attachment_mode, worktree_id, source_project_path, git_root, worktree_path, git_branch, git_base_ref, git_head, git_dirty, git_untracked_count, git_remote_tracking_branch, session_state_observed_at, workspace_warnings_json,
                 approval_mode,
                 execution_mode,
                 run_budget_mode,
@@ -1925,7 +2008,7 @@ impl StateStore {
                 last_message_excerpt,
                 turn_count
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, 'active', '', '', '', 0)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, 'active', '', '', '', 0)
             ",
             params![
                 record.id,
@@ -1945,6 +2028,8 @@ impl StateStore {
                 record.working_dir,
                 record.working_dir_kind,
                 record.workspace_mode,
+                record.attachment_mode,
+                record.worktree_id,
                 record.source_project_path,
                 record.git_root,
                 record.worktree_path,
@@ -7465,14 +7550,14 @@ fn load_session_summary(connection: &Connection, session_id: &str) -> Result<Ses
         .query_row(
             "
             SELECT
-                id,
+                sessions.id,
                 title,
                 profile_id,
                 profile_title,
                 route_id,
                 route_title,
                 scope,
-                project_id,
+                sessions.project_id,
                 project_title,
                 project_path,
                 provider,
@@ -7481,7 +7566,26 @@ fn load_session_summary(connection: &Connection, session_id: &str) -> Result<Ses
                 provider_api_key,
                 working_dir,
                 working_dir_kind,
-                workspace_mode, source_project_path, git_root, worktree_path, git_branch, git_base_ref, git_head, git_dirty, git_untracked_count, git_remote_tracking_branch, session_state_observed_at, workspace_warnings_json,
+                workspace_mode,
+                attachment_mode,
+                worktree_id,
+                source_project_path,
+                git_root,
+                worktree_path,
+                git_branch,
+                git_base_ref,
+                git_head,
+                git_dirty,
+                git_untracked_count,
+                git_remote_tracking_branch,
+                COALESCE(worktrees.base_ref, sessions.git_base_ref) AS base_ref,
+                COALESCE(worktrees.base_commit, '') AS base_commit,
+                CASE
+                    WHEN sessions.attachment_mode = 'new_worktree' AND worktrees.id IS NOT NULL THEN 0
+                    ELSE NULL
+                END AS behind_by,
+                session_state_observed_at,
+                workspace_warnings_json,
                 approval_mode,
                 execution_mode,
                 run_budget_mode,
@@ -7490,10 +7594,11 @@ fn load_session_summary(connection: &Connection, session_id: &str) -> Result<Ses
                 last_error,
                 last_message_excerpt,
                 turn_count,
-                created_at,
-                updated_at
+                sessions.created_at,
+                sessions.updated_at
             FROM sessions
-            WHERE id = ?1
+            LEFT JOIN worktrees ON worktrees.id = sessions.worktree_id
+            WHERE sessions.id = ?1
             ",
             params![session_id],
             map_session_summary_row,
@@ -7538,30 +7643,35 @@ fn map_session_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionS
         working_dir: row.get(14)?,
         working_dir_kind: row.get(15)?,
         workspace_mode: row.get(16)?,
-        source_project_path: row.get(17)?,
-        git_root: row.get(18)?,
-        worktree_path: row.get(19)?,
-        git_branch: row.get(20)?,
-        git_base_ref: row.get(21)?,
-        git_head: row.get(22)?,
-        git_dirty: row.get::<_, i64>(23)? != 0,
-        git_untracked_count: row.get::<_, i64>(24)? as usize,
-        git_remote_tracking_branch: row.get(25)?,
-        session_state_observed_at: row.get(26)?,
-        workspace_warnings: serde_json::from_str(&row.get::<_, String>(27)?).unwrap_or_default(),
-        approval_mode: row.get(28)?,
-        execution_mode: row.get(29)?,
-        run_budget_mode: row.get(30)?,
+        attachment_mode: row.get(17)?,
+        worktree_id: row.get(18)?,
+        source_project_path: row.get(19)?,
+        git_root: row.get(20)?,
+        worktree_path: row.get(21)?,
+        git_branch: row.get(22)?,
+        git_base_ref: row.get(23)?,
+        git_head: row.get(24)?,
+        git_dirty: row.get::<_, i64>(25)? != 0,
+        git_untracked_count: row.get::<_, i64>(26)? as usize,
+        git_remote_tracking_branch: row.get(27)?,
+        base_ref: row.get(28)?,
+        base_commit: row.get(29)?,
+        behind_by: row.get(30)?,
+        session_state_observed_at: row.get(31)?,
+        workspace_warnings: serde_json::from_str(&row.get::<_, String>(32)?).unwrap_or_default(),
+        approval_mode: row.get(33)?,
+        execution_mode: row.get(34)?,
+        run_budget_mode: row.get(35)?,
         run_budget: RunBudgetSummary::default(),
         project_count: 0,
         projects: Vec::new(),
-        state: row.get(31)?,
-        provider_session_id: row.get(32)?,
-        last_error: row.get(33)?,
+        state: row.get(36)?,
+        provider_session_id: row.get(37)?,
+        last_error: row.get(38)?,
         user_error: None,
         capabilities: Vec::new(),
-        last_message_excerpt: row.get(34)?,
-        turn_count: row.get(35)?,
+        last_message_excerpt: row.get(39)?,
+        turn_count: row.get(40)?,
         last_resumed_at: None,
         last_reasoning: String::new(),
         last_reasoning_at: None,
@@ -7570,8 +7680,8 @@ fn map_session_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionS
         completion_tokens: 0,
         cached_tokens: 0,
         cost_usd_estimate: None,
-        created_at: row.get(36)?,
-        updated_at: row.get(37)?,
+        created_at: row.get(41)?,
+        updated_at: row.get(42)?,
     })
 }
 
@@ -11052,6 +11162,99 @@ mod tests {
     }
 
     #[test]
+    fn insert_worktree_persists_record_and_rejects_duplicate_path() {
+        let state_dir = test_state_dir("worktree-insert");
+        let (alpha, _) = prepare_two_projects(&state_dir);
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let path = state_dir.join("session-worktree").display().to_string();
+
+        store
+            .insert_worktree(WorktreeRecord {
+                id: "worktree-one".to_string(),
+                project_id: alpha.id.clone(),
+                name: "work/alpha/one".to_string(),
+                path: path.clone(),
+                branch: "work/alpha/one".to_string(),
+                base_ref: "origin/dev".to_string(),
+                base_commit: "abc123".to_string(),
+                origin_url: "https://example.test/repo.git".to_string(),
+                status: "active".to_string(),
+            })
+            .expect("worktree should insert");
+
+        let loaded = store
+            .get_worktree("worktree-one")
+            .expect("worktree lookup should succeed")
+            .expect("worktree should exist");
+        assert_eq!(loaded.project_id, alpha.id);
+        assert_eq!(loaded.path, path);
+        assert_eq!(loaded.base_ref, "origin/dev");
+        assert_eq!(loaded.base_commit, "abc123");
+
+        let error = store
+            .insert_worktree(WorktreeRecord {
+                id: "worktree-two".to_string(),
+                project_id: loaded.project_id,
+                name: "work/alpha/two".to_string(),
+                path: loaded.path,
+                branch: "work/alpha/two".to_string(),
+                base_ref: "origin/dev".to_string(),
+                base_commit: "def456".to_string(),
+                origin_url: "https://example.test/repo.git".to_string(),
+                status: "active".to_string(),
+            })
+            .expect_err("duplicate path should fail");
+        assert!(error.to_string().contains("failed to insert worktree"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn set_session_worktree_updates_attachment_and_timestamp() {
+        let state_dir = test_state_dir("session-worktree-update");
+        let (alpha, _) = prepare_two_projects(&state_dir);
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let mut record = test_session_record(
+            "session-worktree-update",
+            "Session worktree update",
+            "project",
+            alpha.absolute_path.clone(),
+        );
+        record.project_id = alpha.id.clone();
+        record.project_title = alpha.title.clone();
+        record.project_path = alpha.absolute_path.clone();
+        record.project_ids = vec![alpha.id.clone()];
+        record.workspace_mode = "shared_project_root".to_string();
+        record.attachment_mode = "project_root".to_string();
+        store
+            .create_session(record)
+            .expect("session should be created");
+
+        {
+            let connection = store.connection.lock().expect("storage mutex poisoned");
+            connection
+                .execute(
+                    "UPDATE sessions SET updated_at = 100 WHERE id = ?1",
+                    params!["session-worktree-update"],
+                )
+                .expect("timestamp should update");
+        }
+
+        store
+            .set_session_worktree("session-worktree-update", "new_worktree", "worktree-one")
+            .expect("session worktree should update");
+
+        let connection = store.connection.lock().expect("storage mutex poisoned");
+        let (mode, worktree_id) = session_attachment(&connection, "session-worktree-update");
+        assert_eq!(mode, "new_worktree");
+        assert_eq!(worktree_id, "worktree-one");
+        assert!(session_updated_at(&connection, "session-worktree-update") > 100);
+        drop(connection);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
     fn backfills_legacy_project_sessions_into_session_projects() {
         let state_dir = test_state_dir("legacy-session-backfill");
         let workspace_root = state_dir.join("workspace");
@@ -11292,6 +11495,8 @@ mod tests {
                 working_dir: scratch_dir,
                 working_dir_kind: "workspace_scratch".to_string(),
                 workspace_mode: "scratch_only".to_string(),
+                attachment_mode: "scratch".to_string(),
+                worktree_id: String::new(),
                 source_project_path: String::new(),
                 git_root: String::new(),
                 worktree_path: String::new(),
@@ -11420,6 +11625,8 @@ mod tests {
                 working_dir: scratch_dir,
                 working_dir_kind: "workspace_scratch".to_string(),
                 workspace_mode: "scratch_only".to_string(),
+                attachment_mode: "scratch".to_string(),
+                worktree_id: String::new(),
                 source_project_path: String::new(),
                 git_root: String::new(),
                 worktree_path: String::new(),
@@ -13675,6 +13882,8 @@ and open a pull request to dev when it is ready."
             working_dir,
             working_dir_kind: "workspace_scratch".to_string(),
             workspace_mode: "scratch_only".to_string(),
+            attachment_mode: "scratch".to_string(),
+            worktree_id: String::new(),
             source_project_path: String::new(),
             git_root: String::new(),
             worktree_path: String::new(),
