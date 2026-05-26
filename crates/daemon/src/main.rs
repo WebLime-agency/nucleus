@@ -4369,6 +4369,16 @@ async fn update_session(
     };
 
     state.store.update_session(&session_id, patch)?;
+    if let Some(workspace) = prepared_workspace.as_ref() {
+        state
+            .store
+            .set_session_worktree(
+                &session_id,
+                &workspace.attachment_mode,
+                &workspace.worktree_id,
+            )
+            .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
+    }
     let detail = state.store.get_session(&session_id)?;
     let _ = try_record_audit_event(
         &state,
@@ -10658,6 +10668,66 @@ mod tests {
                 "remove",
                 "--force",
                 &detail.session.worktree_path,
+            ])
+            .output();
+        let _ = fs::remove_dir_all(&fixture.state_dir);
+    }
+
+    #[tokio::test]
+    async fn update_session_workspace_persists_new_worktree_attachment() {
+        let fixture = fresh_worktree_fixture("session-update-worktree-attachment");
+        let state = test_app_state(&fixture.store);
+
+        let created = create_session(
+            State(state.clone()),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "project_id": fixture.project_id.clone(),
+                    "attachment_mode": "project_root"
+                }))
+                .expect("payload should serialize"),
+            ),
+        )
+        .await
+        .expect("project root session should create")
+        .0;
+
+        let updated = update_session(
+            State(state),
+            Path(created.session.id.clone()),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "workspace_mode": "isolated_worktree",
+                    "branch_name": "work/update-fresh"
+                }))
+                .expect("payload should serialize"),
+            ),
+        )
+        .await
+        .expect("session workspace should update")
+        .0;
+
+        assert_eq!(updated.session.attachment_mode, "new_worktree");
+        assert_eq!(updated.session.workspace_mode, "isolated_worktree");
+        assert_eq!(updated.session.worktree_id, updated.session.id);
+        assert_eq!(updated.session.base_commit, fixture.fresh_head);
+        assert_eq!(updated.session.behind_by, Some(0));
+        assert!(
+            fixture
+                .store
+                .get_worktree(&updated.session.worktree_id)
+                .expect("worktree lookup should succeed")
+                .is_some()
+        );
+
+        let _ = StdCommand::new("git")
+            .arg("-C")
+            .arg(&fixture.project)
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                &updated.session.worktree_path,
             ])
             .output();
         let _ = fs::remove_dir_all(&fixture.state_dir);
