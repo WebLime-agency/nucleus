@@ -71,7 +71,7 @@ use nucleus_release::read_installed_release_metadata;
 use nucleus_storage::{
     AuditEventRecord, INSTANCE_LOG_MAX_ROWS, INSTANCE_LOG_RETENTION_DAYS, InstanceLogRecord,
     ProjectPatch, SessionPatch, SessionRecord, StateStore, VaultSecretPolicyRecord,
-    VaultSecretRecord, WorkspaceProfilePatch,
+    VaultSecretRecord, WorkspaceProfilePatch, WorktreeRecord,
 };
 use runtime::RuntimeManager;
 use serde::{Deserialize, de::DeserializeOwned};
@@ -3958,17 +3958,82 @@ async fn action_detail(Path(action_id): Path<String>) -> Result<Json<ActionSumma
     Ok(Json(action))
 }
 
+fn normalize_attachment_mode(
+    attachment_mode: Option<&str>,
+    workspace_mode: Option<&str>,
+) -> Result<String, ApiError> {
+    let normalized_attachment = attachment_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| match value {
+            "new_worktree" | "project_root" | "scratch" => Ok(value.to_string()),
+            _ => Err(ApiError::bad_request(format!(
+                "unknown attachment_mode '{value}'; expected new_worktree, project_root, or scratch"
+            ))),
+        })
+        .transpose()?;
+    let normalized_workspace = workspace_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| match value {
+            "isolated_worktree" => Ok("new_worktree".to_string()),
+            "shared_project_root" => Ok("project_root".to_string()),
+            "scratch_only" => Ok("scratch".to_string()),
+            _ => Err(ApiError::bad_request(format!(
+                "unknown workspace_mode '{value}'; expected isolated_worktree, shared_project_root, or scratch_only"
+            ))),
+        })
+        .transpose()?;
+
+    match (normalized_attachment, normalized_workspace) {
+        (Some(attachment), Some(workspace)) if attachment != workspace => {
+            Err(ApiError::bad_request(format!(
+                "attachment_mode '{attachment}' conflicts with workspace_mode '{}'; expected matching values using isolated_worktree<->new_worktree, shared_project_root<->project_root, or scratch_only<->scratch",
+                workspace_mode.unwrap_or_default().trim()
+            )))
+        }
+        (Some(attachment), _) => Ok(attachment),
+        (_, Some(workspace)) => Ok(workspace),
+        (None, None) => Ok(String::new()),
+    }
+}
+
+fn workspace_mode_for_attachment(attachment_mode: &str) -> &'static str {
+    match attachment_mode {
+        "new_worktree" => "isolated_worktree",
+        "scratch" => "scratch_only",
+        _ => "shared_project_root",
+    }
+}
+
 async fn create_session(
     State(state): State<AppState>,
     body: Bytes,
 ) -> Result<Json<SessionDetail>, ApiError> {
     let payload = decode_json::<CreateSessionRequest>(&body)?;
+    let attachment_mode = normalize_attachment_mode(
+        payload.attachment_mode.as_deref(),
+        payload.workspace_mode.as_deref(),
+    )?;
     let session_id = Uuid::new_v4().to_string();
+    let attach_projects = attachment_mode != "scratch";
     let projects = resolve_session_projects(
         &state,
-        payload.project_id.as_deref(),
-        payload.primary_project_id.as_deref(),
-        payload.project_ids.as_deref(),
+        if attach_projects {
+            payload.project_id.as_deref()
+        } else {
+            None
+        },
+        if attach_projects {
+            payload.primary_project_id.as_deref()
+        } else {
+            None
+        },
+        if attach_projects {
+            payload.project_ids.as_deref()
+        } else {
+            None
+        },
         Some(&session_id),
         None,
     )?;
@@ -4039,7 +4104,7 @@ async fn create_session(
         &state,
         &session_id,
         &projects,
-        payload.workspace_mode.as_deref(),
+        &attachment_mode,
         payload.branch_name.as_deref(),
     )?;
 
@@ -4062,6 +4127,8 @@ async fn create_session(
         working_dir: workspace.working_dir.clone(),
         working_dir_kind: workspace.working_dir_kind.clone(),
         workspace_mode: workspace.workspace_mode.clone(),
+        attachment_mode: workspace.attachment_mode.clone(),
+        worktree_id: workspace.worktree_id.clone(),
         source_project_path: workspace.source_project_path.clone(),
         git_root: workspace.git_root.clone(),
         worktree_path: workspace.worktree_path.clone(),
@@ -4178,14 +4245,16 @@ async fn update_session(
         None
     };
     let prepared_workspace = if let Some(selection) = project_selection.as_ref() {
+        let requested_attachment_mode = if payload.workspace_mode.is_some() {
+            normalize_attachment_mode(None, payload.workspace_mode.as_deref())?
+        } else {
+            before.session.attachment_mode.clone()
+        };
         Some(prepare_session_workspace(
             &state,
             &session_id,
             selection,
-            payload
-                .workspace_mode
-                .as_deref()
-                .or(Some(before.session.workspace_mode.as_str())),
+            &requested_attachment_mode,
             payload.branch_name.as_deref(),
         )?)
     } else {
@@ -6389,6 +6458,8 @@ struct PreparedSessionWorkspace {
     working_dir: String,
     working_dir_kind: String,
     workspace_mode: String,
+    attachment_mode: String,
+    worktree_id: String,
     source_project_path: String,
     git_root: String,
     worktree_path: String,
@@ -6405,27 +6476,27 @@ fn prepare_session_workspace(
     state: &AppState,
     session_id: &str,
     projects: &SessionProjectSelection,
-    requested_mode: Option<&str>,
+    requested_attachment_mode: &str,
     requested_branch: Option<&str>,
 ) -> Result<PreparedSessionWorkspace, ApiError> {
-    let mut mode = requested_mode.unwrap_or("").trim().to_string();
-    if mode.is_empty() {
-        mode = if projects.primary_project_path.is_empty() {
-            "scratch_only"
+    let mut attachment_mode = requested_attachment_mode.trim().to_string();
+    if attachment_mode.is_empty() {
+        attachment_mode = if projects.primary_project_path.is_empty() {
+            "scratch"
         } else {
-            "isolated_worktree"
+            "new_worktree"
         }
         .to_string();
     }
     if !matches!(
-        mode.as_str(),
-        "shared_project_root" | "isolated_worktree" | "scratch_only"
+        attachment_mode.as_str(),
+        "new_worktree" | "project_root" | "scratch"
     ) {
         return Err(ApiError::bad_request(format!(
-            "unknown workspace mode '{mode}'"
+            "unknown attachment_mode '{attachment_mode}'"
         )));
     }
-    if mode == "scratch_only" || projects.primary_project_path.is_empty() {
+    if attachment_mode == "scratch" || projects.primary_project_path.is_empty() {
         let scratch_dir = state
             .store
             .scratch_dir_for_session(session_id)
@@ -6433,15 +6504,16 @@ fn prepare_session_workspace(
         return Ok(PreparedSessionWorkspace::empty(
             scratch_dir,
             "workspace_scratch",
-            "scratch_only",
+            "scratch",
         ));
     }
     let git = snapshot_git_state(&projects.primary_project_path).unwrap_or_default();
-    if mode == "shared_project_root" || git.git_root.is_empty() {
+    if attachment_mode == "project_root" || git.git_root.is_empty() {
         let mut prepared = PreparedSessionWorkspace::from_git(
             projects.working_dir.clone(),
             projects.working_dir_kind.clone(),
-            &mode,
+            &attachment_mode,
+            String::new(),
             &projects.primary_project_path,
             git,
         );
@@ -6452,17 +6524,46 @@ fn prepare_session_workspace(
             .into_iter()
             .filter(|s| s.state == "active" && s.working_dir == projects.working_dir)
             .count();
-        if mode == "shared_project_root" && active > 0 {
+        if attachment_mode == "project_root" && active > 0 {
             prepared.workspace_warnings.push(format!("shared checkout already has {active} active session(s); branch and dirty state can cross session boundaries"));
         }
-        if mode == "isolated_worktree" && prepared.git_root.is_empty() {
-            prepared.workspace_warnings.push("requested isolated_worktree but project is not git-backed; using shared project directory".to_string());
+        if attachment_mode == "new_worktree" && prepared.git_root.is_empty() {
+            prepared.workspace_warnings.push("requested new_worktree but project is not git-backed; using shared project directory".to_string());
             prepared.workspace_mode = "shared_project_root".to_string();
+            prepared.attachment_mode = "project_root".to_string();
         }
         return Ok(prepared);
     }
     let git_root = git.git_root.clone();
     let base_ref = choose_session_base_ref(&git_root, &git);
+    let fetch_ref = origin_fetch_ref(&base_ref);
+    let remote_base_ref = origin_tracking_ref(&base_ref);
+    let origin_url = git_output(&git_root, &["remote", "get-url", "origin"]).map_err(|error| {
+        ApiError::bad_request(format!(
+            "failed to resolve origin URL before creating worktree from {remote_base_ref}: {}",
+            error.message
+        ))
+    })?;
+    let fetch_output = StdCommand::new("git")
+        .arg("-C")
+        .arg(&git_root)
+        .arg("fetch")
+        .arg("origin")
+        .arg(&fetch_ref)
+        .output()
+        .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
+    if !fetch_output.status.success() {
+        return Err(ApiError::bad_request(format!(
+            "failed to fetch origin ref '{fetch_ref}' for worktree base {remote_base_ref}: {}",
+            String::from_utf8_lossy(&fetch_output.stderr).trim()
+        )));
+    }
+    let base_commit = git_output(&git_root, &["rev-parse", &remote_base_ref]).map_err(|error| {
+        ApiError::bad_request(format!(
+            "failed to resolve fetched worktree base {remote_base_ref}: {}",
+            error.message
+        ))
+    })?;
     let slug = slugify(&projects.primary_project_title).if_empty("project");
     let short = session_id.chars().take(8).collect::<String>();
     let branch = requested_branch
@@ -6489,17 +6590,10 @@ fn prepare_session_workspace(
         .arg(&git_root)
         .arg("worktree")
         .arg("add")
-        .arg(&wt);
-    if requested_branch
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_some()
-        && branch_exists(&git_root, &branch)
-    {
-        command.arg(&branch);
-    } else {
-        command.arg("-b").arg(&branch).arg(&base_ref);
-    }
+        .arg(&wt)
+        .arg("-b")
+        .arg(&branch)
+        .arg(&remote_base_ref);
     let output = command
         .output()
         .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
@@ -6511,11 +6605,34 @@ fn prepare_session_workspace(
         )));
     }
     let mut wt_git = snapshot_git_state(&display(&wt)).unwrap_or_default();
-    wt_git.git_base_ref = base_ref.clone();
+    wt_git.git_base_ref = remote_base_ref.clone();
+    if wt_git.git_head.is_empty() {
+        wt_git.git_head = base_commit.clone();
+    }
+    if let Err(error) = state.store.insert_worktree(WorktreeRecord {
+        id: session_id.to_string(),
+        project_id: projects.primary_project_id.clone(),
+        name: branch.clone(),
+        path: display(&wt),
+        branch,
+        base_ref: remote_base_ref.clone(),
+        base_commit: base_commit.clone(),
+        origin_url,
+        status: "active".to_string(),
+    }) {
+        let _ = StdCommand::new("git")
+            .arg("-C")
+            .arg(&git_root)
+            .args(["worktree", "remove", "--force", &display(&wt)])
+            .output();
+        let _ = fs::remove_dir_all(&wt);
+        return Err(ApiError::from(anyhow::Error::from(error)));
+    }
     Ok(PreparedSessionWorkspace::from_git(
         display(&wt),
         "managed_git_worktree".to_string(),
-        "isolated_worktree",
+        "new_worktree",
+        session_id.to_string(),
         &projects.primary_project_path,
         wt_git,
     ))
@@ -6535,11 +6652,13 @@ impl IfEmpty for String {
 }
 
 impl PreparedSessionWorkspace {
-    fn empty(working_dir: String, working_dir_kind: &str, mode: &str) -> Self {
+    fn empty(working_dir: String, working_dir_kind: &str, attachment_mode: &str) -> Self {
         Self {
             working_dir,
             working_dir_kind: working_dir_kind.to_string(),
-            workspace_mode: mode.to_string(),
+            workspace_mode: workspace_mode_for_attachment(attachment_mode).to_string(),
+            attachment_mode: attachment_mode.to_string(),
+            worktree_id: String::new(),
             source_project_path: String::new(),
             git_root: String::new(),
             worktree_path: String::new(),
@@ -6555,14 +6674,17 @@ impl PreparedSessionWorkspace {
     fn from_git(
         working_dir: String,
         working_dir_kind: String,
-        mode: &str,
+        attachment_mode: &str,
+        worktree_id: String,
         source: &str,
         git: GitSnapshot,
     ) -> Self {
         Self {
             working_dir: working_dir.clone(),
             working_dir_kind,
-            workspace_mode: mode.to_string(),
+            workspace_mode: workspace_mode_for_attachment(attachment_mode).to_string(),
+            attachment_mode: attachment_mode.to_string(),
+            worktree_id,
             source_project_path: source.to_string(),
             git_root: git.git_root,
             worktree_path: working_dir,
@@ -6709,15 +6831,50 @@ fn short_sha(value: &str) -> String {
 }
 
 fn choose_session_base_ref(git_root: &str, git: &GitSnapshot) -> String {
-    for candidate in ["dev", "origin/dev", "main", "origin/main"] {
+    for candidate in ["origin/dev", "origin/main"] {
         if git_output(git_root, &["rev-parse", "--verify", candidate]).is_ok() {
             return candidate.to_string();
         }
     }
+    if git.git_remote_tracking_branch.starts_with("origin/")
+        && git_output(
+            git_root,
+            &["rev-parse", "--verify", &git.git_remote_tracking_branch],
+        )
+        .is_ok()
+    {
+        return git.git_remote_tracking_branch.clone();
+    }
     if !git.git_branch.is_empty() {
-        git.git_branch.clone()
+        let remote_branch = format!("origin/{}", git.git_branch);
+        if git_output(git_root, &["rev-parse", "--verify", &remote_branch]).is_ok() {
+            return remote_branch;
+        }
+    }
+    for candidate in ["dev", "main"] {
+        if git_output(git_root, &["rev-parse", "--verify", candidate]).is_ok() {
+            return format!("origin/{candidate}");
+        }
+    }
+    if !git.git_branch.is_empty() {
+        format!("origin/{}", git.git_branch)
     } else {
-        "HEAD".to_string()
+        "origin/HEAD".to_string()
+    }
+}
+
+fn origin_fetch_ref(base_ref: &str) -> String {
+    base_ref
+        .strip_prefix("origin/")
+        .unwrap_or(base_ref)
+        .to_string()
+}
+
+fn origin_tracking_ref(base_ref: &str) -> String {
+    if base_ref.starts_with("origin/") {
+        base_ref.to_string()
+    } else {
+        format!("origin/{base_ref}")
     }
 }
 
@@ -6739,14 +6896,6 @@ fn branch_worktree_path(git_root: &str, branch: &str) -> Result<Option<String>, 
         }
     }
     Ok(None)
-}
-
-fn branch_exists(git_root: &str, branch: &str) -> bool {
-    git_output(
-        git_root,
-        &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
-    )
-    .is_ok()
 }
 
 fn git_output(path: &str, args: &[&str]) -> Result<String, ApiError> {
@@ -9552,6 +9701,8 @@ mod tests {
             working_dir: "/home/eba/dev-projects/project-one".to_string(),
             working_dir_kind: "project_root".to_string(),
             workspace_mode: "shared_project_root".to_string(),
+            attachment_mode: "project_root".to_string(),
+            worktree_id: String::new(),
             source_project_path: String::new(),
             git_root: String::new(),
             worktree_path: String::new(),
@@ -9561,6 +9712,9 @@ mod tests {
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            base_ref: String::new(),
+            base_commit: String::new(),
+            behind_by: None,
             session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             approval_mode: "ask".to_string(),
@@ -9756,6 +9910,8 @@ mod tests {
             working_dir: workspace_root.display().to_string(),
             working_dir_kind: "workspace".to_string(),
             workspace_mode: "shared_project_root".to_string(),
+            attachment_mode: "project_root".to_string(),
+            worktree_id: String::new(),
             source_project_path: String::new(),
             git_root: String::new(),
             worktree_path: String::new(),
@@ -9765,6 +9921,9 @@ mod tests {
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            base_ref: String::new(),
+            base_commit: String::new(),
+            behind_by: None,
             session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             scope: "workspace".to_string(),
@@ -9985,6 +10144,8 @@ mod tests {
             working_dir: workspace_root.display().to_string(),
             working_dir_kind: "workspace_scratch".to_string(),
             workspace_mode: "shared_project_root".to_string(),
+            attachment_mode: "project_root".to_string(),
+            worktree_id: String::new(),
             source_project_path: String::new(),
             git_root: String::new(),
             worktree_path: String::new(),
@@ -9994,6 +10155,9 @@ mod tests {
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            base_ref: String::new(),
+            base_commit: String::new(),
+            behind_by: None,
             session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             approval_mode: "ask".to_string(),
@@ -10265,6 +10429,241 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_session_new_worktree_fetches_fresh_remote_head() {
+        let fixture = fresh_worktree_fixture("session-new-worktree-fresh");
+        let state = test_app_state(&fixture.store);
+
+        let detail = create_session(
+            State(state),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "project_id": fixture.project_id.clone(),
+                    "attachment_mode": "new_worktree",
+                    "branch_name": "work/fresh-test"
+                }))
+                .expect("payload should serialize"),
+            ),
+        )
+        .await
+        .expect("new worktree session should create")
+        .0;
+
+        assert_eq!(detail.session.attachment_mode, "new_worktree");
+        assert_eq!(detail.session.workspace_mode, "isolated_worktree");
+        assert_eq!(detail.session.worktree_id, detail.session.id);
+        assert_eq!(detail.session.git_base_ref, "origin/dev");
+        assert_eq!(detail.session.base_ref, "origin/dev");
+        assert_eq!(detail.session.base_commit, fixture.fresh_head);
+        assert_eq!(detail.session.behind_by, Some(0));
+        assert_eq!(
+            git_stdout(
+                FsPath::new(&detail.session.worktree_path),
+                &["rev-parse", "HEAD"]
+            ),
+            fixture.fresh_head
+        );
+
+        let worktree = fixture
+            .store
+            .get_worktree(&detail.session.worktree_id)
+            .expect("worktree lookup should succeed")
+            .expect("worktree row should exist");
+        assert_eq!(worktree.id, detail.session.id);
+        assert_eq!(worktree.base_ref, "origin/dev");
+        assert_eq!(worktree.base_commit, fixture.fresh_head);
+        assert_eq!(worktree.status, "active");
+
+        let _ = StdCommand::new("git")
+            .arg("-C")
+            .arg(&fixture.project)
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                &detail.session.worktree_path,
+            ])
+            .output();
+        let _ = fs::remove_dir_all(&fixture.state_dir);
+    }
+
+    #[tokio::test]
+    async fn create_session_project_root_attaches_without_worktree_row() {
+        let fixture = fresh_worktree_fixture("session-project-root");
+        let state = test_app_state(&fixture.store);
+
+        let detail = create_session(
+            State(state),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "project_id": fixture.project_id.clone(),
+                    "attachment_mode": "project_root"
+                }))
+                .expect("payload should serialize"),
+            ),
+        )
+        .await
+        .expect("project root session should create")
+        .0;
+
+        assert_eq!(detail.session.attachment_mode, "project_root");
+        assert_eq!(detail.session.workspace_mode, "shared_project_root");
+        assert!(detail.session.worktree_id.is_empty());
+        assert_eq!(
+            detail.session.working_dir,
+            fixture.project.display().to_string()
+        );
+        assert!(
+            fixture
+                .store
+                .list_worktrees(&fixture.project_id)
+                .expect("worktrees should list")
+                .is_empty()
+        );
+
+        let _ = fs::remove_dir_all(&fixture.state_dir);
+    }
+
+    #[tokio::test]
+    async fn create_session_scratch_has_no_project_or_worktree() {
+        let fixture = fresh_worktree_fixture("session-scratch");
+        let state = test_app_state(&fixture.store);
+
+        let detail = create_session(
+            State(state),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "project_id": fixture.project_id.clone(),
+                    "attachment_mode": "scratch"
+                }))
+                .expect("payload should serialize"),
+            ),
+        )
+        .await
+        .expect("scratch session should create")
+        .0;
+
+        assert_eq!(detail.session.attachment_mode, "scratch");
+        assert_eq!(detail.session.workspace_mode, "scratch_only");
+        assert!(detail.session.project_id.is_empty());
+        assert!(detail.session.worktree_id.is_empty());
+        assert!(detail.session.git_root.is_empty());
+        assert!(
+            fixture
+                .store
+                .list_worktrees(&fixture.project_id)
+                .expect("worktrees should list")
+                .is_empty()
+        );
+
+        let _ = fs::remove_dir_all(&fixture.state_dir);
+    }
+
+    #[tokio::test]
+    async fn create_session_fetch_failure_fails_loudly_without_local_fallback() {
+        let fixture = fresh_worktree_fixture("session-fetch-failure");
+        run_git(
+            &fixture.project,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "/tmp/nucleus-missing-remote.git",
+            ],
+        );
+        let state = test_app_state(&fixture.store);
+
+        let error = create_session(
+            State(state),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "project_id": fixture.project_id.clone(),
+                    "attachment_mode": "new_worktree",
+                    "branch_name": "work/fetch-fails"
+                }))
+                .expect("payload should serialize"),
+            ),
+        )
+        .await
+        .expect_err("fetch failure should fail loudly");
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("failed to fetch origin ref 'dev'"));
+        assert!(error.message.contains("origin/dev"));
+        assert!(
+            fixture
+                .store
+                .list_worktrees(&fixture.project_id)
+                .expect("worktrees should list")
+                .is_empty()
+        );
+
+        let _ = fs::remove_dir_all(&fixture.state_dir);
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_conflicting_workspace_and_attachment_modes() {
+        let fixture = fresh_worktree_fixture("session-mode-conflict");
+        let state = test_app_state(&fixture.store);
+
+        let error = create_session(
+            State(state),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "project_id": fixture.project_id.clone(),
+                    "attachment_mode": "scratch",
+                    "workspace_mode": "isolated_worktree"
+                }))
+                .expect("payload should serialize"),
+            ),
+        )
+        .await
+        .expect_err("conflicting modes should fail");
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("conflicts with workspace_mode"));
+
+        let _ = fs::remove_dir_all(&fixture.state_dir);
+    }
+
+    #[tokio::test]
+    async fn create_session_legacy_isolated_workspace_maps_to_new_worktree() {
+        let fixture = fresh_worktree_fixture("session-legacy-workspace-mode");
+        let state = test_app_state(&fixture.store);
+
+        let detail = create_session(
+            State(state),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "project_id": fixture.project_id.clone(),
+                    "workspace_mode": "isolated_worktree",
+                    "branch_name": "work/legacy-mode"
+                }))
+                .expect("payload should serialize"),
+            ),
+        )
+        .await
+        .expect("legacy workspace mode should create")
+        .0;
+
+        assert_eq!(detail.session.attachment_mode, "new_worktree");
+        assert_eq!(detail.session.workspace_mode, "isolated_worktree");
+        assert_eq!(detail.session.worktree_id, detail.session.id);
+        assert_eq!(detail.session.base_commit, fixture.fresh_head);
+
+        let _ = StdCommand::new("git")
+            .arg("-C")
+            .arg(&fixture.project)
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                &detail.session.worktree_path,
+            ])
+            .output();
+        let _ = fs::remove_dir_all(&fixture.state_dir);
+    }
+
+    #[tokio::test]
     async fn creates_sessions_from_openai_compatible_workspace_profiles() {
         let state_dir = test_state_dir("create-session-openai-profile");
         let store = initialize_test_store(&state_dir);
@@ -10317,6 +10716,7 @@ mod tests {
                     approval_mode: None,
                     execution_mode: None,
                     run_budget_mode: None,
+                    attachment_mode: None,
                     workspace_mode: None,
                     branch_name: None,
                 })
@@ -10389,6 +10789,8 @@ mod tests {
             working_dir: "/tmp".to_string(),
             working_dir_kind: "workspace_scratch".to_string(),
             workspace_mode: "shared_project_root".to_string(),
+            attachment_mode: "project_root".to_string(),
+            worktree_id: String::new(),
             source_project_path: String::new(),
             git_root: String::new(),
             worktree_path: String::new(),
@@ -10398,6 +10800,9 @@ mod tests {
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            base_ref: String::new(),
+            base_commit: String::new(),
+            behind_by: None,
             session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             approval_mode: "ask".to_string(),
@@ -10481,6 +10886,8 @@ mod tests {
             working_dir: "/tmp".to_string(),
             working_dir_kind: "workspace_scratch".to_string(),
             workspace_mode: "shared_project_root".to_string(),
+            attachment_mode: "project_root".to_string(),
+            worktree_id: String::new(),
             source_project_path: String::new(),
             git_root: String::new(),
             worktree_path: String::new(),
@@ -10490,6 +10897,9 @@ mod tests {
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            base_ref: String::new(),
+            base_commit: String::new(),
+            behind_by: None,
             session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             approval_mode: "ask".to_string(),
@@ -10847,6 +11257,106 @@ mod tests {
         );
     }
 
+    fn git_stdout(root: &FsPath, args: &[&str]) -> String {
+        let output = StdCommand::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    struct FreshWorktreeFixture {
+        state_dir: PathBuf,
+        project: PathBuf,
+        store: Arc<StateStore>,
+        project_id: String,
+        fresh_head: String,
+    }
+
+    fn fresh_worktree_fixture(label: &str) -> FreshWorktreeFixture {
+        let state_dir = test_state_dir(label);
+        let workspace_root = state_dir.join("workspace");
+        let remote = state_dir.join("remote.git");
+        let seed = state_dir.join("seed");
+        let project = workspace_root.join("project");
+        fs::create_dir_all(&workspace_root).expect("workspace root should create");
+        fs::create_dir_all(&seed).expect("seed repo should create");
+        fs::create_dir_all(&remote).expect("remote dir should create");
+
+        run_git(&remote, &["init", "--bare"]);
+        run_git(&seed, &["init", "-b", "dev"]);
+        run_git(&seed, &["config", "user.email", "nucleus@example.test"]);
+        run_git(&seed, &["config", "user.name", "Nucleus Test"]);
+        fs::write(seed.join("README.md"), "initial\n").expect("seed file should write");
+        run_git(&seed, &["add", "."]);
+        run_git(&seed, &["commit", "-m", "initial"]);
+        run_git(
+            &seed,
+            &["remote", "add", "origin", &remote.display().to_string()],
+        );
+        run_git(&seed, &["push", "-u", "origin", "dev"]);
+
+        let clone_output = StdCommand::new("git")
+            .arg("clone")
+            .arg("--branch")
+            .arg("dev")
+            .arg(&remote)
+            .arg(&project)
+            .output()
+            .expect("git clone should run");
+        assert!(
+            clone_output.status.success(),
+            "git clone failed: {}",
+            String::from_utf8_lossy(&clone_output.stderr)
+        );
+        run_git(&project, &["config", "user.email", "nucleus@example.test"]);
+        run_git(&project, &["config", "user.name", "Nucleus Test"]);
+
+        fs::write(seed.join("README.md"), "fresh\n").expect("seed file should update");
+        run_git(&seed, &["add", "."]);
+        run_git(&seed, &["commit", "-m", "fresh"]);
+        run_git(&seed, &["push", "origin", "dev"]);
+        let fresh_head = git_stdout(&seed, &["rev-parse", "HEAD"]);
+
+        let store = initialize_test_store(&state_dir);
+        let workspace = store
+            .update_workspace(
+                Some(
+                    workspace_root
+                        .to_str()
+                        .expect("workspace root should be utf-8"),
+                ),
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("workspace should update");
+        let project_id = workspace
+            .projects
+            .iter()
+            .find(|summary| summary.absolute_path == project.display().to_string())
+            .map(|summary| summary.id.clone())
+            .or_else(|| workspace.projects.first().map(|summary| summary.id.clone()))
+            .expect("project should be discovered");
+
+        FreshWorktreeFixture {
+            state_dir,
+            project,
+            store,
+            project_id,
+            fresh_head,
+        }
+    }
+
     fn test_state_dir(label: &str) -> PathBuf {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -11202,6 +11712,8 @@ mod tests {
                 working_dir: workspace_root.display().to_string(),
                 working_dir_kind: "workspace".to_string(),
                 workspace_mode: "shared_project_root".to_string(),
+                attachment_mode: "project_root".to_string(),
+                worktree_id: String::new(),
                 source_project_path: String::new(),
                 git_root: String::new(),
                 worktree_path: String::new(),
@@ -12811,6 +13323,8 @@ mod tests {
             working_dir: workspace_root.display().to_string(),
             working_dir_kind: "workspace".to_string(),
             workspace_mode: "shared_project_root".to_string(),
+            attachment_mode: "project_root".to_string(),
+            worktree_id: String::new(),
             source_project_path: String::new(),
             git_root: String::new(),
             worktree_path: String::new(),
@@ -12820,6 +13334,9 @@ mod tests {
             git_dirty: false,
             git_untracked_count: 0,
             git_remote_tracking_branch: String::new(),
+            base_ref: String::new(),
+            base_commit: String::new(),
+            behind_by: None,
             session_state_observed_at: None,
             workspace_warnings: Vec::new(),
             scope: "workspace".to_string(),
