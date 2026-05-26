@@ -97,3 +97,9 @@ Managed release channel publishing:
 - channel manifests are release assets named `manifest-stable.json`, `manifest-beta.json`, and `manifest-nightly.json`
 - official channel artifacts include `bin/nucleus-daemon`, `bin/nucleus`, and the matching embedded web bundle
 - official channel artifacts also include Browser sidecar assets when Browser is enabled: `scripts/browser-sidecar.mjs`, `node_modules/playwright`, and `node_modules/playwright-core`
+
+Stable publishes auto-bump the product version before packaging by reading the
+latest `vX.Y.Z` source tag, writing the next version back to the Rust workspace
+and web package, committing that bump to `main`, and tagging the release. See
+[Managed Releases: Versioning](managed-release.md#versioning) for the bootstrap
+tag, workflow inputs, and `RELEASE_PUSH_TOKEN` requirement.

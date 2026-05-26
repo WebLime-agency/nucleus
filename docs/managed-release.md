@@ -177,6 +177,7 @@ Defaults:
 
 The workflow:
 
+- resolves the stable release version before packaging
 - verifies Rust and web checks
 - builds release binaries
 - packages `bin/nucleus-daemon`, `bin/nucleus`, and the built web bundle
@@ -193,3 +194,38 @@ nucleus-channel-stable
 nucleus-channel-beta
 nucleus-channel-nightly
 ```
+
+## Versioning
+
+Stable managed releases use git tags as the version source of truth. At the start
+of a stable publish, the workflow fetches tags, finds the latest `vX.Y.Z` tag,
+computes the next version, writes that version into the workspace `Cargo.toml`,
+`Cargo.lock`, and `apps/web/package.json`, commits the bump to `main`, and creates
+an annotated `vX.Y.Z` release tag.
+
+The default manual publish input is:
+
+```text
+version_mode=auto
+bump=patch
+```
+
+With the bootstrap tag `v0.1.0`, the default stable publish computes `0.1.1`.
+Use `bump=minor` or `bump=major` when the next stable release should move to the
+next minor or major version. To publish an exact semantic version, run the workflow
+with `version_mode=explicit` and set `version` to the intended value, for example
+`0.5.0`. The `version` input is ignored while `version_mode=auto`.
+
+If no `vX.Y.Z` tag exists, the workflow fails before packaging. Bootstrap once by
+cutting an annotated `v0.1.0` tag against the current `main` HEAD:
+
+```bash
+git fetch origin main
+git tag -a v0.1.0 origin/main -m "Release v0.1.0"
+git push origin v0.1.0
+```
+
+Stable write-back requires the `RELEASE_PUSH_TOKEN` repository secret with
+`contents: write` permission and enough scope to push the release bump commit to
+`main` and push annotated release tags. If the secret is absent, the workflow falls
+back to `GITHUB_TOKEN`, but branch protection may reject the push.
