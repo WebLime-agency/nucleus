@@ -41,6 +41,30 @@ export function formatDateTime(timestampSeconds: number): string {
   }).format(timestampSeconds * 1000);
 }
 
+export function formatRelativeTime(timestampSeconds: number, nowSeconds = Date.now() / 1000): string {
+  if (!timestampSeconds) return 'unknown';
+
+  const elapsedSeconds = Math.max(0, Math.floor(nowSeconds - timestampSeconds));
+  if (elapsedSeconds < 60) return 'just now';
+
+  const elapsedMinutes = Math.floor(elapsedSeconds / 60);
+  if (elapsedMinutes < 60) return `${elapsedMinutes}m ago`;
+
+  const elapsedHours = Math.floor(elapsedMinutes / 60);
+  if (elapsedHours < 24) return `${elapsedHours}h ago`;
+  if (elapsedHours < 48) return 'yesterday';
+
+  const date = new Date(timestampSeconds * 1000);
+  const now = new Date(nowSeconds * 1000);
+  const sameYear = date.getFullYear() === now.getFullYear();
+
+  return new Intl.DateTimeFormat(undefined, {
+    month: 'short',
+    day: 'numeric',
+    ...(sameYear ? {} : { year: 'numeric' })
+  }).format(date);
+}
+
 export function formatState(value: string): string {
   return value
     .replace(/_/g, ' ')
