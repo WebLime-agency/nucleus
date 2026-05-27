@@ -54,6 +54,7 @@ import {
   workspaceProfileSummarySchema,
   workspaceProfileWriteRequestSchema,
   workspaceSummarySchema,
+  worktreeSummarySchema,
   workspaceUpdateRequestSchema,
   vaultSecretListResponseSchema,
   vaultSecretPolicyListResponseSchema,
@@ -231,6 +232,19 @@ export async function fetchWorkspace(fetchImpl: FetchLike = fetch) {
       headers: { accept: 'application/json' }
     }),
     workspaceSummarySchema
+  );
+}
+
+export async function fetchProjectWorktrees(projectId: string, fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(
+      fetchImpl,
+      `/api/workspace/projects/${encodeURIComponent(projectId)}/worktrees`,
+      {
+        headers: { accept: 'application/json' }
+      }
+    ),
+    z.array(worktreeSummarySchema)
   );
 }
 
