@@ -3779,7 +3779,7 @@
                     <ImagePlus class="size-4" />
                   </Button>
 
-                  <span title="Voice input is not yet wired. Follow-up #295: Composer voice input - wire mic button to actual capture.">
+                  <span title="Voice input is not yet wired. Follow-up #298: bidirectional voice I/O.">
                     <Button
                       variant="ghost"
                       size="icon"
