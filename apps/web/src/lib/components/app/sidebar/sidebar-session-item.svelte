@@ -13,6 +13,7 @@
     state: string;
     created_at: number;
     last_resumed_at?: number | null;
+    nowMs: number;
     active?: boolean;
     onclick?: () => void;
   };
@@ -25,11 +26,12 @@
     state,
     created_at,
     last_resumed_at = null,
+    nowMs,
     active = false,
     onclick
   }: Props = $props();
 
-  let lastActivityLabel = $derived(formatRelativeTime(last_resumed_at ?? created_at));
+  let lastActivityLabel = $derived.by(() => formatRelativeTime(last_resumed_at ?? created_at, nowMs / 1000));
 </script>
 
 <button
