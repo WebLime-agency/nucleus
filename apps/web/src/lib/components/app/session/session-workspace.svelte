@@ -15,6 +15,7 @@
     FolderTree,
     ImagePlus,
     MessageSquare,
+    Mic,
     MonitorSmartphone,
     NotebookPen,
     PanelRightOpen,
@@ -3293,14 +3294,92 @@
           </div>
 
           <div class="shrink-0 border-t border-zinc-900 bg-zinc-950/95 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 sm:px-6">
-            {#if composerActivityDisplay}
+            {#if selectedSession.state === 'paused' || selectedSession.state === 'error'}
               <section
-                aria-label="Nucleus activity"
                 class={cn(
-                  'mb-3 overflow-hidden rounded-lg border border-zinc-800 bg-zinc-950/95 shadow-2xl shadow-black/25 transition-[max-height]',
-                  composerActivityExpanded ? 'max-h-[min(30rem,46vh)]' : 'max-h-20'
+                  'mb-3 rounded-xl border px-4 py-3 text-sm',
+                  selectedSession.state === 'paused'
+                    ? 'border-amber-500/30 bg-amber-500/10 text-amber-100'
+                    : 'border-red-500/30 bg-red-500/10 text-red-100'
                 )}
               >
+                {#if selectedSession.state === 'error' && composerActivityUserError}
+                  <FriendlyErrorNotice
+                    userError={composerActivityUserError}
+                    class="border-0 bg-transparent p-0"
+                    onRetryJob={() => void handleResumeJob(composerActivityJobSummary?.id)}
+                    onCancelJob={() => void handleCancelJob(composerActivityJobSummary?.id)}
+                    onOpenJobDetails={() => openJobDetails(composerActivityJobSummary?.id)}
+                    retryDisabled={jobActioning}
+                    cancelDisabled={jobActioning}
+                  />
+                {:else}
+                  <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div class="min-w-0">
+                      <div class="font-medium">
+                        {selectedSession.state === 'paused' ? 'This session is paused.' : 'This session has a recoverable job error.'}
+                      </div>
+                      <div class="mt-1 text-xs leading-5 opacity-75">
+                        {selectedSession.state === 'paused'
+                          ? 'Resume or cancel the paused Utility Worker job before sending another prompt.'
+                          : 'Retry the checkpointed Utility Worker job or cancel it before continuing this session.'}
+                      </div>
+                    </div>
+                    <div class="flex shrink-0 flex-wrap gap-2">
+                      {#if composerActivityJobSummary?.state === 'paused' || composerActivityJobSummary?.state === 'failed'}
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          disabled={jobActioning}
+                          onclick={() => handleResumeJob(composerActivityJobSummary?.id)}
+                        >
+                          <RotateCcw class={cn('size-4', jobActioning && 'animate-spin')} />
+                          <span>{jobActioning ? 'Retrying' : composerActivityJobSummary?.state === 'failed' ? 'Retry Job' : 'Resume Job'}</span>
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={jobActioning}
+                          onclick={() => handleCancelJob(composerActivityJobSummary?.id)}
+                        >
+                          <XCircle class="size-4" />
+                          <span>Cancel Job</span>
+                        </Button>
+                      {/if}
+                      {#if composerActivityJobSummary}
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onclick={() => openJobDetails(composerActivityJobSummary.id)}
+                        >
+                          Open Job Details
+                        </Button>
+                      {/if}
+                    </div>
+                  </div>
+                {/if}
+              </section>
+            {/if}
+
+            <div
+              role="group"
+              aria-label="Session composer"
+              class={cn(
+                'overflow-hidden rounded-lg border bg-zinc-900/85 shadow-2xl shadow-black/20 transition-colors',
+                dragOver ? 'border-lime-300/50' : 'border-zinc-800'
+              )}
+              ondragover={handleComposerDragOver}
+              ondragleave={handleComposerDragLeave}
+              ondrop={handleComposerDrop}
+            >
+              {#if composerActivityDisplay}
+                <section
+                  aria-label="Nucleus activity"
+                  class={cn(
+                    'overflow-hidden border-b border-zinc-800 bg-zinc-950/95 transition-[max-height]',
+                    composerActivityExpanded ? 'max-h-[min(30rem,46vh)]' : 'max-h-20'
+                  )}
+                >
                 <div class="flex flex-col gap-2 px-3 py-2.5 sm:flex-row sm:items-center">
                   <button
                     type="button"
@@ -3624,86 +3703,8 @@
               </section>
             {/if}
 
-            {#if selectedSession.state === 'paused' || selectedSession.state === 'error'}
-              <section
-                class={cn(
-                  'mb-3 rounded-xl border px-4 py-3 text-sm',
-                  selectedSession.state === 'paused'
-                    ? 'border-amber-500/30 bg-amber-500/10 text-amber-100'
-                    : 'border-red-500/30 bg-red-500/10 text-red-100'
-                )}
-              >
-                {#if selectedSession.state === 'error' && composerActivityUserError}
-                  <FriendlyErrorNotice
-                    userError={composerActivityUserError}
-                    class="border-0 bg-transparent p-0"
-                    onRetryJob={() => void handleResumeJob(composerActivityJobSummary?.id)}
-                    onCancelJob={() => void handleCancelJob(composerActivityJobSummary?.id)}
-                    onOpenJobDetails={() => openJobDetails(composerActivityJobSummary?.id)}
-                    retryDisabled={jobActioning}
-                    cancelDisabled={jobActioning}
-                  />
-                {:else}
-                  <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                    <div class="min-w-0">
-                      <div class="font-medium">
-                        {selectedSession.state === 'paused' ? 'This session is paused.' : 'This session has a recoverable job error.'}
-                      </div>
-                      <div class="mt-1 text-xs leading-5 opacity-75">
-                        {selectedSession.state === 'paused'
-                          ? 'Resume or cancel the paused Utility Worker job before sending another prompt.'
-                          : 'Retry the checkpointed Utility Worker job or cancel it before continuing this session.'}
-                      </div>
-                    </div>
-                    <div class="flex shrink-0 flex-wrap gap-2">
-                      {#if composerActivityJobSummary?.state === 'paused' || composerActivityJobSummary?.state === 'failed'}
-                        <Button
-                          variant="secondary"
-                          size="sm"
-                          disabled={jobActioning}
-                          onclick={() => handleResumeJob(composerActivityJobSummary?.id)}
-                        >
-                          <RotateCcw class={cn('size-4', jobActioning && 'animate-spin')} />
-                          <span>{jobActioning ? 'Retrying' : composerActivityJobSummary?.state === 'failed' ? 'Retry Job' : 'Resume Job'}</span>
-                        </Button>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          disabled={jobActioning}
-                          onclick={() => handleCancelJob(composerActivityJobSummary?.id)}
-                        >
-                          <XCircle class="size-4" />
-                          <span>Cancel Job</span>
-                        </Button>
-                      {/if}
-                      {#if composerActivityJobSummary}
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onclick={() => openJobDetails(composerActivityJobSummary.id)}
-                        >
-                          Open Job Details
-                        </Button>
-                      {/if}
-                    </div>
-                  </div>
-                {/if}
-              </section>
-            {/if}
-
-            <div
-              role="group"
-              aria-label="Session composer"
-              class={cn(
-                'rounded-lg border bg-zinc-900/85 p-2 transition-colors',
-                dragOver ? 'border-lime-300/50 bg-lime-300/8' : 'border-zinc-800'
-              )}
-              ondragover={handleComposerDragOver}
-              ondragleave={handleComposerDragLeave}
-              ondrop={handleComposerDrop}
-            >
               {#if promptImages.length > 0}
-                <div class="mb-2 flex gap-2 overflow-x-auto pb-1">
+                <div class="flex gap-2 overflow-x-auto border-b border-zinc-800 bg-zinc-950/50 p-2">
                   {#each promptImages as image}
                     <div class="relative flex h-12 min-w-0 max-w-40 shrink-0 items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-950/75 p-1 pr-8">
                       <img
@@ -3725,133 +3726,17 @@
                 </div>
               {/if}
 
-              <div class="flex items-end gap-2">
-                <input
-                  bind:this={fileInputElement}
-                  type="file"
-                  accept="image/*"
-                  multiple
-                  class="hidden"
-                  onchange={handleFileInputChange}
-                />
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  class="h-9 w-9"
-                  aria-label="Attach image"
-                  title={composerHint}
-                  disabled={
-                    !sessionSupportsImages ||
-                    sending ||
-                    selectedSession.state === 'archived' ||
-                    selectedSession.state === 'running' ||
-                    selectedSession.state === 'paused'
-                  }
-                  onclick={triggerImagePicker}
-                >
-                  <ImagePlus class="size-4" />
-                </Button>
-
-                <DropdownMenu.Root bind:open={composerModeMenuOpen}>
-                  <DropdownMenu.Trigger
-                    class={composerModeTriggerClass(sessionComposerMode(selectedSession))}
-                    aria-label={`Session mode: ${composerModeLabel(sessionComposerMode(selectedSession))}`}
-                    title={composerModeDescription(sessionComposerMode(selectedSession))}
-                    disabled={savingSession || selectedSession.state === 'archived'}
-                  >
-                    {#if sessionComposerMode(selectedSession) === 'plan'}
-                      <MessageSquare class="size-4" />
-                    {:else}
-                      <Wrench class="size-4" />
-                    {/if}
-                    <span class="hidden sm:inline">{composerModeLabel(sessionComposerMode(selectedSession))}</span>
-                    <ChevronUp class="size-3.5 text-zinc-500" />
-                  </DropdownMenu.Trigger>
-                  <DropdownMenu.Content side="top" align="start" sideOffset={8} class="w-64 max-w-[calc(100vw-2rem)]">
-                    <DropdownMenu.RadioGroup
-                      value={sessionComposerMode(selectedSession)}
-                      onValueChange={(value) => {
-                        if (value === 'plan' || value === 'ask' || value === 'trusted') {
-                          void handleSelectComposerMode(value);
-                        }
-                      }}
-                    >
-                      {#each COMPOSER_MODES as mode}
-                        <DropdownMenu.RadioItem value={mode} class="items-start gap-3 py-2 pl-2 pr-8">
-                          <div class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center text-zinc-400">
-                            {#if mode === 'plan'}
-                              <MessageSquare class="size-4" />
-                            {:else}
-                              <Wrench class="size-4" />
-                            {/if}
-                          </div>
-                          <div class="min-w-0">
-                            <div class="text-sm font-medium text-zinc-100">
-                              {composerModeLabel(mode)}
-                            </div>
-                            <div class="mt-0.5 text-xs leading-5 text-zinc-500">
-                              {composerModeDescription(mode)}
-                            </div>
-                          </div>
-                        </DropdownMenu.RadioItem>
-                      {/each}
-                    </DropdownMenu.RadioGroup>
-                  </DropdownMenu.Content>
-                </DropdownMenu.Root>
-
-                <DropdownMenu.Root bind:open={runBudgetMenuOpen}>
-                  <DropdownMenu.Trigger
-                    class="inline-flex h-9 items-center justify-center gap-2 rounded-md px-2.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-900 hover:text-zinc-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-700 disabled:pointer-events-none disabled:opacity-50 sm:px-3"
-                    aria-label={`Run budget: ${runBudgetModeLabel(normalizeRunBudgetMode(selectedSession.run_budget_mode))}`}
-                    title={formatRunBudget(selectedSession)}
-                    disabled={savingSession || selectedSession.state === 'archived'}
-                  >
-                    <Clock3 class="size-4" />
-                    <span class="hidden sm:inline">{runBudgetModeLabel(normalizeRunBudgetMode(selectedSession.run_budget_mode))}</span>
-                    <ChevronUp class="size-3.5 text-zinc-500" />
-                  </DropdownMenu.Trigger>
-                  <DropdownMenu.Content side="top" align="start" sideOffset={8} class="w-72 max-w-[calc(100vw-2rem)]">
-                    <DropdownMenu.RadioGroup
-                      value={normalizeRunBudgetMode(selectedSession.run_budget_mode)}
-                      onValueChange={(value) => {
-                        if (
-                          value === 'inherit' ||
-                          value === 'standard' ||
-                          value === 'extended' ||
-                          value === 'marathon' ||
-                          value === 'unbounded'
-                        ) {
-                          void handleSelectRunBudgetMode(value);
-                        }
-                      }}
-                    >
-                      {#each RUN_BUDGET_MODES as mode}
-                        <DropdownMenu.RadioItem value={mode} class="items-start gap-3 py-2 pl-2 pr-8">
-                          <div class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center text-zinc-400">
-                            <Clock3 class="size-4" />
-                          </div>
-                          <div class="min-w-0">
-                            <div class="text-sm font-medium text-zinc-100">
-                              {runBudgetModeLabel(mode)}
-                            </div>
-                            <div class="mt-0.5 text-xs leading-5 text-zinc-500">
-                              {runBudgetModeDescription(mode)}
-                            </div>
-                            <div class="mt-0.5 text-xs leading-5 text-zinc-600">
-                              {runBudgetModeHelp(mode)}
-                            </div>
-                          </div>
-                        </DropdownMenu.RadioItem>
-                      {/each}
-                    </DropdownMenu.RadioGroup>
-                  </DropdownMenu.Content>
-                </DropdownMenu.Root>
-
+              <div
+                class={cn(
+                  'border-b border-zinc-800 bg-zinc-900/85 p-2 transition-colors',
+                  dragOver && 'bg-lime-300/8'
+                )}
+              >
                 <Textarea
                   bind:ref={composerTextareaElement}
                   bind:value={promptText}
                   rows={1}
-                  class="max-h-[10.5rem] min-h-10 flex-1 resize-none border-0 bg-transparent px-1 py-2 text-sm leading-5 text-zinc-100 focus:border-transparent focus-visible:ring-0"
+                  class="max-h-[10.5rem] min-h-[4.5rem] w-full resize-none border-0 bg-transparent px-2 py-2 text-sm leading-5 text-zinc-100 focus:border-transparent focus-visible:ring-0"
                   placeholder="Send a message..."
                   spellcheck={false}
                   aria-describedby="composer-hint"
@@ -3863,10 +3748,169 @@
                   onkeydown={handleComposerKeydown}
                   onpaste={handleComposerPaste}
                 ></Textarea>
+              </div>
+
+              <div class="flex flex-wrap items-center gap-2 bg-zinc-950/65 p-2">
+                <input
+                  bind:this={fileInputElement}
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  class="hidden"
+                  onchange={handleFileInputChange}
+                />
+
+                <div class="flex min-w-0 flex-wrap items-center gap-2">
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    class="h-9 w-9"
+                    aria-label="Attach image"
+                    title={composerHint}
+                    disabled={
+                      !sessionSupportsImages ||
+                      sending ||
+                      selectedSession.state === 'archived' ||
+                      selectedSession.state === 'running' ||
+                      selectedSession.state === 'paused'
+                    }
+                    onclick={triggerImagePicker}
+                  >
+                    <ImagePlus class="size-4" />
+                  </Button>
+
+                  <span title="Voice input is not yet wired. Follow-up #295: Composer voice input - wire mic button to actual capture.">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      class="h-9 w-9"
+                      aria-label="Voice input (coming soon)"
+                      disabled
+                    >
+                      <Mic class="size-4" />
+                    </Button>
+                  </span>
+
+                  <DropdownMenu.Root bind:open={composerModeMenuOpen}>
+                    <DropdownMenu.Trigger
+                      class={composerModeTriggerClass(sessionComposerMode(selectedSession))}
+                      aria-label={`Session mode: ${composerModeLabel(sessionComposerMode(selectedSession))}`}
+                      title={composerModeDescription(sessionComposerMode(selectedSession))}
+                      disabled={savingSession || selectedSession.state === 'archived'}
+                    >
+                      {#if sessionComposerMode(selectedSession) === 'plan'}
+                        <MessageSquare class="size-4" />
+                      {:else}
+                        <Wrench class="size-4" />
+                      {/if}
+                      <span class="hidden sm:inline">{composerModeLabel(sessionComposerMode(selectedSession))}</span>
+                      <ChevronUp class="size-3.5 text-zinc-500" />
+                    </DropdownMenu.Trigger>
+                    <DropdownMenu.Content side="top" align="start" sideOffset={8} class="w-64 max-w-[calc(100vw-2rem)]">
+                      <DropdownMenu.RadioGroup
+                        value={sessionComposerMode(selectedSession)}
+                        onValueChange={(value) => {
+                          if (value === 'plan' || value === 'ask' || value === 'trusted') {
+                            void handleSelectComposerMode(value);
+                          }
+                        }}
+                      >
+                        {#each COMPOSER_MODES as mode}
+                          <DropdownMenu.RadioItem value={mode} class="items-start gap-3 py-2 pl-2 pr-8">
+                            <div class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center text-zinc-400">
+                              {#if mode === 'plan'}
+                                <MessageSquare class="size-4" />
+                              {:else}
+                                <Wrench class="size-4" />
+                              {/if}
+                            </div>
+                            <div class="min-w-0">
+                              <div class="text-sm font-medium text-zinc-100">
+                                {composerModeLabel(mode)}
+                              </div>
+                              <div class="mt-0.5 text-xs leading-5 text-zinc-500">
+                                {composerModeDescription(mode)}
+                              </div>
+                            </div>
+                          </DropdownMenu.RadioItem>
+                        {/each}
+                      </DropdownMenu.RadioGroup>
+                    </DropdownMenu.Content>
+                  </DropdownMenu.Root>
+
+                  <DropdownMenu.Root bind:open={runBudgetMenuOpen}>
+                    <DropdownMenu.Trigger
+                      class="inline-flex h-9 items-center justify-center gap-2 rounded-md px-2.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-900 hover:text-zinc-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-700 disabled:pointer-events-none disabled:opacity-50 sm:px-3"
+                      aria-label={`Run budget: ${runBudgetModeLabel(normalizeRunBudgetMode(selectedSession.run_budget_mode))}`}
+                      title={formatRunBudget(selectedSession)}
+                      disabled={savingSession || selectedSession.state === 'archived'}
+                    >
+                      <Clock3 class="size-4" />
+                      <span class="hidden sm:inline">{runBudgetModeLabel(normalizeRunBudgetMode(selectedSession.run_budget_mode))}</span>
+                      <ChevronUp class="size-3.5 text-zinc-500" />
+                    </DropdownMenu.Trigger>
+                    <DropdownMenu.Content side="top" align="start" sideOffset={8} class="w-72 max-w-[calc(100vw-2rem)]">
+                      <DropdownMenu.RadioGroup
+                        value={normalizeRunBudgetMode(selectedSession.run_budget_mode)}
+                        onValueChange={(value) => {
+                          if (
+                            value === 'inherit' ||
+                            value === 'standard' ||
+                            value === 'extended' ||
+                            value === 'marathon' ||
+                            value === 'unbounded'
+                          ) {
+                            void handleSelectRunBudgetMode(value);
+                          }
+                        }}
+                      >
+                        {#each RUN_BUDGET_MODES as mode}
+                          <DropdownMenu.RadioItem value={mode} class="items-start gap-3 py-2 pl-2 pr-8">
+                            <div class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center text-zinc-400">
+                              <Clock3 class="size-4" />
+                            </div>
+                            <div class="min-w-0">
+                              <div class="text-sm font-medium text-zinc-100">
+                                {runBudgetModeLabel(mode)}
+                              </div>
+                              <div class="mt-0.5 text-xs leading-5 text-zinc-500">
+                                {runBudgetModeDescription(mode)}
+                              </div>
+                              <div class="mt-0.5 text-xs leading-5 text-zinc-600">
+                                {runBudgetModeHelp(mode)}
+                              </div>
+                            </div>
+                          </DropdownMenu.RadioItem>
+                        {/each}
+                      </DropdownMenu.RadioGroup>
+                    </DropdownMenu.Content>
+                  </DropdownMenu.Root>
+                </div>
+
+                <div class="ml-auto flex min-w-0 flex-1 flex-wrap items-center justify-end gap-2 sm:flex-none">
+                  <span
+                    class="inline-flex h-9 max-w-[13rem] items-center gap-2 rounded-md border border-zinc-800 bg-zinc-900/75 px-2.5 text-xs text-zinc-300"
+                    title="Current model from the active profile/route. Follow-up #296: Composer model selector - allow per-turn model override."
+                  >
+                    <Bot class="size-4 shrink-0 text-zinc-500" />
+                    <span class="truncate">{selectedSession.model || 'Provider default model'}</span>
+                  </span>
+
+                  <span
+                    class="inline-flex h-9 items-center rounded-md border border-zinc-800 bg-zinc-900/40 px-2.5 text-xs text-zinc-500"
+                    title="Context-window percentage is not present in the web session payload yet. Follow-up #297: Composer context-window % - surface from daemon payload."
+                    aria-disabled="true"
+                  >
+                    Context: —%
+                  </span>
+
+                  <div data-slot="worktree-picker" class="hidden min-h-9 min-w-0 sm:block" aria-hidden="true"></div>
+                </div>
 
                 <Button
                   variant="default"
                   size="icon"
+                  class="ml-auto h-9 w-9 sm:ml-0"
                   aria-label={sending ? 'Sending prompt' : 'Send prompt'}
                   disabled={
                     !promptReady ||
