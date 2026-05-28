@@ -200,8 +200,9 @@ nucleus-channel-nightly
 Stable managed releases use git tags as the version source of truth. At the start
 of a stable publish, the workflow fetches tags, finds the latest `vX.Y.Z` tag,
 computes the next version, writes that version into the workspace `Cargo.toml`,
-`Cargo.lock`, and `apps/web/package.json`, commits the bump to `main`, and creates
-an annotated `vX.Y.Z` release tag.
+`Cargo.lock`, and `apps/web/package.json`, opens an automated version-bump PR to
+`main`, waits for the protected-branch checks to pass and merge, and creates an
+annotated `vX.Y.Z` release tag on the merged `main` commit.
 
 The default manual publish input is:
 
@@ -226,6 +227,7 @@ git push origin v0.1.0
 ```
 
 Stable write-back requires the `RELEASE_PUSH_TOKEN` repository secret with
-`contents: write` permission and enough scope to push the release bump commit to
-`main` and push annotated release tags. If the secret is absent, the workflow falls
-back to `GITHUB_TOKEN`, but branch protection may reject the push.
+`contents: write` and `pull_requests: write` permission, plus enough scope to push
+the generated release branch, open and merge the version-bump PR, and push
+annotated release tags. The release workflow does not direct-push `main`; `main`
+continues to move through the normal protected PR path.
