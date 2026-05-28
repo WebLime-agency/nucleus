@@ -215,6 +215,10 @@ fn app(state: AppState) -> Router {
             axum::routing::post(sync_projects),
         )
         .route(
+            "/workspace/projects/{project_id}/worktrees",
+            get(list_project_worktrees),
+        )
+        .route(
             "/workspace/projects/{project_id}",
             axum::routing::patch(update_project),
         )
@@ -1009,6 +1013,13 @@ async fn sync_projects(State(state): State<AppState>) -> Result<Json<WorkspaceSu
     }
     let _ = publish_overview_event(&state).await;
     Ok(Json(redact_workspace_summary(workspace)))
+}
+
+async fn list_project_worktrees(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Vec<nucleus_protocol::WorktreeSummary>>, ApiError> {
+    Ok(Json(state.store.list_worktrees(&project_id)?))
 }
 
 async fn update_project(

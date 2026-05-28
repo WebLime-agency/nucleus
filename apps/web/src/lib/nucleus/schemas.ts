@@ -43,6 +43,14 @@ export const userFacingErrorSummarySchema = z.object({
   technical_detail: z.string().default('')
 });
 
+export const attachmentModeSchema = z.enum(['new_worktree', 'project_root', 'scratch']);
+export const readableAttachmentModeSchema = z.union([attachmentModeSchema, z.literal('')]);
+export const workspaceModeSchema = z.enum([
+  'shared_project_root',
+  'isolated_worktree',
+  'scratch_only'
+]);
+
 export const sessionSummarySchema = z.object({
   id: z.string(),
   title: z.string(),
@@ -60,6 +68,8 @@ export const sessionSummarySchema = z.object({
   working_dir: z.string(),
   working_dir_kind: z.string(),
   workspace_mode: z.string().default('shared_project_root'),
+  attachment_mode: readableAttachmentModeSchema.default(''),
+  worktree_id: z.string().default(''),
   source_project_path: z.string().default(''),
   git_root: z.string().default(''),
   worktree_path: z.string().default(''),
@@ -440,7 +450,8 @@ export const createSessionRequestSchema = z.object({
   approval_mode: z.enum(['ask', 'trusted']).optional(),
   execution_mode: z.enum(['act', 'plan']).optional(),
   run_budget_mode: z.enum(['inherit', 'standard', 'extended', 'marathon', 'unbounded']).optional(),
-  workspace_mode: z.enum(['shared_project_root', 'isolated_worktree', 'scratch_only']).optional(),
+  attachment_mode: attachmentModeSchema.optional(),
+  workspace_mode: workspaceModeSchema.optional(),
   branch_name: z.string().trim().optional()
 });
 
@@ -457,7 +468,8 @@ export const updateSessionRequestSchema = z.object({
   approval_mode: z.enum(['ask', 'trusted']).optional(),
   execution_mode: z.enum(['act', 'plan']).optional(),
   run_budget_mode: z.enum(['inherit', 'standard', 'extended', 'marathon', 'unbounded']).optional(),
-  workspace_mode: z.enum(['shared_project_root', 'isolated_worktree', 'scratch_only']).optional(),
+  attachment_mode: attachmentModeSchema.optional(),
+  workspace_mode: workspaceModeSchema.optional(),
   branch_name: z.string().trim().optional()
 });
 
@@ -538,6 +550,20 @@ export const projectSummarySchema = z.object({
   relative_path: z.string(),
   absolute_path: z.string(),
   origin_url: z.string().default(''),
+  created_at: z.number().int(),
+  updated_at: z.number().int()
+});
+
+export const worktreeSummarySchema = z.object({
+  id: z.string(),
+  project_id: z.string(),
+  name: z.string(),
+  path: z.string(),
+  branch: z.string(),
+  base_ref: z.string(),
+  base_commit: z.string(),
+  origin_url: z.string().default(''),
+  status: z.string(),
   created_at: z.number().int(),
   updated_at: z.number().int()
 });
@@ -1320,6 +1346,7 @@ export type InstanceLogEntry = z.infer<typeof instanceLogEntrySchema>;
 export type InstanceLogListResponse = z.infer<typeof instanceLogListResponseSchema>;
 export type InstanceLogCategorySummary = z.infer<typeof instanceLogCategorySummarySchema>;
 export type ProjectSummary = z.infer<typeof projectSummarySchema>;
+export type WorktreeSummary = z.infer<typeof worktreeSummarySchema>;
 export type WorkspaceSummary = z.infer<typeof workspaceSummarySchema>;
 export type WorkspaceModelConfig = z.infer<typeof workspaceModelConfigSchema>;
 export type WorkspaceProfileSummary = z.infer<typeof workspaceProfileSummarySchema>;
