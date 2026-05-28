@@ -228,3 +228,21 @@ test('activity failure view does not let stale job errors mask newer progress', 
 
   assert.equal(failure, null);
 });
+
+test('activity failure view ignores historical failures after successful completion', () => {
+  const failure = activityFailureView({
+    job: { title: 'Utility job', state: 'completed', last_error: '', updated_at: 1_020 },
+    tool_calls: [
+      {
+        tool_id: 'python.run',
+        status: 'failed',
+        error_detail: 'python executable not found',
+        created_at: 1_000,
+        completed_at: 1_005
+      }
+    ],
+    command_sessions: []
+  });
+
+  assert.equal(failure, null);
+});

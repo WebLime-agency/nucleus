@@ -114,6 +114,7 @@ export function noActivity(record, nowSeconds) {
 
 export function activityFailureView(detail, activeProgress) {
   if (!detail) return null;
+  if (SUCCESS_JOB_STATES.has(detail.job?.state)) return null;
 
   const progressTime = activityTimestamp(activeProgress);
   const failedCommand = latestByTimestamp(
@@ -164,6 +165,7 @@ export function activityFailureView(detail, activeProgress) {
 }
 
 const FAILURE_STATES = new Set(['failed', 'timed_out', 'error']);
+const SUCCESS_JOB_STATES = new Set(['approved', 'completed']);
 
 function shouldShowJobError(job, progressTime) {
   if (!progressTime) return true;
