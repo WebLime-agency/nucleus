@@ -100,6 +100,7 @@ Managed release channel publishing:
 
 Stable publishes auto-bump the product version before packaging by reading the
 latest `vX.Y.Z` source tag, writing the next version back to the Rust workspace
-and web package, committing that bump to `main`, and tagging the release. See
+and web package, opening an automated version-bump PR to `main`, waiting for the
+protected checks to pass and merge, and tagging the merged `main` commit. See
 [Managed Releases: Versioning](managed-release.md#versioning) for the bootstrap
 tag, workflow inputs, and `RELEASE_PUSH_TOKEN` requirement.
