@@ -10685,6 +10685,14 @@ async fn execute_pending_tool_action(
         Ok(result) => result,
         Err(error) => {
             state.agent.release_write_lock(&pending.tool_call_id);
+            if *cancel_rx.borrow() || is_terminal_job_state(&state.store.get_job(job_id)?.job.state)
+            {
+                return record_recoverable_tool_failure(
+                    state, session, job_id, worker, checkpoint, step, tool_calls, &pending,
+                    cancel_rx, error,
+                )
+                .await;
+            }
             if is_browser_tool(&tool) {
                 if state.store.get_job(job_id)?.job.publication_requested {
                     let error_detail = error.to_string();
@@ -10768,7 +10776,8 @@ async fn execute_pending_tool_action(
                 );
             }
             return record_recoverable_tool_failure(
-                state, session, job_id, worker, checkpoint, step, tool_calls, &pending, error,
+                state, session, job_id, worker, checkpoint, step, tool_calls, &pending, cancel_rx,
+                error,
             )
             .await;
         }
@@ -10864,6 +10873,7 @@ async fn record_recoverable_tool_failure(
     step: &mut usize,
     tool_calls: &usize,
     pending: &PendingToolAction,
+    cancel_rx: &watch::Receiver<bool>,
     error: anyhow::Error,
 ) -> Result<LoopDisposition> {
     let error_detail = error.to_string();
@@ -10899,6 +10909,35 @@ async fn record_recoverable_tool_failure(
     )?;
 
     let user_failure = format!("{} failed: {}", pending.tool, error_detail);
+    let current_detail = state.store.get_job(job_id)?;
+    if *cancel_rx.borrow() || is_terminal_job_state(&current_detail.job.state) {
+        let _ = state.store.append_job_event(JobEventRecord {
+            job_id: job_id.to_string(),
+            worker_id: Some(worker.id.clone()),
+            event_type: "tool.failed".to_string(),
+            status: "failed".to_string(),
+            summary: format!("Failed {}", pending.tool),
+            detail: error_detail.clone(),
+            data_json: json!({
+                "tool_id": pending.tool.clone(),
+                "tool_call_id": pending.tool_call_id.clone(),
+                "error_class": error_class,
+                "job_state": current_detail.job.state,
+            }),
+        });
+        publish_job_updated(state, &current_detail.job).await;
+        if let Some(current_worker) = current_detail
+            .workers
+            .iter()
+            .find(|candidate| candidate.id == worker.id)
+        {
+            publish_worker_updated(state, current_worker).await;
+        } else {
+            publish_worker_updated(state, worker).await;
+        }
+        return Ok(LoopDisposition::Return);
+    }
+
     *step += 1;
     *worker = state.store.update_worker(
         &worker.id,
@@ -12776,6 +12815,7 @@ async fn execute_python_run_tool(
         network_policy: normalized_network_policy(args.network_policy)?,
         env: sanitize_command_env(args.env)?,
     };
+    record_shared_checkout_python_git_warning(state, job_id, worker, tool_call_id, script).await;
     let mut result = run_bounded_command_tool(
         state,
         job_id,
@@ -13919,6 +13959,46 @@ async fn record_shared_checkout_git_command_warning(
     if !is_risky_git_command(spec) {
         return;
     }
+    record_shared_checkout_git_warning(
+        state,
+        job_id,
+        worker,
+        tool_call_id,
+        "Command",
+        &command_label(spec),
+    )
+    .await;
+}
+
+async fn record_shared_checkout_python_git_warning(
+    state: &AppState,
+    job_id: &str,
+    worker: &WorkerSummary,
+    tool_call_id: &str,
+    script: &str,
+) {
+    if !is_risky_git_python_script(script) {
+        return;
+    }
+    record_shared_checkout_git_warning(
+        state,
+        job_id,
+        worker,
+        tool_call_id,
+        "Python snippet",
+        "python.run",
+    )
+    .await;
+}
+
+async fn record_shared_checkout_git_warning(
+    state: &AppState,
+    job_id: &str,
+    worker: &WorkerSummary,
+    tool_call_id: &str,
+    action_kind: &str,
+    action_label: &str,
+) {
     let Ok(job) = state.store.get_job(job_id) else {
         return;
     };
@@ -13955,8 +14035,7 @@ async fn record_shared_checkout_git_command_warning(
         status: "warning".to_string(),
         summary: "Risky git command in shared checkout".to_string(),
         detail: format!(
-            "Command '{}' may change branch or discard changes while {shared_count} other active session(s) share {}.",
-            command_label(spec),
+            "{action_kind} '{action_label}' may change branch or discard changes while {shared_count} other active session(s) share {}.",
             detail.session.working_dir
         ),
         data_json: json!({
@@ -13984,6 +14063,32 @@ fn is_risky_git_command(spec: &ResolvedCommandSpec) -> bool {
         || normalized.contains(" git reset")
         || normalized.contains(" git clean")
 }
+
+fn is_risky_git_python_script(script: &str) -> bool {
+    contains_risky_git_text(script) || contains_tokenized_risky_git_call(script)
+}
+
+fn contains_risky_git_text(text: &str) -> bool {
+    let normalized = text.trim();
+    RISKY_GIT_SUBCOMMANDS.iter().any(|subcommand| {
+        normalized.contains(&format!("git {subcommand}"))
+            || normalized.contains(&format!("git\t{subcommand}"))
+    })
+}
+
+fn contains_tokenized_risky_git_call(script: &str) -> bool {
+    let has_git_token = ["'git'", "\"git\"", "`git`"]
+        .iter()
+        .any(|token| script.contains(token));
+    has_git_token
+        && RISKY_GIT_SUBCOMMANDS.iter().any(|subcommand| {
+            ["'", "\"", "`"]
+                .iter()
+                .any(|quote| script.contains(&format!("{quote}{subcommand}{quote}")))
+        })
+}
+
+const RISKY_GIT_SUBCOMMANDS: &[&str] = &["checkout", "switch", "reset", "clean"];
 
 async fn run_bounded_command_tool(
     state: &AppState,
@@ -27863,6 +27968,7 @@ for line in sys.stdin:
         checkpoint.pending_action = Some(pending.clone());
         let mut step = 0;
         let tool_calls = 1;
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
 
         let disposition = record_recoverable_tool_failure(
             &state,
@@ -27873,6 +27979,7 @@ for line in sys.stdin:
             &mut step,
             &tool_calls,
             &pending,
+            &cancel_rx,
             anyhow!("python executable not found"),
         )
         .await
@@ -27919,6 +28026,218 @@ for line in sys.stdin:
         assert!(detail.job.last_error.contains("python.run failed"));
         assert_eq!(detail.workers[0].state, "running");
         assert!(detail.workers[0].last_error.contains("python.run failed"));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn recoverable_tool_failure_does_not_resurrect_canceled_job() {
+        let state_dir = test_state_dir("recoverable-tool-failure-canceled");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, job_id, mut worker) = create_parent_fanout_context(
+            &state,
+            "recoverable-tool-failure-canceled",
+            &workspace_root,
+            "http://127.0.0.1:9",
+        );
+        let tool_call_id = "recoverable-canceled-tool-call".to_string();
+        state
+            .store
+            .create_tool_call(ToolCallRecord {
+                id: tool_call_id.clone(),
+                job_id: job_id.clone(),
+                worker_id: worker.id.clone(),
+                tool_id: "python.run".to_string(),
+                status: "running".to_string(),
+                summary: "run python".to_string(),
+                args_json: json!({"script": "print('hi')"}),
+                result_json: None,
+                policy_decision: None,
+                artifact_ids: Vec::new(),
+                error_class: String::new(),
+                error_detail: String::new(),
+                started_at: Some(unix_timestamp()),
+                completed_at: None,
+            })
+            .expect("tool call should persist");
+        state
+            .store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    state: Some("canceled".to_string()),
+                    last_error: Some(String::new()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("job should be canceled");
+        worker = state
+            .store
+            .update_worker(
+                &worker.id,
+                WorkerPatch {
+                    state: Some("canceled".to_string()),
+                    last_error: Some(String::new()),
+                    ..WorkerPatch::default()
+                },
+            )
+            .expect("worker should be canceled");
+        let pending = PendingToolAction {
+            action_kind: "tool".to_string(),
+            tool_call_id: tool_call_id.clone(),
+            approval_id: None,
+            command_session_id: None,
+            child_job_ids: Vec::new(),
+            summary: "run python".to_string(),
+            tool: "python.run".to_string(),
+            args: json!({"script": "print('hi')"}),
+        };
+        let mut checkpoint = test_checkpoint_with_prompt("run python");
+        checkpoint.pending_action = Some(pending.clone());
+        let mut step = 0;
+        let tool_calls = 1;
+        let (_cancel_tx, cancel_rx) = watch::channel(true);
+
+        let disposition = record_recoverable_tool_failure(
+            &state,
+            &session,
+            &job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            &tool_calls,
+            &pending,
+            &cancel_rx,
+            anyhow!("python executable not found"),
+        )
+        .await
+        .expect("late failure should persist without continuing");
+
+        assert_eq!(disposition, LoopDisposition::Return);
+        assert_eq!(step, 0);
+        let detail = state.store.get_job(&job_id).expect("job should reload");
+        assert_eq!(detail.job.state, "canceled");
+        assert_eq!(detail.job.last_error, "");
+        assert_eq!(detail.workers[0].state, "canceled");
+        assert_eq!(detail.workers[0].last_error, "");
+        let tool_call = detail
+            .tool_calls
+            .iter()
+            .find(|tool_call| tool_call.id == tool_call_id)
+            .expect("tool call should load");
+        assert_eq!(tool_call.status, "failed");
+        assert_eq!(tool_call.error_class, "missing_capability");
+        assert!(
+            detail
+                .events
+                .iter()
+                .any(|event| event.event_type == "tool.failed"
+                    && event.data_json["job_state"] == "canceled")
+        );
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn detects_risky_git_python_snippets() {
+        assert!(is_risky_git_python_script(
+            "import os\nos.system('git reset --hard')"
+        ));
+        assert!(is_risky_git_python_script(
+            "import subprocess\nsubprocess.run(['git', 'clean', '-fd'])"
+        ));
+        assert!(!is_risky_git_python_script(
+            "print('git status is safe to mention')"
+        ));
+    }
+
+    #[tokio::test]
+    async fn python_run_records_shared_checkout_git_warning() {
+        let state_dir = test_state_dir("python-run-shared-checkout-warning");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let session_id = "session-python-warning";
+        let mut session = test_session_record(session_id, "Python warning", &workspace_root);
+        session.working_dir_kind = "project_root".to_string();
+        session.workspace_mode = "shared_project_root".to_string();
+        session.attachment_mode = "project_root".to_string();
+        state
+            .store
+            .create_session(session)
+            .expect("session should persist");
+        let mut sibling =
+            test_session_record("session-python-warning-sibling", "Sibling", &workspace_root);
+        sibling.working_dir_kind = "project_root".to_string();
+        sibling.workspace_mode = "shared_project_root".to_string();
+        sibling.attachment_mode = "project_root".to_string();
+        state
+            .store
+            .create_session(sibling)
+            .expect("sibling session should persist");
+        let job_id = "job-python-warning".to_string();
+        state
+            .store
+            .create_job(JobRecord {
+                id: job_id.clone(),
+                session_id: Some(session_id.to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: None,
+                title: "Python warning job".to_string(),
+                purpose: "test warning".to_string(),
+                trigger_kind: "manual".to_string(),
+                state: "running".to_string(),
+                requested_by: "test".to_string(),
+                prompt_excerpt: String::new(),
+                publication_intent_text: None,
+            })
+            .expect("job should persist");
+        let worker = state
+            .store
+            .create_worker(WorkerRecord {
+                id: "worker-python-warning".to_string(),
+                job_id: job_id.clone(),
+                parent_worker_id: None,
+                title: "Python warning worker".to_string(),
+                lane: "utility".to_string(),
+                state: "running".to_string(),
+                provider: "test".to_string(),
+                model: "test".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: workspace_root.display().to_string(),
+                read_roots: vec![workspace_root.display().to_string()],
+                write_roots: vec![workspace_root.display().to_string()],
+                max_steps: 10,
+                max_tool_calls: 10,
+                max_wall_clock_secs: 30,
+            })
+            .expect("worker should persist");
+        let tool_call_id = "tool-call-python-warning";
+
+        record_shared_checkout_python_git_warning(
+            &state,
+            &job_id,
+            &worker,
+            tool_call_id,
+            "import os\nos.system('git reset --hard')",
+        )
+        .await;
+
+        let detail = state.store.get_job(&job_id).expect("job should reload");
+        let warning = detail
+            .events
+            .iter()
+            .find(|event| event.event_type == "workspace.warning")
+            .expect("shared checkout warning should be recorded");
+        assert_eq!(warning.summary, "Risky git command in shared checkout");
+        assert!(warning.detail.contains("Python snippet"));
+        assert_eq!(warning.data_json["tool_call_id"], tool_call_id);
+        assert_eq!(warning.data_json["shared_session_count"], 1);
         let _ = fs::remove_dir_all(&state_dir);
     }
 
