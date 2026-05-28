@@ -208,3 +208,23 @@ test('activity failure view keeps older failures that are still current worker e
     state: 'failed'
   });
 });
+
+test('activity failure view does not let stale job errors mask newer progress', () => {
+  const failure = activityFailureView(
+    {
+      job: {
+        title: 'Utility job',
+        state: 'running',
+        last_error: 'python.run failed: python executable not found',
+        created_at: 1_000,
+        updated_at: 1_005
+      },
+      tool_calls: [],
+      command_sessions: [],
+      workers: [{ state: 'running', last_error: 'python.run failed: python executable not found' }]
+    },
+    { status: 'running', created_at: 1_010 }
+  );
+
+  assert.equal(failure, null);
+});

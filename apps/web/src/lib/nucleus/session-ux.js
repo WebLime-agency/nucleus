@@ -152,7 +152,7 @@ export function activityFailureView(detail, activeProgress) {
   }
 
   const jobError = String(detail.job?.last_error ?? '').trim();
-  if (jobError) {
+  if (jobError && shouldShowJobError(detail.job, progressTime)) {
     return {
       title: detail.job?.title || 'Utility Worker issue',
       detail: jobError,
@@ -164,6 +164,12 @@ export function activityFailureView(detail, activeProgress) {
 }
 
 const FAILURE_STATES = new Set(['failed', 'timed_out', 'error']);
+
+function shouldShowJobError(job, progressTime) {
+  if (!progressTime) return true;
+  if (FAILURE_STATES.has(job?.state)) return true;
+  return activityTimestamp(job) >= progressTime;
+}
 
 function failureIsCurrent(detail, errorText, failureTime, progressTime) {
   if (!progressTime || failureTime >= progressTime) {
