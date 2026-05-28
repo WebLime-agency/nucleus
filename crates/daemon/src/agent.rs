@@ -12746,8 +12746,7 @@ async fn execute_python_run_tool(
     }
     let cwd = resolve_command_cwd(worker, args.cwd.as_deref())?;
     let runtime = resolve_python_runtime(&cwd)?;
-    let mut command_args = vec!["-c".to_string(), script.to_string(), "--".to_string()];
-    command_args.extend(args.args);
+    let command_args = python_run_command_args(script, args.args);
     let spec = ResolvedCommandSpec {
         mode: "python".to_string(),
         title: "Nucleus-owned Python runtime".to_string(),
@@ -12780,6 +12779,12 @@ async fn execute_python_run_tool(
         "source": runtime.source,
     });
     Ok(result)
+}
+
+fn python_run_command_args(script: &str, args: Vec<String>) -> Vec<String> {
+    let mut command_args = vec!["-c".to_string(), script.to_string()];
+    command_args.extend(args);
+    command_args
 }
 
 async fn execute_command_run_tool(
@@ -27731,6 +27736,24 @@ for line in sys.stdin:
 
         assert!(error.to_string().contains("python executable not found"));
         let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn python_run_command_args_pass_user_args_without_sentinel_shift() {
+        let args = python_run_command_args(
+            "import sys; print(sys.argv)",
+            vec!["alpha".to_string(), "--flag".to_string()],
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "-c".to_string(),
+                "import sys; print(sys.argv)".to_string(),
+                "alpha".to_string(),
+                "--flag".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]
