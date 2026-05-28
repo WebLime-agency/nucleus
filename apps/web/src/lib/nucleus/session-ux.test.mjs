@@ -246,3 +246,30 @@ test('activity failure view ignores historical failures after successful complet
 
   assert.equal(failure, null);
 });
+
+test('activity failure view ignores historical failures after cancellation', () => {
+  const failure = activityFailureView({
+    job: { title: 'Utility job', state: 'canceled', last_error: '', updated_at: 1_020 },
+    tool_calls: [
+      {
+        tool_id: 'python.run',
+        status: 'failed',
+        error_detail: 'python executable not found',
+        created_at: 1_000,
+        completed_at: 1_005
+      }
+    ],
+    command_sessions: [
+      {
+        title: 'Nucleus-owned command',
+        command: 'npm test',
+        state: 'failed',
+        last_error: 'command exited with status 1',
+        created_at: 1_000,
+        completed_at: 1_006
+      }
+    ]
+  });
+
+  assert.equal(failure, null);
+});
