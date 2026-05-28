@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
+  activityFailureView,
   completionGateGroups,
   gateBadgeVariant,
   nextRuntimeTick,
@@ -104,4 +105,144 @@ test('completion gates are grouped by daemon-provided state', () => {
   assert.equal(gateBadgeVariant('blocked'), 'destructive');
   assert.equal(gateBadgeVariant('pending'), 'warning');
   assert.equal(gateBadgeVariant('done'), 'default');
+});
+
+test('activity failure view surfaces failed Python tool result', () => {
+  const failure = activityFailureView({
+    job: { title: 'Utility job', state: 'running', last_error: '' },
+    tool_calls: [
+      {
+        tool_id: 'python.run',
+        status: 'failed',
+        error_detail: 'python executable not found',
+        created_at: 1_000,
+        completed_at: 1_005
+      }
+    ],
+    command_sessions: []
+  });
+
+  assert.deepEqual(failure, {
+    title: 'Python runtime failed',
+    detail: 'python executable not found',
+    state: 'failed'
+  });
+});
+
+test('activity failure view prefers newer command failure detail', () => {
+  const failure = activityFailureView({
+    job: { title: 'Utility job', state: 'running', last_error: '' },
+    tool_calls: [
+      {
+        tool_id: 'python.run',
+        status: 'failed',
+        error_detail: 'python executable not found',
+        created_at: 1_000,
+        completed_at: 1_005
+      }
+    ],
+    command_sessions: [
+      {
+        title: 'Nucleus-owned Python runtime',
+        command: '/usr/bin/python3',
+        state: 'failed',
+        last_error: 'command exited with status 1',
+        created_at: 1_000,
+        completed_at: 1_010
+      }
+    ]
+  });
+
+  assert.deepEqual(failure, {
+    title: 'Nucleus-owned Python runtime',
+    detail: 'command exited with status 1',
+    state: 'failed'
+  });
+});
+
+test('activity failure view does not let old command failures mask newer progress', () => {
+  const failure = activityFailureView(
+    {
+      job: { title: 'Utility job', state: 'running', last_error: '' },
+      tool_calls: [],
+      command_sessions: [
+        {
+          title: 'Nucleus-owned command',
+          command: 'npm test',
+          state: 'failed',
+          last_error: 'command exited with status 1',
+          created_at: 1_000,
+          completed_at: 1_005
+        }
+      ],
+      workers: [{ state: 'running', last_error: '' }]
+    },
+    { status: 'running', created_at: 1_010 }
+  );
+
+  assert.equal(failure, null);
+});
+
+test('activity failure view keeps older failures that are still current worker errors', () => {
+  const failure = activityFailureView(
+    {
+      job: { title: 'Utility job', state: 'running', last_error: '' },
+      tool_calls: [
+        {
+          tool_id: 'python.run',
+          status: 'failed',
+          error_detail: 'python executable not found',
+          created_at: 1_000,
+          completed_at: 1_005
+        }
+      ],
+      command_sessions: [],
+      workers: [{ state: 'running', last_error: 'python.run failed: python executable not found' }]
+    },
+    { status: 'running', created_at: 1_010 }
+  );
+
+  assert.deepEqual(failure, {
+    title: 'Python runtime failed',
+    detail: 'python executable not found',
+    state: 'failed'
+  });
+});
+
+test('activity failure view does not let stale job errors mask newer progress', () => {
+  const failure = activityFailureView(
+    {
+      job: {
+        title: 'Utility job',
+        state: 'running',
+        last_error: 'python.run failed: python executable not found',
+        created_at: 1_000,
+        updated_at: 1_005
+      },
+      tool_calls: [],
+      command_sessions: [],
+      workers: [{ state: 'running', last_error: 'python.run failed: python executable not found' }]
+    },
+    { status: 'running', created_at: 1_010 }
+  );
+
+  assert.equal(failure, null);
+});
+
+test('activity failure view ignores historical failures after successful completion', () => {
+  const failure = activityFailureView({
+    job: { title: 'Utility job', state: 'completed', last_error: '', updated_at: 1_020 },
+    tool_calls: [
+      {
+        tool_id: 'python.run',
+        status: 'failed',
+        error_detail: 'python executable not found',
+        created_at: 1_000,
+        completed_at: 1_005
+      }
+    ],
+    command_sessions: []
+  });
+
+  assert.equal(failure, null);
 });
