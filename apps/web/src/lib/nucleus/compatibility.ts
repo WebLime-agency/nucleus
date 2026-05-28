@@ -1,6 +1,7 @@
 import type { CompatibilitySummary } from './schemas';
+import packageJson from '../../../package.json';
 
-export const CURRENT_CLIENT_VERSION = '0.1.0';
+export const CURRENT_CLIENT_VERSION = packageJson.version;
 export const CURRENT_CLIENT_SURFACE_VERSION = '2026-05-managed-release-v1';
 
 export type CompatibilityLevel = 'supported' | 'degraded' | 'blocked';

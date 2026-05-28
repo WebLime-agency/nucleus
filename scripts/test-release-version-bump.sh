@@ -94,7 +94,7 @@ explicit_good="$(cd "${explicit_good_dir}" && VERSION_MODE=explicit VERSION=0.5.
 assert_eq "0.5.0" "${explicit_good}" "explicit-good"
 
 fixture="${tmpdir}/fixture"
-mkdir -p "${fixture}/apps/web"
+mkdir -p "${fixture}/apps/web/src/lib/nucleus"
 cat > "${fixture}/Cargo.toml" <<'CARGO'
 [workspace]
 members = []
@@ -116,16 +116,22 @@ cat > "${fixture}/apps/web/package.json" <<'JSON'
   }
 }
 JSON
+cat > "${fixture}/apps/web/src/lib/nucleus/compatibility.ts" <<'TS'
+import packageJson from '../../../package.json';
+
+export const CURRENT_CLIENT_VERSION = packageJson.version;
+TS
 git -C "${fixture}" init -q
 git -C "${fixture}" config user.name "Release Test"
 git -C "${fixture}" config user.email "release-test@example.invalid"
-git -C "${fixture}" add Cargo.toml apps/web/package.json
+git -C "${fixture}" add Cargo.toml apps/web/package.json apps/web/src/lib/nucleus/compatibility.ts
 git -C "${fixture}" commit -q -m "fixture"
 
 "${update_files}" 0.1.1 "${fixture}"
 
 grep -q '^version = "0.1.1"$' "${fixture}/Cargo.toml" || fail "Cargo.toml version was not updated"
 jq -e '.version == "0.1.1"' "${fixture}/apps/web/package.json" >/dev/null || fail "package.json version was not updated"
+grep -q "packageJson.version" "${fixture}/apps/web/src/lib/nucleus/compatibility.ts" || fail "web client version should derive from package.json"
 
 version_diff="$(git -C "${fixture}" diff --no-ext-diff --unified=0 -- Cargo.toml apps/web/package.json | awk '/^[-+]version = "/ || /^[-+]  "version": "/ { print }')"
 expected_version_diff="$(cat <<'DIFF'
