@@ -1376,6 +1376,7 @@ fn is_builtin_nucleus_tool(tool: &str) -> bool {
             | "fs.mkdir"
             | "git.stage_patch"
             | "command.run"
+            | "python.run"
             | "command.session.open"
             | "command.session.write"
             | "command.session.close"

@@ -644,6 +644,19 @@ struct CommandRunArgs {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct PythonRunArgs {
+    script: String,
+    #[serde(default)]
+    args: Vec<String>,
+    cwd: Option<String>,
+    timeout_secs: Option<u64>,
+    output_limit_bytes: Option<usize>,
+    network_policy: Option<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct CommandSessionOpenArgs {
     command: String,
     #[serde(default)]
@@ -864,6 +877,12 @@ struct ResolvedCommandSpec {
     output_limit_bytes: usize,
     network_policy: String,
     env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PythonRuntime {
+    command: String,
+    source: String,
 }
 
 #[derive(Debug, Clone)]
@@ -10748,17 +10767,10 @@ async fn execute_pending_tool_action(
                     },
                 );
             }
-            let _ = state.store.update_tool_call(
-                &pending.tool_call_id,
-                ToolCallPatch {
-                    status: Some("failed".to_string()),
-                    error_class: Some("tool_error".to_string()),
-                    error_detail: Some(error.to_string()),
-                    completed_at: Some(Some(unix_timestamp())),
-                    ..ToolCallPatch::default()
-                },
-            );
-            return Err(error);
+            return record_recoverable_tool_failure(
+                state, session, job_id, worker, checkpoint, step, tool_calls, &pending, error,
+            )
+            .await;
         }
     };
 
@@ -10841,6 +10853,117 @@ async fn execute_pending_tool_action(
     publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
     publish_worker_updated(state, worker).await;
     Ok(LoopDisposition::Continue)
+}
+
+async fn record_recoverable_tool_failure(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &mut WorkerSummary,
+    checkpoint: &mut WorkerCheckpoint,
+    step: &mut usize,
+    tool_calls: &usize,
+    pending: &PendingToolAction,
+    error: anyhow::Error,
+) -> Result<LoopDisposition> {
+    let error_detail = error.to_string();
+    let error_class = recoverable_tool_error_class(&pending.tool, &error_detail);
+    let tool_result = json!({
+        "ok": false,
+        "tool_id": pending.tool.clone(),
+        "status": error_class,
+        "error": error_detail,
+        "error_class": error_class,
+    });
+    state.store.update_tool_call(
+        &pending.tool_call_id,
+        ToolCallPatch {
+            status: Some("failed".to_string()),
+            result_json: Some(Some(tool_result.clone())),
+            error_class: Some(error_class.to_string()),
+            error_detail: Some(error_detail.clone()),
+            completed_at: Some(Some(unix_timestamp())),
+            ..ToolCallPatch::default()
+        },
+    )?;
+
+    checkpoint.pending_action = None;
+    checkpoint.next_prompt = Some(build_tool_result_prompt(
+        &pending.tool,
+        &pending.summary,
+        &tool_result,
+    ));
+    state.store.write_worker_checkpoint(
+        &worker.id,
+        &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+    )?;
+
+    let user_failure = format!("{} failed: {}", pending.tool, error_detail);
+    *step += 1;
+    *worker = state.store.update_worker(
+        &worker.id,
+        WorkerPatch {
+            state: Some("running".to_string()),
+            step_count: Some(*step),
+            tool_call_count: Some(*tool_calls),
+            last_error: Some(user_failure.clone()),
+            ..WorkerPatch::default()
+        },
+    )?;
+    let _ = state.store.update_job(
+        job_id,
+        JobPatch {
+            state: Some("running".to_string()),
+            last_error: Some(user_failure.clone()),
+            ..JobPatch::default()
+        },
+    );
+    let _ = state.store.update_session(
+        &session.session.id,
+        SessionPatch {
+            state: Some("running".to_string()),
+            last_error: Some(user_failure.clone()),
+            ..SessionPatch::default()
+        },
+    );
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: job_id.to_string(),
+        worker_id: Some(worker.id.clone()),
+        event_type: "tool.failed".to_string(),
+        status: "failed".to_string(),
+        summary: format!("Failed {}", pending.tool),
+        detail: error_detail.clone(),
+        data_json: json!({
+            "tool_id": pending.tool.clone(),
+            "tool_call_id": pending.tool_call_id.clone(),
+            "error_class": error_class,
+        }),
+    });
+
+    if let Ok(updated) = state.store.get_session(&session.session.id) {
+        let _ = publish_session_event(state, updated).await;
+    }
+    publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+    publish_worker_updated(state, worker).await;
+    publish_prompt_status(
+        state,
+        &session.session,
+        worker,
+        "tool_error",
+        &format!("{} failed", pending.tool),
+        &error_detail,
+        &[],
+    )
+    .await;
+    Ok(LoopDisposition::Continue)
+}
+
+fn recoverable_tool_error_class(tool: &str, error_detail: &str) -> &'static str {
+    if tool == "python.run" && error_detail.contains("python executable not found") {
+        "missing_capability"
+    } else {
+        "tool_error"
+    }
 }
 
 async fn execute_granted_tool(
@@ -10930,6 +11053,20 @@ async fn execute_granted_tool(
             let args = serde_json::from_value::<CommandRunArgs>(args)
                 .context("invalid args for command.run")?;
             execute_command_run_tool(
+                state,
+                job_id,
+                worker,
+                tool_call_id,
+                checkpoint,
+                cancel_rx,
+                args,
+            )
+            .await
+        }
+        "python.run" => {
+            let args = serde_json::from_value::<PythonRunArgs>(args)
+                .context("invalid args for python.run")?;
+            execute_python_run_tool(
                 state,
                 job_id,
                 worker,
@@ -11090,6 +11227,11 @@ fn preview_approval_tool(
             let args = serde_json::from_value::<CommandRunArgs>(args.clone())
                 .context("invalid args for command.run")?;
             preview_command_run(worker, args)
+        }
+        "python.run" => {
+            let args = serde_json::from_value::<PythonRunArgs>(args.clone())
+                .context("invalid args for python.run")?;
+            preview_python_run(worker, args)
         }
         "command.session.open" => {
             let args = serde_json::from_value::<CommandSessionOpenArgs>(args.clone())
@@ -12080,6 +12222,59 @@ fn preview_command_run(worker: &WorkerSummary, args: CommandRunArgs) -> Result<M
     })
 }
 
+fn preview_python_run(worker: &WorkerSummary, args: PythonRunArgs) -> Result<MutationPreview> {
+    let cwd = resolve_command_cwd(worker, args.cwd.as_deref())?;
+    let timeout_secs = args
+        .timeout_secs
+        .unwrap_or(COMMAND_DEFAULT_TIMEOUT_SECS)
+        .clamp(1, COMMAND_MAX_TIMEOUT_SECS);
+    let output_limit_bytes = args
+        .output_limit_bytes
+        .unwrap_or(COMMAND_DEFAULT_OUTPUT_LIMIT_BYTES)
+        .clamp(1_024, COMMAND_MAX_OUTPUT_LIMIT_BYTES);
+    let network_policy = normalized_network_policy(args.network_policy)?;
+    let env = sanitize_command_env(args.env)?;
+    let worker_root = Path::new(&worker.working_dir);
+    let runtime = python_runtime_prompt_status(&cwd, Some(worker_root));
+    let env_summary = if env.is_empty() {
+        "No environment overrides.".to_string()
+    } else {
+        format!(
+            "Environment overrides:\n{}",
+            env.keys()
+                .map(|key| format!("- {key}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    let plan = format!(
+        "Run a bounded Python snippet through the daemon-owned Python runtime.\n\n{}\nWorking directory: {}\nPython args: {}\nTimeout: {}s\nOutput budget: {} bytes\nNetwork policy: {}\n{}\n\nScript preview:\n{}",
+        runtime,
+        cwd.display(),
+        if args.args.is_empty() {
+            "(none)".to_string()
+        } else {
+            args.args.join(" ")
+        },
+        timeout_secs,
+        output_limit_bytes,
+        network_policy,
+        env_summary,
+        excerpt(&args.script, DIFF_PREVIEW_CHAR_LIMIT)
+    );
+    Ok(MutationPreview {
+        detail: "Run a Python snippet through Nucleus Python runtime discovery.".to_string(),
+        diff_preview: excerpt(&plan, DIFF_PREVIEW_CHAR_LIMIT),
+        artifact: Some(text_artifact(
+            "command-plan",
+            "Python runtime plan".to_string(),
+            "txt",
+            "text/plain",
+            plan,
+        )),
+    })
+}
+
 fn preview_command_session_open(
     worker: &WorkerSummary,
     args: CommandSessionOpenArgs,
@@ -12360,6 +12555,133 @@ fn is_allowed_command_env_key(key: &str) -> bool {
         || key.starts_with("GO")
 }
 
+fn resolve_python_runtime(cwd: &Path, project_root: Option<&Path>) -> Result<PythonRuntime> {
+    resolve_python_runtime_with_path(
+        cwd,
+        project_root,
+        env::var_os("VIRTUAL_ENV").as_deref(),
+        command_path_env().as_deref(),
+    )
+}
+
+fn resolve_python_runtime_with_path(
+    cwd: &Path,
+    project_root: Option<&Path>,
+    virtual_env: Option<&std::ffi::OsStr>,
+    path_env: Option<&std::ffi::OsStr>,
+) -> Result<PythonRuntime> {
+    for (candidate, source) in python_runtime_candidates(cwd, project_root, virtual_env, path_env) {
+        if candidate_is_executable(&candidate) {
+            return Ok(PythonRuntime {
+                command: candidate.display().to_string(),
+                source,
+            });
+        }
+    }
+
+    bail!(
+        "python executable not found; Nucleus looked for project .venv/venv, active VIRTUAL_ENV, python3, and python on PATH. Use fs.apply_patch or fs.write_text for simple edits, or install Python and retry."
+    )
+}
+
+fn python_runtime_candidates(
+    cwd: &Path,
+    project_root: Option<&Path>,
+    virtual_env: Option<&std::ffi::OsStr>,
+    path_env: Option<&std::ffi::OsStr>,
+) -> Vec<(PathBuf, String)> {
+    let mut candidates = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut roots = Vec::new();
+    if let Some(project_root) = project_root {
+        roots.push((project_root, "project"));
+    }
+    roots.push((cwd, "cwd"));
+    for (root, label) in roots {
+        for dirname in [".venv", "venv"] {
+            push_python_candidate(
+                &mut candidates,
+                &mut seen,
+                root.join(dirname).join("bin").join("python"),
+                format!("{label} {dirname}"),
+            );
+            push_python_candidate(
+                &mut candidates,
+                &mut seen,
+                root.join(dirname).join("Scripts").join("python.exe"),
+                format!("{label} {dirname}"),
+            );
+        }
+    }
+    if let Some(virtual_env) = virtual_env.filter(|value| !value.is_empty()) {
+        let root = PathBuf::from(virtual_env);
+        push_python_candidate(
+            &mut candidates,
+            &mut seen,
+            root.join("bin").join("python"),
+            "VIRTUAL_ENV".to_string(),
+        );
+        push_python_candidate(
+            &mut candidates,
+            &mut seen,
+            root.join("Scripts").join("python.exe"),
+            "VIRTUAL_ENV".to_string(),
+        );
+    }
+    if let Some(path_env) = path_env {
+        for executable in ["python3", "python", "python3.exe", "python.exe"] {
+            for dir in env::split_paths(path_env) {
+                push_python_candidate(
+                    &mut candidates,
+                    &mut seen,
+                    dir.join(executable),
+                    format!("PATH {executable}"),
+                );
+            }
+        }
+    }
+    candidates
+}
+
+fn push_python_candidate(
+    candidates: &mut Vec<(PathBuf, String)>,
+    seen: &mut BTreeSet<PathBuf>,
+    path: PathBuf,
+    source: String,
+) {
+    if seen.insert(path.clone()) {
+        candidates.push((path, source));
+    }
+}
+
+fn candidate_is_executable(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn python_runtime_prompt_status(cwd: &Path, project_root: Option<&Path>) -> String {
+    match resolve_python_runtime(cwd, project_root) {
+        Ok(runtime) => format!(
+            "Python runtime: available via {} ({})",
+            runtime.command, runtime.source
+        ),
+        Err(error) => format!("Python runtime: unavailable ({error})"),
+    }
+}
+
 fn is_supported_test_command(command: &str) -> bool {
     let executable = Path::new(command)
         .file_name()
@@ -12415,6 +12737,66 @@ fn shell_quoted_command(spec: &ResolvedCommandSpec) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+async fn execute_python_run_tool(
+    state: &AppState,
+    job_id: &str,
+    worker: &WorkerSummary,
+    tool_call_id: &str,
+    checkpoint: &mut WorkerCheckpoint,
+    cancel_rx: &mut watch::Receiver<bool>,
+    args: PythonRunArgs,
+) -> Result<Value> {
+    let script = args.script.trim();
+    if script.is_empty() {
+        bail!("python.run requires a non-empty script");
+    }
+    if script.len() > 100_000 {
+        bail!("python.run script exceeds the 100000 byte limit");
+    }
+    let cwd = resolve_command_cwd(worker, args.cwd.as_deref())?;
+    let worker_root = Path::new(&worker.working_dir);
+    let runtime = resolve_python_runtime(&cwd, Some(worker_root))?;
+    let command_args = python_run_command_args(script, args.args);
+    let spec = ResolvedCommandSpec {
+        mode: "python".to_string(),
+        title: "Nucleus-owned Python runtime".to_string(),
+        command: runtime.command.clone(),
+        args: command_args,
+        cwd,
+        timeout_secs: args
+            .timeout_secs
+            .unwrap_or(COMMAND_DEFAULT_TIMEOUT_SECS)
+            .clamp(1, COMMAND_MAX_TIMEOUT_SECS),
+        output_limit_bytes: args
+            .output_limit_bytes
+            .unwrap_or(COMMAND_DEFAULT_OUTPUT_LIMIT_BYTES)
+            .clamp(1_024, COMMAND_MAX_OUTPUT_LIMIT_BYTES),
+        network_policy: normalized_network_policy(args.network_policy)?,
+        env: sanitize_command_env(args.env)?,
+    };
+    let mut result = run_bounded_command_tool(
+        state,
+        job_id,
+        worker,
+        tool_call_id,
+        checkpoint,
+        cancel_rx,
+        spec,
+    )
+    .await?;
+    result["runtime"] = json!({
+        "kind": "python",
+        "source": runtime.source,
+    });
+    Ok(result)
+}
+
+fn python_run_command_args(script: &str, args: Vec<String>) -> Vec<String> {
+    let mut command_args = vec!["-c".to_string(), script.to_string()];
+    command_args.extend(args);
+    command_args
 }
 
 async fn execute_command_run_tool(
@@ -15169,7 +15551,10 @@ fn policy_for_tool_with_mode(tool: &str, approval_mode: &str) -> PolicyDecisionR
 fn requires_approval_for_tool(tool: &str) -> bool {
     is_mutating_tool(tool)
         || is_browser_action_tool(tool)
-        || matches!(tool, "command.run" | "command.session.open" | "tests.run")
+        || matches!(
+            tool,
+            "command.run" | "python.run" | "command.session.open" | "tests.run"
+        )
 }
 
 fn is_mutating_tool(tool: &str) -> bool {
@@ -15213,7 +15598,11 @@ fn is_browser_tool(tool: &str) -> bool {
 }
 
 fn requires_write_lock(tool: &str) -> bool {
-    is_mutating_tool(tool) || matches!(tool, "command.run" | "command.session.open" | "tests.run")
+    is_mutating_tool(tool)
+        || matches!(
+            tool,
+            "command.run" | "python.run" | "command.session.open" | "tests.run"
+        )
 }
 
 fn lock_reason_for_tool(tool: &str, summary: &str) -> String {
@@ -16367,6 +16756,18 @@ fn execution_capabilities() -> Vec<ToolCapabilityGrantRecord> {
             scope_kind: "process".to_string(),
         },
         ToolCapabilityGrantRecord {
+            tool_id: "python.run".to_string(),
+            summary: "Run a bounded Python snippet through Nucleus interpreter discovery; resolves project virtualenvs, python3, then python, and reports a clear missing-capability error when unavailable.".to_string(),
+            approval_mode: "explicit".to_string(),
+            risk_level: "high".to_string(),
+            side_effect_level: "process".to_string(),
+            timeout_secs: COMMAND_DEFAULT_TIMEOUT_SECS,
+            max_output_bytes: COMMAND_DEFAULT_OUTPUT_LIMIT_BYTES,
+            supports_streaming: false,
+            concurrency_group: "process".to_string(),
+            scope_kind: "process".to_string(),
+        },
+        ToolCapabilityGrantRecord {
             tool_id: "command.session.open".to_string(),
             summary: "Open a bounded interactive command session owned by Nucleus.".to_string(),
             approval_mode: "explicit".to_string(),
@@ -16616,6 +17017,7 @@ Working directory: {}\n",
 {\"kind\":\"tool_call\",\"summary\":\"fetch inline PR review threads\",\"tool\":\"github.pr_review_threads\",\"args\":{\"pr_number\":123}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"fetch direct PR lifecycle state\",\"tool\":\"github.pr_state\",\"args\":{\"pr_number\":123}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"check running dev processes\",\"tool\":\"command.run\",\"args\":{\"command\":\"sh\",\"args\":[\"-lc\",\"ps -ef | grep -iE 'stfr|vite|next|webpack|dev server' | grep -v grep\"],\"cwd\":\".\",\"timeout_secs\":20}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"run a Python snippet through Nucleus runtime discovery\",\"tool\":\"python.run\",\"args\":{\"script\":\"print('hello')\",\"cwd\":\".\",\"timeout_secs\":20}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"verify the UI in Browser\",\"tool\":\"browser.navigate\",\"args\":{\"url\":\"http://127.0.0.1:5299\"}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"read Browser refs\",\"tool\":\"browser.snapshot\",\"args\":{}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"click a Browser control by ref\",\"tool\":\"browser.click\",\"args\":{\"target_ref\":\"ref-1\"}}\n\
@@ -16679,13 +17081,24 @@ Rules:\n\
 - If a user challenges or repeats a prior clean/no-action answer, treat it as a grounding failure signal and use a deeper or different evidence path before repeating the conclusion.\n\
 - Treat zero matched tests as no tests matched, not validation success.\n\
 - When posting GitHub comments, use github.comment or a body file/stdin path. Do not put comment bodies with backticks or shell metacharacters inside sh -lc strings.\n\
+- Use python.run for Python snippets instead of hard-coding python or python3 in command.run. For simple edits, prefer fs.apply_patch or fs.write_text over script-generated edits.\n\
 - Use final_answer only as the terminal completion action when the requested task is complete and validated, or when you are genuinely blocked.\n\
 - Do not use provider-native tool wrappers such as tool_call/tool_name/shell; use the exact Nucleus JSON shapes above.\n\
 - Do not wrap JSON in markdown fences.\n\
 Available tools:\n{}\n\
+{}\n\
 Worker lane: {}\n\
 Working directory: {}\n",
-        worker.lane, action_shapes, child_job_rules, tool_help, worker.lane, worker.working_dir
+        worker.lane,
+        action_shapes,
+        child_job_rules,
+        tool_help,
+        python_runtime_prompt_status(
+            Path::new(&worker.working_dir),
+            Some(Path::new(&worker.working_dir)),
+        ),
+        worker.lane,
+        worker.working_dir
     )
 }
 
@@ -27305,6 +27718,219 @@ for line in sys.stdin:
             display_name: display_name.to_string(),
             mime_type: "image/png".to_string(),
             data_url: "data:image/png;base64,iVBORw0KGgo=".to_string(),
+        }
+    }
+
+    #[test]
+    fn python_runtime_prefers_python3_when_python_alias_is_absent() {
+        let state_dir = test_state_dir("python-runtime-python3-only");
+        let bin_dir = state_dir.join("bin");
+        fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+        let python3 = bin_dir.join("python3");
+        fs::write(&python3, "#!/bin/sh\nexit 0\n").expect("python3 shim should write");
+        make_executable(&python3);
+        let path_env = env::join_paths([bin_dir]).expect("path env should join");
+
+        let runtime = resolve_python_runtime_with_path(&state_dir, None, None, Some(&path_env))
+            .expect("python3-only path should resolve");
+
+        assert_eq!(runtime.command, python3.display().to_string());
+        assert_eq!(runtime.source, "PATH python3");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn python_runtime_finds_windows_python_exe_on_path() {
+        let state_dir = test_state_dir("python-runtime-windows-path");
+        let bin_dir = state_dir.join("bin");
+        fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+        let python_exe = bin_dir.join("python.exe");
+        fs::write(&python_exe, "#!/bin/sh\nexit 0\n").expect("python.exe shim should write");
+        make_executable(&python_exe);
+        let path_env = env::join_paths([bin_dir]).expect("path env should join");
+
+        let runtime = resolve_python_runtime_with_path(&state_dir, None, None, Some(&path_env))
+            .expect("python.exe path should resolve");
+
+        assert_eq!(runtime.command, python_exe.display().to_string());
+        assert_eq!(runtime.source, "PATH python.exe");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn python_runtime_checks_worker_root_venv_before_command_cwd() {
+        let state_dir = test_state_dir("python-runtime-worker-root-venv");
+        let worker_root = state_dir.join("project");
+        let command_cwd = worker_root.join("apps").join("web");
+        let venv_bin = worker_root.join(".venv").join("bin");
+        fs::create_dir_all(&command_cwd).expect("command cwd should exist");
+        fs::create_dir_all(&venv_bin).expect("venv bin should exist");
+        let python = venv_bin.join("python");
+        fs::write(&python, "#!/bin/sh\nexit 0\n").expect("python shim should write");
+        make_executable(&python);
+        let empty_bin = state_dir.join("empty-bin");
+        fs::create_dir_all(&empty_bin).expect("empty bin dir should exist");
+        let path_env = env::join_paths([empty_bin]).expect("path env should join");
+
+        let runtime = resolve_python_runtime_with_path(
+            &command_cwd,
+            Some(&worker_root),
+            None,
+            Some(&path_env),
+        )
+        .expect("worker root .venv should resolve from nested cwd");
+
+        assert_eq!(runtime.command, python.display().to_string());
+        assert_eq!(runtime.source, "project .venv");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn python_runtime_reports_missing_capability_without_python() {
+        let state_dir = test_state_dir("python-runtime-missing");
+        let empty_bin = state_dir.join("empty-bin");
+        fs::create_dir_all(&empty_bin).expect("empty bin dir should exist");
+        let path_env = env::join_paths([empty_bin]).expect("path env should join");
+
+        let error = resolve_python_runtime_with_path(&state_dir, None, None, Some(&path_env))
+            .expect_err("missing Python should be explicit");
+
+        assert!(error.to_string().contains("python executable not found"));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn python_run_command_args_pass_user_args_without_sentinel_shift() {
+        let args = python_run_command_args(
+            "import sys; print(sys.argv)",
+            vec!["alpha".to_string(), "--flag".to_string()],
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "-c".to_string(),
+                "import sys; print(sys.argv)".to_string(),
+                "alpha".to_string(),
+                "--flag".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn recoverable_tool_failure_persists_checkpoint_and_job_state() {
+        let state_dir = test_state_dir("recoverable-tool-failure");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, job_id, mut worker) = create_parent_fanout_context(
+            &state,
+            "recoverable-tool-failure",
+            &workspace_root,
+            "http://127.0.0.1:9",
+        );
+        let tool_call_id = "recoverable-python-tool-call".to_string();
+        state
+            .store
+            .create_tool_call(ToolCallRecord {
+                id: tool_call_id.clone(),
+                job_id: job_id.clone(),
+                worker_id: worker.id.clone(),
+                tool_id: "python.run".to_string(),
+                status: "running".to_string(),
+                summary: "run python".to_string(),
+                args_json: json!({"script": "print('hi')"}),
+                result_json: None,
+                policy_decision: None,
+                artifact_ids: Vec::new(),
+                error_class: String::new(),
+                error_detail: String::new(),
+                started_at: Some(unix_timestamp()),
+                completed_at: None,
+            })
+            .expect("tool call should persist");
+        let pending = PendingToolAction {
+            action_kind: "tool".to_string(),
+            tool_call_id: tool_call_id.clone(),
+            approval_id: None,
+            command_session_id: None,
+            child_job_ids: Vec::new(),
+            summary: "run python".to_string(),
+            tool: "python.run".to_string(),
+            args: json!({"script": "print('hi')"}),
+        };
+        let mut checkpoint = test_checkpoint_with_prompt("run python");
+        checkpoint.pending_action = Some(pending.clone());
+        let mut step = 0;
+        let tool_calls = 1;
+
+        let disposition = record_recoverable_tool_failure(
+            &state,
+            &session,
+            &job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            &tool_calls,
+            &pending,
+            anyhow!("python executable not found"),
+        )
+        .await
+        .expect("failure should be recoverable");
+
+        assert_eq!(disposition, LoopDisposition::Continue);
+        assert_eq!(step, 1);
+        let tool_call = state
+            .store
+            .get_job(&job_id)
+            .expect("job should load")
+            .tool_calls
+            .into_iter()
+            .find(|tool_call| tool_call.id == tool_call_id)
+            .expect("tool call should load");
+        assert_eq!(tool_call.status, "failed");
+        assert_eq!(tool_call.error_class, "missing_capability");
+        assert!(
+            tool_call
+                .result_json
+                .as_ref()
+                .and_then(|value| value.get("error"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("python executable not found")
+        );
+        let persisted: WorkerCheckpoint = serde_json::from_value(
+            state
+                .store
+                .read_worker_checkpoint(&worker.id)
+                .expect("checkpoint query should succeed")
+                .expect("checkpoint should persist"),
+        )
+        .expect("checkpoint should decode");
+        assert!(persisted.pending_action.is_none());
+        assert!(
+            persisted
+                .next_prompt
+                .as_deref()
+                .unwrap_or_default()
+                .contains("python executable not found")
+        );
+        let detail = state.store.get_job(&job_id).expect("job should reload");
+        assert!(detail.job.last_error.contains("python.run failed"));
+        assert_eq!(detail.workers[0].state, "running");
+        assert!(detail.workers[0].last_error.contains("python.run failed"));
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    fn make_executable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(path)
+                .expect("file metadata should load")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).expect("permissions should update");
         }
     }
 
