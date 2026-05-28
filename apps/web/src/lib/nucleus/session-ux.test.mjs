@@ -159,3 +159,52 @@ test('activity failure view prefers newer command failure detail', () => {
     state: 'failed'
   });
 });
+
+test('activity failure view does not let old command failures mask newer progress', () => {
+  const failure = activityFailureView(
+    {
+      job: { title: 'Utility job', state: 'running', last_error: '' },
+      tool_calls: [],
+      command_sessions: [
+        {
+          title: 'Nucleus-owned command',
+          command: 'npm test',
+          state: 'failed',
+          last_error: 'command exited with status 1',
+          created_at: 1_000,
+          completed_at: 1_005
+        }
+      ],
+      workers: [{ state: 'running', last_error: '' }]
+    },
+    { status: 'running', created_at: 1_010 }
+  );
+
+  assert.equal(failure, null);
+});
+
+test('activity failure view keeps older failures that are still current worker errors', () => {
+  const failure = activityFailureView(
+    {
+      job: { title: 'Utility job', state: 'running', last_error: '' },
+      tool_calls: [
+        {
+          tool_id: 'python.run',
+          status: 'failed',
+          error_detail: 'python executable not found',
+          created_at: 1_000,
+          completed_at: 1_005
+        }
+      ],
+      command_sessions: [],
+      workers: [{ state: 'running', last_error: 'python.run failed: python executable not found' }]
+    },
+    { status: 'running', created_at: 1_010 }
+  );
+
+  assert.deepEqual(failure, {
+    title: 'Python runtime failed',
+    detail: 'python executable not found',
+    state: 'failed'
+  });
+});

@@ -12234,7 +12234,8 @@ fn preview_python_run(worker: &WorkerSummary, args: PythonRunArgs) -> Result<Mut
         .clamp(1_024, COMMAND_MAX_OUTPUT_LIMIT_BYTES);
     let network_policy = normalized_network_policy(args.network_policy)?;
     let env = sanitize_command_env(args.env)?;
-    let runtime = python_runtime_prompt_status(&cwd);
+    let worker_root = Path::new(&worker.working_dir);
+    let runtime = python_runtime_prompt_status(&cwd, Some(worker_root));
     let env_summary = if env.is_empty() {
         "No environment overrides.".to_string()
     } else {
@@ -12554,9 +12555,10 @@ fn is_allowed_command_env_key(key: &str) -> bool {
         || key.starts_with("GO")
 }
 
-fn resolve_python_runtime(cwd: &Path) -> Result<PythonRuntime> {
+fn resolve_python_runtime(cwd: &Path, project_root: Option<&Path>) -> Result<PythonRuntime> {
     resolve_python_runtime_with_path(
         cwd,
+        project_root,
         env::var_os("VIRTUAL_ENV").as_deref(),
         command_path_env().as_deref(),
     )
@@ -12564,10 +12566,11 @@ fn resolve_python_runtime(cwd: &Path) -> Result<PythonRuntime> {
 
 fn resolve_python_runtime_with_path(
     cwd: &Path,
+    project_root: Option<&Path>,
     virtual_env: Option<&std::ffi::OsStr>,
     path_env: Option<&std::ffi::OsStr>,
 ) -> Result<PythonRuntime> {
-    for (candidate, source) in python_runtime_candidates(cwd, virtual_env, path_env) {
+    for (candidate, source) in python_runtime_candidates(cwd, project_root, virtual_env, path_env) {
         if candidate_is_executable(&candidate) {
             return Ok(PythonRuntime {
                 command: candidate.display().to_string(),
@@ -12583,24 +12586,32 @@ fn resolve_python_runtime_with_path(
 
 fn python_runtime_candidates(
     cwd: &Path,
+    project_root: Option<&Path>,
     virtual_env: Option<&std::ffi::OsStr>,
     path_env: Option<&std::ffi::OsStr>,
 ) -> Vec<(PathBuf, String)> {
     let mut candidates = Vec::new();
     let mut seen = BTreeSet::new();
-    for dirname in [".venv", "venv"] {
-        push_python_candidate(
-            &mut candidates,
-            &mut seen,
-            cwd.join(dirname).join("bin").join("python"),
-            format!("project {dirname}"),
-        );
-        push_python_candidate(
-            &mut candidates,
-            &mut seen,
-            cwd.join(dirname).join("Scripts").join("python.exe"),
-            format!("project {dirname}"),
-        );
+    let mut roots = Vec::new();
+    if let Some(project_root) = project_root {
+        roots.push((project_root, "project"));
+    }
+    roots.push((cwd, "cwd"));
+    for (root, label) in roots {
+        for dirname in [".venv", "venv"] {
+            push_python_candidate(
+                &mut candidates,
+                &mut seen,
+                root.join(dirname).join("bin").join("python"),
+                format!("{label} {dirname}"),
+            );
+            push_python_candidate(
+                &mut candidates,
+                &mut seen,
+                root.join(dirname).join("Scripts").join("python.exe"),
+                format!("{label} {dirname}"),
+            );
+        }
     }
     if let Some(virtual_env) = virtual_env.filter(|value| !value.is_empty()) {
         let root = PathBuf::from(virtual_env);
@@ -12618,7 +12629,7 @@ fn python_runtime_candidates(
         );
     }
     if let Some(path_env) = path_env {
-        for executable in ["python3", "python"] {
+        for executable in ["python3", "python", "python3.exe", "python.exe"] {
             for dir in env::split_paths(path_env) {
                 push_python_candidate(
                     &mut candidates,
@@ -12661,8 +12672,8 @@ fn candidate_is_executable(path: &Path) -> bool {
     }
 }
 
-fn python_runtime_prompt_status(cwd: &Path) -> String {
-    match resolve_python_runtime(cwd) {
+fn python_runtime_prompt_status(cwd: &Path, project_root: Option<&Path>) -> String {
+    match resolve_python_runtime(cwd, project_root) {
         Ok(runtime) => format!(
             "Python runtime: available via {} ({})",
             runtime.command, runtime.source
@@ -12745,7 +12756,8 @@ async fn execute_python_run_tool(
         bail!("python.run script exceeds the 100000 byte limit");
     }
     let cwd = resolve_command_cwd(worker, args.cwd.as_deref())?;
-    let runtime = resolve_python_runtime(&cwd)?;
+    let worker_root = Path::new(&worker.working_dir);
+    let runtime = resolve_python_runtime(&cwd, Some(worker_root))?;
     let command_args = python_run_command_args(script, args.args);
     let spec = ResolvedCommandSpec {
         mode: "python".to_string(),
@@ -17081,7 +17093,10 @@ Working directory: {}\n",
         action_shapes,
         child_job_rules,
         tool_help,
-        python_runtime_prompt_status(Path::new(&worker.working_dir)),
+        python_runtime_prompt_status(
+            Path::new(&worker.working_dir),
+            Some(Path::new(&worker.working_dir)),
+        ),
         worker.lane,
         worker.working_dir
     )
@@ -27716,11 +27731,57 @@ for line in sys.stdin:
         make_executable(&python3);
         let path_env = env::join_paths([bin_dir]).expect("path env should join");
 
-        let runtime = resolve_python_runtime_with_path(&state_dir, None, Some(&path_env))
+        let runtime = resolve_python_runtime_with_path(&state_dir, None, None, Some(&path_env))
             .expect("python3-only path should resolve");
 
         assert_eq!(runtime.command, python3.display().to_string());
         assert_eq!(runtime.source, "PATH python3");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn python_runtime_finds_windows_python_exe_on_path() {
+        let state_dir = test_state_dir("python-runtime-windows-path");
+        let bin_dir = state_dir.join("bin");
+        fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+        let python_exe = bin_dir.join("python.exe");
+        fs::write(&python_exe, "#!/bin/sh\nexit 0\n").expect("python.exe shim should write");
+        make_executable(&python_exe);
+        let path_env = env::join_paths([bin_dir]).expect("path env should join");
+
+        let runtime = resolve_python_runtime_with_path(&state_dir, None, None, Some(&path_env))
+            .expect("python.exe path should resolve");
+
+        assert_eq!(runtime.command, python_exe.display().to_string());
+        assert_eq!(runtime.source, "PATH python.exe");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn python_runtime_checks_worker_root_venv_before_command_cwd() {
+        let state_dir = test_state_dir("python-runtime-worker-root-venv");
+        let worker_root = state_dir.join("project");
+        let command_cwd = worker_root.join("apps").join("web");
+        let venv_bin = worker_root.join(".venv").join("bin");
+        fs::create_dir_all(&command_cwd).expect("command cwd should exist");
+        fs::create_dir_all(&venv_bin).expect("venv bin should exist");
+        let python = venv_bin.join("python");
+        fs::write(&python, "#!/bin/sh\nexit 0\n").expect("python shim should write");
+        make_executable(&python);
+        let empty_bin = state_dir.join("empty-bin");
+        fs::create_dir_all(&empty_bin).expect("empty bin dir should exist");
+        let path_env = env::join_paths([empty_bin]).expect("path env should join");
+
+        let runtime = resolve_python_runtime_with_path(
+            &command_cwd,
+            Some(&worker_root),
+            None,
+            Some(&path_env),
+        )
+        .expect("worker root .venv should resolve from nested cwd");
+
+        assert_eq!(runtime.command, python.display().to_string());
+        assert_eq!(runtime.source, "project .venv");
         let _ = fs::remove_dir_all(&state_dir);
     }
 
@@ -27731,7 +27792,7 @@ for line in sys.stdin:
         fs::create_dir_all(&empty_bin).expect("empty bin dir should exist");
         let path_env = env::join_paths([empty_bin]).expect("path env should join");
 
-        let error = resolve_python_runtime_with_path(&state_dir, None, Some(&path_env))
+        let error = resolve_python_runtime_with_path(&state_dir, None, None, Some(&path_env))
             .expect_err("missing Python should be explicit");
 
         assert!(error.to_string().contains("python executable not found"));

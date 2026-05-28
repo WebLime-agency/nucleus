@@ -383,7 +383,7 @@
   let composerActivityWorker = $derived.by(() =>
     latestByState(activityJobDetail?.workers ?? [], ['running', 'waiting', 'queued', 'paused'])
   );
-  let composerActivityFailure = $derived(activityFailureView(activityJobDetail));
+  let composerActivityFailure = $derived(activityFailureView(activityJobDetail, activePromptProgress));
   let composerActivitySummary = $derived.by(() => {
     if (composerActivityPendingApproval) {
       const toolCall = toolCallForApproval(

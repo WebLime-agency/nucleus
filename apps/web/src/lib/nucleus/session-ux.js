@@ -112,17 +112,24 @@ export function noActivity(record, nowSeconds) {
   return reasoningActivityView(record, nowSeconds)?.stale ?? false;
 }
 
-export function activityFailureView(detail) {
+export function activityFailureView(detail, activeProgress) {
   if (!detail) return null;
 
+  const progressTime = activityTimestamp(activeProgress);
   const failedCommand = latestByTimestamp(
     (Array.isArray(detail.command_sessions) ? detail.command_sessions : []).filter(
-      (item) => FAILURE_STATES.has(item?.state) && String(item?.last_error ?? '').trim()
+      (item) =>
+        FAILURE_STATES.has(item?.state) &&
+        String(item?.last_error ?? '').trim() &&
+        failureIsCurrent(detail, item.last_error, activityTimestamp(item), progressTime)
     )
   );
   const failedTool = latestByTimestamp(
     (Array.isArray(detail.tool_calls) ? detail.tool_calls : []).filter(
-      (item) => item?.status === 'failed' && String(item?.error_detail ?? '').trim()
+      (item) =>
+        item?.status === 'failed' &&
+        String(item?.error_detail ?? '').trim() &&
+        failureIsCurrent(detail, item.error_detail, activityTimestamp(item), progressTime)
     )
   );
   const commandTime = activityTimestamp(failedCommand);
@@ -157,6 +164,26 @@ export function activityFailureView(detail) {
 }
 
 const FAILURE_STATES = new Set(['failed', 'timed_out', 'error']);
+
+function failureIsCurrent(detail, errorText, failureTime, progressTime) {
+  if (!progressTime || failureTime >= progressTime) {
+    return true;
+  }
+
+  const failure = String(errorText ?? '').trim();
+  if (!failure) return false;
+
+  return currentErrorTexts(detail).some((current) => current.includes(failure) || failure.includes(current));
+}
+
+function currentErrorTexts(detail) {
+  return [
+    detail?.job?.last_error,
+    ...(Array.isArray(detail?.workers) ? detail.workers.map((worker) => worker?.last_error) : [])
+  ]
+    .map((value) => String(value ?? '').trim())
+    .filter(Boolean);
+}
 
 function latestByTimestamp(items) {
   return items.reduce((latest, item) => {
