@@ -12,6 +12,7 @@
     ChevronDown,
     ChevronUp,
     Clock3,
+    GitBranch,
     FolderTree,
     ImagePlus,
     MessageSquare,
@@ -55,6 +56,7 @@
     fetchAuditEvents,
     fetchJobDetail,
     fetchOverview,
+    fetchProjectWorktrees,
     fetchSessionJobs,
     fetchSessionDetail,
     resumeJob,
@@ -93,6 +95,7 @@
     ToolCapabilitySummary,
     SessionTurnImage,
     ToolCallSummary,
+    WorktreeSummary,
     WorkerSummary
   } from '$lib/nucleus/schemas';
   import { cn } from '$lib/utils';
@@ -126,6 +129,13 @@
   type JobOutcomeRow = { label: string; value: string; href?: string };
   type CompletionGateSection = { key: string; label: string; gates: JobSummary['completion_gates'] };
   type ActivityMetric = { label: string; title?: string };
+  type WorktreeChipView = {
+    kind: 'worktree' | 'project_root';
+    label: string;
+    title: string;
+    details: { label: string; value: string }[];
+    loadError?: string;
+  };
   type UtilityRunSnapshot = {
     sessionId: string;
     jobId: string;
@@ -218,6 +228,10 @@
   let composerActivityExpanded = $state(false);
   let composerModeMenuOpen = $state(false);
   let runBudgetMenuOpen = $state(false);
+  let worktreesByProject = $state<Record<string, WorktreeSummary[]>>({});
+  let worktreeLoadingProjectIds = $state<Record<string, boolean>>({});
+  let worktreeLoadErrors = $state<Record<string, string>>({});
+  let worktreeLookupAttempts = $state<Record<string, boolean>>({});
   let activityJobDetail = $state<JobDetail | null>(null);
   let activityJobRequestInFlight = $state('');
   let lastCompletedUtilityRun = $state<UtilityRunSnapshot | null>(null);
@@ -261,6 +275,25 @@
   let browserCapabilityAvailable = $derived(browserCapabilitySummaries.length > 0);
   let attachedProjects = $derived(selectedSession?.projects ?? []);
   let selectedProject = $derived(attachedProjects.find((project) => project.is_primary) ?? null);
+  let selectedProjectWorktrees = $derived(
+    selectedSession?.project_id ? (worktreesByProject[selectedSession.project_id] ?? []) : []
+  );
+  let selectedWorktree = $derived.by(() => {
+    if (!selectedSession?.worktree_id) {
+      return null;
+    }
+
+    return selectedProjectWorktrees.find((worktree) => worktree.id === selectedSession.worktree_id) ?? null;
+  });
+  let worktreeChip = $derived.by(() =>
+    selectedSession
+      ? worktreeChipView(
+          selectedSession,
+          selectedWorktree,
+          selectedSession.project_id ? worktreeLoadErrors[selectedSession.project_id] : ''
+        )
+      : null
+  );
   let selectedProjectTitle = $derived(
     selectedProject?.title ??
       selectedSession?.project_title ??
@@ -982,6 +1015,131 @@
     };
   }
 
+  function attachmentModeFor(session: SessionSummary) {
+    if (session.attachment_mode === 'new_worktree' || session.attachment_mode === 'project_root' || session.attachment_mode === 'scratch') {
+      return session.attachment_mode;
+    }
+
+    if (session.workspace_mode === 'isolated_worktree') return 'new_worktree';
+    if (session.workspace_mode === 'scratch_only') return 'scratch';
+    return 'project_root';
+  }
+
+  function pathBasename(value: string) {
+    const normalized = value.trim().replace(/\/+$/, '');
+    if (!normalized) return '';
+    return normalized.split('/').pop() ?? normalized;
+  }
+
+  function shortSha(value: string) {
+    return value ? value.slice(0, 12) : '';
+  }
+
+  function worktreeChipView(
+    session: SessionSummary,
+    worktree: WorktreeSummary | null,
+    loadError = ''
+  ): WorktreeChipView | null {
+    const attachmentMode = attachmentModeFor(session);
+
+    if (attachmentMode === 'scratch') {
+      return null;
+    }
+
+    const branch = worktree?.branch || session.git_branch || session.git_remote_tracking_branch || '';
+
+    if (attachmentMode === 'project_root') {
+      if (!branch) {
+        return null;
+      }
+
+      return {
+        kind: 'project_root',
+        label: branch,
+        title: `Project-root branch. Mid-session switching is deferred to #300.`,
+        details: [
+          { label: 'Attachment', value: 'Project root' },
+          { label: 'Project', value: session.project_title || selectedProjectTitle },
+          { label: 'Branch', value: branch },
+          { label: 'Path', value: session.working_dir }
+        ]
+      };
+    }
+
+    const name =
+      worktree?.name ||
+      pathBasename(session.worktree_path) ||
+      pathBasename(session.working_dir) ||
+      'Worktree';
+    const label = branch ? `${name} · ${branch}` : name;
+    const details = [
+      { label: 'Worktree', value: name },
+      { label: 'Branch', value: branch || 'detached' },
+      { label: 'Path', value: worktree?.path || session.worktree_path || session.working_dir },
+      { label: 'Base', value: worktree?.base_ref || session.git_base_ref || 'unknown' },
+      { label: 'Head', value: shortSha(worktree?.base_commit || session.git_head) || 'unknown' }
+    ];
+
+    return {
+      kind: 'worktree',
+      label,
+      title: `Read-only worktree details. Mid-session switching is deferred to #300.`,
+      details,
+      loadError: loadError || undefined
+    };
+  }
+
+  async function ensureProjectWorktrees(session: SessionSummary | null) {
+    if (!session || attachmentModeFor(session) !== 'new_worktree' || !session.project_id) {
+      return;
+    }
+
+    const lookupKey = `${session.project_id}:${session.worktree_id || 'all'}`;
+    const cached = worktreesByProject[session.project_id];
+    if (cached && (!session.worktree_id || cached.some((worktree) => worktree.id === session.worktree_id))) {
+      return;
+    }
+
+    if (
+      worktreeLoadingProjectIds[session.project_id] ||
+      worktreeLoadErrors[session.project_id] ||
+      worktreeLookupAttempts[lookupKey]
+    ) {
+      return;
+    }
+
+    worktreeLookupAttempts = {
+      ...worktreeLookupAttempts,
+      [lookupKey]: true
+    };
+    worktreeLoadingProjectIds = {
+      ...worktreeLoadingProjectIds,
+      [session.project_id]: true
+    };
+
+    try {
+      const worktrees = await fetchProjectWorktrees(session.project_id);
+      worktreesByProject = {
+        ...worktreesByProject,
+        [session.project_id]: worktrees
+      };
+      worktreeLoadErrors = {
+        ...worktreeLoadErrors,
+        [session.project_id]: ''
+      };
+    } catch (cause) {
+      worktreeLoadErrors = {
+        ...worktreeLoadErrors,
+        [session.project_id]: cause instanceof Error ? cause.message : 'Failed to load project worktrees.'
+      };
+    } finally {
+      worktreeLoadingProjectIds = {
+        ...worktreeLoadingProjectIds,
+        [session.project_id]: false
+      };
+    }
+  }
+
   function setSessionDrafts(session: SessionSummary | null) {
     draftTitle = session?.title ?? '';
     draftProfileId = session?.profile_id ?? '';
@@ -1465,6 +1623,10 @@
     }
 
     void loadActivityJob(jobId);
+  });
+
+  $effect(() => {
+    void ensureProjectWorktrees(selectedSession);
   });
 
   $effect(() => {
@@ -3904,7 +4066,47 @@
                     Context: —%
                   </span>
 
-                  <div data-slot="worktree-picker" class="hidden min-h-9 min-w-0 sm:block" aria-hidden="true"></div>
+                  {#if worktreeChip}
+                    <div data-slot="worktree-picker" class="hidden min-h-9 min-w-0 sm:block">
+                      <DropdownMenu.Root>
+                        <DropdownMenu.Trigger
+                          class="inline-flex h-9 max-w-[16rem] items-center gap-2 rounded-md border border-zinc-800 bg-zinc-900/75 px-2.5 text-xs text-zinc-300 transition-colors hover:border-zinc-700 hover:bg-zinc-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-700"
+                          aria-label={worktreeChip.title}
+                          title={worktreeChip.title}
+                        >
+                          <GitBranch class="size-4 shrink-0 text-zinc-500" />
+                          <span class="truncate">{worktreeChip.label}</span>
+                        </DropdownMenu.Trigger>
+                        <DropdownMenu.Content align="end" sideOffset={8} class="z-50 w-[min(22rem,calc(100vw-2rem))]">
+                          <div class="space-y-3 px-1 py-1">
+                            <div class="px-2">
+                              <div class="text-sm font-medium text-zinc-100">
+                                {worktreeChip.kind === 'worktree' ? 'Worktree' : 'Project root'}
+                              </div>
+                              <div class="mt-0.5 text-xs leading-5 text-zinc-500">
+                                Mid-session switching is tracked in #300.
+                              </div>
+                            </div>
+
+                            <div class="space-y-2 px-2">
+                              {#each worktreeChip.details as item}
+                                <div class="grid grid-cols-[5rem_minmax(0,1fr)] gap-2 text-xs">
+                                  <div class="text-zinc-500">{item.label}</div>
+                                  <div class="min-w-0 truncate text-zinc-300" title={item.value}>{item.value}</div>
+                                </div>
+                              {/each}
+                            </div>
+
+                            {#if worktreeChip.loadError}
+                              <div class="rounded-md border border-yellow-400/25 bg-yellow-400/10 px-2 py-1.5 text-xs leading-5 text-yellow-100">
+                                {worktreeChip.loadError}
+                              </div>
+                            {/if}
+                          </div>
+                        </DropdownMenu.Content>
+                      </DropdownMenu.Root>
+                    </div>
+                  {/if}
                 </div>
 
                 <Button

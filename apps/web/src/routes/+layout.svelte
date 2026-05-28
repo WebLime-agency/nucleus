@@ -4,17 +4,23 @@
   import { page } from '$app/state';
   import { onMount } from 'svelte';
   import {
+    FolderKanban,
     FolderTree,
     Gauge,
     MessageSquare,
     Menu,
     MessageSquarePlus,
+    PencilLine,
     Workflow
   } from 'lucide-svelte';
 
   import { Badge } from '$lib/components/ui/badge';
   import AppSidebar from '$lib/components/app/sidebar/app-sidebar.svelte';
   import { Button } from '$lib/components/ui/button';
+  import { Dialog, DialogContent, DialogDescription, DialogTitle } from '$lib/components/ui/dialog';
+  import { Input } from '$lib/components/ui/input';
+  import { Label } from '$lib/components/ui/label';
+  import { Select } from '$lib/components/ui/select';
   import { evaluateCompatibility } from '$lib/nucleus/compatibility';
   import {
     clearAccessToken,
@@ -41,11 +47,39 @@
 
   let { children } = $props();
 
+  type AttachmentMode = 'new_worktree' | 'project_root' | 'scratch';
+
   const navigation = [
     { href: '/', label: 'Chat', icon: MessageSquare },
     { href: '/dashboard', label: 'Dashboard', icon: Gauge },
     { href: '/automations', label: 'Automations', icon: Workflow },
     { href: '/workspace', label: 'Workspace', icon: FolderTree }
+  ];
+
+  const ATTACHMENT_MODE_OPTIONS: {
+    value: AttachmentMode;
+    label: string;
+    description: string;
+    icon: typeof import('lucide-svelte').Icon;
+  }[] = [
+    {
+      value: 'new_worktree',
+      label: 'New worktree session',
+      description: 'Create a separate checkout for this session.',
+      icon: FolderKanban
+    },
+    {
+      value: 'project_root',
+      label: 'New project-root session',
+      description: 'Work directly in the selected project checkout.',
+      icon: PencilLine
+    },
+    {
+      value: 'scratch',
+      label: 'New scratch session',
+      description: 'Start without an attached project.',
+      icon: MessageSquarePlus
+    }
   ];
 
   let overview = $state<RuntimeOverview | null>(null);
@@ -55,8 +89,10 @@
   let creating = $state(false);
   let error = $state<string | null>(null);
   let streamStatus = $state<StreamStatus>('connecting');
+  let createDialogOpen = $state(false);
   let createProjectId = $state('');
-  let createWorkspaceMode = $state<'isolated_worktree' | 'shared_project_root' | 'scratch_only'>('isolated_worktree');
+  let createAttachmentMode = $state<AttachmentMode>('new_worktree');
+  let createTitle = $state('');
   let sidebarOpen = $state(false);
   let updateToastVisible = $state(false);
   let dismissedUpdateTarget = $state('');
@@ -74,6 +110,11 @@
       'Default'
   );
   let sessions = $derived(overview?.sessions ?? []);
+  let selectedCreateProject = $derived(
+    discoveredProjects.find((project) => project.id === createProjectId) ?? null
+  );
+  let createRequiresProject = $derived(createAttachmentMode !== 'scratch');
+  let createCanSubmit = $derived(!createRequiresProject || Boolean(createProjectId));
   let updateStatus = $derived(settings?.update ?? null);
   let hasUpdateAvailable = $derived(updateStatus?.update_available ?? false);
   let restartRequired = $derived(updateStatus?.restart_required ?? false);
@@ -111,17 +152,19 @@
   let compatibilityWarning = $derived(compatibility.message);
   let compatibilityBlocked = $derived(compatibility.level === 'blocked');
   let createSessionTitle = $derived.by(() => {
-    if (!createProjectId) {
+    if (createTitle.trim()) {
+      return createTitle.trim();
+    }
+
+    if (createAttachmentMode === 'scratch') {
       return `New ${defaultProfileTitle} session`;
     }
 
-    const project = discoveredProjects.find((item) => item.id === createProjectId);
-
-    if (!project) {
+    if (!selectedCreateProject) {
       return 'New session';
     }
 
-    return `New ${defaultProfileTitle} session from ${project.title}`;
+    return `New ${defaultProfileTitle} session from ${selectedCreateProject.title}`;
   });
   let statusLabel = $derived.by(() => {
     if (loading) return 'Connecting';
@@ -137,8 +180,18 @@
 
   function syncCreateDefaults() {
     if (!discoveredProjects.some((project) => project.id === createProjectId)) {
-      createProjectId = '';
+      createProjectId = discoveredProjects[0]?.id ?? '';
     }
+
+    if (discoveredProjects.length === 0 && createAttachmentMode !== 'scratch') {
+      createAttachmentMode = 'scratch';
+    }
+  }
+
+  function openCreateSessionDialog() {
+    syncCreateDefaults();
+    error = null;
+    createDialogOpen = true;
   }
 
   function badgeVariantForSession(
@@ -216,25 +269,29 @@
   }
 
   async function handleCreateSession() {
-    if (compatibilityBlocked) {
+    if (compatibilityBlocked || !createCanSubmit) {
       return;
     }
 
     creating = true;
 
     try {
-      const detail = await createSession(
-        createProjectId
-          ? {
+      const trimmedTitle = createTitle.trim();
+      const detail = await createSession({
+        ...(trimmedTitle ? { title: trimmedTitle } : {}),
+        attachment_mode: createAttachmentMode,
+        ...(createAttachmentMode === 'scratch'
+          ? {}
+          : {
               primary_project_id: createProjectId,
-              project_ids: [createProjectId],
-              workspace_mode: createWorkspaceMode
-            }
-          : { workspace_mode: 'scratch_only' }
-      );
+              project_ids: [createProjectId]
+            })
+      });
 
       prependSession(detail.session);
       error = null;
+      createDialogOpen = false;
+      createTitle = '';
       sidebarOpen = false;
       await goto(`/?session=${detail.session.id}`, { noScroll: true });
     } catch (cause) {
@@ -385,9 +442,6 @@
     {creating}
     {compatibilityBlocked}
     {createSessionTitle}
-    createProjectId={createProjectId}
-    createWorkspaceMode={createWorkspaceMode}
-    projects={discoveredProjects}
     {hasUpdateAvailable}
     {restartRequired}
     updateTrackLabel={updateTrackLabel}
@@ -397,18 +451,105 @@
     {badgeVariantForSession}
     {isNavActive}
     {openNavigation}
-    {handleCreateSession}
-    onSelectCreateProject={(projectId) => {
-      createProjectId = projectId;
-    }}
-    onSelectCreateWorkspaceMode={(mode) => {
-      createWorkspaceMode = mode;
-    }}
+    {openCreateSessionDialog}
     closeSidebar={() => {
       sidebarOpen = false;
     }}
   />
 
+
+  <Dialog bind:open={createDialogOpen}>
+    <DialogContent class="w-[min(34rem,calc(100vw-2rem))]">
+      <div class="flex items-start justify-between gap-4">
+        <div class="min-w-0">
+          <DialogTitle id="session-create-title">Start session</DialogTitle>
+          <DialogDescription>Choose where this session should work before the composer opens.</DialogDescription>
+        </div>
+      </div>
+
+      <form class="mt-5 space-y-5" onsubmit={(event) => { event.preventDefault(); void handleCreateSession(); }}>
+        <div class="grid gap-2">
+          {#each ATTACHMENT_MODE_OPTIONS as option}
+            {@const OptionIcon = option.icon}
+            <label
+              class={cn(
+                'flex cursor-pointer items-start gap-3 rounded-md border px-3 py-3 transition-colors',
+                createAttachmentMode === option.value
+                  ? 'border-lime-400/60 bg-lime-400/10'
+                  : 'border-zinc-800 bg-zinc-950 hover:border-zinc-700 hover:bg-zinc-900'
+              )}
+            >
+              <input
+                class="sr-only"
+                type="radio"
+                name="attachment-mode"
+                value={option.value}
+                checked={createAttachmentMode === option.value}
+                onchange={() => {
+                  createAttachmentMode = option.value;
+                  if (option.value !== 'scratch' && !createProjectId) {
+                    createProjectId = discoveredProjects[0]?.id ?? '';
+                  }
+                }}
+              />
+              <span class="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-zinc-900 text-zinc-300">
+                <OptionIcon class="size-4" />
+              </span>
+              <span class="min-w-0">
+                <span class="block text-sm font-medium text-zinc-100">{option.label}</span>
+                <span class="mt-0.5 block text-xs leading-5 text-zinc-500">{option.description}</span>
+              </span>
+            </label>
+          {/each}
+        </div>
+
+        {#if createRequiresProject}
+          <div class="space-y-1.5">
+            <Label for="session-create-project">Project</Label>
+            <Select
+              id="session-create-project"
+              bind:value={createProjectId}
+              disabled={discoveredProjects.length === 0}
+            >
+              {#if discoveredProjects.length === 0}
+                <option value="">No projects discovered</option>
+              {:else}
+                {#each discoveredProjects as project}
+                  <option value={project.id}>{project.title} · {project.relative_path}</option>
+                {/each}
+              {/if}
+            </Select>
+          </div>
+        {/if}
+
+        <div class="space-y-1.5">
+          <Label for="session-create-title-input">Title</Label>
+          <Input
+            id="session-create-title-input"
+            bind:value={createTitle}
+            placeholder={createSessionTitle}
+            autocomplete="off"
+          />
+        </div>
+
+        {#if error}
+          <div class="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-200">
+            {error}
+          </div>
+        {/if}
+
+        <div class="flex flex-wrap items-center justify-end gap-2">
+          <Button type="button" variant="ghost" onclick={() => (createDialogOpen = false)}>
+            Cancel
+          </Button>
+          <Button type="submit" disabled={creating || compatibilityBlocked || !createCanSubmit}>
+            <MessageSquarePlus class={creating ? 'size-4 animate-spin' : 'size-4'} />
+            {creating ? 'Starting...' : 'Start session'}
+          </Button>
+        </div>
+      </form>
+    </DialogContent>
+  </Dialog>
 
   <main
     class={cn(
@@ -447,7 +588,7 @@
             aria-label={createSessionTitle}
             title={createSessionTitle}
             disabled={creating || compatibilityBlocked}
-            onclick={handleCreateSession}
+            onclick={openCreateSessionDialog}
           >
             <MessageSquarePlus class={creating ? 'size-4 animate-spin' : 'size-4'} />
           </Button>
