@@ -15,6 +15,7 @@
     FolderTree,
     ImagePlus,
     MessageSquare,
+    Mic,
     MonitorSmartphone,
     NotebookPen,
     PanelRightOpen,
@@ -69,8 +70,8 @@
     stopBrowserStream,
     updateSession
   } from '$lib/nucleus/client';
-  import { compactPath, formatDateTime, formatState } from '$lib/nucleus/format';
-  import { childRouteLabel, completionGateGroups, gateBadgeVariant, noActivity, usageView } from '$lib/nucleus/session-ux.js';
+  import { compactPath, formatCount, formatDateTime, formatState } from '$lib/nucleus/format';
+  import { childRouteLabel, completionGateGroups, gateBadgeVariant, noActivity, runtimeStartSeconds, usageView } from '$lib/nucleus/session-ux.js';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
   import type {
     ActionSummary,
@@ -100,6 +101,17 @@
   const MAX_IMAGES = 5;
   const MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024;
   const MAX_TOTAL_IMAGE_SIZE_BYTES = 50 * 1024 * 1024;
+  const TERMINAL_JOB_STATES = new Set([
+    'approved',
+    'blocked',
+    'canceled',
+    'closed',
+    'completed',
+    'denied',
+    'error',
+    'failed',
+    'orphaned'
+  ]);
 
   type ComposerImage = SessionTurnImage & {
     id: string;
@@ -113,6 +125,23 @@
   type BrowserAnnotationDraft = { page_id: string; x: number; y: number };
   type JobOutcomeRow = { label: string; value: string; href?: string };
   type CompletionGateSection = { key: string; label: string; gates: JobSummary['completion_gates'] };
+  type ActivityMetric = { label: string; title?: string };
+  type UtilityRunSnapshot = {
+    sessionId: string;
+    jobId: string;
+    title: string;
+    detail: string;
+    state: string;
+    durationSeconds: number;
+    tokenUsageKnown: boolean;
+    promptTokens: number;
+    completionTokens: number;
+    cachedTokens: number;
+    costUsdEstimate: number | null;
+    outcomeLabel: string;
+    blockedReason: string;
+    updatedAt: number;
+  };
 
   const COMPOSER_MODES: SessionComposerMode[] = ['plan', 'ask', 'trusted'];
   const RUN_BUDGET_MODES: SessionRunBudgetMode[] = [
@@ -191,6 +220,7 @@
   let runBudgetMenuOpen = $state(false);
   let activityJobDetail = $state<JobDetail | null>(null);
   let activityJobRequestInFlight = $state('');
+  let lastCompletedUtilityRun = $state<UtilityRunSnapshot | null>(null);
   let transcriptAnchor = $state('');
   let observabilityNow = $state(Math.floor(Date.now() / 1000));
 
@@ -370,10 +400,7 @@
     if (activityJobDetail) {
       return {
         title: activityJobDetail.job.title,
-        detail:
-          activityJobDetail.job.result_summary ||
-          activityJobDetail.job.prompt_excerpt ||
-          activityJobDetail.job.purpose,
+        detail: utilityRunDetail(activityJobDetail.job, jobIsActive(activityJobDetail.job.state)),
         state: activityJobDetail.job.state
       };
     }
@@ -381,10 +408,7 @@
     if (composerActivityJobSummary) {
       return {
         title: composerActivityJobSummary.title,
-        detail:
-          composerActivityJobSummary.result_summary ||
-          composerActivityJobSummary.prompt_excerpt ||
-          composerActivityJobSummary.purpose,
+        detail: utilityRunDetail(composerActivityJobSummary, jobIsActive(composerActivityJobSummary.state)),
         state: composerActivityJobSummary.state
       };
     }
@@ -399,9 +423,47 @@
 
     return null;
   });
+  let composerActivityRunMetrics = $derived.by(() => {
+    if (composerActivityJobSummary) {
+      return utilityRunMetricLabels(composerActivityJobSummary, jobIsActive(composerActivityJobSummary.state));
+    }
+
+    if (lastCompletedUtilityRun?.sessionId === selectedSessionId) {
+      return utilitySnapshotMetricLabels(lastCompletedUtilityRun);
+    }
+
+    return [];
+  });
+  let composerActivityBlockedReason = $derived.by(() => {
+    if (composerActivityJobSummary) {
+      return utilityRunBlockedReason(composerActivityJobSummary);
+    }
+
+    if (lastCompletedUtilityRun?.sessionId === selectedSessionId) {
+      return lastCompletedUtilityRun.blockedReason;
+    }
+
+    return '';
+  });
   let composerActivityDisplay = $derived.by(() => {
     if (composerActivitySummary) {
-      return composerActivitySummary;
+      return {
+        ...composerActivitySummary,
+        metrics: composerActivityRunMetrics,
+        blockedReason: composerActivityBlockedReason,
+        persisted: false
+      };
+    }
+
+    if (lastCompletedUtilityRun?.sessionId === selectedSessionId) {
+      return {
+        title: lastCompletedUtilityRun.title,
+        detail: lastCompletedUtilityRun.detail,
+        state: lastCompletedUtilityRun.state,
+        metrics: composerActivityRunMetrics,
+        blockedReason: composerActivityBlockedReason,
+        persisted: true
+      };
     }
 
     if (!selectedSession) {
@@ -411,8 +473,30 @@
     return {
       title: 'Utility Worker activity',
       detail: 'No active background work for this session.',
-      state: 'idle'
+      state: 'idle',
+      metrics: [],
+      blockedReason: '',
+      persisted: false
     };
+  });
+
+  $effect(() => {
+    const job = composerActivityJobSummary;
+
+    if (!selectedSessionId || !job || job.session_id !== selectedSessionId) {
+      return;
+    }
+
+    if (jobIsActive(job.state)) {
+      if (lastCompletedUtilityRun?.sessionId === selectedSessionId && lastCompletedUtilityRun.jobId !== job.id) {
+        lastCompletedUtilityRun = null;
+      }
+      return;
+    }
+
+    if (jobIsTerminal(job.state)) {
+      lastCompletedUtilityRun = captureUtilityRunSnapshot(job);
+    }
   });
 
   function uniqueId() {
@@ -607,7 +691,124 @@
   }
 
   function jobIsActive(state: string) {
-    return state === 'running' || state === 'queued' || state === 'paused';
+    return state === 'running' || state === 'queued' || state === 'paused' || state === 'waiting';
+  }
+
+  function jobIsTerminal(state: string) {
+    return TERMINAL_JOB_STATES.has(state);
+  }
+
+  function utilityRunStartedAt(job: JobSummary) {
+    return runtimeStartSeconds(job);
+  }
+
+  function utilityRunDurationSeconds(job: JobSummary, active: boolean) {
+    const startedAt = utilityRunStartedAt(job);
+    const endedAt = active ? observabilityNow : job.updated_at;
+    return Math.max(0, endedAt - startedAt);
+  }
+
+  function utilityRunTotalTokens(record: Pick<JobSummary, 'prompt_tokens' | 'completion_tokens' | 'cached_tokens'>) {
+    return Number(record.prompt_tokens ?? 0) + Number(record.completion_tokens ?? 0) + Number(record.cached_tokens ?? 0);
+  }
+
+  function formatCostEstimate(value: number | null) {
+    if (typeof value !== 'number') return '$—';
+    if (value > 0 && value < 0.01) return `$${value.toFixed(4)}`;
+    return `$${value.toFixed(2)}`;
+  }
+
+  function utilityRunOutcomeLabel(job: JobSummary) {
+    if (job.completion_status === 'blocked' || job.completion_blockers.length > 0) return 'blocked';
+    if (job.state === 'completed' || job.state === 'approved') return 'success';
+    if (job.state === 'canceled' || job.state === 'closed' || job.state === 'denied' || job.state === 'orphaned') {
+      return 'canceled';
+    }
+    if (job.state === 'failed' || job.state === 'error') return 'error';
+    return formatState(job.state).toLowerCase();
+  }
+
+  function utilityRunBlockedReason(job: JobSummary) {
+    if (job.completion_blockers.length > 0) return job.completion_blockers.join(' · ');
+    if (job.publication_status === 'blocked' && job.publication_summary) return job.publication_summary;
+    if (job.user_error) return `${job.user_error.title}: ${job.user_error.message}`;
+    if (job.last_error) return job.last_error;
+    return '';
+  }
+
+  function utilityRunDetail(job: JobSummary, active: boolean) {
+    const summary = job.result_summary || job.prompt_excerpt || job.purpose;
+    if (active) return summary;
+
+    return `${utilityRunOutcomeLabel(job)} · ${formatDuration(utilityRunDurationSeconds(job, false))} · ${formatCount(utilityRunTotalTokens(job))} tokens · ${formatCostEstimate(job.cost_usd_estimate)}`;
+  }
+
+  function utilityRunMetricLabels(job: JobSummary, active: boolean): ActivityMetric[] {
+    const usage = usageView(job);
+    const totalTokens = utilityRunTotalTokens(job);
+
+    return [
+      {
+        label: `${active ? 'Elapsed' : 'Duration'} ${formatDuration(utilityRunDurationSeconds(job, active))}`,
+        title: `Started ${formatDateTime(utilityRunStartedAt(job))}${active ? '' : ` · Ended ${formatDateTime(job.updated_at)}`}`
+      },
+      {
+        label: job.token_usage_known
+          ? `${formatCount(totalTokens)} tokens`
+          : usage.label,
+        title: job.token_usage_known
+          ? `${usage.title} · Total with cached: ${formatCount(totalTokens)}`
+          : usage.title
+      },
+      {
+        label: `P ${formatCount(job.prompt_tokens)} / C ${formatCount(job.completion_tokens)} / cached ${formatCount(job.cached_tokens)}`,
+        title: 'Prompt / completion / cached tokens'
+      },
+      {
+        label: `Cost ${formatCostEstimate(job.cost_usd_estimate)}`,
+        title: typeof job.cost_usd_estimate === 'number' ? 'Estimated model cost' : 'No price available for this model'
+      }
+    ];
+  }
+
+  function utilitySnapshotMetricLabels(snapshot: UtilityRunSnapshot): ActivityMetric[] {
+    return [
+      {
+        label: `Duration ${formatDuration(snapshot.durationSeconds)}`,
+        title: `Completed ${formatDateTime(snapshot.updatedAt)}`
+      },
+      {
+        label: snapshot.tokenUsageKnown ? `${formatCount(snapshot.promptTokens + snapshot.completionTokens + snapshot.cachedTokens)} tokens` : 'tokens unknown',
+        title: `Prompt: ${formatCount(snapshot.promptTokens)} · Completion: ${formatCount(snapshot.completionTokens)} · Cached: ${formatCount(snapshot.cachedTokens)}`
+      },
+      {
+        label: `P ${formatCount(snapshot.promptTokens)} / C ${formatCount(snapshot.completionTokens)} / cached ${formatCount(snapshot.cachedTokens)}`,
+        title: 'Prompt / completion / cached tokens'
+      },
+      {
+        label: `Cost ${formatCostEstimate(snapshot.costUsdEstimate)}`,
+        title: typeof snapshot.costUsdEstimate === 'number' ? 'Estimated model cost' : 'No price available for this model'
+      }
+    ];
+  }
+
+  function captureUtilityRunSnapshot(job: JobSummary): UtilityRunSnapshot {
+    return {
+      sessionId: job.session_id ?? '',
+      jobId: job.id,
+      title: job.title || 'Utility Worker run complete',
+      detail: utilityRunDetail(job, false),
+      state: job.state,
+      durationSeconds: utilityRunDurationSeconds(job, false),
+      tokenUsageKnown: job.token_usage_known,
+      promptTokens: job.prompt_tokens,
+      completionTokens: job.completion_tokens,
+      cachedTokens: job.cached_tokens,
+      costUsdEstimate: job.cost_usd_estimate,
+      outcomeLabel: utilityRunOutcomeLabel(job),
+      blockedReason: utilityRunBlockedReason(job),
+      updatedAt: job.updated_at
+    };
   }
 
   function lastItem<T>(items: T[]) {
@@ -2823,7 +3024,7 @@
     void loadAll();
     const observabilityInterval = window.setInterval(() => {
       observabilityNow = Math.floor(Date.now() / 1000);
-    }, 10_000);
+    }, 1_000);
 
     const disconnect = connectDaemonStream({
       onEvent: applyStreamEvent,
@@ -3093,14 +3294,92 @@
           </div>
 
           <div class="shrink-0 border-t border-zinc-900 bg-zinc-950/95 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 sm:px-6">
-            {#if composerActivityDisplay}
+            {#if selectedSession.state === 'paused' || selectedSession.state === 'error'}
               <section
-                aria-label="Nucleus activity"
                 class={cn(
-                  'mb-3 overflow-hidden rounded-lg border border-zinc-800 bg-zinc-950/95 shadow-2xl shadow-black/25 transition-[max-height]',
-                  composerActivityExpanded ? 'max-h-[min(30rem,46vh)]' : 'max-h-20'
+                  'mb-3 rounded-xl border px-4 py-3 text-sm',
+                  selectedSession.state === 'paused'
+                    ? 'border-amber-500/30 bg-amber-500/10 text-amber-100'
+                    : 'border-red-500/30 bg-red-500/10 text-red-100'
                 )}
               >
+                {#if selectedSession.state === 'error' && composerActivityUserError}
+                  <FriendlyErrorNotice
+                    userError={composerActivityUserError}
+                    class="border-0 bg-transparent p-0"
+                    onRetryJob={() => void handleResumeJob(composerActivityJobSummary?.id)}
+                    onCancelJob={() => void handleCancelJob(composerActivityJobSummary?.id)}
+                    onOpenJobDetails={() => openJobDetails(composerActivityJobSummary?.id)}
+                    retryDisabled={jobActioning}
+                    cancelDisabled={jobActioning}
+                  />
+                {:else}
+                  <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div class="min-w-0">
+                      <div class="font-medium">
+                        {selectedSession.state === 'paused' ? 'This session is paused.' : 'This session has a recoverable job error.'}
+                      </div>
+                      <div class="mt-1 text-xs leading-5 opacity-75">
+                        {selectedSession.state === 'paused'
+                          ? 'Resume or cancel the paused Utility Worker job before sending another prompt.'
+                          : 'Retry the checkpointed Utility Worker job or cancel it before continuing this session.'}
+                      </div>
+                    </div>
+                    <div class="flex shrink-0 flex-wrap gap-2">
+                      {#if composerActivityJobSummary?.state === 'paused' || composerActivityJobSummary?.state === 'failed'}
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          disabled={jobActioning}
+                          onclick={() => handleResumeJob(composerActivityJobSummary?.id)}
+                        >
+                          <RotateCcw class={cn('size-4', jobActioning && 'animate-spin')} />
+                          <span>{jobActioning ? 'Retrying' : composerActivityJobSummary?.state === 'failed' ? 'Retry Job' : 'Resume Job'}</span>
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={jobActioning}
+                          onclick={() => handleCancelJob(composerActivityJobSummary?.id)}
+                        >
+                          <XCircle class="size-4" />
+                          <span>Cancel Job</span>
+                        </Button>
+                      {/if}
+                      {#if composerActivityJobSummary}
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onclick={() => openJobDetails(composerActivityJobSummary.id)}
+                        >
+                          Open Job Details
+                        </Button>
+                      {/if}
+                    </div>
+                  </div>
+                {/if}
+              </section>
+            {/if}
+
+            <div
+              role="group"
+              aria-label="Session composer"
+              class={cn(
+                'overflow-hidden rounded-lg border bg-zinc-900/85 shadow-2xl shadow-black/20 transition-colors',
+                dragOver ? 'border-lime-300/50' : 'border-zinc-800'
+              )}
+              ondragover={handleComposerDragOver}
+              ondragleave={handleComposerDragLeave}
+              ondrop={handleComposerDrop}
+            >
+              {#if composerActivityDisplay}
+                <section
+                  aria-label="Nucleus activity"
+                  class={cn(
+                    'overflow-hidden border-b border-zinc-800 bg-zinc-950/95 transition-[max-height]',
+                    composerActivityExpanded ? 'max-h-[min(30rem,46vh)]' : 'max-h-20'
+                  )}
+                >
                 <div class="flex flex-col gap-2 px-3 py-2.5 sm:flex-row sm:items-center">
                   <button
                     type="button"
@@ -3129,6 +3408,9 @@
                     </div>
 
                     <div class="hidden shrink-0 flex-wrap justify-end gap-x-3 gap-y-1 text-[11px] text-zinc-600 md:flex">
+                      {#each composerActivityDisplay.metrics as metric}
+                        <span title={metric.title}>{metric.label}</span>
+                      {/each}
                       {#if composerActivityJobSummary}
                         <span>{composerActivityJobSummary.worker_count} Utility Worker{composerActivityJobSummary.worker_count === 1 ? '' : 's'}</span>
                         <span>{composerActivityJobSummary.pending_approval_count} approvals</span>
@@ -3181,7 +3463,32 @@
                 {#if composerActivityExpanded}
                   <div class="border-t border-zinc-800 px-3 pb-3 pt-3">
                     <div class="max-h-[min(24rem,38vh)] space-y-4 overflow-y-auto pr-1">
-                      {#if promptProgress.length === 0 && !activityJobDetail}
+                      {#if composerActivityDisplay.metrics.length > 0 || composerActivityDisplay.blockedReason}
+                        <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3">
+                          <div class="flex items-start justify-between gap-3">
+                            <div class="min-w-0">
+                              <div class="text-[11px] uppercase tracking-[0.14em] text-zinc-500">
+                                {composerActivityDisplay.persisted ? 'Most Recent Run' : 'Current Run'}
+                              </div>
+                              <div class="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-zinc-400">
+                                {#each composerActivityDisplay.metrics as metric}
+                                  <span title={metric.title}>{metric.label}</span>
+                                {/each}
+                              </div>
+                              {#if composerActivityDisplay.blockedReason}
+                                <div class="mt-2 text-xs leading-5 text-red-200">
+                                  {composerActivityDisplay.blockedReason}
+                                </div>
+                              {/if}
+                            </div>
+                            <Badge variant={badgeVariantForActivityState(composerActivityDisplay.state)}>
+                              {formatPromptProgressStatus(composerActivityDisplay.state)}
+                            </Badge>
+                          </div>
+                        </div>
+                      {/if}
+
+                      {#if promptProgress.length === 0 && !activityJobDetail && composerActivityDisplay.metrics.length === 0}
                         <div class="rounded-xl border border-zinc-800 bg-zinc-900/75 px-3 py-3 text-sm text-zinc-500">
                           Utility Worker activity will appear here when Nucleus starts work for this session.
                         </div>
@@ -3396,86 +3703,8 @@
               </section>
             {/if}
 
-            {#if selectedSession.state === 'paused' || selectedSession.state === 'error'}
-              <section
-                class={cn(
-                  'mb-3 rounded-xl border px-4 py-3 text-sm',
-                  selectedSession.state === 'paused'
-                    ? 'border-amber-500/30 bg-amber-500/10 text-amber-100'
-                    : 'border-red-500/30 bg-red-500/10 text-red-100'
-                )}
-              >
-                {#if selectedSession.state === 'error' && composerActivityUserError}
-                  <FriendlyErrorNotice
-                    userError={composerActivityUserError}
-                    class="border-0 bg-transparent p-0"
-                    onRetryJob={() => void handleResumeJob(composerActivityJobSummary?.id)}
-                    onCancelJob={() => void handleCancelJob(composerActivityJobSummary?.id)}
-                    onOpenJobDetails={() => openJobDetails(composerActivityJobSummary?.id)}
-                    retryDisabled={jobActioning}
-                    cancelDisabled={jobActioning}
-                  />
-                {:else}
-                  <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                    <div class="min-w-0">
-                      <div class="font-medium">
-                        {selectedSession.state === 'paused' ? 'This session is paused.' : 'This session has a recoverable job error.'}
-                      </div>
-                      <div class="mt-1 text-xs leading-5 opacity-75">
-                        {selectedSession.state === 'paused'
-                          ? 'Resume or cancel the paused Utility Worker job before sending another prompt.'
-                          : 'Retry the checkpointed Utility Worker job or cancel it before continuing this session.'}
-                      </div>
-                    </div>
-                    <div class="flex shrink-0 flex-wrap gap-2">
-                      {#if composerActivityJobSummary?.state === 'paused' || composerActivityJobSummary?.state === 'failed'}
-                        <Button
-                          variant="secondary"
-                          size="sm"
-                          disabled={jobActioning}
-                          onclick={() => handleResumeJob(composerActivityJobSummary?.id)}
-                        >
-                          <RotateCcw class={cn('size-4', jobActioning && 'animate-spin')} />
-                          <span>{jobActioning ? 'Retrying' : composerActivityJobSummary?.state === 'failed' ? 'Retry Job' : 'Resume Job'}</span>
-                        </Button>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          disabled={jobActioning}
-                          onclick={() => handleCancelJob(composerActivityJobSummary?.id)}
-                        >
-                          <XCircle class="size-4" />
-                          <span>Cancel Job</span>
-                        </Button>
-                      {/if}
-                      {#if composerActivityJobSummary}
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onclick={() => openJobDetails(composerActivityJobSummary.id)}
-                        >
-                          Open Job Details
-                        </Button>
-                      {/if}
-                    </div>
-                  </div>
-                {/if}
-              </section>
-            {/if}
-
-            <div
-              role="group"
-              aria-label="Session composer"
-              class={cn(
-                'rounded-lg border bg-zinc-900/85 p-2 transition-colors',
-                dragOver ? 'border-lime-300/50 bg-lime-300/8' : 'border-zinc-800'
-              )}
-              ondragover={handleComposerDragOver}
-              ondragleave={handleComposerDragLeave}
-              ondrop={handleComposerDrop}
-            >
               {#if promptImages.length > 0}
-                <div class="mb-2 flex gap-2 overflow-x-auto pb-1">
+                <div class="flex gap-2 overflow-x-auto border-b border-zinc-800 bg-zinc-950/50 p-2">
                   {#each promptImages as image}
                     <div class="relative flex h-12 min-w-0 max-w-40 shrink-0 items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-950/75 p-1 pr-8">
                       <img
@@ -3497,133 +3726,17 @@
                 </div>
               {/if}
 
-              <div class="flex items-end gap-2">
-                <input
-                  bind:this={fileInputElement}
-                  type="file"
-                  accept="image/*"
-                  multiple
-                  class="hidden"
-                  onchange={handleFileInputChange}
-                />
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  class="h-9 w-9"
-                  aria-label="Attach image"
-                  title={composerHint}
-                  disabled={
-                    !sessionSupportsImages ||
-                    sending ||
-                    selectedSession.state === 'archived' ||
-                    selectedSession.state === 'running' ||
-                    selectedSession.state === 'paused'
-                  }
-                  onclick={triggerImagePicker}
-                >
-                  <ImagePlus class="size-4" />
-                </Button>
-
-                <DropdownMenu.Root bind:open={composerModeMenuOpen}>
-                  <DropdownMenu.Trigger
-                    class={composerModeTriggerClass(sessionComposerMode(selectedSession))}
-                    aria-label={`Session mode: ${composerModeLabel(sessionComposerMode(selectedSession))}`}
-                    title={composerModeDescription(sessionComposerMode(selectedSession))}
-                    disabled={savingSession || selectedSession.state === 'archived'}
-                  >
-                    {#if sessionComposerMode(selectedSession) === 'plan'}
-                      <MessageSquare class="size-4" />
-                    {:else}
-                      <Wrench class="size-4" />
-                    {/if}
-                    <span class="hidden sm:inline">{composerModeLabel(sessionComposerMode(selectedSession))}</span>
-                    <ChevronUp class="size-3.5 text-zinc-500" />
-                  </DropdownMenu.Trigger>
-                  <DropdownMenu.Content side="top" align="start" sideOffset={8} class="w-64 max-w-[calc(100vw-2rem)]">
-                    <DropdownMenu.RadioGroup
-                      value={sessionComposerMode(selectedSession)}
-                      onValueChange={(value) => {
-                        if (value === 'plan' || value === 'ask' || value === 'trusted') {
-                          void handleSelectComposerMode(value);
-                        }
-                      }}
-                    >
-                      {#each COMPOSER_MODES as mode}
-                        <DropdownMenu.RadioItem value={mode} class="items-start gap-3 py-2 pl-2 pr-8">
-                          <div class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center text-zinc-400">
-                            {#if mode === 'plan'}
-                              <MessageSquare class="size-4" />
-                            {:else}
-                              <Wrench class="size-4" />
-                            {/if}
-                          </div>
-                          <div class="min-w-0">
-                            <div class="text-sm font-medium text-zinc-100">
-                              {composerModeLabel(mode)}
-                            </div>
-                            <div class="mt-0.5 text-xs leading-5 text-zinc-500">
-                              {composerModeDescription(mode)}
-                            </div>
-                          </div>
-                        </DropdownMenu.RadioItem>
-                      {/each}
-                    </DropdownMenu.RadioGroup>
-                  </DropdownMenu.Content>
-                </DropdownMenu.Root>
-
-                <DropdownMenu.Root bind:open={runBudgetMenuOpen}>
-                  <DropdownMenu.Trigger
-                    class="inline-flex h-9 items-center justify-center gap-2 rounded-md px-2.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-900 hover:text-zinc-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-700 disabled:pointer-events-none disabled:opacity-50 sm:px-3"
-                    aria-label={`Run budget: ${runBudgetModeLabel(normalizeRunBudgetMode(selectedSession.run_budget_mode))}`}
-                    title={formatRunBudget(selectedSession)}
-                    disabled={savingSession || selectedSession.state === 'archived'}
-                  >
-                    <Clock3 class="size-4" />
-                    <span class="hidden sm:inline">{runBudgetModeLabel(normalizeRunBudgetMode(selectedSession.run_budget_mode))}</span>
-                    <ChevronUp class="size-3.5 text-zinc-500" />
-                  </DropdownMenu.Trigger>
-                  <DropdownMenu.Content side="top" align="start" sideOffset={8} class="w-72 max-w-[calc(100vw-2rem)]">
-                    <DropdownMenu.RadioGroup
-                      value={normalizeRunBudgetMode(selectedSession.run_budget_mode)}
-                      onValueChange={(value) => {
-                        if (
-                          value === 'inherit' ||
-                          value === 'standard' ||
-                          value === 'extended' ||
-                          value === 'marathon' ||
-                          value === 'unbounded'
-                        ) {
-                          void handleSelectRunBudgetMode(value);
-                        }
-                      }}
-                    >
-                      {#each RUN_BUDGET_MODES as mode}
-                        <DropdownMenu.RadioItem value={mode} class="items-start gap-3 py-2 pl-2 pr-8">
-                          <div class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center text-zinc-400">
-                            <Clock3 class="size-4" />
-                          </div>
-                          <div class="min-w-0">
-                            <div class="text-sm font-medium text-zinc-100">
-                              {runBudgetModeLabel(mode)}
-                            </div>
-                            <div class="mt-0.5 text-xs leading-5 text-zinc-500">
-                              {runBudgetModeDescription(mode)}
-                            </div>
-                            <div class="mt-0.5 text-xs leading-5 text-zinc-600">
-                              {runBudgetModeHelp(mode)}
-                            </div>
-                          </div>
-                        </DropdownMenu.RadioItem>
-                      {/each}
-                    </DropdownMenu.RadioGroup>
-                  </DropdownMenu.Content>
-                </DropdownMenu.Root>
-
+              <div
+                class={cn(
+                  'border-b border-zinc-800 bg-zinc-900/85 p-2 transition-colors',
+                  dragOver && 'bg-lime-300/8'
+                )}
+              >
                 <Textarea
                   bind:ref={composerTextareaElement}
                   bind:value={promptText}
                   rows={1}
-                  class="max-h-[10.5rem] min-h-10 flex-1 resize-none border-0 bg-transparent px-1 py-2 text-sm leading-5 text-zinc-100 focus:border-transparent focus-visible:ring-0"
+                  class="max-h-[10.5rem] min-h-[4.5rem] w-full resize-none border-0 bg-transparent px-2 py-2 text-sm leading-5 text-zinc-100 focus:border-transparent focus-visible:ring-0"
                   placeholder="Send a message..."
                   spellcheck={false}
                   aria-describedby="composer-hint"
@@ -3635,10 +3748,169 @@
                   onkeydown={handleComposerKeydown}
                   onpaste={handleComposerPaste}
                 ></Textarea>
+              </div>
+
+              <div class="flex flex-wrap items-center gap-2 bg-zinc-950/65 p-2">
+                <input
+                  bind:this={fileInputElement}
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  class="hidden"
+                  onchange={handleFileInputChange}
+                />
+
+                <div class="flex min-w-0 flex-wrap items-center gap-2">
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    class="h-9 w-9"
+                    aria-label="Attach image"
+                    title={composerHint}
+                    disabled={
+                      !sessionSupportsImages ||
+                      sending ||
+                      selectedSession.state === 'archived' ||
+                      selectedSession.state === 'running' ||
+                      selectedSession.state === 'paused'
+                    }
+                    onclick={triggerImagePicker}
+                  >
+                    <ImagePlus class="size-4" />
+                  </Button>
+
+                  <span title="Voice input is not yet wired. Follow-up #298: bidirectional voice I/O.">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      class="h-9 w-9"
+                      aria-label="Voice input (coming soon)"
+                      disabled
+                    >
+                      <Mic class="size-4" />
+                    </Button>
+                  </span>
+
+                  <DropdownMenu.Root bind:open={composerModeMenuOpen}>
+                    <DropdownMenu.Trigger
+                      class={composerModeTriggerClass(sessionComposerMode(selectedSession))}
+                      aria-label={`Session mode: ${composerModeLabel(sessionComposerMode(selectedSession))}`}
+                      title={composerModeDescription(sessionComposerMode(selectedSession))}
+                      disabled={savingSession || selectedSession.state === 'archived'}
+                    >
+                      {#if sessionComposerMode(selectedSession) === 'plan'}
+                        <MessageSquare class="size-4" />
+                      {:else}
+                        <Wrench class="size-4" />
+                      {/if}
+                      <span class="hidden sm:inline">{composerModeLabel(sessionComposerMode(selectedSession))}</span>
+                      <ChevronUp class="size-3.5 text-zinc-500" />
+                    </DropdownMenu.Trigger>
+                    <DropdownMenu.Content side="top" align="start" sideOffset={8} class="w-64 max-w-[calc(100vw-2rem)]">
+                      <DropdownMenu.RadioGroup
+                        value={sessionComposerMode(selectedSession)}
+                        onValueChange={(value) => {
+                          if (value === 'plan' || value === 'ask' || value === 'trusted') {
+                            void handleSelectComposerMode(value);
+                          }
+                        }}
+                      >
+                        {#each COMPOSER_MODES as mode}
+                          <DropdownMenu.RadioItem value={mode} class="items-start gap-3 py-2 pl-2 pr-8">
+                            <div class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center text-zinc-400">
+                              {#if mode === 'plan'}
+                                <MessageSquare class="size-4" />
+                              {:else}
+                                <Wrench class="size-4" />
+                              {/if}
+                            </div>
+                            <div class="min-w-0">
+                              <div class="text-sm font-medium text-zinc-100">
+                                {composerModeLabel(mode)}
+                              </div>
+                              <div class="mt-0.5 text-xs leading-5 text-zinc-500">
+                                {composerModeDescription(mode)}
+                              </div>
+                            </div>
+                          </DropdownMenu.RadioItem>
+                        {/each}
+                      </DropdownMenu.RadioGroup>
+                    </DropdownMenu.Content>
+                  </DropdownMenu.Root>
+
+                  <DropdownMenu.Root bind:open={runBudgetMenuOpen}>
+                    <DropdownMenu.Trigger
+                      class="inline-flex h-9 items-center justify-center gap-2 rounded-md px-2.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-900 hover:text-zinc-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-700 disabled:pointer-events-none disabled:opacity-50 sm:px-3"
+                      aria-label={`Run budget: ${runBudgetModeLabel(normalizeRunBudgetMode(selectedSession.run_budget_mode))}`}
+                      title={formatRunBudget(selectedSession)}
+                      disabled={savingSession || selectedSession.state === 'archived'}
+                    >
+                      <Clock3 class="size-4" />
+                      <span class="hidden sm:inline">{runBudgetModeLabel(normalizeRunBudgetMode(selectedSession.run_budget_mode))}</span>
+                      <ChevronUp class="size-3.5 text-zinc-500" />
+                    </DropdownMenu.Trigger>
+                    <DropdownMenu.Content side="top" align="start" sideOffset={8} class="w-72 max-w-[calc(100vw-2rem)]">
+                      <DropdownMenu.RadioGroup
+                        value={normalizeRunBudgetMode(selectedSession.run_budget_mode)}
+                        onValueChange={(value) => {
+                          if (
+                            value === 'inherit' ||
+                            value === 'standard' ||
+                            value === 'extended' ||
+                            value === 'marathon' ||
+                            value === 'unbounded'
+                          ) {
+                            void handleSelectRunBudgetMode(value);
+                          }
+                        }}
+                      >
+                        {#each RUN_BUDGET_MODES as mode}
+                          <DropdownMenu.RadioItem value={mode} class="items-start gap-3 py-2 pl-2 pr-8">
+                            <div class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center text-zinc-400">
+                              <Clock3 class="size-4" />
+                            </div>
+                            <div class="min-w-0">
+                              <div class="text-sm font-medium text-zinc-100">
+                                {runBudgetModeLabel(mode)}
+                              </div>
+                              <div class="mt-0.5 text-xs leading-5 text-zinc-500">
+                                {runBudgetModeDescription(mode)}
+                              </div>
+                              <div class="mt-0.5 text-xs leading-5 text-zinc-600">
+                                {runBudgetModeHelp(mode)}
+                              </div>
+                            </div>
+                          </DropdownMenu.RadioItem>
+                        {/each}
+                      </DropdownMenu.RadioGroup>
+                    </DropdownMenu.Content>
+                  </DropdownMenu.Root>
+                </div>
+
+                <div class="ml-auto flex min-w-0 flex-1 flex-wrap items-center justify-end gap-2 sm:flex-none">
+                  <span
+                    class="inline-flex h-9 max-w-[13rem] items-center gap-2 rounded-md border border-zinc-800 bg-zinc-900/75 px-2.5 text-xs text-zinc-300"
+                    title="Current model from the active profile/route. Follow-up #296: Composer model selector - allow per-turn model override."
+                  >
+                    <Bot class="size-4 shrink-0 text-zinc-500" />
+                    <span class="truncate">{selectedSession.model || 'Provider default model'}</span>
+                  </span>
+
+                  <span
+                    class="inline-flex h-9 items-center rounded-md border border-zinc-800 bg-zinc-900/40 px-2.5 text-xs text-zinc-500"
+                    title="Context-window percentage is not present in the web session payload yet. Follow-up #297: Composer context-window % - surface from daemon payload."
+                    aria-disabled="true"
+                  >
+                    Context: —%
+                  </span>
+
+                  <div data-slot="worktree-picker" class="hidden min-h-9 min-w-0 sm:block" aria-hidden="true"></div>
+                </div>
 
                 <Button
                   variant="default"
                   size="icon"
+                  class="ml-auto h-9 w-9 sm:ml-0"
                   aria-label={sending ? 'Sending prompt' : 'Send prompt'}
                   disabled={
                     !promptReady ||

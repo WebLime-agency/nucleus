@@ -16,7 +16,6 @@
   import AppSidebar from '$lib/components/app/sidebar/app-sidebar.svelte';
   import { Button } from '$lib/components/ui/button';
   import { evaluateCompatibility } from '$lib/nucleus/compatibility';
-  import { markdownExcerpt } from '$lib/nucleus/markdown';
   import {
     clearAccessToken,
     isAuthError,
@@ -394,7 +393,6 @@
     updateTrackLabel={updateTrackLabel}
     updateLastAttemptResult={updateStatus?.last_attempt_result ?? null}
     {projectLabel}
-    {markdownExcerpt}
     {formatState}
     {badgeVariantForSession}
     {isNavActive}

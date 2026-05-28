@@ -29,7 +29,6 @@
     updateTrackLabel?: string;
     updateLastAttemptResult?: string | null;
     projectLabel: (projectCount: number, projectTitle: string) => string;
-    markdownExcerpt: (value: string) => string;
     formatState: (value: string) => string;
     badgeVariantForSession: (value: string) => 'default' | 'secondary' | 'warning' | 'destructive';
     isNavActive: (href: string, currentPath: string) => boolean;
@@ -57,7 +56,6 @@
     updateTrackLabel = '',
     updateLastAttemptResult = null,
     projectLabel,
-    markdownExcerpt,
     formatState,
     badgeVariantForSession,
     isNavActive,
@@ -276,20 +274,11 @@
             id: session.id,
             title: session.title,
             projectLabel: projectLabel(session.project_count, session.project_title),
-            turnCount: session.turn_count,
-            excerpt: session.last_message_excerpt ? markdownExcerpt(session.last_message_excerpt) : null,
             stateLabel: formatState(session.state),
             stateVariant: badgeVariantForSession(session.state),
             state: session.state,
             created_at: session.created_at,
-            last_resumed_at: session.last_resumed_at,
-            last_reasoning: session.last_reasoning,
-            last_reasoning_at: session.last_reasoning_at,
-            token_usage_known: session.token_usage_known,
-            prompt_tokens: session.prompt_tokens,
-            completion_tokens: session.completion_tokens,
-            cached_tokens: session.cached_tokens,
-            cost_usd_estimate: session.cost_usd_estimate
+            last_resumed_at: session.last_resumed_at
           }))}
           activeSessionId={activeSidebarSessionId}
           onOpen={(sessionId) => openNavigation(`/?session=${sessionId}`)}
