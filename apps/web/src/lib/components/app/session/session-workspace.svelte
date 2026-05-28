@@ -73,7 +73,7 @@
     updateSession
   } from '$lib/nucleus/client';
   import { compactPath, formatCount, formatDateTime, formatState } from '$lib/nucleus/format';
-  import { childRouteLabel, completionGateGroups, gateBadgeVariant, noActivity, runtimeStartSeconds, usageView } from '$lib/nucleus/session-ux.js';
+  import { activityFailureView, childRouteLabel, completionGateGroups, gateBadgeVariant, noActivity, runtimeStartSeconds, usageView } from '$lib/nucleus/session-ux.js';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
   import type {
     ActionSummary,
@@ -383,15 +383,8 @@
   let composerActivityWorker = $derived.by(() =>
     latestByState(activityJobDetail?.workers ?? [], ['running', 'waiting', 'queued', 'paused'])
   );
+  let composerActivityFailure = $derived(activityFailureView(activityJobDetail));
   let composerActivitySummary = $derived.by(() => {
-    if (activePromptProgress) {
-      return {
-        title: activePromptProgress.label || 'Working on your prompt',
-        detail: activePromptProgress.detail || 'Nucleus is preparing the next turn.',
-        state: activePromptProgress.status
-      };
-    }
-
     if (composerActivityPendingApproval) {
       const toolCall = toolCallForApproval(
         composerActivityPendingApproval,
@@ -419,6 +412,18 @@
         title: formatActionLabel(composerActivityToolCall.tool_id),
         detail: formatToolCallSummary(composerActivityToolCall),
         state: composerActivityToolCall.status
+      };
+    }
+
+    if (composerActivityFailure) {
+      return composerActivityFailure;
+    }
+
+    if (activePromptProgress) {
+      return {
+        title: activePromptProgress.label || 'Working on your prompt',
+        detail: activePromptProgress.detail || 'Nucleus is preparing the next turn.',
+        state: activePromptProgress.status
       };
     }
 
@@ -2768,6 +2773,10 @@
   }
 
   function formatToolCallSummary(toolCall: ToolCallSummary) {
+    if (toolCall.tool_id === 'python.run') {
+      return toolCall.summary || 'Python runtime';
+    }
+
     if (toolCall.tool_id === 'command.run') {
       return formatToolCallCommandDetail(toolCall) || toolCall.summary || toolCall.tool_id;
     }
@@ -2776,6 +2785,10 @@
   }
 
   function formatToolCallTitle(toolCall: ToolCallSummary) {
+    if (toolCall.tool_id === 'python.run') {
+      return 'Run Python';
+    }
+
     if (toolCall.tool_id === 'command.run') {
       const commandDetail = formatToolCallCommandDetail(toolCall);
       return commandDetail ? `Run: ${compactText(commandDetail, 96)}` : 'Run command';
@@ -2919,6 +2932,7 @@
 
   function formatActionLabel(toolId: string) {
     if (toolId === 'command.run') return 'Run command';
+    if (toolId === 'python.run') return 'Run Python';
     if (toolId === 'command.session.open') return 'Open command session';
     if (toolId === 'command.session.write') return 'Send command input';
     if (toolId === 'command.session.close') return 'Close command session';
@@ -2997,6 +3011,11 @@
       return cwd ? `${commandLine} in ${compactPath(cwd)}` : commandLine;
     }
 
+    if (toolCall.tool_id === 'python.run') {
+      const cwd = stringValue(args.cwd);
+      return cwd ? `Python snippet in ${compactPath(cwd)}` : 'Python snippet';
+    }
+
     if (toolCall.tool_id === 'fs.read_text' || toolCall.tool_id === 'fs.write_text') {
       const path = stringValue(args.path);
       return path ? compactPath(path) : formatToolCallSummary(toolCall);
@@ -3057,6 +3076,10 @@
   }
 
   function formatCommandInvocation(commandSession: CommandSessionSummary) {
+    if (commandSession.mode === 'python') {
+      return commandSession.cwd ? `python.run in ${compactPath(commandSession.cwd)}` : 'python.run';
+    }
+
     if (commandSession.args.length === 0) {
       return commandSession.command;
     }

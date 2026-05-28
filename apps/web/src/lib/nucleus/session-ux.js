@@ -112,6 +112,77 @@ export function noActivity(record, nowSeconds) {
   return reasoningActivityView(record, nowSeconds)?.stale ?? false;
 }
 
+export function activityFailureView(detail) {
+  if (!detail) return null;
+
+  const failedCommand = latestByTimestamp(
+    (Array.isArray(detail.command_sessions) ? detail.command_sessions : []).filter(
+      (item) => FAILURE_STATES.has(item?.state) && String(item?.last_error ?? '').trim()
+    )
+  );
+  const failedTool = latestByTimestamp(
+    (Array.isArray(detail.tool_calls) ? detail.tool_calls : []).filter(
+      (item) => item?.status === 'failed' && String(item?.error_detail ?? '').trim()
+    )
+  );
+  const commandTime = activityTimestamp(failedCommand);
+  const toolTime = activityTimestamp(failedTool);
+
+  if (failedCommand && commandTime >= toolTime) {
+    return {
+      title: commandSessionTitle(failedCommand),
+      detail: String(failedCommand.last_error).trim(),
+      state: failedCommand.state
+    };
+  }
+
+  if (failedTool) {
+    return {
+      title: `${toolLabel(failedTool.tool_id)} failed`,
+      detail: String(failedTool.error_detail).trim(),
+      state: failedTool.status
+    };
+  }
+
+  const jobError = String(detail.job?.last_error ?? '').trim();
+  if (jobError) {
+    return {
+      title: detail.job?.title || 'Utility Worker issue',
+      detail: jobError,
+      state: detail.job?.state || 'failed'
+    };
+  }
+
+  return null;
+}
+
+const FAILURE_STATES = new Set(['failed', 'timed_out', 'error']);
+
+function latestByTimestamp(items) {
+  return items.reduce((latest, item) => {
+    if (!latest) return item;
+    return activityTimestamp(item) >= activityTimestamp(latest) ? item : latest;
+  }, null);
+}
+
+function activityTimestamp(item) {
+  return Number(item?.completed_at ?? item?.updated_at ?? item?.created_at ?? 0);
+}
+
+function commandSessionTitle(commandSession) {
+  const title = String(commandSession?.title ?? '').trim();
+  if (title) return title;
+
+  const command = String(commandSession?.command ?? '').trim();
+  return command ? `Command ${command}` : 'Command failed';
+}
+
+function toolLabel(toolId) {
+  if (toolId === 'python.run') return 'Python runtime';
+  if (toolId === 'command.run') return 'Command';
+  return String(toolId ?? 'Tool').replaceAll('_', ' ');
+}
+
 function formatDuration(seconds) {
   const total = Math.max(0, Math.round(seconds));
   if (total >= 3600) return `${Math.floor(total / 3600)}h ${Math.floor((total % 3600) / 60)}m`;
