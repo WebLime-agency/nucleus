@@ -49,15 +49,37 @@ pub(crate) async fn classify_memory_for_turn(
     // queueing chunk/snapshot clones that would never be drained.
     let (events, receiver) = mpsc::unbounded_channel::<PromptStreamEvent>();
     drop(receiver);
+    let capabilities = agent::utility_runtime_model_capabilities(
+        state,
+        Some(&detail.session),
+        &execution.provider,
+        &execution.model,
+        &execution.provider_base_url,
+    );
     let result = timeout(
         MEMORY_CLASSIFIER_TIMEOUT,
         state
             .runtimes
-            .execute_compiled_turn_stream(&execution, Arc::new(compiled_turn), events),
+            .execute_compiled_turn_stream_cancellable_with_capabilities(
+                &execution,
+                Arc::new(compiled_turn),
+                capabilities,
+                events,
+                None,
+            ),
     )
     .await
     .map_err(|_| ApiError::bad_request("memory classifier timed out"))?
     .map_err(|error| ApiError::bad_request(format!("memory classifier failed: {error}")))?;
+
+    agent::record_successful_utility_transport_capability(
+        state,
+        Some(&detail.session),
+        &execution.provider,
+        &execution.model,
+        &execution.provider_base_url,
+        result.transport,
+    );
 
     parse_memory_classifier_response(&result.content)
 }

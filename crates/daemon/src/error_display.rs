@@ -57,6 +57,12 @@ pub(crate) fn classify_user_error(detail: &str) -> Option<UserFacingErrorSummary
         return Some(model_endpoint_unreachable(detail));
     }
 
+    if lower.contains("utility model")
+        && lower.contains("completed without producing a valid action")
+    {
+        return Some(utility_model_empty_output(detail));
+    }
+
     if contains_worker_action_contract_failure(&lower) {
         return Some(worker_action_contract_failed(detail));
     }
@@ -153,6 +159,21 @@ fn worker_action_contract_failed(detail: &str) -> UserFacingErrorSummary {
             "Nucleus could not safely normalize the worker response. Retry this job to ask the Utility Worker for a valid Action, or cancel it to unblock the session."
                 .to_string(),
         actions: [RETRY_JOB, CANCEL_JOB, OPEN_JOB_DETAILS]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        technical_detail: redact_likely_secret_tokens(detail),
+    }
+}
+
+fn utility_model_empty_output(detail: &str) -> UserFacingErrorSummary {
+    UserFacingErrorSummary {
+        code: "utility_model_empty_output".to_string(),
+        title: "The Utility model returned no Action".to_string(),
+        message:
+            "The selected Utility model completed without producing a usable Action. Check this profile or choose a different Utility model, then retry this job."
+                .to_string(),
+        actions: [OPEN_PROFILES, RETRY_JOB, CANCEL_JOB, OPEN_JOB_DETAILS]
             .into_iter()
             .map(str::to_string)
             .collect(),
@@ -459,6 +480,20 @@ mod tests {
         assert_eq!(summary.code, "model_config_incomplete");
         assert!(summary.message.contains("model name"));
         assert!(summary.message.contains("Profiles"));
+    }
+
+    #[test]
+    fn classifies_empty_utility_model_output() {
+        let raw = "OpenAI-compatible stream failed: Utility model 'qwen' completed without producing a valid action. Check this profile or pick another Utility model.";
+
+        let summary = classify_user_error(raw).expect("error should classify");
+
+        assert_eq!(summary.code, "utility_model_empty_output");
+        assert!(summary.message.contains("Utility model"));
+        assert!(
+            summary.message.contains("Profiles")
+                || summary.actions.contains(&OPEN_PROFILES.to_string())
+        );
     }
 
     #[test]

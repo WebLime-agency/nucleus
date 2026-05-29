@@ -60,6 +60,11 @@
       helper: 'Works with 9Router, OpenRouter, LM Studio, OpenAI-compatible gateways, and similar APIs.'
     }
   ];
+  const unknownModelCapabilities = {
+    json_object: 'unknown' as const,
+    transport: 'unknown' as const,
+    action_contract: 'unknown' as const
+  };
 
   let overview = $state<RuntimeOverview | null>(null);
   let defaultProfileId = $state('');
@@ -114,9 +119,39 @@
     return JSON.stringify({
       title: profile.title,
       is_default: profile.id === selectedDefaultProfileId,
-      main: profile.main,
-      utility: profile.utility
+      main: editableModelConfig(profile.main),
+      utility: editableModelConfig(profile.utility)
     });
+  }
+
+  function editableModelConfig(config: WorkspaceModelConfig) {
+    return {
+      adapter: config.adapter,
+      model: config.model,
+      base_url: config.base_url,
+      api_key: config.api_key
+    };
+  }
+
+  function modelTargetMatches(left: WorkspaceModelConfig, right: WorkspaceModelConfig) {
+    return (
+      left.adapter === right.adapter &&
+      left.model.trim() === right.model.trim() &&
+      left.base_url.trim().replace(/\/+$/, '') === right.base_url.trim().replace(/\/+$/, '')
+    );
+  }
+
+  function modelConfigForSave(draft: WorkspaceModelConfig, source?: WorkspaceModelConfig) {
+    if (!source || !modelTargetMatches(draft, source)) {
+      return draft;
+    }
+
+    return {
+      ...draft,
+      json_object: source.json_object,
+      transport: source.transport,
+      action_contract: source.action_contract
+    };
   }
 
   function profileIsDirty(profile: WorkspaceProfileSummary, currentWorkspace: WorkspaceSummary) {
@@ -201,13 +236,15 @@
       adapter: 'claude',
       model: 'sonnet',
       base_url: '',
-      api_key: ''
+      api_key: '',
+      ...unknownModelCapabilities
     };
     const baseUtility = template?.utility ?? {
       adapter: 'codex',
       model: '',
       base_url: '',
-      api_key: ''
+      api_key: '',
+      ...unknownModelCapabilities
     };
 
     creatingProfile = true;
@@ -252,10 +289,11 @@
     success = null;
 
     try {
+      const source = workspace?.profiles.find((item) => item.id === profile.id);
       const saved = await updateWorkspaceProfile(profileId, {
         title: profile.title,
-        main: profile.main,
-        utility: profile.utility,
+        main: modelConfigForSave(profile.main, source?.main),
+        utility: modelConfigForSave(profile.utility, source?.utility),
         is_default: profile.id === defaultProfileId
       });
 
@@ -518,7 +556,8 @@
                               ...current,
                               adapter,
                               base_url: adapterNeedsBaseUrl(adapter) ? current.base_url : '',
-                              api_key: adapterNeedsBaseUrl(adapter) ? current.api_key : ''
+                              api_key: adapterNeedsBaseUrl(adapter) ? current.api_key : '',
+                              ...unknownModelCapabilities
                             };
                           })}
                       >
@@ -546,7 +585,8 @@
                         oninput={(event) =>
                           updateModelDraft(selectedProfile.id, modelRole.key, (current) => ({
                             ...current,
-                            model: (event.currentTarget as HTMLInputElement).value
+                            model: (event.currentTarget as HTMLInputElement).value,
+                            ...unknownModelCapabilities
                           }))}
                       />
                     </label>
@@ -564,7 +604,8 @@
                           oninput={(event) =>
                             updateModelDraft(selectedProfile.id, modelRole.key, (current) => ({
                               ...current,
-                              base_url: (event.currentTarget as HTMLInputElement).value
+                              base_url: (event.currentTarget as HTMLInputElement).value,
+                              ...unknownModelCapabilities
                             }))}
                         />
                       </label>

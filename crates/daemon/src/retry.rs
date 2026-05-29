@@ -192,7 +192,6 @@ fn is_retryable_transport_text(text: &str) -> bool {
         || lower.contains("connect")
         || lower.contains("eof")
         || lower.contains("stream ended before")
-        || lower.contains("stream complete")
 }
 
 #[cfg(test)]
@@ -266,7 +265,6 @@ mod tests {
             "connection reset by peer",
             "request timed out",
             "EOF before stream complete",
-            "stream completed with empty response",
         ] {
             assert!(matches!(
                 classify_provider_error(&anyhow!(message), 1, None),
@@ -283,9 +281,9 @@ mod tests {
 
         assert!(matches!(
             classify_provider_error(&error, 1, None),
-            RetryDecision::Retry { .. }
+            RetryDecision::GiveUp { .. }
         ));
-        assert_eq!(provider_error_class(&error), "stream_eof");
+        assert_eq!(provider_error_class(&error), "stream_malformed");
     }
 
     #[test]
