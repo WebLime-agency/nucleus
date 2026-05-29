@@ -871,7 +871,9 @@ async fn create_workspace_profile(
     body: Bytes,
 ) -> Result<Json<WorkspaceProfileSummary>, ApiError> {
     let payload = decode_json::<WorkspaceProfileWriteRequest>(&body)?;
-    let patch = sanitize_workspace_profile_patch(&payload)?;
+    let mut patch = sanitize_workspace_profile_patch(&payload)?;
+    let workspace = state.store.workspace()?;
+    preserve_redacted_workspace_profile_secrets(&mut patch, &workspace.profiles, None);
     validate_workspace_model_runtime(&state, &patch.utility, "Utility Worker").await?;
     let profile = state.store.create_workspace_profile(patch)?;
     let _ = try_record_audit_event(
@@ -898,7 +900,10 @@ async fn update_workspace_profile(
     body: Bytes,
 ) -> Result<Json<WorkspaceProfileSummary>, ApiError> {
     let payload = decode_json::<WorkspaceProfileWriteRequest>(&body)?;
-    let patch = sanitize_workspace_profile_patch(&payload)?;
+    let mut patch = sanitize_workspace_profile_patch(&payload)?;
+    let workspace = state.store.workspace()?;
+    let _ = resolve_workspace_profile(&workspace, &profile_id)?;
+    preserve_redacted_workspace_profile_secrets(&mut patch, &workspace.profiles, Some(&profile_id));
     validate_workspace_model_runtime(&state, &patch.utility, "Utility Worker").await?;
     let profile = state.store.update_workspace_profile(&profile_id, patch)?;
     let _ = try_record_audit_event(
@@ -5291,6 +5296,87 @@ fn sanitize_workspace_model_config(
     })
 }
 
+fn preserve_redacted_workspace_profile_secrets(
+    patch: &mut WorkspaceProfilePatch,
+    existing_profiles: &[WorkspaceProfileSummary],
+    current_profile_id: Option<&str>,
+) {
+    preserve_redacted_workspace_model_secret(
+        &mut patch.main,
+        existing_profiles,
+        current_profile_id,
+        WorkspaceModelRole::Main,
+    );
+    preserve_redacted_workspace_model_secret(
+        &mut patch.utility,
+        existing_profiles,
+        current_profile_id,
+        WorkspaceModelRole::Utility,
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WorkspaceModelRole {
+    Main,
+    Utility,
+}
+
+fn preserve_redacted_workspace_model_secret(
+    next: &mut WorkspaceModelConfig,
+    existing_profiles: &[WorkspaceProfileSummary],
+    current_profile_id: Option<&str>,
+    role: WorkspaceModelRole,
+) {
+    if next.adapter != AdapterKind::OpenAiCompatible.as_str() || !next.api_key.trim().is_empty() {
+        return;
+    }
+
+    if let Some(current_profile_id) = current_profile_id {
+        if let Some(current) = existing_profiles
+            .iter()
+            .find(|profile| profile.id == current_profile_id)
+            .map(|profile| workspace_model_config_for_role(profile, role))
+        {
+            if current.adapter == AdapterKind::OpenAiCompatible.as_str()
+                && !current.api_key.trim().is_empty()
+            {
+                next.api_key = current.api_key.trim().to_string();
+                return;
+            }
+        }
+    }
+
+    if let Some(secret) = existing_profiles
+        .iter()
+        .flat_map(|profile| [&profile.main, &profile.utility])
+        .find(|candidate| workspace_model_configs_match_without_secret(next, candidate))
+        .map(|candidate| candidate.api_key.trim())
+        .filter(|api_key| !api_key.is_empty())
+    {
+        next.api_key = secret.to_string();
+    }
+}
+
+fn workspace_model_config_for_role(
+    profile: &WorkspaceProfileSummary,
+    role: WorkspaceModelRole,
+) -> &WorkspaceModelConfig {
+    match role {
+        WorkspaceModelRole::Main => &profile.main,
+        WorkspaceModelRole::Utility => &profile.utility,
+    }
+}
+
+fn workspace_model_configs_match_without_secret(
+    next: &WorkspaceModelConfig,
+    candidate: &WorkspaceModelConfig,
+) -> bool {
+    candidate.adapter == next.adapter
+        && candidate.model.trim() == next.model.trim()
+        && candidate.base_url.trim().trim_end_matches('/')
+            == next.base_url.trim().trim_end_matches('/')
+}
+
 async fn validate_workspace_model_runtime(
     state: &AppState,
     config: &WorkspaceModelConfig,
@@ -9351,6 +9437,79 @@ mod tests {
             images: Vec::new(),
             created_at: 0,
         }
+    }
+
+    fn workspace_profile(
+        id: &str,
+        main: WorkspaceModelConfig,
+        utility: WorkspaceModelConfig,
+    ) -> WorkspaceProfileSummary {
+        WorkspaceProfileSummary {
+            id: id.to_string(),
+            title: id.to_string(),
+            is_default: false,
+            main,
+            utility,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn openai_workspace_model(model: &str, base_url: &str, api_key: &str) -> WorkspaceModelConfig {
+        WorkspaceModelConfig {
+            adapter: AdapterKind::OpenAiCompatible.as_str().to_string(),
+            model: model.to_string(),
+            base_url: base_url.to_string(),
+            api_key: api_key.to_string(),
+        }
+    }
+
+    #[test]
+    fn profile_update_preserves_redacted_current_openai_keys() {
+        let existing = workspace_profile(
+            "developer",
+            openai_workspace_model("cx/gpt-5.5", "http://127.0.0.1:20128/v1", "main-secret"),
+            openai_workspace_model(
+                "cx/gpt-5.4-mini",
+                "http://127.0.0.1:20128/v1",
+                "utility-secret",
+            ),
+        );
+        let mut patch = WorkspaceProfilePatch {
+            title: "Developer".to_string(),
+            main: openai_workspace_model("cx/gpt-5.5", "http://100.64.6.84:20128/v1", ""),
+            utility: openai_workspace_model("cx/gpt-5.4-mini", "http://100.64.6.84:20128/v1", ""),
+            is_default: false,
+        };
+
+        preserve_redacted_workspace_profile_secrets(&mut patch, &[existing], Some("developer"));
+
+        assert_eq!(patch.main.api_key, "main-secret");
+        assert_eq!(patch.utility.api_key, "utility-secret");
+    }
+
+    #[test]
+    fn profile_create_reuses_matching_openai_key_from_existing_profile() {
+        let existing = workspace_profile(
+            "default",
+            openai_workspace_model("cx/gpt-5.5", "http://127.0.0.1:20128/v1", "main-secret"),
+            openai_workspace_model(
+                "cx/gpt-5.4-mini",
+                "http://127.0.0.1:20128/v1",
+                "utility-secret",
+            ),
+        );
+        let mut patch = WorkspaceProfilePatch {
+            title: "New Profile".to_string(),
+            main: openai_workspace_model("cx/gpt-5.5", "http://127.0.0.1:20128/v1", ""),
+            utility: openai_workspace_model("cx/gpt-5.4-mini", "http://127.0.0.1:20128/v1/", ""),
+            is_default: false,
+        };
+
+        preserve_redacted_workspace_profile_secrets(&mut patch, &[existing], None);
+
+        assert_eq!(patch.main.api_key, "main-secret");
+        assert_eq!(patch.utility.api_key, "utility-secret");
     }
 
     #[test]
