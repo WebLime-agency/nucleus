@@ -109,6 +109,7 @@ impl WorkerActionParseError {
             WorkerActionParseError::NoJsonObject
                 | WorkerActionParseError::MalformedJson { .. }
                 | WorkerActionParseError::InvalidActionShape
+                | WorkerActionParseError::UnknownTool { .. }
         )
     }
 }
@@ -1273,7 +1274,13 @@ fn normalize_worker_tool_name_and_args(
         "read_file" | "fs.read" => Ok(("fs.read_text".to_string(), args)),
         "list_files" | "ls" => Ok(("fs.list".to_string(), args)),
         "search" | "grep" | "ripgrep" => Ok(("rg.search".to_string(), args)),
-        "inspect_repo" | "inspect_project" | "repo_inspect" | "project_inspect" => Ok((
+        "inspect_repo"
+        | "inspect_project"
+        | "repo_inspect"
+        | "project_inspect"
+        | "workspace_inspect"
+        | "workspace_inspection"
+        | "workspace.inspect" => Ok((
             "project.inspect".to_string(),
             Value::Object(serde_json::Map::new()),
         )),
@@ -1397,7 +1404,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classifies_unknown_provider_tool_without_repairing() {
+    fn classifies_unknown_provider_tool_as_repairable_contract_error() {
         let error = parse_worker_action(
             r#"{"tool_call":{"tool":"nucleus_repo_search","arguments":{"path":"/tmp","query":"home 404","limit":20}}}"#,
         )
@@ -1409,7 +1416,7 @@ mod tests {
                 tool: "nucleus_repo_search".to_string()
             }
         );
-        assert!(!error.is_repairable_contract_error());
+        assert!(error.is_repairable_contract_error());
     }
 
     #[test]
@@ -1532,7 +1539,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_xml_style_unknown_tool_without_repair() {
+    fn rejects_xml_style_unknown_tool_as_repairable_contract_error() {
         let error = parse_worker_action_with_registered_mcp_tools(
             r#"<tool_call name="cloudflare-api.execute">{"script":"lookup"}</tool_call>"#,
             ["cloudflare-api.search"],
@@ -1545,7 +1552,7 @@ mod tests {
                 tool: "cloudflare-api.execute".to_string()
             }
         );
-        assert!(!error.is_repairable_contract_error());
+        assert!(error.is_repairable_contract_error());
     }
 
     #[test]
@@ -2076,6 +2083,27 @@ mod tests {
             r#"{"tool_call":{"name":"inspect_repo","arguments":{"cwd":"/tmp/project","targets":["apps/web/src/lib/components"]}}}"#,
         )
         .expect("inspect_repo should normalize to project.inspect");
+
+        let WorkerAction::ToolCall {
+            summary,
+            tool,
+            args,
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(summary, "Run the requested Nucleus action.");
+        assert_eq!(tool, "project.inspect");
+        assert!(args.as_object().is_some_and(|object| object.is_empty()));
+    }
+
+    #[test]
+    fn accepts_workspace_inspection_as_project_inspect_compatibility() {
+        let action = parse_worker_action(
+            r#"{"action":"tool_call","tool":"workspace_inspection","args":{"reason":"Need to inspect the repository state and issue context."}}"#,
+        )
+        .expect("workspace_inspection should normalize to project.inspect");
 
         let WorkerAction::ToolCall {
             summary,
