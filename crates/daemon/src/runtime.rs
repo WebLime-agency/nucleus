@@ -470,7 +470,9 @@ async fn read_openai_compatible_stream(
         }));
     }
     if content.is_empty() {
-        bail!("OpenAI-compatible endpoint returned an empty response.");
+        return Err(anyhow!(ProviderTransportError::Stream {
+            detail: "stream completed with empty response".to_string(),
+        }));
     }
 
     Ok(ProviderTurnResult {
