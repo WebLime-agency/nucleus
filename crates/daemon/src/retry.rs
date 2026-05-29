@@ -266,12 +266,26 @@ mod tests {
             "connection reset by peer",
             "request timed out",
             "EOF before stream complete",
+            "stream completed with empty response",
         ] {
             assert!(matches!(
                 classify_provider_error(&anyhow!(message), 1, None),
                 RetryDecision::Retry { .. }
             ));
         }
+    }
+
+    #[test]
+    fn retries_empty_completed_provider_stream() {
+        let error = anyhow!(ProviderTransportError::Stream {
+            detail: "stream completed with empty response".to_string(),
+        });
+
+        assert!(matches!(
+            classify_provider_error(&error, 1, None),
+            RetryDecision::Retry { .. }
+        ));
+        assert_eq!(provider_error_class(&error), "stream_eof");
     }
 
     #[test]
