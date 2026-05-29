@@ -4641,7 +4641,8 @@ Visible provider: {} / {}\n\
 Utility Worker provider: {} / {}\n\
 Prompt-time context and user request:\n{}\n\
 Return one JSON action for the next step. If repo or workspace inspection is needed, return a tool_call. If you need to persist a non-terminal checkpoint, return progress_update. Only return final_answer when it is a complete terminal response, never an action plan, progress update, or a description of what should happen next.\n\
-If the current user request corrects, refines, or challenges the previous answer, treat it as a continuation of the unresolved task. Do not merely acknowledge or restate the correction; use the visible conversation history to continue troubleshooting or answer the corrected question.",
+If the current user request corrects, refines, or challenges the previous answer, treat it as a continuation of the unresolved task. Do not merely acknowledge or restate the correction; use the visible conversation history to continue troubleshooting or answer the corrected question.\n\
+If the current user asks why they still cannot see a previous UI/code change, mentions being on the wrong branch/worktree, or asks whether an update/release/instance mismatch explains what they see, first answer that deployment visibility question directly. Inspect git state, the active session worktree, and any managed-release install path as needed. Do not make another code edit unless the user explicitly asks for one after that diagnosis, and do not let Browser verification status replace the branch/worktree/release answer.",
         session.title,
         project_context,
         session.provider,
@@ -24561,6 +24562,9 @@ Cleanup status: clean";
 
         assert!(prompt.contains("corrects, refines, or challenges the previous answer"));
         assert!(prompt.contains("Do not merely acknowledge or restate the correction"));
+        assert!(prompt.contains("wrong branch/worktree"));
+        assert!(prompt.contains("deployment visibility question directly"));
+        assert!(prompt.contains("do not let Browser verification status replace"));
     }
 
     #[tokio::test]
