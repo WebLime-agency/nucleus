@@ -902,8 +902,9 @@ async fn update_workspace_profile(
     let payload = decode_json::<WorkspaceProfileWriteRequest>(&body)?;
     let mut patch = sanitize_workspace_profile_patch(&payload)?;
     let workspace = state.store.workspace()?;
-    let _ = resolve_workspace_profile(&workspace, &profile_id)?;
+    let current_profile = resolve_workspace_profile(&workspace, &profile_id)?;
     preserve_redacted_workspace_profile_secrets(&mut patch, &workspace.profiles, Some(&profile_id));
+    reset_workspace_profile_capabilities_on_target_change(&mut patch, current_profile);
     validate_workspace_model_runtime(&state, &patch.utility, "Utility Worker").await?;
     let profile = state.store.update_workspace_profile(&profile_id, patch)?;
     let _ = try_record_audit_event(
@@ -5293,6 +5294,9 @@ fn sanitize_workspace_model_config(
         model,
         base_url,
         api_key,
+        json_object: config.json_object,
+        transport: config.transport,
+        action_contract: config.action_contract,
     })
 }
 
@@ -5313,6 +5317,27 @@ fn preserve_redacted_workspace_profile_secrets(
         current_profile_id,
         WorkspaceModelRole::Utility,
     );
+}
+
+fn reset_workspace_profile_capabilities_on_target_change(
+    patch: &mut WorkspaceProfilePatch,
+    current: &WorkspaceProfileSummary,
+) {
+    reset_model_capabilities_on_target_change(&mut patch.main, &current.main);
+    reset_model_capabilities_on_target_change(&mut patch.utility, &current.utility);
+}
+
+fn reset_model_capabilities_on_target_change(
+    next: &mut WorkspaceModelConfig,
+    current: &WorkspaceModelConfig,
+) {
+    if workspace_model_configs_match_without_secret(next, current) {
+        return;
+    }
+
+    next.json_object = Default::default();
+    next.transport = Default::default();
+    next.action_contract = Default::default();
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -9461,6 +9486,9 @@ mod tests {
             model: model.to_string(),
             base_url: base_url.to_string(),
             api_key: api_key.to_string(),
+            json_object: Default::default(),
+            transport: Default::default(),
+            action_contract: Default::default(),
         }
     }
 
@@ -9510,6 +9538,51 @@ mod tests {
 
         assert_eq!(patch.main.api_key, "main-secret");
         assert_eq!(patch.utility.api_key, "utility-secret");
+    }
+
+    #[test]
+    fn profile_update_resets_capabilities_when_model_target_changes() {
+        let mut existing_utility =
+            openai_workspace_model("qwen-old", "http://127.0.0.1:20128/v1", "utility-secret");
+        existing_utility.json_object = nucleus_protocol::ModelJsonObjectCapability::Supported;
+        existing_utility.transport = nucleus_protocol::ModelTransportCapability::NonStreaming;
+        existing_utility.action_contract = nucleus_protocol::ModelActionContractCapability::Passed;
+        let existing = workspace_profile(
+            "developer",
+            openai_workspace_model("main", "http://127.0.0.1:20128/v1", "main-secret"),
+            existing_utility,
+        );
+        let mut patch = WorkspaceProfilePatch {
+            title: "Developer".to_string(),
+            main: existing.main.clone(),
+            utility: WorkspaceModelConfig {
+                model: "qwen-new".to_string(),
+                json_object: nucleus_protocol::ModelJsonObjectCapability::Supported,
+                transport: nucleus_protocol::ModelTransportCapability::NonStreaming,
+                action_contract: nucleus_protocol::ModelActionContractCapability::Passed,
+                ..existing.utility.clone()
+            },
+            is_default: false,
+        };
+
+        reset_workspace_profile_capabilities_on_target_change(&mut patch, &existing);
+
+        assert_eq!(
+            patch.utility.json_object,
+            nucleus_protocol::ModelJsonObjectCapability::Unknown
+        );
+        assert_eq!(
+            patch.utility.transport,
+            nucleus_protocol::ModelTransportCapability::Unknown
+        );
+        assert_eq!(
+            patch.utility.action_contract,
+            nucleus_protocol::ModelActionContractCapability::Unknown
+        );
+        assert_eq!(
+            patch.main.transport,
+            nucleus_protocol::ModelTransportCapability::Unknown
+        );
     }
 
     #[test]
@@ -10915,12 +10988,18 @@ mod tests {
                     model: "gpt-4.1-mini".to_string(),
                     base_url: "http://127.0.0.1:20128/v1".to_string(),
                     api_key: "nuctk_test".to_string(),
+                    json_object: Default::default(),
+                    transport: Default::default(),
+                    action_contract: Default::default(),
                 },
                 utility: WorkspaceModelConfig {
                     adapter: "openai_compatible".to_string(),
                     model: "gpt-4.1-mini".to_string(),
                     base_url: "http://127.0.0.1:20129/v1".to_string(),
                     api_key: String::new(),
+                    json_object: Default::default(),
+                    transport: Default::default(),
+                    action_contract: Default::default(),
                 },
                 is_default: false,
             })
@@ -12021,6 +12100,9 @@ mod tests {
                         model: model.to_string(),
                         base_url: base_url.to_string(),
                         api_key: api_key.to_string(),
+                        json_object: Default::default(),
+                        transport: Default::default(),
+                        action_contract: Default::default(),
                     },
                     is_default: true,
                 },
@@ -12171,8 +12253,8 @@ mod tests {
             "classifier should produce a saved memory outcome: {outcomes:?}"
         );
         let request_body = server.await.expect("server should finish");
-        assert!(request_body.contains("response_format"));
-        assert!(request_body.contains("json_object"));
+        assert!(!request_body.contains("response_format"));
+        assert!(!request_body.contains("json_object"));
         let entries = state.store.list_memory_entries().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].source_kind, "auto_memory");
