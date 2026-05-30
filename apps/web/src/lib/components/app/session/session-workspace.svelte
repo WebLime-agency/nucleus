@@ -73,7 +73,16 @@
     updateSession
   } from '$lib/nucleus/client';
   import { compactPath, formatCount, formatDateTime, formatState } from '$lib/nucleus/format';
-  import { activityFailureView, childRouteLabel, completionGateGroups, gateBadgeVariant, noActivity, runtimeStartSeconds, usageView } from '$lib/nucleus/session-ux.js';
+  import {
+    activityFailureView,
+    activityFreshnessView,
+    childRouteLabel,
+    completionGateGroups,
+    gateBadgeVariant,
+    noActivity,
+    runtimeStartSeconds,
+    usageView
+  } from '$lib/nucleus/session-ux.js';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
   import type {
     ActionSummary,
@@ -384,7 +393,20 @@
     latestByState(activityJobDetail?.workers ?? [], ['running', 'waiting', 'queued', 'paused'])
   );
   let composerActivityFailure = $derived(activityFailureView(activityJobDetail, activePromptProgress));
+  let composerActivityFreshness = $derived.by(() =>
+    composerActivityJobSummary
+      ? activityFreshnessView(composerActivityJobSummary, observabilityNow)
+      : null
+  );
   let composerActivitySummary = $derived.by(() => {
+    if (composerActivityFreshness?.stale && composerActivityJobSummary) {
+      return {
+        title: 'No recent worker updates',
+        detail: composerActivityFreshness.text,
+        state: 'stalled'
+      };
+    }
+
     if (composerActivityPendingApproval) {
       const toolCall = toolCallForApproval(
         composerActivityPendingApproval,
@@ -473,6 +495,10 @@
     return [];
   });
   let composerActivityBlockedReason = $derived.by(() => {
+    if (composerActivityFreshness?.stale) {
+      return composerActivityFreshness.text;
+    }
+
     if (composerActivityJobSummary) {
       return utilityRunBlockedReason(composerActivityJobSummary);
     }
@@ -907,6 +933,7 @@
     if (status === 'thinking') return 'Thinking';
     if (status === 'streaming') return 'Streaming';
     if (status === 'retrying') return 'Retrying';
+    if (status === 'stalled') return 'Stalled';
     if (status === 'completed') return 'Completed';
     if (status === 'failed') return 'Failed';
     return formatState(status);
@@ -960,6 +987,10 @@
   function badgeVariantForActivityState(
     state: string
   ): 'default' | 'secondary' | 'warning' | 'destructive' {
+    if (state === 'stalled') {
+      return 'destructive';
+    }
+
     if (
       state === 'queued' ||
       state === 'running' ||

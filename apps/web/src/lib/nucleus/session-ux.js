@@ -1,5 +1,6 @@
 export const RUNTIME_ACTIVE_STATES = new Set(['running', 'waiting', 'paused']);
 export const REASONING_STALE_AFTER_SECONDS = 90;
+export const ACTIVITY_STALE_AFTER_SECONDS = 120;
 
 export function runtimeStartSeconds(record) {
   const createdAt = Number(record?.created_at ?? 0);
@@ -51,6 +52,35 @@ export function reasoningActivityView(record, nowSeconds) {
     text: `last reasoning · ${formatDuration(ageSeconds)} ago: ${lastReasoning}`,
     stale,
     ageSeconds
+  };
+}
+
+export function activityFreshnessView(record, nowSeconds) {
+  if (!record || !RUNTIME_ACTIVE_STATES.has(record.state)) {
+    return null;
+  }
+
+  const lastReasoning = String(record.last_reasoning ?? '').trim();
+  const lastReasoningAt = Number(record.last_reasoning_at ?? 0);
+  const updatedAt = Number(record.updated_at ?? 0);
+  const createdAt = Number(record.created_at ?? 0);
+  const lastActivityAt = Math.max(lastReasoningAt, updatedAt, createdAt);
+
+  if (!lastActivityAt) {
+    return null;
+  }
+
+  const ageSeconds = Math.max(0, nowSeconds - lastActivityAt);
+  const stale = ageSeconds > ACTIVITY_STALE_AFTER_SECONDS;
+  const stalePrefix = stale ? 'No worker updates' : 'Last worker update';
+
+  return {
+    text: lastReasoning
+      ? `${stalePrefix} for ${formatDuration(ageSeconds)}; latest reasoning: ${lastReasoning}`
+      : `${stalePrefix} for ${formatDuration(ageSeconds)}.`,
+    stale,
+    ageSeconds,
+    lastActivityAt
   };
 }
 
@@ -109,7 +139,7 @@ export function childRouteLabel(record) {
 }
 
 export function noActivity(record, nowSeconds) {
-  return reasoningActivityView(record, nowSeconds)?.stale ?? false;
+  return activityFreshnessView(record, nowSeconds)?.stale ?? false;
 }
 
 export function activityFailureView(detail, activeProgress) {

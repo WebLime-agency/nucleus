@@ -3,6 +3,7 @@ import { test } from 'node:test';
 
 import {
   activityFailureView,
+  activityFreshnessView,
   completionGateGroups,
   gateBadgeVariant,
   nextRuntimeTick,
@@ -67,7 +68,33 @@ test('reasoning activity flips stale after the 90s activity window', () => {
 
   assert.equal(reasoningActivityView(record, 1_090).stale, false);
   assert.equal(reasoningActivityView(record, 1_091).stale, true);
-  assert.equal(noActivity(record, 1_091), true);
+  assert.equal(noActivity(record, 1_121), true);
+});
+
+test('active jobs are stale when no persisted update arrives for two minutes', () => {
+  const record = {
+    state: 'running',
+    created_at: 1_000,
+    updated_at: 1_010
+  };
+
+  assert.equal(activityFreshnessView(record, 1_130).stale, false);
+  assert.equal(activityFreshnessView(record, 1_131).stale, true);
+  assert.equal(noActivity(record, 1_131), true);
+});
+
+test('freshness prefers reasoning heartbeat over generic update timestamp', () => {
+  const record = {
+    state: 'running',
+    created_at: 1_000,
+    updated_at: 1_010,
+    last_reasoning: 'reviewing command output',
+    last_reasoning_at: 1_100
+  };
+
+  const view = activityFreshnessView(record, 1_170);
+  assert.equal(view.stale, false);
+  assert.match(view.text, /latest reasoning: reviewing command output/);
 });
 
 test('usage display distinguishes missing prices from missing usage', () => {

@@ -37,7 +37,7 @@ use axum::{
 use base64::Engine as _;
 use flate2::read::GzDecoder;
 use futures_util::SinkExt;
-use host::{DEFAULT_PROCESS_LIMIT, HostEngine, ProcessSort, resolve_process_limit};
+use host::{HostEngine, ProcessSort, resolve_process_limit};
 use nucleus_core::{
     AdapterKind, DEFAULT_DAEMON_ADDR, DEFAULT_OPENAI_COMPATIBLE_BASE_URL, PRODUCT_NAME,
     product_banner,
@@ -54,10 +54,10 @@ use nucleus_protocol::{
     MemoryCandidateListResponse, MemoryCandidateUpsertRequest, MemoryEntry,
     MemoryEntryUpsertRequest, MemoryOutcome, MemorySearchResponse, MemorySummary,
     NucleusToolDescriptor, PlaybookDetail, PlaybookSummary, ProcessKillRequest,
-    ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate, ProjectUpdateRequest,
-    PromptProgressUpdate, RouterProfileSummary, RunBudgetSummary, RuntimeOverview, RuntimeSummary,
-    SessionDetail, SessionPromptRequest, SessionSummary, SettingsSummary, SkillImportRequest,
-    SkillImportResponse, SkillInstallResult, SkillInstallVerification, SkillInstallationRecord,
+    ProcessKillResponse, ProcessListResponse, ProjectUpdateRequest, PromptProgressUpdate,
+    RouterProfileSummary, RunBudgetSummary, RuntimeOverview, RuntimeSummary, SessionDetail,
+    SessionPromptRequest, SessionSummary, SettingsSummary, SkillImportRequest, SkillImportResponse,
+    SkillInstallResult, SkillInstallVerification, SkillInstallationRecord,
     SkillInstallationUpsertRequest, SkillManifest, SkillPackageRecord, SkillPackageUpsertRequest,
     SkillReconcileCandidate, SkillReconcileRequest, SkillReconcileScanResponse, StreamConnected,
     SystemStats, UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
@@ -92,7 +92,6 @@ use tracing::{info, warn};
 use updates::{InstanceRuntime, UpdateManager};
 use uuid::Uuid;
 
-const STREAM_PROCESS_LIMIT: usize = DEFAULT_PROCESS_LIMIT;
 const STREAM_INTERVAL: Duration = Duration::from_secs(2);
 const DEFAULT_AUDIT_LIMIT: usize = 20;
 const MAX_AUDIT_LIMIT: usize = 100;
@@ -4753,29 +4752,13 @@ async fn send_initial_stream_snapshot(
     socket: &mut WebSocket,
     state: &AppState,
 ) -> anyhow::Result<()> {
-    let frame = state.host.telemetry_frame(STREAM_PROCESS_LIMIT);
+    let frame = state.host.system_telemetry_frame();
     let overview = build_runtime_overview(state, frame.host_status.clone(), false).await?;
     let audit = state.store.list_audit_events(DEFAULT_AUDIT_LIMIT)?;
 
     send_event(socket, DaemonEvent::OverviewUpdated(overview)).await?;
     send_event(socket, DaemonEvent::AuditUpdated(audit)).await?;
     send_event(socket, DaemonEvent::SystemUpdated(frame.system_stats)).await?;
-    send_event(
-        socket,
-        DaemonEvent::ProcessesUpdated(ProcessStreamUpdate {
-            sort: ProcessSort::Cpu.as_str().to_string(),
-            response: frame.processes_cpu,
-        }),
-    )
-    .await?;
-    send_event(
-        socket,
-        DaemonEvent::ProcessesUpdated(ProcessStreamUpdate {
-            sort: ProcessSort::Memory.as_str().to_string(),
-            response: frame.processes_memory,
-        }),
-    )
-    .await?;
     send_event(
         socket,
         DaemonEvent::UpdateUpdated(state.updates.current().await),
@@ -4840,25 +4823,13 @@ fn spawn_update_monitor(state: AppState) {
 }
 
 async fn publish_stream_snapshot(state: &AppState) -> anyhow::Result<()> {
-    let frame = state.host.telemetry_frame(STREAM_PROCESS_LIMIT);
+    let frame = state.host.system_telemetry_frame();
     let overview = build_runtime_overview(state, frame.host_status.clone(), false).await?;
 
     let _ = state.events.send(DaemonEvent::OverviewUpdated(overview));
     let _ = state
         .events
         .send(DaemonEvent::SystemUpdated(frame.system_stats));
-    let _ = state
-        .events
-        .send(DaemonEvent::ProcessesUpdated(ProcessStreamUpdate {
-            sort: ProcessSort::Cpu.as_str().to_string(),
-            response: frame.processes_cpu,
-        }));
-    let _ = state
-        .events
-        .send(DaemonEvent::ProcessesUpdated(ProcessStreamUpdate {
-            sort: ProcessSort::Memory.as_str().to_string(),
-            response: frame.processes_memory,
-        }));
 
     Ok(())
 }

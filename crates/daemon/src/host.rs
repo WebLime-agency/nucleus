@@ -6,7 +6,7 @@ use nucleus_protocol::{
 };
 use sysinfo::{
     Disks, MINIMUM_CPU_UPDATE_INTERVAL, Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System,
-    Users,
+    UpdateKind, Users,
 };
 
 use crate::ApiError;
@@ -15,11 +15,9 @@ pub const DEFAULT_PROCESS_LIMIT: usize = 30;
 pub const MAX_PROCESS_LIMIT: usize = 100;
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct TelemetryFrame {
+pub struct SystemTelemetryFrame {
     pub host_status: HostStatus,
     pub system_stats: SystemStats,
-    pub processes_cpu: ProcessListResponse,
-    pub processes_memory: ProcessListResponse,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,30 +87,15 @@ impl HostEngine {
         Ok(build_processes(&system, &users, &current_user, sort, limit))
     }
 
-    pub fn telemetry_frame(&self, process_limit: usize) -> TelemetryFrame {
+    pub fn system_telemetry_frame(&self) -> SystemTelemetryFrame {
         let current_user = current_user();
-        let users = Users::new_with_refreshed_list();
         let disks = collect_disks();
         let mut system = self.system.lock().expect("host system mutex poisoned");
         refresh_system(&mut system);
 
-        TelemetryFrame {
+        SystemTelemetryFrame {
             host_status: build_host_status(&system),
             system_stats: build_system_stats(&system, &current_user, disks),
-            processes_cpu: build_processes(
-                &system,
-                &users,
-                &current_user,
-                ProcessSort::Cpu,
-                process_limit,
-            ),
-            processes_memory: build_processes(
-                &system,
-                &users,
-                &current_user,
-                ProcessSort::Memory,
-                process_limit,
-            ),
         }
     }
 
@@ -180,7 +163,11 @@ pub fn resolve_process_limit(limit: Option<usize>) -> Result<usize, ApiError> {
 fn refresh_system(system: &mut System) {
     system.refresh_memory();
     system.refresh_cpu_all();
-    system.refresh_processes_specifics(ProcessesToUpdate::All, true, process_refresh_kind());
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().without_tasks(),
+    );
 }
 
 fn build_host_status(system: &System) -> HostStatus {
@@ -290,7 +277,14 @@ fn build_processes(
 }
 
 fn process_refresh_kind() -> ProcessRefreshKind {
-    ProcessRefreshKind::everything().without_tasks()
+    ProcessRefreshKind::nothing()
+        .with_cpu()
+        .with_memory()
+        .with_user(UpdateKind::OnlyIfNotSet)
+        .with_cmd(UpdateKind::OnlyIfNotSet)
+        .with_exe(UpdateKind::OnlyIfNotSet)
+        .with_cwd(UpdateKind::OnlyIfNotSet)
+        .without_tasks()
 }
 
 fn hostname() -> String {
