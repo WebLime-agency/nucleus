@@ -183,24 +183,40 @@ fn parse_worker_action_with_support(
     support: &WorkerToolSupport,
 ) -> Result<WorkerAction, WorkerActionParseError> {
     let trimmed = content.trim();
-    if let Some(action) = recover_provider_tool_action(trimmed, support)? {
-        return validate_worker_action(action, support);
+    let mut first_error = match recover_provider_tool_action(trimmed, support) {
+        Ok(Some(action)) => return validate_worker_action(action, support),
+        Ok(None) => None,
+        Err(error @ WorkerActionParseError::InvalidActionShape) => return Err(error),
+        Err(error) => Some(error),
+    };
+
+    let candidates = json_object_candidates(trimmed);
+    if candidates.is_empty() {
+        return Err(first_error.unwrap_or(WorkerActionParseError::NoJsonObject));
     }
 
-    let start = trimmed
-        .find('{')
-        .ok_or(WorkerActionParseError::NoJsonObject)?;
-    let end = trimmed
-        .rfind('}')
-        .ok_or(WorkerActionParseError::NoJsonObject)?;
-    let candidate = &trimmed[start..=end];
-
-    parse_worker_action_json_candidate(candidate, support).or_else(|error| {
-        if let Some(action) = recover_provider_shell_action(candidate, support)? {
-            return validate_worker_action(action, support);
+    for candidate in candidates {
+        match parse_worker_action_json_candidate(candidate, support) {
+            Ok(action) => match validate_worker_action(action, support) {
+                Ok(action) => return Ok(action),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            },
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                if let Some(action) = recover_provider_shell_action(candidate, support)? {
+                    return validate_worker_action(action, support);
+                }
+            }
         }
-        Err(error)
-    })
+    }
+
+    Err(first_error.unwrap_or(WorkerActionParseError::NoJsonObject))
 }
 
 fn parse_worker_action_json_candidate(
@@ -1460,6 +1476,20 @@ mod tests {
         assert_eq!(summary, "search source");
         assert_eq!(tool, "rg.search");
         assert_eq!(args["pattern"], "home");
+    }
+
+    #[test]
+    fn parses_valid_action_after_earlier_json_object() {
+        let action = parse_worker_action(
+            r#"Example: {"kind":"tool_call","summary":"unsupported","tool":"provider.shell","args":{"cmd":"pwd"}}
+Action: {"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
+        )
+        .expect("valid later Nucleus action should parse");
+
+        assert!(matches!(
+            action,
+            WorkerAction::FinalAnswer { final_answer, .. } if final_answer == "Done."
+        ));
     }
 
     #[test]

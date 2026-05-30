@@ -21,6 +21,10 @@ use nucleus_protocol::{
     ToolCapabilitySummary, WorkerSummary, WorkspaceModelConfig, WorkspaceProfileSummary,
     WorkspaceSummary, WorktreeSummary,
 };
+#[cfg(test)]
+use nucleus_protocol::{
+    ModelActionContractCapability, ModelJsonObjectCapability, ModelTransportCapability,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -4930,6 +4934,9 @@ fn seed_workspace_profiles(connection: &Connection) -> Result<()> {
         model: DEFAULT_OPENAI_COMPATIBLE_MODEL.to_string(),
         base_url: DEFAULT_OPENAI_COMPATIBLE_BASE_URL.to_string(),
         api_key: String::new(),
+        json_object: Default::default(),
+        transport: Default::default(),
+        action_contract: Default::default(),
     };
     let profiles = [
         (
@@ -5017,6 +5024,9 @@ fn migrate_seeded_cli_defaults_to_protocol(connection: &Connection) -> Result<()
         model: DEFAULT_OPENAI_COMPATIBLE_MODEL.to_string(),
         base_url: DEFAULT_OPENAI_COMPATIBLE_BASE_URL.to_string(),
         api_key: String::new(),
+        json_object: Default::default(),
+        transport: Default::default(),
+        action_contract: Default::default(),
     };
 
     for profile_id in ["default", "researcher", "developer"] {
@@ -6231,6 +6241,9 @@ fn workspace_model_from_legacy_target(
             model: target.model,
             base_url: target.base_url,
             api_key: target.api_key,
+            json_object: Default::default(),
+            transport: Default::default(),
+            action_contract: Default::default(),
         });
     }
 
@@ -6247,6 +6260,9 @@ fn workspace_model_from_legacy_target(
                 .unwrap_or_default(),
             base_url,
             api_key: String::new(),
+            json_object: Default::default(),
+            transport: Default::default(),
+            action_contract: Default::default(),
         });
     }
 
@@ -10736,12 +10752,18 @@ mod tests {
                     model: "gpt-4.1-mini".to_string(),
                     base_url: "http://127.0.0.1:20128/v1".to_string(),
                     api_key: "secret-token".to_string(),
+                    json_object: Default::default(),
+                    transport: Default::default(),
+                    action_contract: Default::default(),
                 },
                 utility: WorkspaceModelConfig {
                     adapter: "claude".to_string(),
                     model: "sonnet".to_string(),
                     base_url: String::new(),
                     api_key: String::new(),
+                    json_object: Default::default(),
+                    transport: Default::default(),
+                    action_contract: Default::default(),
                 },
                 is_default: true,
             })
@@ -10761,6 +10783,79 @@ mod tests {
         assert_eq!(active.main.api_key, "secret-token");
 
         let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn workspace_profile_model_capabilities_round_trip() {
+        let state_dir = test_state_dir("workspace-profile-capabilities-round-trip");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+
+        let created = store
+            .create_workspace_profile(WorkspaceProfilePatch {
+                title: "DeepInfra".to_string(),
+                main: WorkspaceModelConfig {
+                    adapter: "openai_compatible".to_string(),
+                    model: "main-model".to_string(),
+                    base_url: "http://127.0.0.1:20128/v1".to_string(),
+                    api_key: "main-key".to_string(),
+                    json_object: ModelJsonObjectCapability::Supported,
+                    transport: ModelTransportCapability::Streaming,
+                    action_contract: ModelActionContractCapability::Passed,
+                },
+                utility: WorkspaceModelConfig {
+                    adapter: "openai_compatible".to_string(),
+                    model: "qwen".to_string(),
+                    base_url: "http://127.0.0.1:20129/v1".to_string(),
+                    api_key: "utility-key".to_string(),
+                    json_object: ModelJsonObjectCapability::Unsupported,
+                    transport: ModelTransportCapability::NonStreaming,
+                    action_contract: ModelActionContractCapability::Passed,
+                },
+                is_default: false,
+            })
+            .expect("workspace profile should create");
+
+        let workspace = store.workspace().expect("workspace should load");
+        let profile = workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == created.id)
+            .expect("created profile should be listed");
+
+        assert_eq!(
+            profile.main.json_object,
+            ModelJsonObjectCapability::Supported
+        );
+        assert_eq!(profile.main.transport, ModelTransportCapability::Streaming);
+        assert_eq!(
+            profile.utility.json_object,
+            ModelJsonObjectCapability::Unsupported
+        );
+        assert_eq!(
+            profile.utility.transport,
+            ModelTransportCapability::NonStreaming
+        );
+        assert_eq!(
+            profile.utility.action_contract,
+            ModelActionContractCapability::Passed
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn legacy_workspace_model_config_defaults_capabilities_to_unknown() {
+        let decoded: WorkspaceModelConfig = serde_json::from_str(
+            r#"{"adapter":"openai_compatible","model":"qwen","base_url":"http://127.0.0.1:20129/v1","api_key":""}"#,
+        )
+        .expect("legacy model config should deserialize");
+
+        assert_eq!(decoded.json_object, ModelJsonObjectCapability::Unknown);
+        assert_eq!(decoded.transport, ModelTransportCapability::Unknown);
+        assert_eq!(
+            decoded.action_contract,
+            ModelActionContractCapability::Unknown
+        );
     }
 
     #[test]

@@ -14,10 +14,10 @@ use base64::Engine as _;
 use nucleus_protocol::{
     ApprovalRequestSummary, ArtifactSummary, BrowserActionRequest, BrowserNavigateRequest,
     BrowserSnapshot, CommandSessionSummary, CompiledTurn, CreatePlaybookRequest, DaemonEvent,
-    JobDetail, JobSummary, McpServerRecord, McpToolRecord, MemoryOutcome, PlaybookDetail,
-    PlaybookSummary, PromptProgressUpdate, RunBudgetSummary, SessionDetail, SessionPromptRequest,
-    SessionSummary, SessionTurn, SessionTurnImage, UpdatePlaybookRequest, WorkerSummary,
-    WorkspaceProfileSummary, WorkspaceSummary,
+    JobDetail, JobSummary, McpServerRecord, McpToolRecord, MemoryOutcome, ModelTransportCapability,
+    PlaybookDetail, PlaybookSummary, PromptProgressUpdate, RunBudgetSummary, SessionDetail,
+    SessionPromptRequest, SessionSummary, SessionTurn, SessionTurnImage, UpdatePlaybookRequest,
+    WorkerSummary, WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceSummary,
 };
 use nucleus_storage::{
     ApprovalRequestRecord, AuditEventRecord, CommandSessionPatch, CommandSessionRecord,
@@ -48,7 +48,9 @@ use crate::compaction::{
     CompactionOutcome, audit_compaction_outcome, compact_conversation,
     compaction_token_threshold_for_model, estimate_prompt_tokens, should_compact,
 };
-use crate::runtime::{PromptStreamEvent, ProviderTurnResult};
+use crate::runtime::{
+    PromptStreamEvent, ProviderTurnResult, ProviderTurnTransport, RuntimeModelCapabilities,
+};
 #[cfg(test)]
 use crate::worker_action::parse_worker_action;
 use crate::worker_action::{
@@ -9940,6 +9942,7 @@ async fn call_worker_model(
                     excerpt(&repaired.content, 220)
                 )
             })?;
+            record_successful_worker_transport_capability(state, session, worker, &repaired);
             return Ok(ModelResponse {
                 action,
                 raw: repaired.content,
@@ -9959,11 +9962,99 @@ async fn call_worker_model(
         }
     };
 
+    record_successful_worker_transport_capability(state, session, worker, &result);
+
     Ok(ModelResponse {
         action,
         raw: result.content,
         provider_session_id: result.provider_session_id,
     })
+}
+
+fn record_successful_worker_transport_capability(
+    state: &AppState,
+    session: Option<&SessionSummary>,
+    worker: &WorkerSummary,
+    result: &ProviderTurnResult,
+) {
+    record_successful_utility_transport_capability(
+        state,
+        session,
+        &worker.provider,
+        &worker.model,
+        &worker.provider_base_url,
+        result.transport,
+    );
+}
+
+pub(crate) fn record_successful_utility_transport_capability(
+    state: &AppState,
+    session: Option<&SessionSummary>,
+    provider: &str,
+    model: &str,
+    base_url: &str,
+    transport: ProviderTurnTransport,
+) {
+    if transport != ProviderTurnTransport::NonStreaming || provider != "openai_compatible" {
+        return;
+    }
+
+    let Ok(workspace) = state.store.workspace() else {
+        return;
+    };
+    let Some(profile) =
+        matching_utility_profile_for_target(&workspace, session, provider, model, base_url)
+    else {
+        return;
+    };
+    if profile.utility.transport != ModelTransportCapability::Unknown {
+        return;
+    }
+
+    let mut utility = profile.utility.clone();
+    utility.transport = ModelTransportCapability::NonStreaming;
+    if let Err(error) = state.store.update_workspace_profile(
+        &profile.id,
+        nucleus_storage::WorkspaceProfilePatch {
+            title: profile.title,
+            main: profile.main,
+            utility,
+            is_default: profile.is_default,
+        },
+    ) {
+        warn!(
+            ?error,
+            provider, model, "failed to persist utility model non-streaming capability"
+        );
+    }
+}
+
+fn matching_utility_profile_for_target(
+    workspace: &WorkspaceSummary,
+    session: Option<&SessionSummary>,
+    provider: &str,
+    model: &str,
+    base_url: &str,
+) -> Option<WorkspaceProfileSummary> {
+    let preferred_profile_id = session
+        .and_then(|session| {
+            (!session.profile_id.trim().is_empty()).then_some(session.profile_id.as_str())
+        })
+        .unwrap_or(workspace.default_profile_id.as_str());
+
+    workspace
+        .profiles
+        .iter()
+        .find(|profile| {
+            profile.id == preferred_profile_id
+                && workspace_model_matches_target(&profile.utility, provider, model, base_url)
+        })
+        .or_else(|| {
+            workspace.profiles.iter().find(|profile| {
+                workspace_model_matches_target(&profile.utility, provider, model, base_url)
+            })
+        })
+        .cloned()
 }
 
 fn worker_supports_action_contract_repair(worker: &WorkerSummary) -> bool {
@@ -9983,6 +10074,13 @@ pub(crate) async fn execute_worker_text_turn(
 ) -> Result<ProviderTurnResult> {
     let (events, mut receiver) = mpsc::unbounded_channel();
     let execution = build_execution_session(worker);
+    let model_capabilities = utility_runtime_model_capabilities(
+        state,
+        session,
+        &worker.provider,
+        &worker.model,
+        &worker.provider_base_url,
+    );
     let history = checkpoint_history(conversation, &execution.id);
     let prompt_body = build_worker_prompt_input(worker, conversation, prompt);
     let runtimes = state.runtimes.clone();
@@ -10012,9 +10110,10 @@ pub(crate) async fn execute_worker_text_turn(
         match compiled_turn {
             Some(turn) => {
                 runtimes
-                    .execute_compiled_turn_stream_cancellable(
+                    .execute_compiled_turn_stream_cancellable_with_capabilities(
                         &execution_clone,
                         std::sync::Arc::new(turn),
+                        model_capabilities,
                         events,
                         Some(cancel_for_runtime),
                     )
@@ -10022,12 +10121,18 @@ pub(crate) async fn execute_worker_text_turn(
             }
             None => {
                 runtimes
-                    .execute_prompt_stream_cancellable(
+                    .execute_compiled_turn_stream_cancellable_with_capabilities(
                         &execution_clone,
-                        &history_clone,
-                        &prompt_body,
-                        &images,
-                        "utility",
+                        std::sync::Arc::new(crate::runtime::compiled_turn_from_prompt(
+                            &history_clone,
+                            &prompt_body,
+                            &images,
+                            "utility",
+                            &[],
+                            &[],
+                            &[],
+                        )),
+                        model_capabilities,
                         events,
                         Some(cancel_for_runtime),
                     )
@@ -10113,6 +10218,44 @@ pub(crate) async fn execute_worker_text_turn(
     handle
         .await
         .map_err(|error| anyhow!("worker model task crashed: {error}"))?
+}
+
+pub(crate) fn utility_runtime_model_capabilities(
+    state: &AppState,
+    session: Option<&SessionSummary>,
+    provider: &str,
+    model: &str,
+    base_url: &str,
+) -> RuntimeModelCapabilities {
+    if provider != "openai_compatible" {
+        return RuntimeModelCapabilities::default();
+    }
+
+    let Ok(workspace) = state.store.workspace() else {
+        return RuntimeModelCapabilities::default();
+    };
+    let Some(profile) =
+        matching_utility_profile_for_target(&workspace, session, provider, model, base_url)
+    else {
+        return RuntimeModelCapabilities::default();
+    };
+
+    RuntimeModelCapabilities {
+        json_object: profile.utility.json_object,
+        transport: profile.utility.transport,
+        action_contract: profile.utility.action_contract,
+    }
+}
+
+fn workspace_model_matches_target(
+    config: &WorkspaceModelConfig,
+    provider: &str,
+    model: &str,
+    base_url: &str,
+) -> bool {
+    config.adapter == provider
+        && config.model.trim() == model.trim()
+        && config.base_url.trim().trim_end_matches('/') == base_url.trim().trim_end_matches('/')
 }
 
 fn append_reasoning_snapshot(buffer: &mut String, text: &str) -> String {
@@ -21493,6 +21636,389 @@ Cleanup status: clean";
     }
 
     #[tokio::test]
+    async fn call_worker_model_parses_json_in_text_without_json_mode() {
+        let state_dir = test_state_dir("worker-provider-json-in-text-no-json-mode");
+        let state = initialize_test_state(&state_dir);
+        let (base_url, request_count, request_bodies, server) =
+            spawn_dynamic_openai_server(1, |_index, _body| {
+                DynamicOpenAiProviderResponse::content(
+                    r#"Here is the action:
+{"kind":"final_answer","summary":"parsed","final_answer":"Done."}
+Thanks."#,
+                )
+            })
+            .await;
+
+        let mut worker = test_worker_summary("provider-json-in-text", 10, 10);
+        worker.provider_base_url = base_url;
+        worker.model = "utility-json-text-model".to_string();
+        worker.working_dir = state_dir.display().to_string();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let response = call_worker_model(
+            &state,
+            None,
+            &worker,
+            &[],
+            "Answer with a Nucleus action.",
+            &[],
+            &mut cancel_rx,
+        )
+        .await
+        .expect("JSON object embedded in free text should parse");
+
+        assert!(matches!(
+            response.action,
+            WorkerAction::FinalAnswer { final_answer, .. } if final_answer == "Done."
+        ));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        let bodies = request_bodies
+            .lock()
+            .expect("request bodies lock should not be poisoned");
+        assert_eq!(bodies.len(), 1);
+        assert!(!bodies[0].contains("response_format"));
+        assert!(bodies[0].contains("\"stream\":true"));
+
+        server.await.expect("test server should finish");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn call_worker_model_sends_json_mode_when_profile_supports_it() {
+        let state_dir = test_state_dir("worker-provider-json-mode-supported");
+        let state = initialize_test_state(&state_dir);
+        let (base_url, request_count, request_bodies, server) =
+            spawn_dynamic_openai_server(1, |_index, _body| {
+                DynamicOpenAiProviderResponse::content(
+                    r#"{"kind":"final_answer","summary":"json mode","final_answer":"Done."}"#,
+                )
+            })
+            .await;
+
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-json-mode-model",
+            &base_url,
+            "utility-key",
+        );
+        let workspace = state.store.workspace().expect("workspace should load");
+        let profile = workspace
+            .profiles
+            .into_iter()
+            .find(|profile| profile.id == workspace.default_profile_id)
+            .expect("default profile should exist");
+        let mut utility = profile.utility.clone();
+        utility.json_object = nucleus_protocol::ModelJsonObjectCapability::Supported;
+        state
+            .store
+            .update_workspace_profile(
+                &profile.id,
+                nucleus_storage::WorkspaceProfilePatch {
+                    title: profile.title,
+                    main: profile.main,
+                    utility,
+                    is_default: true,
+                },
+            )
+            .expect("profile should update json capability");
+
+        let mut worker = test_worker_summary("provider-json-mode-supported", 10, 10);
+        worker.provider_base_url = base_url;
+        worker.model = "utility-json-mode-model".to_string();
+        worker.working_dir = state_dir.display().to_string();
+        let conversation = vec![CheckpointMessage {
+            role: "system".to_string(),
+            content: worker_system_prompt(&worker),
+            images: Vec::new(),
+            compacted: false,
+            compacted_range: None,
+        }];
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        call_worker_model(
+            &state,
+            None,
+            &worker,
+            &conversation,
+            "Answer with a Nucleus action.",
+            &[],
+            &mut cancel_rx,
+        )
+        .await
+        .expect("supported JSON mode profile should still run");
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        let bodies = request_bodies
+            .lock()
+            .expect("request bodies lock should not be poisoned");
+        assert!(bodies[0].contains("response_format"));
+        assert!(bodies[0].contains("json_object"));
+
+        server.await.expect("test server should finish");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn call_worker_model_empty_completed_stream_fails_fast_without_main_fallback() {
+        let state_dir = test_state_dir("worker-provider-empty-fast-fail");
+        let state = initialize_test_state(&state_dir);
+        let (base_url, request_count, server) =
+            spawn_retry_openai_server(vec![TestOpenAiProviderResponse {
+                status: 200,
+                retry_after_secs: None,
+                body: "",
+                content: Some(""),
+            }])
+            .await;
+
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-empty-model",
+            &base_url,
+            "utility-key",
+        );
+        let workspace = state.store.workspace().expect("workspace should load");
+        let profile = workspace
+            .profiles
+            .into_iter()
+            .find(|profile| profile.id == workspace.default_profile_id)
+            .expect("default profile should exist");
+        let mut utility = profile.utility.clone();
+        utility.transport = ModelTransportCapability::Streaming;
+        state
+            .store
+            .update_workspace_profile(
+                &profile.id,
+                nucleus_storage::WorkspaceProfilePatch {
+                    title: profile.title,
+                    main: profile.main,
+                    utility,
+                    is_default: true,
+                },
+            )
+            .expect("profile should update transport fingerprint");
+
+        let mut worker = test_worker_summary("provider-empty-fast", 10, 10);
+        worker.provider_base_url = base_url;
+        worker.model = "utility-empty-model".to_string();
+        worker.working_dir = state_dir.display().to_string();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let started = Instant::now();
+        let error = call_worker_model(
+            &state,
+            None,
+            &worker,
+            &[],
+            "Answer with a Nucleus action.",
+            &[],
+            &mut cancel_rx,
+        )
+        .await
+        .expect_err("empty completed stream should fail fast");
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        let detail = error.to_string();
+        assert!(detail.contains("Utility model 'utility-empty-model'"));
+        assert!(detail.contains("completed without producing a valid action"));
+        assert!(!detail.contains("main"));
+
+        server.await.expect("test server should finish");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn call_worker_model_falls_back_to_non_streaming_utility_model() {
+        let state_dir = test_state_dir("worker-provider-non-streaming-fallback");
+        let state = initialize_test_state(&state_dir);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener addr should be available")
+        );
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_bodies = Arc::new(TestMutex::new(Vec::new()));
+        let server_request_count = request_count.clone();
+        let server_request_bodies = request_bodies.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .expect("test request should connect");
+                let body = read_test_http_body(&mut socket).await;
+                server_request_bodies
+                    .lock()
+                    .expect("request bodies lock should not be poisoned")
+                    .push(body.clone());
+                let index = server_request_count.fetch_add(1, Ordering::SeqCst);
+                if index == 0 {
+                    write_test_openai_sse_response(&mut socket, "empty-stream-turn", "").await;
+                } else {
+                    assert!(body.contains("\"stream\":false"));
+                    write_test_openai_completion_response(
+                        &mut socket,
+                        "non-streaming-turn",
+                        r#"{"kind":"final_answer","summary":"fallback","final_answer":"Done."}"#,
+                    )
+                    .await;
+                }
+            }
+        });
+
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-fallback-model",
+            &base_url,
+            "utility-key",
+        );
+        let mut worker = test_worker_summary("provider-non-streaming-fallback", 10, 10);
+        worker.provider_base_url = base_url;
+        worker.model = "utility-fallback-model".to_string();
+        worker.working_dir = state_dir.display().to_string();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let response = call_worker_model(
+            &state,
+            None,
+            &worker,
+            &[],
+            "Answer with a Nucleus action.",
+            &[],
+            &mut cancel_rx,
+        )
+        .await
+        .expect("non-streaming fallback should produce a valid action");
+
+        assert!(matches!(
+            response.action,
+            WorkerAction::FinalAnswer { final_answer, .. } if final_answer == "Done."
+        ));
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        let bodies = request_bodies
+            .lock()
+            .expect("request bodies lock should not be poisoned");
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0].contains("\"stream\":true"));
+        assert!(bodies[1].contains("\"stream\":false"));
+        for body in bodies.iter() {
+            assert!(body.contains("\"model\":\"utility-fallback-model\""));
+            assert!(!body.contains("response_format"));
+            assert!(!body.contains("main"));
+        }
+        drop(bodies);
+
+        let workspace = state.store.workspace().expect("workspace should load");
+        let profile = workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == workspace.default_profile_id)
+            .expect("default profile should exist");
+        assert_eq!(
+            profile.utility.transport,
+            ModelTransportCapability::NonStreaming
+        );
+
+        server.await.expect("test server should finish");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn call_worker_model_falls_back_when_stream_request_gets_completion_json() {
+        let state_dir = test_state_dir("worker-provider-completion-json-fallback");
+        let state = initialize_test_state(&state_dir);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener addr should be available")
+        );
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_bodies = Arc::new(TestMutex::new(Vec::new()));
+        let server_request_count = request_count.clone();
+        let server_request_bodies = request_bodies.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .expect("test request should connect");
+                let body = read_test_http_body(&mut socket).await;
+                server_request_bodies
+                    .lock()
+                    .expect("request bodies lock should not be poisoned")
+                    .push(body.clone());
+                let index = server_request_count.fetch_add(1, Ordering::SeqCst);
+                if index == 0 {
+                    assert!(body.contains("\"stream\":true"));
+                    write_test_openai_completion_response(
+                        &mut socket,
+                        "non-sse-turn",
+                        r#"{"kind":"final_answer","summary":"ignored first","final_answer":"Done."}"#,
+                    )
+                    .await;
+                } else {
+                    assert!(body.contains("\"stream\":false"));
+                    write_test_openai_completion_response(
+                        &mut socket,
+                        "fallback-turn",
+                        r#"{"kind":"final_answer","summary":"fallback","final_answer":"Done."}"#,
+                    )
+                    .await;
+                }
+            }
+        });
+
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-completion-json-model",
+            &base_url,
+            "utility-key",
+        );
+        let mut worker = test_worker_summary("provider-completion-json-fallback", 10, 10);
+        worker.provider_base_url = base_url;
+        worker.model = "utility-completion-json-model".to_string();
+        worker.working_dir = state_dir.display().to_string();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let response = call_worker_model(
+            &state,
+            None,
+            &worker,
+            &[],
+            "Answer with a Nucleus action.",
+            &[],
+            &mut cancel_rx,
+        )
+        .await
+        .expect("non-SSE completion response should retry as non-streaming");
+
+        assert!(matches!(
+            response.action,
+            WorkerAction::FinalAnswer { final_answer, .. } if final_answer == "Done."
+        ));
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        let bodies = request_bodies
+            .lock()
+            .expect("request bodies lock should not be poisoned");
+        assert_eq!(bodies.len(), 2);
+        for body in bodies.iter() {
+            assert!(body.contains("\"model\":\"utility-completion-json-model\""));
+            assert!(!body.contains("main"));
+        }
+
+        server.await.expect("test server should finish");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
     async fn compact_checkpoint_replaces_long_history_with_summary() {
         let state_dir = test_state_dir("worker-context-compaction-applied");
         let state = initialize_test_state(&state_dir);
@@ -27487,6 +28013,9 @@ for line in sys.stdin:
                         model: model.to_string(),
                         base_url: base_url.to_string(),
                         api_key: api_key.to_string(),
+                        json_object: Default::default(),
+                        transport: Default::default(),
+                        action_contract: Default::default(),
                     },
                     is_default: true,
                 },
@@ -28344,6 +28873,33 @@ for line in sys.stdin:
         let body = format!("data: {chunk}\n\n");
         let response = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("test response should write");
+    }
+
+    async fn write_test_openai_completion_response(
+        socket: &mut tokio::net::TcpStream,
+        id: &str,
+        content: &str,
+    ) {
+        let body = serde_json::json!({
+            "id": id,
+            "choices": [
+                {
+                    "message": {
+                        "content": content,
+                    },
+                },
+            ],
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
             body.len(),
             body
         );

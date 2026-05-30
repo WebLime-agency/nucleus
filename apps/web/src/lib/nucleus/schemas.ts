@@ -572,7 +572,10 @@ export const workspaceModelConfigSchema = z.object({
   adapter: z.string().trim().min(1),
   model: z.string(),
   base_url: z.string().default(''),
-  api_key: z.string().default('')
+  api_key: z.string().default(''),
+  json_object: z.enum(['supported', 'unsupported', 'unknown']).default('unknown'),
+  transport: z.enum(['streaming', 'non_streaming', 'unknown']).default('unknown'),
+  action_contract: z.enum(['passed', 'failed', 'unknown']).default('unknown')
 });
 
 export const workspaceProfileSummarySchema = z.object({
