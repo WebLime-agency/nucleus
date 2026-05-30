@@ -9,7 +9,8 @@ use futures_util::StreamExt;
 use nucleus_core::{AdapterKind, compiled_turn_openai_messages};
 use nucleus_protocol::{
     CompiledConversationTurn, CompiledPromptLayer, CompiledTurn, CompiledTurnCapabilities,
-    CompiledTurnDebugSummary, McpServerSummary, NucleusToolDescriptor, RuntimeSummary,
+    CompiledTurnDebugSummary, McpServerSummary, ModelActionContractCapability,
+    ModelJsonObjectCapability, ModelTransportCapability, NucleusToolDescriptor, RuntimeSummary,
     SessionSummary, SessionTurn, SessionTurnImage,
 };
 use reqwest::header::{AUTHORIZATION, HeaderMap, RETRY_AFTER};
@@ -39,6 +40,20 @@ struct RuntimeCache {
 pub struct ProviderTurnResult {
     pub provider_session_id: String,
     pub content: String,
+    pub transport: ProviderTurnTransport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderTurnTransport {
+    Streaming,
+    NonStreaming,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeModelCapabilities {
+    pub json_object: ModelJsonObjectCapability,
+    pub transport: ModelTransportCapability,
+    pub action_contract: ModelActionContractCapability,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,41 +107,11 @@ impl RuntimeManager {
         Ok(refreshed)
     }
 
-    pub async fn execute_prompt_stream_cancellable(
-        &self,
-        session: &SessionSummary,
-        history: &[SessionTurn],
-        prompt: &str,
-        images: &[SessionTurnImage],
-        compiler_role: &str,
-        events: mpsc::UnboundedSender<PromptStreamEvent>,
-        cancel_rx: Option<watch::Receiver<bool>>,
-    ) -> Result<ProviderTurnResult> {
-        let compiled_turn =
-            compiled_turn_from_prompt(history, prompt, images, compiler_role, &[], &[], &[]);
-        self.execute_compiled_turn_stream_cancellable(
-            session,
-            Arc::new(compiled_turn),
-            events,
-            cancel_rx,
-        )
-        .await
-    }
-
-    pub async fn execute_compiled_turn_stream(
+    pub async fn execute_compiled_turn_stream_cancellable_with_capabilities(
         &self,
         session: &SessionSummary,
         compiled_turn: Arc<CompiledTurn>,
-        events: mpsc::UnboundedSender<PromptStreamEvent>,
-    ) -> Result<ProviderTurnResult> {
-        self.execute_compiled_turn_stream_cancellable(session, compiled_turn, events, None)
-            .await
-    }
-
-    pub async fn execute_compiled_turn_stream_cancellable(
-        &self,
-        session: &SessionSummary,
-        compiled_turn: Arc<CompiledTurn>,
+        capabilities: RuntimeModelCapabilities,
         events: mpsc::UnboundedSender<PromptStreamEvent>,
         cancel_rx: Option<watch::Receiver<bool>>,
     ) -> Result<ProviderTurnResult> {
@@ -135,7 +120,14 @@ impl RuntimeManager {
 
         match runtime {
             AdapterKind::OpenAiCompatible => {
-                execute_openai_compatible_prompt(session, &compiled_turn, events, cancel_rx).await
+                execute_openai_compatible_prompt(
+                    session,
+                    &compiled_turn,
+                    capabilities,
+                    events,
+                    cancel_rx,
+                )
+                .await
             }
             AdapterKind::Claude | AdapterKind::Codex => bail!(
                 "provider '{}' requires a protocol backend or loopback bridge; CLI model execution is disabled",
@@ -291,6 +283,7 @@ pub(crate) fn nucleus_identity() -> &'static str {
 async fn execute_openai_compatible_prompt(
     session: &SessionSummary,
     compiled_turn: &CompiledTurn,
+    capabilities: RuntimeModelCapabilities,
     events: mpsc::UnboundedSender<PromptStreamEvent>,
     mut cancel_rx: Option<watch::Receiver<bool>>,
 ) -> Result<ProviderTurnResult> {
@@ -310,15 +303,14 @@ async fn execute_openai_compatible_prompt(
         .build()
         .context("failed to build OpenAI-compatible HTTP client")?;
 
-    let mut payload = json!({
-        "model": session.model,
-        "stream": true,
-        "stream_options": { "include_usage": true },
-        "messages": compiled_turn_openai_messages(compiled_turn),
-    });
-    if compiled_turn_requires_json_object(compiled_turn) {
-        payload["response_format"] = json!({ "type": "json_object" });
-    }
+    let messages = compiled_turn_openai_messages(compiled_turn);
+    let json_object_supported = capabilities.json_object == ModelJsonObjectCapability::Supported;
+    let request_json_object =
+        json_object_supported && compiled_turn_requires_json_object(compiled_turn);
+    let mut force_non_streaming = capabilities.transport == ModelTransportCapability::NonStreaming;
+    let may_try_non_streaming_fallback =
+        capabilities.transport == ModelTransportCapability::Unknown;
+    let mut tried_non_streaming_fallback = force_non_streaming;
 
     let mut attempt = 0_u32;
     loop {
@@ -326,11 +318,40 @@ async fn execute_openai_compatible_prompt(
             bail!("worker canceled before provider call");
         }
 
-        match execute_openai_compatible_prompt_once(session, base_url, &client, &payload, &events)
-            .await
+        let stream = !force_non_streaming;
+        let payload = openai_compatible_payload(
+            &session.model,
+            messages.clone(),
+            request_json_object,
+            stream,
+        );
+
+        match execute_openai_compatible_prompt_once(
+            session, base_url, &client, &payload, stream, &events,
+        )
+        .await
         {
             Ok(result) => return Ok(result),
             Err(error) => {
+                if stream
+                    && may_try_non_streaming_fallback
+                    && !tried_non_streaming_fallback
+                    && should_try_non_streaming_fallback(&error)
+                {
+                    force_non_streaming = true;
+                    tried_non_streaming_fallback = true;
+                    continue;
+                }
+
+                if is_empty_completed_provider_output(&error) {
+                    if stream && may_try_non_streaming_fallback && !tried_non_streaming_fallback {
+                        force_non_streaming = true;
+                        tried_non_streaming_fallback = true;
+                        continue;
+                    }
+                    return Err(empty_utility_model_output_error(session));
+                }
+
                 attempt = attempt.saturating_add(1);
                 let retry_after = retry_after_from_error(&error);
                 match classify_provider_error(&error, attempt, retry_after) {
@@ -359,6 +380,7 @@ async fn execute_openai_compatible_prompt_once(
     base_url: &str,
     client: &reqwest::Client,
     payload: &serde_json::Value,
+    stream: bool,
     events: &mpsc::UnboundedSender<PromptStreamEvent>,
 ) -> Result<ProviderTurnResult> {
     // The OpenAI-compatible adapter does not expose a portable idempotency key
@@ -395,7 +417,31 @@ async fn execute_openai_compatible_prompt_once(
         }));
     }
 
-    read_openai_compatible_stream(response, events.clone()).await
+    if stream {
+        read_openai_compatible_stream(response, events.clone()).await
+    } else {
+        read_openai_compatible_completion(response, events.clone()).await
+    }
+}
+
+fn openai_compatible_payload(
+    model: &str,
+    messages: Vec<serde_json::Value>,
+    request_json_object: bool,
+    stream: bool,
+) -> serde_json::Value {
+    let mut payload = json!({
+        "model": model,
+        "stream": stream,
+        "messages": messages,
+    });
+    if stream {
+        payload["stream_options"] = json!({ "include_usage": true });
+    }
+    if request_json_object {
+        payload["response_format"] = json!({ "type": "json_object" });
+    }
+    payload
 }
 
 async fn wait_for_retry_backoff(
@@ -478,6 +524,97 @@ async fn read_openai_compatible_stream(
     Ok(ProviderTurnResult {
         provider_session_id,
         content,
+        transport: ProviderTurnTransport::Streaming,
+    })
+}
+
+async fn read_openai_compatible_completion(
+    response: reqwest::Response,
+    events: mpsc::UnboundedSender<PromptStreamEvent>,
+) -> Result<ProviderTurnResult> {
+    let text = response
+        .text()
+        .await
+        .context("failed while reading the completion response")?;
+    let completion = serde_json::from_str::<OpenAiCompletion>(&text)
+        .with_context(|| "failed to decode OpenAI-compatible completion response".to_string())?;
+
+    let provider_session_id = completion.id.unwrap_or_default();
+    if !provider_session_id.is_empty() {
+        let _ = events.send(PromptStreamEvent::ProviderSessionReady {
+            provider_session_id: provider_session_id.clone(),
+        });
+    }
+
+    if let Some(usage) = completion.usage {
+        let _ = events.send(PromptStreamEvent::TokenUsage {
+            prompt_tokens: usage.prompt_tokens.unwrap_or(0),
+            completion_tokens: usage.completion_tokens.unwrap_or(0),
+            cached_tokens: usage
+                .prompt_tokens_details
+                .and_then(|details| details.cached_tokens)
+                .unwrap_or(0),
+        });
+    }
+
+    let mut content = String::new();
+    for choice in completion.choices {
+        if let Some(delta) = choice
+            .message
+            .and_then(|message| message.content)
+            .or(choice.delta.content)
+        {
+            content.push_str(&delta);
+            let _ = events.send(PromptStreamEvent::AssistantChunk { text: delta });
+            let _ = events.send(PromptStreamEvent::AssistantSnapshot {
+                text: content.clone(),
+            });
+        }
+    }
+
+    let content = content.trim().to_string();
+    if content.is_empty() {
+        return Err(anyhow!(ProviderTransportError::Stream {
+            detail: "completion completed with empty response".to_string(),
+        }));
+    }
+
+    Ok(ProviderTurnResult {
+        provider_session_id,
+        content,
+        transport: ProviderTurnTransport::NonStreaming,
+    })
+}
+
+fn is_empty_completed_provider_output(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ProviderTransportError>().is_some_and(
+        |provider_error| match provider_error {
+            ProviderTransportError::Stream { detail } => {
+                detail == "stream completed with empty response"
+                    || detail == "completion completed with empty response"
+            }
+            ProviderTransportError::Http { .. } => false,
+        },
+    )
+}
+
+fn should_try_non_streaming_fallback(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ProviderTransportError>().is_some_and(
+        |provider_error| match provider_error {
+            ProviderTransportError::Stream { detail } => {
+                detail == "EOF before stream complete" || is_empty_completed_provider_output(error)
+            }
+            ProviderTransportError::Http { .. } => false,
+        },
+    )
+}
+
+fn empty_utility_model_output_error(session: &SessionSummary) -> anyhow::Error {
+    anyhow!(ProviderTransportError::Stream {
+        detail: format!(
+            "Utility model '{}' completed without producing a valid action. Check this profile or pick another Utility model.",
+            session.model
+        ),
     })
 }
 
@@ -587,6 +724,14 @@ fn truncate(value: impl AsRef<str>, max_chars: usize) -> String {
         result.push(ch);
     }
     result
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiCompletion {
+    id: Option<String>,
+    #[serde(default)]
+    choices: Vec<OpenAiChoice>,
+    usage: Option<OpenAiUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -715,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_worker_turns_request_json_object_mode() {
+    fn openai_worker_turns_detect_json_object_contract() {
         let history = vec![SessionTurn {
             id: "system".to_string(),
             session_id: "job".to_string(),
@@ -738,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_regular_turns_do_not_request_json_object_mode() {
+    fn openai_regular_turns_do_not_detect_json_object_contract() {
         let history = vec![SessionTurn {
             id: "user".to_string(),
             session_id: "session".to_string(),
@@ -751,6 +896,31 @@ mod tests {
             compiled_turn_from_prompt(&history, "Summarize.", &[], "main", &[], &[], &[]);
 
         assert!(!compiled_turn_requires_json_object(&compiled));
+    }
+
+    #[test]
+    fn openai_payload_omits_json_mode_when_capability_is_unknown() {
+        let payload = openai_compatible_payload("utility-model", Vec::new(), false, true);
+
+        assert_eq!(payload["stream"], true);
+        assert!(payload.get("stream_options").is_some());
+        assert!(payload.get("response_format").is_none());
+    }
+
+    #[test]
+    fn openai_payload_uses_non_streaming_without_stream_options() {
+        let payload = openai_compatible_payload("utility-model", Vec::new(), false, false);
+
+        assert_eq!(payload["stream"], false);
+        assert!(payload.get("stream_options").is_none());
+        assert!(payload.get("response_format").is_none());
+    }
+
+    #[test]
+    fn openai_payload_sends_json_mode_only_when_requested() {
+        let payload = openai_compatible_payload("utility-model", Vec::new(), true, true);
+
+        assert_eq!(payload["response_format"], json!({ "type": "json_object" }));
     }
 
     #[test]
