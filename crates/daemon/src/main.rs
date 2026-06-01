@@ -18,7 +18,7 @@ use std::{
     path::{Path as FsPath, PathBuf},
     process::Command as StdCommand,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, bail};
@@ -53,8 +53,9 @@ use nucleus_protocol::{
     McpServerSummary, McpToolRecord, MemoryCandidate, MemoryCandidateAcceptRequest,
     MemoryCandidateListResponse, MemoryCandidateUpsertRequest, MemoryEntry,
     MemoryEntryUpsertRequest, MemoryOutcome, MemorySearchResponse, MemorySummary,
-    NucleusToolDescriptor, PlaybookDetail, PlaybookSummary, ProcessKillRequest,
-    ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate, ProjectUpdateRequest,
+    ModelTransportCapability, NucleusToolDescriptor, PlaybookDetail, PlaybookSummary,
+    ProcessKillRequest, ProcessKillResponse, ProcessListResponse, ProcessStreamUpdate,
+    ProfileCheckOutcome, ProfileCheckRequest, ProfileCheckResult, ProjectUpdateRequest,
     PromptProgressUpdate, RouterProfileSummary, RunBudgetSummary, RuntimeOverview, RuntimeSummary,
     SessionDetail, SessionPromptRequest, SessionSummary, SettingsSummary, SkillImportRequest,
     SkillImportResponse, SkillInstallResult, SkillInstallVerification, SkillInstallationRecord,
@@ -73,6 +74,7 @@ use nucleus_storage::{
     ProjectPatch, SessionPatch, SessionRecord, StateStore, VaultSecretPolicyRecord,
     VaultSecretRecord, WorkspaceProfilePatch, WorktreeRecord,
 };
+use retry::{ProviderTransportError, provider_error_class};
 use runtime::RuntimeManager;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -209,6 +211,10 @@ fn app(state: AppState) -> Router {
         .route(
             "/workspace/profiles/{profile_id}",
             axum::routing::patch(update_workspace_profile).delete(delete_workspace_profile),
+        )
+        .route(
+            "/workspace/profiles/{profile_id}/check",
+            axum::routing::post(check_workspace_profile),
         )
         .route(
             "/workspace/projects/sync",
@@ -923,6 +929,257 @@ async fn update_workspace_profile(
     .await;
     let _ = publish_overview_event(&state).await;
     Ok(Json(redact_workspace_profile(profile)))
+}
+
+async fn check_workspace_profile(
+    State(state): State<AppState>,
+    Path(profile_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<ProfileCheckResult>, ApiError> {
+    let payload = decode_json::<ProfileCheckRequest>(&body)?;
+    let role = match payload.role.trim() {
+        "main" => "main".to_string(),
+        "utility" => "utility".to_string(),
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "unsupported profile check role '{other}'"
+            )));
+        }
+    };
+    let workspace = state.store.workspace()?;
+    let profile = workspace
+        .profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+        .ok_or_else(|| {
+            ApiError::not_found(format!("workspace profile '{profile_id}' was not found"))
+        })?;
+
+    let started = Instant::now();
+    let target = match resolve_workspace_profile_target(&state, profile, &role).await {
+        Ok(target) => target,
+        Err(error) => {
+            return Ok(Json(profile_check_result(
+                role,
+                ProfileCheckOutcome::AdapterUnavailable,
+                format!(
+                    "This profile target is not available for daemon-owned checks: {}",
+                    error.message
+                ),
+                None,
+                Some(started.elapsed()),
+            )));
+        }
+    };
+
+    if target.provider != AdapterKind::OpenAiCompatible.as_str() {
+        return Ok(Json(profile_check_result(
+            role,
+            ProfileCheckOutcome::AdapterUnavailable,
+            format!(
+                "Connection checks currently support OpenAI-compatible profile targets; '{}' is not checkable here.",
+                target.provider
+            ),
+            None,
+            Some(started.elapsed()),
+        )));
+    }
+
+    if target.provider_base_url.trim().is_empty() {
+        return Ok(Json(profile_check_result(
+            role,
+            ProfileCheckOutcome::MissingBaseUrl,
+            "Set a base URL for this OpenAI-compatible profile target before checking it.",
+            None,
+            Some(started.elapsed()),
+        )));
+    }
+
+    // Deferred follow-up: a successful probe could refresh the profile capability
+    // fingerprint, but this endpoint is intentionally read-only for now.
+    let config = if role == "utility" {
+        &profile.utility
+    } else {
+        &profile.main
+    };
+    let stream = config.transport != ModelTransportCapability::NonStreaming;
+    match runtime::probe_openai_compatible_endpoint(
+        &target.provider_base_url,
+        &target.provider_api_key,
+        &target.model,
+        stream,
+    )
+    .await
+    {
+        Ok(_) => Ok(Json(profile_check_result(
+            role,
+            ProfileCheckOutcome::Ok,
+            format!(
+                "{} responded with a non-empty assistant message.",
+                target.model
+            ),
+            None,
+            Some(started.elapsed()),
+        ))),
+        Err(error) => Ok(Json(classify_profile_check_error(
+            role,
+            &target.model,
+            target.provider_api_key.trim(),
+            error,
+            started.elapsed(),
+        ))),
+    }
+}
+
+fn profile_check_result(
+    role: String,
+    outcome: ProfileCheckOutcome,
+    message: impl Into<String>,
+    http_status: Option<u16>,
+    latency: Option<Duration>,
+) -> ProfileCheckResult {
+    ProfileCheckResult {
+        role,
+        outcome,
+        message: message.into(),
+        http_status,
+        latency_ms: latency.map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64),
+    }
+}
+
+fn classify_profile_check_error(
+    role: String,
+    model: &str,
+    api_key: &str,
+    error: anyhow::Error,
+    latency: Duration,
+) -> ProfileCheckResult {
+    let redactor = security::RedactionSet::new().with_secret(api_key.to_string());
+    let provider_error = error.downcast_ref::<ProviderTransportError>();
+    let http_status = provider_error.and_then(|error| match error {
+        ProviderTransportError::Http { status, .. } => Some(*status),
+        ProviderTransportError::Stream { .. } => None,
+    });
+
+    if runtime::is_provider_timeout_error(&error) {
+        return profile_check_result(
+            role,
+            ProfileCheckOutcome::Timeout,
+            format!(
+                "Timed out while checking model '{model}'. Verify the gateway is responsive and try again."
+            ),
+            http_status,
+            Some(latency),
+        );
+    }
+
+    if let Some(ProviderTransportError::Http { status, detail, .. }) = provider_error {
+        if matches!(*status, 401 | 403) {
+            if api_key.is_empty() {
+                return profile_check_result(
+                    role,
+                    ProfileCheckOutcome::MissingApiKey,
+                    "The provider requires an API key for this profile target. Save a key and check again.",
+                    Some(*status),
+                    Some(latency),
+                );
+            }
+
+            return profile_check_result(
+                role,
+                ProfileCheckOutcome::InvalidApiKey,
+                "The provider rejected the saved API key. Update the key and check again.",
+                Some(*status),
+                Some(latency),
+            );
+        }
+
+        if matches!(*status, 400 | 404) && response_mentions_unknown_model(detail) {
+            return profile_check_result(
+                role,
+                ProfileCheckOutcome::ModelNotFound,
+                format!(
+                    "The provider could not find model '{model}'. Check the model name and route."
+                ),
+                Some(*status),
+                Some(latency),
+            );
+        }
+
+        return profile_check_result(
+            role,
+            ProfileCheckOutcome::MalformedResponse,
+            format!(
+                "The provider returned HTTP {status}. Check the gateway logs or provider dashboard for details."
+            ),
+            Some(*status),
+            Some(latency),
+        );
+    }
+
+    if let Some(ProviderTransportError::Stream { detail }) = provider_error {
+        if detail == "completion completed with empty response"
+            || detail == "stream completed with empty response"
+        {
+            return profile_check_result(
+                role,
+                ProfileCheckOutcome::EmptyResponse,
+                format!(
+                    "Model '{model}' returned HTTP 200 but produced an empty assistant message. Pick a model that returns non-empty chat completions."
+                ),
+                None,
+                Some(latency),
+            );
+        }
+    }
+
+    match provider_error_class(&error).as_str() {
+        "connection" => profile_check_result(
+            role,
+            ProfileCheckOutcome::Unreachable,
+            "Nucleus could not connect to the provider. Check the base URL, DNS, and local gateway process.",
+            http_status,
+            Some(latency),
+        ),
+        "stream_malformed" | "stream_eof" => profile_check_result(
+            role,
+            ProfileCheckOutcome::MalformedResponse,
+            "The provider response was not a valid OpenAI-compatible chat completion.",
+            http_status,
+            Some(latency),
+        ),
+        _ => {
+            let detail = redactor.redact_text(&error.to_string());
+            profile_check_result(
+                role,
+                ProfileCheckOutcome::MalformedResponse,
+                format!(
+                    "The provider response could not be used as an OpenAI-compatible chat completion: {}",
+                    truncate_profile_check_detail(&detail, 160)
+                ),
+                http_status,
+                Some(latency),
+            )
+        }
+    }
+}
+
+fn response_mentions_unknown_model(detail: &str) -> bool {
+    let lowered = detail.to_ascii_lowercase();
+    lowered.contains("model")
+        && (lowered.contains("not found")
+            || lowered.contains("unknown")
+            || lowered.contains("does not exist")
+            || lowered.contains("no endpoint")
+            || lowered.contains("no route"))
+}
+
+fn truncate_profile_check_detail(value: &str, max_chars: usize) -> String {
+    let mut output = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        output.push_str("...");
+    }
+    output
 }
 
 async fn record_utility_worker_route_startup_validation(state: &AppState) {
@@ -9451,7 +9708,7 @@ mod tests {
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn turn(role: &str, content: &str) -> nucleus_protocol::SessionTurn {
         nucleus_protocol::SessionTurn {
@@ -9490,6 +9747,453 @@ mod tests {
             transport: Default::default(),
             action_contract: Default::default(),
         }
+    }
+
+    fn set_default_profile_model_target(
+        state: &AppState,
+        role: &str,
+        model: &str,
+        base_url: &str,
+        api_key: &str,
+    ) -> String {
+        let workspace = state.store.workspace().expect("workspace should load");
+        let profile = workspace
+            .profiles
+            .into_iter()
+            .find(|profile| profile.id == workspace.default_profile_id)
+            .expect("default profile should exist");
+        let target = openai_workspace_model(model, base_url, api_key);
+        state
+            .store
+            .update_workspace_profile(
+                &profile.id,
+                WorkspaceProfilePatch {
+                    title: profile.title,
+                    main: if role == "main" {
+                        target.clone()
+                    } else {
+                        profile.main
+                    },
+                    utility: if role == "utility" {
+                        target
+                    } else {
+                        profile.utility
+                    },
+                    is_default: true,
+                },
+            )
+            .expect("default profile target should update");
+        profile.id
+    }
+
+    fn set_profile_role_transport(
+        state: &AppState,
+        profile_id: &str,
+        role: &str,
+        transport: ModelTransportCapability,
+    ) {
+        let workspace = state.store.workspace().expect("workspace should load");
+        let profile = workspace
+            .profiles
+            .into_iter()
+            .find(|profile| profile.id == profile_id)
+            .expect("profile should exist");
+        let mut main = profile.main;
+        let mut utility = profile.utility;
+        if role == "utility" {
+            utility.transport = transport;
+        } else {
+            main.transport = transport;
+        }
+        state
+            .store
+            .update_workspace_profile(
+                profile_id,
+                WorkspaceProfilePatch {
+                    title: profile.title,
+                    main,
+                    utility,
+                    is_default: profile.is_default,
+                },
+            )
+            .expect("profile transport should update");
+    }
+
+    async fn read_profile_check_http_body(socket: &mut tokio::net::TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let read = socket
+                .read(&mut chunk)
+                .await
+                .expect("test request should read");
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&buffer[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            let body_start = header_end + 4;
+            if buffer.len() >= body_start + content_length {
+                return String::from_utf8_lossy(&buffer[body_start..body_start + content_length])
+                    .to_string();
+            }
+        }
+        String::new()
+    }
+
+    async fn write_profile_check_http_response(
+        socket: &mut tokio::net::TcpStream,
+        status: u16,
+        body: &str,
+    ) {
+        let reason = match status {
+            200 => "OK",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            404 => "Not Found",
+            _ => "Error",
+        };
+        let response = format!(
+            "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("test response should write");
+    }
+
+    async fn spawn_profile_check_openai_server(
+        status: u16,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener address should be available")
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("test request should connect");
+            let request_body = read_profile_check_http_body(&mut socket).await;
+            write_profile_check_http_response(&mut socket, status, body).await;
+            request_body
+        });
+        (base_url, server)
+    }
+
+    async fn spawn_hanging_profile_check_openai_server() -> (String, tokio::task::JoinHandle<String>)
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener address should be available")
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("test request should connect");
+            let request_body = read_profile_check_http_body(&mut socket).await;
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            request_body
+        });
+        (base_url, server)
+    }
+
+    async fn run_profile_check(
+        state: AppState,
+        profile_id: &str,
+        role: &str,
+    ) -> ProfileCheckResult {
+        check_workspace_profile(
+            State(state),
+            Path(profile_id.to_string()),
+            Bytes::from(json!({ "role": role }).to_string()),
+        )
+        .await
+        .expect("profile check should return a response")
+        .0
+    }
+
+    fn assert_profile_check_created_no_work(state: &AppState) {
+        assert!(
+            state
+                .store
+                .list_sessions()
+                .expect("sessions should list")
+                .is_empty(),
+            "profile check must not create sessions"
+        );
+        assert!(
+            state
+                .store
+                .list_jobs_by_state(&[
+                    "queued",
+                    "running",
+                    "pending",
+                    "completed",
+                    "failed",
+                    "canceled"
+                ])
+                .expect("jobs should list")
+                .is_empty(),
+            "profile check must not create jobs"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_profile_check_classifies_openai_compatible_responses() {
+        let cases = [
+            (
+                "main-ok",
+                "main",
+                200,
+                r#"{"id":"ok","choices":[{"message":{"content":"pong"}}]}"#,
+                ProfileCheckOutcome::Ok,
+            ),
+            (
+                "utility-empty",
+                "utility",
+                200,
+                r#"{"id":"empty","choices":[{"message":{"content":""}}]}"#,
+                ProfileCheckOutcome::EmptyResponse,
+            ),
+            (
+                "utility-invalid-key",
+                "utility",
+                401,
+                r#"{"error":"bad key"}"#,
+                ProfileCheckOutcome::InvalidApiKey,
+            ),
+            (
+                "utility-missing-model-404",
+                "utility",
+                404,
+                r#"{"error":"model not found"}"#,
+                ProfileCheckOutcome::ModelNotFound,
+            ),
+            (
+                "utility-base-path-404",
+                "utility",
+                404,
+                r#"{"error":"not found"}"#,
+                ProfileCheckOutcome::MalformedResponse,
+            ),
+            (
+                "utility-missing-model-400",
+                "utility",
+                400,
+                r#"{"error":"unknown model route"}"#,
+                ProfileCheckOutcome::ModelNotFound,
+            ),
+            (
+                "utility-malformed",
+                "utility",
+                200,
+                "not-json",
+                ProfileCheckOutcome::MalformedResponse,
+            ),
+        ];
+
+        for (name, role, status, body, expected) in cases {
+            let state_dir = test_state_dir(name);
+            let store = initialize_test_store(&state_dir);
+            let state = test_app_state(&store);
+            let (base_url, server) = spawn_profile_check_openai_server(status, body).await;
+            let profile_id = set_default_profile_model_target(
+                &state,
+                role,
+                "profile-check-model",
+                &base_url,
+                "test-key",
+            );
+            set_profile_role_transport(
+                &state,
+                &profile_id,
+                role,
+                ModelTransportCapability::NonStreaming,
+            );
+
+            let result = run_profile_check(state.clone(), &profile_id, role).await;
+
+            assert_eq!(result.role, role);
+            assert_eq!(result.outcome, expected, "case {name}");
+            assert!(result.latency_ms.is_some());
+            if status != 200 {
+                assert_eq!(result.http_status, Some(status));
+            }
+            let request_body = server.await.expect("test server should finish");
+            let payload: Value =
+                serde_json::from_str(&request_body).expect("provider request body should be JSON");
+            assert_eq!(payload["model"], "profile-check-model");
+            assert_eq!(payload["stream"], false);
+            assert_eq!(payload["messages"][0]["content"], "ping");
+            assert_profile_check_created_no_work(&state);
+            let _ = fs::remove_dir_all(&state_dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_profile_check_classifies_hanging_provider_as_timeout() {
+        let state_dir = test_state_dir("profile-check-timeout");
+        let store = initialize_test_store(&state_dir);
+        let state = test_app_state(&store);
+        let (base_url, server) = spawn_hanging_profile_check_openai_server().await;
+        let profile_id = set_default_profile_model_target(
+            &state,
+            "utility",
+            "profile-check-timeout-model",
+            &base_url,
+            "test-key",
+        );
+
+        let result = run_profile_check(state.clone(), &profile_id, "utility").await;
+
+        assert_eq!(result.outcome, ProfileCheckOutcome::Timeout);
+        assert!(result.message.contains("Timed out"));
+        let request_body = server.await.expect("test server should finish");
+        assert!(request_body.contains("profile-check-timeout-model"));
+        assert_profile_check_created_no_work(&state);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn workspace_profile_check_classifies_empty_key_auth_rejection() {
+        let state_dir = test_state_dir("profile-check-missing-key-auth");
+        let store = initialize_test_store(&state_dir);
+        let state = test_app_state(&store);
+        let (base_url, server) =
+            spawn_profile_check_openai_server(401, r#"{"error":"missing api key"}"#).await;
+        let profile_id =
+            set_default_profile_model_target(&state, "main", "auth-required-model", &base_url, "");
+
+        let result = run_profile_check(state.clone(), &profile_id, "main").await;
+
+        assert_eq!(result.outcome, ProfileCheckOutcome::MissingApiKey);
+        let request_body = server.await.expect("test server should finish");
+        assert!(request_body.contains("auth-required-model"));
+        assert_profile_check_created_no_work(&state);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn workspace_profile_check_allows_unauthenticated_loopback_gateway() {
+        let state_dir = test_state_dir("profile-check-loopback-no-auth");
+        let store = initialize_test_store(&state_dir);
+        let state = test_app_state(&store);
+        let (base_url, server) = spawn_profile_check_openai_server(
+            200,
+            r#"{"id":"ok","choices":[{"message":{"content":"pong"}}]}"#,
+        )
+        .await;
+        let profile_id = set_default_profile_model_target(
+            &state,
+            "utility",
+            "loopback-no-auth-model",
+            &base_url,
+            "",
+        );
+        set_profile_role_transport(
+            &state,
+            &profile_id,
+            "utility",
+            ModelTransportCapability::NonStreaming,
+        );
+
+        let result = run_profile_check(state.clone(), &profile_id, "utility").await;
+
+        assert_eq!(result.outcome, ProfileCheckOutcome::Ok);
+        let request_body = server.await.expect("test server should finish");
+        assert!(request_body.contains("loopback-no-auth-model"));
+        assert_profile_check_created_no_work(&state);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn workspace_profile_check_uses_streaming_for_unknown_transport_capability() {
+        let state_dir = test_state_dir("profile-check-streaming-transport");
+        let store = initialize_test_store(&state_dir);
+        let state = test_app_state(&store);
+        let (base_url, server) = spawn_profile_check_openai_server(
+            200,
+            "data: {\"id\":\"stream-ok\",\"choices\":[{\"delta\":{\"content\":\"pong\"}}]}\n\ndata: [DONE]\n\n",
+        )
+        .await;
+        let profile_id = set_default_profile_model_target(
+            &state,
+            "utility",
+            "streaming-check-model",
+            &base_url,
+            "test-key",
+        );
+
+        let result = run_profile_check(state.clone(), &profile_id, "utility").await;
+
+        assert_eq!(result.outcome, ProfileCheckOutcome::Ok);
+        let request_body = server.await.expect("test server should finish");
+        let payload: Value =
+            serde_json::from_str(&request_body).expect("provider request body should be JSON");
+        assert_eq!(payload["stream"], true);
+        assert_profile_check_created_no_work(&state);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn workspace_profile_check_redacts_provider_error_detail() {
+        let state_dir = test_state_dir("profile-check-redacted-error");
+        let store = initialize_test_store(&state_dir);
+        let state = test_app_state(&store);
+        let (base_url, server) = spawn_profile_check_openai_server(
+            500,
+            r#"{"error":"upstream echoed secret-key-12345"}"#,
+        )
+        .await;
+        let profile_id = set_default_profile_model_target(
+            &state,
+            "utility",
+            "redacted-error-model",
+            &base_url,
+            "secret-key-12345",
+        );
+        set_profile_role_transport(
+            &state,
+            &profile_id,
+            "utility",
+            ModelTransportCapability::NonStreaming,
+        );
+
+        let result = run_profile_check(state.clone(), &profile_id, "utility").await;
+
+        assert_eq!(result.outcome, ProfileCheckOutcome::MalformedResponse);
+        assert!(!result.message.contains("secret-key-12345"));
+        assert!(!result.message.contains("upstream echoed"));
+        assert!(result.message.contains("HTTP 500"));
+        let _ = server.await.expect("test server should finish");
+        assert_profile_check_created_no_work(&state);
+        let _ = fs::remove_dir_all(&state_dir);
     }
 
     #[test]

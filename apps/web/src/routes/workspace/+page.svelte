@@ -2,10 +2,13 @@
   import { WorkspacePageHeader } from '$lib/components/app/workspace';
   import { onMount } from 'svelte';
   import {
+    AlertTriangle,
     Bot,
+    CheckCircle2,
     Cpu,
     KeyRound,
     Link2,
+    Loader2,
     Plus,
     Save,
     Settings2,
@@ -22,6 +25,7 @@
     CardTitle
   } from '$lib/components/ui/card';
   import {
+    checkWorkspaceProfile,
     createWorkspaceProfile,
     deleteWorkspaceProfile,
     fetchOverview,
@@ -31,6 +35,7 @@
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
   import type {
     DaemonEvent,
+    ProfileCheckResult,
     RuntimeOverview,
     WorkspaceModelConfig,
     WorkspaceProfileSummary,
@@ -41,6 +46,15 @@
     value: WorkspaceModelConfig['adapter'];
     label: string;
     helper: string;
+  };
+
+  type ModelRole = 'main' | 'utility';
+
+  type ProfileCheckState = {
+    pending: boolean;
+    result: ProfileCheckResult | null;
+    error: string | null;
+    signature: string | null;
   };
 
   const adapterOptions: AdapterOption[] = [
@@ -75,6 +89,7 @@
   let savingProfileId = $state<string | null>(null);
   let deletingProfileId = $state<string | null>(null);
   let creatingProfile = $state(false);
+  let profileChecks = $state<Record<string, ProfileCheckState>>({});
   let error = $state<string | null>(null);
   let success = $state<string | null>(null);
   let streamStatus = $state<StreamStatus>('connecting');
@@ -111,8 +126,30 @@
       : (nextDrafts[0]?.id ?? '');
 
     defaultProfileId = nextWorkspace.default_profile_id;
+    pruneStaleProfileChecks(nextDrafts);
     profileDrafts = nextDrafts;
     selectedProfileId = nextSelectedProfileId;
+  }
+
+  function pruneStaleProfileChecks(nextDrafts: WorkspaceProfileSummary[]) {
+    const nextChecks = { ...profileChecks };
+    let changed = false;
+
+    for (const [key, state] of Object.entries(profileChecks)) {
+      const [profileId, rawRole] = key.split(':');
+      const role: ModelRole | null = rawRole === 'main' || rawRole === 'utility' ? rawRole : null;
+      const profile = nextDrafts.find((item) => item.id === profileId);
+      const signature = profile && role ? modelCheckSignature(profile[role]) : null;
+
+      if (!signature || state.signature !== signature) {
+        delete nextChecks[key];
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      profileChecks = nextChecks;
+    }
   }
 
   function profileSignature(profile: WorkspaceProfileSummary, selectedDefaultProfileId: string) {
@@ -188,6 +225,74 @@
     return config.model.trim() || 'Use provider default';
   }
 
+  function profileCheckKey(profileId: string, role: ModelRole) {
+    return `${profileId}:${role}`;
+  }
+
+  function profileCheckFor(profileId: string, role: ModelRole): ProfileCheckState {
+    return (
+      profileChecks[profileCheckKey(profileId, role)] ?? {
+        pending: false,
+        result: null,
+        error: null,
+        signature: null
+      }
+    );
+  }
+
+  function setProfileCheck(profileId: string, role: ModelRole, state: ProfileCheckState) {
+    profileChecks = {
+      ...profileChecks,
+      [profileCheckKey(profileId, role)]: state
+    };
+  }
+
+  function clearProfileCheck(profileId: string, role: ModelRole) {
+    const key = profileCheckKey(profileId, role);
+    if (!(key in profileChecks)) {
+      return;
+    }
+    const next = { ...profileChecks };
+    delete next[key];
+    profileChecks = next;
+  }
+
+  function profileCheckStatusClass(state: ProfileCheckState) {
+    if (state.pending) {
+      return 'border-amber-300/30 bg-amber-300/10 text-amber-100';
+    }
+    if (state.error || (state.result && state.result.outcome !== 'ok')) {
+      return 'border-red-500/30 bg-red-500/10 text-red-200';
+    }
+    if (state.result?.outcome === 'ok') {
+      return 'border-emerald-400/30 bg-emerald-400/10 text-emerald-100';
+    }
+    return 'border-zinc-800 bg-zinc-950/60 text-zinc-500';
+  }
+
+  function profileCheckMessage(state: ProfileCheckState) {
+    if (state.pending) {
+      return 'Checking connection...';
+    }
+    if (state.error) {
+      return state.error;
+    }
+    if (state.result) {
+      const latency = state.result.latency_ms === undefined ? '' : ` (${state.result.latency_ms} ms)`;
+      return `${state.result.message}${latency}`;
+    }
+    return '';
+  }
+
+  function modelCheckSignature(config: WorkspaceModelConfig) {
+    return JSON.stringify({
+      adapter: config.adapter,
+      model: config.model.trim(),
+      base_url: config.base_url.trim().replace(/\/+$/, ''),
+      api_key: config.api_key
+    });
+  }
+
   function updateProfileDraft(
     profileId: string,
     updater: (profile: WorkspaceProfileSummary) => WorkspaceProfileSummary
@@ -199,13 +304,42 @@
 
   function updateModelDraft(
     profileId: string,
-    role: 'main' | 'utility',
+    role: ModelRole,
     updater: (config: WorkspaceModelConfig) => WorkspaceModelConfig
   ) {
+    clearProfileCheck(profileId, role);
     updateProfileDraft(profileId, (profile) => ({
       ...profile,
       [role]: updater({ ...profile[role] })
     }));
+  }
+
+  async function handleCheckProfile(profileId: string, role: ModelRole) {
+    const profile = profileDrafts.find((item) => item.id === profileId);
+    if (!profile) {
+      return;
+    }
+    const signature = modelCheckSignature(profile[role]);
+    setProfileCheck(profileId, role, { pending: true, result: null, error: null, signature });
+
+    try {
+      const result = await checkWorkspaceProfile(profileId, role);
+      if (profileCheckFor(profileId, role).signature !== signature) {
+        return;
+      }
+      setProfileCheck(profileId, role, { pending: false, result, error: null, signature });
+      error = null;
+    } catch (cause) {
+      if (profileCheckFor(profileId, role).signature !== signature) {
+        return;
+      }
+      setProfileCheck(profileId, role, {
+        pending: false,
+        result: null,
+        error: cause instanceof Error ? cause.message : 'Connection check failed.',
+        signature
+      });
+    }
   }
 
   async function loadAll(silent = false) {
@@ -537,10 +671,28 @@
                 { key: 'main' as const, title: 'Main Model', icon: Bot },
                 { key: 'utility' as const, title: 'Utility Model', icon: Settings2 }
               ] as modelRole}
+                {@const checkState = profileCheckFor(selectedProfile.id, modelRole.key)}
                 <div class="rounded-xl border border-zinc-800 bg-zinc-950/40 p-4">
-                  <div class="mb-4 flex items-center gap-2">
-                    <modelRole.icon class="size-4 text-zinc-500" />
-                    <div class="text-sm font-medium text-zinc-100">{modelRole.title}</div>
+                  <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
+                    <div class="flex items-center gap-2">
+                      <modelRole.icon class="size-4 text-zinc-500" />
+                      <div class="text-sm font-medium text-zinc-100">{modelRole.title}</div>
+                    </div>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={selectedProfileDirty || checkState.pending}
+                      title={selectedProfileDirty ? 'Save changes before checking.' : 'Check connection'}
+                      onclick={() => handleCheckProfile(selectedProfile.id, modelRole.key)}
+                    >
+                      {#if checkState.pending}
+                        <Loader2 class="size-4 animate-spin" />
+                        Checking
+                      {:else}
+                        <CheckCircle2 class="size-4" />
+                        Check connection
+                      {/if}
+                    </Button>
                   </div>
 
                   <div class="space-y-4">
@@ -632,6 +784,27 @@
                     <div class="rounded-md border border-zinc-800 bg-zinc-950/60 px-3 py-2 text-xs text-zinc-500">
                       {adapterLabel(selectedProfile[modelRole.key].adapter)} - {modelSummary(selectedProfile[modelRole.key])}
                     </div>
+
+                    {#if selectedProfileDirty || checkState.pending || checkState.result || checkState.error}
+                      <div
+                        class={`flex items-start gap-2 rounded-md border px-3 py-2 text-xs ${
+                          selectedProfileDirty
+                            ? 'border-amber-300/30 bg-amber-300/10 text-amber-100'
+                            : profileCheckStatusClass(checkState)
+                        }`}
+                      >
+                        {#if checkState.pending}
+                          <Loader2 class="mt-0.5 size-3.5 shrink-0 animate-spin" />
+                        {:else if checkState.result?.outcome === 'ok'}
+                          <CheckCircle2 class="mt-0.5 size-3.5 shrink-0" />
+                        {:else}
+                          <AlertTriangle class="mt-0.5 size-3.5 shrink-0" />
+                        {/if}
+                        <span>
+                          {selectedProfileDirty ? 'Save changes before checking.' : profileCheckMessage(checkState)}
+                        </span>
+                      </div>
+                    {/if}
                   </div>
                 </div>
               {/each}
