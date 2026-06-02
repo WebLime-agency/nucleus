@@ -21828,6 +21828,400 @@ Thanks."#,
     }
 
     #[tokio::test]
+    async fn call_worker_model_hanging_utility_endpoint_times_out_without_main_fallback() {
+        let state_dir = test_state_dir("worker-provider-hang-timeout");
+        let state = initialize_test_state(&state_dir);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener addr should be available")
+        );
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_bodies = Arc::new(TestMutex::new(Vec::new()));
+        let server_request_count = request_count.clone();
+        let server_request_bodies = request_bodies.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("test request should connect");
+            let accepted_at = Instant::now();
+            server_request_count.fetch_add(1, Ordering::SeqCst);
+            let first_handler = tokio::spawn(async move {
+                let body = read_test_http_body(&mut socket).await;
+                server_request_bodies
+                    .lock()
+                    .expect("request bodies lock should not be poisoned")
+                    .push(body);
+                tokio::time::sleep(Duration::from_secs(16)).await;
+            });
+
+            while accepted_at.elapsed() < Duration::from_secs(17) {
+                match timeout(Duration::from_millis(100), listener.accept()).await {
+                    Ok(Ok((_socket, _))) => {
+                        server_request_count.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(Err(error)) => panic!("test listener failed: {error}"),
+                    Err(_) => {}
+                }
+            }
+
+            first_handler
+                .await
+                .expect("test request handler should finish");
+        });
+
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-probe-model",
+            &base_url,
+            "utility-key",
+        );
+        let workspace = state.store.workspace().expect("workspace should load");
+        let main_model = workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == workspace.default_profile_id)
+            .expect("default profile should exist")
+            .main
+            .model
+            .clone();
+
+        let mut worker = test_worker_summary("provider-hang-timeout", 10, 10);
+        worker.provider_base_url = base_url;
+        worker.model = "utility-probe-model".to_string();
+        worker.working_dir = state_dir.display().to_string();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let started = Instant::now();
+        let error = call_worker_model(&state, None, &worker, &[], "Ping.", &[], &mut cancel_rx)
+            .await
+            .expect_err("hanging utility endpoint should time out");
+        let elapsed = started.elapsed();
+
+        assert!(elapsed < Duration::from_secs(25));
+        let detail = error.to_string();
+        assert!(detail.contains("Utility lane OpenAI-compatible endpoint timed out"));
+        assert!(detail.contains("idle/read timeout"));
+        assert!(detail.contains("utility-probe-model"));
+        assert!(!detail.is_empty());
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        let bodies = request_bodies
+            .lock()
+            .expect("request bodies lock should not be poisoned");
+        assert_eq!(bodies.len(), 1);
+        for body in bodies.iter() {
+            let payload: Value = serde_json::from_str(body).expect("request body should be JSON");
+            let model = payload["model"]
+                .as_str()
+                .expect("request model should be a string");
+            assert_eq!(model, "utility-probe-model");
+            assert_ne!(model, main_model);
+        }
+        drop(bodies);
+
+        server.await.expect("test server should finish");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn call_worker_model_slow_streaming_utility_model_survives_idle_timeout() {
+        let state_dir = test_state_dir("worker-provider-slow-stream-survives");
+        let state = initialize_test_state(&state_dir);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener addr should be available")
+        );
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_bodies = Arc::new(TestMutex::new(Vec::new()));
+        let server_request_count = request_count.clone();
+        let server_request_bodies = request_bodies.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("test request should connect");
+            let body = read_test_http_body(&mut socket).await;
+            server_request_bodies
+                .lock()
+                .expect("request bodies lock should not be poisoned")
+                .push(body);
+            server_request_count.fetch_add(1, Ordering::SeqCst);
+
+            write_test_openai_sse_headers(&mut socket).await;
+            write_test_openai_sse_chunk(
+                &mut socket,
+                "slow-stream-turn",
+                r#"{"kind":"final_answer","#,
+            )
+            .await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            write_test_openai_sse_chunk(
+                &mut socket,
+                "slow-stream-turn",
+                r#""summary":"slow stream","#,
+            )
+            .await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            write_test_openai_sse_chunk(
+                &mut socket,
+                "slow-stream-turn",
+                r#""final_answer":"Done after streaming.""#,
+            )
+            .await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            write_test_openai_sse_chunk(&mut socket, "slow-stream-turn", "}").await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            write_test_openai_sse_done(&mut socket).await;
+        });
+
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-slow-stream-model",
+            &base_url,
+            "utility-key",
+        );
+        let workspace = state.store.workspace().expect("workspace should load");
+        let main_model = workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == workspace.default_profile_id)
+            .expect("default profile should exist")
+            .main
+            .model
+            .clone();
+
+        let mut worker = test_worker_summary("provider-slow-stream-survives", 10, 10);
+        worker.provider_base_url = base_url;
+        worker.model = "utility-slow-stream-model".to_string();
+        worker.working_dir = state_dir.display().to_string();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let started = Instant::now();
+        let response = call_worker_model(&state, None, &worker, &[], "Ping.", &[], &mut cancel_rx)
+            .await
+            .expect("healthy slow stream should complete");
+
+        assert!(started.elapsed() > Duration::from_secs(15));
+        assert!(matches!(
+            response.action,
+            WorkerAction::FinalAnswer { final_answer, .. } if final_answer == "Done after streaming."
+        ));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_utility_model_requests(&request_bodies, "utility-slow-stream-model", &main_model);
+
+        server.await.expect("test server should finish");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn call_worker_model_slow_non_streaming_utility_model_keeps_total_backstop() {
+        let state_dir = test_state_dir("worker-provider-slow-non-streaming-survives");
+        let state = initialize_test_state(&state_dir);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener addr should be available")
+        );
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_bodies = Arc::new(TestMutex::new(Vec::new()));
+        let server_request_count = request_count.clone();
+        let server_request_bodies = request_bodies.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("test request should connect");
+            let body = read_test_http_body(&mut socket).await;
+            server_request_bodies
+                .lock()
+                .expect("request bodies lock should not be poisoned")
+                .push(body);
+            server_request_count.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(17)).await;
+            write_test_openai_completion_response(
+                &mut socket,
+                "slow-non-streaming-turn",
+                r#"{"kind":"final_answer","summary":"slow completion","final_answer":"Done after non-streaming wait."}"#,
+            )
+            .await;
+        });
+
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-slow-completion-model",
+            &base_url,
+            "utility-key",
+        );
+        let workspace = state.store.workspace().expect("workspace should load");
+        let profile = workspace
+            .profiles
+            .into_iter()
+            .find(|profile| profile.id == workspace.default_profile_id)
+            .expect("default profile should exist");
+        let main_model = profile.main.model.clone();
+        let mut utility = profile.utility.clone();
+        utility.transport = ModelTransportCapability::NonStreaming;
+        state
+            .store
+            .update_workspace_profile(
+                &profile.id,
+                nucleus_storage::WorkspaceProfilePatch {
+                    title: profile.title,
+                    main: profile.main,
+                    utility,
+                    is_default: true,
+                },
+            )
+            .expect("profile should update transport fingerprint");
+
+        let mut worker = test_worker_summary("provider-slow-completion-survives", 10, 10);
+        worker.provider_base_url = base_url;
+        worker.model = "utility-slow-completion-model".to_string();
+        worker.working_dir = state_dir.display().to_string();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let started = Instant::now();
+        let response = call_worker_model(&state, None, &worker, &[], "Ping.", &[], &mut cancel_rx)
+            .await
+            .expect("healthy slow non-streaming completion should complete");
+
+        assert!(started.elapsed() > Duration::from_secs(15));
+        assert!(matches!(
+            response.action,
+            WorkerAction::FinalAnswer { final_answer, .. } if final_answer == "Done after non-streaming wait."
+        ));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_utility_model_requests(
+            &request_bodies,
+            "utility-slow-completion-model",
+            &main_model,
+        );
+        let bodies = request_bodies
+            .lock()
+            .expect("request bodies lock should not be poisoned");
+        assert!(bodies[0].contains("\"stream\":false"));
+        drop(bodies);
+
+        server.await.expect("test server should finish");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn call_worker_model_stalled_utility_stream_times_out_without_main_fallback() {
+        let state_dir = test_state_dir("worker-provider-stalled-stream-timeout");
+        let state = initialize_test_state(&state_dir);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener addr should be available")
+        );
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_bodies = Arc::new(TestMutex::new(Vec::new()));
+        let server_request_count = request_count.clone();
+        let server_request_bodies = request_bodies.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("test request should connect");
+            let accepted_at = Instant::now();
+            server_request_count.fetch_add(1, Ordering::SeqCst);
+            let first_handler = tokio::spawn(async move {
+                let body = read_test_http_body(&mut socket).await;
+                server_request_bodies
+                    .lock()
+                    .expect("request bodies lock should not be poisoned")
+                    .push(body);
+                write_test_openai_sse_headers(&mut socket).await;
+                write_test_openai_sse_chunk(
+                    &mut socket,
+                    "stalled-stream-turn",
+                    r#"{"kind":"final_answer","#,
+                )
+                .await;
+                tokio::time::sleep(Duration::from_secs(16)).await;
+            });
+
+            while accepted_at.elapsed() < Duration::from_secs(17) {
+                match timeout(Duration::from_millis(100), listener.accept()).await {
+                    Ok(Ok((_socket, _))) => {
+                        server_request_count.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(Err(error)) => panic!("test listener failed: {error}"),
+                    Err(_) => {}
+                }
+            }
+
+            first_handler
+                .await
+                .expect("test request handler should finish");
+        });
+
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-stalled-stream-model",
+            &base_url,
+            "utility-key",
+        );
+        let workspace = state.store.workspace().expect("workspace should load");
+        let main_model = workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == workspace.default_profile_id)
+            .expect("default profile should exist")
+            .main
+            .model
+            .clone();
+
+        let mut worker = test_worker_summary("provider-stalled-stream-timeout", 10, 10);
+        worker.provider_base_url = base_url;
+        worker.model = "utility-stalled-stream-model".to_string();
+        worker.working_dir = state_dir.display().to_string();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let started = Instant::now();
+        let error = call_worker_model(&state, None, &worker, &[], "Ping.", &[], &mut cancel_rx)
+            .await
+            .expect_err("stalled utility stream should time out");
+        let elapsed = started.elapsed();
+
+        assert!(elapsed < Duration::from_secs(25));
+        let detail = error.to_string();
+        assert!(detail.contains("Utility lane OpenAI-compatible endpoint timed out"));
+        assert!(detail.contains("idle/read timeout"));
+        assert!(detail.contains("utility-stalled-stream-model"));
+        assert!(!detail.contains("main"));
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_utility_model_requests(&request_bodies, "utility-stalled-stream-model", &main_model);
+
+        server.await.expect("test server should finish");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
     async fn call_worker_model_falls_back_to_non_streaming_utility_model() {
         let state_dir = test_state_dir("worker-provider-non-streaming-fallback");
         let state = initialize_test_state(&state_dir);
@@ -28786,6 +29180,25 @@ for line in sys.stdin:
         }
     }
 
+    fn assert_utility_model_requests(
+        request_bodies: &Arc<TestMutex<Vec<String>>>,
+        expected_model: &str,
+        main_model: &str,
+    ) {
+        let bodies = request_bodies
+            .lock()
+            .expect("request bodies lock should not be poisoned");
+        assert!(!bodies.is_empty());
+        for body in bodies.iter() {
+            let payload: Value = serde_json::from_str(body).expect("request body should be JSON");
+            let model = payload["model"]
+                .as_str()
+                .expect("request model should be a string");
+            assert_eq!(model, expected_model);
+            assert_ne!(model, main_model);
+        }
+    }
+
     async fn read_test_http_body(socket: &mut tokio::net::TcpStream) -> String {
         let mut buffer = Vec::new();
         let mut chunk = [0_u8; 1024];
@@ -28853,6 +29266,44 @@ for line in sys.stdin:
             .write_all(response.as_bytes())
             .await
             .expect("test response should write");
+    }
+
+    async fn write_test_openai_sse_headers(socket: &mut tokio::net::TcpStream) {
+        let response =
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("test response headers should write");
+    }
+
+    async fn write_test_openai_sse_chunk(
+        socket: &mut tokio::net::TcpStream,
+        id: &str,
+        content: &str,
+    ) {
+        let chunk = serde_json::json!({
+            "id": id,
+            "choices": [
+                {
+                    "delta": {
+                        "content": content,
+                    },
+                },
+            ],
+        });
+        let body = format!("data: {chunk}\n\n");
+        socket
+            .write_all(body.as_bytes())
+            .await
+            .expect("test SSE chunk should write");
+    }
+
+    async fn write_test_openai_sse_done(socket: &mut tokio::net::TcpStream) {
+        socket
+            .write_all(b"data: [DONE]\n\n")
+            .await
+            .expect("test SSE done marker should write");
     }
 
     async fn write_test_openai_sse_response_without_done(

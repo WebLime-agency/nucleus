@@ -6,11 +6,14 @@ import {
   activityFreshnessView,
   completionGateGroups,
   gateBadgeVariant,
+  jobDetailActivityFreshnessView,
   nextRuntimeTick,
   noActivity,
   childRouteLabel,
+  reasoningActivityDisplayView,
   reasoningActivityView,
   runtimeBadgeView,
+  shouldShowActivityStaleWarning,
   usageView
 } from './session-ux.js';
 
@@ -95,6 +98,79 @@ test('freshness prefers reasoning heartbeat over generic update timestamp', () =
   const view = activityFreshnessView(record, 1_170);
   assert.equal(view.stale, false);
   assert.match(view.text, /latest reasoning: reviewing command output/);
+});
+
+test('active job freshness uses refreshed detail child activity', () => {
+  const detail = {
+    job: {
+      state: 'running',
+      created_at: 1_000,
+      updated_at: 1_000
+    },
+    workers: [
+      {
+        state: 'running',
+        created_at: 1_000,
+        updated_at: 1_240,
+        last_reasoning: 'checking the command output',
+        last_reasoning_at: 1_240
+      }
+    ],
+    tool_calls: [],
+    command_sessions: [],
+    approvals: [],
+    child_jobs: [],
+    artifacts: [],
+    events: []
+  };
+
+  assert.equal(activityFreshnessView(detail.job, 1_250).stale, true);
+
+  const view = jobDetailActivityFreshnessView(detail, 1_250);
+  assert.equal(view.stale, false);
+  assert.match(view.text, /checking the command output/);
+});
+
+test('approval waits take precedence over stale worker activity warnings', () => {
+  const pendingApproval = {
+    state: 'pending',
+    requested_at: 1_000
+  };
+  const detail = {
+    job: {
+      state: 'paused',
+      pending_approval_count: 1,
+      created_at: 1_000,
+      updated_at: 1_000
+    },
+    approvals: [pendingApproval],
+    workers: [],
+    tool_calls: [],
+    command_sessions: [],
+    child_jobs: [],
+    artifacts: [],
+    events: []
+  };
+  const freshness = jobDetailActivityFreshnessView(detail, 1_250);
+
+  assert.equal(freshness.stale, true);
+  assert.equal(shouldShowActivityStaleWarning(freshness, detail, pendingApproval), false);
+});
+
+test('terminal records keep historical reasoning display', () => {
+  const record = {
+    state: 'completed',
+    created_at: 1_000,
+    updated_at: 1_010,
+    last_reasoning: 'summarizing the completed work',
+    last_reasoning_at: 1_010
+  };
+
+  assert.equal(activityFreshnessView(record, 1_500), null);
+
+  const view = reasoningActivityDisplayView(record, 1_500);
+  assert.equal(view.stale, false);
+  assert.match(view.text, /summarizing the completed work/);
 });
 
 test('usage display distinguishes missing prices from missing usage', () => {

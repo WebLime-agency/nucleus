@@ -84,6 +84,60 @@ export function activityFreshnessView(record, nowSeconds) {
   };
 }
 
+export function jobDetailActivityFreshnessView(detail, nowSeconds) {
+  if (!detail?.job) {
+    return null;
+  }
+
+  const records = [
+    detail.job,
+    ...(Array.isArray(detail.workers) ? detail.workers : []),
+    ...(Array.isArray(detail.child_jobs) ? detail.child_jobs : [])
+  ];
+  const latestReasoningRecord = records.reduce((latest, record) => {
+    if (!String(record?.last_reasoning ?? '').trim()) return latest;
+    if (!latest) return record;
+    return Number(record.last_reasoning_at ?? 0) >= Number(latest.last_reasoning_at ?? 0)
+      ? record
+      : latest;
+  }, null);
+  const lastActivityAt = Math.max(
+    freshnessTimestamp(detail.job),
+    ...records.map(freshnessTimestamp),
+    ...(Array.isArray(detail.tool_calls) ? detail.tool_calls : []).map(freshnessTimestamp),
+    ...(Array.isArray(detail.command_sessions) ? detail.command_sessions : []).map(freshnessTimestamp),
+    ...(Array.isArray(detail.approvals) ? detail.approvals : []).map(freshnessTimestamp),
+    ...(Array.isArray(detail.artifacts) ? detail.artifacts : []).map(freshnessTimestamp),
+    ...(Array.isArray(detail.events) ? detail.events : []).map(freshnessTimestamp)
+  );
+
+  return activityFreshnessView(
+    {
+      ...detail.job,
+      updated_at: Math.max(Number(detail.job.updated_at ?? 0), lastActivityAt),
+      last_reasoning: latestReasoningRecord?.last_reasoning ?? detail.job.last_reasoning,
+      last_reasoning_at: latestReasoningRecord?.last_reasoning_at ?? detail.job.last_reasoning_at
+    },
+    nowSeconds
+  );
+}
+
+export function reasoningActivityDisplayView(record, nowSeconds) {
+  return activityFreshnessView(record, nowSeconds) ?? reasoningActivityView(record, nowSeconds);
+}
+
+export function shouldShowActivityStaleWarning(freshness, detail, pendingApproval) {
+  if (!freshness?.stale) {
+    return false;
+  }
+
+  if (pendingApproval?.state === 'pending') {
+    return false;
+  }
+
+  return !isPausedApprovalWait(detail);
+}
+
 export function usageView(record) {
   if (!record?.token_usage_known) {
     return {
@@ -239,6 +293,32 @@ function latestByTimestamp(items) {
 
 function activityTimestamp(item) {
   return Number(item?.completed_at ?? item?.updated_at ?? item?.created_at ?? 0);
+}
+
+function freshnessTimestamp(item) {
+  return Math.max(
+    Number(item?.last_reasoning_at ?? 0),
+    Number(item?.completed_at ?? 0),
+    Number(item?.updated_at ?? 0),
+    Number(item?.started_at ?? 0),
+    Number(item?.resolved_at ?? 0),
+    Number(item?.requested_at ?? 0),
+    Number(item?.created_at ?? 0)
+  );
+}
+
+function isPausedApprovalWait(detail) {
+  if (!detail?.job || detail.job.state !== 'paused') {
+    return false;
+  }
+
+  if (Number(detail.job.pending_approval_count ?? 0) > 0) {
+    return true;
+  }
+
+  return (Array.isArray(detail.approvals) ? detail.approvals : []).some(
+    (approval) => approval?.state === 'pending'
+  );
 }
 
 function commandSessionTitle(commandSession) {

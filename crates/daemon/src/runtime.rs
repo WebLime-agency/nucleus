@@ -1,4 +1,5 @@
 use std::{
+    io::ErrorKind,
     path::Path,
     sync::Arc,
     time::{Duration, Instant, SystemTime},
@@ -16,10 +17,21 @@ use nucleus_protocol::{
 use reqwest::header::{AUTHORIZATION, HeaderMap, RETRY_AFTER};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::{
+    sync::{Mutex, mpsc, watch},
+    time::timeout,
+};
 
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
+// Utility providers should connect promptly and keep streamed responses moving,
+// while healthy long worker generations retain the main total backstop.
+const UTILITY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const UTILITY_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const RUNTIME_CACHE_TTL: Duration = Duration::from_secs(30);
+#[cfg(not(test))]
+const PROFILE_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const PROFILE_CHECK_TIMEOUT: Duration = Duration::from_millis(300);
 
 use crate::retry::{
     ProviderTransportError, RetryDecision, classify_provider_error, provider_error_class,
@@ -298,10 +310,11 @@ async fn execute_openai_compatible_prompt(
         bail!("OpenAI-compatible sessions require a model name");
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(PROMPT_TIMEOUT)
-        .build()
-        .context("failed to build OpenAI-compatible HTTP client")?;
+    let utility_lane = compiled_turn.role == "utility";
+    let streaming_client = build_openai_compatible_client(utility_lane, true)?;
+    let non_streaming_client = utility_lane
+        .then(|| build_openai_compatible_client(true, false))
+        .transpose()?;
 
     let messages = compiled_turn_openai_messages(compiled_turn);
     let json_object_supported = capabilities.json_object == ModelJsonObjectCapability::Supported;
@@ -325,14 +338,29 @@ async fn execute_openai_compatible_prompt(
             request_json_object,
             stream,
         );
+        let client = if stream {
+            &streaming_client
+        } else {
+            non_streaming_client.as_ref().unwrap_or(&streaming_client)
+        };
 
         match execute_openai_compatible_prompt_once(
-            session, base_url, &client, &payload, stream, &events,
+            session, base_url, client, &payload, stream, &events,
         )
         .await
         {
             Ok(result) => return Ok(result),
             Err(error) => {
+                if utility_lane && is_provider_timeout_error(&error) {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "Utility lane OpenAI-compatible endpoint timed out while calling model '{}' ({}). Check the Utility provider base URL or choose a responsive Utility model.",
+                            session.model,
+                            utility_timeout_detail(stream),
+                        )
+                    });
+                }
+
                 if stream
                     && may_try_non_streaming_fallback
                     && !tried_non_streaming_fallback
@@ -373,6 +401,109 @@ async fn execute_openai_compatible_prompt(
             }
         }
     }
+}
+
+fn build_openai_compatible_client(utility_lane: bool, stream: bool) -> Result<reqwest::Client> {
+    let client_builder = reqwest::Client::builder().timeout(PROMPT_TIMEOUT);
+    let client_builder = if utility_lane {
+        let client_builder = client_builder.connect_timeout(UTILITY_CONNECT_TIMEOUT);
+        if stream {
+            client_builder.read_timeout(UTILITY_READ_TIMEOUT)
+        } else {
+            client_builder
+        }
+    } else {
+        client_builder
+    };
+
+    client_builder
+        .build()
+        .context("failed to build OpenAI-compatible HTTP client")
+}
+
+pub(crate) async fn probe_openai_compatible_endpoint(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    stream: bool,
+) -> Result<ProviderTurnResult> {
+    let base_url = base_url.trim().trim_end_matches('/').to_string();
+    let client = build_openai_compatible_client(true, stream)?;
+    let payload = openai_compatible_payload(
+        model,
+        vec![json!({ "role": "user", "content": "ping" })],
+        false,
+        stream,
+    );
+
+    let session = SessionSummary {
+        id: "profile-check".to_string(),
+        title: "Profile check".to_string(),
+        profile_id: String::new(),
+        profile_title: String::new(),
+        route_id: String::new(),
+        route_title: String::new(),
+        project_id: String::new(),
+        project_title: String::new(),
+        project_path: String::new(),
+        provider: AdapterKind::OpenAiCompatible.as_str().to_string(),
+        model: model.to_string(),
+        provider_base_url: base_url.to_string(),
+        provider_api_key: api_key.to_string(),
+        working_dir: String::new(),
+        working_dir_kind: "profile_check".to_string(),
+        workspace_mode: "scratch_only".to_string(),
+        attachment_mode: String::new(),
+        worktree_id: String::new(),
+        source_project_path: String::new(),
+        git_root: String::new(),
+        worktree_path: String::new(),
+        git_branch: String::new(),
+        git_base_ref: String::new(),
+        git_head: String::new(),
+        git_dirty: false,
+        git_untracked_count: 0,
+        git_remote_tracking_branch: String::new(),
+        base_ref: String::new(),
+        base_commit: String::new(),
+        behind_by: None,
+        session_state_observed_at: None,
+        workspace_warnings: Vec::new(),
+        scope: "workspace".to_string(),
+        approval_mode: String::new(),
+        execution_mode: String::new(),
+        run_budget_mode: String::new(),
+        run_budget: Default::default(),
+        project_count: 0,
+        projects: Vec::new(),
+        state: "checking".to_string(),
+        provider_session_id: String::new(),
+        last_error: String::new(),
+        user_error: None,
+        capabilities: Vec::new(),
+        last_message_excerpt: String::new(),
+        turn_count: 0,
+        last_resumed_at: None,
+        last_reasoning: String::new(),
+        last_reasoning_at: None,
+        token_usage_known: false,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        cached_tokens: 0,
+        cost_usd_estimate: None,
+        created_at: 0,
+        updated_at: 0,
+    };
+    let (events, _events_rx) = mpsc::unbounded_channel();
+
+    timeout(
+        PROFILE_CHECK_TIMEOUT,
+        execute_openai_compatible_prompt_once(
+            &session, &base_url, &client, &payload, stream, &events,
+        ),
+    )
+    .await
+    .context("OpenAI-compatible profile check timed out")?
 }
 
 async fn execute_openai_compatible_prompt_once(
@@ -607,6 +738,49 @@ fn should_try_non_streaming_fallback(error: &anyhow::Error) -> bool {
             ProviderTransportError::Http { .. } => false,
         },
     )
+}
+
+pub(crate) fn is_provider_timeout_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if cause.is::<tokio::time::error::Elapsed>() {
+            return true;
+        }
+
+        if cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+        {
+            return true;
+        }
+
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == ErrorKind::TimedOut)
+    })
+}
+
+fn utility_timeout_detail(stream: bool) -> String {
+    if stream {
+        format!(
+            "connect timeout {}, streaming idle/read timeout {}",
+            format_duration(UTILITY_CONNECT_TIMEOUT),
+            format_duration(UTILITY_READ_TIMEOUT)
+        )
+    } else {
+        format!(
+            "connect timeout {}, total timeout {}",
+            format_duration(UTILITY_CONNECT_TIMEOUT),
+            format_duration(PROMPT_TIMEOUT)
+        )
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    if duration.subsec_millis() == 0 {
+        format!("{}s", duration.as_secs())
+    } else {
+        format!("{}ms", duration.as_millis())
+    }
 }
 
 fn empty_utility_model_output_error(session: &SessionSummary) -> anyhow::Error {

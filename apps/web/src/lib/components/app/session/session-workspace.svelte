@@ -79,8 +79,10 @@
     childRouteLabel,
     completionGateGroups,
     gateBadgeVariant,
+    jobDetailActivityFreshnessView,
     noActivity,
     runtimeStartSeconds,
+    shouldShowActivityStaleWarning,
     usageView
   } from '$lib/nucleus/session-ux.js';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
@@ -393,20 +395,27 @@
     latestByState(activityJobDetail?.workers ?? [], ['running', 'waiting', 'queued', 'paused'])
   );
   let composerActivityFailure = $derived(activityFailureView(activityJobDetail, activePromptProgress));
+  let composerActivityFreshnessDetail = $derived(
+    activityJobDetail?.job.id === composerActivityJobSummary?.id ? activityJobDetail : null
+  );
+  let composerActivityStaleGateDetail = $derived(
+    composerActivityFreshnessDetail ?? (composerActivityJobSummary ? { job: composerActivityJobSummary } : null)
+  );
   let composerActivityFreshness = $derived.by(() =>
-    composerActivityJobSummary
-      ? activityFreshnessView(composerActivityJobSummary, observabilityNow)
-      : null
+    composerActivityFreshnessDetail
+      ? jobDetailActivityFreshnessView(composerActivityFreshnessDetail, observabilityNow)
+      : composerActivityJobSummary
+        ? activityFreshnessView(composerActivityJobSummary, observabilityNow)
+        : null
+  );
+  let composerActivityShowStaleWarning = $derived(
+    shouldShowActivityStaleWarning(
+      composerActivityFreshness,
+      composerActivityStaleGateDetail,
+      composerActivityPendingApproval
+    )
   );
   let composerActivitySummary = $derived.by(() => {
-    if (composerActivityFreshness?.stale && composerActivityJobSummary) {
-      return {
-        title: 'No recent worker updates',
-        detail: composerActivityFreshness.text,
-        state: 'stalled'
-      };
-    }
-
     if (composerActivityPendingApproval) {
       const toolCall = toolCallForApproval(
         composerActivityPendingApproval,
@@ -418,6 +427,14 @@
           ? formatToolCallApprovalDetail(toolCall)
           : formatApprovalDetail(composerActivityPendingApproval),
         state: composerActivityPendingApproval.state
+      };
+    }
+
+    if (composerActivityShowStaleWarning && composerActivityJobSummary) {
+      return {
+        title: 'No recent worker updates',
+        detail: composerActivityFreshness?.text ?? 'No recent worker updates.',
+        state: 'stalled'
       };
     }
 
@@ -495,8 +512,12 @@
     return [];
   });
   let composerActivityBlockedReason = $derived.by(() => {
-    if (composerActivityFreshness?.stale) {
-      return composerActivityFreshness.text;
+    if (composerActivityPendingApproval) {
+      return formatApprovalDetail(composerActivityPendingApproval);
+    }
+
+    if (composerActivityShowStaleWarning) {
+      return composerActivityFreshness?.text ?? '';
     }
 
     if (composerActivityJobSummary) {
@@ -1814,6 +1835,7 @@
       const next = await fetchJobDetail(jobId);
       if (composerActivityJobId === jobId) {
         activityJobDetail = next;
+        upsertJobSummary(next.job);
       }
     } catch {
       if (composerActivityJobId === jobId) {
@@ -3143,7 +3165,7 @@
       }
     }
 
-    return lastItem(approvals);
+    return null;
   }
 
   function applyStreamEvent(event: DaemonEvent) {

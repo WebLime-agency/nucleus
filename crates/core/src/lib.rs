@@ -133,26 +133,49 @@ pub fn render_compiled_turn_text(turn: &nucleus_protocol::CompiledTurn) -> Strin
 pub fn compiled_turn_openai_messages(
     turn: &nucleus_protocol::CompiledTurn,
 ) -> Vec<serde_json::Value> {
-    let system_text = render_compiled_turn_system_text(turn);
+    let mut system_text = render_compiled_turn_system_text(turn);
+    let mut history_messages = Vec::new();
+    let mut conversation_started = false;
+
+    for item in &turn.history {
+        match item.role.as_str() {
+            "system" if !conversation_started => {
+                append_history_system_content(&mut system_text, &item.content);
+            }
+            "system" => {
+                let content = format!("[system note]\n{}", item.content);
+                history_messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": openai_message_content(&content, &item.images),
+                }));
+            }
+            "user" | "assistant" => {
+                conversation_started = true;
+                history_messages.push(serde_json::json!({
+                    "role": item.role,
+                    "content": openai_message_content(&item.content, &item.images),
+                }));
+            }
+            _ => {}
+        }
+    }
+
     let mut messages = vec![serde_json::json!({
         "role": "system",
         "content": system_text,
     })];
-
-    for item in &turn.history {
-        if matches!(item.role.as_str(), "user" | "assistant" | "system") {
-            messages.push(serde_json::json!({
-                "role": item.role,
-                "content": openai_message_content(&item.content, &item.images),
-            }));
-        }
-    }
+    messages.extend(history_messages);
 
     messages.push(serde_json::json!({
         "role": "user",
         "content": openai_message_content(&turn.user_turn.content, &turn.user_turn.images),
     }));
     messages
+}
+
+fn append_history_system_content(system_text: &mut String, content: &str) {
+    system_text.push_str("\n\n[History system message]\n");
+    system_text.push_str(content);
 }
 
 pub fn render_compiled_turn_system_text(turn: &nucleus_protocol::CompiledTurn) -> String {
@@ -286,4 +309,151 @@ fn openai_message_content(
     }
 
     serde_json::Value::Array(parts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nucleus_protocol::{
+        CompiledConversationTurn, CompiledPromptLayer, CompiledTurn, CompiledTurnCapabilities,
+        CompiledTurnDebugSummary,
+    };
+
+    #[test]
+    fn openai_messages_merge_leading_history_system_into_initial_system_message() {
+        let turn = test_compiled_turn(vec![
+            test_history_turn("system", "worker system prompt"),
+            test_history_turn("user", "previous user"),
+            test_history_turn("assistant", "previous assistant"),
+        ]);
+
+        let messages = compiled_turn_openai_messages(&turn);
+
+        assert_single_leading_system_message(&messages);
+        let system_content = message_content_text(&messages[0]);
+        assert!(system_content.contains("platform system layer"));
+        assert!(system_content.contains("worker system prompt"));
+        assert_eq!(message_role(&messages[1]), "user");
+        assert_eq!(message_content_text(&messages[1]), "previous user");
+        assert_eq!(message_role(&messages[2]), "assistant");
+        assert_eq!(message_content_text(&messages[2]), "previous assistant");
+        assert_eq!(message_role(&messages[3]), "user");
+        assert_eq!(message_content_text(&messages[3]), "current user");
+    }
+
+    #[test]
+    fn openai_messages_relabel_mid_history_system_note_in_place() {
+        let turn = test_compiled_turn(vec![
+            test_history_turn("user", "previous user"),
+            test_history_turn("system", "wake system note"),
+            test_history_turn("assistant", "previous assistant"),
+        ]);
+
+        let messages = compiled_turn_openai_messages(&turn);
+
+        assert_single_leading_system_message(&messages);
+        assert_eq!(message_role(&messages[1]), "user");
+        assert_eq!(message_content_text(&messages[1]), "previous user");
+        assert_eq!(message_role(&messages[2]), "user");
+        let relabeled_content = message_content_text(&messages[2]);
+        assert!(relabeled_content.contains("[system note]"));
+        assert!(relabeled_content.contains("wake system note"));
+        assert_eq!(message_role(&messages[3]), "assistant");
+        assert_eq!(message_content_text(&messages[3]), "previous assistant");
+    }
+
+    #[test]
+    fn openai_messages_without_history_system_turns_are_unchanged() {
+        let turn = test_compiled_turn(vec![
+            test_history_turn("user", "previous user"),
+            test_history_turn("assistant", "previous assistant"),
+        ]);
+
+        let messages = compiled_turn_openai_messages(&turn);
+
+        assert_single_leading_system_message(&messages);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(
+            message_content_text(&messages[0]),
+            render_compiled_turn_system_text(&turn)
+        );
+        assert_eq!(message_role(&messages[1]), "user");
+        assert_eq!(message_content_text(&messages[1]), "previous user");
+        assert_eq!(message_role(&messages[2]), "assistant");
+        assert_eq!(message_content_text(&messages[2]), "previous assistant");
+        assert_eq!(message_role(&messages[3]), "user");
+        assert_eq!(message_content_text(&messages[3]), "current user");
+    }
+
+    fn assert_single_leading_system_message(messages: &[serde_json::Value]) {
+        let system_indexes = messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| (message_role(message) == "system").then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(system_indexes, vec![0]);
+    }
+
+    fn message_role(message: &serde_json::Value) -> &str {
+        message
+            .get("role")
+            .and_then(|value| value.as_str())
+            .expect("message role should be a string")
+    }
+
+    fn message_content_text(message: &serde_json::Value) -> String {
+        message
+            .get("content")
+            .and_then(|value| value.as_str())
+            .expect("message content should be text")
+            .to_string()
+    }
+
+    fn test_history_turn(role: &str, content: &str) -> CompiledConversationTurn {
+        CompiledConversationTurn {
+            role: role.to_string(),
+            content: content.to_string(),
+            images: Vec::new(),
+        }
+    }
+
+    fn test_compiled_turn(history: Vec<CompiledConversationTurn>) -> CompiledTurn {
+        CompiledTurn {
+            id: "turn".to_string(),
+            role: "assistant".to_string(),
+            provider_neutral: true,
+            system_layers: vec![CompiledPromptLayer {
+                id: "system".to_string(),
+                kind: "system".to_string(),
+                scope: "workspace".to_string(),
+                title: "System".to_string(),
+                source_path: String::new(),
+                content: "platform system layer".to_string(),
+            }],
+            project_layers: Vec::new(),
+            skill_layers: Vec::new(),
+            tool_catalog: Vec::new(),
+            mcp_catalog: Vec::new(),
+            history,
+            user_turn: test_history_turn("user", "current user"),
+            capabilities: CompiledTurnCapabilities {
+                needs_images: false,
+                needs_tools: false,
+                needs_mcp: false,
+            },
+            debug_summary: CompiledTurnDebugSummary {
+                include_count: 1,
+                memory_count: 0,
+                memory_included_count: 0,
+                memory_skipped_count: 0,
+                memory_truncated_count: 0,
+                skill_count: 0,
+                mcp_server_count: 0,
+                tool_count: 0,
+                layer_count: 1,
+                summary: String::new(),
+                skill_diagnostics: Vec::new(),
+            },
+        }
+    }
 }

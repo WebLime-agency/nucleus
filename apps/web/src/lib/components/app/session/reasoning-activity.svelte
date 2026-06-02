@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
 
-  import { activityFreshnessView } from '$lib/nucleus/session-ux.js';
+  import { reasoningActivityDisplayView } from '$lib/nucleus/session-ux.js';
   import { cn } from '$lib/utils';
 
   type ReasoningRecord = {
@@ -15,7 +15,7 @@
   let { record, nowSeconds = null }: { record: ReasoningRecord; nowSeconds?: number | null } = $props();
 
   let currentNow = $state(Math.floor(Date.now() / 1000));
-  let activity = $derived(activityFreshnessView(record, currentNow));
+  let activity = $derived(reasoningActivityDisplayView(record, currentNow));
 
   $effect(() => {
     if (nowSeconds !== null) {
