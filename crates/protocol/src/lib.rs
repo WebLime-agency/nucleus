@@ -2737,6 +2737,37 @@ pub struct WorkspaceProfileSummary {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileCheckOutcome {
+    Ok,
+    MissingApiKey,
+    MissingBaseUrl,
+    AdapterUnavailable,
+    InvalidApiKey,
+    ModelNotFound,
+    Timeout,
+    EmptyResponse,
+    MalformedResponse,
+    Unreachable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProfileCheckRequest {
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProfileCheckResult {
+    pub role: String,
+    pub outcome: ProfileCheckOutcome,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceProfileWriteRequest {
     pub title: String,
