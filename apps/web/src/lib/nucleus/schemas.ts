@@ -588,6 +588,27 @@ export const workspaceProfileSummarySchema = z.object({
   updated_at: z.number().int()
 });
 
+export const profileCheckOutcomeSchema = z.enum([
+  'ok',
+  'missing_api_key',
+  'missing_base_url',
+  'adapter_unavailable',
+  'invalid_api_key',
+  'model_not_found',
+  'timeout',
+  'empty_response',
+  'malformed_response',
+  'unreachable'
+]);
+
+export const profileCheckResultSchema = z.object({
+  role: z.enum(['main', 'utility']),
+  outcome: profileCheckOutcomeSchema,
+  message: z.string(),
+  http_status: z.number().int().optional(),
+  latency_ms: z.number().int().optional()
+});
+
 export const workspaceProfileWriteRequestSchema = z.object({
   title: z.string().trim().min(1),
   main: workspaceModelConfigSchema,
@@ -1353,6 +1374,7 @@ export type WorktreeSummary = z.infer<typeof worktreeSummarySchema>;
 export type WorkspaceSummary = z.infer<typeof workspaceSummarySchema>;
 export type WorkspaceModelConfig = z.infer<typeof workspaceModelConfigSchema>;
 export type WorkspaceProfileSummary = z.infer<typeof workspaceProfileSummarySchema>;
+export type ProfileCheckResult = z.infer<typeof profileCheckResultSchema>;
 export type RouterProfileSummary = z.infer<typeof routerProfileSummarySchema>;
 export type RouteTarget = z.infer<typeof routeTargetSchema>;
 export type NucleusToolDescriptor = z.infer<typeof nucleusToolDescriptorSchema>;

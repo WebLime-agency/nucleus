@@ -28,6 +28,7 @@ import {
   processKillRequestSchema,
   processKillResponseSchema,
   processListResponseSchema,
+  profileCheckResultSchema,
   projectUpdateRequestSchema,
   routerProfileSummarySchema,
   runtimeOverviewSchema,
@@ -361,6 +362,24 @@ export async function updateWorkspaceProfile(
       body: JSON.stringify(payload)
     }),
     workspaceProfileSummarySchema
+  );
+}
+
+export async function checkWorkspaceProfile(
+  profileId: string,
+  role: 'main' | 'utility',
+  fetchImpl: FetchLike = fetch
+) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/workspace/profiles/${profileId}/check`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json'
+      },
+      body: JSON.stringify({ role })
+    }),
+    profileCheckResultSchema
   );
 }
 
