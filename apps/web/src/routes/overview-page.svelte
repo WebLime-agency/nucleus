@@ -18,6 +18,8 @@
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
   import type { DaemonEvent, ProcessListResponse, RuntimeOverview, SystemStats } from '$lib/nucleus/schemas';
 
+  const PROCESS_POLL_INTERVAL_MS = 10_000;
+
   let overview = $state<RuntimeOverview | null>(null);
   let system = $state<SystemStats | null>(null);
   let processData = $state<ProcessListResponse | null>(null);
@@ -71,6 +73,16 @@
     await loadAll(true);
   }
 
+  async function loadProcessTable() {
+    try {
+      processData = await fetchProcesses({ sort: 'memory', limit: 12 });
+      updatedAt = Date.now();
+      error = null;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to refresh process data.';
+    }
+  }
+
   async function handleKill(pid: number) {
     if (killConfirmPid !== pid) {
       killConfirmPid = pid;
@@ -105,13 +117,6 @@
         updatedAt = Date.now();
         error = null;
         break;
-      case 'processes.updated':
-        if (event.data.sort === 'memory') {
-          processData = event.data.response;
-          updatedAt = Date.now();
-          error = null;
-        }
-        break;
     }
 
     loading = false;
@@ -120,6 +125,9 @@
 
   onMount(() => {
     void loadAll();
+    const processPoll = window.setInterval(() => {
+      void loadProcessTable();
+    }, PROCESS_POLL_INTERVAL_MS);
     const disconnect = connectDaemonStream({
       onEvent: applyStreamEvent,
       onStatusChange: (status) => {
@@ -131,6 +139,7 @@
     });
 
     return () => {
+      window.clearInterval(processPoll);
       disconnect();
     };
   });
