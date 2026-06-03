@@ -2987,12 +2987,6 @@ pub struct StreamConnected {
     pub compatibility: CompatibilitySummary,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ProcessStreamUpdate {
-    pub sort: String,
-    pub response: ProcessListResponse,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageSummary {
     pub state_dir: String,
@@ -3164,8 +3158,6 @@ pub enum DaemonEvent {
     AuditUpdated(Vec<AuditEvent>),
     #[serde(rename = "system.updated")]
     SystemUpdated(SystemStats),
-    #[serde(rename = "processes.updated")]
-    ProcessesUpdated(ProcessStreamUpdate),
     #[serde(rename = "update.updated")]
     UpdateUpdated(UpdateStatus),
     #[serde(rename = "browser.frame")]

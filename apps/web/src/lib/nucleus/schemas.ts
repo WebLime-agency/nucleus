@@ -1238,12 +1238,6 @@ export const streamConnectedSchema = z.object({
   compatibility: compatibilitySummarySchema
 });
 
-export const processStreamUpdateSchema = z.object({
-  sort: z.enum(['cpu', 'memory']),
-  response: processListResponseSchema
-});
-
-
 const browserFrameEventSchema = z.object({
   session_id: z.string(),
   page_id: z.string(),
@@ -1318,10 +1312,6 @@ export const daemonEventSchema = z.discriminatedUnion('event', [
   z.object({
     event: z.literal('system.updated'),
     data: systemStatsSchema
-  }),
-  z.object({
-    event: z.literal('processes.updated'),
-    data: processStreamUpdateSchema
   }),
   z.object({
     event: z.literal('update.updated'),
