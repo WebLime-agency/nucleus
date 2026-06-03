@@ -2762,6 +2762,12 @@ pub struct ProfileCheckResult {
     pub role: String,
     pub outcome: ProfileCheckOutcome,
     pub message: String,
+    #[serde(default)]
+    pub json_object: ModelJsonObjectCapability,
+    #[serde(default)]
+    pub transport: ModelTransportCapability,
+    #[serde(default)]
+    pub action_contract: ModelActionContractCapability,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_status: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

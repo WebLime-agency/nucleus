@@ -191,6 +191,36 @@
     };
   }
 
+  function applyProfileCheckCapabilities(
+    profileId: string,
+    role: ModelRole,
+    result: ProfileCheckResult
+  ) {
+    const applyToProfile = (profile: WorkspaceProfileSummary): WorkspaceProfileSummary =>
+      profile.id === profileId
+        ? {
+            ...profile,
+            [role]: {
+              ...profile[role],
+              json_object: result.json_object,
+              transport: result.transport,
+              action_contract: result.action_contract
+            }
+          }
+        : profile;
+
+    profileDrafts = profileDrafts.map(applyToProfile);
+    if (overview) {
+      overview = {
+        ...overview,
+        workspace: {
+          ...overview.workspace,
+          profiles: overview.workspace.profiles.map(applyToProfile)
+        }
+      };
+    }
+  }
+
   function profileIsDirty(profile: WorkspaceProfileSummary, currentWorkspace: WorkspaceSummary) {
     const source = currentWorkspace.profiles.find((item) => item.id === profile.id);
     if (!source) {
@@ -284,6 +314,10 @@
     return '';
   }
 
+  function profileCheckFingerprint(result: ProfileCheckResult) {
+    return `Transport ${formatState(result.transport)} / Action ${formatState(result.action_contract)} / JSON ${formatState(result.json_object)}`;
+  }
+
   function modelCheckSignature(config: WorkspaceModelConfig) {
     return JSON.stringify({
       adapter: config.adapter,
@@ -328,6 +362,9 @@
         return;
       }
       setProfileCheck(profileId, role, { pending: false, result, error: null, signature });
+      if (result.outcome === 'ok') {
+        applyProfileCheckCapabilities(profileId, role, result);
+      }
       error = null;
     } catch (cause) {
       if (profileCheckFor(profileId, role).signature !== signature) {
@@ -800,8 +837,11 @@
                         {:else}
                           <AlertTriangle class="mt-0.5 size-3.5 shrink-0" />
                         {/if}
-                        <span>
+                        <span class="space-y-1">
                           {selectedProfileDirty ? 'Save changes before checking.' : profileCheckMessage(checkState)}
+                          {#if checkState.result}
+                            <span class="block opacity-80">{profileCheckFingerprint(checkState.result)}</span>
+                          {/if}
                         </span>
                       </div>
                     {/if}

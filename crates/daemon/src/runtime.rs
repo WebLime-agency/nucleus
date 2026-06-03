@@ -427,14 +427,74 @@ pub(crate) async fn probe_openai_compatible_endpoint(
     model: &str,
     stream: bool,
 ) -> Result<ProviderTurnResult> {
-    let base_url = base_url.trim().trim_end_matches('/').to_string();
-    let client = build_openai_compatible_client(true, stream)?;
-    let payload = openai_compatible_payload(
+    probe_openai_compatible_endpoint_with_messages(
+        base_url,
+        api_key,
         model,
         vec![json!({ "role": "user", "content": "ping" })],
         false,
         stream,
-    );
+    )
+    .await
+}
+
+pub(crate) async fn probe_openai_compatible_json_object(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    stream: bool,
+) -> Result<ProviderTurnResult> {
+    probe_openai_compatible_endpoint_with_messages(
+        base_url,
+        api_key,
+        model,
+        vec![json!({
+            "role": "user",
+            "content": "Return exactly this JSON object and no other text: {\"ok\":true}"
+        })],
+        true,
+        stream,
+    )
+    .await
+}
+
+pub(crate) async fn probe_openai_compatible_action_contract(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    stream: bool,
+) -> Result<ProviderTurnResult> {
+    probe_openai_compatible_endpoint_with_messages(
+        base_url,
+        api_key,
+        model,
+        vec![
+            json!({
+                "role": "system",
+                "content": "Return only a single valid Nucleus worker action JSON object. Do not wrap it in Markdown."
+            }),
+            json!({
+                "role": "user",
+                "content": "Return exactly this valid action shape with any short message: {\"kind\":\"final_answer\",\"message\":\"ok\"}"
+            }),
+        ],
+        false,
+        stream,
+    )
+    .await
+}
+
+async fn probe_openai_compatible_endpoint_with_messages(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: Vec<serde_json::Value>,
+    request_json_object: bool,
+    stream: bool,
+) -> Result<ProviderTurnResult> {
+    let base_url = base_url.trim().trim_end_matches('/').to_string();
+    let client = build_openai_compatible_client(true, stream)?;
+    let payload = openai_compatible_payload(model, messages, request_json_object, stream);
 
     let session = SessionSummary {
         id: "profile-check".to_string(),
@@ -729,7 +789,7 @@ fn is_empty_completed_provider_output(error: &anyhow::Error) -> bool {
     )
 }
 
-fn should_try_non_streaming_fallback(error: &anyhow::Error) -> bool {
+pub(crate) fn should_try_non_streaming_fallback(error: &anyhow::Error) -> bool {
     error.downcast_ref::<ProviderTransportError>().is_some_and(
         |provider_error| match provider_error {
             ProviderTransportError::Stream { detail } => {
