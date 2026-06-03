@@ -28,6 +28,7 @@
 
 
   type DiagnosticsView = 'cpu' | 'memory';
+  const PROCESS_POLL_INTERVAL_MS = 10_000;
 
   let view = $state<DiagnosticsView>('cpu');
   let system = $state<SystemStats | null>(null);
@@ -103,6 +104,24 @@
     await loadAll(true);
   }
 
+  async function loadProcessTables() {
+    try {
+      const [cpuProcesses, memoryProcesses] = await Promise.all([
+        fetchProcesses({ sort: 'cpu', limit: 30 }),
+        fetchProcesses({ sort: 'memory', limit: 30 })
+      ]);
+
+      processCache = {
+        cpu: cpuProcesses,
+        memory: memoryProcesses
+      };
+      updatedAt = Date.now();
+      error = null;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to refresh process data.';
+    }
+  }
+
   async function switchView(next: DiagnosticsView) {
     if (next === view) {
       return;
@@ -144,14 +163,6 @@
         updatedAt = Date.now();
         error = null;
         break;
-      case 'processes.updated':
-        processCache = {
-          ...processCache,
-          [event.data.sort]: event.data.response
-        };
-        updatedAt = Date.now();
-        error = null;
-        break;
       case 'overview.updated':
         break;
     }
@@ -167,6 +178,9 @@
   onMount(() => {
     syncRequestedView();
     void loadAll();
+    const processPoll = window.setInterval(() => {
+      void loadProcessTables();
+    }, PROCESS_POLL_INTERVAL_MS);
 
     const disconnect = connectDaemonStream({
       onEvent: applyStreamEvent,
@@ -179,6 +193,7 @@
     });
 
     return () => {
+      window.clearInterval(processPoll);
       disconnect();
     };
   });
