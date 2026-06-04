@@ -931,9 +931,10 @@ fn retry_after_from_headers(headers: &HeaderMap) -> Option<Duration> {
 fn compiled_turn_requires_json_object(compiled_turn: &CompiledTurn) -> bool {
     compiled_turn.history.iter().any(|turn| {
         turn.role == "system"
-            && turn
-                .content
-                .contains("Return exactly one JSON object and nothing else.")
+            && (turn.content.contains("Nucleus worker action JSON contract")
+                || turn
+                    .content
+                    .contains("Return exactly one JSON object and nothing else."))
     })
 }
 
@@ -1099,6 +1100,30 @@ mod tests {
             id: "system".to_string(),
             session_id: "job".to_string(),
             role: "system".to_string(),
+            content: "Nucleus worker action JSON contract: return one valid Nucleus worker action JSON object."
+                .to_string(),
+            images: Vec::new(),
+            created_at: 0,
+        }];
+        let compiled = compiled_turn_from_prompt(
+            &history,
+            "Decide the next step.",
+            &[],
+            "main",
+            &[],
+            &[],
+            &[],
+        );
+
+        assert!(compiled_turn_requires_json_object(&compiled));
+    }
+
+    #[test]
+    fn openai_legacy_json_object_contract_still_detected() {
+        let history = vec![SessionTurn {
+            id: "system".to_string(),
+            session_id: "job".to_string(),
+            role: "system".to_string(),
             content: "Return exactly one JSON object and nothing else.".to_string(),
             images: Vec::new(),
             created_at: 0,
@@ -1122,7 +1147,8 @@ mod tests {
             id: "user".to_string(),
             session_id: "session".to_string(),
             role: "user".to_string(),
-            content: "Return exactly one JSON object and nothing else.".to_string(),
+            content: "Nucleus worker action JSON contract: return one valid Nucleus worker action JSON object."
+                .to_string(),
             images: Vec::new(),
             created_at: 0,
         }];
