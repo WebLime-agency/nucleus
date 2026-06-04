@@ -114,6 +114,9 @@ struct SetupRuntimeArgs {
 
     #[arg(long)]
     allow_unsafe_bind: bool,
+
+    #[arg(long)]
+    show_token: bool,
 }
 
 #[derive(Debug, Args)]
@@ -234,6 +237,9 @@ struct ReleaseInstallArgs {
 
     #[arg(long)]
     allow_unsafe_bind: bool,
+
+    #[arg(long)]
+    show_token: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -326,7 +332,10 @@ fn run_auth(command: AuthArgs, state_dir: Option<PathBuf>) -> Result<()> {
         AuthCommand::LocalToken(selector) => {
             let state_dir = resolve_auth_state_dir(state_dir, &selector)?;
             let store = open_store(Some(&state_dir))?;
-            println!("{}", store.read_local_auth_token()?);
+            println!(
+                "{}",
+                render_explicit_token_output(&store.read_local_auth_token()?)
+            );
         }
         AuthCommand::RotateToken(selector) => {
             let state_dir = resolve_auth_state_dir(state_dir, &selector)?;
@@ -336,7 +345,7 @@ fn run_auth(command: AuthArgs, state_dir: Option<PathBuf>) -> Result<()> {
                 "Rotated the local auth token for {}. Existing browser and client sessions using the old token must reconnect or re-authenticate.",
                 state_dir.display()
             );
-            println!("{token}");
+            println!("{}", render_explicit_token_output(&token));
         }
     }
 
@@ -363,6 +372,7 @@ async fn run_setup_runtime(
 ) -> Result<()> {
     let store = open_store(state_dir.as_deref())?;
     let token = store.read_local_auth_token()?;
+    let token_path = store.local_auth_token_path();
     let bind = args.bind.unwrap_or_else(|| default_bind.to_string());
     let repo_root = resolve_repo_root(args.repo_root.as_deref())?;
     let web_dist_dir = resolve_web_dist_dir(args.web_dist_dir.as_deref(), &repo_root)?;
@@ -393,7 +403,9 @@ async fn run_setup_runtime(
     );
     println!("Bind: {bind}");
     println!("Web build: {}", web_dist_dir.display());
-    println!("Token: {token}");
+    for line in render_install_summary_lines(&token, &token_path, args.show_token) {
+        println!("{line}");
+    }
     println!("Local URL: {}", hints.local_url);
 
     if let Some(url) = hints.hostname_url {
@@ -585,6 +597,7 @@ async fn run_release_install(
     let state_dir = state_dir_path(explicit_state_dir.as_deref())?;
     let store = open_store(Some(&state_dir))?;
     let token = store.read_local_auth_token()?;
+    let token_path = store.local_auth_token_path();
     let selected = {
         let manifest = load_manifest(&manifest_url).await?;
         select_release(&manifest, channel, &current_platform_target())?
@@ -674,7 +687,9 @@ async fn run_release_install(
     );
     println!("State dir: {}", state_dir.display());
     println!("Manifest URL: {}", manifest_url);
-    println!("Token: {token}");
+    for line in render_install_summary_lines(&token, &token_path, args.show_token) {
+        println!("{line}");
+    }
     println!("Local URL: {}", hints.local_url);
     if let Some(url) = hints.hostname_url {
         println!("Host URL: {url}");
@@ -1410,6 +1425,45 @@ fn render_managed_release_service_unit(plan: &ManagedReleaseInstallPlan) -> Stri
     )
 }
 
+fn render_install_summary_lines(token: &str, token_path: &str, show_token: bool) -> Vec<String> {
+    if show_token {
+        return vec![format!("Local auth token: {token}")];
+    }
+
+    vec![format!(
+        "Local auth token: {} ({})",
+        token_path,
+        masked_token_preview(token)
+    )]
+}
+
+fn render_explicit_token_output(token: &str) -> String {
+    token.to_string()
+}
+
+fn masked_token_preview(token: &str) -> String {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return "[empty]".to_string();
+    }
+    if trimmed.chars().count() <= 4 {
+        return "[masked]".to_string();
+    }
+
+    let suffix = trailing_chars(trimmed, 4);
+    if trimmed.starts_with("nuctk_") {
+        format!("nuctk_...{suffix}")
+    } else {
+        format!("...{suffix}")
+    }
+}
+
+fn trailing_chars(value: &str, count: usize) -> String {
+    let mut chars = value.chars().rev().take(count).collect::<Vec<_>>();
+    chars.reverse();
+    chars.into_iter().collect()
+}
+
 fn trim_nonempty<'a>(value: &'a str, label: &str) -> Result<&'a str> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1446,8 +1500,9 @@ mod tests {
         AuthSelectorArgs, InstallPlan, LocalInstance, ManagedReleaseInstallPlan,
         discover_local_instances_from_systemd_dir, format_instance_suggestions,
         managed_release_archive_name, normalized_capability_flags, parse_local_instance_unit,
-        render_dev_service_unit, render_managed_release_service_unit, require_explicit_remote_bind,
-        resolve_auth_state_dir, select_instance_by_name, select_instance_by_url,
+        render_dev_service_unit, render_explicit_token_output, render_install_summary_lines,
+        render_managed_release_service_unit, require_explicit_remote_bind, resolve_auth_state_dir,
+        select_instance_by_name, select_instance_by_url,
     };
     use std::{
         fs,
@@ -1491,6 +1546,36 @@ mod tests {
         assert!(unit.contains(
             "Environment=NUCLEUS_RELEASE_MANIFEST_URL=https://example.com/manifest-stable.json"
         ));
+    }
+
+    #[test]
+    fn install_summary_hides_local_auth_token_by_default() {
+        let token = "nuctk_super_secret_12345678";
+        let token_path = "/tmp/nucleus/state/local_auth_token";
+        let lines = render_install_summary_lines(token, token_path, false);
+        let output = lines.join("\n");
+
+        assert!(output.contains("Local auth token: /tmp/nucleus/state/local_auth_token"));
+        assert!(output.contains("nuctk_...5678"));
+        assert!(!output.contains(token));
+    }
+
+    #[test]
+    fn install_summary_can_show_local_auth_token_when_requested() {
+        let token = "nuctk_super_secret_12345678";
+        let lines =
+            render_install_summary_lines(token, "/tmp/nucleus/state/local_auth_token", true);
+        let output = lines.join("\n");
+
+        assert!(output.contains("Local auth token: nuctk_super_secret_12345678"));
+        assert!(output.contains(token));
+    }
+
+    #[test]
+    fn explicit_auth_token_output_keeps_full_value() {
+        let token = "nuctk_super_secret_12345678";
+
+        assert_eq!(render_explicit_token_output(token), token);
     }
 
     #[test]
