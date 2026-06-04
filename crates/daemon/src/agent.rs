@@ -2704,7 +2704,8 @@ async fn run_job_loop(
                     &worker,
                     step,
                     tool_calls,
-                ) {
+                ) && !metadata_marks_unrecoverable_worker_action(&metadata)
+                {
                     retry_worker_final_answer(
                         state,
                         job_id,
@@ -7706,6 +7707,13 @@ fn should_retry_unsupported_confident_negative_final_answer(
         && !final_answer_reports_concrete_blocker(&normalize_action_item_text(final_answer))
 }
 
+fn metadata_marks_unrecoverable_worker_action(metadata: &Value) -> bool {
+    metadata
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status == "blocked_invalid_worker_action")
+}
+
 fn evidence_task_text(detail: &JobDetail, checkpoint: &WorkerCheckpoint) -> String {
     let mut parts = vec![
         detail.job.title.as_str(),
@@ -9904,9 +9912,11 @@ async fn call_worker_model(
     )
     .await?;
     let registered_mcp_tool_ids = registered_mcp_tool_ids(state);
+    let supported_tool_ids =
+        worker_action_repair_supported_tool_ids(worker, &registered_mcp_tool_ids);
     let action = match parse_worker_action_with_registered_mcp_tools(
         &result.content,
-        registered_mcp_tool_ids.iter().map(String::as_str),
+        supported_tool_ids.iter().map(String::as_str),
     ) {
         Ok(action) => action,
         Err(error)
@@ -9928,13 +9938,8 @@ async fn call_worker_model(
                 compacted: false,
                 compacted_range: None,
             });
-            let repair_supported_tool_ids =
-                worker_action_repair_supported_tool_ids(worker, &registered_mcp_tool_ids);
-            let repair_prompt = build_worker_action_repair_prompt(
-                &result.content,
-                &error,
-                &repair_supported_tool_ids,
-            );
+            let repair_prompt =
+                build_worker_action_repair_prompt(&result.content, &error, &supported_tool_ids);
             let repaired = execute_worker_text_turn(
                 state,
                 session,
@@ -9945,17 +9950,27 @@ async fn call_worker_model(
                 cancel_rx,
             )
             .await?;
-            let action = parse_worker_action_with_registered_mcp_tools(
+            let action = match parse_worker_action_with_registered_mcp_tools(
                 &repaired.content,
-                registered_mcp_tool_ids.iter().map(String::as_str),
-            )
-            .with_context(|| {
-                format!(
-                    "worker returned invalid Nucleus action after repair retry; original response: {}; repaired response: {}",
-                    excerpt(&result.content, 220),
-                    excerpt(&repaired.content, 220)
-                )
-            })?;
+                supported_tool_ids.iter().map(String::as_str),
+            ) {
+                Ok(action) => action,
+                Err(repair_error) => {
+                    record_successful_worker_transport_capability(
+                        state, session, worker, &repaired,
+                    );
+                    return Ok(build_unrecoverable_worker_action_model_response(
+                        &repair_error,
+                        &supported_tool_ids,
+                        repaired.content,
+                        if repaired.provider_session_id.is_empty() {
+                            result.provider_session_id
+                        } else {
+                            repaired.provider_session_id
+                        },
+                    ));
+                }
+            };
             record_successful_worker_transport_capability(state, session, worker, &repaired);
             return Ok(ModelResponse {
                 action,
@@ -9968,10 +9983,12 @@ async fn call_worker_model(
             });
         }
         Err(error) => {
-            return Err(anyhow!(
-                "{}; response excerpt: {}",
-                error,
-                excerpt(&result.content, 500)
+            record_successful_worker_transport_capability(state, session, worker, &result);
+            return Ok(build_unrecoverable_worker_action_model_response(
+                &error,
+                &supported_tool_ids,
+                result.content,
+                result.provider_session_id,
             ));
         }
     };
@@ -10571,6 +10588,42 @@ struct ModelResponse {
     action: WorkerAction,
     raw: String,
     provider_session_id: String,
+}
+
+fn build_unrecoverable_worker_action_model_response(
+    error: &dyn std::fmt::Display,
+    supported_tool_ids: &[String],
+    raw_response: String,
+    provider_session_id: String,
+) -> ModelResponse {
+    let supported_tool_text = if supported_tool_ids.is_empty() {
+        "No tool IDs are available in this session.".to_string()
+    } else {
+        supported_tool_ids
+            .iter()
+            .map(|tool_id| format!("- {tool_id}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let final_answer = format!(
+        "I couldn't select a usable Nucleus action for this turn. The worker response did not match the action contract: {error}.\n\nAvailable tools in this session:\n{supported_tool_text}\n\nPlease clarify the next step or enable the capability needed for the action you want me to take."
+    );
+
+    ModelResponse {
+        action: WorkerAction::FinalAnswer {
+            thoughts: None,
+            summary: "blocked by unavailable or invalid worker action".to_string(),
+            final_answer,
+            metadata: json!({
+                "status": "blocked_invalid_worker_action",
+                "available_tool_ids": supported_tool_ids,
+            }),
+            artifacts: Vec::new(),
+            browser_verification: None,
+        },
+        raw: raw_response,
+        provider_session_id,
+    }
 }
 
 async fn resolve_approval_request(
@@ -17302,6 +17355,16 @@ Working directory: {}\n",
 {\"kind\":\"wait\",\"summary\":\"park until a child report exists\",\"until\":{\"kind\":\"artifact_kind\",\"job_id\":\"job-id\",\"artifact_kind\":\"child-report\"},\"max_wait_seconds\":1800}\n\
 {\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\"}"
     };
+    let action_shapes = if is_root_worker && !worker_has_tool_capability(worker, "browser.navigate")
+    {
+        action_shapes
+            .lines()
+            .filter(|line| !line.contains("\"tool\":\"browser."))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        action_shapes.to_string()
+    };
     let tool_help = worker
         .capabilities
         .iter()
@@ -17368,6 +17431,13 @@ Working directory: {}\n",
         worker.lane,
         worker.working_dir
     )
+}
+
+fn worker_has_tool_capability(worker: &WorkerSummary, tool_id: &str) -> bool {
+    worker
+        .capabilities
+        .iter()
+        .any(|capability| capability.tool_id == tool_id)
 }
 
 fn command_path_env() -> Option<std::ffi::OsString> {
@@ -18204,6 +18274,23 @@ mod tests {
             root_prompt.contains("Do not use provider-native tool wrappers"),
             "worker prompt should reject provider-native tool-call shapes"
         );
+    }
+
+    #[test]
+    fn root_worker_prompt_only_advertises_browser_examples_when_granted() {
+        let mut worker = test_worker_summary("root", 10, 20);
+        worker.parent_worker_id = None;
+
+        let prompt_without_browser = worker_system_prompt_with_mode(&worker, "act");
+        assert!(!prompt_without_browser.contains("\"tool\":\"browser.navigate\""));
+        assert!(!prompt_without_browser.contains("\"tool\":\"browser.snapshot\""));
+        assert!(!prompt_without_browser.contains("\"tool\":\"browser.click\""));
+
+        worker.capabilities = grant_records_to_summaries(browser_capabilities());
+        let prompt_with_browser = worker_system_prompt_with_mode(&worker, "act");
+        assert!(prompt_with_browser.contains("\"tool\":\"browser.navigate\""));
+        assert!(prompt_with_browser.contains("\"tool\":\"browser.snapshot\""));
+        assert!(prompt_with_browser.contains("\"tool\":\"browser.click\""));
     }
 
     #[test]
@@ -21342,9 +21429,45 @@ Cleanup status: clean";
         assert!(prompt.contains("\"kind\":\"spawn_child_jobs\""));
         assert!(prompt.contains("one valid Nucleus worker action"));
         assert!(prompt.contains("brief thoughts"));
+        assert!(prompt.contains("Currently supported tool IDs:"));
         assert!(prompt.contains("cloudflare-api.search"));
         assert!(prompt.contains("preserve that exact tool ID"));
         assert!(prompt.contains("Do not replace a supported non-command tool with command.run"));
+    }
+
+    #[test]
+    fn unrecoverable_worker_action_response_is_graceful_final_answer() {
+        let response = build_unrecoverable_worker_action_model_response(
+            &crate::worker_action::WorkerActionParseError::UnknownTool {
+                tool: "browser.navigate".to_string(),
+            },
+            &["fs.read_text".to_string(), "project.inspect".to_string()],
+            "private raw response that should stay out of the visible answer".to_string(),
+            "turn-2".to_string(),
+        );
+
+        let WorkerAction::FinalAnswer {
+            summary,
+            final_answer,
+            metadata,
+            ..
+        } = response.action
+        else {
+            panic!("expected graceful final_answer action");
+        };
+
+        assert_eq!(summary, "blocked by unavailable or invalid worker action");
+        assert!(final_answer.contains("couldn't select a usable Nucleus action"));
+        assert!(final_answer.contains("Available tools in this session:"));
+        assert!(final_answer.contains("- fs.read_text"));
+        assert!(final_answer.contains("- project.inspect"));
+        assert!(!final_answer.contains("private raw response"));
+        assert_eq!(metadata["status"], "blocked_invalid_worker_action");
+        assert_eq!(
+            response.raw,
+            "private raw response that should stay out of the visible answer"
+        );
+        assert_eq!(response.provider_session_id, "turn-2");
     }
 
     #[tokio::test]
@@ -21423,6 +21546,149 @@ Cleanup status: clean";
         assert!(bodies[0].contains("Inspect the repo."));
         assert!(bodies[1].contains("Nucleus action contract"));
         assert!(bodies[1].contains("I should inspect the repo next"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn call_worker_model_returns_graceful_final_answer_after_failed_action_repair() {
+        let state_dir = test_state_dir("worker-action-repair-graceful-fallback");
+        let state = initialize_test_state(&state_dir);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener addr should be available")
+        );
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_bodies = Arc::new(TestMutex::new(Vec::new()));
+        let server_request_count = request_count.clone();
+        let server_request_bodies = request_bodies.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .expect("test request should connect");
+                let body = read_test_http_body(&mut socket).await;
+                server_request_bodies
+                    .lock()
+                    .expect("request bodies lock should not be poisoned")
+                    .push(body);
+                let index = server_request_count.fetch_add(1, Ordering::SeqCst);
+                let content = r#"{"kind":"tool_call","summary":"open browser","tool":"browser.navigate","args":{"url":"http://127.0.0.1:5299"}}"#;
+                write_test_openai_sse_response(&mut socket, &format!("turn-{index}"), content)
+                    .await;
+            }
+        });
+
+        let mut worker = test_worker_summary("repair-fallback-worker", 10, 10);
+        worker.provider_base_url = base_url;
+        worker.working_dir = state_dir.display().to_string();
+        worker.capabilities = grant_records_to_summaries(read_only_capabilities());
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let response = call_worker_model(
+            &state,
+            None,
+            &worker,
+            &[],
+            "Verify the UI.",
+            &[],
+            &mut cancel_rx,
+        )
+        .await
+        .expect("failed repair should terminate with graceful final_answer");
+
+        let WorkerAction::FinalAnswer { final_answer, .. } = response.action else {
+            panic!("expected graceful final_answer action");
+        };
+        assert!(final_answer.contains("couldn't select a usable Nucleus action"));
+        assert!(final_answer.contains("Available tools in this session:"));
+        assert!(final_answer.contains("fs.read_text"));
+        assert!(!final_answer.contains("open browser"));
+        assert_eq!(response.provider_session_id, "turn-1");
+
+        server.await.expect("test server should finish");
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        let bodies = request_bodies
+            .lock()
+            .expect("request bodies lock should not be poisoned");
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[1].contains("Currently supported tool IDs:"));
+        assert!(bodies[1].contains("fs.read_text"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn call_worker_model_accepts_granted_browser_tool_after_action_repair() {
+        let state_dir = test_state_dir("worker-action-repair-browser-grant");
+        let state = initialize_test_state(&state_dir);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener addr should be available")
+        );
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server_request_count = request_count.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .expect("test request should connect");
+                let _body = read_test_http_body(&mut socket).await;
+                let index = server_request_count.fetch_add(1, Ordering::SeqCst);
+                let content = if index == 0 {
+                    r#"{"message":"I need Browser verification next"}"#
+                } else {
+                    r#"{"kind":"tool_call","summary":"verify UI","tool":"browser.navigate","args":{"url":"http://127.0.0.1:5299"}}"#
+                };
+                write_test_openai_sse_response(&mut socket, &format!("turn-{index}"), content)
+                    .await;
+            }
+        });
+
+        let mut worker = test_worker_summary("repair-browser-worker", 10, 10);
+        worker.provider_base_url = base_url;
+        worker.working_dir = state_dir.display().to_string();
+        worker.capabilities = grant_records_to_summaries(browser_capabilities());
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let response = call_worker_model(
+            &state,
+            None,
+            &worker,
+            &[],
+            "Verify the UI.",
+            &[],
+            &mut cancel_rx,
+        )
+        .await
+        .expect("granted Browser tool should survive repair parsing");
+
+        let WorkerAction::ToolCall {
+            summary,
+            tool,
+            args,
+            ..
+        } = response.action
+        else {
+            panic!("expected repaired Browser tool call");
+        };
+        assert_eq!(summary, "verify UI");
+        assert_eq!(tool, "browser.navigate");
+        assert_eq!(args["url"], "http://127.0.0.1:5299");
+        assert_eq!(response.provider_session_id, "turn-1");
+
+        server.await.expect("test server should finish");
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
 
         let _ = fs::remove_dir_all(&state_dir);
     }
@@ -22869,7 +23135,7 @@ Thanks."#,
     }
 
     #[tokio::test]
-    async fn invalid_worker_action_after_repair_marks_job_worker_and_session_failed() {
+    async fn invalid_worker_action_after_repair_completes_with_graceful_answer() {
         let state_dir = test_state_dir("worker-action-repair-failure");
         let state = initialize_test_state(&state_dir);
         let workspace_root = PathBuf::from(
@@ -22962,9 +23228,6 @@ Thanks."#,
                 job_id,
                 JobPatch {
                     root_worker_id: Some(worker_id.to_string()),
-                    ui_renderable: Some("true".to_string()),
-                    browser_verification_required: Some(true),
-                    browser_verification_status: Some("pending".to_string()),
                     ..JobPatch::default()
                 },
             )
@@ -22995,18 +23258,33 @@ Thanks."#,
 
         spawn_job_task(state.clone(), job_id.to_string());
         server.await.expect("test server should finish");
-        let session = wait_for_session_state(&state, session_id, "error").await;
-        let detail = state.store.get_job(job_id).expect("job should reload");
+        let detail = wait_for_job_state(&state, job_id, "completed").await;
+        let session = state
+            .store
+            .get_session(session_id)
+            .expect("session should reload");
 
-        assert_eq!(detail.job.state, "failed");
-        assert_eq!(detail.workers[0].state, "failed");
-        assert_eq!(session.session.state, "error");
-        assert!(detail.job.last_error.contains("repair retry"));
-        assert_eq!(detail.job.browser_verification_status, "unavailable");
-        assert_eq!(
-            detail.job.browser_verification_summary,
-            "Job failed before browser verification completed."
+        assert_eq!(detail.job.state, "completed");
+        assert_eq!(detail.workers[0].state, "completed");
+        assert_eq!(session.session.state, "active");
+        assert!(detail.job.last_error.is_empty());
+        let final_turn = session
+            .turns
+            .iter()
+            .rev()
+            .find(|turn| turn.role == "assistant")
+            .expect("completed session should have assistant final answer");
+        assert!(
+            final_turn
+                .content
+                .contains("couldn't select a usable Nucleus action")
         );
+        assert!(
+            final_turn
+                .content
+                .contains("Available tools in this session:")
+        );
+        assert_ne!(detail.job.browser_verification_status, "failed");
 
         let _ = fs::remove_dir_all(&state_dir);
     }
@@ -29617,15 +29895,21 @@ for line in sys.stdin:
     }
 
     async fn wait_for_job_state(state: &AppState, job_id: &str, expected_state: &str) -> JobDetail {
+        let mut last_state = String::new();
+        let mut last_error = String::new();
         for _ in 0..500 {
             let detail = state.store.get_job(job_id).expect("job should load");
             if detail.job.state == expected_state {
                 return detail;
             }
+            last_state = detail.job.state.clone();
+            last_error = detail.job.last_error.clone();
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        panic!("job '{job_id}' did not reach state '{expected_state}'");
+        panic!(
+            "job '{job_id}' did not reach state '{expected_state}' (last state: '{last_state}', last error: '{last_error}')"
+        );
     }
 
     async fn wait_for_child_count(
@@ -29905,6 +30189,26 @@ for line in sys.stdin:
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    fn grant_records_to_summaries(
+        grants: Vec<ToolCapabilityGrantRecord>,
+    ) -> Vec<nucleus_protocol::ToolCapabilitySummary> {
+        grants
+            .into_iter()
+            .map(|grant| nucleus_protocol::ToolCapabilitySummary {
+                tool_id: grant.tool_id,
+                summary: grant.summary,
+                approval_mode: grant.approval_mode,
+                risk_level: grant.risk_level,
+                side_effect_level: grant.side_effect_level,
+                timeout_secs: grant.timeout_secs,
+                max_output_bytes: grant.max_output_bytes,
+                supports_streaming: grant.supports_streaming,
+                concurrency_group: grant.concurrency_group,
+                scope_kind: grant.scope_kind,
+            })
+            .collect()
     }
 
     fn long_test_checkpoint(session_id: &str, message_count: usize) -> WorkerCheckpoint {
