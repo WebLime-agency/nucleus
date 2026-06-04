@@ -53,15 +53,16 @@ use nucleus_protocol::{
     McpServerSummary, McpToolRecord, MemoryCandidate, MemoryCandidateAcceptRequest,
     MemoryCandidateListResponse, MemoryCandidateUpsertRequest, MemoryEntry,
     MemoryEntryUpsertRequest, MemoryOutcome, MemorySearchResponse, MemorySummary,
-    ModelTransportCapability, NucleusToolDescriptor, PlaybookDetail, PlaybookSummary,
-    ProcessKillRequest, ProcessKillResponse, ProcessListResponse, ProfileCheckOutcome,
-    ProfileCheckRequest, ProfileCheckResult, ProjectUpdateRequest, PromptProgressUpdate,
-    RouterProfileSummary, RunBudgetSummary, RuntimeOverview, RuntimeSummary, SessionDetail,
-    SessionPromptRequest, SessionSummary, SettingsSummary, SkillImportRequest, SkillImportResponse,
-    SkillInstallResult, SkillInstallVerification, SkillInstallationRecord,
-    SkillInstallationUpsertRequest, SkillManifest, SkillPackageRecord, SkillPackageUpsertRequest,
-    SkillReconcileCandidate, SkillReconcileRequest, SkillReconcileScanResponse, StreamConnected,
-    SystemStats, UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
+    ModelActionContractCapability, ModelJsonObjectCapability, ModelTransportCapability,
+    NucleusToolDescriptor, PlaybookDetail, PlaybookSummary, ProcessKillRequest,
+    ProcessKillResponse, ProcessListResponse, ProfileCheckOutcome, ProfileCheckRequest,
+    ProfileCheckResult, ProjectUpdateRequest, PromptProgressUpdate, RouterProfileSummary,
+    RunBudgetSummary, RuntimeOverview, RuntimeSummary, SessionDetail, SessionPromptRequest,
+    SessionSummary, SettingsSummary, SkillImportRequest, SkillImportResponse, SkillInstallResult,
+    SkillInstallVerification, SkillInstallationRecord, SkillInstallationUpsertRequest,
+    SkillManifest, SkillPackageRecord, SkillPackageUpsertRequest, SkillReconcileCandidate,
+    SkillReconcileRequest, SkillReconcileScanResponse, StreamConnected, SystemStats,
+    UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
     UserFacingErrorSummary, VaultInitRequest, VaultSecretListResponse,
     VaultSecretPolicyListResponse, VaultSecretPolicySummary, VaultSecretPolicyUpsertRequest,
     VaultSecretSummary, VaultSecretUpdateRequest, VaultSecretUpsertRequest, VaultStatusSummary,
@@ -93,6 +94,7 @@ use tower_http::{
 use tracing::{info, warn};
 use updates::{InstanceRuntime, UpdateManager};
 use uuid::Uuid;
+use worker_action::parse_worker_action;
 
 const STREAM_INTERVAL: Duration = Duration::from_secs(2);
 const DEFAULT_AUDIT_LIMIT: usize = 20;
@@ -950,12 +952,13 @@ async fn check_workspace_profile(
         .profiles
         .iter()
         .find(|profile| profile.id == profile_id)
+        .cloned()
         .ok_or_else(|| {
             ApiError::not_found(format!("workspace profile '{profile_id}' was not found"))
         })?;
 
     let started = Instant::now();
-    let target = match resolve_workspace_profile_target(&state, profile, &role).await {
+    let target = match resolve_workspace_profile_target(&state, &profile, &role).await {
         Ok(target) => target,
         Err(error) => {
             return Ok(Json(profile_check_result(
@@ -994,32 +997,46 @@ async fn check_workspace_profile(
         )));
     }
 
-    // Deferred follow-up: a successful probe could refresh the profile capability
-    // fingerprint, but this endpoint is intentionally read-only for now.
     let config = if role == "utility" {
         &profile.utility
     } else {
         &profile.main
     };
-    let stream = config.transport != ModelTransportCapability::NonStreaming;
-    match runtime::probe_openai_compatible_endpoint(
-        &target.provider_base_url,
-        &target.provider_api_key,
-        &target.model,
-        stream,
-    )
-    .await
-    {
-        Ok(_) => Ok(Json(profile_check_result(
-            role,
-            ProfileCheckOutcome::Ok,
-            format!(
-                "{} responded with a non-empty assistant message.",
-                target.model
-            ),
-            None,
-            Some(started.elapsed()),
-        ))),
+    match probe_profile_check_transport(&target, config).await {
+        Ok(probe) => {
+            let transport = model_transport_capability_from_provider(probe.transport);
+            let json_object = probe_profile_check_json_object(&target, probe.transport).await;
+            let action_contract =
+                probe_profile_check_action_contract(&target, probe.transport).await;
+            let (json_object, transport, action_contract, persisted) =
+                persist_profile_check_capabilities(
+                    &state,
+                    &profile,
+                    &role,
+                    &target,
+                    json_object,
+                    transport,
+                    action_contract,
+                )?;
+            if persisted {
+                let _ = publish_overview_event(&state).await;
+            }
+            Ok(Json(profile_check_result_with_capabilities(
+                role,
+                ProfileCheckOutcome::Ok,
+                format!(
+                    "{} responded with a non-empty assistant message.",
+                    target.model
+                ),
+                ProfileCheckCapabilities {
+                    json_object,
+                    transport,
+                    action_contract,
+                },
+                None,
+                Some(started.elapsed()),
+            )))
+        }
         Err(error) => Ok(Json(classify_profile_check_error(
             role,
             &target.model,
@@ -1030,6 +1047,223 @@ async fn check_workspace_profile(
     }
 }
 
+async fn probe_profile_check_transport(
+    target: &SessionTargetSelection,
+    config: &WorkspaceModelConfig,
+) -> anyhow::Result<runtime::ProviderTurnResult> {
+    if config.transport == ModelTransportCapability::NonStreaming {
+        return runtime::probe_openai_compatible_endpoint(
+            &target.provider_base_url,
+            &target.provider_api_key,
+            &target.model,
+            false,
+        )
+        .await;
+    }
+
+    match runtime::probe_openai_compatible_endpoint(
+        &target.provider_base_url,
+        &target.provider_api_key,
+        &target.model,
+        true,
+    )
+    .await
+    {
+        Ok(result) => Ok(result),
+        Err(error) if should_try_profile_check_non_streaming_fallback(&error) => {
+            runtime::probe_openai_compatible_endpoint(
+                &target.provider_base_url,
+                &target.provider_api_key,
+                &target.model,
+                false,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn should_try_profile_check_non_streaming_fallback(error: &anyhow::Error) -> bool {
+    if runtime::should_try_non_streaming_fallback(error) {
+        return true;
+    }
+
+    error.downcast_ref::<ProviderTransportError>().is_some_and(
+        |provider_error| match provider_error {
+            ProviderTransportError::Http { status, detail, .. } => {
+                matches!(*status, 400 | 422) && detail.to_ascii_lowercase().contains("stream")
+            }
+            ProviderTransportError::Stream { .. } => false,
+        },
+    )
+}
+
+async fn probe_profile_check_json_object(
+    target: &SessionTargetSelection,
+    transport: runtime::ProviderTurnTransport,
+) -> Option<ModelJsonObjectCapability> {
+    let stream = transport == runtime::ProviderTurnTransport::Streaming;
+    match runtime::probe_openai_compatible_json_object(
+        &target.provider_base_url,
+        &target.provider_api_key,
+        &target.model,
+        stream,
+    )
+    .await
+    {
+        Ok(result) => match serde_json::from_str::<Value>(&result.content) {
+            Ok(Value::Object(_)) => Some(ModelJsonObjectCapability::Supported),
+            _ => Some(ModelJsonObjectCapability::Unsupported),
+        },
+        Err(error) => error
+            .downcast_ref::<ProviderTransportError>()
+            .and_then(|provider_error| match provider_error {
+                ProviderTransportError::Http { status, .. } if matches!(*status, 400 | 422) => {
+                    Some(ModelJsonObjectCapability::Unsupported)
+                }
+                _ => None,
+            }),
+    }
+}
+
+async fn probe_profile_check_action_contract(
+    target: &SessionTargetSelection,
+    transport: runtime::ProviderTurnTransport,
+) -> Option<ModelActionContractCapability> {
+    let stream = transport == runtime::ProviderTurnTransport::Streaming;
+    match runtime::probe_openai_compatible_action_contract(
+        &target.provider_base_url,
+        &target.provider_api_key,
+        &target.model,
+        stream,
+    )
+    .await
+    {
+        Ok(result) if parse_worker_action(&result.content).is_ok() => {
+            Some(ModelActionContractCapability::Passed)
+        }
+        Ok(_) => Some(ModelActionContractCapability::Failed),
+        Err(_) => None,
+    }
+}
+
+fn persist_profile_check_capabilities(
+    state: &AppState,
+    profile: &WorkspaceProfileSummary,
+    role: &str,
+    target: &SessionTargetSelection,
+    json_object: Option<ModelJsonObjectCapability>,
+    transport: ModelTransportCapability,
+    action_contract: Option<ModelActionContractCapability>,
+) -> Result<
+    (
+        ModelJsonObjectCapability,
+        ModelTransportCapability,
+        ModelActionContractCapability,
+        bool,
+    ),
+    ApiError,
+> {
+    let workspace = state.store.workspace()?;
+    let current_profile = resolve_workspace_profile(&workspace, &profile.id)?;
+    let current_config = if role == "utility" {
+        &current_profile.utility
+    } else {
+        &current_profile.main
+    };
+    if !workspace_model_config_matches_profile_check_target(current_config, target) {
+        return Ok((
+            current_config.json_object,
+            current_config.transport,
+            current_config.action_contract,
+            false,
+        ));
+    }
+
+    let mut main = current_profile.main.clone();
+    let mut utility = current_profile.utility.clone();
+    let config = if role == "utility" {
+        &mut utility
+    } else {
+        &mut main
+    };
+    if let Some(json_object) = json_object {
+        config.json_object = json_object;
+    }
+    config.transport = transport;
+    if let Some(action_contract) = action_contract {
+        config.action_contract = action_contract;
+    }
+
+    let updated = state.store.update_workspace_profile(
+        &profile.id,
+        WorkspaceProfilePatch {
+            title: current_profile.title.clone(),
+            main,
+            utility,
+            is_default: current_profile.is_default,
+        },
+    )?;
+    let updated_config = if role == "utility" {
+        updated.utility
+    } else {
+        updated.main
+    };
+
+    Ok((
+        updated_config.json_object,
+        updated_config.transport,
+        updated_config.action_contract,
+        true,
+    ))
+}
+
+fn workspace_model_config_matches_profile_check_target(
+    config: &WorkspaceModelConfig,
+    target: &SessionTargetSelection,
+) -> bool {
+    let Ok(provider) = resolve_provider(&config.adapter) else {
+        return false;
+    };
+    let model = if config.model.trim().is_empty() {
+        provider.default_model().to_string()
+    } else {
+        config.model.trim().to_string()
+    };
+
+    provider.as_str() == target.provider
+        && model == target.model
+        && config.base_url.trim().trim_end_matches('/')
+            == target.provider_base_url.trim().trim_end_matches('/')
+        && config.api_key.trim() == target.provider_api_key.trim()
+}
+
+fn model_transport_capability_from_provider(
+    transport: runtime::ProviderTurnTransport,
+) -> ModelTransportCapability {
+    match transport {
+        runtime::ProviderTurnTransport::Streaming => ModelTransportCapability::Streaming,
+        runtime::ProviderTurnTransport::NonStreaming => ModelTransportCapability::NonStreaming,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProfileCheckCapabilities {
+    json_object: ModelJsonObjectCapability,
+    transport: ModelTransportCapability,
+    action_contract: ModelActionContractCapability,
+}
+
+impl Default for ProfileCheckCapabilities {
+    fn default() -> Self {
+        Self {
+            json_object: ModelJsonObjectCapability::Unknown,
+            transport: ModelTransportCapability::Unknown,
+            action_contract: ModelActionContractCapability::Unknown,
+        }
+    }
+}
+
 fn profile_check_result(
     role: String,
     outcome: ProfileCheckOutcome,
@@ -1037,10 +1271,31 @@ fn profile_check_result(
     http_status: Option<u16>,
     latency: Option<Duration>,
 ) -> ProfileCheckResult {
+    profile_check_result_with_capabilities(
+        role,
+        outcome,
+        message,
+        ProfileCheckCapabilities::default(),
+        http_status,
+        latency,
+    )
+}
+
+fn profile_check_result_with_capabilities(
+    role: String,
+    outcome: ProfileCheckOutcome,
+    message: impl Into<String>,
+    capabilities: ProfileCheckCapabilities,
+    http_status: Option<u16>,
+    latency: Option<Duration>,
+) -> ProfileCheckResult {
     ProfileCheckResult {
         role,
         outcome,
         message: message.into(),
+        json_object: capabilities.json_object,
+        transport: capabilities.transport,
+        action_contract: capabilities.action_contract,
         http_status,
         latency_ms: latency.map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64),
     }
@@ -9790,6 +10045,31 @@ mod tests {
             .expect("profile transport should update");
     }
 
+    fn profile_check_target_selection(
+        profile_id: &str,
+        profile_title: &str,
+        model: &str,
+        base_url: &str,
+        api_key: &str,
+    ) -> SessionTargetSelection {
+        SessionTargetSelection {
+            profile_id: profile_id.to_string(),
+            profile_title: profile_title.to_string(),
+            route_id: String::new(),
+            route_title: String::new(),
+            provider: AdapterKind::OpenAiCompatible.as_str().to_string(),
+            model: model.to_string(),
+            provider_base_url: base_url.to_string(),
+            provider_api_key: api_key.to_string(),
+        }
+    }
+
+    const PROFILE_CHECK_JSON_OBJECT_RESPONSE: &str =
+        r#"{"id":"json","choices":[{"message":{"content":"{\"ok\":true}"}}]}"#;
+    const PROFILE_CHECK_ACTION_RESPONSE: &str = r#"{"id":"contract","choices":[{"message":{"content":"{\"kind\":\"final_answer\",\"message\":\"ok\"}"}}]}"#;
+    const PROFILE_CHECK_STREAM_JSON_OBJECT_RESPONSE: &str = "data: {\"id\":\"json\",\"choices\":[{\"delta\":{\"content\":\"{\\\"ok\\\":true}\"}}]}\n\ndata: [DONE]\n\n";
+    const PROFILE_CHECK_STREAM_ACTION_RESPONSE: &str = "data: {\"id\":\"contract\",\"choices\":[{\"delta\":{\"content\":\"{\\\"kind\\\":\\\"final_answer\\\",\\\"message\\\":\\\"ok\\\"}\"}}]}\n\ndata: [DONE]\n\n";
+
     async fn read_profile_check_http_body(socket: &mut tokio::net::TcpStream) -> String {
         let mut buffer = Vec::new();
         let mut chunk = [0_u8; 1024];
@@ -9867,6 +10147,34 @@ mod tests {
             let request_body = read_profile_check_http_body(&mut socket).await;
             write_profile_check_http_response(&mut socket, status, body).await;
             request_body
+        });
+        (base_url, server)
+    }
+
+    async fn spawn_profile_check_openai_sequence_server(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener address should be available")
+        );
+        let server = tokio::spawn(async move {
+            let mut request_bodies = Vec::new();
+            for (status, body) in responses {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .expect("test request should connect");
+                let request_body = read_profile_check_http_body(&mut socket).await;
+                write_profile_check_http_response(&mut socket, status, body).await;
+                request_bodies.push(request_body);
+            }
+            request_bodies
         });
         (base_url, server)
     }
@@ -9993,7 +10301,12 @@ mod tests {
             let state_dir = test_state_dir(name);
             let store = initialize_test_store(&state_dir);
             let state = test_app_state(&store);
-            let (base_url, server) = spawn_profile_check_openai_server(status, body).await;
+            let mut responses = vec![(status, body)];
+            if expected == ProfileCheckOutcome::Ok {
+                responses.push((200, PROFILE_CHECK_JSON_OBJECT_RESPONSE));
+                responses.push((200, PROFILE_CHECK_ACTION_RESPONSE));
+            }
+            let (base_url, server) = spawn_profile_check_openai_sequence_server(responses).await;
             let profile_id = set_default_profile_model_target(
                 &state,
                 role,
@@ -10016,7 +10329,8 @@ mod tests {
             if status != 200 {
                 assert_eq!(result.http_status, Some(status));
             }
-            let request_body = server.await.expect("test server should finish");
+            let requests = server.await.expect("test server should finish");
+            let request_body = requests.first().expect("first request should be captured");
             let payload: Value =
                 serde_json::from_str(&request_body).expect("provider request body should be JSON");
             assert_eq!(payload["model"], "profile-check-model");
@@ -10075,10 +10389,14 @@ mod tests {
         let state_dir = test_state_dir("profile-check-loopback-no-auth");
         let store = initialize_test_store(&state_dir);
         let state = test_app_state(&store);
-        let (base_url, server) = spawn_profile_check_openai_server(
-            200,
-            r#"{"id":"ok","choices":[{"message":{"content":"pong"}}]}"#,
-        )
+        let (base_url, server) = spawn_profile_check_openai_sequence_server(vec![
+            (
+                200,
+                r#"{"id":"ok","choices":[{"message":{"content":"pong"}}]}"#,
+            ),
+            (200, PROFILE_CHECK_JSON_OBJECT_RESPONSE),
+            (200, PROFILE_CHECK_ACTION_RESPONSE),
+        ])
         .await;
         let profile_id = set_default_profile_model_target(
             &state,
@@ -10097,7 +10415,8 @@ mod tests {
         let result = run_profile_check(state.clone(), &profile_id, "utility").await;
 
         assert_eq!(result.outcome, ProfileCheckOutcome::Ok);
-        let request_body = server.await.expect("test server should finish");
+        let requests = server.await.expect("test server should finish");
+        let request_body = requests.first().expect("first request should be captured");
         assert!(request_body.contains("loopback-no-auth-model"));
         assert_profile_check_created_no_work(&state);
         let _ = fs::remove_dir_all(&state_dir);
@@ -10108,10 +10427,14 @@ mod tests {
         let state_dir = test_state_dir("profile-check-streaming-transport");
         let store = initialize_test_store(&state_dir);
         let state = test_app_state(&store);
-        let (base_url, server) = spawn_profile_check_openai_server(
-            200,
-            "data: {\"id\":\"stream-ok\",\"choices\":[{\"delta\":{\"content\":\"pong\"}}]}\n\ndata: [DONE]\n\n",
-        )
+        let (base_url, server) = spawn_profile_check_openai_sequence_server(vec![
+            (
+                200,
+                "data: {\"id\":\"stream-ok\",\"choices\":[{\"delta\":{\"content\":\"pong\"}}]}\n\ndata: [DONE]\n\n",
+            ),
+            (200, PROFILE_CHECK_STREAM_JSON_OBJECT_RESPONSE),
+            (200, PROFILE_CHECK_STREAM_ACTION_RESPONSE),
+        ])
         .await;
         let profile_id = set_default_profile_model_target(
             &state,
@@ -10124,10 +10447,296 @@ mod tests {
         let result = run_profile_check(state.clone(), &profile_id, "utility").await;
 
         assert_eq!(result.outcome, ProfileCheckOutcome::Ok);
-        let request_body = server.await.expect("test server should finish");
+        let requests = server.await.expect("test server should finish");
+        let request_body = requests.first().expect("first request should be captured");
         let payload: Value =
             serde_json::from_str(&request_body).expect("provider request body should be JSON");
         assert_eq!(payload["stream"], true);
+        assert_profile_check_created_no_work(&state);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn workspace_profile_check_falls_back_to_non_streaming_and_persists_transport() {
+        let state_dir = test_state_dir("profile-check-non-streaming-discovery");
+        let store = initialize_test_store(&state_dir);
+        let state = test_app_state(&store);
+        let (base_url, server) = spawn_profile_check_openai_sequence_server(vec![
+            (200, "data: [DONE]\n\n"),
+            (
+                200,
+                r#"{"id":"ok","choices":[{"message":{"content":"pong"}}]}"#,
+            ),
+            (200, PROFILE_CHECK_JSON_OBJECT_RESPONSE),
+            (200, PROFILE_CHECK_ACTION_RESPONSE),
+        ])
+        .await;
+        let profile_id = set_default_profile_model_target(
+            &state,
+            "utility",
+            "non-streaming-check-model",
+            &base_url,
+            "test-key",
+        );
+
+        let result = run_profile_check(state.clone(), &profile_id, "utility").await;
+
+        assert_eq!(result.outcome, ProfileCheckOutcome::Ok);
+        assert_eq!(result.json_object, ModelJsonObjectCapability::Supported);
+        assert_eq!(result.transport, ModelTransportCapability::NonStreaming);
+        assert_eq!(
+            result.action_contract,
+            ModelActionContractCapability::Passed
+        );
+        let requests = server.await.expect("test server should finish");
+        assert_eq!(requests.len(), 4);
+        let first: Value = serde_json::from_str(&requests[0]).expect("request body should parse");
+        let second: Value = serde_json::from_str(&requests[1]).expect("request body should parse");
+        let third: Value = serde_json::from_str(&requests[2]).expect("request body should parse");
+        let fourth: Value = serde_json::from_str(&requests[3]).expect("request body should parse");
+        assert_eq!(first["stream"], true);
+        assert_eq!(second["stream"], false);
+        assert_eq!(third["stream"], false);
+        assert_eq!(third["response_format"]["type"], "json_object");
+        assert_eq!(fourth["stream"], false);
+        assert!(
+            fourth["messages"][1]["content"]
+                .as_str()
+                .expect("contract prompt should be text")
+                .contains("final_answer")
+        );
+        let workspace = state.store.workspace().expect("workspace should load");
+        let profile = workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .expect("profile should exist");
+        assert_eq!(
+            profile.utility.json_object,
+            ModelJsonObjectCapability::Supported
+        );
+        assert_eq!(
+            profile.utility.transport,
+            ModelTransportCapability::NonStreaming
+        );
+        assert_eq!(
+            profile.utility.action_contract,
+            ModelActionContractCapability::Passed
+        );
+        assert_eq!(profile.utility.api_key, "test-key");
+        assert_profile_check_created_no_work(&state);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn workspace_profile_check_falls_back_when_streaming_is_rejected_over_http() {
+        let state_dir = test_state_dir("profile-check-http-streaming-rejected");
+        let store = initialize_test_store(&state_dir);
+        let state = test_app_state(&store);
+        let (base_url, server) = spawn_profile_check_openai_sequence_server(vec![
+            (400, r#"{"error":"stream is not supported for this route"}"#),
+            (
+                200,
+                r#"{"id":"ok","choices":[{"message":{"content":"pong"}}]}"#,
+            ),
+            (200, PROFILE_CHECK_JSON_OBJECT_RESPONSE),
+            (200, PROFILE_CHECK_ACTION_RESPONSE),
+        ])
+        .await;
+        let profile_id = set_default_profile_model_target(
+            &state,
+            "utility",
+            "http-stream-reject-model",
+            &base_url,
+            "test-key",
+        );
+
+        let result = run_profile_check(state.clone(), &profile_id, "utility").await;
+
+        assert_eq!(result.outcome, ProfileCheckOutcome::Ok);
+        assert_eq!(result.transport, ModelTransportCapability::NonStreaming);
+        let requests = server.await.expect("test server should finish");
+        assert_eq!(requests.len(), 4);
+        let first: Value = serde_json::from_str(&requests[0]).expect("request body should parse");
+        let second: Value = serde_json::from_str(&requests[1]).expect("request body should parse");
+        assert_eq!(first["stream"], true);
+        assert_eq!(second["stream"], false);
+        let workspace = state.store.workspace().expect("workspace should load");
+        let profile = workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .expect("profile should exist");
+        assert_eq!(
+            profile.utility.transport,
+            ModelTransportCapability::NonStreaming
+        );
+        assert_profile_check_created_no_work(&state);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn workspace_profile_check_persists_failed_action_contract() {
+        let state_dir = test_state_dir("profile-check-action-contract-failed");
+        let store = initialize_test_store(&state_dir);
+        let state = test_app_state(&store);
+        let (base_url, server) = spawn_profile_check_openai_sequence_server(vec![
+            (
+                200,
+                r#"{"id":"ok","choices":[{"message":{"content":"pong"}}]}"#,
+            ),
+            (200, PROFILE_CHECK_JSON_OBJECT_RESPONSE),
+            (
+                200,
+                r#"{"id":"contract","choices":[{"message":{"content":"plain text, not an action"}}]}"#,
+            ),
+        ])
+        .await;
+        let profile_id = set_default_profile_model_target(
+            &state,
+            "utility",
+            "failed-contract-model",
+            &base_url,
+            "test-key",
+        );
+        set_profile_role_transport(
+            &state,
+            &profile_id,
+            "utility",
+            ModelTransportCapability::NonStreaming,
+        );
+
+        let result = run_profile_check(state.clone(), &profile_id, "utility").await;
+
+        assert_eq!(result.outcome, ProfileCheckOutcome::Ok);
+        assert_eq!(
+            result.action_contract,
+            ModelActionContractCapability::Failed
+        );
+        let requests = server.await.expect("test server should finish");
+        assert_eq!(requests.len(), 3);
+        let workspace = state.store.workspace().expect("workspace should load");
+        let profile = workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .expect("profile should exist");
+        assert_eq!(
+            profile.utility.action_contract,
+            ModelActionContractCapability::Failed
+        );
+        assert_eq!(profile.utility.api_key, "test-key");
+        assert_profile_check_created_no_work(&state);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn workspace_profile_check_keeps_action_contract_unknown_on_probe_transport_error() {
+        let state_dir = test_state_dir("profile-check-action-contract-transport-error");
+        let store = initialize_test_store(&state_dir);
+        let state = test_app_state(&store);
+        let (base_url, server) = spawn_profile_check_openai_sequence_server(vec![
+            (
+                200,
+                r#"{"id":"ok","choices":[{"message":{"content":"pong"}}]}"#,
+            ),
+            (200, PROFILE_CHECK_JSON_OBJECT_RESPONSE),
+            (500, r#"{"error":"temporary upstream failure"}"#),
+        ])
+        .await;
+        let profile_id = set_default_profile_model_target(
+            &state,
+            "utility",
+            "transient-contract-error-model",
+            &base_url,
+            "test-key",
+        );
+        set_profile_role_transport(
+            &state,
+            &profile_id,
+            "utility",
+            ModelTransportCapability::NonStreaming,
+        );
+
+        let result = run_profile_check(state.clone(), &profile_id, "utility").await;
+
+        assert_eq!(result.outcome, ProfileCheckOutcome::Ok);
+        assert_eq!(result.json_object, ModelJsonObjectCapability::Supported);
+        assert_eq!(
+            result.action_contract,
+            ModelActionContractCapability::Unknown
+        );
+        let requests = server.await.expect("test server should finish");
+        assert_eq!(requests.len(), 3);
+        let workspace = state.store.workspace().expect("workspace should load");
+        let profile = workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .expect("profile should exist");
+        assert_eq!(
+            profile.utility.json_object,
+            ModelJsonObjectCapability::Supported
+        );
+        assert_eq!(
+            profile.utility.action_contract,
+            ModelActionContractCapability::Unknown
+        );
+        assert_profile_check_created_no_work(&state);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn workspace_profile_check_persists_passed_action_contract() {
+        let state_dir = test_state_dir("profile-check-action-contract-passed");
+        let store = initialize_test_store(&state_dir);
+        let state = test_app_state(&store);
+        let (base_url, server) = spawn_profile_check_openai_sequence_server(vec![
+            (
+                200,
+                r#"{"id":"ok","choices":[{"message":{"content":"pong"}}]}"#,
+            ),
+            (200, PROFILE_CHECK_JSON_OBJECT_RESPONSE),
+            (
+                200,
+                r#"{"id":"contract","choices":[{"message":{"content":"{\"kind\":\"final_answer\",\"message\":\"ready\"}"}}]}"#,
+            ),
+        ])
+        .await;
+        let profile_id = set_default_profile_model_target(
+            &state,
+            "main",
+            "passed-contract-model",
+            &base_url,
+            "main-key",
+        );
+        set_profile_role_transport(
+            &state,
+            &profile_id,
+            "main",
+            ModelTransportCapability::NonStreaming,
+        );
+
+        let result = run_profile_check(state.clone(), &profile_id, "main").await;
+
+        assert_eq!(result.outcome, ProfileCheckOutcome::Ok);
+        assert_eq!(
+            result.action_contract,
+            ModelActionContractCapability::Passed
+        );
+        let requests = server.await.expect("test server should finish");
+        assert_eq!(requests.len(), 3);
+        let workspace = state.store.workspace().expect("workspace should load");
+        let profile = workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .expect("profile should exist");
+        assert_eq!(
+            profile.main.action_contract,
+            ModelActionContractCapability::Passed
+        );
+        assert_eq!(profile.main.api_key, "main-key");
         assert_profile_check_created_no_work(&state);
         let _ = fs::remove_dir_all(&state_dir);
     }
@@ -10258,6 +10867,161 @@ mod tests {
             patch.main.transport,
             nucleus_protocol::ModelTransportCapability::Unknown
         );
+    }
+
+    #[test]
+    fn profile_check_capability_persist_merges_with_current_profile_edits() {
+        let state_dir = test_state_dir("profile-check-capability-merge-current");
+        let store = initialize_test_store(&state_dir);
+        let state = test_app_state(&store);
+        let profile_id = set_default_profile_model_target(
+            &state,
+            "utility",
+            "merge-model",
+            "http://127.0.0.1:20128/v1",
+            "utility-secret",
+        );
+        let original_workspace = state.store.workspace().expect("workspace should load");
+        let original_profile = original_workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .expect("profile should exist")
+            .clone();
+        let target = profile_check_target_selection(
+            &profile_id,
+            &original_profile.title,
+            "merge-model",
+            "http://127.0.0.1:20128/v1",
+            "utility-secret",
+        );
+        let mut current_main = original_profile.main.clone();
+        current_main.model = "edited-main-model".to_string();
+        state
+            .store
+            .update_workspace_profile(
+                &profile_id,
+                WorkspaceProfilePatch {
+                    title: "Renamed while checking".to_string(),
+                    main: current_main,
+                    utility: original_profile.utility.clone(),
+                    is_default: original_profile.is_default,
+                },
+            )
+            .expect("profile edit should persist");
+
+        let (json_object, transport, action_contract, persisted) =
+            persist_profile_check_capabilities(
+                &state,
+                &original_profile,
+                "utility",
+                &target,
+                Some(ModelJsonObjectCapability::Supported),
+                ModelTransportCapability::NonStreaming,
+                Some(ModelActionContractCapability::Passed),
+            )
+            .expect("capabilities should persist");
+
+        assert!(persisted);
+        assert_eq!(json_object, ModelJsonObjectCapability::Supported);
+        assert_eq!(transport, ModelTransportCapability::NonStreaming);
+        assert_eq!(action_contract, ModelActionContractCapability::Passed);
+        let workspace = state.store.workspace().expect("workspace should load");
+        let profile = workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .expect("profile should exist");
+        assert_eq!(profile.title, "Renamed while checking");
+        assert_eq!(profile.main.model, "edited-main-model");
+        assert_eq!(profile.utility.api_key, "utility-secret");
+        assert_eq!(
+            profile.utility.json_object,
+            ModelJsonObjectCapability::Supported
+        );
+        assert_eq!(
+            profile.utility.transport,
+            ModelTransportCapability::NonStreaming
+        );
+        assert_eq!(
+            profile.utility.action_contract,
+            ModelActionContractCapability::Passed
+        );
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn profile_check_capability_persist_skips_when_checked_target_changed() {
+        let state_dir = test_state_dir("profile-check-capability-target-changed");
+        let store = initialize_test_store(&state_dir);
+        let state = test_app_state(&store);
+        let profile_id = set_default_profile_model_target(
+            &state,
+            "utility",
+            "old-model",
+            "http://127.0.0.1:20128/v1",
+            "old-secret",
+        );
+        let original_workspace = state.store.workspace().expect("workspace should load");
+        let original_profile = original_workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .expect("profile should exist")
+            .clone();
+        let target = profile_check_target_selection(
+            &profile_id,
+            &original_profile.title,
+            "old-model",
+            "http://127.0.0.1:20128/v1",
+            "old-secret",
+        );
+        let mut changed_utility = original_profile.utility.clone();
+        changed_utility.model = "new-model".to_string();
+        changed_utility.api_key = "new-secret".to_string();
+        state
+            .store
+            .update_workspace_profile(
+                &profile_id,
+                WorkspaceProfilePatch {
+                    title: original_profile.title.clone(),
+                    main: original_profile.main.clone(),
+                    utility: changed_utility,
+                    is_default: original_profile.is_default,
+                },
+            )
+            .expect("profile edit should persist");
+
+        let (json_object, transport, action_contract, persisted) =
+            persist_profile_check_capabilities(
+                &state,
+                &original_profile,
+                "utility",
+                &target,
+                Some(ModelJsonObjectCapability::Supported),
+                ModelTransportCapability::NonStreaming,
+                Some(ModelActionContractCapability::Passed),
+            )
+            .expect("capability persist should skip stale target");
+
+        assert!(!persisted);
+        assert_eq!(json_object, ModelJsonObjectCapability::Unknown);
+        assert_eq!(transport, ModelTransportCapability::Unknown);
+        assert_eq!(action_contract, ModelActionContractCapability::Unknown);
+        let workspace = state.store.workspace().expect("workspace should load");
+        let profile = workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .expect("profile should exist");
+        assert_eq!(profile.utility.model, "new-model");
+        assert_eq!(profile.utility.api_key, "new-secret");
+        assert_eq!(profile.utility.transport, ModelTransportCapability::Unknown);
+        assert_eq!(
+            profile.utility.action_contract,
+            ModelActionContractCapability::Unknown
+        );
+        let _ = fs::remove_dir_all(&state_dir);
     }
 
     #[test]
