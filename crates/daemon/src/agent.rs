@@ -2588,7 +2588,7 @@ async fn run_job_loop(
 
         session = state.store.get_session(&session_id)?;
         match response.action {
-            WorkerAction::SpawnChildJobs { summary, jobs } => {
+            WorkerAction::SpawnChildJobs { summary, jobs, .. } => {
                 if session.session.execution_mode == "plan" {
                     retry_plan_mode_action(
                         state,
@@ -2625,6 +2625,7 @@ async fn run_job_loop(
                 metadata,
                 artifacts,
                 browser_verification,
+                ..
             } => {
                 let detail = state.store.get_job(job_id)?;
                 if should_retry_zero_tool_action_final_answer(
@@ -2798,7 +2799,9 @@ async fn run_job_loop(
                 .await?;
                 return Ok(());
             }
-            WorkerAction::ProgressUpdate { summary, detail } => {
+            WorkerAction::ProgressUpdate {
+                summary, detail, ..
+            } => {
                 if session.session.execution_mode == "plan" {
                     retry_plan_mode_action(
                         state,
@@ -2833,6 +2836,7 @@ async fn run_job_loop(
                 until,
                 max_wait_seconds,
                 wake_note,
+                ..
             } => {
                 if session.session.execution_mode == "plan" {
                     retry_plan_mode_action(
@@ -2867,6 +2871,7 @@ async fn run_job_loop(
                 summary,
                 tool,
                 args,
+                ..
             } => {
                 if session.session.execution_mode == "plan" {
                     retry_plan_mode_action(
@@ -3752,7 +3757,7 @@ async fn record_worker_progress_update(
     summary: &str,
     detail: &str,
 ) -> Result<()> {
-    checkpoint.next_prompt = Some(build_progress_update_continuation_prompt(summary, detail));
+    checkpoint.next_prompt = progress_update_next_prompt();
     state.store.write_worker_checkpoint(
         &worker.id,
         &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
@@ -4540,10 +4545,16 @@ async fn complete_job_with_budget_checkpoint(
     budget_kind: &str,
 ) -> Result<()> {
     let summary = format!("Reached current {budget_kind} budget");
+    let latest_progress_detail = state
+        .store
+        .get_job(job_id)
+        .ok()
+        .and_then(|detail| latest_worker_progress_detail(&detail, &worker.id));
     let final_answer = build_budget_checkpoint_answer(
         session,
         worker,
         checkpoint,
+        latest_progress_detail.as_deref(),
         step_count,
         tool_call_count,
         budget_kind,
@@ -4568,6 +4579,7 @@ fn build_budget_checkpoint_answer(
     session: &SessionDetail,
     worker: &WorkerSummary,
     checkpoint: &WorkerCheckpoint,
+    latest_progress_detail: Option<&str>,
     step_count: usize,
     tool_call_count: usize,
     budget_kind: &str,
@@ -4580,6 +4592,7 @@ fn build_budget_checkpoint_answer(
     let latest_checkpoint = checkpoint
         .next_prompt
         .as_deref()
+        .or(latest_progress_detail)
         .or_else(|| {
             checkpoint
                 .conversation
@@ -4611,6 +4624,18 @@ fn build_budget_checkpoint_answer(
     format!(
         "Nucleus reached the current {budget_kind} budget for this run ({step_count} steps, {tool_call_count} actions, limit {limit}) while working in {project}.\n\nLatest checkpoint:\n{latest_checkpoint}{pending}\n\nSend a follow-up such as \"continue from the checkpoint\" to give Nucleus a fresh run budget without losing the visible session context."
     )
+}
+
+fn latest_worker_progress_detail(detail: &JobDetail, worker_id: &str) -> Option<String> {
+    detail
+        .events
+        .iter()
+        .rev()
+        .find(|event| {
+            event.event_type == "worker.progress" && event.worker_id.as_deref() == Some(worker_id)
+        })
+        .map(|event| event.detail.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn build_initial_step_prompt(
@@ -9346,7 +9371,7 @@ fn build_internal_action_item_retry_prompt(summary: &str, final_answer: &str) ->
         "Your previous final_answer was an internal action item, not a user-facing answer.\n\
 Previous summary: {}\n\
 Previous final_answer: {}\n\
-Return exactly one valid Nucleus worker action JSON object.\n\
+Return one valid Nucleus worker action JSON object. You may include brief thoughts before the action fields.\n\
 - If you need repo, workspace, file, git, search, or process information, return a tool_call instead of describing the action.\n\
 - Prefer auto-approved read actions such as project.inspect, fs.list, fs.read_text, rg.search, git.status, and git.diff when they can answer the request.\n\
 - Only return final_answer when the text directly answers the user.",
@@ -9360,7 +9385,7 @@ fn build_incomplete_progress_retry_prompt(summary: &str, final_answer: &str) -> 
         "Your previous final_answer said the requested work is incomplete, so it was a progress report rather than a completion answer.\n\
 Previous summary: {}\n\
 Previous final_answer: {}\n\
-Return exactly one valid Nucleus worker action JSON object.\n\
+Return one valid Nucleus worker action JSON object. You may include brief thoughts before the action fields.\n\
 - Do not final_answer progress updates, partial completion notes, or lists of remaining work.\n\
 - Continue with the next smallest useful tool_call unless you are genuinely blocked or the run budget is exhausted.\n\
 - Only return final_answer when the user's requested phase/task is fully complete and validated, or when you clearly cannot continue without user input.",
@@ -9379,7 +9404,7 @@ fn build_zero_tool_action_retry_prompt(
 User request excerpt: {}\n\
 Previous summary: {}\n\
 Previous final_answer: {}\n\
-Return exactly one valid Nucleus worker action JSON object and continue the job.\n\
+Return one valid Nucleus worker action JSON object and continue the job. You may include brief thoughts before the action fields.\n\
 - If the requested action can be performed, return the smallest useful tool_call now.\n\
 - If the action is ambiguous or requires user approval, return final_answer asking the specific confirmation question.\n\
 - If the action is blocked or impossible, return final_answer with the concrete blocker and evidence.\n\
@@ -9395,7 +9420,7 @@ fn build_evidence_completion_retry_prompt(summary: &str, final_answer: &str) -> 
         "Your previous final_answer made a confident negative claim without complete required evidence.\n\
 Previous summary: {}\n\
 Previous final_answer: {}\n\
-Return exactly one valid Nucleus worker action JSON object.\n\
+Return one valid Nucleus worker action JSON object. You may include brief thoughts before the action fields.\n\
 Rules:\n\
 - For PR review or latest feedback tasks, fetch thread-aware review data before saying there is no actionable feedback. Prefer github.pr_review_threads for inline review threads.\n\
 - For PR lifecycle claims such as already merged, nothing left to merge, open, closed, ready, mergeable, or approved, fetch direct PR state with github.pr_state. Local git status or log output is not enough.\n\
@@ -9580,7 +9605,7 @@ fn build_publication_outcome_retry_prompt(summary: &str, final_answer: &str) -> 
         "Your previous final_answer is missing explicit terminal metadata for a publication-oriented job.\n\
 Previous summary: {}\n\
 Previous final_answer: {}\n\
-Return exactly one valid Nucleus worker action JSON object using kind=\"final_answer\".\n\
+Return one valid Nucleus worker action JSON object using kind=\"final_answer\". You may include brief thoughts before the action fields.\n\
 Return a clean user-facing final_answer message plus these terminal metadata fields as JSON fields on the action or inside a structured final_answer object:\n\
 - publication_status: not_requested | opened | not_opened | blocked | failed\n\
 - publication_summary\n\
@@ -9706,19 +9731,8 @@ async fn apply_browser_verification_final_state(
     Ok(final_answer.to_string())
 }
 
-fn build_progress_update_continuation_prompt(summary: &str, detail: &str) -> String {
-    format!(
-        "Nucleus recorded your previous response as a non-terminal progress checkpoint.\n\
-Checkpoint summary: {}\n\
-Checkpoint detail: {}\n\
-Return exactly one valid Nucleus worker action JSON object for the next step.\n\
-- Continue working from this checkpoint.\n\
-- Prefer a tool_call for the next concrete repo, file, command, test, or verification action.\n\
-- You may use progress_update again only for a durable checkpoint; it does not complete the job.\n\
-- Use final_answer only when the requested task is complete and validated, or when you are genuinely blocked.",
-        excerpt(summary, 320),
-        excerpt(detail, 1_200)
-    )
+fn progress_update_next_prompt() -> Option<String> {
+    None
 }
 
 fn build_plan_mode_retry_prompt(summary: &str, attempted_action: &str) -> String {
@@ -10296,12 +10310,12 @@ fn build_worker_action_repair_prompt(
 
     format!(
         "Your previous Utility Worker response did not match the Nucleus action contract: {}.\n\
-Convert the previous response into exactly one valid Nucleus worker action JSON object and nothing else.\n\
+Convert the previous response into one valid Nucleus worker action JSON object. Include brief thoughts if they clarify the chosen action.\n\
 Currently supported tool IDs:\n\
 {}\n\
 Use the supported action shape that matches the previous intent:\n\
-- final_answer: {{\"kind\":\"final_answer\",\"summary\":\"brief reason the work is done\",\"final_answer\":\"user-facing answer\"}}\n\
-- tool_call: {{\"kind\":\"tool_call\",\"summary\":\"why this action is needed\",\"tool\":\"command.run\",\"args\":{{\"command\":\"sh\",\"args\":[\"-lc\",\"command text\"],\"cwd\":\"/path/if/needed\"}}}}\n\
+- final_answer: {{\"kind\":\"final_answer\",\"thoughts\":\"brief reason this answers the user\",\"summary\":\"brief reason the work is done\",\"final_answer\":\"user-facing answer\"}}\n\
+- tool_call: {{\"kind\":\"tool_call\",\"thoughts\":\"brief reason this action is needed\",\"summary\":\"why this action is needed\",\"tool\":\"command.run\",\"args\":{{\"command\":\"sh\",\"args\":[\"-lc\",\"command text\"],\"cwd\":\"/path/if/needed\"}}}}\n\
 - progress_update: {{\"kind\":\"progress_update\",\"summary\":\"checkpoint summary\",\"detail\":\"non-terminal progress detail\"}}\n\
 - spawn_child_jobs: {{\"kind\":\"spawn_child_jobs\",\"summary\":\"why fan-out is needed\",\"jobs\":[{{\"title\":\"Focused child job\",\"prompt\":\"specific child task\",\"task_class\":\"local_project\",\"working_dir\":null}}]}}\n\
 Rules:\n\
@@ -17240,12 +17254,13 @@ fn worker_system_prompt(worker: &WorkerSummary) -> String {
 fn worker_system_prompt_with_mode(worker: &WorkerSummary, execution_mode: &str) -> String {
     if execution_mode == "plan" {
         return format!(
-            "You are the Utility Nucleus {} worker for a Nucleus-owned job.\n\
-Return exactly one JSON object and nothing else.\n\
+            "Respond to the user as the Utility Nucleus {} worker.\n\
+Nucleus worker action JSON contract: return one valid Nucleus worker action JSON object.\n\
 Plan mode is enabled for this session.\n\
 Allowed response shape:\n\
-{{\"kind\":\"final_answer\",\"summary\":\"what the plan covers\",\"final_answer\":\"concise user-facing plan\"}}\n\
+{{\"kind\":\"final_answer\",\"thoughts\":\"brief reason this can be answered without tools\",\"summary\":\"what the plan covers\",\"final_answer\":\"concise user-facing plan\"}}\n\
 Rules:\n\
+- Think briefly in thoughts before choosing the final_answer.\n\
 - Do not call tools.\n\
 - Do not spawn Utility Subworkers.\n\
 - Do not run commands, inspect files, edit files, or assume action results.\n\
@@ -17261,7 +17276,8 @@ Working directory: {}\n",
 
     let is_root_worker = worker.parent_worker_id.is_none();
     let action_shapes = if is_root_worker {
-        "{\"kind\":\"tool_call\",\"summary\":\"inspect the active project\",\"tool\":\"project.inspect\",\"args\":{}}\n\
+        "{\"kind\":\"final_answer\",\"thoughts\":\"brief reason the prompt is already answerable\",\"summary\":\"why the response is complete\",\"final_answer\":\"clean user-facing answer\",\"browser_verification\":{\"status\":\"passed|failed|not_performed|unavailable\",\"summary\":\"concise Browser verification result\",\"artifact_ids\":[\"artifact-id\"]}}\n\
+{\"kind\":\"tool_call\",\"thoughts\":\"brief reason this needs project evidence\",\"summary\":\"inspect the active project\",\"tool\":\"project.inspect\",\"args\":{}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"list likely project directories\",\"tool\":\"fs.list\",\"args\":{\"path\":\".\",\"recursive\":false,\"limit\":100}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"fetch inline PR review threads\",\"tool\":\"github.pr_review_threads\",\"args\":{\"pr_number\":123}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"fetch direct PR lifecycle state\",\"tool\":\"github.pr_state\",\"args\":{\"pr_number\":123}}\n\
@@ -17274,9 +17290,10 @@ Working directory: {}\n",
 {\"kind\":\"progress_update\",\"summary\":\"durable checkpoint, not done\",\"detail\":\"completed evidence and exact continuation point\"}\n\
 {\"kind\":\"wait\",\"summary\":\"park until an external condition is ready\",\"until\":{\"kind\":\"delay_seconds\",\"delay_seconds\":60},\"max_wait_seconds\":1800,\"wake_note\":\"optional wake-up context\"}\n\
 {\"kind\":\"wait\",\"summary\":\"park until memory classification finishes\",\"until\":{\"kind\":\"audit_event\",\"event_kind\":\"memory.classifier.completed\",\"target_pattern\":\"session:\",\"status\":\"success\"},\"max_wait_seconds\":1800}\n\
-{\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\",\"browser_verification\":{\"status\":\"passed|failed|not_performed|unavailable\",\"summary\":\"concise Browser verification result\",\"artifact_ids\":[\"artifact-id\"]}}"
+{\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\"}"
     } else {
-        "{\"kind\":\"tool_call\",\"summary\":\"inspect the active project\",\"tool\":\"project.inspect\",\"args\":{}}\n\
+        "{\"kind\":\"final_answer\",\"thoughts\":\"brief reason the prompt is already answerable\",\"summary\":\"why the response is complete\",\"final_answer\":\"clean user-facing answer\"}\n\
+{\"kind\":\"tool_call\",\"thoughts\":\"brief reason this needs project evidence\",\"summary\":\"inspect the active project\",\"tool\":\"project.inspect\",\"args\":{}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"list likely project directories\",\"tool\":\"fs.list\",\"args\":{\"path\":\".\",\"recursive\":false,\"limit\":100}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"fetch inline PR review threads\",\"tool\":\"github.pr_review_threads\",\"args\":{\"pr_number\":123}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"fetch direct PR lifecycle state\",\"tool\":\"github.pr_state\",\"args\":{\"pr_number\":123}}\n\
@@ -17307,12 +17324,14 @@ Working directory: {}\n",
     };
 
     format!(
-        "You are the Utility Nucleus {} worker for a Nucleus-owned job.\n\
-Return exactly one JSON object and nothing else.\n\
+        "Respond to the user as the Utility Nucleus {} worker. Use tools only when the task actually needs them.\n\
+Nucleus worker action JSON contract: return one valid Nucleus worker action JSON object.\n\
 Allowed response shapes:\n\
 {}\n\
 Rules:\n\
-- Choose and execute the smallest useful next action.\n\
+- Think briefly in the thoughts field first, then choose the action.\n\
+- If the user's prompt is conversational or already answerable from visible context, answer directly with final_answer.\n\
+- Choose the smallest useful next action when the request needs action, external state, or local evidence.\n\
 - Use tools only when they materially improve the answer.\n\
 - Never invent tool output.\n\
 - Stay inside the granted repo scope.\n\
@@ -17324,14 +17343,14 @@ Rules:\n\
 - progress_update records a non-terminal checkpoint for Nucleus; it does not complete the job.\n\
 - wait parks the worker until delay_seconds, absolute_unix, audit_event, child_jobs_completed, or artifact_kind is satisfied. It does not spend step/action budget but still spends wall-clock budget.\n\
 - Do not put plans, next-step instructions, progress updates, partial completion notes, or descriptions of future actions in final_answer.\n\
-- If the requested work is incomplete and you are not blocked or out of budget, continue with a tool_call instead of returning final_answer.\n\
+- If the requested work needs more evidence or action and you are not blocked or out of budget, continue with the appropriate action instead of returning final_answer.\n\
 - For PR feedback, latest review, requested changes, Codex review, or unresolved comment tasks, do not rely on flat gh pr view comments alone. Fetch thread-aware inline review data with github.pr_review_threads before saying there is no actionable feedback.\n\
 - For PR lifecycle claims like merged, open, closed, ready, mergeable, or approved, fetch direct GitHub PR state with github.pr_state. Local git state can supplement, but it is never enough to say a PR is already merged or that nothing is left to merge. Only say that when direct PR state is MERGED or mergedAt is non-empty. If PR identity is unclear, resolve it from the session branch or ask a bounded follow-up.\n\
 - If a user challenges or repeats a prior clean/no-action answer, treat it as a grounding failure signal and use a deeper or different evidence path before repeating the conclusion.\n\
 - Treat zero matched tests as no tests matched, not validation success.\n\
 - When posting GitHub comments, use github.comment or a body file/stdin path. Do not put comment bodies with backticks or shell metacharacters inside sh -lc strings.\n\
 - Use python.run for Python snippets instead of hard-coding python or python3 in command.run. For simple edits, prefer fs.apply_patch or fs.write_text over script-generated edits.\n\
-- Use final_answer only as the terminal completion action when the requested task is complete and validated, or when you are genuinely blocked.\n\
+- Use final_answer as the terminal action when the user is answered, the requested task is complete and validated, or you are genuinely blocked.\n\
 - Do not use provider-native tool wrappers such as tool_call/tool_name/shell; use the exact Nucleus JSON shapes above.\n\
 - Do not wrap JSON in markdown fences.\n\
 Available tools:\n{}\n\
@@ -17855,11 +17874,43 @@ mod tests {
             patch_loop_guardrail_triggered: false,
         };
 
-        let answer = build_budget_checkpoint_answer(&session, &worker, &checkpoint, 10, 8, "step");
+        let answer =
+            build_budget_checkpoint_answer(&session, &worker, &checkpoint, None, 10, 8, "step");
 
         assert!(answer.contains("reached the current step budget"));
         assert!(answer.contains("seed completed"));
         assert!(answer.contains("continue from the checkpoint"));
+    }
+
+    #[test]
+    fn budget_checkpoint_answer_uses_latest_progress_detail_when_next_prompt_is_empty() {
+        let worker = test_worker_summary("root", 10, 20);
+        let session = SessionDetail {
+            session: build_execution_session(&worker),
+            turns: Vec::new(),
+        };
+        let checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "do useful work".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+
+        let answer = build_budget_checkpoint_answer(
+            &session,
+            &worker,
+            &checkpoint,
+            Some("Progress detail remains available for the user handoff."),
+            10,
+            8,
+            "step",
+        );
+
+        assert!(answer.contains("Progress detail remains available for the user handoff."));
     }
 
     #[test]
@@ -18126,6 +18177,15 @@ mod tests {
         assert!(root_prompt.contains("spawn_child_jobs"));
         assert!(!child_prompt.contains("spawn_child_jobs"));
         assert!(root_prompt.contains("{\"kind\":\"final_answer\""));
+        assert!(root_prompt.contains("Nucleus worker action JSON contract"));
+        assert!(root_prompt.contains("Think briefly in the thoughts field first"));
+        assert!(root_prompt.contains("already answerable from visible context"));
+        assert!(!root_prompt.contains("and nothing else"));
+        assert!(
+            root_prompt.find("{\"kind\":\"final_answer\"")
+                < root_prompt.find("{\"kind\":\"tool_call\""),
+            "worker prompt should present final_answer before tool_call examples"
+        );
         assert!(
             !root_prompt.contains("{{\"kind\""),
             "worker prompt must show valid single-object JSON examples"
@@ -20816,15 +20876,10 @@ Cleanup status: clean";
     }
 
     #[test]
-    fn progress_update_continuation_prompt_keeps_job_running() {
-        let prompt = build_progress_update_continuation_prompt(
-            "checkpoint saved",
-            "Composer extraction is complete; continue with sidebar extraction.",
-        );
+    fn progress_update_next_prompt_is_empty_without_reinjecting_detail() {
+        let prompt = progress_update_next_prompt();
 
-        assert!(prompt.contains("non-terminal progress checkpoint"));
-        assert!(prompt.contains("Continue working from this checkpoint"));
-        assert!(prompt.contains("Use final_answer only when the requested task is complete"));
+        assert!(prompt.is_none());
     }
 
     #[test]
@@ -21107,6 +21162,7 @@ Cleanup status: clean";
             summary,
             tool,
             args,
+            ..
         } = action
         else {
             panic!("expected tool call");
@@ -21132,6 +21188,7 @@ Cleanup status: clean";
             summary,
             tool,
             args,
+            ..
         } = action
         else {
             panic!("expected tool call");
@@ -21156,6 +21213,7 @@ Cleanup status: clean";
             summary,
             tool,
             args,
+            ..
         } = action
         else {
             panic!("expected tool call");
@@ -21222,6 +21280,7 @@ Cleanup status: clean";
             summary,
             tool,
             args,
+            ..
         } = action
         else {
             panic!("expected tool call");
@@ -21248,6 +21307,7 @@ Cleanup status: clean";
             summary,
             tool,
             args,
+            ..
         } = action
         else {
             panic!("expected tool call");
@@ -21280,7 +21340,8 @@ Cleanup status: clean";
         assert!(prompt.contains("\"tool\":\"command.run\""));
         assert!(prompt.contains("\"kind\":\"progress_update\""));
         assert!(prompt.contains("\"kind\":\"spawn_child_jobs\""));
-        assert!(prompt.contains("exactly one valid Nucleus worker action"));
+        assert!(prompt.contains("one valid Nucleus worker action"));
+        assert!(prompt.contains("brief thoughts"));
         assert!(prompt.contains("cloudflare-api.search"));
         assert!(prompt.contains("preserve that exact tool ID"));
         assert!(prompt.contains("Do not replace a supported non-command tool with command.run"));
@@ -22961,6 +23022,7 @@ Thanks."#,
             summary,
             tool,
             args,
+            ..
         } = action
         else {
             panic!("expected tool call");
@@ -22983,6 +23045,7 @@ Thanks."#,
             summary,
             tool,
             args,
+            ..
         } = action
         else {
             panic!("expected tool call");
@@ -23004,6 +23067,7 @@ Thanks."#,
             summary,
             tool,
             args,
+            ..
         } = action
         else {
             panic!("expected tool call");
@@ -23056,7 +23120,8 @@ Thanks."#,
         let conversation = vec![
             CheckpointMessage {
                 role: "system".to_string(),
-                content: "Return exactly one JSON object and nothing else.".to_string(),
+                content: "Nucleus worker action JSON contract: return one valid Nucleus worker action JSON object."
+                    .to_string(),
                 images: Vec::new(),
                 compacted: false,
                 compacted_range: None,
@@ -23084,7 +23149,7 @@ Thanks."#,
         let prompt = build_worker_prompt_input(&worker, &conversation, "You there?");
 
         assert!(
-            prompt.contains("Return exactly one JSON object and nothing else."),
+            prompt.contains("Nucleus worker action JSON contract"),
             "expected Claude prompt to inline the system contract: {prompt}"
         );
         assert!(
@@ -23142,7 +23207,8 @@ Thanks."#,
         };
         let conversation = vec![CheckpointMessage {
             role: "system".to_string(),
-            content: "Return exactly one JSON object and nothing else.".to_string(),
+            content: "Nucleus worker action JSON contract: return one valid Nucleus worker action JSON object."
+                .to_string(),
             images: Vec::new(),
             compacted: false,
             compacted_range: None,
@@ -23162,7 +23228,8 @@ Thanks."#,
             images: vec![image.clone()],
             conversation: vec![CheckpointMessage {
                 role: "system".to_string(),
-                content: "Return exactly one JSON object and nothing else.".to_string(),
+                content: "Nucleus worker action JSON contract: return one valid Nucleus worker action JSON object."
+                    .to_string(),
                 images: Vec::new(),
                 compacted: false,
                 compacted_range: None,
@@ -29510,7 +29577,8 @@ for line in sys.stdin:
                     images: Vec::new(),
                     conversation: vec![CheckpointMessage {
                         role: "system".to_string(),
-                        content: "Return exactly one JSON object and nothing else.".to_string(),
+                        content: "Nucleus worker action JSON contract: return one valid Nucleus worker action JSON object."
+                            .to_string(),
                         images: Vec::new(),
                         compacted: false,
                         compacted_range: None,
@@ -29842,7 +29910,8 @@ for line in sys.stdin:
     fn long_test_checkpoint(session_id: &str, message_count: usize) -> WorkerCheckpoint {
         let mut conversation = vec![CheckpointMessage {
             role: "system".to_string(),
-            content: "Return exactly one JSON object and nothing else.".to_string(),
+            content: "Nucleus worker action JSON contract: return one valid Nucleus worker action JSON object."
+                .to_string(),
             images: Vec::new(),
             compacted: false,
             compacted_range: None,
