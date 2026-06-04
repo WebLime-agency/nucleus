@@ -20,12 +20,29 @@ test('profile check schema parses a successful result', () => {
     role: 'utility',
     outcome: 'ok',
     message: 'Model responded.',
+    json_object: 'unknown',
+    transport: 'non_streaming',
+    action_contract: 'passed',
     latency_ms: 42
   });
 
   assert.equal(parsed.role, 'utility');
   assert.equal(parsed.outcome, 'ok');
+  assert.equal(parsed.transport, 'non_streaming');
+  assert.equal(parsed.action_contract, 'passed');
   assert.equal(parsed.latency_ms, 42);
+});
+
+test('profile check schema defaults unknown fingerprint fields', () => {
+  const parsed = profileCheckResultSchema.parse({
+    role: 'utility',
+    outcome: 'ok',
+    message: 'Model responded.'
+  });
+
+  assert.equal(parsed.json_object, 'unknown');
+  assert.equal(parsed.transport, 'unknown');
+  assert.equal(parsed.action_contract, 'unknown');
 });
 
 test('profile check schema parses classified failure results', () => {
