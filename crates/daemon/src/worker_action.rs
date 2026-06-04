@@ -7,20 +7,28 @@ use serde_json::{Map, Value, json};
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkerAction {
     ToolCall {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thoughts: Option<String>,
         summary: String,
         tool: String,
         #[serde(default)]
         args: Value,
     },
     SpawnChildJobs {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thoughts: Option<String>,
         summary: String,
         jobs: Vec<ChildJobProposal>,
     },
     ProgressUpdate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thoughts: Option<String>,
         summary: String,
         detail: String,
     },
     Wait {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thoughts: Option<String>,
         summary: String,
         until: WaitUntil,
         #[serde(default)]
@@ -29,6 +37,8 @@ pub enum WorkerAction {
         wake_note: Option<String>,
     },
     FinalAnswer {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thoughts: Option<String>,
         summary: String,
         final_answer: String,
         #[serde(default)]
@@ -500,6 +510,7 @@ fn recover_provider_shell_action(
     normalize_worker_tool_name_and_args("shell", Value::Object(args), support).map(
         |(tool, args)| {
             Some(WorkerAction::ToolCall {
+                thoughts: None,
                 summary: "Run the requested Nucleus action.".to_string(),
                 tool,
                 args,
@@ -684,11 +695,13 @@ fn normalize_worker_action_value(
     }
 
     if let Some(tool_call) = object.get("tool_call") {
-        return normalize_worker_tool_call_value(tool_call, support).map(Some);
+        let tool_call = inherit_action_context(tool_call, object);
+        return normalize_worker_tool_call_value(&tool_call, support).map(Some);
     }
 
     if let Some(function_call) = object.get("function_call") {
-        return normalize_worker_tool_call_value(function_call, support).map(Some);
+        let function_call = inherit_action_context(function_call, object);
+        return normalize_worker_tool_call_value(&function_call, support).map(Some);
     }
 
     if object
@@ -765,8 +778,13 @@ fn normalize_worker_progress_update_value(
         .filter(|value| !value.is_empty())
         .unwrap_or("Recorded a non-terminal progress checkpoint.")
         .to_string();
+    let thoughts = normalized_action_thoughts(object, nested);
 
-    Ok(WorkerAction::ProgressUpdate { summary, detail })
+    Ok(WorkerAction::ProgressUpdate {
+        thoughts,
+        summary,
+        detail,
+    })
 }
 
 fn format_progress_update_object(object: &serde_json::Map<String, Value>) -> String {
@@ -792,6 +810,7 @@ fn format_progress_update_object(object: &serde_json::Map<String, Value>) -> Str
             "changed_files",
             "remaining",
             "next",
+            "thoughts",
         ]
         .contains(&key.as_str())
         {
@@ -814,6 +833,7 @@ fn normalize_worker_final_answer_value(
     object: &serde_json::Map<String, Value>,
 ) -> Result<WorkerAction, WorkerActionParseError> {
     let nested_final_answer = object.get("final_answer").and_then(Value::as_object);
+    let thoughts = normalized_action_thoughts(object, nested_final_answer);
     let final_answer = normalized_final_answer_message(object)
         .or_else(|| nested_final_answer.and_then(normalized_final_answer_message))
         .or_else(|| {
@@ -875,6 +895,7 @@ fn normalize_worker_final_answer_value(
     }
 
     Ok(WorkerAction::FinalAnswer {
+        thoughts,
         summary,
         final_answer,
         metadata: Value::Object(metadata),
@@ -1063,6 +1084,7 @@ fn is_final_answer_control_key(key: &str) -> bool {
             | "content"
             | "answer"
             | "text"
+            | "thoughts"
             | "summary"
             | "artifacts"
             | "browser_verification"
@@ -1227,6 +1249,7 @@ fn normalize_worker_tool_call_value(
             inline_args.remove("name");
             inline_args.remove("summary");
             inline_args.remove("reason");
+            inline_args.remove("thoughts");
             if inline_args.len() == 1 && inline_args.contains_key("input") {
                 inline_args.remove("input").unwrap_or(Value::Null)
             } else {
@@ -1242,13 +1265,41 @@ fn normalize_worker_tool_call_value(
         .filter(|value| !value.is_empty())
         .unwrap_or("Run the requested Nucleus action.")
         .to_string();
+    let thoughts = normalized_action_thoughts(object, None);
 
     let (tool, args) = normalize_worker_tool_name_and_args(raw_tool, args, support)?;
     Ok(WorkerAction::ToolCall {
+        thoughts,
         summary,
         tool,
         args,
     })
+}
+
+fn inherit_action_context(value: &Value, parent: &serde_json::Map<String, Value>) -> Value {
+    let Some(child) = value.as_object() else {
+        return value.clone();
+    };
+    if child.contains_key("thoughts") || !parent.contains_key("thoughts") {
+        return value.clone();
+    }
+
+    let mut inherited = child.clone();
+    if let Some(thoughts) = parent.get("thoughts") {
+        inherited.insert("thoughts".to_string(), thoughts.clone());
+    }
+    Value::Object(inherited)
+}
+
+fn normalized_action_thoughts(
+    object: &serde_json::Map<String, Value>,
+    nested: Option<&serde_json::Map<String, Value>>,
+) -> Option<String> {
+    object
+        .get("thoughts")
+        .or_else(|| nested.and_then(|value| value.get("thoughts")))
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed)
 }
 
 fn is_provider_tool_call_type(value: Option<&Value>) -> bool {
@@ -1468,6 +1519,7 @@ mod tests {
             summary,
             tool,
             args,
+            ..
         } = action
         else {
             panic!("expected tool call");
@@ -1493,6 +1545,76 @@ Action: {"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
     }
 
     #[test]
+    fn parses_final_answer_with_thoughts_as_terminal_action() {
+        let action = parse_worker_action(
+            r#"{"kind":"final_answer","thoughts":"The prompt is conversational and needs no tools.","summary":"answered directly","final_answer":"Ready."}"#,
+        )
+        .expect("final answer with thoughts should parse");
+
+        let WorkerAction::FinalAnswer {
+            thoughts,
+            summary,
+            final_answer,
+            metadata,
+            ..
+        } = action
+        else {
+            panic!("expected final answer");
+        };
+
+        assert_eq!(
+            thoughts.as_deref(),
+            Some("The prompt is conversational and needs no tools.")
+        );
+        assert_eq!(summary, "answered directly");
+        assert_eq!(final_answer, "Ready.");
+        assert!(metadata.get("thoughts").is_none());
+    }
+
+    #[test]
+    fn parses_tool_call_with_thoughts_without_leaking_to_args() {
+        let action = parse_worker_action(
+            r#"{"kind":"tool_call","thoughts":"I need local evidence before answering.","summary":"inspect project","tool":"project.inspect","args":{}}"#,
+        )
+        .expect("tool call with thoughts should parse");
+
+        let WorkerAction::ToolCall {
+            thoughts,
+            summary,
+            tool,
+            args,
+        } = action
+        else {
+            panic!("expected tool call");
+        };
+
+        assert_eq!(
+            thoughts.as_deref(),
+            Some("I need local evidence before answering.")
+        );
+        assert_eq!(summary, "inspect project");
+        assert_eq!(tool, "project.inspect");
+        assert_eq!(args, json!({}));
+    }
+
+    #[test]
+    fn parses_prose_wrapped_action_with_thoughts() {
+        let action = parse_worker_action(
+            r#"Briefly, this is already answerable.
+{"kind":"final_answer","thoughts":"No repository evidence is required.","summary":"answered directly","final_answer":"Ready."}
+No other action is needed."#,
+        )
+        .expect("balanced JSON action inside prose should parse");
+
+        assert!(matches!(
+            action,
+            WorkerAction::FinalAnswer { thoughts, final_answer, .. }
+                if thoughts.as_deref() == Some("No repository evidence is required.")
+                    && final_answer == "Ready."
+        ));
+    }
+
+    #[test]
     fn accepts_registered_mcp_tool_id_without_mcp_prefix() {
         let action = parse_worker_action_with_registered_mcp_tools(
             r#"{"kind":"tool_call","summary":"search cloudflare","tool":"cloudflare-api.search","args":{"query":"workers ai"}}"#,
@@ -1504,6 +1626,7 @@ Action: {"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
             summary,
             tool,
             args,
+            ..
         } = action
         else {
             panic!("expected tool call");
@@ -1526,6 +1649,7 @@ Action: {"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
             summary,
             tool,
             args,
+            ..
         } = action
         else {
             panic!("expected tool call");
@@ -1625,6 +1749,7 @@ Action: {"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
             summary,
             tool,
             args,
+            ..
         } = action
         else {
             panic!("expected tool call");
@@ -2043,7 +2168,10 @@ Action: {"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
         )
         .expect("progress_update should parse");
 
-        let WorkerAction::ProgressUpdate { summary, detail } = action else {
+        let WorkerAction::ProgressUpdate {
+            summary, detail, ..
+        } = action
+        else {
             panic!("expected progress update");
         };
 
@@ -2061,7 +2189,10 @@ Action: {"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
         )
         .expect("checkpoint/content progress should normalize");
 
-        let WorkerAction::ProgressUpdate { summary, detail } = action else {
+        let WorkerAction::ProgressUpdate {
+            summary, detail, ..
+        } = action
+        else {
             panic!("expected progress update");
         };
 
@@ -2079,7 +2210,10 @@ Action: {"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
         )
         .expect("object progress_update should normalize");
 
-        let WorkerAction::ProgressUpdate { summary, detail } = action else {
+        let WorkerAction::ProgressUpdate {
+            summary, detail, ..
+        } = action
+        else {
             panic!("expected progress update");
         };
 
@@ -2097,7 +2231,10 @@ Action: {"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
         )
         .expect("structured progress_update should normalize");
 
-        let WorkerAction::ProgressUpdate { summary, detail } = action else {
+        let WorkerAction::ProgressUpdate {
+            summary, detail, ..
+        } = action
+        else {
             panic!("expected progress update");
         };
 
@@ -2105,6 +2242,33 @@ Action: {"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
         assert!(detail.contains("status: partial_success"));
         assert!(detail.contains("validated:"));
         assert!(detail.contains("Continue with the session workspace decomposition."));
+    }
+
+    #[test]
+    fn structured_progress_update_excludes_thoughts_from_detail() {
+        let action = parse_worker_action(
+            r#"{"progress_update":{"thoughts":"Private reasoning stays out of progress detail.","status":"partial_success","summary":"checkpoint saved","next":"Continue with the next slice."}}"#,
+        )
+        .expect("structured progress_update should normalize");
+
+        let WorkerAction::ProgressUpdate {
+            thoughts,
+            summary,
+            detail,
+        } = action
+        else {
+            panic!("expected progress update");
+        };
+
+        assert_eq!(
+            thoughts.as_deref(),
+            Some("Private reasoning stays out of progress detail.")
+        );
+        assert_eq!(summary, "checkpoint saved");
+        assert!(detail.contains("status: partial_success"));
+        assert!(detail.contains("next: Continue with the next slice."));
+        assert!(!detail.contains("thoughts"));
+        assert!(!detail.contains("Private reasoning"));
     }
 
     #[test]
@@ -2118,6 +2282,7 @@ Action: {"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
             summary,
             tool,
             args,
+            ..
         } = action
         else {
             panic!("expected tool call");
@@ -2139,6 +2304,7 @@ Action: {"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
             summary,
             tool,
             args,
+            ..
         } = action
         else {
             panic!("expected tool call");
@@ -2160,6 +2326,7 @@ Action: {"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
             summary,
             tool,
             args,
+            ..
         } = action
         else {
             panic!("expected tool call");
@@ -2187,6 +2354,7 @@ Action: {"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
             summary,
             tool,
             args,
+            ..
         } = action
         else {
             panic!("expected tool call");
