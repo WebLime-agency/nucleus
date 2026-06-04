@@ -3757,7 +3757,7 @@ async fn record_worker_progress_update(
     summary: &str,
     detail: &str,
 ) -> Result<()> {
-    checkpoint.next_prompt = Some(build_progress_update_continuation_prompt(summary, detail));
+    checkpoint.next_prompt = progress_update_next_prompt();
     state.store.write_worker_checkpoint(
         &worker.id,
         &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
@@ -4545,10 +4545,16 @@ async fn complete_job_with_budget_checkpoint(
     budget_kind: &str,
 ) -> Result<()> {
     let summary = format!("Reached current {budget_kind} budget");
+    let latest_progress_detail = state
+        .store
+        .get_job(job_id)
+        .ok()
+        .and_then(|detail| latest_worker_progress_detail(&detail, &worker.id));
     let final_answer = build_budget_checkpoint_answer(
         session,
         worker,
         checkpoint,
+        latest_progress_detail.as_deref(),
         step_count,
         tool_call_count,
         budget_kind,
@@ -4573,6 +4579,7 @@ fn build_budget_checkpoint_answer(
     session: &SessionDetail,
     worker: &WorkerSummary,
     checkpoint: &WorkerCheckpoint,
+    latest_progress_detail: Option<&str>,
     step_count: usize,
     tool_call_count: usize,
     budget_kind: &str,
@@ -4585,6 +4592,7 @@ fn build_budget_checkpoint_answer(
     let latest_checkpoint = checkpoint
         .next_prompt
         .as_deref()
+        .or(latest_progress_detail)
         .or_else(|| {
             checkpoint
                 .conversation
@@ -4616,6 +4624,18 @@ fn build_budget_checkpoint_answer(
     format!(
         "Nucleus reached the current {budget_kind} budget for this run ({step_count} steps, {tool_call_count} actions, limit {limit}) while working in {project}.\n\nLatest checkpoint:\n{latest_checkpoint}{pending}\n\nSend a follow-up such as \"continue from the checkpoint\" to give Nucleus a fresh run budget without losing the visible session context."
     )
+}
+
+fn latest_worker_progress_detail(detail: &JobDetail, worker_id: &str) -> Option<String> {
+    detail
+        .events
+        .iter()
+        .rev()
+        .find(|event| {
+            event.event_type == "worker.progress" && event.worker_id.as_deref() == Some(worker_id)
+        })
+        .map(|event| event.detail.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn build_initial_step_prompt(
@@ -9711,19 +9731,8 @@ async fn apply_browser_verification_final_state(
     Ok(final_answer.to_string())
 }
 
-fn build_progress_update_continuation_prompt(summary: &str, detail: &str) -> String {
-    format!(
-        "Nucleus recorded your previous response as a non-terminal progress checkpoint.\n\
-Checkpoint summary: {}\n\
-Checkpoint detail: {}\n\
-Return exactly one valid Nucleus worker action JSON object for the next step.\n\
-- Continue working from this checkpoint.\n\
-- Prefer a tool_call for the next concrete repo, file, command, test, or verification action.\n\
-- You may use progress_update again only for a durable checkpoint; it does not complete the job.\n\
-- Use final_answer only when the requested task is complete and validated, or when you are genuinely blocked.",
-        excerpt(summary, 320),
-        excerpt(detail, 1_200)
-    )
+fn progress_update_next_prompt() -> Option<String> {
+    None
 }
 
 fn build_plan_mode_retry_prompt(summary: &str, attempted_action: &str) -> String {
@@ -17865,11 +17874,43 @@ mod tests {
             patch_loop_guardrail_triggered: false,
         };
 
-        let answer = build_budget_checkpoint_answer(&session, &worker, &checkpoint, 10, 8, "step");
+        let answer =
+            build_budget_checkpoint_answer(&session, &worker, &checkpoint, None, 10, 8, "step");
 
         assert!(answer.contains("reached the current step budget"));
         assert!(answer.contains("seed completed"));
         assert!(answer.contains("continue from the checkpoint"));
+    }
+
+    #[test]
+    fn budget_checkpoint_answer_uses_latest_progress_detail_when_next_prompt_is_empty() {
+        let worker = test_worker_summary("root", 10, 20);
+        let session = SessionDetail {
+            session: build_execution_session(&worker),
+            turns: Vec::new(),
+        };
+        let checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "do useful work".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+
+        let answer = build_budget_checkpoint_answer(
+            &session,
+            &worker,
+            &checkpoint,
+            Some("Progress detail remains available for the user handoff."),
+            10,
+            8,
+            "step",
+        );
+
+        assert!(answer.contains("Progress detail remains available for the user handoff."));
     }
 
     #[test]
@@ -20835,15 +20876,10 @@ Cleanup status: clean";
     }
 
     #[test]
-    fn progress_update_continuation_prompt_keeps_job_running() {
-        let prompt = build_progress_update_continuation_prompt(
-            "checkpoint saved",
-            "Composer extraction is complete; continue with sidebar extraction.",
-        );
+    fn progress_update_next_prompt_is_empty_without_reinjecting_detail() {
+        let prompt = progress_update_next_prompt();
 
-        assert!(prompt.contains("non-terminal progress checkpoint"));
-        assert!(prompt.contains("Continue working from this checkpoint"));
-        assert!(prompt.contains("Use final_answer only when the requested task is complete"));
+        assert!(prompt.is_none());
     }
 
     #[test]
