@@ -63,6 +63,8 @@ const DEFAULT_JOB_MAX_WALL_CLOCK_SECS: u64 = 7_200;
 const MAX_CONFIGURED_JOB_STEPS: usize = 1_000;
 const MAX_CONFIGURED_JOB_TOOL_CALLS: usize = 2_000;
 const MAX_CONFIGURED_JOB_WALL_CLOCK_SECS: u64 = 86_400;
+const LOW_CONTEXT_JOB_MAX_STEPS: usize = 12;
+const LOW_CONTEXT_JOB_MAX_TOOL_CALLS: usize = 16;
 const JOB_MAX_CHILDREN_PER_FANOUT: usize = 5;
 const DEFAULT_CHILD_JOB_MAX_STEPS: usize = 24;
 const DEFAULT_CHILD_JOB_MAX_TOOL_CALLS: usize = 48;
@@ -465,6 +467,35 @@ fn configured_child_job_max_tool_calls() -> usize {
         1,
         MAX_CONFIGURED_JOB_TOOL_CALLS,
     )
+}
+
+fn is_low_context_session_prompt(session: &SessionSummary, task_class: Option<&str>) -> bool {
+    session.project_id.trim().is_empty()
+        && task_class
+            .map(|value| value.trim().is_empty())
+            .unwrap_or(true)
+}
+
+fn is_low_context_session_job(session: &SessionSummary, job: &JobSummary) -> bool {
+    job.trigger_kind == "session_prompt"
+        && !job.publication_requested
+        && is_low_context_session_prompt(session, job.task_class.as_deref())
+}
+
+fn low_context_root_worker_max_steps(session_max_steps: usize) -> usize {
+    if session_max_steps == 0 {
+        0
+    } else {
+        session_max_steps.min(LOW_CONTEXT_JOB_MAX_STEPS)
+    }
+}
+
+fn low_context_root_worker_max_tool_calls(session_max_tool_calls: usize) -> usize {
+    if session_max_tool_calls == 0 {
+        0
+    } else {
+        session_max_tool_calls.min(LOW_CONTEXT_JOB_MAX_TOOL_CALLS)
+    }
 }
 
 fn configured_usize_env(name: &str, default: usize, min: usize, max: usize) -> usize {
@@ -995,6 +1026,7 @@ pub async fn start_prompt_job(
             browser_tools_granted,
         ),
     )?;
+    let low_context_turn = is_low_context_session_job(&current.session, &job);
     if job.publication_requested {
         record_publication_git_hygiene_baseline(&state, &job, &current.session.working_dir)?;
     }
@@ -1029,8 +1061,16 @@ pub async fn start_prompt_job(
         working_dir: current.session.working_dir.clone(),
         read_roots: worker_read_roots(&current.session),
         write_roots: worker_write_roots(&current.session),
-        max_steps: current.session.run_budget.max_steps,
-        max_tool_calls: current.session.run_budget.max_tool_calls,
+        max_steps: if low_context_turn {
+            low_context_root_worker_max_steps(current.session.run_budget.max_steps)
+        } else {
+            current.session.run_budget.max_steps
+        },
+        max_tool_calls: if low_context_turn {
+            low_context_root_worker_max_tool_calls(current.session.run_budget.max_tool_calls)
+        } else {
+            current.session.run_budget.max_tool_calls
+        },
         max_wall_clock_secs: current.session.run_budget.max_wall_clock_secs,
     })?;
     state.store.update_job(
@@ -1058,13 +1098,14 @@ pub async fn start_prompt_job(
     // user before the job queues. The actual CompiledTurn sent to the provider
     // is rebuilt per model call inside `execute_worker_text_turn` so memory,
     // skill, and include layers reflect the latest session state.
-    let _ = crate::compile_session_turn(
+    let _ = crate::compile_session_turn_with_mcp_catalog(
         &state,
         &current.session,
         &current.turns,
         &payload.prompt,
         &payload.images,
         &compiler_role,
+        !low_context_turn,
     )?;
 
     let checkpoint = WorkerCheckpoint {
@@ -1075,6 +1116,7 @@ pub async fn start_prompt_job(
             &worker,
             &current.session.execution_mode,
             &current.turns,
+            low_context_turn,
         ),
         next_prompt: None,
         pending_action: None,
@@ -2381,9 +2423,11 @@ async fn run_job_loop(
         }
 
         session = state.store.get_session(&session_id)?;
-        if is_terminal_job_state(&state.store.get_job(job_id)?.job.state) {
+        let current_job = state.store.get_job(job_id)?.job;
+        if is_terminal_job_state(&current_job.state) {
             return Ok(());
         }
+        let low_context_turn = is_low_context_session_job(&session.session, &current_job);
         if let LoopDisposition::Return = handle_pending_action(
             state,
             &session,
@@ -2512,6 +2556,7 @@ async fn run_job_loop(
             &mut checkpoint,
             &prompt,
             &prompt_images,
+            low_context_turn,
             cancel_rx,
         )
         .await
@@ -2541,6 +2586,7 @@ async fn run_job_loop(
             &checkpoint.conversation,
             &prompt,
             &prompt_images,
+            low_context_turn,
             cancel_rx,
         )
         .await
@@ -9785,13 +9831,20 @@ async fn compact_checkpoint_if_needed(
     checkpoint: &mut WorkerCheckpoint,
     prompt: &str,
     images: &[SessionTurnImage],
+    low_context_turn: bool,
     cancel_rx: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     let threshold = compaction_token_threshold_for_model(&worker.model);
     for _ in 0..MAX_COMPACTION_PASSES {
-        let Some(compiled_turn) =
-            compile_worker_prompt_for_estimate(state, session, worker, checkpoint, prompt, images)
-        else {
+        let Some(compiled_turn) = compile_worker_prompt_for_estimate(
+            state,
+            session,
+            worker,
+            checkpoint,
+            prompt,
+            images,
+            low_context_turn,
+        ) else {
             return Ok(());
         };
         if !should_compact(&compiled_turn, threshold) {
@@ -9799,7 +9852,15 @@ async fn compact_checkpoint_if_needed(
         }
         let before_tokens = estimate_prompt_tokens(&compiled_turn);
 
-        let outcome = compact_conversation(state, session, worker, checkpoint, cancel_rx).await?;
+        let outcome = compact_conversation(
+            state,
+            session,
+            worker,
+            checkpoint,
+            low_context_turn,
+            cancel_rx,
+        )
+        .await?;
         audit_compaction_outcome(state, worker, &outcome).await;
         match outcome {
             CompactionOutcome::Applied { .. } => {
@@ -9825,9 +9886,15 @@ async fn compact_checkpoint_if_needed(
             CompactionOutcome::Failed { .. } => return Ok(()),
         }
 
-        let Some(compiled_turn) =
-            compile_worker_prompt_for_estimate(state, session, worker, checkpoint, prompt, images)
-        else {
+        let Some(compiled_turn) = compile_worker_prompt_for_estimate(
+            state,
+            session,
+            worker,
+            checkpoint,
+            prompt,
+            images,
+            low_context_turn,
+        ) else {
             return Ok(());
         };
         let after_tokens = estimate_prompt_tokens(&compiled_turn);
@@ -9869,19 +9936,28 @@ fn compile_worker_prompt_for_estimate(
     checkpoint: &WorkerCheckpoint,
     prompt: &str,
     images: &[SessionTurnImage],
+    low_context_turn: bool,
 ) -> Option<CompiledTurn> {
     let execution = build_execution_session(worker);
     let history = checkpoint_history(&checkpoint.conversation, &execution.id);
     let prompt_body = build_worker_prompt_input(worker, &checkpoint.conversation, prompt);
-    crate::compile_session_turn(state, session, &history, &prompt_body, images, "utility")
-        .inspect_err(|error| {
-            warn!(
-                ?error,
-                session_id = session.id.as_str(),
-                "session-aware prompt compile failed; skipping compaction threshold check",
-            );
-        })
-        .ok()
+    crate::compile_session_turn_with_mcp_catalog(
+        state,
+        session,
+        &history,
+        &prompt_body,
+        images,
+        "utility",
+        !low_context_turn,
+    )
+    .inspect_err(|error| {
+        warn!(
+            ?error,
+            session_id = session.id.as_str(),
+            "session-aware prompt compile failed; skipping compaction threshold check",
+        );
+    })
+    .ok()
 }
 
 fn unsupported_vision_with_tools_detail(worker: &WorkerSummary, image_count: usize) -> String {
@@ -9899,6 +9975,7 @@ async fn call_worker_model(
     conversation: &[CheckpointMessage],
     prompt: &str,
     images: &[SessionTurnImage],
+    low_context_turn: bool,
     cancel_rx: &mut watch::Receiver<bool>,
 ) -> Result<ModelResponse> {
     let result = execute_worker_text_turn(
@@ -9908,12 +9985,22 @@ async fn call_worker_model(
         conversation,
         prompt,
         images,
+        low_context_turn,
         cancel_rx,
     )
     .await?;
     let registered_mcp_tool_ids = registered_mcp_tool_ids(state);
     let supported_tool_ids =
         worker_action_repair_supported_tool_ids(worker, &registered_mcp_tool_ids);
+    let repair_prompt_tool_ids = if low_context_turn {
+        supported_tool_ids
+            .iter()
+            .filter(|tool_id| low_context_prompt_tool_visible(tool_id))
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        supported_tool_ids.clone()
+    };
     let action = match parse_worker_action_with_registered_mcp_tools(
         &result.content,
         supported_tool_ids.iter().map(String::as_str),
@@ -9939,7 +10026,7 @@ async fn call_worker_model(
                 compacted_range: None,
             });
             let repair_prompt =
-                build_worker_action_repair_prompt(&result.content, &error, &supported_tool_ids);
+                build_worker_action_repair_prompt(&result.content, &error, &repair_prompt_tool_ids);
             let repaired = execute_worker_text_turn(
                 state,
                 session,
@@ -9947,6 +10034,7 @@ async fn call_worker_model(
                 &repair_conversation,
                 &repair_prompt,
                 &[],
+                low_context_turn,
                 cancel_rx,
             )
             .await?;
@@ -10101,6 +10189,7 @@ pub(crate) async fn execute_worker_text_turn(
     conversation: &[CheckpointMessage],
     prompt: &str,
     images: &[SessionTurnImage],
+    low_context_turn: bool,
     cancel_rx: &mut watch::Receiver<bool>,
 ) -> Result<ProviderTurnResult> {
     let (events, mut receiver) = mpsc::unbounded_channel();
@@ -10124,18 +10213,25 @@ pub(crate) async fn execute_worker_text_turn(
     // system prompt the daemon advertises in debug summaries. Without this
     // wiring `execute_prompt_stream` would rebuild an empty CompiledTurn
     // (see issue #232).
-    let compiled_turn = session
-        .and_then(|sess| {
-            crate::compile_session_turn(state, sess, &history, &prompt_body, &images, "utility")
-                .inspect_err(|error| {
-                    warn!(
-                        ?error,
-                        session_id = sess.id.as_str(),
-                        "session-aware prompt compile failed; falling back to layered-empty CompiledTurn",
-                    );
-                })
-                .ok()
-        });
+    let compiled_turn = session.and_then(|sess| {
+        crate::compile_session_turn_with_mcp_catalog(
+            state,
+            sess,
+            &history,
+            &prompt_body,
+            &images,
+            "utility",
+            !low_context_turn,
+        )
+        .inspect_err(|error| {
+            warn!(
+                ?error,
+                session_id = sess.id.as_str(),
+                "session-aware prompt compile failed; falling back to layered-empty CompiledTurn",
+            );
+        })
+        .ok()
+    });
 
     let handle = tokio::spawn(async move {
         match compiled_turn {
@@ -10551,10 +10647,11 @@ fn initial_worker_conversation(
     worker: &WorkerSummary,
     execution_mode: &str,
     prior_turns: &[SessionTurn],
+    low_context_turn: bool,
 ) -> Vec<CheckpointMessage> {
     let mut conversation = vec![CheckpointMessage {
         role: "system".to_string(),
-        content: worker_system_prompt_with_mode(worker, execution_mode),
+        content: worker_system_prompt_with_context(worker, execution_mode, low_context_turn),
         images: Vec::new(),
         compacted: false,
         compacted_range: None,
@@ -17305,6 +17402,14 @@ fn worker_system_prompt(worker: &WorkerSummary) -> String {
 }
 
 fn worker_system_prompt_with_mode(worker: &WorkerSummary, execution_mode: &str) -> String {
+    worker_system_prompt_with_context(worker, execution_mode, false)
+}
+
+fn worker_system_prompt_with_context(
+    worker: &WorkerSummary,
+    execution_mode: &str,
+    low_context_turn: bool,
+) -> String {
     if execution_mode == "plan" {
         return format!(
             "Respond to the user as the Utility Nucleus {} worker.\n\
@@ -17328,6 +17433,68 @@ Working directory: {}\n",
     }
 
     let is_root_worker = worker.parent_worker_id.is_none();
+    if low_context_turn && is_root_worker {
+        let action_shapes = "{\"kind\":\"final_answer\",\"thoughts\":\"brief reason the prompt is already answerable\",\"summary\":\"why the response is complete\",\"final_answer\":\"clean user-facing answer\",\"browser_verification\":{\"status\":\"passed|failed|not_performed|unavailable\",\"summary\":\"concise Browser verification result\",\"artifact_ids\":[\"artifact-id\"]}}\n\
+{\"kind\":\"tool_call\",\"thoughts\":\"brief reason this needs local evidence\",\"summary\":\"inspect the active project or workspace\",\"tool\":\"project.inspect\",\"args\":{}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"list likely workspace directories\",\"tool\":\"fs.list\",\"args\":{\"path\":\".\",\"recursive\":false,\"limit\":100}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"fetch inline PR review threads\",\"tool\":\"github.pr_review_threads\",\"args\":{\"pr_number\":123}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"fetch direct PR lifecycle state\",\"tool\":\"github.pr_state\",\"args\":{\"pr_number\":123}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"run a focused local command\",\"tool\":\"command.run\",\"args\":{\"command\":\"sh\",\"args\":[\"-lc\",\"pwd\"],\"cwd\":\".\",\"timeout_secs\":20}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"verify the UI in Browser\",\"tool\":\"browser.navigate\",\"args\":{\"url\":\"http://127.0.0.1:5299\"}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"read Browser refs\",\"tool\":\"browser.snapshot\",\"args\":{}}\n\
+{\"kind\":\"tool_call\",\"summary\":\"click a Browser control by ref\",\"tool\":\"browser.click\",\"args\":{\"target_ref\":\"ref-1\"}}\n\
+{\"kind\":\"final_answer\",\"summary\":\"why the work is done\",\"final_answer\":\"clean user-facing answer\"}";
+        let action_shapes = if worker_has_tool_capability(worker, "browser.navigate") {
+            action_shapes.to_string()
+        } else {
+            action_shapes
+                .lines()
+                .filter(|line| !line.contains("\"tool\":\"browser."))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let tool_help = worker
+            .capabilities
+            .iter()
+            .filter(|capability| low_context_prompt_tool_visible(&capability.tool_id))
+            .map(|capability| {
+                format!(
+                    "- {}: {} (approval={}, risk={})",
+                    capability.tool_id,
+                    capability.summary,
+                    capability.approval_mode,
+                    capability.risk_level
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        return format!(
+            "Respond to the user as the Utility Nucleus {} worker. This is a low-context turn; prefer a concise final_answer unless evidence or action is truly needed.\n\
+Nucleus worker action JSON contract: return one valid Nucleus worker action JSON object.\n\
+Allowed response shapes:\n\
+{}\n\
+Rules:\n\
+- Think briefly in the thoughts field first, then choose the action.\n\
+- If the user's prompt is conversational or already answerable from visible context, answer directly with final_answer.\n\
+- Use tools only when they materially improve the answer, and choose the smallest useful action.\n\
+- Never invent tool output.\n\
+- Stay inside the granted repo scope.\n\
+- For UI or visual changes, use Browser tools when Browser verification is required and available.\n\
+- For UI-renderable work, include browser_verification in final_answer with status passed, failed, not_performed, or unavailable. Typecheck/build success alone is not rendered-UI verification.\n\
+- For PR review or lifecycle claims, fetch thread-aware review data with github.pr_review_threads or direct PR state with github.pr_state before making the claim.\n\
+- The visible chat will only receive final_answer, not your intermediate reasoning.\n\
+- Use final_answer as the terminal action when the user is answered, the requested task is complete and validated, or you are genuinely blocked.\n\
+- Do not use provider-native tool wrappers such as tool_call/tool_name/shell; use the exact Nucleus JSON shapes above.\n\
+- Do not wrap JSON in markdown fences.\n\
+Available tools:\n\
+{}\n\
+Worker lane: {}\n\
+Working directory: {}\n",
+            worker.lane, action_shapes, tool_help, worker.lane, worker.working_dir
+        );
+    }
+
     let action_shapes = if is_root_worker {
         "{\"kind\":\"final_answer\",\"thoughts\":\"brief reason the prompt is already answerable\",\"summary\":\"why the response is complete\",\"final_answer\":\"clean user-facing answer\",\"browser_verification\":{\"status\":\"passed|failed|not_performed|unavailable\",\"summary\":\"concise Browser verification result\",\"artifact_ids\":[\"artifact-id\"]}}\n\
 {\"kind\":\"tool_call\",\"thoughts\":\"brief reason this needs project evidence\",\"summary\":\"inspect the active project\",\"tool\":\"project.inspect\",\"args\":{}}\n\
@@ -17430,6 +17597,31 @@ Working directory: {}\n",
         ),
         worker.lane,
         worker.working_dir
+    )
+}
+
+fn low_context_prompt_tool_visible(tool_id: &str) -> bool {
+    matches!(
+        tool_id,
+        "project.inspect"
+            | "fs.list"
+            | "fs.read_text"
+            | "rg.search"
+            | "git.status"
+            | "git.diff"
+            | "github.pr_review_threads"
+            | "github.pr_state"
+            | "browser.context"
+            | "browser.navigate"
+            | "browser.snapshot"
+            | "browser.screenshot"
+            | "browser.click"
+            | "browser.type"
+            | "browser.fill"
+            | "browser.scroll"
+            | "browser.press"
+            | "browser.submit"
+            | "command.run"
     )
 }
 
@@ -18291,6 +18483,40 @@ mod tests {
         assert!(prompt_with_browser.contains("\"tool\":\"browser.navigate\""));
         assert!(prompt_with_browser.contains("\"tool\":\"browser.snapshot\""));
         assert!(prompt_with_browser.contains("\"tool\":\"browser.click\""));
+    }
+
+    #[test]
+    fn low_context_signal_treats_blank_task_class_as_absent() {
+        let worker = test_worker_summary("low-context-signal", 10, 20);
+        let mut session = build_execution_session(&worker);
+        session.project_id = String::new();
+
+        assert!(is_low_context_session_prompt(&session, None));
+        assert!(is_low_context_session_prompt(&session, Some("")));
+        assert!(is_low_context_session_prompt(&session, Some("  ")));
+        assert!(!is_low_context_session_prompt(
+            &session,
+            Some("local_project")
+        ));
+
+        session.project_id = "project-1".to_string();
+        assert!(!is_low_context_session_prompt(&session, None));
+    }
+
+    #[test]
+    fn low_context_budget_caps_defaults_but_preserves_unbounded_limits() {
+        assert_eq!(
+            low_context_root_worker_max_steps(80),
+            LOW_CONTEXT_JOB_MAX_STEPS
+        );
+        assert_eq!(
+            low_context_root_worker_max_tool_calls(160),
+            LOW_CONTEXT_JOB_MAX_TOOL_CALLS
+        );
+        assert_eq!(low_context_root_worker_max_steps(4), 4);
+        assert_eq!(low_context_root_worker_max_tool_calls(6), 6);
+        assert_eq!(low_context_root_worker_max_steps(0), 0);
+        assert_eq!(low_context_root_worker_max_tool_calls(0), 0);
     }
 
     #[test]
@@ -21520,6 +21746,7 @@ Cleanup status: clean";
             &[],
             "Inspect the repo.",
             &[],
+            false,
             &mut cancel_rx,
         )
         .await
@@ -21597,6 +21824,7 @@ Cleanup status: clean";
             &[],
             "Verify the UI.",
             &[],
+            false,
             &mut cancel_rx,
         )
         .await
@@ -21668,6 +21896,7 @@ Cleanup status: clean";
             &[],
             "Verify the UI.",
             &[],
+            false,
             &mut cancel_rx,
         )
         .await
@@ -21689,6 +21918,84 @@ Cleanup status: clean";
 
         server.await.expect("test server should finish");
         assert_eq!(request_count.load(Ordering::SeqCst), 2);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn low_context_action_repair_prompt_keeps_trimmed_tool_scope() {
+        let state_dir = test_state_dir("worker-action-repair-low-context");
+        let state = initialize_test_state(&state_dir);
+        seed_enabled_mcp_tool(&state, "mcp.docs.searchDocs");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener addr should be available")
+        );
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_bodies = Arc::new(TestMutex::new(Vec::new()));
+        let server_request_count = request_count.clone();
+        let server_request_bodies = request_bodies.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .expect("test request should connect");
+                let body = read_test_http_body(&mut socket).await;
+                server_request_bodies
+                    .lock()
+                    .expect("request bodies lock should not be poisoned")
+                    .push(body);
+                let index = server_request_count.fetch_add(1, Ordering::SeqCst);
+                let content = if index == 0 {
+                    r#"{"message":"I should inspect the repo next"}"#
+                } else {
+                    r#"{"kind":"final_answer","summary":"repaired action","final_answer":"Done."}"#
+                };
+                write_test_openai_sse_response(&mut socket, &format!("turn-{index}"), content)
+                    .await;
+            }
+        });
+
+        let mut capabilities = root_worker_capabilities();
+        capabilities.extend(mcp_tool_capabilities(&state));
+        let mut worker = test_worker_summary("repair-low-context-worker", 10, 10);
+        worker.provider_base_url = base_url;
+        worker.working_dir = state_dir.display().to_string();
+        worker.capabilities = grant_records_to_summaries(capabilities);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let response = call_worker_model(
+            &state,
+            None,
+            &worker,
+            &[],
+            "Ready?",
+            &[],
+            true,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("repair turn should produce a valid action");
+
+        assert!(matches!(response.action, WorkerAction::FinalAnswer { .. }));
+        server.await.expect("test server should finish");
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        let bodies = request_bodies
+            .lock()
+            .expect("request bodies lock should not be poisoned");
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[1].contains("Currently supported tool IDs:"));
+        assert!(bodies[1].contains("command.run"));
+        assert!(bodies[1].contains("fs.list"));
+        assert!(bodies[1].contains("browser.navigate"));
+        assert!(bodies[1].contains("github.pr_state"));
+        assert!(bodies[1].contains("github.pr_review_threads"));
+        assert!(!bodies[1].contains("mcp.docs.searchDocs"));
 
         let _ = fs::remove_dir_all(&state_dir);
     }
@@ -21719,10 +22026,18 @@ Cleanup status: clean";
         worker.provider_base_url = base_url;
         worker.working_dir = state_dir.display().to_string();
         let (_cancel_tx, mut cancel_rx) = watch::channel(false);
-        let response =
-            call_worker_model(&state, None, &worker, &[], "Try once.", &[], &mut cancel_rx)
-                .await
-                .expect("transient 500 should retry and succeed");
+        let response = call_worker_model(
+            &state,
+            None,
+            &worker,
+            &[],
+            "Try once.",
+            &[],
+            false,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("transient 500 should retry and succeed");
 
         assert_eq!(request_count.load(Ordering::SeqCst), 2);
         assert!(matches!(
@@ -21777,6 +22092,7 @@ Cleanup status: clean";
             &[],
             "Try later.",
             &[],
+            false,
             &mut cancel_rx,
         )
         .await
@@ -21809,9 +22125,18 @@ Cleanup status: clean";
         worker.provider_base_url = base_url;
         worker.working_dir = state_dir.display().to_string();
         let (_cancel_tx, mut cancel_rx) = watch::channel(false);
-        let error = call_worker_model(&state, None, &worker, &[], "Try auth.", &[], &mut cancel_rx)
-            .await
-            .expect_err("401 should fail immediately");
+        let error = call_worker_model(
+            &state,
+            None,
+            &worker,
+            &[],
+            "Try auth.",
+            &[],
+            false,
+            &mut cancel_rx,
+        )
+        .await
+        .expect_err("401 should fail immediately");
 
         assert!(error.to_string().contains("401"));
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
@@ -21854,6 +22179,7 @@ Cleanup status: clean";
             &[],
             "Try until cap.",
             &[],
+            false,
             &mut cancel_rx,
         )
         .await
@@ -21901,6 +22227,7 @@ Cleanup status: clean";
             &[],
             "Try then cancel.",
             &[],
+            false,
             &mut cancel_rx,
         );
         let cancel_after_first_retry = async {
@@ -21948,10 +22275,18 @@ Cleanup status: clean";
         worker.provider_base_url = base_url;
         worker.working_dir = state_dir.display().to_string();
         let (_cancel_tx, mut cancel_rx) = watch::channel(false);
-        let response =
-            call_worker_model(&state, None, &worker, &[], "Try once.", &[], &mut cancel_rx)
-                .await
-                .expect("provider content without DONE marker should still succeed");
+        let response = call_worker_model(
+            &state,
+            None,
+            &worker,
+            &[],
+            "Try once.",
+            &[],
+            false,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("provider content without DONE marker should still succeed");
 
         assert!(matches!(
             response.action,
@@ -21988,6 +22323,7 @@ Thanks."#,
             &[],
             "Answer with a Nucleus action.",
             &[],
+            false,
             &mut cancel_rx,
         )
         .await
@@ -22068,6 +22404,7 @@ Thanks."#,
             &conversation,
             "Answer with a Nucleus action.",
             &[],
+            false,
             &mut cancel_rx,
         )
         .await
@@ -22138,6 +22475,7 @@ Thanks."#,
             &[],
             "Answer with a Nucleus action.",
             &[],
+            false,
             &mut cancel_rx,
         )
         .await
@@ -22225,9 +22563,18 @@ Thanks."#,
         worker.working_dir = state_dir.display().to_string();
         let (_cancel_tx, mut cancel_rx) = watch::channel(false);
         let started = Instant::now();
-        let error = call_worker_model(&state, None, &worker, &[], "Ping.", &[], &mut cancel_rx)
-            .await
-            .expect_err("hanging utility endpoint should time out");
+        let error = call_worker_model(
+            &state,
+            None,
+            &worker,
+            &[],
+            "Ping.",
+            &[],
+            false,
+            &mut cancel_rx,
+        )
+        .await
+        .expect_err("hanging utility endpoint should time out");
         let elapsed = started.elapsed();
 
         assert!(elapsed < Duration::from_secs(25));
@@ -22337,9 +22684,18 @@ Thanks."#,
         worker.working_dir = state_dir.display().to_string();
         let (_cancel_tx, mut cancel_rx) = watch::channel(false);
         let started = Instant::now();
-        let response = call_worker_model(&state, None, &worker, &[], "Ping.", &[], &mut cancel_rx)
-            .await
-            .expect("healthy slow stream should complete");
+        let response = call_worker_model(
+            &state,
+            None,
+            &worker,
+            &[],
+            "Ping.",
+            &[],
+            false,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("healthy slow stream should complete");
 
         assert!(started.elapsed() > Duration::from_secs(15));
         assert!(matches!(
@@ -22425,9 +22781,18 @@ Thanks."#,
         worker.working_dir = state_dir.display().to_string();
         let (_cancel_tx, mut cancel_rx) = watch::channel(false);
         let started = Instant::now();
-        let response = call_worker_model(&state, None, &worker, &[], "Ping.", &[], &mut cancel_rx)
-            .await
-            .expect("healthy slow non-streaming completion should complete");
+        let response = call_worker_model(
+            &state,
+            None,
+            &worker,
+            &[],
+            "Ping.",
+            &[],
+            false,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("healthy slow non-streaming completion should complete");
 
         assert!(started.elapsed() > Duration::from_secs(15));
         assert!(matches!(
@@ -22528,9 +22893,18 @@ Thanks."#,
         worker.working_dir = state_dir.display().to_string();
         let (_cancel_tx, mut cancel_rx) = watch::channel(false);
         let started = Instant::now();
-        let error = call_worker_model(&state, None, &worker, &[], "Ping.", &[], &mut cancel_rx)
-            .await
-            .expect_err("stalled utility stream should time out");
+        let error = call_worker_model(
+            &state,
+            None,
+            &worker,
+            &[],
+            "Ping.",
+            &[],
+            false,
+            &mut cancel_rx,
+        )
+        .await
+        .expect_err("stalled utility stream should time out");
         let elapsed = started.elapsed();
 
         assert!(elapsed < Duration::from_secs(25));
@@ -22610,6 +22984,7 @@ Thanks."#,
             &[],
             "Answer with a Nucleus action.",
             &[],
+            false,
             &mut cancel_rx,
         )
         .await
@@ -22716,6 +23091,7 @@ Thanks."#,
             &[],
             "Answer with a Nucleus action.",
             &[],
+            false,
             &mut cancel_rx,
         )
         .await
@@ -22778,6 +23154,7 @@ Thanks."#,
             &mut checkpoint,
             "Continue the long running task.",
             &[],
+            false,
             &mut cancel_rx,
         )
         .await
@@ -22833,6 +23210,7 @@ Thanks."#,
             &checkpoint,
             "Continue the long running task.",
             &[],
+            false,
         )
         .expect("prompt should compile after compaction");
         assert!(
@@ -22864,6 +23242,90 @@ Thanks."#,
                 ..JobPatch::default()
             },
         );
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn low_context_compaction_omits_mcp_catalog() {
+        let state_dir = test_state_dir("worker-context-compaction-low-context");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        seed_enabled_mcp_tool(&state, "mcp.docs.searchDocs");
+        let session = state
+            .store
+            .create_session(test_session_record(
+                "compact-low-context-session",
+                "Compact low context session",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+        let (_, mut worker, _) = create_command_test_context(&state, "compact-low-context");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener addr should be available")
+        );
+        let request_body = Arc::new(TestMutex::new(String::new()));
+        let server_request_body = request_body.clone();
+        let summary_json = r##"{"summary":"Preserved the concise low-context history.","preserved_identifiers":[],"preserved_artifact_ids":[],"preserved_file_paths":[],"user_preferences_mentioned":[]}"##;
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("test request should connect");
+            let body = read_test_http_body(&mut socket).await;
+            *server_request_body
+                .lock()
+                .expect("request body lock should not be poisoned") = body;
+            write_test_openai_sse_response(&mut socket, "turn-0", summary_json).await;
+        });
+
+        worker.provider = "openai_compatible".to_string();
+        worker.model = "test-model".to_string();
+        worker.provider_base_url = base_url;
+        worker.working_dir = workspace_root.display().to_string();
+        let mut capabilities = root_worker_capabilities();
+        capabilities.extend(mcp_tool_capabilities(&state));
+        worker.capabilities = grant_records_to_summaries(capabilities);
+
+        let mut checkpoint = long_test_checkpoint(&session.id, 52);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        compact_checkpoint_if_needed(
+            &state,
+            &session,
+            &worker,
+            &mut checkpoint,
+            "Ready?",
+            &[],
+            true,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("low-context compaction should not fail the turn");
+
+        server.await.expect("test server should finish");
+        let body = request_body
+            .lock()
+            .expect("request body lock should not be poisoned");
+        assert!(body.contains("conversation compaction worker"));
+        assert!(!body.contains("mcp.docs.searchDocs"));
+        assert!(
+            checkpoint
+                .conversation
+                .iter()
+                .any(|message| message.compacted)
+        );
+
         let _ = fs::remove_dir_all(&state_dir);
     }
 
@@ -22908,6 +23370,7 @@ Thanks."#,
             &mut checkpoint,
             "Continue the long running task.",
             &[],
+            false,
             &mut cancel_rx,
         )
         .await
@@ -22931,6 +23394,7 @@ Thanks."#,
             &checkpoint,
             "Continue the long running task.",
             &[],
+            false,
         )
         .expect("prompt should compile after oversized compaction");
         assert!(
@@ -22984,6 +23448,7 @@ Thanks."#,
             &mut checkpoint,
             "Continue the long running task.",
             &[],
+            false,
             &mut cancel_rx,
         )
         .await
@@ -23102,6 +23567,7 @@ Thanks."#,
             &[],
             "What ice cream do I like?",
             &[],
+            false,
             &mut cancel_rx,
         )
         .await
@@ -25713,7 +26179,7 @@ Thanks."#,
             },
         ];
 
-        let conversation = initial_worker_conversation(&worker, "act", &prior_turns);
+        let conversation = initial_worker_conversation(&worker, "act", &prior_turns, false);
 
         assert_eq!(conversation[0].role, "system");
         assert_eq!(conversation[1].content, "why is uhm giving me a 404?");
@@ -26410,6 +26876,352 @@ Thanks."#,
                 .any(|grant| grant.tool_id == "command.run")
         );
         assert!(!worker.title.contains("main"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn low_context_prompt_uses_small_budget_and_hides_mcp_catalog() {
+        let state_dir = test_state_dir("low-context-prompt-budget");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        seed_enabled_mcp_tool(&state, "mcp.docs.searchDocs");
+        let (base_url, server) = spawn_response_sequence_openai_server(vec![
+            r#"{"kind":"final_answer","summary":"ready","final_answer":"Ready."}"#,
+            r#"{"decisions":[]}"#,
+        ])
+        .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-test-model",
+            &base_url,
+            "utility-key",
+        );
+
+        let session_id = "session-low-context".to_string();
+        state
+            .store
+            .create_session(test_session_record(
+                &session_id,
+                "Low context prompt",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+
+        let payload = SessionPromptRequest {
+            prompt: "Ready?".to_string(),
+            images: Vec::new(),
+            task_class: None,
+            role: "main".to_string(),
+        };
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            payload,
+            current,
+            "Ready?".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("prompt should queue utility executor");
+
+        let jobs = state
+            .store
+            .list_jobs_for_session(&session_id)
+            .expect("jobs should load");
+        let detail = state.store.get_job(&jobs[0].id).expect("job should load");
+        let worker = detail.workers.first().expect("worker should exist");
+        assert_eq!(worker.max_steps, LOW_CONTEXT_JOB_MAX_STEPS);
+        assert_eq!(worker.max_tool_calls, LOW_CONTEXT_JOB_MAX_TOOL_CALLS);
+        assert!(
+            worker
+                .capabilities
+                .iter()
+                .any(|grant| grant.tool_id == "mcp.docs.searchDocs"),
+            "low-context prompt trim must not revoke MCP grants"
+        );
+        assert!(
+            worker
+                .capabilities
+                .iter()
+                .any(|grant| grant.tool_id == "command.run")
+        );
+
+        let checkpoint: WorkerCheckpoint = serde_json::from_value(
+            state
+                .store
+                .read_worker_checkpoint(&worker.id)
+                .expect("checkpoint should load")
+                .expect("checkpoint should exist"),
+        )
+        .expect("checkpoint should decode");
+        let prompt = checkpoint
+            .conversation
+            .first()
+            .expect("system prompt should exist")
+            .content
+            .as_str();
+        assert!(prompt.contains("Available tools:"));
+        assert!(prompt.contains("browser_verification"));
+        assert!(prompt.contains("command.run"));
+        assert!(prompt.contains("fs.list"));
+        assert!(prompt.contains("github.pr_state"));
+        assert!(prompt.contains("github.pr_review_threads"));
+        assert!(prompt.contains("browser.navigate"));
+        assert!(prompt.contains("browser.snapshot"));
+        assert!(!prompt.contains("mcp.docs.searchDocs"));
+        assert!(!prompt.contains("spawn_child_jobs"));
+
+        let full_prompt = worker_system_prompt_with_context(worker, "act", false);
+        assert!(full_prompt.contains("mcp.docs.searchDocs"));
+        assert!(prompt.len() + 1_000 < full_prompt.len());
+
+        server.abort();
+        let _ = server.await;
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn task_class_prompt_keeps_default_budget_and_full_mcp_catalog() {
+        let state_dir = test_state_dir("task-context-prompt-budget");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        seed_enabled_mcp_tool(&state, "mcp.docs.searchDocs");
+        let (base_url, server) = spawn_response_sequence_openai_server(vec![
+            r#"{"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
+            r#"{"decisions":[]}"#,
+        ])
+        .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-test-model",
+            &base_url,
+            "utility-key",
+        );
+
+        let session_id = "session-task-context".to_string();
+        state
+            .store
+            .create_session(test_session_record(
+                &session_id,
+                "Task context prompt",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+
+        let payload = SessionPromptRequest {
+            prompt: "Inspect the workspace.".to_string(),
+            images: Vec::new(),
+            task_class: Some("local_project".to_string()),
+            role: "main".to_string(),
+        };
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            payload,
+            current,
+            "Inspect the workspace.".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("prompt should queue utility executor");
+
+        let jobs = state
+            .store
+            .list_jobs_for_session(&session_id)
+            .expect("jobs should load");
+        let detail = state.store.get_job(&jobs[0].id).expect("job should load");
+        let worker = detail.workers.first().expect("worker should exist");
+        let default_budget = RunBudgetSummary::default();
+        assert_eq!(worker.max_steps, default_budget.max_steps);
+        assert_eq!(worker.max_tool_calls, default_budget.max_tool_calls);
+
+        let checkpoint: WorkerCheckpoint = serde_json::from_value(
+            state
+                .store
+                .read_worker_checkpoint(&worker.id)
+                .expect("checkpoint should load")
+                .expect("checkpoint should exist"),
+        )
+        .expect("checkpoint should decode");
+        let prompt = checkpoint
+            .conversation
+            .first()
+            .expect("system prompt should exist")
+            .content
+            .as_str();
+        assert!(prompt.contains("mcp.docs.searchDocs"));
+        assert!(prompt.contains("spawn_child_jobs"));
+        assert!(prompt.contains("browser.navigate"));
+
+        let _ = wait_for_session_state(&state, &session_id, "active").await;
+        server.await.expect("test server should finish");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn inferred_publication_prompt_keeps_default_budget_and_full_mcp_catalog() {
+        let state_dir = test_state_dir("publication-context-prompt-budget");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        seed_enabled_mcp_tool(&state, "mcp.docs.searchDocs");
+        let (base_url, server) = spawn_response_sequence_openai_server(vec![
+            r#"{"kind":"final_answer","summary":"done","final_answer":"Done."}"#,
+            r#"{"decisions":[]}"#,
+        ])
+        .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-test-model",
+            &base_url,
+            "utility-key",
+        );
+
+        let session_id = "session-publication-context".to_string();
+        state
+            .store
+            .create_session(test_session_record(
+                &session_id,
+                "Publication context prompt",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+
+        let payload = SessionPromptRequest {
+            prompt: "open a PR to merge to dev".to_string(),
+            images: Vec::new(),
+            task_class: None,
+            role: "main".to_string(),
+        };
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            payload,
+            current,
+            "open a PR to merge to dev".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("publication prompt should queue utility executor");
+
+        let jobs = state
+            .store
+            .list_jobs_for_session(&session_id)
+            .expect("jobs should load");
+        let detail = state.store.get_job(&jobs[0].id).expect("job should load");
+        assert!(detail.job.publication_requested);
+        assert_eq!(detail.job.task_class.as_deref(), Some("github_pr"));
+        let worker = detail.workers.first().expect("worker should exist");
+        let default_budget = RunBudgetSummary::default();
+        assert_eq!(worker.max_steps, default_budget.max_steps);
+        assert_eq!(worker.max_tool_calls, default_budget.max_tool_calls);
+
+        let checkpoint: WorkerCheckpoint = serde_json::from_value(
+            state
+                .store
+                .read_worker_checkpoint(&worker.id)
+                .expect("checkpoint should load")
+                .expect("checkpoint should exist"),
+        )
+        .expect("checkpoint should decode");
+        let prompt = checkpoint
+            .conversation
+            .first()
+            .expect("system prompt should exist")
+            .content
+            .as_str();
+        assert!(prompt.contains("mcp.docs.searchDocs"));
+        assert!(prompt.contains("github.pr_state"));
+        assert!(prompt.contains("github.pr_review_threads"));
+
+        server.abort();
+        let _ = server.await;
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn low_context_compiled_turn_omits_mcp_catalog() {
+        let state_dir = test_state_dir("low-context-compiled-catalog");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        seed_enabled_mcp_tool(&state, "mcp.docs.searchDocs");
+        let session = state
+            .store
+            .create_session(test_session_record(
+                "low-context-compiled-session",
+                "Low context compiled session",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+
+        let full = crate::compile_session_turn_with_mcp_catalog(
+            &state,
+            &session,
+            &[],
+            "Ready?",
+            &[],
+            "utility",
+            true,
+        )
+        .expect("full compiled turn should build");
+        assert_eq!(full.mcp_catalog.len(), 1);
+
+        let low_context = crate::compile_session_turn_with_mcp_catalog(
+            &state,
+            &session,
+            &[],
+            "Ready?",
+            &[],
+            "utility",
+            false,
+        )
+        .expect("low-context compiled turn should build");
+        assert!(low_context.mcp_catalog.is_empty());
+        assert!(low_context.tool_catalog.is_empty());
+        assert_eq!(low_context.debug_summary.mcp_server_count, 0);
+        assert_eq!(low_context.debug_summary.tool_count, 0);
 
         let _ = fs::remove_dir_all(&state_dir);
     }
@@ -28464,7 +29276,13 @@ for line in sys.stdin:
                     created_at: 1,
                     updated_at: 1,
                 },
-                &[],
+                &[nucleus_protocol::NucleusToolDescriptor {
+                    id: "mcp.docs.searchDocs".to_string(),
+                    title: "searchDocs".to_string(),
+                    description: "Search docs".to_string(),
+                    input_schema: json!({"type":"object"}),
+                    source: "mcp.docs".to_string(),
+                }],
                 &[],
             )
             .expect("mcp server should persist");
@@ -28549,7 +29367,13 @@ for line in sys.stdin:
                     created_at: 1,
                     updated_at: 1,
                 },
-                &[],
+                &[nucleus_protocol::NucleusToolDescriptor {
+                    id: "cloudflare-api.search".to_string(),
+                    title: "search".to_string(),
+                    description: "Search API docs".to_string(),
+                    input_schema: json!({"type":"object"}),
+                    source: "cloudflare-api".to_string(),
+                }],
                 &[],
             )
             .expect("mcp server should persist");
@@ -30189,6 +31013,49 @@ for line in sys.stdin:
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    fn seed_enabled_mcp_tool(state: &AppState, tool_id: &str) {
+        state
+            .store
+            .upsert_mcp_server_record(
+                &McpServerRecord {
+                    id: "mcp.docs".to_string(),
+                    workspace_id: "workspace".to_string(),
+                    title: "Docs MCP".to_string(),
+                    transport: "stdio".to_string(),
+                    command: "true".to_string(),
+                    args: Vec::new(),
+                    env_json: json!({}),
+                    url: String::new(),
+                    headers_json: json!({}),
+                    auth_kind: "none".to_string(),
+                    auth_ref: String::new(),
+                    enabled: true,
+                    sync_status: "ready".to_string(),
+                    last_error: String::new(),
+                    last_synced_at: Some(1),
+                    created_at: 1,
+                    updated_at: 1,
+                },
+                &[],
+                &[],
+            )
+            .expect("mcp server should persist");
+        state
+            .store
+            .upsert_mcp_tool(&McpToolRecord {
+                id: tool_id.to_string(),
+                server_id: "mcp.docs".to_string(),
+                name: "searchDocs".to_string(),
+                description: "Search docs".to_string(),
+                input_schema: json!({"type":"object"}),
+                source: "mcp.docs".to_string(),
+                discovered_at: 1,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("mcp tool should persist");
     }
 
     fn grant_records_to_summaries(
