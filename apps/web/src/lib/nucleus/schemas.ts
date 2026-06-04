@@ -605,6 +605,9 @@ export const profileCheckResultSchema = z.object({
   role: z.enum(['main', 'utility']),
   outcome: profileCheckOutcomeSchema,
   message: z.string(),
+  json_object: z.enum(['supported', 'unsupported', 'unknown']).default('unknown'),
+  transport: z.enum(['streaming', 'non_streaming', 'unknown']).default('unknown'),
+  action_contract: z.enum(['passed', 'failed', 'unknown']).default('unknown'),
   http_status: z.number().int().optional(),
   latency_ms: z.number().int().optional()
 });
