@@ -113,6 +113,48 @@ const UI_RENDERABLE_TERMS: &[&str] = &[
     "css",
     "page",
 ];
+// Text prompts led by these primary intents should be answered directly rather
+// than framed as UI implementation work just because they mention UI terms.
+const NON_IMPLEMENTATION_UI_INTENT_PHRASES: &[&str] = &[
+    "file an issue",
+    "open an issue",
+    "create an issue",
+    "file a ticket",
+    "open a ticket",
+    "create a ticket",
+    "log a bug",
+    "report a bug",
+    "bug report",
+    "suggestion for",
+    "draft a note",
+    "draft an issue",
+    "draft a ticket",
+    "draft a suggestion",
+    "draft a bug report",
+    "draft a write-up",
+    "draft a writeup",
+    "write up",
+    "write a note",
+    "what do you think",
+    "what's your take",
+    "question about",
+    "ask about",
+];
+const NON_IMPLEMENTATION_UI_INTENT_PREFIXES: &[&str] =
+    &["explain ", "summarize ", "describe ", "discuss ", "review "];
+const NON_IMPLEMENTATION_UI_INTENT_LEAD_INS: &[&str] = &[
+    "please ",
+    "can you ",
+    "can you please ",
+    "could you ",
+    "could you please ",
+    "would you ",
+    "would you please ",
+    "i want to ",
+    "i need to ",
+    "i need you to ",
+    "help me ",
+];
 const PATCH_LOOP_CORRECTION_PHRASES: &[&str] = &[
     "still wrong",
     "not clickable",
@@ -142,6 +184,9 @@ fn configured_job_max_wall_clock_secs() -> u64 {
 
 fn classify_prompt_ui_renderable(prompt: &str, image_count: usize) -> String {
     let normalized = prompt.to_ascii_lowercase();
+    if mentions_non_implementation_ui_intent(&normalized) {
+        return "false".to_string();
+    }
     if image_count > 0 {
         if mentions_non_ui_image_context(&normalized) {
             return "false".to_string();
@@ -172,6 +217,39 @@ fn mentions_non_ui_image_context(prompt: &str) -> bool {
     ]
     .iter()
     .any(|term| prompt.contains(term))
+}
+
+fn mentions_non_implementation_ui_intent(prompt: &str) -> bool {
+    let trimmed = trim_non_implementation_intent_lead_ins(prompt);
+    if NON_IMPLEMENTATION_UI_INTENT_PHRASES
+        .iter()
+        .any(|term| trimmed.starts_with(term))
+    {
+        return true;
+    }
+
+    NON_IMPLEMENTATION_UI_INTENT_PREFIXES.iter().any(|prefix| {
+        if *prefix == "review "
+            && (normalized_contains_term(trimmed, "browser")
+                || normalized_contains_term(trimmed, "screenshot"))
+        {
+            return false;
+        }
+        trimmed.starts_with(prefix)
+    })
+}
+
+fn trim_non_implementation_intent_lead_ins(prompt: &str) -> &str {
+    let mut trimmed = prompt.trim_start();
+    loop {
+        let Some(rest) = NON_IMPLEMENTATION_UI_INTENT_LEAD_INS
+            .iter()
+            .find_map(|prefix| trimmed.strip_prefix(prefix))
+        else {
+            return trimmed;
+        };
+        trimmed = rest.trim_start();
+    }
 }
 
 fn normalized_contains_term(text: &str, term: &str) -> bool {
@@ -24006,6 +24084,30 @@ Thanks."#,
             classify_prompt_ui_renderable("Fix the mobile sidebar dropdown layout", 0),
             "true"
         );
+        for prompt in [
+            "File an issue for the repo with a suggestion for the web UI: move the three-dots dropdown",
+            "What do you think about the layout of the web UI?",
+            "Draft a note about the sidebar behavior",
+        ] {
+            assert_eq!(classify_prompt_ui_renderable(prompt, 0), "false");
+        }
+        assert_eq!(
+            classify_prompt_ui_renderable("File an issue for this mobile UI screenshot", 1),
+            "false"
+        );
+        for prompt in [
+            "Implement the dropdown in the web UI",
+            "Build the dropdown in the web UI",
+            "Change the dropdown in the web UI",
+            "Restyle the dropdown in the web UI",
+            "Redesign the modal",
+            "Review the mobile layout in the browser",
+            "Please review this screenshot match",
+            "Implement my suggestion for the mobile layout",
+            "Draft a CSS fix for the sidebar",
+        ] {
+            assert_eq!(classify_prompt_ui_renderable(prompt, 0), "true");
+        }
         assert_eq!(
             classify_prompt_ui_renderable("Refactor the Rust parser", 0),
             "false"
