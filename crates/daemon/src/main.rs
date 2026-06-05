@@ -8362,16 +8362,42 @@ fn compile_session_turn(
     images: &[nucleus_protocol::SessionTurnImage],
     compiler_role: &str,
 ) -> Result<CompiledTurn, ApiError> {
+    compile_session_turn_with_mcp_catalog(
+        state,
+        session,
+        history,
+        prompt,
+        images,
+        compiler_role,
+        true,
+    )
+}
+
+fn compile_session_turn_with_mcp_catalog(
+    state: &AppState,
+    session: &SessionSummary,
+    history: &[nucleus_protocol::SessionTurn],
+    prompt: &str,
+    images: &[nucleus_protocol::SessionTurnImage],
+    compiler_role: &str,
+    include_mcp_catalog: bool,
+) -> Result<CompiledTurn, ApiError> {
     let prompt_sources = discover_prompt_sources(state, session)?;
     let mut project_layers = compiled_include_layers(&prompt_sources);
     let memory_collection = collect_memory_layers(state, session)?;
     project_layers.extend(memory_collection.layers.clone());
     let skill_collection = collect_compiled_skill_layers(state, session, prompt)?;
     let skill_layers = skill_collection.layers;
-    let mut mcp_catalog = state.store.list_mcp_servers()?;
-    mcp_catalog.retain(|server| server.enabled);
-    annotate_mcp_invocation_availability(state, session, &mut mcp_catalog);
-    mcp_catalog.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut mcp_catalog = if include_mcp_catalog {
+        state.store.list_mcp_servers()?
+    } else {
+        Vec::new()
+    };
+    if include_mcp_catalog {
+        mcp_catalog.retain(|server| server.enabled);
+        annotate_mcp_invocation_availability(state, session, &mut mcp_catalog);
+        mcp_catalog.sort_by(|a, b| a.id.cmp(&b.id));
+    }
     let tool_catalog = mcp_catalog
         .iter()
         .flat_map(|server| server.tools.clone())
