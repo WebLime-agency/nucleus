@@ -182,6 +182,7 @@ pub(crate) async fn compact_conversation(
     session: &SessionSummary,
     worker: &WorkerSummary,
     checkpoint: &mut WorkerCheckpoint,
+    low_context_turn: bool,
     cancel_rx: &mut watch::Receiver<bool>,
 ) -> Result<CompactionOutcome> {
     let Some(window) = select_compaction_window(checkpoint) else {
@@ -194,10 +195,18 @@ pub(crate) async fn compact_conversation(
         &checkpoint.conversation[window.start..window.end],
         window.start,
     );
-    let result =
-        execute_worker_text_turn(state, Some(session), worker, &[], &prompt, &[], cancel_rx)
-            .await
-            .context("conversation compaction model call failed")?;
+    let result = execute_worker_text_turn(
+        state,
+        Some(session),
+        worker,
+        &[],
+        &prompt,
+        &[],
+        low_context_turn,
+        cancel_rx,
+    )
+    .await
+    .context("conversation compaction model call failed")?;
 
     let summary = match parse_compaction_summary(&result.content) {
         Ok(summary) => summary,
