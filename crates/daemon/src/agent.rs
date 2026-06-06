@@ -2874,6 +2874,42 @@ async fn run_job_loop(
                     continue;
                 }
 
+                let claimed_browser_verification_status = browser_verification_final_claimed_status(
+                    browser_verification.as_ref(),
+                    &metadata,
+                    &final_answer,
+                );
+                if should_retry_false_browser_unavailable_claim(
+                    &current_job,
+                    claimed_browser_verification_status.as_deref(),
+                    &worker,
+                    step + 1,
+                    tool_calls,
+                    worker_has_browser_tool_grant(&worker),
+                    crate::browser::BrowserRuntime::availability_error().is_none()
+                        && !browser_runtime_unavailable_observed_for_worker(
+                            &detail.tool_calls,
+                            &worker.id,
+                        ),
+                    browser_verification_false_unavailable_retry_already_attempted(&detail),
+                ) {
+                    checkpoint.browser_verification_final_answer_rejected = true;
+                    retry_worker_final_answer(
+                        state,
+                        job_id,
+                        &mut worker,
+                        &mut checkpoint,
+                        &mut step,
+                        tool_calls,
+                        "Rejected false Browser unavailable claim.",
+                        "browser_verification_false_unavailable",
+                        &build_false_browser_unavailable_retry_prompt(&current_job, &final_answer),
+                        &final_answer,
+                    )
+                    .await?;
+                    continue;
+                }
+
                 if should_retry_missing_publication_outcome(
                     &detail,
                     &summary,
@@ -9588,6 +9624,42 @@ Rejected final_answer:\n{}",
     )
 }
 
+fn build_false_browser_unavailable_retry_prompt(job: &JobSummary, final_answer: &str) -> String {
+    let artifact_note = if job.browser_verification_artifact_ids.is_empty() {
+        "No Browser evidence artifacts are currently attached to this job.".to_string()
+    } else {
+        format!(
+            "Current Browser evidence artifact ids: {}.",
+            job.browser_verification_artifact_ids.join(", ")
+        )
+    };
+    format!(
+        "Your previous final_answer claimed Browser verification was unavailable or not performed, but that claim is incorrect for this session.\n\
+Browser tools are granted to this worker and the Browser runtime is available.\n\
+{artifact_note}\n\n\
+Return one valid Nucleus worker action JSON object. You may include brief thoughts before the action fields.\n\
+Before returning final_answer, either:\n\
+- actually perform rendered Browser verification with tools such as browser.navigate, browser.snapshot, browser.screenshot, or interaction tools, then report the real browser_verification status and evidence; or\n\
+- complete the task without asserting that Browser is unavailable or not performed.\n\n\
+Use this final_answer shape when done:\n\
+{{\"kind\":\"final_answer\",\"summary\":\"why the work is complete or blocked\",\"final_answer\":\"user-facing answer\",\"browser_verification\":{{\"status\":\"passed|failed|not_performed|unavailable\",\"summary\":\"concise verification result\",\"artifact_ids\":[\"artifact-id\"]}}}}\n\n\
+Rejected final_answer:\n{}",
+        excerpt(final_answer, 1_200)
+    )
+}
+
+fn browser_verification_final_claimed_status(
+    claim: Option<&BrowserVerificationClaim>,
+    final_answer_metadata: &Value,
+    final_answer: &str,
+) -> Option<String> {
+    claim
+        .and_then(|claim| normalize_browser_verification_claim_status(&claim.status))
+        .map(str::to_string)
+        .or_else(|| final_response_browser_verification_status(final_answer_metadata))
+        .or_else(|| status_from_browser_verification_text(final_answer).map(str::to_string))
+}
+
 fn should_retry_missing_publication_outcome(
     detail: &JobDetail,
     summary: &str,
@@ -9780,6 +9852,70 @@ fn should_retry_browser_verification_final_answer(
         && remaining_budget_for_browser_verification(worker, step_after_rejection, tool_calls)
 }
 
+fn should_retry_false_browser_unavailable_claim(
+    job: &JobSummary,
+    claimed_status: Option<&str>,
+    worker: &WorkerSummary,
+    step_after_rejection: usize,
+    tool_calls: usize,
+    browser_tools_granted: bool,
+    runtime_available: bool,
+    false_unavailable_retry_already_attempted: bool,
+) -> bool {
+    job.browser_verification_required
+        && matches!(claimed_status, Some("unavailable" | "not_performed"))
+        && browser_tools_granted
+        && runtime_available
+        && !false_unavailable_retry_already_attempted
+        && remaining_budget_for_browser_verification(worker, step_after_rejection, tool_calls)
+}
+
+fn browser_verification_false_unavailable_retry_already_attempted(detail: &JobDetail) -> bool {
+    detail.events.iter().any(|event| {
+        event.event_type == "worker.retry"
+            && event
+                .data_json
+                .get("reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| reason == "browser_verification_false_unavailable")
+    })
+}
+
+fn browser_runtime_unavailable_observed_for_worker(
+    tool_calls: &[nucleus_protocol::ToolCallSummary],
+    worker_id: &str,
+) -> bool {
+    tool_calls.iter().any(|tool_call| {
+        tool_call.worker_id == worker_id
+            && is_browser_tool(&tool_call.tool_id)
+            && browser_tool_call_indicates_runtime_unavailable(tool_call)
+    })
+}
+
+fn browser_tool_call_indicates_runtime_unavailable(
+    tool_call: &nucleus_protocol::ToolCallSummary,
+) -> bool {
+    tool_call.error_class == "browser_unavailable"
+        || tool_call
+            .result_json
+            .as_ref()
+            .and_then(|result| result.get("browser_verification_status"))
+            .and_then(Value::as_str)
+            .is_some_and(|status| status == "unavailable")
+        || (tool_call.status == "failed"
+            && browser_error_indicates_runtime_unavailable(&tool_call.error_detail))
+}
+
+fn browser_error_indicates_runtime_unavailable(error_detail: &str) -> bool {
+    let normalized = error_detail.to_ascii_lowercase();
+    normalized.contains("browser sidecar")
+        || normalized.contains("playwright")
+        || normalized.contains("chromium")
+        || normalized.contains("browser executable")
+        || normalized.contains("executable doesn't exist")
+        || normalized.contains("chrome executable")
+}
+
 async fn apply_browser_verification_final_state(
     state: &AppState,
     job_id: &str,
@@ -9792,12 +9928,11 @@ async fn apply_browser_verification_final_state(
         return Ok(final_answer.to_string());
     }
 
-    let claimed_status = claim
-        .as_ref()
-        .and_then(|claim| normalize_browser_verification_claim_status(&claim.status))
-        .map(str::to_string)
-        .or_else(|| final_response_browser_verification_status(final_answer_metadata))
-        .or_else(|| status_from_browser_verification_text(final_answer).map(str::to_string));
+    let claimed_status = browser_verification_final_claimed_status(
+        claim.as_ref(),
+        final_answer_metadata,
+        final_answer,
+    );
     let next_status =
         claimed_status
             .as_deref()
@@ -17710,6 +17845,13 @@ fn worker_has_tool_capability(worker: &WorkerSummary, tool_id: &str) -> bool {
         .any(|capability| capability.tool_id == tool_id)
 }
 
+fn worker_has_browser_tool_grant(worker: &WorkerSummary) -> bool {
+    worker
+        .capabilities
+        .iter()
+        .any(|capability| capability.tool_id.starts_with("browser."))
+}
+
 fn command_path_env() -> Option<std::ffi::OsString> {
     const FALLBACK_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
@@ -24375,6 +24517,214 @@ Thanks."#,
             2,
             0,
         ));
+    }
+
+    #[test]
+    fn false_browser_unavailable_claim_retry_requires_ground_truth_and_budget() {
+        let worker = test_worker_summary("false-browser-claim", 10, 10);
+        let mut job = test_publication_job_summary("false-browser-claim");
+        job.browser_verification_required = true;
+        job.browser_verification_status = "pending".to_string();
+
+        assert!(should_retry_false_browser_unavailable_claim(
+            &job,
+            Some("unavailable"),
+            &worker,
+            1,
+            0,
+            true,
+            true,
+            false,
+        ));
+        assert!(should_retry_false_browser_unavailable_claim(
+            &job,
+            Some("not_performed"),
+            &worker,
+            1,
+            0,
+            true,
+            true,
+            false,
+        ));
+        assert!(!should_retry_false_browser_unavailable_claim(
+            &job,
+            Some("unavailable"),
+            &worker,
+            1,
+            0,
+            false,
+            true,
+            false,
+        ));
+        assert!(!should_retry_false_browser_unavailable_claim(
+            &job,
+            Some("unavailable"),
+            &worker,
+            1,
+            0,
+            true,
+            false,
+            false,
+        ));
+
+        assert!(!should_retry_false_browser_unavailable_claim(
+            &job,
+            Some("unavailable"),
+            &worker,
+            1,
+            0,
+            true,
+            true,
+            true,
+        ));
+
+        let mut not_required = job.clone();
+        not_required.browser_verification_required = false;
+        assert!(!should_retry_false_browser_unavailable_claim(
+            &not_required,
+            Some("unavailable"),
+            &worker,
+            1,
+            0,
+            true,
+            true,
+            false,
+        ));
+        assert!(!should_retry_false_browser_unavailable_claim(
+            &job,
+            Some("passed"),
+            &worker,
+            1,
+            0,
+            true,
+            true,
+            false,
+        ));
+        assert!(!should_retry_false_browser_unavailable_claim(
+            &job,
+            Some("failed"),
+            &worker,
+            1,
+            0,
+            true,
+            true,
+            false,
+        ));
+        assert!(!should_retry_false_browser_unavailable_claim(
+            &job, None, &worker, 1, 0, true, true, false,
+        ));
+
+        let exhausted_worker = test_worker_summary("false-browser-claim-exhausted", 1, 10);
+        assert!(!should_retry_false_browser_unavailable_claim(
+            &job,
+            Some("unavailable"),
+            &exhausted_worker,
+            1,
+            0,
+            true,
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn false_browser_unavailable_retry_marker_is_separate_from_generic_browser_retry() {
+        let mut detail = test_job_detail_with_prompt("fix the UI");
+        detail.events = vec![nucleus_protocol::JobEvent {
+            id: 1,
+            job_id: detail.job.id.clone(),
+            worker_id: Some("worker-false-browser-claim".to_string()),
+            event_type: "worker.retry".to_string(),
+            status: "running".to_string(),
+            summary: "Rejected final answer without Browser verification outcome.".to_string(),
+            detail: String::new(),
+            data_json: json!({ "reason": "browser_verification_required" }),
+            created_at: 1,
+        }];
+
+        assert!(!browser_verification_false_unavailable_retry_already_attempted(&detail));
+
+        detail.events.push(nucleus_protocol::JobEvent {
+            id: 2,
+            job_id: detail.job.id.clone(),
+            worker_id: Some("worker-false-browser-claim".to_string()),
+            event_type: "worker.retry".to_string(),
+            status: "running".to_string(),
+            summary: "Rejected false Browser unavailable claim.".to_string(),
+            detail: String::new(),
+            data_json: json!({ "reason": "browser_verification_false_unavailable" }),
+            created_at: 2,
+        });
+
+        assert!(browser_verification_false_unavailable_retry_already_attempted(&detail));
+    }
+
+    #[test]
+    fn browser_runtime_unavailable_observation_uses_browser_tool_evidence() {
+        let mut sidecar_unavailable = test_tool_call_summary(
+            "browser.navigate",
+            json!({
+                "ok": false,
+                "browser_verification_status": "unavailable",
+                "error": "Playwright module missing"
+            }),
+        );
+        sidecar_unavailable.worker_id = "worker-browser".to_string();
+        sidecar_unavailable.error_class = "browser_unavailable".to_string();
+
+        let mut sidecar_failed = test_tool_call_summary("browser.screenshot", json!({}));
+        sidecar_failed.worker_id = "worker-browser".to_string();
+        sidecar_failed.status = "failed".to_string();
+        sidecar_failed.error_detail =
+            "failed to start browser sidecar: executable doesn't exist".to_string();
+
+        let mut navigation_failed = test_tool_call_summary("browser.navigate", json!({}));
+        navigation_failed.worker_id = "worker-browser".to_string();
+        navigation_failed.status = "failed".to_string();
+        navigation_failed.error_detail =
+            "browser navigation failed: net::ERR_NAME_NOT_RESOLVED".to_string();
+
+        let mut other_worker_failed = sidecar_failed.clone();
+        other_worker_failed.worker_id = "other-worker".to_string();
+        let mut non_browser_failed = sidecar_failed.clone();
+        non_browser_failed.tool_id = "command.run".to_string();
+
+        assert!(browser_runtime_unavailable_observed_for_worker(
+            &[sidecar_unavailable.clone()],
+            "worker-browser",
+        ));
+        assert!(browser_runtime_unavailable_observed_for_worker(
+            &[sidecar_failed],
+            "worker-browser",
+        ));
+        assert!(!browser_runtime_unavailable_observed_for_worker(
+            &[navigation_failed],
+            "worker-browser",
+        ));
+        assert!(!browser_runtime_unavailable_observed_for_worker(
+            &[other_worker_failed, non_browser_failed],
+            "worker-browser",
+        ));
+    }
+
+    #[test]
+    fn false_browser_unavailable_retry_prompt_corrects_claim() {
+        let mut job = test_publication_job_summary("false-browser-prompt");
+        job.browser_verification_required = true;
+        job.browser_verification_status = "pending".to_string();
+
+        let prompt = build_false_browser_unavailable_retry_prompt(
+            &job,
+            "Browser verification status: unavailable",
+        );
+
+        assert!(prompt.contains("Browser tools are granted"));
+        assert!(prompt.contains("Browser runtime is available"));
+        assert!(prompt.contains("browser.navigate"));
+        assert!(prompt.contains("browser.snapshot"));
+        assert!(prompt.contains("browser.screenshot"));
+        assert!(prompt.contains("complete the task without asserting that Browser is unavailable"));
+        assert!(prompt.contains("You may include brief thoughts"));
     }
 
     #[test]
