@@ -10,6 +10,8 @@ import {
   nextRuntimeTick,
   noActivity,
   childRouteLabel,
+  publicationOutcomeBadgeVariant,
+  publicationOutcomeLabel,
   reasoningActivityDisplayView,
   reasoningActivityView,
   runtimeBadgeView,
@@ -208,6 +210,21 @@ test('completion gates are grouped by daemon-provided state', () => {
   assert.equal(gateBadgeVariant('blocked'), 'destructive');
   assert.equal(gateBadgeVariant('pending'), 'warning');
   assert.equal(gateBadgeVariant('done'), 'default');
+});
+
+test('publication outcome view shows merged jobs as merged', () => {
+  const job = {
+    publication_requested: true,
+    publication_status: 'merged',
+    browser_verification_status: 'passed'
+  };
+
+  assert.equal(publicationOutcomeBadgeVariant('merged'), 'default');
+  assert.equal(publicationOutcomeLabel(job), 'PR merged, browser-verified');
+  assert.equal(
+    publicationOutcomeLabel({ ...job, browser_verification_status: 'not_required' }),
+    'PR merged, not browser-verified'
+  );
 });
 
 test('activity failure view surfaces failed Python tool result', () => {

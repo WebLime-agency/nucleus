@@ -3,6 +3,7 @@ import { test } from 'node:test';
 
 import {
   createSessionRequestSchema,
+  jobSummarySchema,
   sessionSummarySchema,
   updateSessionRequestSchema
 } from './schemas.ts';
@@ -83,4 +84,34 @@ test('session summary preserves missing attachment mode for legacy workspace fal
 
   assert.equal(parsed.workspace_mode, 'isolated_worktree');
   assert.equal(parsed.attachment_mode, '');
+});
+
+test('job summary accepts merged publication status', () => {
+  const parsed = jobSummarySchema.parse({
+    id: 'job-merged-publication',
+    session_id: 'session-one',
+    parent_job_id: null,
+    template_id: null,
+    title: 'Merge PR',
+    purpose: 'Merge the PR into dev',
+    trigger_kind: 'session_prompt',
+    state: 'completed',
+    requested_by: 'user',
+    prompt_excerpt: 'merge it into the dev branch',
+    root_worker_id: null,
+    visible_turn_id: null,
+    result_summary: 'PR merged into dev.',
+    last_error: '',
+    publication_requested: true,
+    publication_status: 'merged',
+    pr_url: 'https://github.com/WebLime-agency/nucleus/pull/369',
+    target_branch: 'dev',
+    worker_count: 0,
+    pending_approval_count: 0,
+    artifact_count: 0,
+    created_at: 1,
+    updated_at: 1
+  });
+
+  assert.equal(parsed.publication_status, 'merged');
 });

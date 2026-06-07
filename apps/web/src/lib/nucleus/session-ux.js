@@ -182,6 +182,46 @@ export function gateBadgeVariant(state) {
   return 'warning';
 }
 
+export function publicationOutcomeBadgeVariant(status) {
+  if (status === 'opened' || status === 'merged') return 'default';
+  if (status === 'failed' || status === 'blocked' || status === 'not_opened') {
+    return 'destructive';
+  }
+  if (status === 'not_requested') return 'secondary';
+  return 'warning';
+}
+
+export function publicationOutcomeLabel(job) {
+  if (!job?.publication_requested) return '';
+
+  if (job.publication_status === 'opened') {
+    return job.browser_verification_status === 'passed'
+      ? 'PR opened, browser-verified'
+      : 'PR opened, not browser-verified';
+  }
+
+  if (job.publication_status === 'merged') {
+    return job.browser_verification_status === 'passed'
+      ? 'PR merged, browser-verified'
+      : 'PR merged, not browser-verified';
+  }
+
+  if (job.publication_status === 'blocked') {
+    if (job.validation_status === 'failed') return 'Blocked, validation failed';
+    if (
+      job.browser_verification_status === 'unavailable' ||
+      job.browser_verification_status === 'not_performed'
+    ) {
+      return 'Blocked, not browser-verified';
+    }
+    return 'PR publication blocked';
+  }
+
+  if (job.publication_status === 'failed') return 'PR publication failed';
+  if (job.publication_status === 'not_opened') return 'PR not opened';
+  return 'Publication requested';
+}
+
 export function childRouteLabel(record) {
   const title = String(record?.executor_route_title ?? '').trim();
   if (title) return title;

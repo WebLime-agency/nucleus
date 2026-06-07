@@ -5595,6 +5595,9 @@ fn publication_segment_has_unnegated_publication_phrase(text: &str) -> bool {
         text.match_indices(phrase).any(|(index, _)| {
             phrase_match_has_boundaries(text, phrase, index)
                 && !publication_phrase_is_negated(text, index)
+                && !publication_merge_phrase_is_local_only(text, phrase, index)
+                && !publication_merge_phrase_targets_file_name(text, phrase, index)
+                && !publication_merge_phrase_targets_local_object_name(text, phrase, index)
         })
     })
 }
@@ -5618,7 +5621,188 @@ fn publication_phrases() -> &'static [&'static str] {
         "publish branch",
         "pr to merge",
         "pull request to merge",
+        "merge a pr",
+        "merge the pr",
+        "merge this pr",
+        "merge a pull request",
+        "merge the pull request",
+        "merge this pull request",
+        "merge into dev",
+        "merge into main",
+        "merge into develop",
+        "merge into staging",
+        "merge into release branch",
+        "merge into the dev branch",
+        "merge into the main branch",
+        "merge into the develop branch",
+        "merge into the staging branch",
+        "merge into the release branch",
+        "merge it into dev",
+        "merge it into main",
+        "merge it into develop",
+        "merge it into staging",
+        "merge it into release branch",
+        "merge it into the dev branch",
+        "merge it into the main branch",
+        "merge it into the develop branch",
+        "merge it into the staging branch",
+        "merge it into the release branch",
+        "merge this into dev",
+        "merge this into main",
+        "merge this into develop",
+        "merge this into staging",
+        "merge this into release branch",
+        "merge this into the dev branch",
+        "merge this into the main branch",
+        "merge this into the develop branch",
+        "merge this into the staging branch",
+        "merge this into the release branch",
+        "merge the branch",
+        "merge this branch",
+        "merge the current branch",
+        "merge current branch",
+        "merge to dev",
+        "merge to main",
+        "merge to develop",
+        "merge to staging",
+        "merge to release branch",
+        "merge it to dev",
+        "merge it to main",
+        "merge it to develop",
+        "merge it to staging",
+        "merge it to release branch",
+        "merge this to dev",
+        "merge this to main",
+        "merge this to develop",
+        "merge this to staging",
+        "merge this to release branch",
+        "ship this to dev",
+        "ship this to main",
+        "ship this to develop",
+        "ship this to staging",
+        "ship this to release branch",
+        "ship it to dev",
+        "ship it to main",
+        "ship it to develop",
+        "ship it to staging",
+        "ship it to release branch",
+        "ship the branch to dev",
+        "ship the branch to main",
+        "ship the branch to develop",
+        "ship the branch to staging",
+        "ship the branch to release branch",
+        "ship this branch to dev",
+        "ship this branch to main",
+        "ship this branch to develop",
+        "ship this branch to staging",
+        "ship this branch to release branch",
+        "land a pr",
+        "land the pr",
+        "land this pr",
+        "land a pull request",
+        "land the pull request",
+        "land this pull request",
+        "land the branch",
+        "land this branch",
     ]
+}
+
+fn publication_merge_phrase_is_local_only(text: &str, phrase: &str, phrase_index: usize) -> bool {
+    if !phrase.starts_with("merge ") {
+        return false;
+    }
+
+    let suffix = text[phrase_index + phrase.len()..].trim_start();
+    let suffix_window: String = suffix.chars().take(96).collect();
+    contains_any(
+        &suffix_window,
+        &[
+            " locally",
+            " local ",
+            " test locally",
+            " for local testing",
+            " to test locally",
+            " and report conflicts",
+            " report conflicts",
+            " and report merge conflicts",
+            " report merge conflicts",
+            " and resolve conflicts",
+            " resolve conflicts",
+            " and resolve merge conflicts",
+            " resolve merge conflicts",
+        ],
+    ) || suffix_window.starts_with("locally")
+        || suffix_window.starts_with("to test locally")
+        || suffix_window.starts_with("for local testing")
+        || suffix_window.starts_with("and report conflicts")
+        || suffix_window.starts_with("report conflicts")
+        || suffix_window.starts_with("and report merge conflicts")
+        || suffix_window.starts_with("report merge conflicts")
+        || suffix_window.starts_with("and resolve conflicts")
+        || suffix_window.starts_with("resolve conflicts")
+        || suffix_window.starts_with("and resolve merge conflicts")
+        || suffix_window.starts_with("resolve merge conflicts")
+}
+
+fn publication_merge_phrase_targets_file_name(
+    text: &str,
+    phrase: &str,
+    phrase_index: usize,
+) -> bool {
+    if !phrase.starts_with("merge ") {
+        return false;
+    }
+
+    let mut suffix = text[phrase_index + phrase.len()..].chars();
+    suffix.next() == Some('.')
+        && suffix
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric())
+}
+
+fn publication_merge_phrase_targets_local_object_name(
+    text: &str,
+    phrase: &str,
+    phrase_index: usize,
+) -> bool {
+    if !phrase.starts_with("merge ") {
+        return false;
+    }
+
+    let suffix = text[phrase_index + phrase.len()..].trim_start();
+    let suffix_word = suffix
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .find(|word| !word.is_empty())
+        .unwrap_or_default();
+    matches!(
+        suffix_word,
+        "function"
+            | "functions"
+            | "component"
+            | "components"
+            | "doc"
+            | "docs"
+            | "documentation"
+            | "file"
+            | "files"
+            | "module"
+            | "modules"
+            | "class"
+            | "classes"
+            | "method"
+            | "methods"
+            | "code"
+            | "config"
+            | "configuration"
+            | "page"
+            | "pages"
+            | "view"
+            | "views"
+            | "helper"
+            | "helpers"
+            | "test"
+            | "tests"
+    )
 }
 
 fn publication_phrase_is_negated(text: &str, phrase_index: usize) -> bool {
@@ -12035,9 +12219,89 @@ and open a pull request to dev when it is ready."
             "merge into dev and report conflicts"
         ));
         assert!(!publication_requested_for_job(
+            "Merge functions",
+            "Session prompt",
+            "merge these two functions"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge data",
+            "Session prompt",
+            "merge the data files"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge conflict",
+            "Session prompt",
+            "resolve the merge conflict"
+        ));
+        assert!(!publication_requested_for_job(
+            "Local merge",
+            "Session prompt",
+            "git merge to test locally"
+        ));
+        assert!(!publication_requested_for_job(
+            "Resolve conflicts",
+            "Session prompt",
+            "merge to dev and resolve conflicts"
+        ));
+        assert!(!publication_requested_for_job(
+            "Resolve merge conflicts",
+            "Session prompt",
+            "merge into dev and resolve merge conflicts"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge function body",
+            "Session prompt",
+            "merge this into the existing function"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge docs",
+            "Session prompt",
+            "merge it into the existing docs"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge into Rust file",
+            "Session prompt",
+            "merge this into main.rs"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge into Python file",
+            "Session prompt",
+            "merge it into main.py"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge into main function",
+            "Session prompt",
+            "merge this into main function"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge into main component",
+            "Session prompt",
+            "merge this into main component"
+        ));
+        assert!(!publication_requested_for_job(
+            "Ship to production",
+            "Session prompt",
+            "ship this to production"
+        ));
+        assert!(!publication_requested_for_job(
+            "Ship to customer",
+            "Session prompt",
+            "ship it to the customer"
+        ));
+        assert!(!publication_requested_for_job(
+            "Ship branch to production",
+            "Session prompt",
+            "ship the branch to production"
+        ));
+        assert!(!publication_requested_for_job(
             "How do I open a PR?",
             "Session prompt",
             "how do I open a PR?"
+        ));
+        assert!(!publication_requested_for_job(
+            "How do I merge a PR?",
+            "Session prompt",
+            "how do I merge a PR into dev?"
         ));
         assert!(!publication_requested_for_job(
             "Prompt how do I open a PR?",
@@ -12094,6 +12358,16 @@ and open a pull request to dev when it is ready."
             "Session prompt",
             "do not open a PR"
         ));
+        assert!(!publication_requested_for_job(
+            "Do not merge",
+            "Session prompt",
+            "do not merge it into dev"
+        ));
+        assert!(!publication_requested_for_job(
+            "Do not merge PR",
+            "Session prompt",
+            "don't merge the PR yet"
+        ));
         assert!(publication_requested_for_job(
             "Explain then publish",
             "Session prompt",
@@ -12118,6 +12392,66 @@ and open a pull request to dev when it is ready."
             "Publish branch",
             "Session prompt",
             "publish this branch"
+        ));
+        assert!(publication_requested_for_job(
+            "Merge repro typo",
+            "Session prompt",
+            "conitune and merge it into the dev branch"
+        ));
+        assert!(publication_requested_for_job(
+            "Merge repro",
+            "Session prompt",
+            "continue and merge it into the dev branch"
+        ));
+        assert!(publication_requested_for_job(
+            "Merge PR",
+            "Session prompt",
+            "merge the PR"
+        ));
+        assert!(publication_requested_for_job(
+            "Merge into dev",
+            "Session prompt",
+            "merge this into dev"
+        ));
+        assert!(publication_requested_for_job(
+            "Bare merge into dev",
+            "Session prompt",
+            "merge into dev"
+        ));
+        assert!(publication_requested_for_job(
+            "Ship to dev",
+            "Session prompt",
+            "ship this to dev"
+        ));
+        assert!(publication_requested_for_job(
+            "Land PR",
+            "Session prompt",
+            "land the PR"
+        ));
+        assert!(publication_requested_for_job(
+            "Merge to dev",
+            "Session prompt",
+            "merge to dev after validation"
+        ));
+        assert!(publication_requested_for_job(
+            "Merge it to dev",
+            "Session prompt",
+            "merge it to dev after validation"
+        ));
+        assert!(publication_requested_for_job(
+            "Merge this to staging",
+            "Session prompt",
+            "merge this to staging"
+        ));
+        assert!(publication_requested_for_job(
+            "Ship branch to dev",
+            "Session prompt",
+            "ship this branch to dev"
+        ));
+        assert!(publication_requested_for_job(
+            "Land branch",
+            "Session prompt",
+            "land this branch"
         ));
         assert!(publication_requested_for_job(
             "Open PR",

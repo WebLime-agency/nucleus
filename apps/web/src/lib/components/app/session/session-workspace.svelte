@@ -81,6 +81,8 @@
     gateBadgeVariant,
     jobDetailActivityFreshnessView,
     noActivity,
+    publicationOutcomeBadgeVariant,
+    publicationOutcomeLabel,
     runtimeStartSeconds,
     shouldShowActivityStaleWarning,
     usageView
@@ -646,17 +648,6 @@
     return 'secondary';
   }
 
-  function badgeVariantForPublicationOutcome(
-    status: string
-  ): 'default' | 'secondary' | 'warning' | 'destructive' {
-    if (status === 'opened') return 'default';
-    if (status === 'failed' || status === 'blocked' || status === 'not_opened') {
-      return 'destructive';
-    }
-    if (status === 'not_requested') return 'secondary';
-    return 'warning';
-  }
-
   function formatVerificationStatus(status: string): string {
     if (status === 'passed') return 'Browser-verified';
     if (status === 'failed') return 'Browser verification failed';
@@ -664,31 +655,6 @@
     if (status === 'not_performed') return 'Not browser-verified';
     if (status === 'pending') return 'Verification pending';
     return 'Not required';
-  }
-
-  function publicationOutcomeLabel(job: JobSummary) {
-    if (!job.publication_requested) return '';
-
-    if (job.publication_status === 'opened') {
-      return job.browser_verification_status === 'passed'
-        ? 'PR opened, browser-verified'
-        : 'PR opened, not browser-verified';
-    }
-
-    if (job.publication_status === 'blocked') {
-      if (job.validation_status === 'failed') return 'Blocked, validation failed';
-      if (
-        job.browser_verification_status === 'unavailable' ||
-        job.browser_verification_status === 'not_performed'
-      ) {
-        return 'Blocked, not browser-verified';
-      }
-      return 'PR publication blocked';
-    }
-
-    if (job.publication_status === 'failed') return 'PR publication failed';
-    if (job.publication_status === 'not_opened') return 'PR not opened';
-    return 'Publication requested';
   }
 
   function publicationOutcomeRows(job: JobSummary): JobOutcomeRow[] {
@@ -4891,7 +4857,7 @@
                         <div class="mt-3 rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-3">
                           <div class="flex flex-wrap items-center justify-between gap-2">
                             <div class="text-xs font-medium uppercase tracking-[0.14em] text-zinc-500">Publication Outcome</div>
-                            <Badge variant={badgeVariantForPublicationOutcome(jobDetail.job.publication_status)}>
+                            <Badge variant={publicationOutcomeBadgeVariant(jobDetail.job.publication_status)}>
                               {publicationOutcomeLabel(jobDetail.job)}
                             </Badge>
                           </div>

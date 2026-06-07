@@ -744,11 +744,17 @@ fn publication_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
     .flatten()
     .collect::<Vec<_>>();
 
-    let has_open_pr_evidence = job.publication_status == "opened"
-        && !job.pr_url.is_empty()
-        && !job.target_branch.is_empty();
-    let state = if has_open_pr_evidence {
+    let merge_completion_requested = publication_prompt_requests_merge_completion(job);
+    let has_pr_target_evidence = !job.pr_url.is_empty() && !job.target_branch.is_empty();
+    let has_opened_publication_evidence =
+        job.publication_status == "opened" && has_pr_target_evidence;
+    let has_completed_publication_evidence = has_pr_target_evidence
+        && (job.publication_status == "merged"
+            || (job.publication_status == "opened" && !merge_completion_requested));
+    let state = if has_completed_publication_evidence {
         "done"
+    } else if has_opened_publication_evidence && merge_completion_requested {
+        if terminal { "blocked" } else { "pending" }
     } else if matches!(
         job.publication_status.as_str(),
         "blocked" | "failed" | "not_opened"
@@ -759,11 +765,23 @@ fn publication_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
         "pending"
     };
     let summary = match state {
+        "done" if job.publication_status == "merged" => format!(
+            "PR was merged into {}.",
+            empty_fallback(&job.target_branch, "the requested base")
+        ),
         "done" => format!(
             "PR is open against {}.",
             empty_fallback(&job.target_branch, "the requested base")
         ),
+        "pending" if has_opened_publication_evidence && merge_completion_requested => format!(
+            "PR is open against {}, but merge completion evidence is still pending.",
+            empty_fallback(&job.target_branch, "the requested base")
+        ),
         "pending" => "PR publication evidence is still pending.".to_string(),
+        _ if has_opened_publication_evidence && merge_completion_requested => format!(
+            "PR is open against {}, but merge completion evidence is missing.",
+            empty_fallback(&job.target_branch, "the requested base")
+        ),
         _ if job.publication_summary.trim().is_empty() => {
             "Publication was requested, but no open PR URL and target branch evidence are recorded."
                 .to_string()
@@ -780,6 +798,209 @@ fn publication_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
         required_evidence_for("github_pr", &["pr_state"]),
         evidence,
     )
+}
+
+fn publication_prompt_requests_merge_completion(job: &JobSummary) -> bool {
+    let text = normalize_prompt_text(&format!(
+        "{} {} {}",
+        job.title, job.purpose, job.prompt_excerpt
+    ));
+    if text.is_empty() {
+        return false;
+    }
+
+    if publication_prompt_contains_merge_object(&text) {
+        return true;
+    }
+
+    let has_branch_target = publication_prompt_contains_branch_target(
+        &text,
+        &[
+            "merge into",
+            "merge it into",
+            "merge this into",
+            "merge that into",
+            "merge to",
+            "merge it to",
+            "merge this to",
+            "ship this to",
+            "ship it to",
+            "ship the branch to",
+            "ship this branch to",
+            "ship to",
+            "land this in",
+            "land it in",
+            "land in",
+        ],
+    );
+    if !has_branch_target {
+        return false;
+    }
+
+    !(publication_prompt_requests_pr_creation(&text)
+        && publication_prompt_merge_target_is_pr_creation_clause(&text))
+}
+
+fn publication_prompt_contains_merge_object(text: &str) -> bool {
+    [
+        "merge a pr",
+        "merge the pr",
+        "merge this pr",
+        "merge my pr",
+        "merge a pull request",
+        "merge the pull request",
+        "merge this pull request",
+        "merge my pull request",
+        "merge the branch",
+        "merge this branch",
+        "merge my branch",
+        "land a pr",
+        "land the pr",
+        "land this pr",
+        "land a pull request",
+        "land the pull request",
+        "land this pull request",
+        "land the branch",
+        "land this branch",
+    ]
+    .iter()
+    .any(|phrase| publication_prompt_contains_unnegated_phrase(text, phrase))
+}
+
+fn publication_prompt_requests_pr_creation(text: &str) -> bool {
+    [
+        "open a pr",
+        "open the pr",
+        "open pr",
+        "open a pull request",
+        "open the pull request",
+        "create a pr",
+        "create the pr",
+        "create pr",
+        "create a pull request",
+        "create the pull request",
+        "raise a pr",
+        "raise a pull request",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
+}
+
+fn publication_prompt_merge_target_is_pr_creation_clause(text: &str) -> bool {
+    [
+        "pr to merge",
+        "pull request to merge",
+        "to merge to",
+        "to merge into",
+        "to merge it to",
+        "to merge it into",
+        "to merge this to",
+        "to merge this into",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
+}
+
+fn publication_prompt_contains_branch_target(text: &str, prefixes: &[&str]) -> bool {
+    let branches = ["dev", "main", "develop", "staging", "release"];
+    let tokens = prompt_tokens(text);
+    for prefix in prefixes {
+        let prefix_tokens = prompt_tokens(prefix);
+        if prefix_tokens.is_empty() || tokens.len() < prefix_tokens.len() + 1 {
+            continue;
+        }
+
+        for start in 0..=tokens.len() - prefix_tokens.len() {
+            if tokens[start..start + prefix_tokens.len()] != prefix_tokens {
+                continue;
+            }
+
+            let mut branch_index = start + prefix_tokens.len();
+            if tokens.get(branch_index).is_some_and(|token| token == "the") {
+                branch_index += 1;
+            }
+
+            let Some(branch) = tokens.get(branch_index) else {
+                continue;
+            };
+            if !branches.contains(&branch.as_str()) {
+                continue;
+            }
+
+            if tokens
+                .get(branch_index + 1)
+                .is_some_and(|token| publication_branch_target_followup_is_file_extension(token))
+            {
+                continue;
+            }
+
+            let phrase = tokens[start..=branch_index].join(" ");
+            if !publication_prompt_contains_unnegated_phrase(text, &phrase) {
+                continue;
+            }
+
+            return true;
+        }
+    }
+
+    false
+}
+
+fn publication_branch_target_followup_is_file_extension(token: &str) -> bool {
+    matches!(
+        token,
+        "rs" | "py"
+            | "js"
+            | "ts"
+            | "tsx"
+            | "jsx"
+            | "go"
+            | "java"
+            | "rb"
+            | "php"
+            | "css"
+            | "html"
+            | "md"
+            | "json"
+            | "toml"
+            | "yaml"
+            | "yml"
+    )
+}
+
+fn prompt_tokens(text: &str) -> Vec<String> {
+    text.split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn publication_prompt_contains_unnegated_phrase(text: &str, phrase: &str) -> bool {
+    text.match_indices(phrase)
+        .any(|(index, _)| !publication_prompt_phrase_is_negated(text, index))
+}
+
+fn publication_prompt_phrase_is_negated(text: &str, phrase_index: usize) -> bool {
+    let before = &text[..phrase_index];
+    let before_window = before
+        .chars()
+        .rev()
+        .take(64)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    let trimmed = before_window.trim_end();
+    ["do not", "don't", "dont", "never", "not", "without"]
+        .iter()
+        .any(|marker| trimmed.ends_with(marker))
+}
+
+fn normalize_prompt_text(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 fn validation_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
@@ -3827,6 +4048,170 @@ mod tests {
                 .iter()
                 .any(|gate| gate.id == "validation" && gate.state == "blocked")
         );
+    }
+
+    #[test]
+    fn merged_publication_status_satisfies_publication_gate() {
+        let mut job = task_class_job("github_pr", Vec::new());
+        job.publication_requested = true;
+        job.publication_status = "merged".to_string();
+        job.pr_url = "https://github.com/WebLime-agency/nucleus/pull/369".to_string();
+        job.target_branch = "dev".to_string();
+        job.validation_status = "passed".to_string();
+        job.browser_verification_status = "not_required".to_string();
+        job.cleanup_status = "clean".to_string();
+        assert!(!publication_prompt_requests_merge_completion(&job));
+
+        let summary = job.with_completion_gates();
+
+        assert_eq!(summary.completion_status, "satisfied");
+        assert!(summary.completion_gates.iter().any(|gate| {
+            gate.id == "publication"
+                && gate.state == "done"
+                && gate.summary == "PR was merged into dev."
+        }));
+    }
+
+    #[test]
+    fn merge_intent_requires_merged_publication_status() {
+        let mut job = task_class_job("github_pr", Vec::new());
+        job.publication_requested = true;
+        job.prompt_excerpt = "merge this into dev".to_string();
+        job.publication_status = "opened".to_string();
+        job.pr_url = "https://github.com/WebLime-agency/nucleus/pull/369".to_string();
+        job.target_branch = "dev".to_string();
+        job.validation_status = "passed".to_string();
+        job.browser_verification_status = "not_required".to_string();
+        job.cleanup_status = "clean".to_string();
+
+        let summary = job.with_completion_gates();
+        let publication_gate = summary
+            .completion_gates
+            .iter()
+            .find(|gate| gate.id == "publication")
+            .expect("publication gate should be present");
+
+        assert_eq!(summary.completion_status, "blocked");
+        assert_eq!(publication_gate.state, "blocked");
+        assert!(
+            publication_gate
+                .summary
+                .contains("merge completion evidence is missing")
+        );
+    }
+
+    #[test]
+    fn mixed_pr_creation_and_merge_intent_requires_merged_publication_status() {
+        let mut job = task_class_job("github_pr", Vec::new());
+        job.publication_requested = true;
+        job.prompt_excerpt = "open a PR and merge it into dev".to_string();
+        job.publication_status = "opened".to_string();
+        job.pr_url = "https://github.com/WebLime-agency/nucleus/pull/369".to_string();
+        job.target_branch = "dev".to_string();
+        job.validation_status = "passed".to_string();
+        job.browser_verification_status = "not_required".to_string();
+        job.cleanup_status = "clean".to_string();
+
+        let summary = job.with_completion_gates();
+
+        assert_eq!(summary.completion_status, "blocked");
+        assert!(summary.completion_gates.iter().any(|gate| {
+            gate.id == "publication"
+                && gate.state == "blocked"
+                && gate
+                    .summary
+                    .contains("merge completion evidence is missing")
+        }));
+
+        let mut merge_pr_job = task_class_job("github_pr", Vec::new());
+        merge_pr_job.publication_requested = true;
+        merge_pr_job.prompt_excerpt = "create the pull request, then merge the PR".to_string();
+        assert!(publication_prompt_requests_merge_completion(&merge_pr_job));
+
+        merge_pr_job.prompt_excerpt = "merge a pull request into dev".to_string();
+        assert!(publication_prompt_requests_merge_completion(&merge_pr_job));
+    }
+
+    #[test]
+    fn pr_creation_intent_accepts_opened_publication_status() {
+        let mut job = task_class_job("github_pr", Vec::new());
+        job.publication_requested = true;
+        job.prompt_excerpt = "open a pr to merge to dev".to_string();
+        job.publication_status = "opened".to_string();
+        job.pr_url = "https://github.com/WebLime-agency/nucleus/pull/369".to_string();
+        job.target_branch = "dev".to_string();
+        job.validation_status = "passed".to_string();
+        job.browser_verification_status = "not_required".to_string();
+        job.cleanup_status = "clean".to_string();
+
+        let summary = job.with_completion_gates();
+
+        assert_eq!(summary.completion_status, "satisfied");
+        assert!(summary.completion_gates.iter().any(|gate| {
+            gate.id == "publication"
+                && gate.state == "done"
+                && gate.summary == "PR is open against dev."
+        }));
+    }
+
+    #[test]
+    fn negated_merge_intent_accepts_opened_publication_status() {
+        let mut job = task_class_job("github_pr", Vec::new());
+        job.publication_requested = true;
+        job.prompt_excerpt = "open a PR, but don't merge the PR yet".to_string();
+        job.publication_status = "opened".to_string();
+        job.pr_url = "https://github.com/WebLime-agency/nucleus/pull/369".to_string();
+        job.target_branch = "dev".to_string();
+        job.validation_status = "passed".to_string();
+        job.browser_verification_status = "not_required".to_string();
+        job.cleanup_status = "clean".to_string();
+        assert!(!publication_prompt_requests_merge_completion(&job));
+
+        let summary = job.with_completion_gates();
+
+        assert_eq!(summary.completion_status, "satisfied");
+        assert!(summary.completion_gates.iter().any(|gate| {
+            gate.id == "publication"
+                && gate.state == "done"
+                && gate.summary == "PR is open against dev."
+        }));
+    }
+
+    #[test]
+    fn branch_shipping_intent_requires_merged_publication_status() {
+        let mut job = task_class_job("github_pr", Vec::new());
+        job.publication_requested = true;
+        job.prompt_excerpt = "ship this branch to dev".to_string();
+        job.publication_status = "opened".to_string();
+        job.pr_url = "https://github.com/WebLime-agency/nucleus/pull/369".to_string();
+        job.target_branch = "dev".to_string();
+        job.validation_status = "passed".to_string();
+        job.browser_verification_status = "not_required".to_string();
+        job.cleanup_status = "clean".to_string();
+
+        let summary = job.with_completion_gates();
+
+        assert_eq!(summary.completion_status, "blocked");
+        assert!(
+            summary
+                .completion_gates
+                .iter()
+                .any(|gate| gate.id == "publication" && gate.state == "blocked")
+        );
+    }
+
+    #[test]
+    fn merge_completion_prompt_detection_ignores_branch_named_file_targets() {
+        let mut job = task_class_job("github_pr", Vec::new());
+
+        job.prompt_excerpt = "merge this into main.rs".to_string();
+        assert!(!publication_prompt_requests_merge_completion(&job));
+
+        job.prompt_excerpt = "merge it into main.py".to_string();
+        assert!(!publication_prompt_requests_merge_completion(&job));
+
+        job.prompt_excerpt = "merge it into the dev branch".to_string();
+        assert!(publication_prompt_requests_merge_completion(&job));
     }
 
     #[test]

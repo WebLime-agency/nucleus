@@ -4868,11 +4868,12 @@ fn add_publication_initial_prompt_guidance(
     format!(
         "{}\n\nPublication job requirements:\n\
 - The user request is publication-oriented, so the final response JSON must include explicit terminal metadata for publication_status, validation_status, browser_verification_status, and cleanup_status. Put these as JSON fields, not prose labels inside the visible final_answer message.\n\
-- Allowed publication_status values: not_requested, opened, not_opened, blocked, failed.\n\
+- Allowed publication_status values: not_requested, opened, merged, not_opened, blocked, failed.\n\
 - Allowed validation_status values: passed, failed, not_performed, unavailable.\n\
 - Allowed browser_verification_status values: not_required, pending, passed, failed, not_performed, unavailable.\n\
 - Allowed cleanup_status values: clean, cleaned, cleanup_required, unknown.\n\
 - Include pr_url, source_branch, and target_branch when known.\n\
+- For protected target branches, resolve and merge the PR through the GitHub PR merge path, such as `gh pr merge <number> --squash --delete-branch` or `gh pr merge <number> --auto --squash` using the repo's allowed strategy. Do not push directly to protected branches, such as `git push <sha>:dev`, or check out shared local target-branch worktrees. If branch protection blocks the merge, set publication_status=blocked or failed with the concrete reason.\n\
 - Use the daemon-owned Browser tools for rendered verification when possible. Do not create repo-local Playwright projects, .tmp-playwright, or ad-hoc .tmp-* verification folders.\n\
 - Missing Browser or Playwright tooling is not a generic job failure. Record browser_verification_status=unavailable or not_performed with the concrete reason.\n\
 - Put scratch verification scripts outside the git worktree when you need them. Scoped file tools can only write within worker write roots; use shell commands for daemon-owned scratch work in this job temp directory: {}\n\
@@ -8794,11 +8795,7 @@ fn publication_outcome_patch_with_metadata(
     })
     .and_then(|value| normalize_publication_status(&value))
     .or_else(|| {
-        if pr_url.is_some() {
-            Some("opened".to_string())
-        } else if publication_text_says_opened(&normalized) {
-            Some("opened".to_string())
-        } else if normalized.contains("publication failed") || normalized.contains("pr failed") {
+        if normalized.contains("publication failed") || normalized.contains("pr failed") {
             Some("failed".to_string())
         } else if blocked {
             Some("blocked".to_string())
@@ -8807,6 +8804,12 @@ fn publication_outcome_patch_with_metadata(
             || normalized.contains("did not open")
         {
             Some("not_opened".to_string())
+        } else if publication_text_says_merged(&normalized) {
+            Some("merged".to_string())
+        } else if pr_url.is_some() {
+            Some("opened".to_string())
+        } else if publication_text_says_opened(&normalized) {
+            Some("opened".to_string())
         } else {
             match current.publication_status.as_str() {
                 "" | "not_requested" => Some("blocked".to_string()),
@@ -9193,6 +9196,34 @@ fn publication_text_says_opened(text: &str) -> bool {
     .any(|needle| text.contains(needle))
 }
 
+fn publication_text_says_merged(text: &str) -> bool {
+    if [
+        "no pr was merged",
+        "no pull request was merged",
+        "pr was not merged",
+        "pull request was not merged",
+        "not merged",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+    {
+        return false;
+    }
+
+    [
+        "pull request merged",
+        "pull request was merged",
+        "merged pull request",
+        "pr merged",
+        "pr was merged",
+        "the pr was merged",
+        "the pull request was merged",
+        "merged pr",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
 fn normalize_publication_status(value: &str) -> Option<String> {
     let normalized = value
         .trim()
@@ -9205,7 +9236,14 @@ fn normalize_publication_status(value: &str) -> Option<String> {
     }
     normalize_enum_value(
         value,
-        &["not_requested", "opened", "not_opened", "blocked", "failed"],
+        &[
+            "not_requested",
+            "opened",
+            "merged",
+            "not_opened",
+            "blocked",
+            "failed",
+        ],
     )
 }
 
@@ -9749,6 +9787,7 @@ fn publication_final_answer_has_required_facts_with_metadata(
         .is_some()
         || normalized.contains("blocked_without_browser_verification")
         || normalized.contains("pr not opened")
+        || publication_text_says_merged(&normalized)
         || publication_text_says_opened(&normalized);
     let has_validation = final_response_metadata_string(
         final_answer_metadata,
@@ -9811,7 +9850,7 @@ Previous summary: {}\n\
 Previous final_answer: {}\n\
 Return one valid Nucleus worker action JSON object using kind=\"final_answer\". You may include brief thoughts before the action fields.\n\
 Return a clean user-facing final_answer message plus these terminal metadata fields as JSON fields on the action or inside a structured final_answer object:\n\
-- publication_status: not_requested | opened | not_opened | blocked | failed\n\
+- publication_status: not_requested | opened | merged | not_opened | blocked | failed\n\
 - publication_summary\n\
 - pr_url, source_branch, target_branch when known\n\
 - validation_status: passed | failed | not_performed | unavailable\n\
@@ -20068,6 +20107,27 @@ Remaining:\n\
     }
 
     #[test]
+    fn publication_initial_prompt_guidance_steers_pr_merge_path() {
+        let state_dir = test_state_dir("publication-pr-merge-guidance");
+        let state = initialize_test_state(&state_dir);
+        let job = test_publication_job_summary("publication-pr-merge-guidance");
+
+        let prompt = add_publication_initial_prompt_guidance(
+            &state,
+            &job,
+            "continue and merge it into the dev branch".to_string(),
+        );
+
+        assert!(prompt.contains("GitHub PR merge path"));
+        assert!(prompt.contains("publication_status values: not_requested, opened, merged"));
+        assert!(prompt.contains("--squash"));
+        assert!(prompt.contains("Do not push directly to protected branches"));
+        assert!(prompt.contains("git push <sha>:dev"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
     fn terminal_metadata_does_not_treat_generic_reached_current_text_as_blocked() {
         let metadata = final_answer_terminal_metadata(
             "Completed the requested cleanup.",
@@ -20231,6 +20291,90 @@ Cleanup paths: .tmp-playwright.",
         assert_eq!(
             patch.cleanup_paths.as_deref(),
             Some(&[".tmp-playwright".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn publication_outcome_patch_accepts_merged_status() {
+        let job = test_publication_job_summary("publication-merged");
+        let patch = publication_outcome_patch(
+            &job,
+            "Merged PR",
+            "Publication status: merged\n\
+Publication summary: PR merged into dev.\n\
+PR URL: https://github.com/WebLime-agency/nucleus/pull/369\n\
+Target branch: dev\n\
+Validation status: passed\n\
+Browser verification status: not_required\n\
+Cleanup status: clean",
+            8,
+            4,
+        );
+
+        assert_eq!(patch.publication_status.as_deref(), Some("merged"));
+        assert_eq!(
+            patch.pr_url.as_deref(),
+            Some("https://github.com/WebLime-agency/nucleus/pull/369")
+        );
+        assert!(publication_final_answer_has_required_facts(
+            "Merged PR",
+            "PR merged into dev.\n\
+Validation status: passed\n\
+Browser verification status: not_required\n\
+Cleanup status: clean"
+        ));
+    }
+
+    #[test]
+    fn publication_outcome_patch_infers_passive_merged_status() {
+        let job = test_publication_job_summary("publication-passive-merged");
+        let patch = publication_outcome_patch(
+            &job,
+            "Merged PR",
+            "PR was merged into dev.\n\
+PR URL: https://github.com/WebLime-agency/nucleus/pull/369\n\
+Target branch: dev\n\
+Validation status: passed\n\
+Browser verification status: not_required\n\
+Cleanup status: clean",
+            8,
+            4,
+        );
+
+        assert_eq!(patch.publication_status.as_deref(), Some("merged"));
+        assert_eq!(
+            patch.pr_url.as_deref(),
+            Some("https://github.com/WebLime-agency/nucleus/pull/369")
+        );
+        assert!(publication_final_answer_has_required_facts(
+            "Merged PR",
+            "PR was merged into dev.\n\
+Validation status: passed\n\
+Browser verification status: not_required\n\
+Cleanup status: clean"
+        ));
+    }
+
+    #[test]
+    fn publication_outcome_patch_prefers_blocked_over_passive_merged_text() {
+        let job = test_publication_job_summary("publication-passive-merge-blocked");
+        let patch = publication_outcome_patch(
+            &job,
+            "Merge blocked",
+            "No PR was merged; it was blocked by branch protection.\n\
+PR URL: https://github.com/WebLime-agency/nucleus/pull/369\n\
+Target branch: dev\n\
+Validation status: passed\n\
+Browser verification status: not_required\n\
+Cleanup status: clean",
+            8,
+            4,
+        );
+
+        assert_eq!(patch.publication_status.as_deref(), Some("blocked"));
+        assert_eq!(
+            patch.pr_url.as_deref(),
+            Some("https://github.com/WebLime-agency/nucleus/pull/369")
         );
     }
 
