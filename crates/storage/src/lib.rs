@@ -5865,7 +5865,15 @@ fn publication_segment_is_readiness_question(text: &str) -> bool {
     let phrase_text = command_phrase_text(text);
     advisory_pr_merge_phrases()
         .iter()
-        .chain(["merge it into", "merge this into", "land the branch"].iter())
+        .chain(
+            [
+                "merge it into",
+                "merge this into",
+                "land the branch",
+                "land this branch",
+            ]
+            .iter(),
+        )
         .any(|phrase| command_phrase_contains(&phrase_text, phrase))
 }
 
@@ -12538,6 +12546,11 @@ and open a pull request to dev when it is ready."
             "Land advice",
             "Session prompt",
             "would it be ok to land the branch?"
+        ));
+        assert!(!publication_requested_for_job(
+            "Land this branch advice",
+            "Session prompt",
+            "can we land this branch?"
         ));
         assert!(publication_requested_for_job(
             "Explain then publish",
