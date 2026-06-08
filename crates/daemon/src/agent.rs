@@ -4868,11 +4868,13 @@ fn add_publication_initial_prompt_guidance(
     format!(
         "{}\n\nPublication job requirements:\n\
 - The user request is publication-oriented, so the final response JSON must include explicit terminal metadata for publication_status, validation_status, browser_verification_status, and cleanup_status. Put these as JSON fields, not prose labels inside the visible final_answer message.\n\
-- Allowed publication_status values: not_requested, opened, not_opened, blocked, failed.\n\
+- Allowed publication_status values: not_requested, opened, merged, not_opened, blocked, failed.\n\
 - Allowed validation_status values: passed, failed, not_performed, unavailable.\n\
 - Allowed browser_verification_status values: not_required, pending, passed, failed, not_performed, unavailable.\n\
 - Allowed cleanup_status values: clean, cleaned, cleanup_required, unknown.\n\
 - Include pr_url, source_branch, and target_branch when known.\n\
+- For protected target branches, resolve and merge the PR through the GitHub PR-merge path such as gh pr merge or the github.* tools. Do not push directly to a protected branch, for example git push <sha>:dev, or check out a shared local dev worktree; if branch protection blocks the merge, set publication_status=blocked or failed with the concrete reason.\n\
+- If a requested PR merge succeeds, set publication_status=merged and record the merge result in publication_summary.\n\
 - Use the daemon-owned Browser tools for rendered verification when possible. Do not create repo-local Playwright projects, .tmp-playwright, or ad-hoc .tmp-* verification folders.\n\
 - Missing Browser or Playwright tooling is not a generic job failure. Record browser_verification_status=unavailable or not_performed with the concrete reason.\n\
 - Put scratch verification scripts outside the git worktree when you need them. Scoped file tools can only write within worker write roots; use shell commands for daemon-owned scratch work in this job temp directory: {}\n\
@@ -8766,6 +8768,8 @@ fn publication_outcome_patch_with_metadata(
 
     let raw_text = format!("{summary}\n{final_answer}");
     let normalized = normalize_action_item_text(&raw_text);
+    let normalized_summary = normalize_action_item_text(summary).to_ascii_lowercase();
+    let normalized_final_answer = normalize_action_item_text(final_answer).to_ascii_lowercase();
     let blocked = contains_blocked_terminal_result_language(&normalized);
     let pr_url = final_response_metadata_string(
         final_answer_metadata,
@@ -8794,7 +8798,12 @@ fn publication_outcome_patch_with_metadata(
     })
     .and_then(|value| normalize_publication_status(&value))
     .or_else(|| {
-        if pr_url.is_some() {
+        if !publication_text_negates_merged(&normalized)
+            && (publication_text_says_merged(&normalized_summary)
+                || publication_text_says_merged(&normalized_final_answer))
+        {
+            Some("merged".to_string())
+        } else if pr_url.is_some() {
             Some("opened".to_string())
         } else if publication_text_says_opened(&normalized) {
             Some("opened".to_string())
@@ -9193,6 +9202,93 @@ fn publication_text_says_opened(text: &str) -> bool {
     .any(|needle| text.contains(needle))
 }
 
+fn publication_text_says_merged(text: &str) -> bool {
+    if publication_text_negates_merged(text) {
+        return false;
+    }
+
+    let tokens = publication_text_tokens(text);
+    publication_tokens_say_pr_merged(&tokens)
+}
+
+fn publication_text_tokens(text: &str) -> Vec<&str> {
+    text.split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn publication_tokens_say_pr_merged(tokens: &[&str]) -> bool {
+    let mut index = 0;
+    while index < tokens.len() {
+        let pr_token_len = if tokens[index] == "pr" {
+            Some(1)
+        } else if tokens[index] == "pull" && tokens.get(index + 1).copied() == Some("request") {
+            Some(2)
+        } else {
+            None
+        };
+
+        let Some(pr_token_len) = pr_token_len else {
+            index += 1;
+            continue;
+        };
+        let pr_end = index + pr_token_len - 1;
+
+        if !publication_pr_phrase_is_branch_reference(tokens, pr_end)
+            && (tokens[..index].last().copied() == Some("merged")
+                || (index >= 2 && tokens[index - 2] == "merged" && tokens[index - 1] == "the")
+                || (index >= 2 && tokens[index - 2] == "merged" && tokens[index - 1] == "this"))
+        {
+            return true;
+        }
+
+        if tokens[pr_end + 1..]
+            .iter()
+            .take(4)
+            .copied()
+            .take_while(|token| publication_pr_merge_status_filler_token(token))
+            .last()
+            == Some("merged")
+        {
+            return true;
+        }
+
+        index += pr_token_len;
+    }
+
+    false
+}
+
+fn publication_pr_phrase_is_branch_reference(tokens: &[&str], pr_end: usize) -> bool {
+    matches!(
+        tokens.get(pr_end + 1).copied(),
+        Some("branch" | "branches" | "head" | "heads" | "update" | "updates")
+    )
+}
+
+fn publication_pr_merge_status_filler_token(token: &str) -> bool {
+    token == "merged"
+        || token.chars().all(|character| character.is_ascii_digit())
+        || matches!(
+            token,
+            "was" | "is" | "has" | "been" | "successfully" | "now" | "already"
+        )
+}
+
+fn publication_text_negates_merged(text: &str) -> bool {
+    [
+        "not merged",
+        "not a merged",
+        "no merged",
+        "no pr merged",
+        "no pull request merged",
+        "without a merged",
+        "without merged",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
 fn normalize_publication_status(value: &str) -> Option<String> {
     let normalized = value
         .trim()
@@ -9205,7 +9301,14 @@ fn normalize_publication_status(value: &str) -> Option<String> {
     }
     normalize_enum_value(
         value,
-        &["not_requested", "opened", "not_opened", "blocked", "failed"],
+        &[
+            "not_requested",
+            "opened",
+            "merged",
+            "not_opened",
+            "blocked",
+            "failed",
+        ],
     )
 }
 
@@ -9811,7 +9914,7 @@ Previous summary: {}\n\
 Previous final_answer: {}\n\
 Return one valid Nucleus worker action JSON object using kind=\"final_answer\". You may include brief thoughts before the action fields.\n\
 Return a clean user-facing final_answer message plus these terminal metadata fields as JSON fields on the action or inside a structured final_answer object:\n\
-- publication_status: not_requested | opened | not_opened | blocked | failed\n\
+- publication_status: not_requested | opened | merged | not_opened | blocked | failed\n\
 - publication_summary\n\
 - pr_url, source_branch, target_branch when known\n\
 - validation_status: passed | failed | not_performed | unavailable\n\
@@ -20068,6 +20171,27 @@ Remaining:\n\
     }
 
     #[test]
+    fn publication_initial_guidance_steers_protected_branch_merges_to_pr_path() {
+        let state_dir = test_state_dir("publication-guidance-pr-merge-path");
+        let state = initialize_test_state(&state_dir);
+        let prompt = add_publication_initial_prompt_guidance(
+            &state,
+            &test_publication_job_summary("publication-guidance-pr-merge-path"),
+            "continue and merge it into the dev branch".to_string(),
+        );
+
+        assert!(prompt.contains("GitHub PR-merge path"));
+        assert!(prompt.contains("gh pr merge"));
+        assert!(prompt.contains("github.* tools"));
+        assert!(prompt.contains("Do not push directly to a protected branch"));
+        assert!(prompt.contains("git push <sha>:dev"));
+        assert!(prompt.contains("publication_status=blocked or failed"));
+        assert!(prompt.contains("publication_status=merged"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
     fn terminal_metadata_does_not_treat_generic_reached_current_text_as_blocked() {
         let metadata = final_answer_terminal_metadata(
             "Completed the requested cleanup.",
@@ -20232,6 +20356,129 @@ Cleanup paths: .tmp-playwright.",
             patch.cleanup_paths.as_deref(),
             Some(&[".tmp-playwright".to_string()][..])
         );
+    }
+
+    #[test]
+    fn publication_outcome_patch_accepts_merged_publication_status() {
+        let job = test_publication_job_summary("publication-merged-status");
+        let patch = publication_outcome_patch(
+            &job,
+            "Merged PR",
+            "Publication status: merged\n\
+Publication summary: Merged PR #200 into dev.\n\
+PR URL: https://github.com/WebLime-agency/nucleus/pull/200\n\
+Target branch: dev\n\
+Validation status: passed\n\
+Browser verification status: not_required\n\
+Cleanup status: clean",
+            8,
+            4,
+        );
+
+        assert_eq!(patch.publication_status.as_deref(), Some("merged"));
+        assert_eq!(patch.validation_status.as_deref(), Some("passed"));
+    }
+
+    #[test]
+    fn publication_outcome_patch_infers_merged_publication_status() {
+        let job = test_publication_job_summary("publication-merged-inferred");
+        let patch = publication_outcome_patch(
+            &job,
+            "Merged PR",
+            "Merged PR #200 into dev after validation passed.",
+            8,
+            4,
+        );
+
+        assert_eq!(patch.publication_status.as_deref(), Some("merged"));
+        assert_eq!(patch.publication_summary.as_deref(), Some("Merged PR"));
+    }
+
+    #[test]
+    fn publication_outcome_patch_infers_merged_status_with_pr_number_between_tokens() {
+        let job = test_publication_job_summary("publication-merged-token-window");
+        let pr_number_patch = publication_outcome_patch(
+            &job,
+            "Merged PR",
+            "PR #207 was merged into dev after validation passed.",
+            8,
+            4,
+        );
+        assert_eq!(
+            pr_number_patch.publication_status.as_deref(),
+            Some("merged")
+        );
+
+        let pull_request_patch = publication_outcome_patch(
+            &job,
+            "Merged PR",
+            "Pull request #207 merged after validation passed.",
+            8,
+            4,
+        );
+        assert_eq!(
+            pull_request_patch.publication_status.as_deref(),
+            Some("merged")
+        );
+    }
+
+    #[test]
+    fn publication_outcome_patch_does_not_infer_negated_merged_status() {
+        let mut job = test_publication_job_summary("publication-merged-negated");
+        job.publication_status = "not_requested".to_string();
+
+        let blocked_patch =
+            publication_outcome_patch(&job, "Blocked", "Blocked: no merged PR evidence.", 8, 4);
+        assert_eq!(blocked_patch.publication_status.as_deref(), Some("blocked"));
+
+        let not_merged_patch = publication_outcome_patch(
+            &job,
+            "Checks failed",
+            "Not merged PR #207 because checks failed.",
+            8,
+            4,
+        );
+        assert_eq!(
+            not_merged_patch.publication_status.as_deref(),
+            Some("blocked")
+        );
+    }
+
+    #[test]
+    fn publication_outcome_patch_does_not_infer_pr_merge_from_branch_update_wording() {
+        let job = test_publication_job_summary("publication-branch-update-not-merged");
+        let branch_update_patch = publication_outcome_patch(
+            &job,
+            "Opened PR",
+            "Merged main into the PR branch, then opened PR https://github.com/WebLime-agency/nucleus/pull/207.",
+            8,
+            4,
+        );
+        assert_eq!(
+            branch_update_patch.publication_status.as_deref(),
+            Some("opened")
+        );
+
+        let pr_branch_patch = publication_outcome_patch(
+            &job,
+            "Opened PR",
+            "Merged PR branch with main, then opened PR https://github.com/WebLime-agency/nucleus/pull/207.",
+            8,
+            4,
+        );
+        assert_eq!(
+            pr_branch_patch.publication_status.as_deref(),
+            Some("opened")
+        );
+
+        let pr_url_patch = publication_outcome_patch(
+            &job,
+            "Opened PR",
+            "Merged main. PR URL: https://github.com/WebLime-agency/nucleus/pull/207.",
+            8,
+            4,
+        );
+        assert_eq!(pr_url_patch.publication_status.as_deref(), Some("opened"));
     }
 
     #[test]

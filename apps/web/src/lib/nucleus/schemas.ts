@@ -193,7 +193,7 @@ export const jobSummarySchema = z.object({
   browser_verification_summary: z.string().default(''),
   browser_verification_artifact_ids: z.array(z.string()).default([]),
   publication_requested: z.boolean().default(false),
-  publication_status: z.enum(['not_requested', 'opened', 'not_opened', 'blocked', 'failed']).default('not_requested'),
+  publication_status: z.enum(['not_requested', 'opened', 'merged', 'not_opened', 'blocked', 'failed']).default('not_requested'),
   publication_summary: z.string().default(''),
   pr_url: z.string().default(''),
   source_branch: z.string().default(''),

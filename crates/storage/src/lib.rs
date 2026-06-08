@@ -5460,7 +5460,12 @@ fn is_pending_browser_verification_summary(summary: &str) -> bool {
 
 fn publication_requested_for_job(_title: &str, _purpose: &str, prompt_excerpt: &str) -> bool {
     let prompt_excerpt = prompt_excerpt.to_ascii_lowercase();
-    if publication_segment_has_publication_phrase(&prompt_excerpt) {
+    let phrase_text = command_phrase_text(&prompt_excerpt);
+    let mentions_pr = command_phrase_contains(&phrase_text, "pr")
+        || command_phrase_contains(&phrase_text, "pull request");
+    if publication_segment_has_publication_phrase(&prompt_excerpt)
+        || (mentions_pr && publication_segment_has_actionable_suffix(&prompt_excerpt))
+    {
         return publication_segment_requests_publication(&prompt_excerpt);
     }
 
@@ -5579,8 +5584,16 @@ fn job_task_class_cleared(connection: &Connection, job_id: &str) -> Result<bool>
 }
 
 fn publication_segment_requests_publication(text: &str) -> bool {
-    (publication_segment_has_unnegated_publication_phrase(text)
-        || publication_segment_has_actionable_suffix(text))
+    let has_actionable_suffix = publication_segment_has_actionable_suffix(text);
+    if publication_segment_is_hard_local_merge_probe(text) && !has_actionable_suffix {
+        return false;
+    }
+
+    let has_direct_publication_request = publication_segment_has_unnegated_publication_phrase(text)
+        && !publication_segment_is_readiness_question(text)
+        && !publication_segment_is_soft_local_merge_probe(text);
+
+    (has_direct_publication_request || has_actionable_suffix)
         && !publication_segment_is_informational(text)
 }
 
@@ -5588,6 +5601,7 @@ fn publication_segment_has_publication_phrase(text: &str) -> bool {
     publication_phrases()
         .iter()
         .any(|needle| contains_phrase_with_boundaries(text, needle))
+        || publication_segment_has_contextual_publication_phrase(text)
 }
 
 fn publication_segment_has_unnegated_publication_phrase(text: &str) -> bool {
@@ -5596,7 +5610,7 @@ fn publication_segment_has_unnegated_publication_phrase(text: &str) -> bool {
             phrase_match_has_boundaries(text, phrase, index)
                 && !publication_phrase_is_negated(text, index)
         })
-    })
+    }) || publication_segment_has_unnegated_contextual_publication_phrase(text)
 }
 
 fn publication_phrases() -> &'static [&'static str] {
@@ -5618,7 +5632,127 @@ fn publication_phrases() -> &'static [&'static str] {
         "publish branch",
         "pr to merge",
         "pull request to merge",
+        "merge into dev",
+        "merge into main",
+        "merge to dev",
+        "merge to main",
+        "merge-to-dev",
+        "merge-to-main",
+        "merge pr",
+        "merge the pr",
+        "merge this pr",
+        "merge pull request",
+        "merge the pull request",
+        "merge this pull request",
+        "land pr",
+        "land this pr",
+        "land the pr",
+        "land pull request",
+        "land this pull request",
+        "land the pull request",
+        "land this branch",
+        "land the branch",
     ]
+}
+
+fn contextual_publication_phrases() -> &'static [&'static str] {
+    &[
+        "merge it into",
+        "merge this into",
+        "merge the branch into",
+        "merge this branch into",
+        "merge the branch to",
+        "merge this branch to",
+        "ship this to",
+        "ship it to",
+    ]
+}
+
+fn publication_segment_has_contextual_publication_phrase(text: &str) -> bool {
+    contextual_publication_phrases()
+        .iter()
+        .copied()
+        .any(|phrase| {
+            text.match_indices(phrase).any(|(index, _)| {
+                phrase_match_has_boundaries(text, phrase, index)
+                    && publication_phrase_has_branch_target_for_phrase(text, phrase, index)
+            })
+        })
+}
+
+fn publication_segment_has_unnegated_contextual_publication_phrase(text: &str) -> bool {
+    contextual_publication_phrases()
+        .iter()
+        .copied()
+        .any(|phrase| {
+            text.match_indices(phrase).any(|(index, _)| {
+                phrase_match_has_boundaries(text, phrase, index)
+                    && publication_phrase_has_branch_target_for_phrase(text, phrase, index)
+                    && !publication_phrase_is_negated(text, index)
+            })
+        })
+}
+
+fn publication_phrase_has_branch_target_for_phrase(text: &str, phrase: &str, index: usize) -> bool {
+    if matches!(phrase, "ship this to" | "ship it to") {
+        return publication_phrase_has_branch_target_excluding_deploy_targets(text, phrase, index);
+    }
+    publication_phrase_has_branch_target(text, phrase, index)
+}
+
+fn publication_phrase_has_branch_target(text: &str, phrase: &str, index: usize) -> bool {
+    let target_text = &text[index + phrase.len()..];
+    let tokens = command_tokens(target_text);
+    let mut tokens = tokens.as_slice();
+    if tokens.first().copied() == Some("the") {
+        tokens = &tokens[1..];
+    }
+    let Some(first) = tokens.first().copied() else {
+        return false;
+    };
+    if first == "target" && tokens.get(1).copied() == Some("branch") {
+        return true;
+    }
+    let branch_targets = [
+        "dev",
+        "main",
+        "master",
+        "stable",
+        "beta",
+        "nightly",
+        "release",
+        "next",
+        "staging",
+        "production",
+        "prod",
+        "trunk",
+        "integration",
+    ];
+    branch_targets.contains(&first)
+        || (tokens.get(1).copied() == Some("branch") && branch_targets.contains(&first))
+}
+
+fn publication_phrase_has_branch_target_excluding_deploy_targets(
+    text: &str,
+    phrase: &str,
+    index: usize,
+) -> bool {
+    let target_text = &text[index + phrase.len()..];
+    let tokens = command_tokens(target_text);
+    let mut tokens = tokens.as_slice();
+    if tokens.first().copied() == Some("the") {
+        tokens = &tokens[1..];
+    }
+    let Some(first) = tokens.first().copied() else {
+        return false;
+    };
+    if matches!(
+        first,
+        "production" | "prod" | "staging" | "stable" | "beta" | "nightly"
+    ) {
+        return false;
+    }
+    publication_phrase_has_branch_target(text, phrase, index)
 }
 
 fn publication_phrase_is_negated(text: &str, phrase_index: usize) -> bool {
@@ -5667,13 +5801,126 @@ fn publication_segment_is_informational(text: &str) -> bool {
         "what's ",
         "can you explain",
         "could you explain",
+        "can you tell me how",
+        "could you tell me how",
         "please explain",
         "explain how",
+        "show me how",
+        "can you show me how",
+        "could you show me how",
+        "tell me how",
         "guide me through",
         "instructions for",
     ]
     .iter()
     .any(|prefix| text.starts_with(prefix))
+}
+
+fn publication_segment_is_readiness_question(text: &str) -> bool {
+    let text = text.trim_start();
+    if publication_segment_has_actionable_suffix(text) {
+        return false;
+    }
+
+    let has_readiness_prefix = [
+        "can we ",
+        "can i ",
+        "could we ",
+        "could i ",
+        "should we ",
+        "should i ",
+        "are we ready to ",
+        "is it ready to ",
+        "is this ready to ",
+    ]
+    .iter()
+    .any(|prefix| text.starts_with(prefix));
+
+    if !has_readiness_prefix {
+        return false;
+    }
+
+    let phrase_text = command_phrase_text(text);
+    [
+        "merge pr",
+        "merge the pr",
+        "merge this pr",
+        "merge pull request",
+        "merge the pull request",
+        "merge this pull request",
+        "merge it into",
+        "merge this into",
+        "land pr",
+        "land the pr",
+        "land this pr",
+        "land pull request",
+        "land the pull request",
+        "land this pull request",
+    ]
+    .iter()
+    .any(|phrase| command_phrase_contains(&phrase_text, phrase))
+}
+
+fn publication_segment_is_hard_local_merge_probe(text: &str) -> bool {
+    let phrase_text = command_phrase_text(text);
+    let explicit_pr_merge = publication_segment_has_explicit_pr_merge_request(&phrase_text);
+    (command_phrase_contains(&phrase_text, "without opening a pr") && !explicit_pr_merge)
+        || (command_phrase_contains(&phrase_text, "without opening a pull request")
+            && !explicit_pr_merge)
+}
+
+fn publication_segment_is_soft_local_merge_probe(text: &str) -> bool {
+    let phrase_text = command_phrase_text(text);
+    let explicit_pr_merge = publication_segment_has_explicit_pr_merge_request(&phrase_text);
+    (command_phrase_contains(&phrase_text, "git merge") && !explicit_pr_merge)
+        || (publication_segment_has_local_merge_qualifier(&phrase_text) && !explicit_pr_merge)
+        || (command_phrase_contains(&phrase_text, "report conflicts")
+            && !publication_segment_has_explicit_pr_request(&phrase_text)
+            && !explicit_pr_merge)
+}
+
+fn publication_segment_has_local_merge_qualifier(phrase_text: &str) -> bool {
+    phrase_text
+        .match_indices(" merge ")
+        .any(|(index, phrase)| phrase_text[index + phrase.len()..].contains(" locally "))
+}
+
+fn publication_segment_has_explicit_pr_request(phrase_text: &str) -> bool {
+    [
+        "open a pr",
+        "open the pr",
+        "open pr",
+        "open a pull request",
+        "open the pull request",
+        "open pull request",
+        "create a pr",
+        "create the pr",
+        "create pr",
+        "create a pull request",
+        "create the pull request",
+        "create pull request",
+    ]
+    .iter()
+    .any(|phrase| command_phrase_contains(phrase_text, phrase))
+}
+
+fn publication_segment_has_explicit_pr_merge_request(phrase_text: &str) -> bool {
+    [
+        "merge pr",
+        "merge the pr",
+        "merge this pr",
+        "merge pull request",
+        "merge the pull request",
+        "merge this pull request",
+        "land pr",
+        "land the pr",
+        "land this pr",
+        "land pull request",
+        "land the pull request",
+        "land this pull request",
+    ]
+    .iter()
+    .any(|phrase| command_phrase_contains(phrase_text, phrase))
 }
 
 fn publication_segment_has_actionable_suffix(text: &str) -> bool {
@@ -12035,6 +12282,101 @@ and open a pull request to dev when it is ready."
             "merge into dev and report conflicts"
         ));
         assert!(!publication_requested_for_job(
+            "Dry run merge without PR",
+            "Session prompt",
+            "without opening a PR, merge this into dev locally"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge into dev locally",
+            "Session prompt",
+            "merge this into dev locally"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge branch to dev locally",
+            "Session prompt",
+            "merge this branch to dev locally"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge functions",
+            "Session prompt",
+            "merge these two functions"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge data files",
+            "Session prompt",
+            "merge the data files"
+        ));
+        assert!(!publication_requested_for_job(
+            "Resolve merge conflict",
+            "Session prompt",
+            "resolve the merge conflict"
+        ));
+        assert!(!publication_requested_for_job(
+            "Local merge test",
+            "Session prompt",
+            "git merge to test locally"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge content",
+            "Session prompt",
+            "merge this into the README"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge config",
+            "Session prompt",
+            "merge this into the existing config"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge branch locally",
+            "Session prompt",
+            "merge this branch into my current worktree"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge branch names",
+            "Session prompt",
+            "merge the branch names in the report"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge docs",
+            "Session prompt",
+            "merge this into the branch protection docs"
+        ));
+        assert!(!publication_requested_for_job(
+            "Ship customer artifact",
+            "Session prompt",
+            "ship this to the customer"
+        ));
+        assert!(!publication_requested_for_job(
+            "Ship users artifact",
+            "Session prompt",
+            "ship it to users"
+        ));
+        assert!(!publication_requested_for_job(
+            "Ship production",
+            "Session prompt",
+            "ship this to production"
+        ));
+        assert!(!publication_requested_for_job(
+            "Ship staging",
+            "Session prompt",
+            "ship it to staging"
+        ));
+        assert!(!publication_requested_for_job(
+            "Ship stable channel",
+            "Session prompt",
+            "ship this to stable"
+        ));
+        assert!(!publication_requested_for_job(
+            "Ship beta channel",
+            "Session prompt",
+            "ship this to beta"
+        ));
+        assert!(!publication_requested_for_job(
+            "Ship nightly channel",
+            "Session prompt",
+            "ship this to nightly"
+        ));
+        assert!(!publication_requested_for_job(
             "How do I open a PR?",
             "Session prompt",
             "how do I open a PR?"
@@ -12090,14 +12432,79 @@ and open a pull request to dev when it is ready."
             "no need to open a PR"
         ));
         assert!(!publication_requested_for_job(
+            "No merge",
+            "Session prompt",
+            "do not merge it into dev"
+        ));
+        assert!(!publication_requested_for_job(
+            "No merge",
+            "Session prompt",
+            "don't merge the PR yet"
+        ));
+        assert!(!publication_requested_for_job(
             "Open PR",
             "Session prompt",
             "do not open a PR"
+        ));
+        assert!(!publication_requested_for_job(
+            "Explain merge",
+            "Session prompt",
+            "how do I merge a PR into dev?"
+        ));
+        assert!(!publication_requested_for_job(
+            "Explain PR merge",
+            "Session prompt",
+            "can you tell me how to merge PR #207?"
+        ));
+        assert!(!publication_requested_for_job(
+            "Show PR merge",
+            "Session prompt",
+            "show me how to merge the PR"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge readiness",
+            "Session prompt",
+            "can we merge the PR?"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge advice",
+            "Session prompt",
+            "should I merge the pull request?"
         ));
         assert!(publication_requested_for_job(
             "Explain then publish",
             "Session prompt",
             "Please explain quickly, then open a PR to dev"
+        ));
+        assert!(publication_requested_for_job(
+            "Polite PR request",
+            "Session prompt",
+            "can you open a PR?"
+        ));
+        assert!(publication_requested_for_job(
+            "Polite merge request",
+            "Session prompt",
+            "can you merge the PR?"
+        ));
+        assert!(publication_requested_for_job(
+            "Open PR and report conflicts",
+            "Session prompt",
+            "open a PR to dev and report conflicts if GitHub finds any"
+        ));
+        assert!(publication_requested_for_job(
+            "Test then publish",
+            "Session prompt",
+            "test locally, then open a PR to dev"
+        ));
+        assert!(publication_requested_for_job(
+            "Dry run merge then publish",
+            "Session prompt",
+            "run git merge --no-commit to check conflicts, then open a PR"
+        ));
+        assert!(publication_requested_for_job(
+            "Test and merge",
+            "Session prompt",
+            "test locally and merge it into dev"
         ));
         assert!(publication_requested_for_job(
             "Explain then publish",
@@ -12109,6 +12516,11 @@ and open a pull request to dev when it is ready."
             "Session prompt",
             "do not open a PR until tests pass, then open one"
         ));
+        assert!(publication_requested_for_job(
+            "Delayed publication after validation",
+            "Session prompt",
+            "run validation without opening a PR, then open one if it passes"
+        ));
         assert!(!publication_requested_for_job(
             "Explain but do not publish",
             "Session prompt",
@@ -12118,6 +12530,81 @@ and open a pull request to dev when it is ready."
             "Publish branch",
             "Session prompt",
             "publish this branch"
+        ));
+        assert!(publication_requested_for_job(
+            "Merge repro typo",
+            "Session prompt",
+            "conitune and merge it into the dev branch"
+        ));
+        assert!(publication_requested_for_job(
+            "Merge repro",
+            "Session prompt",
+            "continue and merge it into the dev branch"
+        ));
+        assert!(publication_requested_for_job(
+            "Merge PR",
+            "Session prompt",
+            "merge the PR"
+        ));
+        assert!(publication_requested_for_job(
+            "Merge PR number",
+            "Session prompt",
+            "merge PR #207 into dev"
+        ));
+        assert!(publication_requested_for_job(
+            "Merge PR after local tests",
+            "Session prompt",
+            "merge PR #207 into dev after testing locally"
+        ));
+        assert!(publication_requested_for_job(
+            "Merge PR without git merge",
+            "Session prompt",
+            "merge the PR; do not use git merge directly"
+        ));
+        assert!(publication_requested_for_job(
+            "Merge existing PR without new PR",
+            "Session prompt",
+            "merge PR #207 into dev without opening a PR"
+        ));
+        assert!(publication_requested_for_job(
+            "Merge pull request number",
+            "Session prompt",
+            "merge pull request #207"
+        ));
+        assert!(publication_requested_for_job(
+            "Land PR number",
+            "Session prompt",
+            "land PR #207"
+        ));
+        assert!(publication_requested_for_job(
+            "Land pull request number",
+            "Session prompt",
+            "land pull request #207"
+        ));
+        assert!(publication_requested_for_job(
+            "Merge into dev",
+            "Session prompt",
+            "merge this into dev"
+        ));
+        assert!(publication_requested_for_job(
+            "Hyphen merge to dev",
+            "Session prompt",
+            "merge-to-dev"
+        ));
+        assert!(publication_requested_for_job(
+            "Merge branch into dev",
+            "Session prompt",
+            "merge this branch into dev"
+        ));
+        assert!(publication_requested_for_job(
+            "Ship to dev",
+            "Session prompt",
+            "ship this to dev"
+        ));
+        assert!(publication_requested_for_job(
+            "Land PR",
+            "Session prompt",
+            "land the PR"
         ));
         assert!(publication_requested_for_job(
             "Open PR",
