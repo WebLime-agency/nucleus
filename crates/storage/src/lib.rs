@@ -5694,10 +5694,19 @@ fn publication_segment_has_unnegated_contextual_publication_phrase(text: &str) -
 }
 
 fn publication_phrase_has_branch_target_for_phrase(text: &str, phrase: &str, index: usize) -> bool {
-    if matches!(phrase, "ship this to" | "ship it to") {
-        return publication_phrase_has_branch_target_excluding_deploy_targets(text, phrase, index);
+    match phrase {
+        "merge it into"
+        | "merge this into"
+        | "merge the branch into"
+        | "merge this branch into"
+        | "merge the branch to"
+        | "merge this branch to"
+        | "ship this to"
+        | "ship it to" => {
+            publication_phrase_has_branch_target_excluding_deploy_targets(text, phrase, index)
+        }
+        _ => publication_phrase_has_branch_target(text, phrase, index),
     }
-    publication_phrase_has_branch_target(text, phrase, index)
 }
 
 fn publication_phrase_has_branch_target(text: &str, phrase: &str, index: usize) -> bool {
@@ -5832,6 +5841,9 @@ fn publication_segment_is_readiness_question(text: &str) -> bool {
         "are we ready to ",
         "is it ready to ",
         "is this ready to ",
+        "is it safe to ",
+        "would it be ok to ",
+        "would it be okay to ",
     ]
     .iter()
     .any(|prefix| text.starts_with(prefix));
@@ -5841,24 +5853,10 @@ fn publication_segment_is_readiness_question(text: &str) -> bool {
     }
 
     let phrase_text = command_phrase_text(text);
-    [
-        "merge pr",
-        "merge the pr",
-        "merge this pr",
-        "merge pull request",
-        "merge the pull request",
-        "merge this pull request",
-        "merge it into",
-        "merge this into",
-        "land pr",
-        "land the pr",
-        "land this pr",
-        "land pull request",
-        "land the pull request",
-        "land this pull request",
-    ]
-    .iter()
-    .any(|phrase| command_phrase_contains(&phrase_text, phrase))
+    advisory_pr_merge_phrases()
+        .iter()
+        .chain(["merge it into", "merge this into", "land the branch"].iter())
+        .any(|phrase| command_phrase_contains(&phrase_text, phrase))
 }
 
 fn publication_segment_is_hard_local_merge_probe(text: &str) -> bool {
@@ -5905,7 +5903,13 @@ fn publication_segment_has_explicit_pr_request(phrase_text: &str) -> bool {
 }
 
 fn publication_segment_has_explicit_pr_merge_request(phrase_text: &str) -> bool {
-    [
+    advisory_pr_merge_phrases()
+        .iter()
+        .any(|phrase| command_phrase_contains(phrase_text, phrase))
+}
+
+fn advisory_pr_merge_phrases() -> &'static [&'static str] {
+    &[
         "merge pr",
         "merge the pr",
         "merge this pr",
@@ -5919,8 +5923,6 @@ fn publication_segment_has_explicit_pr_merge_request(phrase_text: &str) -> bool 
         "land the pull request",
         "land this pull request",
     ]
-    .iter()
-    .any(|phrase| command_phrase_contains(phrase_text, phrase))
 }
 
 fn publication_segment_has_actionable_suffix(text: &str) -> bool {
@@ -12377,6 +12379,36 @@ and open a pull request to dev when it is ready."
             "ship this to nightly"
         ));
         assert!(!publication_requested_for_job(
+            "Merge into production",
+            "Session prompt",
+            "merge this into production"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge into staging",
+            "Session prompt",
+            "merge it into staging"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge branch to prod",
+            "Session prompt",
+            "merge this branch to prod"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge into stable channel",
+            "Session prompt",
+            "merge this into stable"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge into beta channel",
+            "Session prompt",
+            "merge this into beta"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge into nightly channel",
+            "Session prompt",
+            "merge this into nightly"
+        ));
+        assert!(!publication_requested_for_job(
             "How do I open a PR?",
             "Session prompt",
             "how do I open a PR?"
@@ -12470,6 +12502,16 @@ and open a pull request to dev when it is ready."
             "Merge advice",
             "Session prompt",
             "should I merge the pull request?"
+        ));
+        assert!(!publication_requested_for_job(
+            "Merge safety advice",
+            "Session prompt",
+            "is it safe to merge the PR?"
+        ));
+        assert!(!publication_requested_for_job(
+            "Land advice",
+            "Session prompt",
+            "would it be ok to land the branch?"
         ));
         assert!(publication_requested_for_job(
             "Explain then publish",

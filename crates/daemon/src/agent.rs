@@ -9247,8 +9247,7 @@ fn publication_tokens_say_pr_merged(tokens: &[&str]) -> bool {
             .take(4)
             .copied()
             .take_while(|token| publication_pr_merge_status_filler_token(token))
-            .last()
-            == Some("merged")
+            .any(|token| token == "merged")
         {
             return true;
         }
@@ -20418,6 +20417,30 @@ Cleanup status: clean",
         );
         assert_eq!(
             pull_request_patch.publication_status.as_deref(),
+            Some("merged")
+        );
+
+        let merged_successfully_patch = publication_outcome_patch(
+            &job,
+            "Merged PR",
+            "The PR was merged successfully after validation passed.",
+            8,
+            4,
+        );
+        assert_eq!(
+            merged_successfully_patch.publication_status.as_deref(),
+            Some("merged")
+        );
+
+        let successfully_merged_patch = publication_outcome_patch(
+            &job,
+            "Merged PR",
+            "The PR was successfully merged after validation passed.",
+            8,
+            4,
+        );
+        assert_eq!(
+            successfully_merged_patch.publication_status.as_deref(),
             Some("merged")
         );
     }
