@@ -7959,6 +7959,10 @@ fn requires_test_validation_evidence(text: &str) -> bool {
 
 fn confident_negative_claim(summary: &str, final_answer: &str) -> bool {
     let text = normalize_action_item_text(&format!("{summary}\n{final_answer}"));
+    if publication_text_says_merged(&text) {
+        return true;
+    }
+
     [
         "no actionable feedback",
         "nothing actionable",
@@ -8019,6 +8023,10 @@ fn confident_pr_lifecycle_claim(summary: &str, final_answer: &str) -> bool {
 
 fn confident_pr_merged_claim(summary: &str, final_answer: &str) -> bool {
     let text = normalize_action_item_text(&format!("{summary}\n{final_answer}"));
+    if publication_text_says_merged(&text) {
+        return true;
+    }
+
     [
         "already merged",
         "has already been merged",
@@ -9259,8 +9267,14 @@ fn publication_tokens_say_pr_merged(tokens: &[&str]) -> bool {
 }
 
 fn publication_pr_phrase_is_branch_reference(tokens: &[&str], pr_end: usize) -> bool {
+    let next = tokens.get(pr_end + 1).copied();
+    let candidate = if next == Some("s") {
+        tokens.get(pr_end + 2).copied()
+    } else {
+        next
+    };
     matches!(
-        tokens.get(pr_end + 1).copied(),
+        candidate,
         Some("branch" | "branches" | "head" | "heads" | "update" | "updates")
     )
 }
@@ -19451,6 +19465,16 @@ mod tests {
             3,
             1,
         ));
+        assert!(should_retry_unsupported_confident_negative_final_answer(
+            &detail,
+            "Merged PR",
+            "Merged PR #217 into dev.",
+            "act",
+            &checkpoint,
+            &worker,
+            3,
+            1,
+        ));
 
         let mut wrong_pr_detail = detail.clone();
         wrong_pr_detail.tool_calls.push(test_tool_call_summary(
@@ -19466,8 +19490,8 @@ mod tests {
         ));
         assert!(should_retry_unsupported_confident_negative_final_answer(
             &wrong_pr_detail,
-            "Already merged",
-            "PR #217 is already merged into dev; nothing is left to merge.",
+            "Merged PR",
+            "Merged PR #217 into dev.",
             "act",
             &checkpoint,
             &worker,
@@ -19518,8 +19542,8 @@ mod tests {
         ));
         assert!(!should_retry_unsupported_confident_negative_final_answer(
             &merged_detail,
-            "Already merged",
-            "PR #217 is already merged into dev; nothing is left to merge.",
+            "Merged PR",
+            "Merged PR #217 into dev.",
             "act",
             &checkpoint,
             &worker,
@@ -20491,6 +20515,18 @@ Cleanup status: clean",
         );
         assert_eq!(
             pr_branch_patch.publication_status.as_deref(),
+            Some("opened")
+        );
+
+        let possessive_pr_branch_patch = publication_outcome_patch(
+            &job,
+            "Opened PR",
+            "Merged the PR's branch with main, then opened PR https://github.com/WebLime-agency/nucleus/pull/207.",
+            8,
+            4,
+        );
+        assert_eq!(
+            possessive_pr_branch_patch.publication_status.as_deref(),
             Some("opened")
         );
 

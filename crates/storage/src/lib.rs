@@ -5466,7 +5466,10 @@ fn publication_requested_for_job(_title: &str, _purpose: &str, prompt_excerpt: &
         || command_phrase_contains(&phrase_text, "pull requests")
         || command_phrase_contains(&phrase_text, "pull request");
     if publication_segment_has_publication_phrase(&prompt_excerpt)
-        || (mentions_pr && publication_segment_has_actionable_suffix(&prompt_excerpt))
+        || (mentions_pr
+            && publication_segment_has_direct_publication_actionable_suffix(&prompt_excerpt))
+        || (publication_segment_has_referenced_publication_context(&phrase_text)
+            && publication_segment_has_actionable_suffix(&prompt_excerpt))
     {
         return publication_segment_requests_publication(&prompt_excerpt);
     }
@@ -5923,6 +5926,21 @@ fn publication_segment_has_explicit_pr_request(phrase_text: &str) -> bool {
     .any(|phrase| command_phrase_contains(phrase_text, phrase))
 }
 
+fn publication_segment_has_referenced_publication_context(phrase_text: &str) -> bool {
+    [
+        "opening a pr",
+        "opening the pr",
+        "opening a pull request",
+        "opening the pull request",
+        "creating a pr",
+        "creating the pr",
+        "creating a pull request",
+        "creating the pull request",
+    ]
+    .iter()
+    .any(|phrase| command_phrase_contains(phrase_text, phrase))
+}
+
 fn publication_segment_has_explicit_pr_merge_request(phrase_text: &str) -> bool {
     advisory_pr_merge_phrases()
         .iter()
@@ -5955,6 +5973,17 @@ fn advisory_pr_merge_phrases() -> &'static [&'static str] {
 }
 
 fn publication_segment_has_actionable_suffix(text: &str) -> bool {
+    publication_segment_actionable_suffixes(text).any(|suffix| {
+        publication_segment_requests_publication(suffix)
+            || publication_segment_requests_referenced_publication(suffix)
+    })
+}
+
+fn publication_segment_has_direct_publication_actionable_suffix(text: &str) -> bool {
+    publication_segment_actionable_suffixes(text).any(publication_segment_requests_publication)
+}
+
+fn publication_segment_actionable_suffixes(text: &str) -> impl Iterator<Item = &str> {
     [
         ", then ",
         "; then ",
@@ -5967,16 +5996,8 @@ fn publication_segment_has_actionable_suffix(text: &str) -> bool {
         "; ",
         ". ",
     ]
-    .iter()
-    .any(|separator| {
-        text.split(separator)
-            .skip(1)
-            .map(str::trim_start)
-            .any(|suffix| {
-                publication_segment_requests_publication(suffix)
-                    || publication_segment_requests_referenced_publication(suffix)
-            })
-    })
+    .into_iter()
+    .flat_map(|separator| text.split(separator).skip(1).map(str::trim_start))
 }
 
 fn publication_segment_requests_referenced_publication(text: &str) -> bool {
@@ -5991,9 +6012,31 @@ fn publication_segment_requests_referenced_publication(text: &str) -> bool {
     .any(|phrase| {
         text.match_indices(phrase).any(|(index, _)| {
             phrase_match_has_boundaries(text, phrase, index)
+                && publication_referenced_publication_phrase_has_valid_tail(text, phrase, index)
                 && !publication_phrase_is_negated(text, index)
         })
     })
+}
+
+fn publication_referenced_publication_phrase_has_valid_tail(
+    text: &str,
+    phrase: &str,
+    index: usize,
+) -> bool {
+    if !matches!(phrase, "open one" | "create one") {
+        return true;
+    }
+
+    let tail = &text[index + phrase.len()..];
+    let tokens = command_tokens(tail);
+    let Some(first) = tokens.first().copied() else {
+        return true;
+    };
+
+    matches!(
+        first,
+        "after" | "against" | "for" | "from" | "if" | "in" | "once" | "on" | "to" | "when"
+    )
 }
 
 fn contains_phrase_with_boundaries(text: &str, phrase: &str) -> bool {
@@ -12526,6 +12569,16 @@ and open a pull request to dev when it is ready."
             "Show PR merge",
             "Session prompt",
             "show me how to merge the PR"
+        ));
+        assert!(!publication_requested_for_job(
+            "Review PR then open file",
+            "Session prompt",
+            "review PR #207, then open one of the changed files"
+        ));
+        assert!(!publication_requested_for_job(
+            "Review PR then add test",
+            "Session prompt",
+            "review PR #207, then create one regression test"
         ));
         assert!(!publication_requested_for_job(
             "Merge readiness",
