@@ -5462,6 +5462,8 @@ fn publication_requested_for_job(_title: &str, _purpose: &str, prompt_excerpt: &
     let prompt_excerpt = prompt_excerpt.to_ascii_lowercase();
     let phrase_text = command_phrase_text(&prompt_excerpt);
     let mentions_pr = command_phrase_contains(&phrase_text, "pr")
+        || command_phrase_contains(&phrase_text, "prs")
+        || command_phrase_contains(&phrase_text, "pull requests")
         || command_phrase_contains(&phrase_text, "pull request");
     if publication_segment_has_publication_phrase(&prompt_excerpt)
         || (mentions_pr && publication_segment_has_actionable_suffix(&prompt_excerpt))
@@ -5639,17 +5641,25 @@ fn publication_phrases() -> &'static [&'static str] {
         "merge-to-dev",
         "merge-to-main",
         "merge pr",
+        "merge prs",
         "merge the pr",
+        "merge the prs",
         "merge this pr",
         "merge pull request",
+        "merge pull requests",
         "merge the pull request",
+        "merge the pull requests",
         "merge this pull request",
         "land pr",
+        "land prs",
         "land this pr",
         "land the pr",
+        "land the prs",
         "land pull request",
+        "land pull requests",
         "land this pull request",
         "land the pull request",
+        "land the pull requests",
         "land this branch",
         "land the branch",
     ]
@@ -5870,7 +5880,9 @@ fn publication_segment_is_hard_local_merge_probe(text: &str) -> bool {
 fn publication_segment_is_soft_local_merge_probe(text: &str) -> bool {
     let phrase_text = command_phrase_text(text);
     let explicit_pr_merge = publication_segment_has_explicit_pr_merge_request(&phrase_text);
-    (command_phrase_contains(&phrase_text, "git merge") && !explicit_pr_merge)
+    (command_phrase_contains(&phrase_text, "git merge")
+        && !explicit_pr_merge
+        && !publication_segment_has_contextual_publication_phrase(text))
         || (publication_segment_has_local_merge_qualifier(&phrase_text) && !explicit_pr_merge)
         || (command_phrase_contains(&phrase_text, "report conflicts")
             && !publication_segment_has_explicit_pr_request(&phrase_text)
@@ -5878,9 +5890,10 @@ fn publication_segment_is_soft_local_merge_probe(text: &str) -> bool {
 }
 
 fn publication_segment_has_local_merge_qualifier(phrase_text: &str) -> bool {
-    phrase_text
-        .match_indices(" merge ")
-        .any(|(index, phrase)| phrase_text[index + phrase.len()..].contains(" locally "))
+    command_phrase_contains(phrase_text, "locally merge")
+        || phrase_text
+            .match_indices(" merge ")
+            .any(|(index, phrase)| phrase_text[index + phrase.len()..].contains(" locally "))
 }
 
 fn publication_segment_has_explicit_pr_request(phrase_text: &str) -> bool {
@@ -5911,16 +5924,24 @@ fn publication_segment_has_explicit_pr_merge_request(phrase_text: &str) -> bool 
 fn advisory_pr_merge_phrases() -> &'static [&'static str] {
     &[
         "merge pr",
+        "merge prs",
         "merge the pr",
+        "merge the prs",
         "merge this pr",
         "merge pull request",
+        "merge pull requests",
         "merge the pull request",
+        "merge the pull requests",
         "merge this pull request",
         "land pr",
+        "land prs",
         "land the pr",
+        "land the prs",
         "land this pr",
         "land pull request",
+        "land pull requests",
         "land the pull request",
+        "land the pull requests",
         "land this pull request",
     ]
 }
@@ -12299,6 +12320,11 @@ and open a pull request to dev when it is ready."
             "merge this branch to dev locally"
         ));
         assert!(!publication_requested_for_job(
+            "Locally merge into dev",
+            "Session prompt",
+            "locally merge this into dev"
+        ));
+        assert!(!publication_requested_for_job(
             "Merge functions",
             "Session prompt",
             "merge these two functions"
@@ -12624,9 +12650,24 @@ and open a pull request to dev when it is ready."
             "land pull request #207"
         ));
         assert!(publication_requested_for_job(
+            "Merge multiple PRs",
+            "Session prompt",
+            "merge PRs #217 and #219 into dev"
+        ));
+        assert!(publication_requested_for_job(
+            "Land pull requests",
+            "Session prompt",
+            "land the pull requests"
+        ));
+        assert!(publication_requested_for_job(
             "Merge into dev",
             "Session prompt",
             "merge this into dev"
+        ));
+        assert!(publication_requested_for_job(
+            "Merge into dev without direct git merge",
+            "Session prompt",
+            "merge this into dev; do not use git merge directly"
         ));
         assert!(publication_requested_for_job(
             "Hyphen merge to dev",
