@@ -1,5 +1,8 @@
 name: Claude Code
 
+# Temporary external PR/issue assistant while Nucleus-native automations are not
+# ready to run this workflow class themselves. See docs/decisions/0004-temporary-external-pr-reviewers.md.
+
 on:
   issue_comment:
     types: [created]
@@ -9,6 +12,10 @@ on:
     types: [opened, assigned]
   pull_request_review:
     types: [submitted]
+
+concurrency:
+  group: claude-code-${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   claude:
@@ -47,4 +54,3 @@ jobs:
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
           # claude_args: '--allowed-tools Bash(gh pr *)'
-
