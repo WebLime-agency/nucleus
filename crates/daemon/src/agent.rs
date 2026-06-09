@@ -9275,7 +9275,19 @@ fn publication_pr_phrase_is_branch_reference(tokens: &[&str], pr_end: usize) -> 
     };
     matches!(
         candidate,
-        Some("branch" | "branches" | "head" | "heads" | "update" | "updates")
+        Some(
+            "branch"
+                | "branches"
+                | "comment"
+                | "comments"
+                | "feedback"
+                | "head"
+                | "heads"
+                | "review"
+                | "reviews"
+                | "update"
+                | "updates"
+        )
     )
 }
 
@@ -20527,6 +20539,18 @@ Cleanup status: clean",
         );
         assert_eq!(
             possessive_pr_branch_patch.publication_status.as_deref(),
+            Some("opened")
+        );
+
+        let pr_feedback_patch = publication_outcome_patch(
+            &job,
+            "Opened PR",
+            "Merged PR feedback into the branch, then opened PR https://github.com/WebLime-agency/nucleus/pull/207.",
+            8,
+            4,
+        );
+        assert_eq!(
+            pr_feedback_patch.publication_status.as_deref(),
             Some("opened")
         );
 
