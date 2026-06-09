@@ -739,15 +739,18 @@ fn publication_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
         non_empty_evidence("PR", &job.pr_url),
         non_empty_evidence("Source", &job.source_branch),
         non_empty_evidence("Target", &job.target_branch),
+        non_empty_evidence("Publication", &job.publication_summary),
     ]
     .into_iter()
     .flatten()
     .collect::<Vec<_>>();
 
-    let has_open_pr_evidence = job.publication_status == "opened"
-        && !job.pr_url.is_empty()
-        && !job.target_branch.is_empty();
-    let state = if has_open_pr_evidence {
+    let has_successful_pr_evidence = match job.publication_status.as_str() {
+        "opened" => !job.pr_url.is_empty() && !job.target_branch.is_empty(),
+        "merged" => !job.target_branch.is_empty() && !job.pr_url.is_empty(),
+        _ => false,
+    };
+    let state = if has_successful_pr_evidence {
         "done"
     } else if matches!(
         job.publication_status.as_str(),
@@ -758,12 +761,16 @@ fn publication_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
     } else {
         "pending"
     };
-    let summary = match state {
-        "done" => format!(
+    let summary = match (state, job.publication_status.as_str()) {
+        ("done", "merged") => format!(
+            "PR is merged into {}.",
+            empty_fallback(&job.target_branch, "the requested base")
+        ),
+        ("done", _) => format!(
             "PR is open against {}.",
             empty_fallback(&job.target_branch, "the requested base")
         ),
-        "pending" => "PR publication evidence is still pending.".to_string(),
+        ("pending", _) => "PR publication evidence is still pending.".to_string(),
         _ if job.publication_summary.trim().is_empty() => {
             "Publication was requested, but no open PR URL and target branch evidence are recorded."
                 .to_string()
@@ -3827,6 +3834,67 @@ mod tests {
                 .iter()
                 .any(|gate| gate.id == "validation" && gate.state == "blocked")
         );
+    }
+
+    #[test]
+    fn merged_publication_status_satisfies_publication_gate() {
+        let mut summary = task_class_job("github_pr", Vec::new());
+        summary.publication_status = "merged".to_string();
+        summary.target_branch = "dev".to_string();
+        summary.pr_url = "https://github.com/WebLime-agency/nucleus/pull/370".to_string();
+        summary.publication_summary = "Merged PR #370 into dev.".to_string();
+        summary.validation_status = "passed".to_string();
+        summary.cleanup_status = "clean".to_string();
+
+        let summary = summary.with_completion_gates();
+        let publication_gate = summary
+            .completion_gates
+            .iter()
+            .find(|gate| gate.id == "publication")
+            .expect("publication gate should exist");
+        assert_eq!(publication_gate.state, "done");
+        assert_eq!(publication_gate.summary, "PR is merged into dev.");
+        assert!(
+            publication_gate
+                .evidence
+                .contains(&"Publication Merged PR #370 into dev.".to_string())
+        );
+    }
+
+    #[test]
+    fn merged_publication_status_requires_durable_pr_evidence() {
+        let mut summary = task_class_job("github_pr", Vec::new());
+        summary.publication_status = "merged".to_string();
+        summary.target_branch = "dev".to_string();
+        summary.publication_summary = "Merged PR #370 into dev.".to_string();
+        summary.validation_status = "passed".to_string();
+        summary.cleanup_status = "clean".to_string();
+
+        let summary = summary.with_completion_gates();
+        let publication_gate = summary
+            .completion_gates
+            .iter()
+            .find(|gate| gate.id == "publication")
+            .expect("publication gate should exist");
+        assert_eq!(publication_gate.state, "blocked");
+    }
+
+    #[test]
+    fn merged_publication_status_rejects_source_branch_without_pr_url() {
+        let mut summary = task_class_job("github_pr", Vec::new());
+        summary.publication_status = "merged".to_string();
+        summary.source_branch = "weblime/publication-merge-intent".to_string();
+        summary.target_branch = "dev".to_string();
+        summary.validation_status = "passed".to_string();
+        summary.cleanup_status = "clean".to_string();
+
+        let summary = summary.with_completion_gates();
+        let publication_gate = summary
+            .completion_gates
+            .iter()
+            .find(|gate| gate.id == "publication")
+            .expect("publication gate should exist");
+        assert_eq!(publication_gate.state, "blocked");
     }
 
     #[test]

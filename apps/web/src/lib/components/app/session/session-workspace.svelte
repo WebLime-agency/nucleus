@@ -649,7 +649,7 @@
   function badgeVariantForPublicationOutcome(
     status: string
   ): 'default' | 'secondary' | 'warning' | 'destructive' {
-    if (status === 'opened') return 'default';
+    if (status === 'opened' || status === 'merged') return 'default';
     if (status === 'failed' || status === 'blocked' || status === 'not_opened') {
       return 'destructive';
     }
@@ -673,6 +673,12 @@
       return job.browser_verification_status === 'passed'
         ? 'PR opened, browser-verified'
         : 'PR opened, not browser-verified';
+    }
+
+    if (job.publication_status === 'merged') {
+      return job.browser_verification_status === 'passed'
+        ? 'PR merged, browser-verified'
+        : 'PR merged, not browser-verified';
     }
 
     if (job.publication_status === 'blocked') {
