@@ -7216,6 +7216,9 @@ fn prepare_session_workspace(
     if wt_git.git_head.is_empty() {
         wt_git.git_head = base_commit.clone();
     }
+    // `remote_base_ref` was fetched and resolved before `git worktree add`.
+    // Worktrees share repository refs, so a failure here means the allocation
+    // cannot produce trustworthy freshness metadata and should be torn down.
     let behind_by = match if reused_existing_branch {
         compute_worktree_behind_by(&wt, &remote_base_ref)
     } else {
@@ -7554,6 +7557,9 @@ fn worktree_add_command(
         .arg("worktree")
         .arg("add")
         .arg(worktree_path);
+    // This branch existence check only selects the intended git invocation.
+    // If another allocation races this one, `git worktree add` remains the
+    // authority and the caller surfaces its failure.
     let reuse_existing_branch = local_branch_exists(git_root, branch)?;
     if reuse_existing_branch {
         command.arg(branch);
