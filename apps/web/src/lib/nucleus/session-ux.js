@@ -182,6 +182,22 @@ export function gateBadgeVariant(state) {
   return 'warning';
 }
 
+export function publicationOutcomeBadgeVariant(status) {
+  switch (status) {
+    case 'opened':
+    case 'merged':
+      return 'default';
+    case 'blocked':
+    case 'failed':
+    case 'not_opened':
+      return 'destructive';
+    case 'not_requested':
+      return 'secondary';
+    default:
+      return 'warning';
+  }
+}
+
 export function childRouteLabel(record) {
   const title = String(record?.executor_route_title ?? '').trim();
   if (title) return title;

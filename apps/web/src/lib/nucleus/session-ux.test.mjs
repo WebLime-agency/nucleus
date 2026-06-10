@@ -10,6 +10,7 @@ import {
   nextRuntimeTick,
   noActivity,
   childRouteLabel,
+  publicationOutcomeBadgeVariant,
   reasoningActivityDisplayView,
   reasoningActivityView,
   runtimeBadgeView,
@@ -208,6 +209,24 @@ test('completion gates are grouped by daemon-provided state', () => {
   assert.equal(gateBadgeVariant('blocked'), 'destructive');
   assert.equal(gateBadgeVariant('pending'), 'warning');
   assert.equal(gateBadgeVariant('done'), 'default');
+});
+
+test('publication outcomes map to valid badge variants', () => {
+  const validBadgeVariants = new Set(['default', 'secondary', 'outline', 'warning', 'destructive']);
+  const expectedVariants = new Map([
+    ['opened', 'default'],
+    ['merged', 'default'],
+    ['blocked', 'destructive'],
+    ['failed', 'destructive'],
+    ['not_opened', 'destructive'],
+    ['not_requested', 'secondary']
+  ]);
+
+  for (const [status, expectedVariant] of expectedVariants) {
+    const variant = publicationOutcomeBadgeVariant(status);
+    assert.equal(variant, expectedVariant);
+    assert.equal(validBadgeVariants.has(variant), true);
+  }
 });
 
 test('activity failure view surfaces failed Python tool result', () => {
