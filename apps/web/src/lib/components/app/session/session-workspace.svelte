@@ -81,6 +81,7 @@
     gateBadgeVariant,
     jobDetailActivityFreshnessView,
     noActivity,
+    publicationOutcomeBadgeVariant,
     runtimeStartSeconds,
     shouldShowActivityStaleWarning,
     usageView
@@ -644,17 +645,6 @@
     if (status === 'failed') return 'destructive';
     if (status === 'pending') return 'warning';
     return 'secondary';
-  }
-
-  function badgeVariantForPublicationOutcome(
-    status: string
-  ): 'default' | 'secondary' | 'warning' | 'destructive' {
-    if (status === 'opened' || status === 'merged') return 'default';
-    if (status === 'failed' || status === 'blocked' || status === 'not_opened') {
-      return 'destructive';
-    }
-    if (status === 'not_requested') return 'secondary';
-    return 'warning';
   }
 
   function formatVerificationStatus(status: string): string {
@@ -4752,8 +4742,10 @@
                           </div>
                         {/if}
                         {#if publicationOutcomeLabel(job)}
-                          <div class="mt-2 text-xs text-zinc-400">
-                            {publicationOutcomeLabel(job)}
+                          <div class="mt-2">
+                            <Badge variant={publicationOutcomeBadgeVariant(job.publication_status)}>
+                              {publicationOutcomeLabel(job)}
+                            </Badge>
                           </div>
                         {/if}
                       </button>
@@ -4893,11 +4885,11 @@
                         </div>
                       {/if}
 
-                      {#if jobDetail.job.publication_requested}
+                      {#if publicationOutcomeLabel(jobDetail.job)}
                         <div class="mt-3 rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-3">
                           <div class="flex flex-wrap items-center justify-between gap-2">
                             <div class="text-xs font-medium uppercase tracking-[0.14em] text-zinc-500">Publication Outcome</div>
-                            <Badge variant={badgeVariantForPublicationOutcome(jobDetail.job.publication_status)}>
+                            <Badge variant={publicationOutcomeBadgeVariant(jobDetail.job.publication_status)}>
                               {publicationOutcomeLabel(jobDetail.job)}
                             </Badge>
                           </div>
