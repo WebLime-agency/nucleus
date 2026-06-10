@@ -79,6 +79,8 @@ pub struct WorktreeSummary {
     pub branch: String,
     pub base_ref: String,
     pub base_commit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind_by: Option<i64>,
     pub origin_url: String,
     pub status: String,
     pub created_at: i64,

@@ -401,6 +401,7 @@ pub struct WorktreeRecord {
     pub branch: String,
     pub base_ref: String,
     pub base_commit: String,
+    pub behind_by: Option<i64>,
     pub origin_url: String,
     pub status: String,
 }
@@ -1876,10 +1877,11 @@ impl StateStore {
                     branch,
                     base_ref,
                     base_commit,
+                    behind_by,
                     origin_url,
                     status
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                 ON CONFLICT(id) DO UPDATE SET
                     project_id = excluded.project_id,
                     name = excluded.name,
@@ -1887,6 +1889,7 @@ impl StateStore {
                     branch = excluded.branch,
                     base_ref = excluded.base_ref,
                     base_commit = excluded.base_commit,
+                    behind_by = excluded.behind_by,
                     origin_url = excluded.origin_url,
                     status = excluded.status,
                     updated_at = unixepoch()
@@ -1899,6 +1902,7 @@ impl StateStore {
                     record.branch,
                     record.base_ref,
                     record.base_commit,
+                    record.behind_by,
                     record.origin_url,
                     record.status,
                 ],
@@ -4135,6 +4139,7 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             branch TEXT NOT NULL DEFAULT '',
             base_ref TEXT NOT NULL DEFAULT '',
             base_commit TEXT NOT NULL DEFAULT '',
+            behind_by INTEGER,
             origin_url TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'archived')),
             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -4730,6 +4735,7 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         "TEXT NOT NULL DEFAULT ''",
     )?;
     ensure_column(connection, "jobs", "worktree_behind_by", "INTEGER")?;
+    ensure_column(connection, "worktrees", "behind_by", "INTEGER")?;
     ensure_column(
         connection,
         "jobs",
@@ -5184,10 +5190,11 @@ fn backfill_session_worktrees_with_connection(connection: &Connection) -> Result
                 branch,
                 base_ref,
                 base_commit,
+                behind_by,
                 origin_url,
                 status
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', ?7, 'active')
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', NULL, ?7, 'active')
             ON CONFLICT(path) DO NOTHING
             ",
             params![
@@ -6863,7 +6870,7 @@ fn list_worktrees_with_connection(
 ) -> Result<Vec<WorktreeSummary>> {
     let mut statement = connection.prepare(
         "
-        SELECT id, project_id, name, path, branch, base_ref, base_commit, origin_url, status, created_at, updated_at
+        SELECT id, project_id, name, path, branch, base_ref, base_commit, behind_by, origin_url, status, created_at, updated_at
         FROM worktrees
         WHERE project_id = ?1
           AND status = 'active'
@@ -6883,7 +6890,7 @@ fn load_worktree_summary_optional(
     connection
         .query_row(
             "
-            SELECT id, project_id, name, path, branch, base_ref, base_commit, origin_url, status, created_at, updated_at
+            SELECT id, project_id, name, path, branch, base_ref, base_commit, behind_by, origin_url, status, created_at, updated_at
             FROM worktrees
             WHERE id = ?1
             ",
@@ -6898,7 +6905,7 @@ fn load_worktree_summary_by_path(connection: &Connection, path: &str) -> Result<
     connection
         .query_row(
             "
-            SELECT id, project_id, name, path, branch, base_ref, base_commit, origin_url, status, created_at, updated_at
+            SELECT id, project_id, name, path, branch, base_ref, base_commit, behind_by, origin_url, status, created_at, updated_at
             FROM worktrees
             WHERE path = ?1
             ",
@@ -6910,7 +6917,7 @@ fn load_worktree_summary_by_path(connection: &Connection, path: &str) -> Result<
 }
 
 fn map_worktree_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorktreeSummary> {
-    let origin_url: String = row.get(7)?;
+    let origin_url: String = row.get(8)?;
     Ok(WorktreeSummary {
         id: row.get(0)?,
         project_id: row.get(1)?,
@@ -6919,10 +6926,11 @@ fn map_worktree_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorktreeSum
         branch: row.get(4)?,
         base_ref: row.get(5)?,
         base_commit: row.get(6)?,
+        behind_by: row.get(7)?,
         origin_url: redact_git_remote_url_userinfo(&origin_url),
-        status: row.get(8)?,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
+        status: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
     })
 }
 
@@ -7975,10 +7983,7 @@ fn load_session_summary(connection: &Connection, session_id: &str) -> Result<Ses
                 git_remote_tracking_branch,
                 COALESCE(worktrees.base_ref, sessions.git_base_ref) AS base_ref,
                 COALESCE(worktrees.base_commit, '') AS base_commit,
-                CASE
-                    WHEN sessions.attachment_mode = 'new_worktree' AND worktrees.id IS NOT NULL THEN 0
-                    ELSE NULL
-                END AS behind_by,
+                worktrees.behind_by AS behind_by,
                 session_state_observed_at,
                 workspace_warnings_json,
                 approval_mode,
@@ -11380,6 +11385,7 @@ mod tests {
             "branch",
             "base_ref",
             "base_commit",
+            "behind_by",
             "origin_url",
             "status",
             "created_at",
@@ -11651,6 +11657,7 @@ mod tests {
                 branch: "work/alpha/one".to_string(),
                 base_ref: "origin/dev".to_string(),
                 base_commit: "abc123".to_string(),
+                behind_by: Some(0),
                 origin_url: "https://example.test/repo.git".to_string(),
                 status: "active".to_string(),
             })
@@ -11664,6 +11671,7 @@ mod tests {
         assert_eq!(loaded.path, path);
         assert_eq!(loaded.base_ref, "origin/dev");
         assert_eq!(loaded.base_commit, "abc123");
+        assert_eq!(loaded.behind_by, Some(0));
 
         let error = store
             .insert_worktree(WorktreeRecord {
@@ -11674,6 +11682,7 @@ mod tests {
                 branch: "work/alpha/two".to_string(),
                 base_ref: "origin/dev".to_string(),
                 base_commit: "def456".to_string(),
+                behind_by: Some(1),
                 origin_url: "https://example.test/repo.git".to_string(),
                 status: "active".to_string(),
             })
