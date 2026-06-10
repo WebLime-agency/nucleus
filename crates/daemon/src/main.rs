@@ -7199,16 +7199,8 @@ fn prepare_session_workspace(
         .join(session_id);
     fs::create_dir_all(wt.parent().unwrap())
         .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
-    let mut command = StdCommand::new("git");
-    command
-        .arg("-C")
-        .arg(&git_root)
-        .arg("worktree")
-        .arg("add")
-        .arg(&wt)
-        .arg("-b")
-        .arg(&branch)
-        .arg(&remote_base_ref);
+    let (mut command, reused_existing_branch) =
+        worktree_add_command(&git_root, &wt, &branch, &remote_base_ref)?;
     let output = command
         .output()
         .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
@@ -7224,6 +7216,25 @@ fn prepare_session_workspace(
     if wt_git.git_head.is_empty() {
         wt_git.git_head = base_commit.clone();
     }
+    // `remote_base_ref` was fetched and resolved before `git worktree add`.
+    // Worktrees share repository refs, so a failure here means the allocation
+    // cannot produce trustworthy freshness metadata and should be torn down.
+    let behind_by = match if reused_existing_branch {
+        compute_worktree_behind_by(&wt, &remote_base_ref)
+    } else {
+        Ok(0)
+    } {
+        Ok(behind_by) => behind_by,
+        Err(error) => {
+            let _ = StdCommand::new("git")
+                .arg("-C")
+                .arg(&git_root)
+                .args(["worktree", "remove", "--force", &display(&wt)])
+                .output();
+            let _ = fs::remove_dir_all(&wt);
+            return Err(error);
+        }
+    };
     if let Err(error) = state.store.insert_worktree(WorktreeRecord {
         id: session_id.to_string(),
         project_id: projects.primary_project_id.clone(),
@@ -7232,6 +7243,7 @@ fn prepare_session_workspace(
         branch,
         base_ref: remote_base_ref.clone(),
         base_commit: base_commit.clone(),
+        behind_by: Some(behind_by),
         origin_url,
         status: "active".to_string(),
     }) {
@@ -7511,6 +7523,63 @@ fn branch_worktree_path(git_root: &str, branch: &str) -> Result<Option<String>, 
         }
     }
     Ok(None)
+}
+
+fn local_branch_exists(git_root: &str, branch: &str) -> Result<bool, ApiError> {
+    let output = StdCommand::new("git")
+        .arg("-C")
+        .arg(git_root)
+        .args(["show-ref", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .output()
+        .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
+    if output.status.success() {
+        Ok(true)
+    } else if output.status.code() == Some(1) {
+        Ok(false)
+    } else {
+        Err(ApiError::bad_request(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ))
+    }
+}
+
+fn worktree_add_command(
+    git_root: &str,
+    worktree_path: &FsPath,
+    branch: &str,
+    remote_base_ref: &str,
+) -> Result<(StdCommand, bool), ApiError> {
+    let mut command = StdCommand::new("git");
+    command
+        .arg("-C")
+        .arg(git_root)
+        .arg("worktree")
+        .arg("add")
+        .arg(worktree_path);
+    // This branch existence check only selects the intended git invocation.
+    // If another allocation races this one, `git worktree add` remains the
+    // authority and the caller surfaces its failure.
+    let reuse_existing_branch = local_branch_exists(git_root, branch)?;
+    if reuse_existing_branch {
+        command.arg(branch);
+    } else {
+        command.arg("-b").arg(branch).arg(remote_base_ref);
+    }
+    Ok((command, reuse_existing_branch))
+}
+
+fn compute_worktree_behind_by(
+    worktree_path: &FsPath,
+    remote_base_ref: &str,
+) -> Result<i64, ApiError> {
+    let range = format!("HEAD..{remote_base_ref}");
+    let count = git_output(&display(worktree_path), &["rev-list", "--count", &range])?;
+    count.parse::<i64>().map_err(|error| {
+        ApiError::bad_request(format!(
+            "failed to parse commits behind {remote_base_ref}: {error}"
+        ))
+    })
 }
 
 fn git_output(path: &str, args: &[&str]) -> Result<String, ApiError> {
@@ -11361,6 +11430,15 @@ mod tests {
         let owner = branch_worktree_path(&root.display().to_string(), "feature/test")
             .expect("worktree list should parse");
         assert_eq!(owner, Some(feature.display().to_string()));
+        let error = owner
+            .map(|owner| {
+                ApiError::bad_request(format!(
+                    "branch 'feature/test' is already checked out at {owner}; attach to the owning session/worktree or choose a different branch"
+                ))
+            })
+            .expect("checked-out branch should produce guard error");
+        assert!(error.message.contains("already checked out"));
+        assert!(error.message.contains(&feature.display().to_string()));
 
         let missing = branch_worktree_path(&root.display().to_string(), "feature/missing")
             .expect("worktree list should parse");
@@ -11378,6 +11456,141 @@ mod tests {
             .output();
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&feature);
+    }
+
+    #[test]
+    fn worktree_add_creates_new_branch_from_canonical_base() {
+        let root = test_state_dir("worktree-add-new-branch");
+        fs::create_dir_all(&root).expect("repo dir should create");
+        run_git(&root, &["init", "-b", "dev"]);
+        run_git(&root, &["config", "user.email", "nucleus@example.test"]);
+        run_git(&root, &["config", "user.name", "Nucleus Test"]);
+        fs::write(root.join("README.md"), "base\n").expect("file should write");
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-m", "base"]);
+        let base_head = git_output(&root.display().to_string(), &["rev-parse", "HEAD"])
+            .expect("base head should resolve");
+        run_git(&root, &["update-ref", "refs/remotes/origin/dev", "HEAD"]);
+        fs::write(root.join("README.md"), "local dev moved\n").expect("file should write");
+        run_git(&root, &["commit", "-am", "local dev moved"]);
+        let local_dev_head = git_output(&root.display().to_string(), &["rev-parse", "HEAD"])
+            .expect("local dev head should resolve");
+        assert_ne!(base_head, local_dev_head);
+
+        let worktree = root.with_file_name(format!(
+            "{}-new",
+            root.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("repo")
+        ));
+        let (mut command, reused_existing_branch) = worktree_add_command(
+            &root.display().to_string(),
+            &worktree,
+            "feature/new-branch",
+            "origin/dev",
+        )
+        .expect("worktree command should build");
+        assert!(!reused_existing_branch);
+        let output = command.output().expect("worktree command should run");
+        assert!(
+            output.status.success(),
+            "worktree add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let branch = git_output(
+            &worktree.display().to_string(),
+            &["branch", "--show-current"],
+        )
+        .expect("worktree branch should resolve");
+        let head = git_output(&worktree.display().to_string(), &["rev-parse", "HEAD"])
+            .expect("worktree head should resolve");
+        assert_eq!(branch, "feature/new-branch");
+        assert_eq!(head, base_head);
+
+        let _ = StdCommand::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                &worktree.display().to_string(),
+            ])
+            .output();
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&worktree);
+    }
+
+    #[test]
+    fn worktree_add_attaches_existing_local_branch() {
+        let root = test_state_dir("worktree-add-existing-branch");
+        fs::create_dir_all(&root).expect("repo dir should create");
+        run_git(&root, &["init", "-b", "dev"]);
+        run_git(&root, &["config", "user.email", "nucleus@example.test"]);
+        run_git(&root, &["config", "user.name", "Nucleus Test"]);
+        fs::write(root.join("README.md"), "base\n").expect("file should write");
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-m", "base"]);
+        let existing_head = git_output(&root.display().to_string(), &["rev-parse", "HEAD"])
+            .expect("existing head should resolve");
+        run_git(&root, &["branch", "feature/existing"]);
+        run_git(&root, &["update-ref", "refs/remotes/origin/dev", "HEAD"]);
+        fs::write(root.join("README.md"), "canonical moved\n").expect("file should write");
+        run_git(&root, &["commit", "-am", "canonical moved"]);
+        run_git(&root, &["update-ref", "refs/remotes/origin/dev", "HEAD"]);
+
+        let worktree = root.with_file_name(format!(
+            "{}-existing",
+            root.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("repo")
+        ));
+        assert!(
+            local_branch_exists(&root.display().to_string(), "feature/existing")
+                .expect("branch existence should resolve")
+        );
+        let (mut command, reused_existing_branch) = worktree_add_command(
+            &root.display().to_string(),
+            &worktree,
+            "feature/existing",
+            "origin/dev",
+        )
+        .expect("worktree command should build");
+        assert!(reused_existing_branch);
+        let output = command.output().expect("worktree command should run");
+        assert!(
+            output.status.success(),
+            "worktree add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let branch = git_output(
+            &worktree.display().to_string(),
+            &["branch", "--show-current"],
+        )
+        .expect("worktree branch should resolve");
+        let head = git_output(&worktree.display().to_string(), &["rev-parse", "HEAD"])
+            .expect("worktree head should resolve");
+        assert_eq!(branch, "feature/existing");
+        assert_eq!(head, existing_head);
+        assert_eq!(
+            compute_worktree_behind_by(&worktree, "origin/dev").unwrap(),
+            1
+        );
+
+        let _ = StdCommand::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                &worktree.display().to_string(),
+            ])
+            .output();
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&worktree);
     }
 
     #[test]
@@ -12190,6 +12403,71 @@ mod tests {
         assert_eq!(worktree.base_ref, "origin/dev");
         assert_eq!(worktree.base_commit, fixture.fresh_head);
         assert_eq!(worktree.status, "active");
+
+        let _ = StdCommand::new("git")
+            .arg("-C")
+            .arg(&fixture.project)
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                &detail.session.worktree_path,
+            ])
+            .output();
+        let _ = fs::remove_dir_all(&fixture.state_dir);
+    }
+
+    #[tokio::test]
+    async fn create_session_reuses_stale_existing_branch_reports_behind() {
+        let fixture = fresh_worktree_fixture("session-reuse-stale-branch");
+        let stale_head = git_stdout(&fixture.project, &["rev-parse", "HEAD"]);
+        run_git(&fixture.project, &["branch", "work/stale-reuse", "HEAD"]);
+        let state = test_app_state(&fixture.store);
+
+        let detail = create_session(
+            State(state),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "project_id": fixture.project_id.clone(),
+                    "attachment_mode": "new_worktree",
+                    "branch_name": "work/stale-reuse"
+                }))
+                .expect("payload should serialize"),
+            ),
+        )
+        .await
+        .expect("existing branch worktree session should create")
+        .0;
+
+        assert_eq!(detail.session.attachment_mode, "new_worktree");
+        assert_eq!(detail.session.workspace_mode, "isolated_worktree");
+        assert_eq!(detail.session.git_base_ref, "origin/dev");
+        assert_eq!(detail.session.base_ref, "origin/dev");
+        assert_eq!(detail.session.base_commit, fixture.fresh_head);
+        assert_eq!(detail.session.git_head, stale_head);
+        assert_eq!(detail.session.behind_by, Some(1));
+        assert_eq!(
+            git_stdout(
+                FsPath::new(&detail.session.worktree_path),
+                &["rev-parse", "HEAD"]
+            ),
+            stale_head
+        );
+
+        let worktree = fixture
+            .store
+            .get_worktree(&detail.session.worktree_id)
+            .expect("worktree lookup should succeed")
+            .expect("worktree row should exist");
+        assert_eq!(worktree.base_ref, "origin/dev");
+        assert_eq!(worktree.base_commit, fixture.fresh_head);
+        assert_eq!(worktree.behind_by, Some(1));
+
+        let listed = fixture
+            .store
+            .list_worktrees(&fixture.project_id)
+            .expect("worktrees should list");
+        assert_eq!(listed[0].behind_by, Some(1));
 
         let _ = StdCommand::new("git")
             .arg("-C")

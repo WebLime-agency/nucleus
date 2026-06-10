@@ -562,6 +562,7 @@ export const worktreeSummarySchema = z.object({
   branch: z.string(),
   base_ref: z.string(),
   base_commit: z.string(),
+  behind_by: z.number().int().nullable().default(null),
   origin_url: z.string().default(''),
   status: z.string(),
   created_at: z.number().int(),
