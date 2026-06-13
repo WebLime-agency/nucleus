@@ -172,6 +172,7 @@ const BROWSER_VERIFICATION_STATUSES: &[&str] = &[
     "unavailable",
 ];
 pub(crate) const ACTION_EXECUTOR_LANE: &str = "utility";
+const MAIN_EXECUTOR_LANE: &str = "main";
 
 fn configured_job_max_wall_clock_secs() -> u64 {
     configured_u64_env(
@@ -2441,7 +2442,7 @@ async fn run_job_loop(
         .ok_or_else(|| anyhow!("job '{job_id}' root worker was not found"))?;
     worker =
         migrate_legacy_root_worker_to_utility(state, &detail.job, &session.session, worker).await?;
-    ensure_utility_worker_executor(&worker)?;
+    ensure_root_worker_is_utility(&worker)?;
 
     state.store.update_job(
         job_id,
@@ -2722,7 +2723,7 @@ async fn run_job_loop(
                         &mut step,
                         tool_calls,
                         &summary,
-                        &format!("spawn {} Utility Subworker job(s)", jobs.len()),
+                        &format!("spawn {} child worker job(s)", jobs.len()),
                     )
                     .await?;
                     continue;
@@ -3532,7 +3533,7 @@ async fn handle_tool_call_proposal(
     tool: String,
     args: Value,
 ) -> Result<LoopDisposition> {
-    ensure_utility_worker_executor(worker)?;
+    ensure_worker_may_execute_actions(worker)?;
     *tool_calls += 1;
     let policy = policy_for_tool_with_mode(&tool, &session.session.approval_mode);
     let tool_call_id = Uuid::new_v4().to_string();
@@ -3723,8 +3724,7 @@ async fn handle_child_job_proposal(
 
     let mut child_plans = Vec::with_capacity(jobs.len());
     for proposal in &jobs {
-        child_plans
-            .push(resolve_child_job_target_plan(state, &session.session, worker, proposal).await?);
+        child_plans.push(resolve_child_job_target_plan(state, &session.session, proposal).await?);
     }
 
     let mut child_job_ids = Vec::with_capacity(jobs.len());
@@ -3776,7 +3776,7 @@ async fn handle_child_job_proposal(
         &session.session,
         worker,
         "running",
-        "Spawning Utility Subworkers",
+        "Spawning child workers",
         &summary,
         &[],
     )
@@ -3991,13 +3991,13 @@ struct ChildJobRunLimits {
 
 #[derive(Debug, Clone)]
 struct ChildJobTargetPlan {
+    lane: String,
     target: HiddenWorkerTarget,
 }
 
 async fn resolve_child_job_target_plan(
     state: &AppState,
     session: &SessionSummary,
-    parent_worker: &WorkerSummary,
     proposal: &ChildJobProposal,
 ) -> Result<ChildJobTargetPlan> {
     let requested_route_id = proposal
@@ -4007,6 +4007,22 @@ async fn resolve_child_job_target_plan(
         .filter(|value| !value.is_empty());
 
     if let Some(route_id) = requested_route_id {
+        if route_id == ACTION_EXECUTOR_LANE {
+            let target = resolve_hidden_worker_target_with_route_override(
+                state,
+                session,
+                ACTION_EXECUTOR_LANE,
+                false,
+                None,
+            )
+            .await
+            .map_err(|error| anyhow!("worker_action.invalid: {}", error.message))?;
+            return Ok(ChildJobTargetPlan {
+                lane: ACTION_EXECUTOR_LANE.to_string(),
+                target,
+            });
+        }
+
         let mut route_session = session.clone();
         route_session.route_id = route_id.to_string();
         route_session.route_title = String::new();
@@ -4017,24 +4033,30 @@ async fn resolve_child_job_target_plan(
         let target = resolve_hidden_worker_target_with_route_override(
             state,
             &route_session,
-            ACTION_EXECUTOR_LANE,
+            MAIN_EXECUTOR_LANE,
             false,
             Some(route_id),
         )
         .await
         .map_err(|error| anyhow!("worker_action.invalid: {}", error.message))?;
-        return Ok(ChildJobTargetPlan { target });
+        return Ok(ChildJobTargetPlan {
+            lane: MAIN_EXECUTOR_LANE.to_string(),
+            target,
+        });
     }
 
+    let target = resolve_hidden_worker_target_with_route_override(
+        state,
+        session,
+        MAIN_EXECUTOR_LANE,
+        false,
+        None,
+    )
+    .await
+    .map_err(|error| anyhow!("worker_action.invalid: {}", error.message))?;
     Ok(ChildJobTargetPlan {
-        target: HiddenWorkerTarget {
-            provider: parent_worker.provider.clone(),
-            model: parent_worker.model.clone(),
-            route_id: String::new(),
-            route_title: String::new(),
-            provider_base_url: parent_worker.provider_base_url.clone(),
-            provider_api_key: parent_worker.provider_api_key.clone(),
-        },
+        lane: MAIN_EXECUTOR_LANE.to_string(),
+        target,
     })
 }
 
@@ -4099,8 +4121,8 @@ async fn create_child_job_with_limits(
         id: child_worker_id.clone(),
         job_id: child_job_id.clone(),
         parent_worker_id: Some(parent_worker.id.clone()),
-        title: format!("Child utility worker: {}", title),
-        lane: "utility".to_string(),
+        title: format!("Child {} worker: {}", target_plan.lane, title),
+        lane: target_plan.lane.clone(),
         state: "queued".to_string(),
         provider: target_plan.target.provider,
         model: target_plan.target.model,
@@ -4123,9 +4145,9 @@ async fn create_child_job_with_limits(
             ..JobPatch::default()
         },
     )?;
-    // Per-child route selection is intentionally Option A from #262: the route
-    // controls model/provider/transport only. Tool and MCP grants still come
-    // from the parent's workspace-scoped child capability set.
+    // Per-child route selection controls model/provider/transport only. Tool
+    // and MCP grants still come from the parent's workspace-scoped child
+    // capability set.
     state
         .store
         .replace_tool_capability_grants(&child_worker_id, &child_worker_capabilities())?;
@@ -4137,7 +4159,7 @@ async fn create_child_job_with_limits(
         .find(|item| item.id == child_worker_id)
         .ok_or_else(|| {
             anyhow!(
-                "Utility Subworker '{}' was not found after creation",
+                "Child worker '{}' was not found after creation",
                 child_worker_id
             )
         })?;
@@ -4160,8 +4182,7 @@ async fn create_child_job_with_limits(
     };
     state.store.write_worker_checkpoint(
         &child_worker.id,
-        &serde_json::to_value(checkpoint)
-            .context("failed to encode Utility Subworker checkpoint")?,
+        &serde_json::to_value(checkpoint).context("failed to encode child worker checkpoint")?,
     )?;
 
     publish_job_created(state, &child_job).await;
@@ -10137,7 +10158,7 @@ Previous summary: {}\n\
 Attempted action: {}\n\
 Return exactly one valid Nucleus worker action JSON object using kind=\"final_answer\".\n\
 - Do not call tools.\n\
-- Do not spawn Utility Subworkers.\n\
+- Do not spawn child workers.\n\
 - Do not run commands, inspect files, edit files, or assume action results.\n\
 - The final_answer should be a concise user-facing plan, including assumptions or information you would need before acting.",
         excerpt(summary, 320),
@@ -11665,7 +11686,7 @@ async fn execute_granted_tool(
     tool: &str,
     args: Value,
 ) -> Result<Value> {
-    ensure_utility_worker_executor(worker)?;
+    ensure_worker_may_execute_actions(worker)?;
     if !worker
         .capabilities
         .iter()
@@ -11863,10 +11884,21 @@ async fn execute_granted_tool(
     }
 }
 
-fn ensure_utility_worker_executor(worker: &WorkerSummary) -> Result<()> {
-    if worker.lane != ACTION_EXECUTOR_LANE {
+fn ensure_root_worker_is_utility(worker: &WorkerSummary) -> Result<()> {
+    if worker.parent_worker_id.is_none() && worker.lane != ACTION_EXECUTOR_LANE {
         bail!(
-            "worker '{}' is lane '{}' and cannot execute Nucleus actions; only utility workers may execute actions",
+            "worker '{}' is lane '{}' and cannot drive a Nucleus session; root workers must use the utility lane",
+            worker.id,
+            worker.lane
+        );
+    }
+    Ok(())
+}
+
+fn ensure_worker_may_execute_actions(worker: &WorkerSummary) -> Result<()> {
+    if worker.lane != ACTION_EXECUTOR_LANE && worker.parent_worker_id.is_none() {
+        bail!(
+            "worker '{}' is lane '{}' and cannot execute Nucleus actions unless it is a spawned sub-worker",
             worker.id,
             worker.lane
         );
@@ -17761,7 +17793,7 @@ Allowed response shape:\n\
 Rules:\n\
 - Think briefly in thoughts before choosing the final_answer.\n\
 - Do not call tools.\n\
-- Do not spawn Utility Subworkers.\n\
+- Do not spawn child workers.\n\
 - Do not run commands, inspect files, edit files, or assume action results.\n\
 - You may reason from the user's prompt and existing visible context only.\n\
 - The visible chat will receive final_answer.\n\
@@ -17847,7 +17879,8 @@ Working directory: {}\n",
 {\"kind\":\"tool_call\",\"summary\":\"verify the UI in Browser\",\"tool\":\"browser.navigate\",\"args\":{\"url\":\"http://127.0.0.1:5299\"}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"read Browser refs\",\"tool\":\"browser.snapshot\",\"args\":{}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"click a Browser control by ref\",\"tool\":\"browser.click\",\"args\":{\"target_ref\":\"ref-1\"}}\n\
-{\"kind\":\"spawn_child_jobs\",\"summary\":\"why parallel exploration helps\",\"jobs\":[{\"title\":\"focused subtask\",\"prompt\":\"precise child prompt\",\"task_class\":\"local_project\",\"working_dir\":\"optional/path/inside/scope\"}]}\n\
+{\"kind\":\"spawn_child_jobs\",\"summary\":\"delegate bounded execution to child workers\",\"jobs\":[{\"title\":\"focused implementation\",\"prompt\":\"precise bounded task, expected output, budget guidance, and join criteria\",\"task_class\":\"local_project\",\"working_dir\":\"optional/path/inside/scope\"}]}\n\
+{\"kind\":\"spawn_child_jobs\",\"summary\":\"run a cheap deterministic check on utility\",\"jobs\":[{\"title\":\"focused check\",\"prompt\":\"precise bounded check and expected report\",\"task_class\":\"local_project\",\"working_dir\":\"optional/path/inside/scope\",\"route_id\":\"utility\"}]}\n\
 {\"kind\":\"progress_update\",\"summary\":\"durable checkpoint, not done\",\"detail\":\"completed evidence and exact continuation point\"}\n\
 {\"kind\":\"wait\",\"summary\":\"park until an external condition is ready\",\"until\":{\"kind\":\"delay_seconds\",\"delay_seconds\":60},\"max_wait_seconds\":1800,\"wake_note\":\"optional wake-up context\"}\n\
 {\"kind\":\"wait\",\"summary\":\"park until memory classification finishes\",\"until\":{\"kind\":\"audit_event\",\"event_kind\":\"memory.classifier.completed\",\"target_pattern\":\"session:\",\"status\":\"success\"},\"max_wait_seconds\":1800}\n\
@@ -17888,14 +17921,28 @@ Working directory: {}\n",
         .collect::<Vec<_>>()
         .join("\n");
     let child_job_rules = if is_root_worker {
-        "- Only root workers may fan out child jobs, and child jobs must stay read-only.\n\
+        "- You are the root Utility Worker: orchestrate, gate, budget, approve, and join child results.\n\
+- Do not do heavy implementation or deep reasoning yourself when the work can be bounded for a child worker.\n\
+- Use spawn_child_jobs for heavy implementation, multi-step investigation, broad search, or work that benefits from the main session model. A child with no route_id uses the main lane and the session main model.\n\
+- Use route_id=\"utility\" only for cheap deterministic child checks that should stay on the utility lane.\n\
+- Only root workers may fan out child jobs, and child jobs must stay read-only.\n\
 - Use at most 5 child jobs in a single spawn_child_jobs action.\n"
     } else {
         ""
     };
 
+    let worker_intro = if is_root_worker {
+        "Respond to the user as the root Utility Worker. You are the orchestrator and deterministic gate for this Nucleus session. Use tools only when the task actually needs them."
+            .to_string()
+    } else {
+        format!(
+            "Respond to the user as a Nucleus {} child worker. Execute the bounded task from your parent and report results clearly.",
+            worker.lane
+        )
+    };
+
     format!(
-        "Respond to the user as the Utility Nucleus {} worker. Use tools only when the task actually needs them.\n\
+        "{}\n\
 Nucleus worker action JSON contract: return one valid Nucleus worker action JSON object.\n\
 Allowed response shapes:\n\
 {}\n\
@@ -17928,7 +17975,7 @@ Available tools:\n{}\n\
 {}\n\
 Worker lane: {}\n\
 Working directory: {}\n",
-        worker.lane,
+        worker_intro,
         action_shapes,
         child_job_rules,
         tool_help,
@@ -28070,6 +28117,7 @@ Thanks."#,
         assert_eq!(jobs.len(), 1);
         let detail = state.store.get_job(&jobs[0].id).expect("job should load");
         assert_eq!(detail.job.state, "failed");
+        assert_eq!(detail.child_jobs.len(), 0);
         assert_eq!(detail.job.executor_lane, "utility");
         assert_eq!(detail.job.executor_model, "utility-auth-model");
         assert!(
@@ -28087,7 +28135,7 @@ Thanks."#,
     }
 
     #[tokio::test]
-    async fn main_lane_workers_cannot_receive_or_execute_action_grants() {
+    async fn main_lane_root_is_blocked_but_main_subworker_can_execute_action_grants() {
         let state_dir = test_state_dir("main-lane-no-action-grants");
         let state = initialize_test_state(&state_dir);
         let workspace_root = PathBuf::from(
@@ -28141,12 +28189,12 @@ Thanks."#,
             .expect("worker should persist");
         let grant_error = state
             .store
-            .replace_tool_capability_grants(&worker.id, &execution_capabilities())
-            .expect_err("main lane must not receive action grants");
-        assert!(grant_error.to_string().contains("only utility workers"));
+            .replace_tool_capability_grants(&worker.id, &child_worker_capabilities())
+            .expect_err("main lane root must not receive action grants");
+        assert!(grant_error.to_string().contains("spawned sub-worker"));
 
         let mut forged_worker = worker.clone();
-        forged_worker.capabilities = execution_capabilities()
+        forged_worker.capabilities = child_worker_capabilities()
             .into_iter()
             .map(|grant| nucleus_protocol::ToolCapabilitySummary {
                 tool_id: grant.tool_id,
@@ -28189,12 +28237,80 @@ Thanks."#,
             "tool-call-main-lane",
             &mut checkpoint,
             &mut cancel_rx,
-            "command.run",
-            json!({ "command": "true" }),
+            "fs.list",
+            json!({ "path": ".", "recursive": false, "limit": 10 }),
         )
         .await
-        .expect_err("main lane must not execute actions");
-        assert!(execute_error.to_string().contains("only utility workers"));
+        .expect_err("main lane root must not execute actions");
+        assert!(execute_error.to_string().contains("spawned sub-worker"));
+
+        let utility_parent = state
+            .store
+            .create_worker(WorkerRecord {
+                id: "worker-utility-parent".to_string(),
+                job_id: job_id.clone(),
+                parent_worker_id: None,
+                title: "Utility parent".to_string(),
+                lane: ACTION_EXECUTOR_LANE.to_string(),
+                state: "running".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "utility-model".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: workspace_root.display().to_string(),
+                read_roots: vec![workspace_root.display().to_string()],
+                write_roots: vec![workspace_root.display().to_string()],
+                max_steps: 10,
+                max_tool_calls: 10,
+                max_wall_clock_secs: 30,
+            })
+            .expect("utility parent should persist");
+        let mut child_worker = state
+            .store
+            .create_worker(WorkerRecord {
+                id: "worker-main-subworker".to_string(),
+                job_id: job_id.clone(),
+                parent_worker_id: Some(utility_parent.id.clone()),
+                title: "Main subworker".to_string(),
+                lane: MAIN_EXECUTOR_LANE.to_string(),
+                state: "running".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "main-model".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: workspace_root.display().to_string(),
+                read_roots: vec![workspace_root.display().to_string()],
+                write_roots: vec![workspace_root.display().to_string()],
+                max_steps: 10,
+                max_tool_calls: 10,
+                max_wall_clock_secs: 30,
+            })
+            .expect("main subworker should persist");
+        child_worker.capabilities = state
+            .store
+            .replace_tool_capability_grants(&child_worker.id, &child_worker_capabilities())
+            .expect("main subworker should receive action grants");
+
+        let result = execute_granted_tool(
+            &state,
+            &session,
+            &job_id,
+            &child_worker,
+            "tool-call-main-subworker",
+            &mut checkpoint,
+            &mut cancel_rx,
+            "fs.list",
+            json!({ "path": ".", "recursive": false, "limit": 10 }),
+        )
+        .await
+        .expect("main subworker should execute granted tools");
+        assert!(result["entries"].is_array());
 
         let _ = fs::remove_dir_all(&state_dir);
     }
@@ -28327,6 +28443,186 @@ Thanks."#,
                 .events
                 .iter()
                 .any(|event| event.event_type == "worker.legacy_lane_migrated")
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn legacy_main_lane_subworker_resume_does_not_migrate_to_utility_executor() {
+        let state_dir = test_state_dir("legacy-main-subworker-no-migration");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let (base_url, server) = spawn_response_sequence_openai_server(vec![
+            r#"{"kind":"final_answer","summary":"child done","final_answer":"Child done."}"#,
+        ])
+        .await;
+
+        let session_id = "session-legacy-main-subworker".to_string();
+        let mut session =
+            test_session_record(&session_id, "Legacy main subworker", &workspace_root);
+        session.provider_base_url = base_url.clone();
+        session.provider_api_key = "main-key".to_string();
+        session.model = "main-resume-model".to_string();
+        state
+            .store
+            .create_session(session)
+            .expect("session should persist");
+
+        let parent_job_id = "job-legacy-main-subworker-parent".to_string();
+        let child_job_id = "job-legacy-main-subworker-child".to_string();
+        let parent_worker_id = "worker-legacy-main-subworker-parent".to_string();
+        let child_worker_id = "worker-legacy-main-subworker-child".to_string();
+        state
+            .store
+            .create_job(JobRecord {
+                id: parent_job_id.clone(),
+                session_id: Some(session_id.clone()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: None,
+                title: "Parent prompt job".to_string(),
+                purpose: "Session prompt".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "running".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "Parent".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("parent job should persist");
+        state
+            .store
+            .create_worker(WorkerRecord {
+                id: parent_worker_id.clone(),
+                job_id: parent_job_id.clone(),
+                parent_worker_id: None,
+                title: "Utility Worker".to_string(),
+                lane: ACTION_EXECUTOR_LANE.to_string(),
+                state: "running".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "utility-model".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: workspace_root.display().to_string(),
+                read_roots: vec![workspace_root.display().to_string()],
+                write_roots: vec![workspace_root.display().to_string()],
+                max_steps: 10,
+                max_tool_calls: 10,
+                max_wall_clock_secs: 30,
+            })
+            .expect("parent worker should persist");
+        state
+            .store
+            .update_job(
+                &parent_job_id,
+                JobPatch {
+                    root_worker_id: Some(parent_worker_id.clone()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("parent root worker should update");
+
+        state
+            .store
+            .create_job(JobRecord {
+                id: child_job_id.clone(),
+                session_id: Some(session_id.clone()),
+                parent_job_id: Some(parent_job_id.clone()),
+                template_id: None,
+                task_class: None,
+                title: "Child prompt job".to_string(),
+                purpose: "Child prompt".to_string(),
+                trigger_kind: "child_job".to_string(),
+                state: "queued".to_string(),
+                requested_by: "agent".to_string(),
+                prompt_excerpt: "Finish child".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("child job should persist");
+        state
+            .store
+            .create_worker(WorkerRecord {
+                id: child_worker_id.clone(),
+                job_id: child_job_id.clone(),
+                parent_worker_id: Some(parent_worker_id.clone()),
+                title: "Child main worker".to_string(),
+                lane: MAIN_EXECUTOR_LANE.to_string(),
+                state: "queued".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "main-resume-model".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: base_url.clone(),
+                provider_api_key: "main-key".to_string(),
+                provider_session_id: "main-provider-session".to_string(),
+                working_dir: workspace_root.display().to_string(),
+                read_roots: vec![workspace_root.display().to_string()],
+                write_roots: Vec::new(),
+                max_steps: 10,
+                max_tool_calls: 10,
+                max_wall_clock_secs: 30,
+            })
+            .expect("child worker should persist");
+        state
+            .store
+            .update_job(
+                &child_job_id,
+                JobPatch {
+                    root_worker_id: Some(child_worker_id.clone()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child root worker should update");
+        state
+            .store
+            .write_worker_checkpoint(
+                &child_worker_id,
+                &serde_json::to_value(WorkerCheckpoint {
+                    session_id: session_id.clone(),
+                    prompt_text: "Finish child".to_string(),
+                    images: Vec::new(),
+                    conversation: Vec::new(),
+                    next_prompt: None,
+                    pending_action: None,
+                    browser_verification_final_answer_rejected: false,
+                    patch_loop_guardrail_triggered: false,
+                })
+                .unwrap(),
+            )
+            .expect("checkpoint should persist");
+
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        run_job_loop(&state, &child_job_id, &mut cancel_rx)
+            .await
+            .expect("main subworker should resume without utility migration");
+        server.await.expect("test server should finish");
+
+        let detail = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child job should load");
+        assert_eq!(detail.job.state, "completed");
+        let worker = detail.workers.first().expect("worker should exist");
+        assert_eq!(
+            worker.parent_worker_id.as_deref(),
+            Some(parent_worker_id.as_str())
+        );
+        assert_eq!(worker.lane, MAIN_EXECUTOR_LANE);
+        assert_eq!(worker.model, "main-resume-model");
+        assert!(
+            detail
+                .events
+                .iter()
+                .all(|event| event.event_type != "worker.legacy_lane_migrated")
         );
 
         let _ = fs::remove_dir_all(&state_dir);
@@ -28772,13 +29068,14 @@ Thanks."#,
             "utility-key",
         );
         let session_id = "spawn-child-jobs-five-session".to_string();
+        let mut session_record =
+            test_session_record(&session_id, "Spawn child jobs five", &workspace_root);
+        session_record.model = "main-fanout-model".to_string();
+        session_record.provider_base_url = base_url.clone();
+        session_record.provider_api_key = "main-key".to_string();
         state
             .store
-            .create_session(test_session_record(
-                &session_id,
-                "Spawn child jobs five",
-                &workspace_root,
-            ))
+            .create_session(session_record)
             .expect("session should persist");
         let current = state
             .store
@@ -28815,6 +29112,8 @@ Thanks."#,
                 .expect("child job should load");
             assert_eq!(detail.job.state, "completed");
             assert_eq!(detail.workers.len(), 1);
+            assert_eq!(detail.workers[0].lane, MAIN_EXECUTOR_LANE);
+            assert_eq!(detail.workers[0].model, "main-fanout-model");
             assert_eq!(detail.workers[0].provider_session_id, "dynamic-turn");
             assert!(
                 detail
@@ -28823,6 +29122,125 @@ Thanks."#,
                     .any(|artifact| artifact.kind == "child-report")
             );
         }
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn utility_root_delegates_default_child_to_main_executor_with_tool_grants() {
+        let state_dir = test_state_dir("spawn-child-jobs-main-tool-execution");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let spawn_action = json!({
+            "kind": "spawn_child_jobs",
+            "summary": "delegate implementation",
+            "jobs": [
+                {"title": "Run Tool", "prompt": "run a bounded command and report", "working_dir": null}
+            ],
+        })
+        .to_string();
+        let (utility_base_url, utility_count, _utility_bodies, utility_server) =
+            spawn_dynamic_openai_server(2, move |index, _body| {
+                if index == 0 {
+                    DynamicOpenAiProviderResponse::content(spawn_action.clone())
+                } else {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"final_answer","summary":"joined","final_answer":"Joined main child report."}"#,
+                    )
+                }
+            })
+            .await;
+        let (main_base_url, main_count, main_bodies, main_server) =
+            spawn_dynamic_openai_server(2, move |index, _body| {
+                if index == 0 {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"tool_call","summary":"list delegated workspace","tool":"fs.list","args":{"path":".","recursive":false,"limit":10}}"#,
+                    )
+                } else {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"final_answer","summary":"child done","final_answer":"Main child ran the command."}"#,
+                    )
+                }
+            })
+            .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-delegator-model",
+            &utility_base_url,
+            "utility-key",
+        );
+        let session_id = "spawn-child-jobs-main-tool-session".to_string();
+        let mut session_record =
+            test_session_record(&session_id, "Spawn child jobs main tool", &workspace_root);
+        session_record.model = "session-main-tool-model".to_string();
+        session_record.provider_base_url = main_base_url.clone();
+        session_record.provider_api_key = "main-key".to_string();
+        state
+            .store
+            .create_session(session_record)
+            .expect("session should persist");
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            SessionPromptRequest {
+                prompt: "delegate a command to main".to_string(),
+                images: vec![],
+                task_class: None,
+                role: "main".to_string(),
+            },
+            current,
+            "delegate a command to main".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("prompt should queue");
+
+        let _ = wait_for_session_state(&state, &session_id, "active").await;
+        utility_server.await.expect("utility server should finish");
+        main_server.await.expect("main server should finish");
+        assert_eq!(utility_count.load(Ordering::SeqCst), 2);
+        assert_eq!(main_count.load(Ordering::SeqCst), 2);
+        assert!(main_bodies.lock().unwrap()[0].contains("run a bounded command"));
+        assert!(main_bodies.lock().unwrap()[1].contains("fs.list"));
+
+        let parent = latest_job_detail(&state, &session_id);
+        assert_eq!(parent.job.state, "completed");
+        assert_eq!(parent.child_jobs.len(), 1);
+        let child = parent.child_jobs.first().expect("child job should exist");
+        assert_eq!(child.executor_lane, MAIN_EXECUTOR_LANE);
+        assert_eq!(child.executor_model, "session-main-tool-model");
+        let child_detail = state.store.get_job(&child.id).expect("child should load");
+        assert_eq!(child_detail.job.state, "completed");
+        let child_worker = child_detail
+            .workers
+            .first()
+            .expect("child worker should exist");
+        assert_eq!(child_worker.lane, MAIN_EXECUTOR_LANE);
+        assert_eq!(child_worker.provider_base_url, main_base_url);
+        assert!(
+            child_worker
+                .capabilities
+                .iter()
+                .any(|grant| grant.tool_id == "fs.list")
+        );
+        assert!(
+            child_detail
+                .events
+                .iter()
+                .any(|event| event.event_type == "tool.completed")
+        );
+        assert!(
+            child_detail
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.kind == "child-report")
+        );
 
         let _ = fs::remove_dir_all(&state_dir);
     }
@@ -28869,6 +29287,57 @@ Thanks."#,
         assert!(error.to_string().contains("unknown router profile"));
         assert_eq!(state.store.get_job(&job_id).unwrap().child_jobs.len(), 0);
         assert_eq!(step, 0);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn spawned_subworkers_cannot_spawn_child_jobs() {
+        let state_dir = test_state_dir("spawn-child-jobs-subworker-contained");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let (session, job_id, worker) =
+            create_parent_fanout_context(&state, "subworker-contained", &workspace_root, "");
+
+        for lane in [MAIN_EXECUTOR_LANE, ACTION_EXECUTOR_LANE] {
+            let mut child_worker = worker.clone();
+            child_worker.id = format!("{lane}-child-worker");
+            child_worker.parent_worker_id = Some(worker.id.clone());
+            child_worker.lane = lane.to_string();
+            let mut checkpoint = WorkerCheckpoint {
+                session_id: session.session.id.clone(),
+                prompt_text: "fan out".to_string(),
+                images: Vec::new(),
+                conversation: Vec::new(),
+                next_prompt: None,
+                pending_action: None,
+                browser_verification_final_answer_rejected: false,
+                patch_loop_guardrail_triggered: false,
+            };
+            let mut step = 0;
+
+            let error = handle_child_job_proposal(
+                &state,
+                &session,
+                &job_id,
+                &mut child_worker,
+                &mut checkpoint,
+                &mut step,
+                "fan out".to_string(),
+                vec![ChildJobProposal {
+                    title: "Nested".to_string(),
+                    prompt: "nested child".to_string(),
+                    task_class: None,
+                    working_dir: None,
+                    route_id: None,
+                }],
+            )
+            .await
+            .expect_err("spawned workers must not spawn child jobs");
+
+            assert!(error.to_string().contains("only the root Utility Worker"));
+            assert_eq!(step, 0);
+        }
 
         let _ = fs::remove_dir_all(&state_dir);
     }
@@ -29089,6 +29558,8 @@ Thanks."#,
             assert_eq!(child.executor_route_id, route_id);
             assert_eq!(child.executor_route_title, route_title);
             let detail = state.store.get_job(&child.id).expect("child should load");
+            assert_eq!(child.executor_lane, MAIN_EXECUTOR_LANE);
+            assert_eq!(detail.workers[0].lane, MAIN_EXECUTOR_LANE);
             assert_eq!(detail.workers[0].model, model);
             assert_eq!(detail.workers[0].provider_base_url, base_url);
             assert_eq!(detail.workers[0].provider_api_key, api_key);
@@ -29098,7 +29569,7 @@ Thanks."#,
     }
 
     #[tokio::test]
-    async fn spawn_child_jobs_mixes_explicit_route_and_parent_inheritance() {
+    async fn spawn_child_jobs_defaults_to_main_and_allows_explicit_utility_selection() {
         let state_dir = test_state_dir("spawn-child-jobs-route-inherit");
         let state = initialize_test_state(&state_dir);
         let workspace_root = state_dir.join("workspace");
@@ -29107,7 +29578,8 @@ Thanks."#,
             "summary": "fan out with mixed routing",
             "jobs": [
                 {"title": "Explicit", "prompt": "explicit-child", "working_dir": null, "route_id": "explicit-route"},
-                {"title": "Inherited", "prompt": "inherited-child", "working_dir": null}
+                {"title": "Default Main", "prompt": "default-main-child", "working_dir": null},
+                {"title": "Utility", "prompt": "utility-child", "working_dir": null, "route_id": "utility"}
             ],
         })
         .to_string();
@@ -29117,7 +29589,7 @@ Thanks."#,
                     DynamicOpenAiProviderResponse::content(spawn_action.clone())
                 } else if index == 1 {
                     DynamicOpenAiProviderResponse::content(
-                        r#"{"kind":"final_answer","summary":"inherited","final_answer":"Inherited child report."}"#,
+                        r#"{"kind":"final_answer","summary":"utility","final_answer":"Utility child report."}"#,
                     )
                 } else {
                     DynamicOpenAiProviderResponse::content(
@@ -29130,6 +29602,13 @@ Thanks."#,
             spawn_dynamic_openai_server(1, |_index, _body| {
                 DynamicOpenAiProviderResponse::content(
                     r#"{"kind":"final_answer","summary":"explicit","final_answer":"Explicit route report."}"#,
+                )
+            })
+            .await;
+        let (main_base_url, main_count, main_bodies, main_server) =
+            spawn_dynamic_openai_server(1, |_index, _body| {
+                DynamicOpenAiProviderResponse::content(
+                    r#"{"kind":"final_answer","summary":"default main","final_answer":"Default main report."}"#,
                 )
             })
             .await;
@@ -29151,13 +29630,14 @@ Thanks."#,
         );
 
         let session_id = "spawn-child-jobs-inherit-session".to_string();
+        let mut session_record =
+            test_session_record(&session_id, "Spawn child jobs inherit", &workspace_root);
+        session_record.model = "session-main-model".to_string();
+        session_record.provider_base_url = main_base_url.clone();
+        session_record.provider_api_key = "main-key".to_string();
         state
             .store
-            .create_session(test_session_record(
-                &session_id,
-                "Spawn child jobs inherit",
-                &workspace_root,
-            ))
+            .create_session(session_record)
             .expect("session should persist");
         let current = state
             .store
@@ -29185,32 +29665,48 @@ Thanks."#,
         explicit_server
             .await
             .expect("explicit route server should finish");
+        main_server.await.expect("main server should finish");
         assert_eq!(parent_count.load(Ordering::SeqCst), 3);
         assert_eq!(explicit_count.load(Ordering::SeqCst), 1);
-        assert!(parent_bodies.lock().unwrap()[1].contains("inherited-child"));
+        assert_eq!(main_count.load(Ordering::SeqCst), 1);
+        assert!(parent_bodies.lock().unwrap()[1].contains("utility-child"));
         assert!(explicit_bodies.lock().unwrap()[0].contains("explicit-child"));
+        assert!(main_bodies.lock().unwrap()[0].contains("default-main-child"));
 
         let parent = latest_job_detail(&state, &session_id);
-        let inherited = parent
+        let default_main = parent
             .child_jobs
             .iter()
-            .find(|child| child.purpose == "Inherited")
-            .expect("inherited child should exist");
-        assert_eq!(inherited.executor_model, "parent-inherited-model");
-        assert_eq!(inherited.executor_route_id, "");
-        assert_eq!(inherited.executor_route_title, "");
-        let inherited_detail = state
+            .find(|child| child.purpose == "Default Main")
+            .expect("default main child should exist");
+        assert_eq!(default_main.executor_lane, MAIN_EXECUTOR_LANE);
+        assert_eq!(default_main.executor_model, "session-main-model");
+        assert_eq!(default_main.executor_route_id, "");
+        assert_eq!(default_main.executor_route_title, "");
+        let default_main_detail = state
             .store
-            .get_job(&inherited.id)
-            .expect("inherited child should load");
+            .get_job(&default_main.id)
+            .expect("default main child should load");
         assert_eq!(
-            inherited_detail.workers[0].provider_base_url,
-            parent_base_url
+            default_main_detail.workers[0].provider_base_url,
+            main_base_url
         );
-        assert_eq!(
-            inherited_detail.workers[0].provider_api_key,
-            "parent-inherited-key"
-        );
+        assert_eq!(default_main_detail.workers[0].provider_api_key, "main-key");
+
+        let utility = parent
+            .child_jobs
+            .iter()
+            .find(|child| child.purpose == "Utility")
+            .expect("utility child should exist");
+        assert_eq!(utility.executor_lane, ACTION_EXECUTOR_LANE);
+        assert_eq!(utility.executor_model, "parent-inherited-model");
+        assert_eq!(utility.executor_route_id, "");
+        let utility_detail = state
+            .store
+            .get_job(&utility.id)
+            .expect("utility child should load");
+        assert_eq!(utility_detail.workers[0].lane, ACTION_EXECUTOR_LANE);
+        assert_eq!(utility_detail.workers[0].provider_base_url, parent_base_url);
 
         let explicit = parent
             .child_jobs
@@ -29218,6 +29714,7 @@ Thanks."#,
             .find(|child| child.purpose == "Explicit")
             .expect("explicit child should exist");
         assert_eq!(explicit.executor_model, "explicit-route-model");
+        assert_eq!(explicit.executor_lane, MAIN_EXECUTOR_LANE);
         assert_eq!(explicit.executor_route_id, "explicit-route");
         assert_eq!(explicit.executor_route_title, "Explicit Route");
         let explicit_detail = state
@@ -29261,13 +29758,14 @@ Thanks."#,
             "utility-key",
         );
         let session_id = "spawn-child-jobs-cancel-session".to_string();
+        let mut session_record =
+            test_session_record(&session_id, "Spawn child jobs cancel", &workspace_root);
+        session_record.model = "main-cancel-model".to_string();
+        session_record.provider_base_url = base_url.clone();
+        session_record.provider_api_key = "main-key".to_string();
         state
             .store
-            .create_session(test_session_record(
-                &session_id,
-                "Spawn child jobs cancel",
-                &workspace_root,
-            ))
+            .create_session(session_record)
             .expect("session should persist");
         let current = state
             .store
@@ -29418,6 +29916,7 @@ Thanks."#,
                 route_id: None,
             },
             ChildJobTargetPlan {
+                lane: MAIN_EXECUTOR_LANE.to_string(),
                 target: HiddenWorkerTarget {
                     provider: parent_worker.provider.clone(),
                     model: parent_worker.model.clone(),
