@@ -138,6 +138,7 @@ struct LocalJobsStreamCache {
     allowlist: Vec<String>,
     last_refreshed_at: Option<Instant>,
     jobs: Option<Vec<LocalJobSummary>>,
+    refresh: Option<Arc<tokio::sync::Notify>>,
 }
 
 static LOCAL_JOBS_STREAM_CACHE: OnceLock<tokio::sync::Mutex<LocalJobsStreamCache>> =
@@ -5177,17 +5178,22 @@ async fn control_local_job(
         },
     )
     .await;
-    let _ = publish_local_jobs_event(&state, true).await;
+    if let Err(error) = publish_local_jobs_event(&state, true).await {
+        warn!(error = %error, "failed to publish local job state after control action");
+    }
     Ok(Json(summary))
 }
 
 fn map_system_job_error(error: anyhow::Error) -> ApiError {
-    let message = error.to_string();
-    if message.contains("not allowlisted") {
-        return ApiError::forbidden(message);
-    }
-    if message.contains("must end with") || message.contains("unsupported characters") {
-        return ApiError::bad_request(message);
+    if let Some(system_error) = error.downcast_ref::<system_jobs::SystemJobError>() {
+        let message = system_error.to_string();
+        return match system_error {
+            system_jobs::SystemJobError::NotAllowlisted { .. } => ApiError::forbidden(message),
+            system_jobs::SystemJobError::InvalidUnit { .. }
+            | system_jobs::SystemJobError::UnsupportedTriggeredUnit { .. } => {
+                ApiError::bad_request(message)
+            }
+        };
     }
 
     ApiError::from(error)
@@ -5474,15 +5480,7 @@ async fn publish_stream_snapshot(state: &AppState) -> anyhow::Result<()> {
 async fn local_jobs_snapshot_if_configured(
     state: &AppState,
 ) -> anyhow::Result<Option<Vec<LocalJobSummary>>> {
-    let allowlist = state.store.system_jobs_unit_globs()?;
-    if allowlist.is_empty() {
-        return Ok(None);
-    }
-
-    let jobs = system_jobs::SystemScheduler::systemd_user()
-        .list_jobs(&allowlist)
-        .await?;
-    Ok(Some(jobs))
+    throttled_local_jobs_snapshot_if_configured(state, false).await
 }
 
 async fn publish_local_jobs_event(state: &AppState, force_refresh: bool) -> anyhow::Result<()> {
@@ -5503,20 +5501,45 @@ async fn throttled_local_jobs_snapshot_if_configured(
 
     let cache = LOCAL_JOBS_STREAM_CACHE
         .get_or_init(|| tokio::sync::Mutex::new(LocalJobsStreamCache::default()));
-    let mut cache = cache.lock().await;
-    let cache_is_current = cache.allowlist == allowlist
-        && cache
-            .last_refreshed_at
-            .is_some_and(|last| last.elapsed() < LOCAL_JOBS_STREAM_MIN_INTERVAL);
-    if !force_refresh && cache_is_current {
-        if let Some(jobs) = cache.jobs.clone() {
-            return Ok(Some(jobs));
-        }
-    }
 
-    let jobs = system_jobs::SystemScheduler::systemd_user()
+    let refresh = loop {
+        let mut cache = cache.lock().await;
+        let cache_is_current = cache.allowlist == allowlist
+            && cache
+                .last_refreshed_at
+                .is_some_and(|last| last.elapsed() < LOCAL_JOBS_STREAM_MIN_INTERVAL);
+        if !force_refresh && cache_is_current {
+            if let Some(jobs) = cache.jobs.clone() {
+                return Ok(Some(jobs));
+            }
+        }
+
+        if let Some(refresh) = cache.refresh.clone() {
+            drop(cache);
+            refresh.notified().await;
+            continue;
+        }
+
+        let refresh = Arc::new(tokio::sync::Notify::new());
+        cache.refresh = Some(refresh.clone());
+        break refresh;
+    };
+
+    let result = system_jobs::SystemScheduler::systemd_user()
         .list_jobs(&allowlist)
-        .await?;
+        .await;
+
+    let mut cache = cache.lock().await;
+    if cache
+        .refresh
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &refresh))
+    {
+        cache.refresh = None;
+    }
+    refresh.notify_waiters();
+
+    let jobs = result?;
     cache.allowlist = allowlist;
     cache.last_refreshed_at = Some(Instant::now());
     cache.jobs = Some(jobs.clone());

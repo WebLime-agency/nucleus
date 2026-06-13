@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt,
     process::Stdio,
     time::{Duration, Instant},
 };
@@ -10,6 +11,29 @@ use tokio::{process::Command, time::timeout};
 
 const BACKEND_SYSTEMD_USER: &str = "systemd-user";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(12);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SystemJobError {
+    NotAllowlisted { unit: String },
+    InvalidUnit { reason: String },
+    UnsupportedTriggeredUnit { unit: String },
+}
+
+impl fmt::Display for SystemJobError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotAllowlisted { unit } => {
+                write!(formatter, "system job unit '{unit}' is not allowlisted")
+            }
+            Self::InvalidUnit { reason } => write!(formatter, "systemd unit {reason}"),
+            Self::UnsupportedTriggeredUnit { unit } => {
+                write!(formatter, "triggered unit '{unit}' must end with .service")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SystemJobError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalJobControl {
@@ -227,7 +251,7 @@ fn parse_local_job_summary_with_listed_next(
     let unit = required_value(&timer, "Id")?.to_string();
     validate_timer_unit(&unit)?;
     let triggered_unit = required_value(&timer, "Triggers")?.to_string();
-    validate_service_unit(&triggered_unit)?;
+    validate_triggered_service_unit(&triggered_unit)?;
 
     let next_elapse_realtime = timer.get("NextElapseUSecRealtime");
     let next_elapse_monotonic = timer.get("NextElapseUSecMonotonic");
@@ -264,9 +288,9 @@ fn parse_local_job_summary_with_listed_next(
             next_elapse_at: next_elapse,
             interval_hint: None,
             raw: next_elapse_realtime
-                .and_then(non_empty_systemd_value)
+                .and_then(|value| non_empty_str(value.as_str()))
                 .or_else(|| listed_next_elapse.and_then(non_empty_str))
-                .or_else(|| next_elapse_monotonic.and_then(non_empty_systemd_value))
+                .or_else(|| next_elapse_monotonic.and_then(|value| non_empty_str(value.as_str())))
                 .unwrap_or_default()
                 .to_string(),
         },
@@ -285,11 +309,9 @@ fn unit_file_state_is_manageable(state: &str) -> bool {
 }
 
 fn is_unsupported_triggered_unit_error(error: &anyhow::Error) -> bool {
-    error.to_string().contains("must end with .service")
-}
-
-fn non_empty_systemd_value(value: &String) -> Option<&str> {
-    non_empty_str(value)
+    error
+        .downcast_ref::<SystemJobError>()
+        .is_some_and(|error| matches!(error, SystemJobError::UnsupportedTriggeredUnit { .. }))
 }
 
 fn non_empty_str(value: &str) -> Option<&str> {
@@ -386,7 +408,7 @@ pub fn parse_journal_tail(stdout: &str) -> Vec<String> {
 fn parse_triggered_unit(timer_show: &str) -> Result<String> {
     let timer = parse_key_values(timer_show);
     let triggered_unit = required_value(&timer, "Triggers")?.to_string();
-    validate_service_unit(&triggered_unit)?;
+    validate_triggered_service_unit(&triggered_unit)?;
     Ok(triggered_unit)
 }
 
@@ -558,7 +580,10 @@ fn ensure_unit_allowlisted(unit: &str, allowlist_globs: &[String]) -> Result<()>
     if unit_is_allowlisted(unit, allowlist_globs) {
         Ok(())
     } else {
-        bail!("system job unit '{unit}' is not allowlisted")
+        Err(SystemJobError::NotAllowlisted {
+            unit: unit.to_string(),
+        }
+        .into())
     }
 }
 
@@ -605,15 +630,34 @@ fn validate_service_unit(unit: &str) -> Result<()> {
     validate_unit_name(unit, ".service")
 }
 
+fn validate_triggered_service_unit(unit: &str) -> Result<()> {
+    if !unit.ends_with(".service") {
+        return Err(SystemJobError::UnsupportedTriggeredUnit {
+            unit: unit.to_string(),
+        }
+        .into());
+    }
+    validate_service_unit(unit)
+}
+
 fn validate_unit_name(unit: &str, suffix: &str) -> Result<()> {
     if unit.trim().is_empty() || !unit.ends_with(suffix) {
-        bail!("systemd unit must end with {suffix}");
+        return Err(SystemJobError::InvalidUnit {
+            reason: format!("must end with {suffix}"),
+        }
+        .into());
     }
     if unit.starts_with('-') {
-        bail!("systemd unit contains unsupported characters");
+        return Err(SystemJobError::InvalidUnit {
+            reason: "contains unsupported characters".to_string(),
+        }
+        .into());
     }
     if unit.contains('/') || unit.chars().any(char::is_whitespace) {
-        bail!("systemd unit contains unsupported characters");
+        return Err(SystemJobError::InvalidUnit {
+            reason: "contains unsupported characters".to_string(),
+        }
+        .into());
     }
     Ok(())
 }

@@ -144,7 +144,6 @@
   let selectedLocalJob = $derived(
     (localJobDetail?.summary.unit === selectedLocalJobUnit ? localJobDetail.summary : null) ??
       localJobs.find((job) => job.unit === selectedLocalJobUnit) ??
-      localJobs[0] ??
       null
   );
   let selectedProfile = $derived(
@@ -236,6 +235,17 @@
     }
     if (localJobDetail && !localJobs.some((job) => job.unit === localJobDetail?.summary.unit)) {
       localJobDetail = null;
+    }
+  }
+
+  async function loadSelectedLocalJobDetail(silent = true) {
+    const unit = selectedLocalJobUnit || localJobs[0]?.unit || '';
+    if (!unit || localJobLoading) {
+      return;
+    }
+
+    if (selectedLocalJobUnit !== unit || localJobDetail?.summary.unit !== unit) {
+      await loadLocalJobDetail(unit, silent);
     }
   }
 
@@ -439,8 +449,8 @@
         syncPlaybookDetail(null);
       }
 
-      if (activeSurface === 'local_jobs' && selectedLocalJobUnit) {
-        await loadLocalJobDetail(selectedLocalJobUnit, true);
+      if (activeSurface === 'local_jobs') {
+        await loadSelectedLocalJobDetail(true);
       }
     } catch (cause) {
       error = cause instanceof Error ? cause.message : 'Failed to load automations.';
@@ -575,6 +585,9 @@
           localJobDetail = { ...localJobDetail, summary: nextSummary };
         }
       }
+      if (activeSurface === 'local_jobs') {
+        void loadSelectedLocalJobDetail(true);
+      }
       error = null;
       return;
     }
@@ -668,9 +681,7 @@
       }`}
       onclick={() => {
         activeSurface = 'local_jobs';
-        if (selectedLocalJobUnit && !localJobDetail) {
-          void loadLocalJobDetail(selectedLocalJobUnit, true);
-        }
+        void loadSelectedLocalJobDetail(true);
       }}
     >
       Local jobs
