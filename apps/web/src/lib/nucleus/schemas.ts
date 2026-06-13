@@ -409,6 +409,37 @@ export const playbookDetailSchema = z.object({
   recent_jobs: z.array(jobSummarySchema).default([])
 });
 
+export const localJobScheduleSchema = z.object({
+  next_elapse_at: z.number().int().nullable(),
+  interval_hint: z.string().nullable(),
+  raw: z.string()
+});
+
+export const localJobExitSchema = z.object({
+  code: z.number().int().nullable(),
+  result: z.string(),
+  at: z.number().int().nullable()
+});
+
+export const localJobSummarySchema = z.object({
+  unit: z.string(),
+  title: z.string(),
+  backend: z.literal('systemd-user'),
+  enabled: z.boolean(),
+  unit_file_state: z.string().default('unknown'),
+  manageable: z.boolean().default(true),
+  active_state: z.string(),
+  schedule: localJobScheduleSchema,
+  last_fired_at: z.number().int().nullable(),
+  last_exit: localJobExitSchema,
+  triggered_unit: z.string()
+});
+
+export const localJobDetailSchema = z.object({
+  summary: localJobSummarySchema,
+  log_tail: z.array(z.string()).default([])
+});
+
 export const promptProgressUpdateSchema = z.object({
   session_id: z.string(),
   status: z.string(),
@@ -1318,6 +1349,10 @@ export const daemonEventSchema = z.discriminatedUnion('event', [
     data: systemStatsSchema
   }),
   z.object({
+    event: z.literal('local_jobs.updated'),
+    data: z.array(localJobSummarySchema)
+  }),
+  z.object({
     event: z.literal('update.updated'),
     data: updateStatusSchema
   }),
@@ -1353,6 +1388,10 @@ export type JobEvent = z.infer<typeof jobEventSchema>;
 export type JobDetail = z.infer<typeof jobDetailSchema>;
 export type PlaybookSummary = z.infer<typeof playbookSummarySchema>;
 export type PlaybookDetail = z.infer<typeof playbookDetailSchema>;
+export type LocalJobSchedule = z.infer<typeof localJobScheduleSchema>;
+export type LocalJobExit = z.infer<typeof localJobExitSchema>;
+export type LocalJobSummary = z.infer<typeof localJobSummarySchema>;
+export type LocalJobDetail = z.infer<typeof localJobDetailSchema>;
 export type PromptProgressUpdate = z.infer<typeof promptProgressUpdateSchema>;
 export type ApprovalResolutionRequest = z.infer<typeof approvalResolutionRequestSchema>;
 export type CreatePlaybookRequest = z.infer<typeof createPlaybookRequestSchema>;

@@ -7,6 +7,7 @@ mod memory_classifier;
 mod retry;
 mod runtime;
 mod security;
+mod system_jobs;
 mod updates;
 mod vault;
 mod worker_action;
@@ -17,7 +18,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path as FsPath, PathBuf},
     process::Command as StdCommand,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -48,11 +49,11 @@ use nucleus_protocol::{
     BrowserContextSummary, BrowserNavigateRequest, BrowserSnapshot, CompatibilitySummary,
     CompiledPromptLayer, CompiledTurn, ConnectionSummary, CreatePlaybookRequest,
     CreateSessionRequest, DaemonEvent, HealthResponse, HostStatus, InstanceLogCategoriesResponse,
-    InstanceLogListResponse, JobDetail, JobSummary, MAX_CONFIGURED_JOB_STEPS,
-    MAX_CONFIGURED_JOB_TOOL_CALLS, MAX_CONFIGURED_JOB_WALL_CLOCK_SECS, McpServerRecord,
-    McpServerSummary, McpToolRecord, MemoryCandidate, MemoryCandidateAcceptRequest,
-    MemoryCandidateListResponse, MemoryCandidateUpsertRequest, MemoryEntry,
-    MemoryEntryUpsertRequest, MemoryOutcome, MemorySearchResponse, MemorySummary,
+    InstanceLogListResponse, JobDetail, JobSummary, LocalJobDetail, LocalJobSummary,
+    MAX_CONFIGURED_JOB_STEPS, MAX_CONFIGURED_JOB_TOOL_CALLS, MAX_CONFIGURED_JOB_WALL_CLOCK_SECS,
+    McpServerRecord, McpServerSummary, McpToolRecord, MemoryCandidate,
+    MemoryCandidateAcceptRequest, MemoryCandidateListResponse, MemoryCandidateUpsertRequest,
+    MemoryEntry, MemoryEntryUpsertRequest, MemoryOutcome, MemorySearchResponse, MemorySummary,
     ModelActionContractCapability, ModelJsonObjectCapability, ModelTransportCapability,
     NucleusToolDescriptor, PlaybookDetail, PlaybookSummary, ProcessKillRequest,
     ProcessKillResponse, ProcessListResponse, ProfileCheckOutcome, ProfileCheckRequest,
@@ -97,6 +98,7 @@ use uuid::Uuid;
 use worker_action::parse_worker_action;
 
 const STREAM_INTERVAL: Duration = Duration::from_secs(2);
+const LOCAL_JOBS_STREAM_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_AUDIT_LIMIT: usize = 20;
 const MAX_AUDIT_LIMIT: usize = 100;
 const DEFAULT_LOG_LIMIT: usize = 100;
@@ -130,6 +132,17 @@ struct AppState {
     tailscale_dns_name: Option<String>,
     events: broadcast::Sender<DaemonEvent>,
 }
+
+#[derive(Default)]
+struct LocalJobsStreamCache {
+    allowlist: Vec<String>,
+    last_refreshed_at: Option<Instant>,
+    jobs: Option<Vec<LocalJobSummary>>,
+    refresh: Option<Arc<tokio::sync::Notify>>,
+}
+
+static LOCAL_JOBS_STREAM_CACHE: OnceLock<tokio::sync::Mutex<LocalJobsStreamCache>> =
+    OnceLock::new();
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -399,6 +412,20 @@ fn app(state: AppState) -> Router {
             get(session_detail).post(prompt_session),
         )
         .route("/host-status", get(host_status))
+        .route("/system/jobs", get(local_jobs))
+        .route("/system/jobs/{unit}", get(local_job_detail))
+        .route(
+            "/system/jobs/{unit}/enable",
+            axum::routing::post(enable_local_job),
+        )
+        .route(
+            "/system/jobs/{unit}/disable",
+            axum::routing::post(disable_local_job),
+        )
+        .route(
+            "/system/jobs/{unit}/run",
+            axum::routing::post(run_local_job),
+        )
         .route("/system", get(system_stats))
         .route("/system/processes", get(processes).post(kill_process))
         .route_layer(middleware::from_fn_with_state(
@@ -5078,6 +5105,99 @@ async fn host_status(State(state): State<AppState>) -> Json<nucleus_protocol::Ho
     Json(state.host.host_status())
 }
 
+async fn local_jobs(State(state): State<AppState>) -> Result<Json<Vec<LocalJobSummary>>, ApiError> {
+    let jobs = throttled_local_jobs_snapshot_if_configured(&state, false)
+        .await
+        .map_err(map_system_job_error)?
+        .unwrap_or_default();
+    Ok(Json(jobs))
+}
+
+async fn local_job_detail(
+    State(state): State<AppState>,
+    Path(unit): Path<String>,
+) -> Result<Json<LocalJobDetail>, ApiError> {
+    let allowlist = state.store.system_jobs_unit_globs()?;
+    let detail = system_jobs::SystemScheduler::systemd_user()
+        .job_detail(&unit, &allowlist)
+        .await
+        .map_err(map_system_job_error)?;
+    Ok(Json(detail))
+}
+
+async fn enable_local_job(
+    State(state): State<AppState>,
+    Path(unit): Path<String>,
+) -> Result<Json<LocalJobSummary>, ApiError> {
+    control_local_job(state, unit, system_jobs::LocalJobControl::Enable, "enabled").await
+}
+
+async fn disable_local_job(
+    State(state): State<AppState>,
+    Path(unit): Path<String>,
+) -> Result<Json<LocalJobSummary>, ApiError> {
+    control_local_job(
+        state,
+        unit,
+        system_jobs::LocalJobControl::Disable,
+        "disabled",
+    )
+    .await
+}
+
+async fn run_local_job(
+    State(state): State<AppState>,
+    Path(unit): Path<String>,
+) -> Result<Json<LocalJobSummary>, ApiError> {
+    control_local_job(state, unit, system_jobs::LocalJobControl::Run, "started").await
+}
+
+async fn control_local_job(
+    state: AppState,
+    unit: String,
+    control: system_jobs::LocalJobControl,
+    action: &str,
+) -> Result<Json<LocalJobSummary>, ApiError> {
+    let allowlist = state.store.system_jobs_unit_globs()?;
+    let summary = system_jobs::SystemScheduler::systemd_user()
+        .control_job(&unit, control, &allowlist)
+        .await
+        .map_err(map_system_job_error)?;
+    let _ = try_record_audit_event(
+        &state,
+        AuditEventRecord {
+            kind: format!("system_job.{action}"),
+            target: format!("system_job:{unit}"),
+            status: "success".to_string(),
+            summary: format!("Local system job '{unit}' {action}."),
+            detail: format!(
+                "backend={} timer={} triggered_unit={} action={action}",
+                summary.backend, summary.unit, summary.triggered_unit
+            ),
+        },
+    )
+    .await;
+    if let Err(error) = publish_local_jobs_event(&state, true).await {
+        warn!(error = %error, "failed to publish local job state after control action");
+    }
+    Ok(Json(summary))
+}
+
+fn map_system_job_error(error: anyhow::Error) -> ApiError {
+    if let Some(system_error) = error.downcast_ref::<system_jobs::SystemJobError>() {
+        let message = system_error.to_string();
+        return match system_error {
+            system_jobs::SystemJobError::NotAllowlisted { .. } => ApiError::forbidden(message),
+            system_jobs::SystemJobError::InvalidUnit { .. }
+            | system_jobs::SystemJobError::UnsupportedTriggeredUnit { .. } => {
+                ApiError::bad_request(message)
+            }
+        };
+    }
+
+    ApiError::from(error)
+}
+
 async fn system_stats(State(state): State<AppState>) -> Json<SystemStats> {
     Json(state.host.system_stats())
 }
@@ -5271,6 +5391,13 @@ async fn send_initial_stream_snapshot(
     send_event(socket, DaemonEvent::OverviewUpdated(overview)).await?;
     send_event(socket, DaemonEvent::AuditUpdated(audit)).await?;
     send_event(socket, DaemonEvent::SystemUpdated(frame.system_stats)).await?;
+    match local_jobs_snapshot_if_configured(state).await {
+        Ok(Some(jobs)) => send_event(socket, DaemonEvent::LocalJobsUpdated(jobs)).await?,
+        Ok(None) => {}
+        Err(error) => {
+            warn!(error = %error, "failed to include local jobs in websocket initial snapshot")
+        }
+    }
     send_event(
         socket,
         DaemonEvent::UpdateUpdated(state.updates.current().await),
@@ -5342,8 +5469,82 @@ async fn publish_stream_snapshot(state: &AppState) -> anyhow::Result<()> {
     let _ = state
         .events
         .send(DaemonEvent::SystemUpdated(frame.system_stats));
+    if let Err(error) = publish_local_jobs_event(state, false).await {
+        warn!(error = %error, "failed to publish local jobs stream update");
+    }
 
     Ok(())
+}
+
+async fn local_jobs_snapshot_if_configured(
+    state: &AppState,
+) -> anyhow::Result<Option<Vec<LocalJobSummary>>> {
+    throttled_local_jobs_snapshot_if_configured(state, false).await
+}
+
+async fn publish_local_jobs_event(state: &AppState, force_refresh: bool) -> anyhow::Result<()> {
+    if let Some(jobs) = throttled_local_jobs_snapshot_if_configured(state, force_refresh).await? {
+        let _ = state.events.send(DaemonEvent::LocalJobsUpdated(jobs));
+    }
+    Ok(())
+}
+
+async fn throttled_local_jobs_snapshot_if_configured(
+    state: &AppState,
+    force_refresh: bool,
+) -> anyhow::Result<Option<Vec<LocalJobSummary>>> {
+    let allowlist = state.store.system_jobs_unit_globs()?;
+    if allowlist.is_empty() {
+        return Ok(None);
+    }
+
+    let cache = LOCAL_JOBS_STREAM_CACHE
+        .get_or_init(|| tokio::sync::Mutex::new(LocalJobsStreamCache::default()));
+
+    let mut waited_for_refresh = false;
+    let refresh = loop {
+        let mut cache = cache.lock().await;
+        let cache_is_current = cache.allowlist == allowlist
+            && cache
+                .last_refreshed_at
+                .is_some_and(|last| last.elapsed() < LOCAL_JOBS_STREAM_MIN_INTERVAL);
+        if (!force_refresh || waited_for_refresh) && cache_is_current {
+            if let Some(jobs) = cache.jobs.clone() {
+                return Ok(Some(jobs));
+            }
+        }
+
+        if let Some(refresh) = cache.refresh.clone() {
+            drop(cache);
+            refresh.notified().await;
+            waited_for_refresh = true;
+            continue;
+        }
+
+        let refresh = Arc::new(tokio::sync::Notify::new());
+        cache.refresh = Some(refresh.clone());
+        break refresh;
+    };
+
+    let result = system_jobs::SystemScheduler::systemd_user()
+        .list_jobs(&allowlist)
+        .await;
+
+    let mut cache = cache.lock().await;
+    if cache
+        .refresh
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &refresh))
+    {
+        cache.refresh = None;
+    }
+    refresh.notify_waiters();
+
+    let jobs = result?;
+    cache.allowlist = allowlist;
+    cache.last_refreshed_at = Some(Instant::now());
+    cache.jobs = Some(jobs.clone());
+    Ok(Some(jobs))
 }
 
 async fn publish_overview_event(state: &AppState) -> anyhow::Result<()> {

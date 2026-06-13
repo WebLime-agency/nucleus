@@ -34,6 +34,7 @@ use uuid::Uuid;
 const LOCAL_AUTH_TOKEN_HASH_KEY: &str = "auth.local_token_hash";
 const LOCAL_AUTH_TOKEN_FILE_NAME: &str = "local-auth-token";
 const UPDATE_STATE_KEY: &str = "updates.state.v1";
+const SYSTEM_JOBS_UNIT_GLOBS_KEY: &str = "system_jobs_unit_globs";
 const MEMORY_CLASSIFIER_KIND_KEY: &str = "memory.classifier_kind";
 const DEFAULT_MEMORY_CLASSIFIER_KIND: &str = "llm";
 const PLAYBOOK_RECENT_JOB_LIMIT: usize = 12;
@@ -1032,6 +1033,24 @@ impl StateStore {
         let payload =
             serde_json::to_string(state).context("failed to serialize stored update state")?;
         set_setting_value(&connection, UPDATE_STATE_KEY, &payload)
+    }
+
+    pub fn system_jobs_unit_globs(&self) -> Result<Vec<String>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let Some(payload) = setting_value_optional(&connection, SYSTEM_JOBS_UNIT_GLOBS_KEY)? else {
+            return Ok(Vec::new());
+        };
+        if payload.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let globs: Vec<String> = serde_json::from_str(&payload)
+            .context("failed to decode system jobs unit allowlist")?;
+        Ok(globs
+            .into_iter()
+            .map(|glob| glob.trim().to_string())
+            .filter(|glob| !glob.is_empty())
+            .collect())
     }
 
     pub fn list_runtimes(&self) -> Result<Vec<RuntimeSummary>> {
