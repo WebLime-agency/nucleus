@@ -7,6 +7,7 @@ mod memory_classifier;
 mod retry;
 mod runtime;
 mod security;
+mod system_jobs;
 mod updates;
 mod vault;
 mod worker_action;
@@ -48,11 +49,11 @@ use nucleus_protocol::{
     BrowserContextSummary, BrowserNavigateRequest, BrowserSnapshot, CompatibilitySummary,
     CompiledPromptLayer, CompiledTurn, ConnectionSummary, CreatePlaybookRequest,
     CreateSessionRequest, DaemonEvent, HealthResponse, HostStatus, InstanceLogCategoriesResponse,
-    InstanceLogListResponse, JobDetail, JobSummary, MAX_CONFIGURED_JOB_STEPS,
-    MAX_CONFIGURED_JOB_TOOL_CALLS, MAX_CONFIGURED_JOB_WALL_CLOCK_SECS, McpServerRecord,
-    McpServerSummary, McpToolRecord, MemoryCandidate, MemoryCandidateAcceptRequest,
-    MemoryCandidateListResponse, MemoryCandidateUpsertRequest, MemoryEntry,
-    MemoryEntryUpsertRequest, MemoryOutcome, MemorySearchResponse, MemorySummary,
+    InstanceLogListResponse, JobDetail, JobSummary, LocalJobDetail, LocalJobSummary,
+    MAX_CONFIGURED_JOB_STEPS, MAX_CONFIGURED_JOB_TOOL_CALLS, MAX_CONFIGURED_JOB_WALL_CLOCK_SECS,
+    McpServerRecord, McpServerSummary, McpToolRecord, MemoryCandidate,
+    MemoryCandidateAcceptRequest, MemoryCandidateListResponse, MemoryCandidateUpsertRequest,
+    MemoryEntry, MemoryEntryUpsertRequest, MemoryOutcome, MemorySearchResponse, MemorySummary,
     ModelActionContractCapability, ModelJsonObjectCapability, ModelTransportCapability,
     NucleusToolDescriptor, PlaybookDetail, PlaybookSummary, ProcessKillRequest,
     ProcessKillResponse, ProcessListResponse, ProfileCheckOutcome, ProfileCheckRequest,
@@ -399,6 +400,20 @@ fn app(state: AppState) -> Router {
             get(session_detail).post(prompt_session),
         )
         .route("/host-status", get(host_status))
+        .route("/system/jobs", get(local_jobs))
+        .route("/system/jobs/{unit}", get(local_job_detail))
+        .route(
+            "/system/jobs/{unit}/enable",
+            axum::routing::post(enable_local_job),
+        )
+        .route(
+            "/system/jobs/{unit}/disable",
+            axum::routing::post(disable_local_job),
+        )
+        .route(
+            "/system/jobs/{unit}/run",
+            axum::routing::post(run_local_job),
+        )
         .route("/system", get(system_stats))
         .route("/system/processes", get(processes).post(kill_process))
         .route_layer(middleware::from_fn_with_state(
@@ -5078,6 +5093,95 @@ async fn host_status(State(state): State<AppState>) -> Json<nucleus_protocol::Ho
     Json(state.host.host_status())
 }
 
+async fn local_jobs(State(state): State<AppState>) -> Result<Json<Vec<LocalJobSummary>>, ApiError> {
+    let allowlist = state.store.system_jobs_unit_globs()?;
+    let jobs = system_jobs::SystemScheduler::systemd_user()
+        .list_jobs(&allowlist)
+        .await
+        .map_err(map_system_job_error)?;
+    Ok(Json(jobs))
+}
+
+async fn local_job_detail(
+    State(state): State<AppState>,
+    Path(unit): Path<String>,
+) -> Result<Json<LocalJobDetail>, ApiError> {
+    let allowlist = state.store.system_jobs_unit_globs()?;
+    let detail = system_jobs::SystemScheduler::systemd_user()
+        .job_detail(&unit, &allowlist)
+        .await
+        .map_err(map_system_job_error)?;
+    Ok(Json(detail))
+}
+
+async fn enable_local_job(
+    State(state): State<AppState>,
+    Path(unit): Path<String>,
+) -> Result<Json<LocalJobSummary>, ApiError> {
+    control_local_job(state, unit, system_jobs::LocalJobControl::Enable, "enabled").await
+}
+
+async fn disable_local_job(
+    State(state): State<AppState>,
+    Path(unit): Path<String>,
+) -> Result<Json<LocalJobSummary>, ApiError> {
+    control_local_job(
+        state,
+        unit,
+        system_jobs::LocalJobControl::Disable,
+        "disabled",
+    )
+    .await
+}
+
+async fn run_local_job(
+    State(state): State<AppState>,
+    Path(unit): Path<String>,
+) -> Result<Json<LocalJobSummary>, ApiError> {
+    control_local_job(state, unit, system_jobs::LocalJobControl::Run, "started").await
+}
+
+async fn control_local_job(
+    state: AppState,
+    unit: String,
+    control: system_jobs::LocalJobControl,
+    action: &str,
+) -> Result<Json<LocalJobSummary>, ApiError> {
+    let allowlist = state.store.system_jobs_unit_globs()?;
+    let summary = system_jobs::SystemScheduler::systemd_user()
+        .control_job(&unit, control, &allowlist)
+        .await
+        .map_err(map_system_job_error)?;
+    let _ = try_record_audit_event(
+        &state,
+        AuditEventRecord {
+            kind: format!("system_job.{action}"),
+            target: format!("system_job:{unit}"),
+            status: "success".to_string(),
+            summary: format!("Local system job '{unit}' {action}."),
+            detail: format!(
+                "backend={} timer={} triggered_unit={} action={action}",
+                summary.backend, summary.unit, summary.triggered_unit
+            ),
+        },
+    )
+    .await;
+    let _ = publish_local_jobs_event(&state).await;
+    Ok(Json(summary))
+}
+
+fn map_system_job_error(error: anyhow::Error) -> ApiError {
+    let message = error.to_string();
+    if message.contains("not allowlisted") {
+        return ApiError::forbidden(message);
+    }
+    if message.contains("must end with") || message.contains("unsupported characters") {
+        return ApiError::bad_request(message);
+    }
+
+    ApiError::from(error)
+}
+
 async fn system_stats(State(state): State<AppState>) -> Json<SystemStats> {
     Json(state.host.system_stats())
 }
@@ -5271,6 +5375,9 @@ async fn send_initial_stream_snapshot(
     send_event(socket, DaemonEvent::OverviewUpdated(overview)).await?;
     send_event(socket, DaemonEvent::AuditUpdated(audit)).await?;
     send_event(socket, DaemonEvent::SystemUpdated(frame.system_stats)).await?;
+    if let Some(jobs) = local_jobs_snapshot_if_configured(state).await? {
+        send_event(socket, DaemonEvent::LocalJobsUpdated(jobs)).await?;
+    }
     send_event(
         socket,
         DaemonEvent::UpdateUpdated(state.updates.current().await),
@@ -5342,7 +5449,29 @@ async fn publish_stream_snapshot(state: &AppState) -> anyhow::Result<()> {
     let _ = state
         .events
         .send(DaemonEvent::SystemUpdated(frame.system_stats));
+    publish_local_jobs_event(state).await?;
 
+    Ok(())
+}
+
+async fn local_jobs_snapshot_if_configured(
+    state: &AppState,
+) -> anyhow::Result<Option<Vec<LocalJobSummary>>> {
+    let allowlist = state.store.system_jobs_unit_globs()?;
+    if allowlist.is_empty() {
+        return Ok(None);
+    }
+
+    let jobs = system_jobs::SystemScheduler::systemd_user()
+        .list_jobs(&allowlist)
+        .await?;
+    Ok(Some(jobs))
+}
+
+async fn publish_local_jobs_event(state: &AppState) -> anyhow::Result<()> {
+    if let Some(jobs) = local_jobs_snapshot_if_configured(state).await? {
+        let _ = state.events.send(DaemonEvent::LocalJobsUpdated(jobs));
+    }
     Ok(())
 }
 

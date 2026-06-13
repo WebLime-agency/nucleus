@@ -16,6 +16,8 @@ import {
   instanceLogListResponseSchema,
   jobDetailSchema,
   jobSummarySchema,
+  localJobDetailSchema,
+  localJobSummarySchema,
   mcpServerRecordSchema,
   mcpServerSummarySchema,
   memoryCandidateListResponseSchema,
@@ -224,6 +226,46 @@ export async function runPlaybook(playbookId: string, fetchImpl: FetchLike = fet
       headers: { accept: 'application/json' }
     }),
     jobDetailSchema
+  );
+}
+
+export async function fetchLocalJobs(fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/system/jobs', {
+      headers: { accept: 'application/json' }
+    }),
+    z.array(localJobSummarySchema)
+  );
+}
+
+export async function fetchLocalJobDetail(unit: string, fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/system/jobs/${encodeURIComponent(unit)}`, {
+      headers: { accept: 'application/json' }
+    }),
+    localJobDetailSchema
+  );
+}
+
+export async function enableLocalJob(unit: string, fetchImpl: FetchLike = fetch) {
+  return mutateLocalJob(unit, 'enable', fetchImpl);
+}
+
+export async function disableLocalJob(unit: string, fetchImpl: FetchLike = fetch) {
+  return mutateLocalJob(unit, 'disable', fetchImpl);
+}
+
+export async function runLocalJob(unit: string, fetchImpl: FetchLike = fetch) {
+  return mutateLocalJob(unit, 'run', fetchImpl);
+}
+
+async function mutateLocalJob(unit: string, action: 'enable' | 'disable' | 'run', fetchImpl: FetchLike) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/system/jobs/${encodeURIComponent(unit)}/${action}`, {
+      method: 'POST',
+      headers: { accept: 'application/json' }
+    }),
+    localJobSummarySchema
   );
 }
 

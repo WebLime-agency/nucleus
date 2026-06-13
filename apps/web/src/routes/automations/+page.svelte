@@ -2,10 +2,15 @@
   import { onMount } from 'svelte';
   import {
     CalendarClock,
+    ChevronDown,
+    Cog,
     Play,
     Plus,
+    Power,
+    PowerOff,
     RefreshCw,
     Save,
+    ScrollText,
     TimerReset,
     Trash2,
     Workflow
@@ -24,10 +29,15 @@
   import {
     createPlaybook,
     deletePlaybook,
+    disableLocalJob,
+    enableLocalJob,
     fetchJobDetail,
+    fetchLocalJobDetail,
+    fetchLocalJobs,
     fetchOverview,
     fetchPlaybookDetail,
     fetchPlaybooks,
+    runLocalJob,
     runPlaybook,
     updatePlaybook
   } from '$lib/nucleus/client';
@@ -37,6 +47,8 @@
     DaemonEvent,
     JobDetail,
     JobSummary,
+    LocalJobDetail,
+    LocalJobSummary,
     PlaybookDetail,
     PlaybookSummary,
     RuntimeOverview,
@@ -85,8 +97,12 @@
 
   let overview = $state<RuntimeOverview | null>(null);
   let playbooks = $state<PlaybookSummary[]>([]);
+  let localJobs = $state<LocalJobSummary[]>([]);
   let playbookDetail = $state<PlaybookDetail | null>(null);
+  let localJobDetail = $state<LocalJobDetail | null>(null);
+  let activeSurface = $state<'playbooks' | 'local_jobs'>('playbooks');
   let selectedPlaybookId = $state('');
+  let selectedLocalJobUnit = $state('');
   let selectedJobId = $state('');
   let selectedJobDetail = $state<JobDetail | null>(null);
   let loading = $state(true);
@@ -96,6 +112,9 @@
   let deleting = $state(false);
   let running = $state(false);
   let jobLoading = $state(false);
+  let localJobLoading = $state(false);
+  let localJobAction = $state<string | null>(null);
+  let expandedLogUnit = $state<string | null>(null);
   let streamStatus = $state<StreamStatus>('connecting');
   let error = $state<string | null>(null);
   let success = $state<string | null>(null);
@@ -118,6 +137,12 @@
     playbookDetail?.playbook ??
       playbooks.find((playbook) => playbook.id === selectedPlaybookId) ??
       playbooks[0] ??
+      null
+  );
+  let selectedLocalJob = $derived(
+    localJobDetail?.summary ??
+      localJobs.find((job) => job.unit === selectedLocalJobUnit) ??
+      localJobs[0] ??
       null
   );
   let selectedProfile = $derived(
@@ -178,6 +203,45 @@
     }
     if (state === 'canceled') return 'secondary';
     return 'destructive';
+  }
+
+  function badgeVariantForLocalJob(job: LocalJobSummary): 'default' | 'secondary' | 'warning' | 'destructive' {
+    if (job.active_state === 'failed' || job.last_exit.result === 'failed') return 'destructive';
+    if (job.active_state === 'active') return 'default';
+    if (job.enabled) return 'warning';
+    return 'secondary';
+  }
+
+  function formatOptionalDate(value: number | null): string {
+    return value ? formatDateTime(value) : 'Not recorded';
+  }
+
+  function formatLocalJobExit(job: LocalJobSummary): string {
+    const code = job.last_exit.code === null ? 'no code' : `exit ${job.last_exit.code}`;
+    return `${job.last_exit.result || 'unknown'} · ${code}`;
+  }
+
+  function localJobActionKey(unit: string, action: string): string {
+    return `${unit}:${action}`;
+  }
+
+  function syncLocalJobSummary(next: LocalJobSummary) {
+    const remaining = localJobs.filter((job) => job.unit !== next.unit);
+    localJobs = [next, ...remaining].sort((left, right) => left.unit.localeCompare(right.unit));
+    if (localJobDetail?.summary.unit === next.unit) {
+      localJobDetail = { ...localJobDetail, summary: next };
+    }
+  }
+
+  function syncLocalJobs(next: LocalJobSummary[]) {
+    localJobs = [...next].sort((left, right) => left.unit.localeCompare(right.unit));
+    if (!localJobs.some((job) => job.unit === selectedLocalJobUnit)) {
+      selectedLocalJobUnit = localJobs[0]?.unit ?? '';
+      localJobDetail = null;
+    }
+    if (localJobDetail && !localJobs.some((job) => job.unit === localJobDetail?.summary.unit)) {
+      localJobDetail = null;
+    }
   }
 
   function jobCompletionLabel(job: JobSummary): string {
@@ -289,6 +353,64 @@
     }
   }
 
+  async function loadLocalJobDetail(unit: string, silent = false) {
+    if (!unit) {
+      localJobDetail = null;
+      return;
+    }
+
+    selectedLocalJobUnit = unit;
+    if (localJobDetail?.summary.unit !== unit) {
+      localJobDetail = null;
+    }
+
+    if (!silent) {
+      localJobLoading = true;
+    }
+
+    try {
+      const detail = await fetchLocalJobDetail(unit);
+      localJobDetail = detail;
+      expandedLogUnit = unit;
+      syncLocalJobSummary(detail.summary);
+      error = null;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to load the selected local job.';
+    } finally {
+      localJobLoading = false;
+    }
+  }
+
+  async function handleLocalJobAction(unit: string, action: 'enable' | 'disable' | 'run') {
+    localJobAction = localJobActionKey(unit, action);
+    success = null;
+
+    try {
+      const next =
+        action === 'enable'
+          ? await enableLocalJob(unit)
+          : action === 'disable'
+            ? await disableLocalJob(unit)
+            : await runLocalJob(unit);
+      syncLocalJobSummary(next);
+      selectedLocalJobUnit = next.unit;
+      if (expandedLogUnit === next.unit || action === 'run') {
+        await loadLocalJobDetail(next.unit, true);
+      }
+      success =
+        action === 'enable'
+          ? 'Local job enabled.'
+          : action === 'disable'
+            ? 'Local job disabled.'
+            : 'Local job handed off to systemd.';
+      error = null;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to update the local job.';
+    } finally {
+      localJobAction = null;
+    }
+  }
+
   async function loadAll(silent = false) {
     if (!silent) {
       loading = overview === null;
@@ -297,9 +419,14 @@
     refreshing = silent;
 
     try {
-      const [nextOverview, nextPlaybooks] = await Promise.all([fetchOverview(), fetchPlaybooks()]);
+      const [nextOverview, nextPlaybooks, nextLocalJobs] = await Promise.all([
+        fetchOverview(),
+        fetchPlaybooks(),
+        fetchLocalJobs()
+      ]);
       overview = nextOverview;
       playbooks = nextPlaybooks;
+      syncLocalJobs(nextLocalJobs);
       error = null;
 
       const nextSelectedPlaybookId =
@@ -311,8 +438,12 @@
       } else {
         syncPlaybookDetail(null);
       }
+
+      if (activeSurface === 'local_jobs' && selectedLocalJobUnit) {
+        await loadLocalJobDetail(selectedLocalJobUnit, true);
+      }
     } catch (cause) {
-      error = cause instanceof Error ? cause.message : 'Failed to load Nucleus playbooks.';
+      error = cause instanceof Error ? cause.message : 'Failed to load automations.';
     } finally {
       loading = false;
       refreshing = false;
@@ -435,6 +566,18 @@
       return;
     }
 
+    if (event.event === 'local_jobs.updated') {
+      syncLocalJobs(event.data);
+      if (localJobDetail) {
+        const nextSummary = event.data.find((job) => job.unit === localJobDetail?.summary.unit);
+        if (nextSummary) {
+          localJobDetail = { ...localJobDetail, summary: nextSummary };
+        }
+      }
+      error = null;
+      return;
+    }
+
     if (
       (event.event === 'job.created' ||
         event.event === 'job.updated' ||
@@ -484,8 +627,9 @@
       <div>
         <h1 class="text-3xl font-semibold text-zinc-50">Automations</h1>
         <p class="mt-2 max-w-3xl text-sm leading-6 text-zinc-400">
-          Saved playbooks run through the same Nucleus-owned Utility Worker engine as chat jobs, including
-          approvals, audit, artifacts, and write-scope locking.
+          {activeSurface === 'playbooks'
+            ? 'Saved playbooks run through the same Nucleus-owned Utility Worker engine as chat jobs, including approvals, audit, artifacts, and write-scope locking.'
+            : 'OS-scheduled. Nucleus observes and controls these units — it never runs them.'}
         </p>
       </div>
     </div>
@@ -495,12 +639,42 @@
         <RefreshCw class={refreshing ? 'size-4 animate-spin' : 'size-4'} />
         {refreshing ? 'Refreshing' : 'Refresh'}
       </Button>
-      <Button onclick={handleCreatePlaybook} disabled={creating}>
-        <Plus class="size-4" />
-        {creating ? 'Creating' : 'New playbook'}
-      </Button>
+      {#if activeSurface === 'playbooks'}
+        <Button onclick={handleCreatePlaybook} disabled={creating}>
+          <Plus class="size-4" />
+          {creating ? 'Creating' : 'New playbook'}
+        </Button>
+      {/if}
     </div>
   </section>
+
+  <div class="inline-flex rounded-lg border border-zinc-800 bg-zinc-950 p-1 text-sm">
+    <button
+      type="button"
+      class={`rounded-md px-3 py-2 transition ${
+        activeSurface === 'playbooks' ? 'bg-zinc-800 text-zinc-50' : 'text-zinc-400 hover:text-zinc-100'
+      }`}
+      onclick={() => {
+        activeSurface = 'playbooks';
+      }}
+    >
+      Playbooks
+    </button>
+    <button
+      type="button"
+      class={`rounded-md px-3 py-2 transition ${
+        activeSurface === 'local_jobs' ? 'bg-zinc-800 text-zinc-50' : 'text-zinc-400 hover:text-zinc-100'
+      }`}
+      onclick={() => {
+        activeSurface = 'local_jobs';
+        if (selectedLocalJobUnit && !localJobDetail) {
+          void loadLocalJobDetail(selectedLocalJobUnit, true);
+        }
+      }}
+    >
+      Local jobs
+    </button>
+  </div>
 
   {#if error}
     <div class="rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">
@@ -514,6 +688,7 @@
     </div>
   {/if}
 
+  {#if activeSurface === 'playbooks'}
   <section class="grid gap-6 xl:grid-cols-[20rem_minmax(0,1fr)]">
     <Card>
       <CardHeader>
@@ -927,4 +1102,216 @@
       {/if}
     </div>
   </section>
+  {:else}
+  <section class="space-y-6">
+    <div class="flex items-center gap-2 text-sm text-zinc-400">
+      <Cog class="size-4 text-zinc-300" />
+      <span>OS-scheduled. Nucleus observes and controls these units — it never runs them.</span>
+    </div>
+
+    {#if localJobs.length === 0}
+      <Card>
+        <CardHeader>
+          <CardTitle>Local Jobs</CardTitle>
+          <CardDescription>
+            No systemd user timers are configured for this workspace allowlist.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div class="rounded-xl border border-dashed border-zinc-800 bg-zinc-950/60 px-4 py-5 text-sm leading-6 text-zinc-500">
+            Add unit globs to the daemon setting <span class="font-mono text-zinc-300">system_jobs_unit_globs</span>
+            to observe existing OS-scheduled user timers here.
+          </div>
+        </CardContent>
+      </Card>
+    {:else}
+      <section class="grid gap-6 xl:grid-cols-[minmax(0,1fr)_28rem]">
+        <div class="space-y-3">
+          {#each localJobs as job}
+            <div
+              class={`rounded-xl border px-4 py-4 transition ${
+                selectedLocalJobUnit === job.unit
+                  ? 'border-lime-400/40 bg-lime-400/10'
+                  : 'border-zinc-800 bg-zinc-950/60'
+              }`}
+            >
+              <div class="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                <button
+                  type="button"
+                  class="min-w-0 text-left"
+                  onclick={() => void loadLocalJobDetail(job.unit)}
+                >
+                  <div class="flex flex-wrap items-center gap-2">
+                    <Cog class="size-4 text-zinc-400" />
+                    <span class="text-sm font-medium text-zinc-100">{job.title}</span>
+                    <Badge variant="secondary">systemd · user</Badge>
+                    <Badge variant={job.enabled ? 'default' : 'secondary'}>
+                      {job.enabled ? 'enabled' : 'disabled'}
+                    </Badge>
+                    <Badge variant={badgeVariantForLocalJob(job)}>{job.active_state}</Badge>
+                  </div>
+                  <div class="mt-2 break-all font-mono text-xs text-zinc-500">{job.unit}</div>
+                </button>
+
+                <div class="flex flex-wrap gap-2">
+                  {#if job.enabled}
+                    <Button
+                      variant="outline"
+                      onclick={() => void handleLocalJobAction(job.unit, 'disable')}
+                      disabled={localJobAction !== null}
+                    >
+                      <PowerOff class="size-4" />
+                      {localJobAction === localJobActionKey(job.unit, 'disable') ? 'Disabling' : 'Disable'}
+                    </Button>
+                  {:else}
+                    <Button
+                      variant="outline"
+                      onclick={() => void handleLocalJobAction(job.unit, 'enable')}
+                      disabled={localJobAction !== null}
+                    >
+                      <Power class="size-4" />
+                      {localJobAction === localJobActionKey(job.unit, 'enable') ? 'Enabling' : 'Enable'}
+                    </Button>
+                  {/if}
+                  <Button
+                    onclick={() => void handleLocalJobAction(job.unit, 'run')}
+                    disabled={localJobAction !== null}
+                  >
+                    <Play class="size-4" />
+                    {localJobAction === localJobActionKey(job.unit, 'run') ? 'Starting' : 'Run now'}
+                  </Button>
+                </div>
+              </div>
+
+              <div class="mt-4 grid gap-3 md:grid-cols-4">
+                <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-3">
+                  <div class="text-[11px] uppercase tracking-[0.18em] text-zinc-500">Next elapse</div>
+                  <div class="mt-2 text-sm text-zinc-100">{formatOptionalDate(job.schedule.next_elapse_at)}</div>
+                </div>
+                <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-3">
+                  <div class="text-[11px] uppercase tracking-[0.18em] text-zinc-500">Last fired</div>
+                  <div class="mt-2 text-sm text-zinc-100">{formatOptionalDate(job.last_fired_at)}</div>
+                </div>
+                <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-3">
+                  <div class="text-[11px] uppercase tracking-[0.18em] text-zinc-500">Last exit</div>
+                  <div class="mt-2 text-sm text-zinc-100">{formatLocalJobExit(job)}</div>
+                </div>
+                <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-3">
+                  <div class="text-[11px] uppercase tracking-[0.18em] text-zinc-500">Triggers</div>
+                  <div class="mt-2 break-all font-mono text-xs text-zinc-100">{job.triggered_unit}</div>
+                </div>
+              </div>
+            </div>
+          {/each}
+        </div>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>{selectedLocalJob ? selectedLocalJob.title : 'Local Job Detail'}</CardTitle>
+            <CardDescription>
+              {selectedLocalJob ? selectedLocalJob.unit : 'Select a systemd user timer to inspect its service log tail.'}
+            </CardDescription>
+          </CardHeader>
+          <CardContent class="space-y-5">
+            {#if localJobLoading}
+              <div class="text-sm text-zinc-500">Loading local job detail…</div>
+            {:else if !selectedLocalJob}
+              <div class="rounded-xl border border-dashed border-zinc-800 bg-zinc-950/60 px-4 py-5 text-sm text-zinc-500">
+                Select a local job to inspect its state, service handoff, and journal tail.
+              </div>
+            {:else}
+              <div class="grid gap-3 sm:grid-cols-2">
+                <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-3">
+                  <div class="text-[11px] uppercase tracking-[0.18em] text-zinc-500">Backend</div>
+                  <div class="mt-2 text-sm text-zinc-100">systemd · user</div>
+                </div>
+                <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-3">
+                  <div class="text-[11px] uppercase tracking-[0.18em] text-zinc-500">Active state</div>
+                  <div class="mt-2">
+                    <Badge variant={badgeVariantForLocalJob(selectedLocalJob)}>{selectedLocalJob.active_state}</Badge>
+                  </div>
+                </div>
+                <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-3">
+                  <div class="text-[11px] uppercase tracking-[0.18em] text-zinc-500">Next elapse</div>
+                  <div class="mt-2 text-sm text-zinc-100">{formatOptionalDate(selectedLocalJob.schedule.next_elapse_at)}</div>
+                  {#if selectedLocalJob.schedule.raw}
+                    <div class="mt-1 text-xs text-zinc-500">{selectedLocalJob.schedule.raw}</div>
+                  {/if}
+                </div>
+                <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-3">
+                  <div class="text-[11px] uppercase tracking-[0.18em] text-zinc-500">Last exit</div>
+                  <div class="mt-2 text-sm text-zinc-100">{formatLocalJobExit(selectedLocalJob)}</div>
+                  <div class="mt-1 text-xs text-zinc-500">{formatOptionalDate(selectedLocalJob.last_exit.at)}</div>
+                </div>
+              </div>
+
+              <div class="flex flex-wrap gap-2">
+                {#if selectedLocalJob.enabled}
+                  <Button
+                    variant="outline"
+                    onclick={() => void handleLocalJobAction(selectedLocalJob.unit, 'disable')}
+                    disabled={localJobAction !== null}
+                  >
+                    <PowerOff class="size-4" />
+                    Disable
+                  </Button>
+                {:else}
+                  <Button
+                    variant="outline"
+                    onclick={() => void handleLocalJobAction(selectedLocalJob.unit, 'enable')}
+                    disabled={localJobAction !== null}
+                  >
+                    <Power class="size-4" />
+                    Enable
+                  </Button>
+                {/if}
+                <Button
+                  onclick={() => void handleLocalJobAction(selectedLocalJob.unit, 'run')}
+                  disabled={localJobAction !== null}
+                >
+                  <Play class="size-4" />
+                  Run now
+                </Button>
+                <Button
+                  variant="outline"
+                  onclick={() => {
+                    expandedLogUnit = expandedLogUnit === selectedLocalJob.unit ? null : selectedLocalJob.unit;
+                    if (expandedLogUnit === selectedLocalJob.unit && !localJobDetail) {
+                      void loadLocalJobDetail(selectedLocalJob.unit, true);
+                    }
+                  }}
+                >
+                  {#if expandedLogUnit === selectedLocalJob.unit}
+                    <ChevronDown class="size-4" />
+                  {:else}
+                    <ScrollText class="size-4" />
+                  {/if}
+                  Log tail
+                </Button>
+              </div>
+
+              {#if expandedLogUnit === selectedLocalJob.unit}
+                <div class="space-y-3">
+                  <div class="flex items-center gap-2 text-sm font-medium text-zinc-200">
+                    <ScrollText class="size-4" />
+                    Journal tail
+                  </div>
+                  {#if !localJobDetail}
+                    <div class="text-sm text-zinc-500">Select this job to load its journal tail.</div>
+                  {:else if localJobDetail.log_tail.length === 0}
+                    <div class="rounded-xl border border-dashed border-zinc-800 bg-zinc-950/60 px-4 py-5 text-sm text-zinc-500">
+                      No journal lines were returned for the triggered service.
+                    </div>
+                  {:else}
+                    <pre class="max-h-[28rem] overflow-auto rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-3 text-xs leading-5 text-zinc-400">{localJobDetail.log_tail.join('\n')}</pre>
+                  {/if}
+                </div>
+              {/if}
+            {/if}
+          </CardContent>
+        </Card>
+      </section>
+    {/if}
+  </section>
+  {/if}
 </div>

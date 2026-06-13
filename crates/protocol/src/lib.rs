@@ -1845,6 +1845,39 @@ pub struct PlaybookDetail {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalJobSchedule {
+    pub next_elapse_at: Option<i64>,
+    pub interval_hint: Option<String>,
+    pub raw: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalJobExit {
+    pub code: Option<i32>,
+    pub result: String,
+    pub at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalJobSummary {
+    pub unit: String,
+    pub title: String,
+    pub backend: String,
+    pub enabled: bool,
+    pub active_state: String,
+    pub schedule: LocalJobSchedule,
+    pub last_fired_at: Option<i64>,
+    pub last_exit: LocalJobExit,
+    pub triggered_unit: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalJobDetail {
+    pub summary: LocalJobSummary,
+    pub log_tail: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PromptProgressUpdate {
     pub session_id: String,
     pub status: String,
@@ -3173,6 +3206,8 @@ pub enum DaemonEvent {
     AuditUpdated(Vec<AuditEvent>),
     #[serde(rename = "system.updated")]
     SystemUpdated(SystemStats),
+    #[serde(rename = "local_jobs.updated")]
+    LocalJobsUpdated(Vec<LocalJobSummary>),
     #[serde(rename = "update.updated")]
     UpdateUpdated(UpdateStatus),
     #[serde(rename = "browser.frame")]
