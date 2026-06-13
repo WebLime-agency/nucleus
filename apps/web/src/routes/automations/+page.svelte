@@ -142,7 +142,7 @@
       null
   );
   let selectedLocalJob = $derived(
-    localJobDetail?.summary ??
+    (localJobDetail?.summary.unit === selectedLocalJobUnit ? localJobDetail.summary : null) ??
       localJobs.find((job) => job.unit === selectedLocalJobUnit) ??
       localJobs[0] ??
       null

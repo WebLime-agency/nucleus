@@ -357,7 +357,7 @@ pub fn parse_list_unit_files(stdout: &str) -> Vec<String> {
         let Some(unit) = line.split_whitespace().next() else {
             continue;
         };
-        if unit.ends_with(".timer") {
+        if unit.ends_with(".timer") && !is_uninstantiated_timer_template(unit) {
             units.insert(unit.to_string());
         }
     }
@@ -375,6 +375,7 @@ pub fn enumerate_timer_units(
     units
         .into_iter()
         .filter(|unit| unit_is_allowlisted(unit, allowlist_globs))
+        .filter(|unit| !is_uninstantiated_timer_template(unit))
         .collect()
 }
 
@@ -608,10 +609,17 @@ fn validate_unit_name(unit: &str, suffix: &str) -> Result<()> {
     if unit.trim().is_empty() || !unit.ends_with(suffix) {
         bail!("systemd unit must end with {suffix}");
     }
+    if unit.starts_with('-') {
+        bail!("systemd unit contains unsupported characters");
+    }
     if unit.contains('/') || unit.chars().any(char::is_whitespace) {
         bail!("systemd unit contains unsupported characters");
     }
     Ok(())
+}
+
+fn is_uninstantiated_timer_template(unit: &str) -> bool {
+    unit.ends_with("@.timer")
 }
 
 fn list_timers_invocation() -> CommandInvocation {
@@ -904,6 +912,17 @@ UnitFileState=enabled\n";
     }
 
     #[test]
+    fn skips_uninstantiated_timer_templates() {
+        let units = enumerate_timer_units(
+            "",
+            "placeholder@.timer disabled disabled\nplaceholder@daily.timer enabled enabled\n",
+            &["placeholder@*.timer".to_string()],
+        );
+
+        assert_eq!(units, vec!["placeholder@daily.timer".to_string()]);
+    }
+
+    #[test]
     fn rejects_non_allowlisted_control_before_building_invocation() {
         let result = build_control_invocation(
             LocalJobControl::Disable,
@@ -914,6 +933,24 @@ UnitFileState=enabled\n";
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not allowlisted"));
+    }
+
+    #[test]
+    fn rejects_dash_prefixed_unit_names() {
+        let result = build_control_invocation(
+            LocalJobControl::Run,
+            "-placeholder.timer",
+            "placeholder.service",
+            &["*.timer".to_string()],
+        );
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported characters")
+        );
     }
 
     #[test]
