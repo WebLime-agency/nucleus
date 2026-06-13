@@ -5106,11 +5106,10 @@ async fn host_status(State(state): State<AppState>) -> Json<nucleus_protocol::Ho
 }
 
 async fn local_jobs(State(state): State<AppState>) -> Result<Json<Vec<LocalJobSummary>>, ApiError> {
-    let allowlist = state.store.system_jobs_unit_globs()?;
-    let jobs = system_jobs::SystemScheduler::systemd_user()
-        .list_jobs(&allowlist)
+    let jobs = throttled_local_jobs_snapshot_if_configured(&state, false)
         .await
-        .map_err(map_system_job_error)?;
+        .map_err(map_system_job_error)?
+        .unwrap_or_default();
     Ok(Json(jobs))
 }
 
@@ -5502,13 +5501,14 @@ async fn throttled_local_jobs_snapshot_if_configured(
     let cache = LOCAL_JOBS_STREAM_CACHE
         .get_or_init(|| tokio::sync::Mutex::new(LocalJobsStreamCache::default()));
 
+    let mut waited_for_refresh = false;
     let refresh = loop {
         let mut cache = cache.lock().await;
         let cache_is_current = cache.allowlist == allowlist
             && cache
                 .last_refreshed_at
                 .is_some_and(|last| last.elapsed() < LOCAL_JOBS_STREAM_MIN_INTERVAL);
-        if !force_refresh && cache_is_current {
+        if (!force_refresh || waited_for_refresh) && cache_is_current {
             if let Some(jobs) = cache.jobs.clone() {
                 return Ok(Some(jobs));
             }
@@ -5517,6 +5517,7 @@ async fn throttled_local_jobs_snapshot_if_configured(
         if let Some(refresh) = cache.refresh.clone() {
             drop(cache);
             refresh.notified().await;
+            waited_for_refresh = true;
             continue;
         }
 

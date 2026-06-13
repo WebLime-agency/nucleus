@@ -238,13 +238,17 @@
     }
   }
 
-  async function loadSelectedLocalJobDetail(silent = true) {
+  async function loadSelectedLocalJobDetail(silent = true, refreshLoaded = false) {
     const unit = selectedLocalJobUnit || localJobs[0]?.unit || '';
     if (!unit || localJobLoading) {
       return;
     }
 
-    if (selectedLocalJobUnit !== unit || localJobDetail?.summary.unit !== unit) {
+    if (
+      selectedLocalJobUnit !== unit ||
+      localJobDetail?.summary.unit !== unit ||
+      (refreshLoaded && expandedLogUnit === unit)
+    ) {
       await loadLocalJobDetail(unit, silent);
     }
   }
@@ -586,7 +590,7 @@
         }
       }
       if (activeSurface === 'local_jobs') {
-        void loadSelectedLocalJobDetail(true);
+        void loadSelectedLocalJobDetail(true, true);
       }
       error = null;
       return;
