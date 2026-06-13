@@ -69,11 +69,14 @@ impl SystemdUserScheduler {
             return Ok(Vec::new());
         }
 
-        let output = run_system_command(list_timers_invocation(), COMMAND_TIMEOUT).await?;
-        let timer_units = parse_list_timers(&output.stdout)
-            .into_iter()
-            .filter(|unit| unit_is_allowlisted(unit, allowlist_globs))
-            .collect::<Vec<_>>();
+        let loaded_output = run_system_command(list_timers_invocation(), COMMAND_TIMEOUT).await?;
+        let installed_output =
+            run_system_command(list_unit_files_invocation(), COMMAND_TIMEOUT).await?;
+        let timer_units = enumerate_timer_units(
+            &loaded_output.stdout,
+            &installed_output.stdout,
+            allowlist_globs,
+        );
 
         let mut summaries = Vec::with_capacity(timer_units.len());
         for unit in timer_units {
@@ -152,6 +155,7 @@ pub fn build_control_invocation(
             args: vec![
                 "--user".to_string(),
                 "enable".to_string(),
+                "--now".to_string(),
                 timer_unit.to_string(),
             ],
         }),
@@ -160,6 +164,7 @@ pub fn build_control_invocation(
             args: vec![
                 "--user".to_string(),
                 "disable".to_string(),
+                "--now".to_string(),
                 timer_unit.to_string(),
             ],
         }),
@@ -170,6 +175,7 @@ pub fn build_control_invocation(
                 args: vec![
                     "--user".to_string(),
                     "start".to_string(),
+                    "--no-block".to_string(),
                     triggered_unit.to_string(),
                 ],
             })
@@ -239,6 +245,33 @@ pub fn parse_list_timers(stdout: &str) -> Vec<String> {
     units.into_iter().collect()
 }
 
+pub fn parse_list_unit_files(stdout: &str) -> Vec<String> {
+    let mut units = BTreeSet::new();
+    for line in stdout.lines() {
+        let Some(unit) = line.split_whitespace().next() else {
+            continue;
+        };
+        if unit.ends_with(".timer") {
+            units.insert(unit.to_string());
+        }
+    }
+    units.into_iter().collect()
+}
+
+pub fn enumerate_timer_units(
+    loaded_timers_stdout: &str,
+    installed_unit_files_stdout: &str,
+    allowlist_globs: &[String],
+) -> Vec<String> {
+    let mut units = BTreeSet::new();
+    units.extend(parse_list_timers(loaded_timers_stdout));
+    units.extend(parse_list_unit_files(installed_unit_files_stdout));
+    units
+        .into_iter()
+        .filter(|unit| unit_is_allowlisted(unit, allowlist_globs))
+        .collect()
+}
+
 pub fn parse_journal_tail(stdout: &str) -> Vec<String> {
     stdout.lines().map(ToOwned::to_owned).collect()
 }
@@ -275,6 +308,10 @@ fn optional_systemd_timestamp(value: Option<&String>) -> Option<i64> {
 }
 
 fn parse_systemd_timestamp(value: &str) -> Option<i64> {
+    if let Some(timestamp) = parse_unix_timestamp(value) {
+        return Some(timestamp);
+    }
+
     let mut parts = value.split_whitespace();
     let first = parts.next()?;
     let date = if first.contains('-') {
@@ -283,6 +320,7 @@ fn parse_systemd_timestamp(value: &str) -> Option<i64> {
         parts.next()?
     };
     let time = parts.next()?;
+    let timezone = parts.next();
     let mut date_parts = date.split('-');
     let year = date_parts.next()?.parse::<i64>().ok()?;
     let month = date_parts.next()?.parse::<i64>().ok()?;
@@ -301,7 +339,77 @@ fn parse_systemd_timestamp(value: &str) -> Option<i64> {
         return None;
     }
 
-    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
+    let offset = timezone_offset_seconds(timezone).unwrap_or(0);
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second - offset)
+}
+
+fn parse_unix_timestamp(value: &str) -> Option<i64> {
+    let value = value.trim().trim_start_matches('@');
+    let whole = value
+        .split_once('.')
+        .map(|(whole, _)| whole)
+        .unwrap_or(value);
+    let parsed = whole.parse::<i64>().ok()?;
+    if parsed > 10_000_000_000_000 {
+        Some(parsed / 1_000_000)
+    } else if parsed > 10_000_000_000 {
+        Some(parsed / 1_000)
+    } else {
+        Some(parsed)
+    }
+}
+
+fn timezone_offset_seconds(timezone: Option<&str>) -> Option<i64> {
+    let timezone = timezone?;
+    if timezone.eq_ignore_ascii_case("UTC")
+        || timezone.eq_ignore_ascii_case("GMT")
+        || timezone == "Z"
+    {
+        return Some(0);
+    }
+    parse_timezone_offset(timezone).or_else(|| named_timezone_offset_seconds(timezone))
+}
+
+fn parse_timezone_offset(value: &str) -> Option<i64> {
+    let sign = match value.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let rest = &value[1..];
+    let (hours, minutes) = if let Some((hours, minutes)) = rest.split_once(':') {
+        (hours.parse::<i64>().ok()?, minutes.parse::<i64>().ok()?)
+    } else if rest.len() == 4 {
+        (
+            rest[..2].parse::<i64>().ok()?,
+            rest[2..].parse::<i64>().ok()?,
+        )
+    } else if rest.len() == 2 {
+        (rest.parse::<i64>().ok()?, 0)
+    } else {
+        return None;
+    };
+    if !(0..=23).contains(&hours) || !(0..=59).contains(&minutes) {
+        return None;
+    }
+    Some(sign * (hours * 3_600 + minutes * 60))
+}
+
+fn named_timezone_offset_seconds(timezone: &str) -> Option<i64> {
+    match timezone {
+        "UTC" | "GMT" => Some(0),
+        "EST" => Some(-5 * 3_600),
+        "EDT" => Some(-4 * 3_600),
+        "CST" => Some(-6 * 3_600),
+        "CDT" => Some(-5 * 3_600),
+        "MST" => Some(-7 * 3_600),
+        "MDT" => Some(-6 * 3_600),
+        "PST" => Some(-8 * 3_600),
+        "PDT" => Some(-7 * 3_600),
+        "CET" => Some(3_600),
+        "CEST" => Some(2 * 3_600),
+        _ => None,
+    }
 }
 
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
@@ -408,11 +516,25 @@ fn list_timers_invocation() -> CommandInvocation {
     }
 }
 
+fn list_unit_files_invocation() -> CommandInvocation {
+    CommandInvocation {
+        program: "systemctl".to_string(),
+        args: vec![
+            "--user".to_string(),
+            "list-unit-files".to_string(),
+            "--type=timer".to_string(),
+            "--no-pager".to_string(),
+            "--no-legend".to_string(),
+        ],
+    }
+}
+
 fn timer_show_invocation(unit: &str) -> CommandInvocation {
     CommandInvocation {
         program: "systemctl".to_string(),
         args: vec![
             "--user".to_string(),
+            "--timestamp=utc".to_string(),
             "show".to_string(),
             unit.to_string(),
             "--property=Id,ActiveState,UnitFileState,LastTriggerUSec,NextElapseUSecRealtime,Triggers"
@@ -427,6 +549,7 @@ fn service_show_invocation(unit: &str) -> CommandInvocation {
         program: "systemctl".to_string(),
         args: vec![
             "--user".to_string(),
+            "--timestamp=utc".to_string(),
             "show".to_string(),
             unit.to_string(),
             "--property=Result,ExecMainStatus,ExecMainExitTimestamp,ActiveState,SubState"
@@ -441,7 +564,7 @@ fn journal_tail_invocation(unit: &str) -> CommandInvocation {
         program: "journalctl".to_string(),
         args: vec![
             "--user".to_string(),
-            "-u".to_string(),
+            "--user-unit".to_string(),
             unit.to_string(),
             "-n".to_string(),
             "100".to_string(),
@@ -464,6 +587,7 @@ async fn run_system_command(
     let started_at = Instant::now();
     let output = Command::new(&invocation.program)
         .args(&invocation.args)
+        .kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -555,6 +679,18 @@ SubState=failed\n";
     }
 
     #[test]
+    fn parses_non_utc_systemd_timestamp_to_correct_epoch() {
+        assert_eq!(
+            parse_systemd_timestamp("Sat 2026-06-13 10:30:00 -0700"),
+            Some(1_781_371_800)
+        );
+        assert_eq!(
+            parse_systemd_timestamp("Sat 2026-06-13 10:30:00 PDT"),
+            Some(1_781_371_800)
+        );
+    }
+
+    #[test]
     fn parses_journal_tail_lines() {
         let lines = parse_journal_tail(
             "2026-06-13T17:00:01+0000 host placeholder[1]: started\n2026-06-13T17:00:02+0000 host placeholder[1]: done\n",
@@ -582,6 +718,17 @@ SubState=failed\n";
     }
 
     #[test]
+    fn enumerates_allowlisted_installed_timer_absent_from_loaded_timers() {
+        let units = enumerate_timer_units(
+            "Sat 2026-06-13 17:30:00 UTC 29min Sat 2026-06-13 17:00:01 UTC 1s ago placeholder-loaded.timer placeholder-loaded.service\n",
+            "placeholder-installed.timer disabled disabled\nplaceholder-other.timer enabled enabled\n",
+            &["placeholder-installed.timer".to_string()],
+        );
+
+        assert_eq!(units, vec!["placeholder-installed.timer".to_string()]);
+    }
+
+    #[test]
     fn rejects_non_allowlisted_control_before_building_invocation() {
         let result = build_control_invocation(
             LocalJobControl::Disable,
@@ -595,7 +742,35 @@ SubState=failed\n";
     }
 
     #[test]
-    fn run_now_starts_triggered_service_not_timer() {
+    fn enable_and_disable_control_timer_with_now() {
+        let allowlist = ["placeholder-cleanup.timer".to_string()];
+        let enable = build_control_invocation(
+            LocalJobControl::Enable,
+            "placeholder-cleanup.timer",
+            "",
+            &allowlist,
+        )
+        .unwrap();
+        let disable = build_control_invocation(
+            LocalJobControl::Disable,
+            "placeholder-cleanup.timer",
+            "",
+            &allowlist,
+        )
+        .unwrap();
+
+        assert_eq!(
+            enable.args,
+            vec!["--user", "enable", "--now", "placeholder-cleanup.timer"]
+        );
+        assert_eq!(
+            disable.args,
+            vec!["--user", "disable", "--now", "placeholder-cleanup.timer"]
+        );
+    }
+
+    #[test]
+    fn run_now_starts_triggered_service_without_blocking_not_timer() {
         let invocation = build_control_invocation(
             LocalJobControl::Run,
             "placeholder-cleanup.timer",
@@ -607,7 +782,12 @@ SubState=failed\n";
         assert_eq!(invocation.program, "systemctl");
         assert_eq!(
             invocation.args,
-            vec!["--user", "start", "placeholder-cleanup.service"]
+            vec![
+                "--user",
+                "start",
+                "--no-block",
+                "placeholder-cleanup.service"
+            ]
         );
     }
 }

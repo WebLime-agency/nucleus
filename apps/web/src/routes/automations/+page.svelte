@@ -42,6 +42,7 @@
     updatePlaybook
   } from '$lib/nucleus/client';
   import { compactPath, formatDateTime, formatState } from '$lib/nucleus/format';
+  import { localJobBadgeVariant } from '$lib/nucleus/local-jobs';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
   import type {
     DaemonEvent,
@@ -203,13 +204,6 @@
     }
     if (state === 'canceled') return 'secondary';
     return 'destructive';
-  }
-
-  function badgeVariantForLocalJob(job: LocalJobSummary): 'default' | 'secondary' | 'warning' | 'destructive' {
-    if (job.active_state === 'failed' || job.last_exit.result === 'failed') return 'destructive';
-    if (job.active_state === 'active') return 'default';
-    if (job.enabled) return 'warning';
-    return 'secondary';
   }
 
   function formatOptionalDate(value: number | null): string {
@@ -1148,7 +1142,7 @@
                     <Badge variant={job.enabled ? 'default' : 'secondary'}>
                       {job.enabled ? 'enabled' : 'disabled'}
                     </Badge>
-                    <Badge variant={badgeVariantForLocalJob(job)}>{job.active_state}</Badge>
+                    <Badge variant={localJobBadgeVariant(job)}>{job.active_state}</Badge>
                   </div>
                   <div class="mt-2 break-all font-mono text-xs text-zinc-500">{job.unit}</div>
                 </button>
@@ -1228,7 +1222,7 @@
                 <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-3">
                   <div class="text-[11px] uppercase tracking-[0.18em] text-zinc-500">Active state</div>
                   <div class="mt-2">
-                    <Badge variant={badgeVariantForLocalJob(selectedLocalJob)}>{selectedLocalJob.active_state}</Badge>
+                    <Badge variant={localJobBadgeVariant(selectedLocalJob)}>{selectedLocalJob.active_state}</Badge>
                   </div>
                 </div>
                 <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-3">

@@ -5375,8 +5375,12 @@ async fn send_initial_stream_snapshot(
     send_event(socket, DaemonEvent::OverviewUpdated(overview)).await?;
     send_event(socket, DaemonEvent::AuditUpdated(audit)).await?;
     send_event(socket, DaemonEvent::SystemUpdated(frame.system_stats)).await?;
-    if let Some(jobs) = local_jobs_snapshot_if_configured(state).await? {
-        send_event(socket, DaemonEvent::LocalJobsUpdated(jobs)).await?;
+    match local_jobs_snapshot_if_configured(state).await {
+        Ok(Some(jobs)) => send_event(socket, DaemonEvent::LocalJobsUpdated(jobs)).await?,
+        Ok(None) => {}
+        Err(error) => {
+            warn!(error = %error, "failed to include local jobs in websocket initial snapshot")
+        }
     }
     send_event(
         socket,
@@ -5449,7 +5453,9 @@ async fn publish_stream_snapshot(state: &AppState) -> anyhow::Result<()> {
     let _ = state
         .events
         .send(DaemonEvent::SystemUpdated(frame.system_stats));
-    publish_local_jobs_event(state).await?;
+    if let Err(error) = publish_local_jobs_event(state).await {
+        warn!(error = %error, "failed to publish local jobs stream update");
+    }
 
     Ok(())
 }
