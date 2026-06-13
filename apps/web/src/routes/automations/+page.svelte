@@ -406,6 +406,12 @@
       if (expandedLogUnit === next.unit || action === 'run') {
         await loadLocalJobDetail(next.unit, true);
       }
+      try {
+        syncLocalJobs(await fetchLocalJobs());
+        localJobLoadError = null;
+      } catch (cause) {
+        localJobLoadError = cause instanceof Error ? cause.message : 'Failed to refresh local jobs.';
+      }
       success =
         action === 'enable'
           ? 'Local job enabled.'
