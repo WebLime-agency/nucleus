@@ -15,3 +15,7 @@ export function localJobLastRunFailed(job: LocalJobSummary): boolean {
   if (!result || result === 'unknown') return false;
   return result !== 'success';
 }
+
+export function localJobCanToggle(job: LocalJobSummary): boolean {
+  return job.manageable;
+}

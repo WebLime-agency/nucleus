@@ -72,6 +72,7 @@ impl SystemdUserScheduler {
         let loaded_output = run_system_command(list_timers_invocation(), COMMAND_TIMEOUT).await?;
         let installed_output =
             run_system_command(list_unit_files_invocation(), COMMAND_TIMEOUT).await?;
+        let listed_next_elapses = parse_list_timer_next_elapses(&loaded_output.stdout);
         let timer_units = enumerate_timer_units(
             &loaded_output.stdout,
             &installed_output.stdout,
@@ -80,7 +81,14 @@ impl SystemdUserScheduler {
 
         let mut summaries = Vec::with_capacity(timer_units.len());
         for unit in timer_units {
-            summaries.push(self.summary_for_unit(&unit, allowlist_globs).await?);
+            summaries.push(
+                self.summary_for_unit_with_listed_next(
+                    &unit,
+                    allowlist_globs,
+                    listed_next_elapses.get(&unit).map(String::as_str),
+                )
+                .await?,
+            );
         }
         summaries.sort_by(|left, right| left.unit.cmp(&right.unit));
         Ok(summaries)
@@ -129,6 +137,20 @@ impl SystemdUserScheduler {
         unit: &str,
         allowlist_globs: &[String],
     ) -> Result<LocalJobSummary> {
+        let listed_next_elapse = run_system_command(list_timers_invocation(), COMMAND_TIMEOUT)
+            .await
+            .ok()
+            .and_then(|output| parse_list_timer_next_elapses(&output.stdout).remove(unit));
+        self.summary_for_unit_with_listed_next(unit, allowlist_globs, listed_next_elapse.as_deref())
+            .await
+    }
+
+    async fn summary_for_unit_with_listed_next(
+        &self,
+        unit: &str,
+        allowlist_globs: &[String],
+        listed_next_elapse: Option<&str>,
+    ) -> Result<LocalJobSummary> {
         validate_timer_unit(unit)?;
         ensure_unit_allowlisted(unit, allowlist_globs)?;
         let timer_output = run_system_command(timer_show_invocation(unit), COMMAND_TIMEOUT).await?;
@@ -136,7 +158,11 @@ impl SystemdUserScheduler {
         let service_output =
             run_system_command(service_show_invocation(&triggered_unit), COMMAND_TIMEOUT).await?;
 
-        parse_local_job_summary(&timer_output.stdout, &service_output.stdout)
+        parse_local_job_summary_with_listed_next(
+            &timer_output.stdout,
+            &service_output.stdout,
+            listed_next_elapse,
+        )
     }
 }
 
@@ -184,6 +210,14 @@ pub fn build_control_invocation(
 }
 
 pub fn parse_local_job_summary(timer_show: &str, service_show: &str) -> Result<LocalJobSummary> {
+    parse_local_job_summary_with_listed_next(timer_show, service_show, None)
+}
+
+fn parse_local_job_summary_with_listed_next(
+    timer_show: &str,
+    service_show: &str,
+    listed_next_elapse: Option<&str>,
+) -> Result<LocalJobSummary> {
     let timer = parse_key_values(timer_show);
     let service = parse_key_values(service_show);
     let unit = required_value(&timer, "Id")?.to_string();
@@ -191,9 +225,17 @@ pub fn parse_local_job_summary(timer_show: &str, service_show: &str) -> Result<L
     let triggered_unit = required_value(&timer, "Triggers")?.to_string();
     validate_service_unit(&triggered_unit)?;
 
-    let next_elapse = optional_systemd_timestamp(timer.get("NextElapseUSecRealtime"));
+    let next_elapse_realtime = timer.get("NextElapseUSecRealtime");
+    let next_elapse_monotonic = timer.get("NextElapseUSecMonotonic");
+    let next_elapse = optional_systemd_timestamp(next_elapse_realtime)
+        .or_else(|| listed_next_elapse.and_then(parse_optional_systemd_timestamp));
     let last_trigger = optional_systemd_timestamp(timer.get("LastTriggerUSec"));
     let exit_timestamp = optional_systemd_timestamp(service.get("ExecMainExitTimestamp"));
+    let unit_file_state = timer
+        .get("UnitFileState")
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
     let exit_code = service
         .get("ExecMainStatus")
         .and_then(|value| value.parse::<i32>().ok());
@@ -207,9 +249,9 @@ pub fn parse_local_job_summary(timer_show: &str, service_show: &str) -> Result<L
         title: title_for_unit(&unit),
         unit,
         backend: BACKEND_SYSTEMD_USER.to_string(),
-        enabled: timer
-            .get("UnitFileState")
-            .is_some_and(|state| state.starts_with("enabled")),
+        enabled: unit_file_state.starts_with("enabled"),
+        manageable: unit_file_state_is_manageable(&unit_file_state),
+        unit_file_state,
         active_state: timer
             .get("ActiveState")
             .cloned()
@@ -217,10 +259,12 @@ pub fn parse_local_job_summary(timer_show: &str, service_show: &str) -> Result<L
         schedule: LocalJobSchedule {
             next_elapse_at: next_elapse,
             interval_hint: None,
-            raw: timer
-                .get("NextElapseUSecRealtime")
-                .cloned()
-                .unwrap_or_default(),
+            raw: next_elapse_realtime
+                .and_then(non_empty_systemd_value)
+                .or_else(|| listed_next_elapse.and_then(non_empty_str))
+                .or_else(|| next_elapse_monotonic.and_then(non_empty_systemd_value))
+                .unwrap_or_default()
+                .to_string(),
         },
         last_fired_at: last_trigger,
         last_exit: LocalJobExit {
@@ -232,17 +276,71 @@ pub fn parse_local_job_summary(timer_show: &str, service_show: &str) -> Result<L
     })
 }
 
+fn unit_file_state_is_manageable(state: &str) -> bool {
+    matches!(state, "enabled" | "enabled-runtime" | "disabled")
+}
+
+fn non_empty_systemd_value(value: &String) -> Option<&str> {
+    non_empty_str(value)
+}
+
+fn non_empty_str(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("n/a") || value == "0" {
+        None
+    } else {
+        Some(value)
+    }
+}
+
 pub fn parse_list_timers(stdout: &str) -> Vec<String> {
+    parse_list_timer_next_elapses(stdout).into_keys().collect()
+}
+
+pub fn parse_list_timer_next_elapses(stdout: &str) -> BTreeMap<String, String> {
     let mut units = BTreeSet::new();
+    let mut next_elapses = BTreeMap::new();
     for line in stdout.lines() {
-        for token in line.split_whitespace() {
+        let tokens = line.split_whitespace().collect::<Vec<_>>();
+        for (index, token) in tokens.iter().enumerate() {
             if token.ends_with(".timer") {
-                units.insert(token.to_string());
+                let unit = token.to_string();
+                units.insert(unit.clone());
+                if let Some(next_elapse) = parse_list_timer_next_elapse(&tokens[..index]) {
+                    next_elapses.insert(unit, next_elapse);
+                }
                 break;
             }
         }
     }
-    units.into_iter().collect()
+    for unit in units {
+        next_elapses.entry(unit).or_default();
+    }
+    next_elapses
+}
+
+fn parse_list_timer_next_elapse(tokens_before_unit: &[&str]) -> Option<String> {
+    if tokens_before_unit.is_empty() || tokens_before_unit[0].eq_ignore_ascii_case("n/a") {
+        return None;
+    }
+
+    let candidates = if tokens_before_unit[0].contains('-') {
+        [3_usize, 0]
+    } else {
+        [4_usize, 3]
+    };
+
+    for len in candidates.into_iter().filter(|len| *len > 0) {
+        if tokens_before_unit.len() < len {
+            continue;
+        }
+        let raw = tokens_before_unit[..len].join(" ");
+        if parse_systemd_timestamp(&raw).is_some() {
+            return Some(raw);
+        }
+    }
+
+    None
 }
 
 pub fn parse_list_unit_files(stdout: &str) -> Vec<String> {
@@ -301,6 +399,11 @@ fn required_value<'a>(values: &'a BTreeMap<String, String>, key: &str) -> Result
 
 fn optional_systemd_timestamp(value: Option<&String>) -> Option<i64> {
     let value = value?.trim();
+    parse_optional_systemd_timestamp(value)
+}
+
+fn parse_optional_systemd_timestamp(value: &str) -> Option<i64> {
+    let value = value.trim();
     if value.is_empty() || value.eq_ignore_ascii_case("n/a") || value == "0" {
         return None;
     }
@@ -508,8 +611,10 @@ fn list_timers_invocation() -> CommandInvocation {
         program: "systemctl".to_string(),
         args: vec![
             "--user".to_string(),
+            "--timestamp=utc".to_string(),
             "list-timers".to_string(),
             "--all".to_string(),
+            "--full".to_string(),
             "--no-pager".to_string(),
             "--no-legend".to_string(),
         ],
@@ -523,6 +628,7 @@ fn list_unit_files_invocation() -> CommandInvocation {
             "--user".to_string(),
             "list-unit-files".to_string(),
             "--type=timer".to_string(),
+            "--full".to_string(),
             "--no-pager".to_string(),
             "--no-legend".to_string(),
         ],
@@ -537,7 +643,7 @@ fn timer_show_invocation(unit: &str) -> CommandInvocation {
             "--timestamp=utc".to_string(),
             "show".to_string(),
             unit.to_string(),
-            "--property=Id,ActiveState,UnitFileState,LastTriggerUSec,NextElapseUSecRealtime,Triggers"
+            "--property=Id,ActiveState,UnitFileState,LastTriggerUSec,NextElapseUSecRealtime,NextElapseUSecMonotonic,Triggers"
                 .to_string(),
             "--no-pager".to_string(),
         ],
@@ -659,6 +765,8 @@ SubState=failed\n";
         assert_eq!(summary.title, "Placeholder Cleanup");
         assert_eq!(summary.backend, "systemd-user");
         assert!(summary.enabled);
+        assert_eq!(summary.unit_file_state, "enabled");
+        assert!(summary.manageable);
         assert_eq!(summary.active_state, "active");
         assert_eq!(summary.triggered_unit, "placeholder-cleanup.service");
         assert_eq!(summary.schedule.next_elapse_at, Some(1_781_371_800));
@@ -676,6 +784,37 @@ SubState=failed\n";
         assert_eq!(summary.last_exit.code, Some(2));
         assert_eq!(summary.last_exit.result, "exit-code");
         assert_eq!(summary.last_exit.at, Some(1_781_370_304));
+    }
+
+    #[test]
+    fn preserves_non_enableable_unit_file_state() {
+        let timer_show = TIMER_SHOW.replace("UnitFileState=enabled", "UnitFileState=static");
+        let summary = parse_local_job_summary(&timer_show, SERVICE_SUCCESS_SHOW).unwrap();
+
+        assert!(!summary.enabled);
+        assert_eq!(summary.unit_file_state, "static");
+        assert!(!summary.manageable);
+    }
+
+    #[test]
+    fn uses_list_timer_next_elapse_for_monotonic_timers() {
+        let timer_show = "\
+NextElapseUSecRealtime=n/a\n\
+NextElapseUSecMonotonic=123456789\n\
+LastTriggerUSec=n/a\n\
+Id=placeholder-cleanup.timer\n\
+Triggers=placeholder-cleanup.service\n\
+ActiveState=active\n\
+UnitFileState=enabled\n";
+        let summary = parse_local_job_summary_with_listed_next(
+            timer_show,
+            SERVICE_SUCCESS_SHOW,
+            Some("Sat 2026-06-13 17:30:00 UTC"),
+        )
+        .unwrap();
+
+        assert_eq!(summary.schedule.next_elapse_at, Some(1_781_371_800));
+        assert_eq!(summary.schedule.raw, "Sat 2026-06-13 17:30:00 UTC");
     }
 
     #[test]
@@ -714,6 +853,23 @@ SubState=failed\n";
                 "placeholder-cleanup.timer".to_string(),
                 "placeholder-sync.timer".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn parses_list_timer_next_elapses() {
+        let next_elapses = parse_list_timer_next_elapses(
+            "Sat 2026-06-13 17:30:00 UTC 29min Sat 2026-06-13 17:00:01 UTC 1s ago placeholder-cleanup.timer placeholder-cleanup.service\n\
+             n/a n/a n/a n/a placeholder-sync.timer placeholder-sync.service\n",
+        );
+
+        assert_eq!(
+            next_elapses.get("placeholder-cleanup.timer"),
+            Some(&"Sat 2026-06-13 17:30:00 UTC".to_string())
+        );
+        assert_eq!(
+            next_elapses.get("placeholder-sync.timer"),
+            Some(&String::new())
         );
     }
 
@@ -766,6 +922,20 @@ SubState=failed\n";
         assert_eq!(
             disable.args,
             vec!["--user", "disable", "--now", "placeholder-cleanup.timer"]
+        );
+    }
+
+    #[test]
+    fn listing_invocations_request_full_unit_names() {
+        assert!(
+            list_timers_invocation()
+                .args
+                .contains(&"--full".to_string())
+        );
+        assert!(
+            list_unit_files_invocation()
+                .args
+                .contains(&"--full".to_string())
         );
     }
 

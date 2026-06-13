@@ -42,7 +42,7 @@
     updatePlaybook
   } from '$lib/nucleus/client';
   import { compactPath, formatDateTime, formatState } from '$lib/nucleus/format';
-  import { localJobBadgeVariant } from '$lib/nucleus/local-jobs';
+  import { localJobBadgeVariant, localJobCanToggle } from '$lib/nucleus/local-jobs';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
   import type {
     DaemonEvent,
@@ -115,6 +115,7 @@
   let jobLoading = $state(false);
   let localJobLoading = $state(false);
   let localJobAction = $state<string | null>(null);
+  let localJobLoadError = $state<string | null>(null);
   let expandedLogUnit = $state<string | null>(null);
   let streamStatus = $state<StreamStatus>('connecting');
   let error = $state<string | null>(null);
@@ -413,15 +414,20 @@
     refreshing = silent;
 
     try {
-      const [nextOverview, nextPlaybooks, nextLocalJobs] = await Promise.all([
+      const [nextOverview, nextPlaybooks] = await Promise.all([
         fetchOverview(),
-        fetchPlaybooks(),
-        fetchLocalJobs()
+        fetchPlaybooks()
       ]);
       overview = nextOverview;
       playbooks = nextPlaybooks;
-      syncLocalJobs(nextLocalJobs);
       error = null;
+
+      try {
+        syncLocalJobs(await fetchLocalJobs());
+        localJobLoadError = null;
+      } catch (cause) {
+        localJobLoadError = cause instanceof Error ? cause.message : 'Failed to load local jobs.';
+      }
 
       const nextSelectedPlaybookId =
         nextPlaybooks.some((playbook) => playbook.id === selectedPlaybookId)
@@ -562,6 +568,7 @@
 
     if (event.event === 'local_jobs.updated') {
       syncLocalJobs(event.data);
+      localJobLoadError = null;
       if (localJobDetail) {
         const nextSummary = event.data.find((job) => job.unit === localJobDetail?.summary.unit);
         if (nextSummary) {
@@ -1103,6 +1110,12 @@
       <span>OS-scheduled. Nucleus observes and controls these units — it never runs them.</span>
     </div>
 
+    {#if localJobLoadError}
+      <div class="rounded-lg border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-sm text-amber-100">
+        {localJobLoadError}
+      </div>
+    {/if}
+
     {#if localJobs.length === 0}
       <Card>
         <CardHeader>
@@ -1142,13 +1155,14 @@
                     <Badge variant={job.enabled ? 'default' : 'secondary'}>
                       {job.enabled ? 'enabled' : 'disabled'}
                     </Badge>
+                    <Badge variant="secondary">{job.unit_file_state}</Badge>
                     <Badge variant={localJobBadgeVariant(job)}>{job.active_state}</Badge>
                   </div>
                   <div class="mt-2 break-all font-mono text-xs text-zinc-500">{job.unit}</div>
                 </button>
 
                 <div class="flex flex-wrap gap-2">
-                  {#if job.enabled}
+                  {#if localJobCanToggle(job) && job.enabled}
                     <Button
                       variant="outline"
                       onclick={() => void handleLocalJobAction(job.unit, 'disable')}
@@ -1157,7 +1171,7 @@
                       <PowerOff class="size-4" />
                       {localJobAction === localJobActionKey(job.unit, 'disable') ? 'Disabling' : 'Disable'}
                     </Button>
-                  {:else}
+                  {:else if localJobCanToggle(job)}
                     <Button
                       variant="outline"
                       onclick={() => void handleLocalJobAction(job.unit, 'enable')}
@@ -1224,6 +1238,7 @@
                   <div class="mt-2">
                     <Badge variant={localJobBadgeVariant(selectedLocalJob)}>{selectedLocalJob.active_state}</Badge>
                   </div>
+                  <div class="mt-1 text-xs text-zinc-500">{selectedLocalJob.unit_file_state}</div>
                 </div>
                 <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-3">
                   <div class="text-[11px] uppercase tracking-[0.18em] text-zinc-500">Next elapse</div>
@@ -1240,7 +1255,7 @@
               </div>
 
               <div class="flex flex-wrap gap-2">
-                {#if selectedLocalJob.enabled}
+                {#if localJobCanToggle(selectedLocalJob) && selectedLocalJob.enabled}
                   <Button
                     variant="outline"
                     onclick={() => void handleLocalJobAction(selectedLocalJob.unit, 'disable')}
@@ -1249,7 +1264,7 @@
                     <PowerOff class="size-4" />
                     Disable
                   </Button>
-                {:else}
+                {:else if localJobCanToggle(selectedLocalJob)}
                   <Button
                     variant="outline"
                     onclick={() => void handleLocalJobAction(selectedLocalJob.unit, 'enable')}

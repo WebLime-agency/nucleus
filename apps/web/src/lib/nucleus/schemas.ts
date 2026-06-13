@@ -426,6 +426,8 @@ export const localJobSummarySchema = z.object({
   title: z.string(),
   backend: z.literal('systemd-user'),
   enabled: z.boolean(),
+  unit_file_state: z.string().default('unknown'),
+  manageable: z.boolean().default(true),
   active_state: z.string(),
   schedule: localJobScheduleSchema,
   last_fired_at: z.number().int().nullable(),

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { localJobBadgeVariant, localJobLastRunFailed } from './local-jobs.ts';
+import { localJobBadgeVariant, localJobCanToggle, localJobLastRunFailed } from './local-jobs.ts';
 
 function job(result) {
   return {
@@ -9,6 +9,8 @@ function job(result) {
     title: 'Placeholder Cleanup',
     backend: 'systemd-user',
     enabled: true,
+    unit_file_state: 'enabled',
+    manageable: true,
     active_state: 'active',
     schedule: {
       next_elapse_at: null,
@@ -39,4 +41,9 @@ test('local job result classification keeps success and never-run non-failed', (
   assert.equal(localJobBadgeVariant(job('unknown')), 'default');
   assert.equal(localJobLastRunFailed(job('')), false);
   assert.equal(localJobBadgeVariant(job('')), 'default');
+});
+
+test('local job toggle availability follows daemon manageability', () => {
+  assert.equal(localJobCanToggle(job('success')), true);
+  assert.equal(localJobCanToggle({ ...job('success'), unit_file_state: 'static', manageable: false }), false);
 });

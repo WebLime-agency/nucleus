@@ -1864,6 +1864,8 @@ pub struct LocalJobSummary {
     pub title: String,
     pub backend: String,
     pub enabled: bool,
+    pub unit_file_state: String,
+    pub manageable: bool,
     pub active_state: String,
     pub schedule: LocalJobSchedule,
     pub last_fired_at: Option<i64>,
