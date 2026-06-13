@@ -81,14 +81,18 @@ impl SystemdUserScheduler {
 
         let mut summaries = Vec::with_capacity(timer_units.len());
         for unit in timer_units {
-            summaries.push(
-                self.summary_for_unit_with_listed_next(
+            match self
+                .summary_for_unit_with_listed_next(
                     &unit,
                     allowlist_globs,
                     listed_next_elapses.get(&unit).map(String::as_str),
                 )
-                .await?,
-            );
+                .await
+            {
+                Ok(summary) => summaries.push(summary),
+                Err(error) if is_unsupported_triggered_unit_error(&error) => continue,
+                Err(error) => return Err(error),
+            }
         }
         summaries.sort_by(|left, right| left.unit.cmp(&right.unit));
         Ok(summaries)
@@ -229,8 +233,8 @@ fn parse_local_job_summary_with_listed_next(
     let next_elapse_monotonic = timer.get("NextElapseUSecMonotonic");
     let next_elapse = optional_systemd_timestamp(next_elapse_realtime)
         .or_else(|| listed_next_elapse.and_then(parse_optional_systemd_timestamp));
-    let last_trigger = optional_systemd_timestamp(timer.get("LastTriggerUSec"));
     let exit_timestamp = optional_systemd_timestamp(service.get("ExecMainExitTimestamp"));
+    let last_trigger = optional_systemd_timestamp(timer.get("LastTriggerUSec")).or(exit_timestamp);
     let unit_file_state = timer
         .get("UnitFileState")
         .filter(|value| !value.trim().is_empty())
@@ -278,6 +282,10 @@ fn parse_local_job_summary_with_listed_next(
 
 fn unit_file_state_is_manageable(state: &str) -> bool {
     matches!(state, "enabled" | "enabled-runtime" | "disabled")
+}
+
+fn is_unsupported_triggered_unit_error(error: &anyhow::Error) -> bool {
+    error.to_string().contains("must end with .service")
 }
 
 fn non_empty_systemd_value(value: &String) -> Option<&str> {
@@ -815,6 +823,17 @@ UnitFileState=enabled\n";
 
         assert_eq!(summary.schedule.next_elapse_at, Some(1_781_371_800));
         assert_eq!(summary.schedule.raw, "Sat 2026-06-13 17:30:00 UTC");
+    }
+
+    #[test]
+    fn falls_back_to_service_exit_for_missing_last_trigger() {
+        let timer_show = TIMER_SHOW.replace(
+            "LastTriggerUSec=Sat 2026-06-13 17:00:01 UTC",
+            "LastTriggerUSec=n/a",
+        );
+        let summary = parse_local_job_summary(&timer_show, SERVICE_SUCCESS_SHOW).unwrap();
+
+        assert_eq!(summary.last_fired_at, Some(1_781_370_002));
     }
 
     #[test]

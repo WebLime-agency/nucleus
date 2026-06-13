@@ -18,7 +18,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path as FsPath, PathBuf},
     process::Command as StdCommand,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -98,6 +98,7 @@ use uuid::Uuid;
 use worker_action::parse_worker_action;
 
 const STREAM_INTERVAL: Duration = Duration::from_secs(2);
+const LOCAL_JOBS_STREAM_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_AUDIT_LIMIT: usize = 20;
 const MAX_AUDIT_LIMIT: usize = 100;
 const DEFAULT_LOG_LIMIT: usize = 100;
@@ -131,6 +132,16 @@ struct AppState {
     tailscale_dns_name: Option<String>,
     events: broadcast::Sender<DaemonEvent>,
 }
+
+#[derive(Default)]
+struct LocalJobsStreamCache {
+    allowlist: Vec<String>,
+    last_refreshed_at: Option<Instant>,
+    jobs: Option<Vec<LocalJobSummary>>,
+}
+
+static LOCAL_JOBS_STREAM_CACHE: OnceLock<tokio::sync::Mutex<LocalJobsStreamCache>> =
+    OnceLock::new();
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -5166,7 +5177,7 @@ async fn control_local_job(
         },
     )
     .await;
-    let _ = publish_local_jobs_event(&state).await;
+    let _ = publish_local_jobs_event(&state, true).await;
     Ok(Json(summary))
 }
 
@@ -5453,7 +5464,7 @@ async fn publish_stream_snapshot(state: &AppState) -> anyhow::Result<()> {
     let _ = state
         .events
         .send(DaemonEvent::SystemUpdated(frame.system_stats));
-    if let Err(error) = publish_local_jobs_event(state).await {
+    if let Err(error) = publish_local_jobs_event(state, false).await {
         warn!(error = %error, "failed to publish local jobs stream update");
     }
 
@@ -5474,11 +5485,42 @@ async fn local_jobs_snapshot_if_configured(
     Ok(Some(jobs))
 }
 
-async fn publish_local_jobs_event(state: &AppState) -> anyhow::Result<()> {
-    if let Some(jobs) = local_jobs_snapshot_if_configured(state).await? {
+async fn publish_local_jobs_event(state: &AppState, force_refresh: bool) -> anyhow::Result<()> {
+    if let Some(jobs) = throttled_local_jobs_snapshot_if_configured(state, force_refresh).await? {
         let _ = state.events.send(DaemonEvent::LocalJobsUpdated(jobs));
     }
     Ok(())
+}
+
+async fn throttled_local_jobs_snapshot_if_configured(
+    state: &AppState,
+    force_refresh: bool,
+) -> anyhow::Result<Option<Vec<LocalJobSummary>>> {
+    let allowlist = state.store.system_jobs_unit_globs()?;
+    if allowlist.is_empty() {
+        return Ok(None);
+    }
+
+    let cache = LOCAL_JOBS_STREAM_CACHE
+        .get_or_init(|| tokio::sync::Mutex::new(LocalJobsStreamCache::default()));
+    let mut cache = cache.lock().await;
+    let cache_is_current = cache.allowlist == allowlist
+        && cache
+            .last_refreshed_at
+            .is_some_and(|last| last.elapsed() < LOCAL_JOBS_STREAM_MIN_INTERVAL);
+    if !force_refresh && cache_is_current {
+        if let Some(jobs) = cache.jobs.clone() {
+            return Ok(Some(jobs));
+        }
+    }
+
+    let jobs = system_jobs::SystemScheduler::systemd_user()
+        .list_jobs(&allowlist)
+        .await?;
+    cache.allowlist = allowlist;
+    cache.last_refreshed_at = Some(Instant::now());
+    cache.jobs = Some(jobs.clone());
+    Ok(Some(jobs))
 }
 
 async fn publish_overview_event(state: &AppState) -> anyhow::Result<()> {
