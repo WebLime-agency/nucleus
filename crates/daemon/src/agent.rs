@@ -3816,7 +3816,13 @@ fn validate_child_fanout_write_scopes(
                 "worker_action.invalid: write-capable main child fan-out requires each main-lane child to set working_dir inside the parent scope; use dedicated child directories or spawn one main child at a time"
             );
         };
-        let normalized_working_dir = normalize_lexical_path(Path::new(working_dir))
+        let raw_working_dir = PathBuf::from(working_dir);
+        let working_dir_candidate = if raw_working_dir.is_absolute() {
+            raw_working_dir
+        } else {
+            Path::new(&parent_worker.working_dir).join(raw_working_dir)
+        };
+        let normalized_working_dir = normalize_lexical_path(&working_dir_candidate)
             .display()
             .to_string();
         if !main_working_dirs.insert(normalized_working_dir.to_string()) {
@@ -19054,6 +19060,14 @@ mod tests {
         jobs[1].working_dir = Some("a/../child-0".to_string());
         let error = validate_child_fanout_write_scopes(&parent, &jobs, &child_plans)
             .expect_err("main sibling fan-out with parent-dir alias should be rejected");
+        assert!(error.to_string().contains("worker_action.invalid"));
+        assert!(error.to_string().contains("distinct working_dir"));
+        assert!(error.to_string().contains("child-0"));
+
+        jobs[0].working_dir = Some("child-0".to_string());
+        jobs[1].working_dir = Some(format!("{}/child-0", parent.working_dir));
+        let error = validate_child_fanout_write_scopes(&parent, &jobs, &child_plans)
+            .expect_err("main sibling fan-out with absolute alias should be rejected");
         assert!(error.to_string().contains("worker_action.invalid"));
         assert!(error.to_string().contains("distinct working_dir"));
         assert!(error.to_string().contains("child-0"));
