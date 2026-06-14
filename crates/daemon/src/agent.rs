@@ -10357,7 +10357,7 @@ fn compile_worker_prompt_for_estimate(
         &history,
         &prompt_body,
         images,
-        "utility",
+        compiler_role_for_worker(worker),
         !low_context_turn,
     )
     .inspect_err(|error| {
@@ -24237,6 +24237,58 @@ Thanks."#,
         }
 
         server.await.expect("test server should finish");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn compile_worker_prompt_for_estimate_uses_worker_lane_role() {
+        let state_dir = test_state_dir("worker-context-compaction-estimate-lane");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let session = state
+            .store
+            .create_session(test_session_record(
+                "compact-estimate-lane-session",
+                "Compact estimate lane session",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+        let (_, mut worker, _) = create_command_test_context(&state, "compact-estimate-lane");
+        worker.working_dir = workspace_root.display().to_string();
+        let checkpoint = long_test_checkpoint(&session.id, 4);
+
+        worker.lane = MAIN_EXECUTOR_LANE.to_string();
+        let compiled = compile_worker_prompt_for_estimate(
+            &state,
+            &session,
+            &worker,
+            &checkpoint,
+            "Continue the long running task.",
+            &[],
+            false,
+        )
+        .expect("main-lane estimate prompt should compile");
+        assert_eq!(compiled.role, MAIN_EXECUTOR_LANE);
+
+        worker.lane = ACTION_EXECUTOR_LANE.to_string();
+        let compiled = compile_worker_prompt_for_estimate(
+            &state,
+            &session,
+            &worker,
+            &checkpoint,
+            "Continue the long running task.",
+            &[],
+            false,
+        )
+        .expect("utility-lane estimate prompt should compile");
+        assert_eq!(compiled.role, ACTION_EXECUTOR_LANE);
+
         let _ = fs::remove_dir_all(&state_dir);
     }
 
