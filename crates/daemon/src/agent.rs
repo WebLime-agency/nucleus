@@ -3801,18 +3801,30 @@ fn validate_child_fanout_write_scopes(
         return Ok(());
     }
 
+    let mut main_working_dirs = BTreeSet::new();
     for (proposal, plan) in jobs.iter().zip(child_plans) {
         if plan.lane != MAIN_EXECUTOR_LANE {
             continue;
         }
-        let has_working_dir = proposal
+        let working_dir = proposal
             .working_dir
             .as_deref()
             .map(str::trim)
-            .is_some_and(|value| !value.is_empty());
-        if !has_working_dir {
+            .filter(|value| !value.is_empty());
+        let Some(working_dir) = working_dir else {
             bail!(
                 "worker_action.invalid: write-capable main child fan-out requires each main-lane child to set working_dir inside the parent scope; use dedicated child directories or spawn one main child at a time"
+            );
+        };
+        let normalized_working_dir = working_dir.trim_end_matches(['/', '\\']);
+        let normalized_working_dir = if normalized_working_dir.is_empty() {
+            working_dir
+        } else {
+            normalized_working_dir
+        };
+        if !main_working_dirs.insert(normalized_working_dir.to_string()) {
+            bail!(
+                "worker_action.invalid: write-capable main child fan-out requires each main-lane child to set a distinct working_dir inside the parent scope; duplicate working_dir `{normalized_working_dir}`"
             );
         }
     }
@@ -19024,6 +19036,14 @@ mod tests {
             .expect_err("main sibling fan-out without workdirs should be rejected");
         assert!(error.to_string().contains("worker_action.invalid"));
         assert!(error.to_string().contains("working_dir"));
+
+        jobs[0].working_dir = Some("child-0".to_string());
+        jobs[1].working_dir = Some(" child-0/ ".to_string());
+        let error = validate_child_fanout_write_scopes(&parent, &jobs, &child_plans)
+            .expect_err("main sibling fan-out with duplicate workdirs should be rejected");
+        assert!(error.to_string().contains("worker_action.invalid"));
+        assert!(error.to_string().contains("distinct working_dir"));
+        assert!(error.to_string().contains("child-0"));
 
         jobs[0].working_dir = Some("child-0".to_string());
         jobs[1].working_dir = Some("child-1".to_string());
