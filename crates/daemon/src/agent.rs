@@ -3726,6 +3726,7 @@ async fn handle_child_job_proposal(
     for proposal in &jobs {
         child_plans.push(resolve_child_job_target_plan(state, &session.session, proposal).await?);
     }
+    validate_child_fanout_write_scopes(worker, &jobs, &child_plans)?;
 
     let mut child_job_ids = Vec::with_capacity(jobs.len());
     for (proposal, target_plan) in jobs.into_iter().zip(child_plans) {
@@ -3782,6 +3783,41 @@ async fn handle_child_job_proposal(
     )
     .await;
     Ok(LoopDisposition::Continue)
+}
+
+fn validate_child_fanout_write_scopes(
+    parent_worker: &WorkerSummary,
+    jobs: &[ChildJobProposal],
+    child_plans: &[ChildJobTargetPlan],
+) -> Result<()> {
+    if jobs.len() <= 1 || parent_worker.write_roots.is_empty() {
+        return Ok(());
+    }
+    let main_child_count = child_plans
+        .iter()
+        .filter(|plan| plan.lane == MAIN_EXECUTOR_LANE)
+        .count();
+    if main_child_count <= 1 {
+        return Ok(());
+    }
+
+    for (proposal, plan) in jobs.iter().zip(child_plans) {
+        if plan.lane != MAIN_EXECUTOR_LANE {
+            continue;
+        }
+        let has_working_dir = proposal
+            .working_dir
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+        if !has_working_dir {
+            bail!(
+                "worker_action.invalid: write-capable main child fan-out requires each main-lane child to set working_dir inside the parent scope; use dedicated child directories or spawn one main child at a time"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 async fn park_worker_wait(
@@ -4053,7 +4089,12 @@ async fn resolve_child_job_target_plan(
         None,
     )
     .await
-    .map_err(|error| anyhow!("worker_action.invalid: {}", error.message))?;
+    .map_err(|error| {
+        anyhow!(
+            "worker_action.invalid: default main child route is unavailable: {}. Configure a runnable main model or set route_id=\"utility\" for a read-only utility child check; no automatic fallback was used.",
+            error.message
+        )
+    })?;
     Ok(ChildJobTargetPlan {
         lane: MAIN_EXECUTOR_LANE.to_string(),
         target,
@@ -4096,6 +4137,12 @@ async fn create_child_job_with_limits(
     } else {
         parent_worker.read_roots.clone()
     };
+    let write_roots = child_worker_write_roots(
+        parent_worker,
+        &target_plan.lane,
+        &working_dir,
+        proposal.working_dir.is_some(),
+    )?;
 
     let child_job_id = Uuid::new_v4().to_string();
     let child_worker_id = Uuid::new_v4().to_string();
@@ -4133,7 +4180,7 @@ async fn create_child_job_with_limits(
         provider_session_id: String::new(),
         working_dir: child_working_dir,
         read_roots,
-        write_roots: Vec::new(),
+        write_roots,
         max_steps: limits.max_steps,
         max_tool_calls: limits.max_tool_calls,
         max_wall_clock_secs: limits.max_wall_clock_secs,
@@ -4145,12 +4192,13 @@ async fn create_child_job_with_limits(
             ..JobPatch::default()
         },
     )?;
-    // Per-child route selection controls model/provider/transport only. Tool
-    // and MCP grants still come from the parent's workspace-scoped child
-    // capability set.
-    state
-        .store
-        .replace_tool_capability_grants(&child_worker_id, &child_worker_capabilities())?;
+    // Per-child route selection controls model/provider/transport and the
+    // bounded child capability set. Approval policy is still applied when a
+    // child proposes any mutating or command action.
+    state.store.replace_tool_capability_grants(
+        &child_worker_id,
+        &child_worker_capabilities_for_lane(parent_worker, &target_plan.lane),
+    )?;
     let child_worker = state
         .store
         .get_job(&child_job_id)?
@@ -10458,9 +10506,10 @@ fn record_successful_worker_transport_capability(
     worker: &WorkerSummary,
     result: &ProviderTurnResult,
 ) {
-    record_successful_utility_transport_capability(
+    record_successful_transport_capability_for_role(
         state,
         session,
+        compiler_role_for_worker(worker),
         &worker.provider,
         &worker.model,
         &worker.provider_base_url,
@@ -10476,6 +10525,26 @@ pub(crate) fn record_successful_utility_transport_capability(
     base_url: &str,
     transport: ProviderTurnTransport,
 ) {
+    record_successful_transport_capability_for_role(
+        state,
+        session,
+        ACTION_EXECUTOR_LANE,
+        provider,
+        model,
+        base_url,
+        transport,
+    );
+}
+
+fn record_successful_transport_capability_for_role(
+    state: &AppState,
+    session: Option<&SessionSummary>,
+    role: &str,
+    provider: &str,
+    model: &str,
+    base_url: &str,
+    transport: ProviderTurnTransport,
+) {
     if transport != ProviderTurnTransport::NonStreaming || provider != "openai_compatible" {
         return;
     }
@@ -10484,28 +10553,38 @@ pub(crate) fn record_successful_utility_transport_capability(
         return;
     };
     let Some(profile) =
-        matching_utility_profile_for_target(&workspace, session, provider, model, base_url)
+        matching_profile_for_target(&workspace, session, role, provider, model, base_url)
     else {
         return;
     };
-    if profile.utility.transport != ModelTransportCapability::Unknown {
+    let current_transport = if role == MAIN_EXECUTOR_LANE {
+        profile.main.transport
+    } else {
+        profile.utility.transport
+    };
+    if current_transport != ModelTransportCapability::Unknown {
         return;
     }
 
+    let mut main = profile.main.clone();
     let mut utility = profile.utility.clone();
-    utility.transport = ModelTransportCapability::NonStreaming;
+    if role == MAIN_EXECUTOR_LANE {
+        main.transport = ModelTransportCapability::NonStreaming;
+    } else {
+        utility.transport = ModelTransportCapability::NonStreaming;
+    }
     if let Err(error) = state.store.update_workspace_profile(
         &profile.id,
         nucleus_storage::WorkspaceProfilePatch {
             title: profile.title,
-            main: profile.main,
+            main,
             utility,
             is_default: profile.is_default,
         },
     ) {
         warn!(
             ?error,
-            provider, model, "failed to persist utility model non-streaming capability"
+            provider, model, role, "failed to persist model non-streaming capability"
         );
     }
 }
@@ -10556,13 +10635,9 @@ pub(crate) async fn execute_worker_text_turn(
 ) -> Result<ProviderTurnResult> {
     let (events, mut receiver) = mpsc::unbounded_channel();
     let execution = build_execution_session(worker);
-    let model_capabilities = utility_runtime_model_capabilities(
-        state,
-        session,
-        &worker.provider,
-        &worker.model,
-        &worker.provider_base_url,
-    );
+    let compiler_role = compiler_role_for_worker(worker).to_string();
+    let model_capabilities =
+        worker_runtime_model_capabilities(state, session, worker, compiler_role.as_str());
     let history = checkpoint_history(conversation, &execution.id);
     let prompt_body = build_worker_prompt_input(worker, conversation, prompt);
     let runtimes = state.runtimes.clone();
@@ -10582,7 +10657,7 @@ pub(crate) async fn execute_worker_text_turn(
             &history,
             &prompt_body,
             &images,
-            "utility",
+            compiler_role.as_str(),
             !low_context_turn,
         )
         .inspect_err(|error| {
@@ -10616,7 +10691,7 @@ pub(crate) async fn execute_worker_text_turn(
                             &history_clone,
                             &prompt_body,
                             &images,
-                            "utility",
+                            compiler_role.as_str(),
                             &[],
                             &[],
                             &[],
@@ -10734,6 +10809,80 @@ pub(crate) fn utility_runtime_model_capabilities(
         transport: profile.utility.transport,
         action_contract: profile.utility.action_contract,
     }
+}
+
+fn compiler_role_for_worker(worker: &WorkerSummary) -> &'static str {
+    if worker.lane == MAIN_EXECUTOR_LANE {
+        MAIN_EXECUTOR_LANE
+    } else {
+        ACTION_EXECUTOR_LANE
+    }
+}
+
+fn worker_runtime_model_capabilities(
+    state: &AppState,
+    session: Option<&SessionSummary>,
+    worker: &WorkerSummary,
+    compiler_role: &str,
+) -> RuntimeModelCapabilities {
+    if worker.provider != "openai_compatible" {
+        return RuntimeModelCapabilities::default();
+    }
+
+    let Ok(workspace) = state.store.workspace() else {
+        return RuntimeModelCapabilities::default();
+    };
+    let Some(profile) = matching_profile_for_target(
+        &workspace,
+        session,
+        compiler_role,
+        &worker.provider,
+        &worker.model,
+        &worker.provider_base_url,
+    ) else {
+        return RuntimeModelCapabilities::default();
+    };
+
+    let config = if compiler_role == MAIN_EXECUTOR_LANE {
+        &profile.main
+    } else {
+        &profile.utility
+    };
+    RuntimeModelCapabilities {
+        json_object: config.json_object,
+        transport: config.transport,
+        action_contract: config.action_contract,
+    }
+}
+
+fn matching_profile_for_target(
+    workspace: &WorkspaceSummary,
+    session: Option<&SessionSummary>,
+    role: &str,
+    provider: &str,
+    model: &str,
+    base_url: &str,
+) -> Option<WorkspaceProfileSummary> {
+    let preferred_profile_id = session
+        .and_then(|session| {
+            (!session.profile_id.trim().is_empty()).then_some(session.profile_id.as_str())
+        })
+        .unwrap_or(workspace.default_profile_id.as_str());
+    let matches = |profile: &&WorkspaceProfileSummary| {
+        let config = if role == MAIN_EXECUTOR_LANE {
+            &profile.main
+        } else {
+            &profile.utility
+        };
+        workspace_model_matches_target(config, provider, model, base_url)
+    };
+
+    workspace
+        .profiles
+        .iter()
+        .find(|profile| profile.id == preferred_profile_id && matches(profile))
+        .or_else(|| workspace.profiles.iter().find(matches))
+        .cloned()
 }
 
 fn workspace_model_matches_target(
@@ -17348,6 +17497,70 @@ fn child_worker_capabilities() -> Vec<ToolCapabilityGrantRecord> {
     read_only_capabilities()
 }
 
+fn child_worker_capabilities_for_lane(
+    parent_worker: &WorkerSummary,
+    lane: &str,
+) -> Vec<ToolCapabilityGrantRecord> {
+    if lane == MAIN_EXECUTOR_LANE {
+        parent_worker
+            .capabilities
+            .iter()
+            .filter(|capability| !capability.tool_id.starts_with("browser."))
+            .map(tool_capability_summary_to_grant)
+            .collect()
+    } else {
+        let read_only_tool_ids = child_worker_capabilities()
+            .into_iter()
+            .map(|grant| grant.tool_id)
+            .collect::<BTreeSet<_>>();
+        parent_worker
+            .capabilities
+            .iter()
+            .filter(|capability| read_only_tool_ids.contains(&capability.tool_id))
+            .map(tool_capability_summary_to_grant)
+            .collect()
+    }
+}
+
+fn tool_capability_summary_to_grant(
+    capability: &nucleus_protocol::ToolCapabilitySummary,
+) -> ToolCapabilityGrantRecord {
+    ToolCapabilityGrantRecord {
+        tool_id: capability.tool_id.clone(),
+        summary: capability.summary.clone(),
+        approval_mode: capability.approval_mode.clone(),
+        risk_level: capability.risk_level.clone(),
+        side_effect_level: capability.side_effect_level.clone(),
+        timeout_secs: capability.timeout_secs,
+        max_output_bytes: capability.max_output_bytes,
+        supports_streaming: capability.supports_streaming,
+        concurrency_group: capability.concurrency_group.clone(),
+        scope_kind: capability.scope_kind.clone(),
+    }
+}
+
+fn child_worker_write_roots(
+    parent_worker: &WorkerSummary,
+    lane: &str,
+    working_dir: &Path,
+    working_dir_was_requested: bool,
+) -> Result<Vec<String>> {
+    if lane != MAIN_EXECUTOR_LANE || parent_worker.write_roots.is_empty() {
+        return Ok(Vec::new());
+    }
+    if working_dir_was_requested {
+        let scoped = resolve_scoped_path_in_roots(
+            parent_worker,
+            &working_dir.display().to_string(),
+            &parent_worker.write_roots,
+            false,
+            "write",
+        )?;
+        return Ok(vec![scoped.display().to_string()]);
+    }
+    Ok(parent_worker.write_roots.clone())
+}
+
 fn read_only_capabilities() -> Vec<ToolCapabilityGrantRecord> {
     vec![
         ToolCapabilityGrantRecord {
@@ -17925,7 +18138,8 @@ Working directory: {}\n",
 - Do not do heavy implementation or deep reasoning yourself when the work can be bounded for a child worker.\n\
 - Use spawn_child_jobs for heavy implementation, multi-step investigation, broad search, or work that benefits from the main session model. A child with no route_id uses the main lane and the session main model.\n\
 - Use route_id=\"utility\" only for cheap deterministic child checks that should stay on the utility lane.\n\
-- Only root workers may fan out child jobs, and child jobs must stay read-only.\n\
+- Only root workers may fan out child jobs. Main-lane children inherit your granted tool set and bounded write scope; utility children are for read-only checks.\n\
+- When spawning write-capable sibling children, give each child a dedicated working_dir inside your scope so its write root and lock are narrowed to that path.\n\
 - Use at most 5 child jobs in a single spawn_child_jobs action.\n"
     } else {
         ""
@@ -18670,6 +18884,154 @@ mod tests {
     }
 
     #[test]
+    fn main_child_capabilities_are_inherited_from_parent_without_upgrade() {
+        let mut read_only_parent = test_worker_summary("read-only-parent", 10, 10);
+        read_only_parent.capabilities = grant_records_to_summaries(read_only_capabilities());
+
+        let main_read_only =
+            child_worker_capabilities_for_lane(&read_only_parent, MAIN_EXECUTOR_LANE);
+        assert!(
+            main_read_only
+                .iter()
+                .any(|grant| grant.tool_id == "fs.read_text")
+        );
+        assert!(
+            !main_read_only
+                .iter()
+                .any(|grant| grant.tool_id == "fs.write_text")
+        );
+        assert!(
+            !main_read_only
+                .iter()
+                .any(|grant| grant.tool_id == "command.run")
+        );
+
+        let mut command_parent = test_worker_summary("command-parent", 10, 10);
+        command_parent.capabilities =
+            grant_records_to_summaries(capabilities_for_policy_bundle("command_runner"));
+        let main_command = child_worker_capabilities_for_lane(&command_parent, MAIN_EXECUTOR_LANE);
+        assert!(
+            main_command
+                .iter()
+                .any(|grant| grant.tool_id == "command.run")
+        );
+        assert!(
+            !main_command
+                .iter()
+                .any(|grant| grant.tool_id == "fs.write_text")
+        );
+        assert!(
+            !main_command
+                .iter()
+                .any(|grant| grant.tool_id == "browser.navigate")
+        );
+
+        let utility_child =
+            child_worker_capabilities_for_lane(&command_parent, ACTION_EXECUTOR_LANE);
+        assert!(
+            utility_child
+                .iter()
+                .any(|grant| grant.tool_id == "fs.read_text")
+        );
+        assert!(
+            !utility_child
+                .iter()
+                .any(|grant| grant.tool_id == "command.run")
+        );
+        assert!(
+            !utility_child
+                .iter()
+                .any(|grant| grant.tool_id == "browser.navigate")
+        );
+    }
+
+    #[test]
+    fn main_child_capabilities_do_not_inherit_shared_browser_controls() {
+        let mut parent = test_worker_summary("browser-parent", 10, 10);
+        parent.capabilities =
+            grant_records_to_summaries(capabilities_for_policy_bundle("full_agent"));
+
+        let child = child_worker_capabilities_for_lane(&parent, MAIN_EXECUTOR_LANE);
+        assert!(child.iter().any(|grant| grant.tool_id == "fs.write_text"));
+        assert!(child.iter().any(|grant| grant.tool_id == "command.run"));
+        assert!(!child.iter().any(|grant| grant.tool_id == "browser.context"));
+        assert!(
+            !child
+                .iter()
+                .any(|grant| grant.tool_id == "browser.navigate")
+        );
+        assert!(!child.iter().any(|grant| grant.tool_id == "browser.click"));
+    }
+
+    #[test]
+    fn main_child_write_roots_narrow_to_requested_working_dir() {
+        let state_dir = test_state_dir("child-write-roots-narrow");
+        let workspace_root = state_dir.join("workspace");
+        let child_root = workspace_root.join("child-a");
+        let outside_root = state_dir.join("outside");
+        fs::create_dir_all(&child_root).expect("child root should exist");
+        fs::create_dir_all(&outside_root).expect("outside root should exist");
+        let mut parent = test_worker_summary("write-root-parent", 10, 10);
+        parent.working_dir = workspace_root.display().to_string();
+        parent.read_roots = vec![workspace_root.display().to_string()];
+        parent.write_roots = vec![workspace_root.display().to_string()];
+
+        assert_eq!(
+            child_worker_write_roots(&parent, MAIN_EXECUTOR_LANE, &workspace_root, false)
+                .expect("inherited write roots should resolve"),
+            vec![workspace_root.display().to_string()]
+        );
+        assert_eq!(
+            child_worker_write_roots(&parent, MAIN_EXECUTOR_LANE, &child_root, true)
+                .expect("narrowed write root should resolve"),
+            vec![child_root.display().to_string()]
+        );
+        assert!(
+            child_worker_write_roots(&parent, MAIN_EXECUTOR_LANE, &outside_root, true).is_err()
+        );
+        assert!(
+            child_worker_write_roots(&parent, ACTION_EXECUTOR_LANE, &child_root, true)
+                .expect("utility child write roots should resolve")
+                .is_empty()
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn main_child_fanout_requires_working_dirs_for_write_scope() {
+        let mut parent = test_worker_summary("fanout-write-parent", 10, 10);
+        parent.write_roots = vec!["/tmp/nucleus-test".to_string()];
+        let mut jobs = vec![
+            ChildJobProposal {
+                title: "First".to_string(),
+                prompt: "first child".to_string(),
+                task_class: None,
+                working_dir: None,
+                route_id: None,
+            },
+            ChildJobProposal {
+                title: "Second".to_string(),
+                prompt: "second child".to_string(),
+                task_class: None,
+                working_dir: None,
+                route_id: None,
+            },
+        ];
+        let child_plans = vec![test_child_target_plan(MAIN_EXECUTOR_LANE); 2];
+
+        let error = validate_child_fanout_write_scopes(&parent, &jobs, &child_plans)
+            .expect_err("main sibling fan-out without workdirs should be rejected");
+        assert!(error.to_string().contains("worker_action.invalid"));
+        assert!(error.to_string().contains("working_dir"));
+
+        jobs[0].working_dir = Some("child-0".to_string());
+        jobs[1].working_dir = Some("child-1".to_string());
+        validate_child_fanout_write_scopes(&parent, &jobs, &child_plans)
+            .expect("dedicated child workdirs should be accepted");
+    }
+
+    #[test]
     fn browser_capabilities_cover_ref_based_actions() {
         let ids = browser_capabilities()
             .into_iter()
@@ -18833,6 +19195,8 @@ mod tests {
 
         assert!(root_prompt.contains("spawn_child_jobs"));
         assert!(!child_prompt.contains("spawn_child_jobs"));
+        assert!(root_prompt.contains("Main-lane children inherit your granted tool set"));
+        assert!(!root_prompt.contains("child jobs must stay read-only"));
         assert!(root_prompt.contains("{\"kind\":\"final_answer\""));
         assert!(root_prompt.contains("Nucleus worker action JSON contract"));
         assert!(root_prompt.contains("Think briefly in the thoughts field first"));
@@ -23018,6 +23382,70 @@ Thanks."#,
         let _ = fs::remove_dir_all(&state_dir);
     }
 
+    #[test]
+    fn main_child_non_streaming_transport_updates_main_profile() {
+        let state_dir = test_state_dir("main-child-non-streaming-profile");
+        let state = initialize_test_state(&state_dir);
+        let base_url = "http://127.0.0.1:43210/v1";
+        let workspace = state.store.workspace().expect("workspace should load");
+        let profile = workspace
+            .profiles
+            .into_iter()
+            .find(|profile| profile.id == workspace.default_profile_id)
+            .expect("default profile should exist");
+        let target = WorkspaceModelConfig {
+            adapter: "openai_compatible".to_string(),
+            model: "shared-target-model".to_string(),
+            base_url: base_url.to_string(),
+            api_key: "test-key".to_string(),
+            json_object: Default::default(),
+            transport: ModelTransportCapability::Unknown,
+            action_contract: Default::default(),
+        };
+        state
+            .store
+            .update_workspace_profile(
+                &profile.id,
+                nucleus_storage::WorkspaceProfilePatch {
+                    title: profile.title,
+                    main: target.clone(),
+                    utility: target,
+                    is_default: true,
+                },
+            )
+            .expect("default profile should update");
+
+        let mut worker = test_worker_summary("main-non-streaming-child", 10, 10);
+        worker.lane = MAIN_EXECUTOR_LANE.to_string();
+        worker.provider = "openai_compatible".to_string();
+        worker.model = "shared-target-model".to_string();
+        worker.provider_base_url = base_url.to_string();
+        record_successful_worker_transport_capability(
+            &state,
+            None,
+            &worker,
+            &ProviderTurnResult {
+                provider_session_id: String::new(),
+                content: String::new(),
+                transport: ProviderTurnTransport::NonStreaming,
+            },
+        );
+
+        let workspace = state.store.workspace().expect("workspace should reload");
+        let profile = workspace
+            .profiles
+            .into_iter()
+            .find(|profile| profile.id == workspace.default_profile_id)
+            .expect("default profile should exist");
+        assert_eq!(
+            profile.main.transport,
+            ModelTransportCapability::NonStreaming
+        );
+        assert_eq!(profile.utility.transport, ModelTransportCapability::Unknown);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
     #[tokio::test]
     async fn call_worker_model_empty_completed_stream_fails_fast_without_main_fallback() {
         let state_dir = test_state_dir("worker-provider-empty-fast-fail");
@@ -23301,6 +23729,106 @@ Thanks."#,
         ));
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         assert_utility_model_requests(&request_bodies, "utility-slow-stream-model", &main_model);
+
+        server.await.expect("test server should finish");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn call_worker_model_slow_streaming_main_subworker_uses_main_timeout() {
+        let state_dir = test_state_dir("worker-provider-main-subworker-slow-stream");
+        let state = initialize_test_state(&state_dir);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener addr should be available")
+        );
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_bodies = Arc::new(TestMutex::new(Vec::new()));
+        let server_request_count = request_count.clone();
+        let server_request_bodies = request_bodies.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("test request should connect");
+            let body = read_test_http_body(&mut socket).await;
+            server_request_bodies
+                .lock()
+                .expect("request bodies lock should not be poisoned")
+                .push(body);
+            server_request_count.fetch_add(1, Ordering::SeqCst);
+
+            write_test_openai_sse_headers(&mut socket).await;
+            write_test_openai_sse_chunk(
+                &mut socket,
+                "main-slow-stream-turn",
+                r#"{"kind":"final_answer","#,
+            )
+            .await;
+            tokio::time::sleep(Duration::from_secs(17)).await;
+            write_test_openai_sse_chunk(
+                &mut socket,
+                "main-slow-stream-turn",
+                r#""summary":"main stream","final_answer":"Main child survived the pause."}"#,
+            )
+            .await;
+            write_test_openai_sse_done(&mut socket).await;
+        });
+
+        let session_id = "main-subworker-slow-stream-session".to_string();
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace root should exist");
+        let mut session_record =
+            test_session_record(&session_id, "Main subworker slow stream", &workspace_root);
+        session_record.model = "main-slow-stream-model".to_string();
+        session_record.provider_base_url = base_url.clone();
+        session_record.provider_api_key = "main-key".to_string();
+        state
+            .store
+            .create_session(session_record)
+            .expect("session should persist");
+        let session = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        let mut worker = test_worker_summary("provider-main-subworker-slow-stream", 10, 10);
+        worker.parent_worker_id = Some("utility-parent".to_string());
+        worker.lane = MAIN_EXECUTOR_LANE.to_string();
+        worker.provider_base_url = base_url;
+        worker.model = "main-slow-stream-model".to_string();
+        worker.working_dir = workspace_root.display().to_string();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let response = call_worker_model(
+            &state,
+            Some(&session.session),
+            &worker,
+            &[],
+            "Ping.",
+            &[],
+            false,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("main subworker slow stream should not use the utility idle timeout");
+
+        assert!(matches!(
+            response.action,
+            WorkerAction::FinalAnswer { final_answer, .. } if final_answer == "Main child survived the pause."
+        ));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        let bodies = request_bodies
+            .lock()
+            .expect("request bodies lock should not be poisoned");
+        assert_eq!(bodies.len(), 1);
+        let payload: Value = serde_json::from_str(&bodies[0]).expect("request body should be JSON");
+        assert_eq!(payload["model"].as_str(), Some("main-slow-stream-model"));
+        drop(bodies);
 
         server.await.expect("test server should finish");
         let _ = fs::remove_dir_all(&state_dir);
@@ -28244,7 +28772,7 @@ Thanks."#,
         .expect_err("main lane root must not execute actions");
         assert!(execute_error.to_string().contains("spawned sub-worker"));
 
-        let utility_parent = state
+        let mut utility_parent = state
             .store
             .create_worker(WorkerRecord {
                 id: "worker-utility-parent".to_string(),
@@ -28268,6 +28796,7 @@ Thanks."#,
                 max_wall_clock_secs: 30,
             })
             .expect("utility parent should persist");
+        utility_parent.capabilities = grant_records_to_summaries(root_worker_capabilities());
         let mut child_worker = state
             .store
             .create_worker(WorkerRecord {
@@ -28294,8 +28823,23 @@ Thanks."#,
             .expect("main subworker should persist");
         child_worker.capabilities = state
             .store
-            .replace_tool_capability_grants(&child_worker.id, &child_worker_capabilities())
+            .replace_tool_capability_grants(
+                &child_worker.id,
+                &child_worker_capabilities_for_lane(&utility_parent, MAIN_EXECUTOR_LANE),
+            )
             .expect("main subworker should receive action grants");
+        assert!(
+            child_worker
+                .capabilities
+                .iter()
+                .any(|grant| grant.tool_id == "command.run")
+        );
+        assert!(
+            child_worker
+                .capabilities
+                .iter()
+                .any(|grant| grant.tool_id == "fs.write_text")
+        );
 
         let result = execute_granted_tool(
             &state,
@@ -29044,6 +29588,7 @@ Thanks."#,
         let state_dir = test_state_dir("spawn-child-jobs-five-way");
         let state = initialize_test_state(&state_dir);
         let workspace_root = state_dir.join("workspace");
+        create_child_workdirs(&workspace_root, 5);
         let spawn_action = spawn_child_jobs_action_json(5, None, "fanout-child");
         let (base_url, request_count, _bodies, server) =
             spawn_dynamic_openai_server(7, move |index, _body| {
@@ -29246,6 +29791,157 @@ Thanks."#,
     }
 
     #[tokio::test]
+    async fn delegated_main_child_write_inherits_scope_and_stays_approval_gated() {
+        let state_dir = test_state_dir("spawn-child-jobs-main-write-approval");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace root should exist");
+        let target_file = workspace_root.join("delegated.txt");
+        let spawn_action = json!({
+            "kind": "spawn_child_jobs",
+            "summary": "delegate implementation",
+            "jobs": [
+                {"title": "Write File", "prompt": "write delegated.txt", "working_dir": null}
+            ],
+        })
+        .to_string();
+        let (utility_base_url, utility_count, _utility_bodies, utility_server) =
+            spawn_dynamic_openai_server(2, move |index, _body| {
+                if index == 0 {
+                    DynamicOpenAiProviderResponse::content(spawn_action.clone())
+                } else {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"final_answer","summary":"joined","final_answer":"Joined delegated write."}"#,
+                    )
+                }
+            })
+            .await;
+        let (main_base_url, main_count, main_bodies, main_server) =
+            spawn_dynamic_openai_server(2, move |index, _body| {
+                if index == 0 {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"tool_call","summary":"write delegated file","tool":"fs.write_text","args":{"path":"delegated.txt","content":"delegated child wrote this\n","create_parent_dirs":false}}"#,
+                    )
+                } else {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"final_answer","summary":"child done","final_answer":"Wrote delegated.txt."}"#,
+                    )
+                }
+            })
+            .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-write-delegator-model",
+            &utility_base_url,
+            "utility-key",
+        );
+        let session_id = "spawn-child-jobs-main-write-session".to_string();
+        let mut session_record =
+            test_session_record(&session_id, "Spawn child jobs main write", &workspace_root);
+        session_record.model = "session-main-write-model".to_string();
+        session_record.provider_base_url = main_base_url.clone();
+        session_record.provider_api_key = "main-key".to_string();
+        session_record.approval_mode = "ask".to_string();
+        state
+            .store
+            .create_session(session_record)
+            .expect("session should persist");
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            SessionPromptRequest {
+                prompt: "delegate a write to main".to_string(),
+                images: vec![],
+                task_class: None,
+                role: "main".to_string(),
+            },
+            current,
+            "delegate a write to main".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("prompt should queue");
+
+        let _paused = wait_for_session_state(&state, &session_id, "paused").await;
+        assert_eq!(utility_count.load(Ordering::SeqCst), 1);
+        assert_eq!(main_count.load(Ordering::SeqCst), 1);
+        assert!(!target_file.exists(), "write must wait for approval");
+        let approvals = state
+            .store
+            .list_pending_approvals()
+            .expect("pending approvals should load");
+        assert_eq!(approvals.len(), 1);
+        let approval = approvals.first().expect("approval should exist");
+        assert_eq!(approval.policy_decision.decision, "require_approval");
+        assert_eq!(
+            approval.policy_decision.matched_rule,
+            "approval:mutation:fs.write_text"
+        );
+        assert_eq!(approval.risk_level, "medium");
+
+        resolve_approval_request(
+            state.clone(),
+            approval.id.clone(),
+            true,
+            Some("approve delegated write".to_string()),
+        )
+        .await
+        .expect("approval should resume child job");
+        let _ = wait_for_session_state(&state, &session_id, "active").await;
+        utility_server.await.expect("utility server should finish");
+        main_server.await.expect("main server should finish");
+        assert_eq!(utility_count.load(Ordering::SeqCst), 2);
+        assert_eq!(main_count.load(Ordering::SeqCst), 2);
+        assert!(main_bodies.lock().unwrap()[0].contains("write delegated.txt"));
+        assert_eq!(
+            fs::read_to_string(&target_file).expect("delegated write should persist"),
+            "delegated child wrote this\n"
+        );
+
+        let parent = latest_job_detail(&state, &session_id);
+        assert_eq!(parent.job.state, "completed");
+        assert_eq!(parent.child_jobs.len(), 1);
+        let child = parent.child_jobs.first().expect("child job should exist");
+        assert_eq!(child.executor_lane, MAIN_EXECUTOR_LANE);
+        let child_detail = state.store.get_job(&child.id).expect("child should load");
+        let child_worker = child_detail
+            .workers
+            .first()
+            .expect("child worker should exist");
+        assert_eq!(child_worker.lane, MAIN_EXECUTOR_LANE);
+        assert_eq!(
+            child_worker.write_roots,
+            vec![workspace_root.display().to_string()]
+        );
+        assert!(
+            child_worker
+                .capabilities
+                .iter()
+                .any(|grant| grant.tool_id == "fs.write_text")
+        );
+        assert!(
+            child_worker
+                .capabilities
+                .iter()
+                .any(|grant| grant.tool_id == "command.run")
+        );
+        assert!(child_detail.events.iter().any(|event| {
+            event.event_type == "approval.requested" && event.summary.contains("fs.write_text")
+        }));
+        assert!(child_detail.events.iter().any(|event| {
+            event.event_type == "tool.completed" && event.summary.contains("fs.write_text")
+        }));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
     async fn spawn_child_jobs_unknown_route_fails_before_child_creation() {
         let state_dir = test_state_dir("spawn-child-jobs-unknown-route");
         let state = initialize_test_state(&state_dir);
@@ -29287,6 +29983,39 @@ Thanks."#,
         assert!(error.to_string().contains("unknown router profile"));
         assert_eq!(state.store.get_job(&job_id).unwrap().child_jobs.len(), 0);
         assert_eq!(step, 0);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn spawn_child_jobs_default_main_unavailable_fails_with_route_guidance() {
+        let state_dir = test_state_dir("spawn-child-jobs-main-unavailable");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let (mut session, _job_id, _worker) =
+            create_parent_fanout_context(&state, "main-unavailable", &workspace_root, "");
+        session.session.provider = "missing-provider".to_string();
+        session.session.model = "missing-model".to_string();
+
+        let error = resolve_child_job_target_plan(
+            &state,
+            &session.session,
+            &ChildJobProposal {
+                title: "Default main".to_string(),
+                prompt: "use default main".to_string(),
+                task_class: None,
+                working_dir: None,
+                route_id: None,
+            },
+        )
+        .await
+        .expect_err("unavailable default main child should fail before child creation");
+
+        let detail = error.to_string();
+        assert!(detail.contains("worker_action.invalid"));
+        assert!(detail.contains("default main child route is unavailable"));
+        assert!(detail.contains("route_id=\"utility\""));
+        assert!(detail.contains("no automatic fallback"));
 
         let _ = fs::remove_dir_all(&state_dir);
     }
@@ -29402,13 +30131,14 @@ Thanks."#,
         let state_dir = test_state_dir("spawn-child-jobs-mixed-routes");
         let state = initialize_test_state(&state_dir);
         let workspace_root = state_dir.join("workspace");
+        create_child_workdirs(&workspace_root, 3);
         let spawn_action = json!({
             "kind": "spawn_child_jobs",
             "summary": "fan out to three routes",
             "jobs": [
-                {"title": "Route A", "prompt": "route-a-child", "working_dir": null, "route_id": "route-a"},
-                {"title": "Route B", "prompt": "route-b-child", "working_dir": null, "route_id": "route-b"},
-                {"title": "Route C", "prompt": "route-c-child", "working_dir": null, "route_id": "route-c"}
+                {"title": "Route A", "prompt": "route-a-child", "working_dir": "child-0", "route_id": "route-a"},
+                {"title": "Route B", "prompt": "route-b-child", "working_dir": "child-1", "route_id": "route-b"},
+                {"title": "Route C", "prompt": "route-c-child", "working_dir": "child-2", "route_id": "route-c"}
             ],
         })
         .to_string();
@@ -29573,12 +30303,13 @@ Thanks."#,
         let state_dir = test_state_dir("spawn-child-jobs-route-inherit");
         let state = initialize_test_state(&state_dir);
         let workspace_root = state_dir.join("workspace");
+        create_child_workdirs(&workspace_root, 2);
         let spawn_action = json!({
             "kind": "spawn_child_jobs",
             "summary": "fan out with mixed routing",
             "jobs": [
-                {"title": "Explicit", "prompt": "explicit-child", "working_dir": null, "route_id": "explicit-route"},
-                {"title": "Default Main", "prompt": "default-main-child", "working_dir": null},
+                {"title": "Explicit", "prompt": "explicit-child", "working_dir": "child-0", "route_id": "explicit-route"},
+                {"title": "Default Main", "prompt": "default-main-child", "working_dir": "child-1"},
                 {"title": "Utility", "prompt": "utility-child", "working_dir": null, "route_id": "utility"}
             ],
         })
@@ -29738,6 +30469,7 @@ Thanks."#,
         let state_dir = test_state_dir("spawn-child-jobs-cancel-cascade");
         let state = initialize_test_state(&state_dir);
         let workspace_root = state_dir.join("workspace");
+        create_child_workdirs(&workspace_root, 3);
         let spawn_action = spawn_child_jobs_action_json(3, None, "cancel-child");
         let (base_url, _request_count, _bodies, server) =
             spawn_dynamic_openai_server(4, move |index, _body| {
@@ -32060,7 +32792,7 @@ for line in sys.stdin:
                 json!({
                     "title": format!("Child {index}"),
                     "prompt": prompt,
-                    "working_dir": null,
+                    "working_dir": format!("child-{index}"),
                 })
             })
             .collect::<Vec<_>>();
@@ -32070,6 +32802,27 @@ for line in sys.stdin:
             "jobs": jobs,
         })
         .to_string()
+    }
+
+    fn create_child_workdirs(workspace_root: &Path, count: usize) {
+        for index in 0..count {
+            fs::create_dir_all(workspace_root.join(format!("child-{index}")))
+                .expect("child workdir should exist");
+        }
+    }
+
+    fn test_child_target_plan(lane: &str) -> ChildJobTargetPlan {
+        ChildJobTargetPlan {
+            lane: lane.to_string(),
+            target: HiddenWorkerTarget {
+                provider: "openai_compatible".to_string(),
+                model: "test-model".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: "test-key".to_string(),
+            },
+        }
     }
 
     fn create_manual_child_jobs(
@@ -32179,7 +32932,7 @@ for line in sys.stdin:
             })
             .expect("parent job should persist");
         let worker_id = format!("{label}-parent-worker");
-        let worker = state
+        let created_worker = state
             .store
             .create_worker(WorkerRecord {
                 id: worker_id.clone(),
@@ -32203,6 +32956,18 @@ for line in sys.stdin:
                 max_wall_clock_secs: 300,
             })
             .expect("parent worker should persist");
+        state
+            .store
+            .replace_tool_capability_grants(&created_worker.id, &root_worker_capabilities())
+            .expect("parent worker capabilities should persist");
+        let worker = state
+            .store
+            .get_job(&job_id)
+            .expect("parent job should reload")
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.id == created_worker.id)
+            .expect("parent worker should reload with capabilities");
         state
             .store
             .update_job(
