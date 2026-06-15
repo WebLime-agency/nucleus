@@ -1053,6 +1053,13 @@ impl StateStore {
             .collect())
     }
 
+    pub fn set_system_jobs_unit_globs(&self, globs: &[String]) -> Result<()> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let payload = serde_json::to_string(globs)
+            .context("failed to serialize system jobs unit allowlist")?;
+        set_setting_value(&connection, SYSTEM_JOBS_UNIT_GLOBS_KEY, &payload)
+    }
+
     pub fn list_runtimes(&self) -> Result<Vec<RuntimeSummary>> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         let mut statement = connection.prepare(
@@ -10460,6 +10467,35 @@ mod tests {
         let output = String::from_utf8(logs.lock().expect("log capture mutex poisoned").clone())
             .expect("captured logs should be utf-8");
         (result, output)
+    }
+
+    #[test]
+    fn system_jobs_unit_globs_round_trip_through_settings() {
+        let state_dir = test_state_dir("system-jobs-unit-globs");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+
+        assert!(
+            store
+                .system_jobs_unit_globs()
+                .expect("missing allowlist loads")
+                .is_empty()
+        );
+
+        store
+            .set_system_jobs_unit_globs(&[
+                "placeholder-cleanup.timer".to_string(),
+                "placeholder-*.timer".to_string(),
+            ])
+            .expect("allowlist stores");
+
+        let reopened = StateStore::initialize_at(&state_dir).expect("store should reopen");
+        assert_eq!(
+            reopened.system_jobs_unit_globs().expect("allowlist loads"),
+            vec![
+                "placeholder-cleanup.timer".to_string(),
+                "placeholder-*.timer".to_string(),
+            ]
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ import {
   instanceLogListResponseSchema,
   jobDetailSchema,
   jobSummarySchema,
+  localJobsAllowlistSchema,
   localJobDetailSchema,
   localJobSummarySchema,
   mcpServerRecordSchema,
@@ -235,6 +236,35 @@ export async function fetchLocalJobs(fetchImpl: FetchLike = fetch) {
       headers: { accept: 'application/json' }
     }),
     z.array(localJobSummarySchema)
+  );
+}
+
+export async function fetchAvailableLocalJobs(fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/system/jobs/available', {
+      headers: { accept: 'application/json' }
+    }),
+    z.array(localJobSummarySchema)
+  );
+}
+
+export async function fetchLocalJobsAllowlist(fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/system/jobs/allowlist', {
+      headers: { accept: 'application/json' }
+    }),
+    localJobsAllowlistSchema
+  );
+}
+
+export async function updateLocalJobsAllowlist(globs: string[], fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/system/jobs/allowlist', {
+      method: 'PUT',
+      headers: { accept: 'application/json', 'content-type': 'application/json' },
+      body: JSON.stringify({ globs })
+    }),
+    localJobsAllowlistSchema
   );
 }
 

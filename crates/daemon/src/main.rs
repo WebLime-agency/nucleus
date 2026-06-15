@@ -50,10 +50,11 @@ use nucleus_protocol::{
     CompiledPromptLayer, CompiledTurn, ConnectionSummary, CreatePlaybookRequest,
     CreateSessionRequest, DaemonEvent, HealthResponse, HostStatus, InstanceLogCategoriesResponse,
     InstanceLogListResponse, JobDetail, JobSummary, LocalJobDetail, LocalJobSummary,
-    MAX_CONFIGURED_JOB_STEPS, MAX_CONFIGURED_JOB_TOOL_CALLS, MAX_CONFIGURED_JOB_WALL_CLOCK_SECS,
-    McpServerRecord, McpServerSummary, McpToolRecord, MemoryCandidate,
-    MemoryCandidateAcceptRequest, MemoryCandidateListResponse, MemoryCandidateUpsertRequest,
-    MemoryEntry, MemoryEntryUpsertRequest, MemoryOutcome, MemorySearchResponse, MemorySummary,
+    LocalJobsAllowlistRequest, LocalJobsAllowlistResponse, MAX_CONFIGURED_JOB_STEPS,
+    MAX_CONFIGURED_JOB_TOOL_CALLS, MAX_CONFIGURED_JOB_WALL_CLOCK_SECS, McpServerRecord,
+    McpServerSummary, McpToolRecord, MemoryCandidate, MemoryCandidateAcceptRequest,
+    MemoryCandidateListResponse, MemoryCandidateUpsertRequest, MemoryEntry,
+    MemoryEntryUpsertRequest, MemoryOutcome, MemorySearchResponse, MemorySummary,
     ModelActionContractCapability, ModelJsonObjectCapability, ModelTransportCapability,
     NucleusToolDescriptor, PlaybookDetail, PlaybookSummary, ProcessKillRequest,
     ProcessKillResponse, ProcessListResponse, ProfileCheckOutcome, ProfileCheckRequest,
@@ -143,6 +144,7 @@ struct LocalJobsStreamCache {
 
 static LOCAL_JOBS_STREAM_CACHE: OnceLock<tokio::sync::Mutex<LocalJobsStreamCache>> =
     OnceLock::new();
+const SYSTEM_JOBS_ALLOWLIST_MAX_GLOBS: usize = 200;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -413,6 +415,11 @@ fn app(state: AppState) -> Router {
         )
         .route("/host-status", get(host_status))
         .route("/system/jobs", get(local_jobs))
+        .route("/system/jobs/available", get(available_local_jobs))
+        .route(
+            "/system/jobs/allowlist",
+            get(local_jobs_allowlist).put(update_local_jobs_allowlist),
+        )
         .route("/system/jobs/{unit}", get(local_job_detail))
         .route(
             "/system/jobs/{unit}/enable",
@@ -5111,6 +5118,69 @@ async fn local_jobs(State(state): State<AppState>) -> Result<Json<Vec<LocalJobSu
         .map_err(map_system_job_error)?
         .unwrap_or_default();
     Ok(Json(jobs))
+}
+
+async fn available_local_jobs(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<LocalJobSummary>>, ApiError> {
+    let allowlist = state.store.system_jobs_unit_globs()?;
+    let jobs = system_jobs::SystemScheduler::systemd_user()
+        .available_jobs(&allowlist)
+        .await
+        .map_err(map_system_job_error)?;
+    Ok(Json(jobs))
+}
+
+async fn local_jobs_allowlist(
+    State(state): State<AppState>,
+) -> Result<Json<LocalJobsAllowlistResponse>, ApiError> {
+    Ok(Json(LocalJobsAllowlistResponse {
+        globs: state.store.system_jobs_unit_globs()?,
+    }))
+}
+
+async fn update_local_jobs_allowlist(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<LocalJobsAllowlistResponse>, ApiError> {
+    let payload = decode_json::<LocalJobsAllowlistRequest>(&body)?;
+    let globs = normalize_system_jobs_unit_globs(payload.globs)?;
+    state.store.set_system_jobs_unit_globs(&globs)?;
+    let _ = try_record_audit_event(
+        &state,
+        AuditEventRecord {
+            kind: "system_job.allowlist.updated".to_string(),
+            target: "system_job_allowlist".to_string(),
+            status: "success".to_string(),
+            summary: "Local system job allowlist updated.".to_string(),
+            detail: format!("{} entries", globs.len()),
+        },
+    )
+    .await;
+    if globs.is_empty() {
+        let _ = state.events.send(DaemonEvent::LocalJobsUpdated(Vec::new()));
+    } else if let Err(error) = publish_local_jobs_event(&state, true).await {
+        warn!(error = %error, "failed to publish local job state after allowlist update");
+    }
+    Ok(Json(LocalJobsAllowlistResponse { globs }))
+}
+
+fn normalize_system_jobs_unit_globs(globs: Vec<String>) -> Result<Vec<String>, ApiError> {
+    let mut seen = BTreeSet::new();
+    let mut normalized = Vec::new();
+    for glob in globs {
+        let glob = glob.trim().to_string();
+        if glob.is_empty() || !seen.insert(glob.clone()) {
+            continue;
+        }
+        normalized.push(glob);
+    }
+    if normalized.len() > SYSTEM_JOBS_ALLOWLIST_MAX_GLOBS {
+        return Err(ApiError::bad_request(format!(
+            "system job allowlist cannot contain more than {SYSTEM_JOBS_ALLOWLIST_MAX_GLOBS} entries"
+        )));
+    }
+    Ok(normalized)
 }
 
 async fn local_job_detail(
@@ -10270,6 +10340,37 @@ mod tests {
             transport: Default::default(),
             action_contract: Default::default(),
         }
+    }
+
+    #[test]
+    fn normalizes_system_jobs_unit_globs_for_put_payloads() {
+        let normalized = normalize_system_jobs_unit_globs(vec![
+            " placeholder-cleanup.timer ".to_string(),
+            "".to_string(),
+            "placeholder-cleanup.timer".to_string(),
+            "placeholder-*.timer".to_string(),
+        ])
+        .expect("allowlist normalizes");
+
+        assert_eq!(
+            normalized,
+            vec![
+                "placeholder-cleanup.timer".to_string(),
+                "placeholder-*.timer".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_system_jobs_unit_globs_above_cap() {
+        let globs = (0..=SYSTEM_JOBS_ALLOWLIST_MAX_GLOBS)
+            .map(|index| format!("placeholder-{index}.timer"))
+            .collect();
+
+        let error = normalize_system_jobs_unit_globs(globs).expect_err("cap should reject");
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("cannot contain more than"));
     }
 
     fn set_default_profile_model_target(

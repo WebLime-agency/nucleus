@@ -425,6 +425,7 @@ export const localJobSummarySchema = z.object({
   unit: z.string(),
   title: z.string(),
   backend: z.literal('systemd-user'),
+  managed: z.boolean().default(false),
   enabled: z.boolean(),
   unit_file_state: z.string().default('unknown'),
   manageable: z.boolean().default(true),
@@ -438,6 +439,10 @@ export const localJobSummarySchema = z.object({
 export const localJobDetailSchema = z.object({
   summary: localJobSummarySchema,
   log_tail: z.array(z.string()).default([])
+});
+
+export const localJobsAllowlistSchema = z.object({
+  globs: z.array(z.string()).default([])
 });
 
 export const promptProgressUpdateSchema = z.object({
@@ -1392,6 +1397,7 @@ export type LocalJobSchedule = z.infer<typeof localJobScheduleSchema>;
 export type LocalJobExit = z.infer<typeof localJobExitSchema>;
 export type LocalJobSummary = z.infer<typeof localJobSummarySchema>;
 export type LocalJobDetail = z.infer<typeof localJobDetailSchema>;
+export type LocalJobsAllowlist = z.infer<typeof localJobsAllowlistSchema>;
 export type PromptProgressUpdate = z.infer<typeof promptProgressUpdateSchema>;
 export type ApprovalResolutionRequest = z.infer<typeof approvalResolutionRequestSchema>;
 export type CreatePlaybookRequest = z.infer<typeof createPlaybookRequestSchema>;
