@@ -1,13 +1,17 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    future::Future,
+    pin::Pin,
     process::Stdio,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
 use nucleus_protocol::{LocalJobDetail, LocalJobExit, LocalJobSchedule, LocalJobSummary};
 use tokio::{process::Command, time::timeout};
+use tracing::warn;
 
 const BACKEND_SYSTEMD_USER: &str = "systemd-user";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(12);
@@ -17,6 +21,7 @@ pub enum SystemJobError {
     NotAllowlisted { unit: String },
     InvalidUnit { reason: String },
     UnsupportedTriggeredUnit { unit: String },
+    MissingTriggeredUnit { unit: String },
 }
 
 impl fmt::Display for SystemJobError {
@@ -28,6 +33,12 @@ impl fmt::Display for SystemJobError {
             Self::InvalidUnit { reason } => write!(formatter, "systemd unit {reason}"),
             Self::UnsupportedTriggeredUnit { unit } => {
                 write!(formatter, "triggered unit '{unit}' must end with .service")
+            }
+            Self::MissingTriggeredUnit { unit } => {
+                write!(
+                    formatter,
+                    "system job timer '{unit}' has no triggered service to run"
+                )
             }
         }
     }
@@ -48,6 +59,10 @@ pub struct CommandInvocation {
     pub args: Vec<String>,
 }
 
+type SystemCommandFuture = Pin<Box<dyn Future<Output = Result<CommandOutput>> + Send>>;
+type SystemCommandRunner =
+    Arc<dyn Fn(CommandInvocation, Duration) -> SystemCommandFuture + Send + Sync>;
+
 #[derive(Debug, Clone, Default)]
 pub struct SystemScheduler {
     backend: SystemdUserScheduler,
@@ -56,7 +71,7 @@ pub struct SystemScheduler {
 impl SystemScheduler {
     pub fn systemd_user() -> Self {
         Self {
-            backend: SystemdUserScheduler,
+            backend: SystemdUserScheduler::default(),
         }
     }
 
@@ -84,18 +99,52 @@ impl SystemScheduler {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-struct SystemdUserScheduler;
+#[derive(Clone)]
+struct SystemdUserScheduler {
+    command_runner: SystemCommandRunner,
+}
+
+impl fmt::Debug for SystemdUserScheduler {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SystemdUserScheduler")
+    }
+}
+
+impl Default for SystemdUserScheduler {
+    fn default() -> Self {
+        Self {
+            command_runner: Arc::new(|invocation, timeout_duration| {
+                Box::pin(run_system_command(invocation, timeout_duration))
+            }),
+        }
+    }
+}
 
 impl SystemdUserScheduler {
+    #[cfg(test)]
+    fn with_command_runner<F, Fut>(runner: F) -> Self
+    where
+        F: Fn(CommandInvocation, Duration) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<CommandOutput>> + Send + 'static,
+    {
+        Self {
+            command_runner: Arc::new(move |invocation, timeout_duration| {
+                Box::pin(runner(invocation, timeout_duration))
+            }),
+        }
+    }
+
+    async fn run_command(&self, invocation: CommandInvocation) -> Result<CommandOutput> {
+        (self.command_runner)(invocation, COMMAND_TIMEOUT).await
+    }
+
     async fn list_jobs(&self, allowlist_globs: &[String]) -> Result<Vec<LocalJobSummary>> {
         if allowlist_globs.is_empty() {
             return Ok(Vec::new());
         }
 
-        let loaded_output = run_system_command(list_timers_invocation(), COMMAND_TIMEOUT).await?;
-        let installed_output =
-            run_system_command(list_unit_files_invocation(), COMMAND_TIMEOUT).await?;
+        let loaded_output = self.run_command(list_timers_invocation()).await?;
+        let installed_output = self.run_command(list_unit_files_invocation()).await?;
         let listed_next_elapses = parse_list_timer_next_elapses(&loaded_output.stdout);
         let timer_units = enumerate_timer_units(
             &loaded_output.stdout,
@@ -114,8 +163,9 @@ impl SystemdUserScheduler {
                 .await
             {
                 Ok(summary) => summaries.push(summary),
-                Err(error) if is_unsupported_triggered_unit_error(&error) => continue,
-                Err(error) => return Err(error),
+                Err(error) => {
+                    warn!(unit = %unit, error = %error, "failed to inspect local system job; skipping unit");
+                }
             }
         }
         summaries.sort_by(|left, right| left.unit.cmp(&right.unit));
@@ -126,11 +176,16 @@ impl SystemdUserScheduler {
         validate_timer_unit(unit)?;
         ensure_unit_allowlisted(unit, allowlist_globs)?;
         let summary = self.summary_for_unit(unit, allowlist_globs).await?;
-        let output = run_system_command(
-            journal_tail_invocation(&summary.triggered_unit),
-            COMMAND_TIMEOUT,
-        )
-        .await?;
+        if summary.triggered_unit.is_empty() {
+            return Ok(LocalJobDetail {
+                summary,
+                log_tail: Vec::new(),
+            });
+        }
+
+        let output = self
+            .run_command(journal_tail_invocation(&summary.triggered_unit))
+            .await?;
 
         Ok(LocalJobDetail {
             summary,
@@ -148,14 +203,13 @@ impl SystemdUserScheduler {
         ensure_unit_allowlisted(unit, allowlist_globs)?;
 
         let triggered_unit = if matches!(control, LocalJobControl::Run) {
-            let timer_output =
-                run_system_command(timer_show_invocation(unit), COMMAND_TIMEOUT).await?;
-            parse_triggered_unit(&timer_output.stdout)?
+            let timer_output = self.run_command(timer_show_invocation(unit)).await?;
+            parse_triggered_unit(&timer_output.stdout, unit)?
         } else {
             String::new()
         };
         let invocation = build_control_invocation(control, unit, &triggered_unit, allowlist_globs)?;
-        run_system_command(invocation, COMMAND_TIMEOUT).await?;
+        self.run_command(invocation).await?;
 
         self.summary_for_unit(unit, allowlist_globs).await
     }
@@ -165,7 +219,8 @@ impl SystemdUserScheduler {
         unit: &str,
         allowlist_globs: &[String],
     ) -> Result<LocalJobSummary> {
-        let listed_next_elapse = run_system_command(list_timers_invocation(), COMMAND_TIMEOUT)
+        let listed_next_elapse = self
+            .run_command(list_timers_invocation())
             .await
             .ok()
             .and_then(|output| parse_list_timer_next_elapses(&output.stdout).remove(unit));
@@ -181,14 +236,23 @@ impl SystemdUserScheduler {
     ) -> Result<LocalJobSummary> {
         validate_timer_unit(unit)?;
         ensure_unit_allowlisted(unit, allowlist_globs)?;
-        let timer_output = run_system_command(timer_show_invocation(unit), COMMAND_TIMEOUT).await?;
-        let triggered_unit = parse_triggered_unit(&timer_output.stdout)?;
-        let service_output =
-            run_system_command(service_show_invocation(&triggered_unit), COMMAND_TIMEOUT).await?;
+        let timer_output = self.run_command(timer_show_invocation(unit)).await?;
+        let timer = parse_key_values(&timer_output.stdout);
+        let triggered_unit = optional_triggered_unit(&timer).unwrap_or_default();
+        if !triggered_unit.is_empty() {
+            validate_triggered_service_unit(&triggered_unit)?;
+        }
+        let service_stdout = if triggered_unit.is_empty() {
+            String::new()
+        } else {
+            self.run_command(service_show_invocation(&triggered_unit))
+                .await?
+                .stdout
+        };
 
         parse_local_job_summary_with_listed_next(
             &timer_output.stdout,
-            &service_output.stdout,
+            &service_stdout,
             listed_next_elapse,
         )
     }
@@ -223,6 +287,12 @@ pub fn build_control_invocation(
             ],
         }),
         LocalJobControl::Run => {
+            if triggered_unit.trim().is_empty() {
+                return Err(SystemJobError::MissingTriggeredUnit {
+                    unit: timer_unit.to_string(),
+                }
+                .into());
+            }
             validate_service_unit(triggered_unit)?;
             Ok(CommandInvocation {
                 program: "systemctl".to_string(),
@@ -250,8 +320,10 @@ fn parse_local_job_summary_with_listed_next(
     let service = parse_key_values(service_show);
     let unit = required_value(&timer, "Id")?.to_string();
     validate_timer_unit(&unit)?;
-    let triggered_unit = required_value(&timer, "Triggers")?.to_string();
-    validate_triggered_service_unit(&triggered_unit)?;
+    let triggered_unit = optional_triggered_unit(&timer).unwrap_or_default();
+    if !triggered_unit.is_empty() {
+        validate_triggered_service_unit(&triggered_unit)?;
+    }
 
     let next_elapse_realtime = timer.get("NextElapseUSecRealtime");
     let next_elapse_monotonic = timer.get("NextElapseUSecMonotonic");
@@ -306,12 +378,6 @@ fn parse_local_job_summary_with_listed_next(
 
 fn unit_file_state_is_manageable(state: &str) -> bool {
     matches!(state, "enabled" | "enabled-runtime" | "disabled")
-}
-
-fn is_unsupported_triggered_unit_error(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<SystemJobError>()
-        .is_some_and(|error| matches!(error, SystemJobError::UnsupportedTriggeredUnit { .. }))
 }
 
 fn non_empty_str(value: &str) -> Option<&str> {
@@ -405,11 +471,22 @@ pub fn parse_journal_tail(stdout: &str) -> Vec<String> {
     stdout.lines().map(ToOwned::to_owned).collect()
 }
 
-fn parse_triggered_unit(timer_show: &str) -> Result<String> {
+fn parse_triggered_unit(timer_show: &str, unit: &str) -> Result<String> {
     let timer = parse_key_values(timer_show);
-    let triggered_unit = required_value(&timer, "Triggers")?.to_string();
+    let triggered_unit =
+        optional_triggered_unit(&timer).ok_or_else(|| SystemJobError::MissingTriggeredUnit {
+            unit: unit.to_string(),
+        })?;
     validate_triggered_service_unit(&triggered_unit)?;
     Ok(triggered_unit)
+}
+
+fn optional_triggered_unit(values: &BTreeMap<String, String>) -> Option<String> {
+    values
+        .get("Triggers")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn parse_key_values(stdout: &str) -> BTreeMap<String, String> {
@@ -794,6 +871,7 @@ async fn run_system_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     const TIMER_SHOW: &str = "\
 NextElapseUSecRealtime=Sat 2026-06-13 17:30:00 UTC\n\
@@ -816,6 +894,30 @@ ExecMainStatus=2\n\
 ExecMainExitTimestamp=Sat 2026-06-13 17:05:04 UTC\n\
 ActiveState=failed\n\
 SubState=failed\n";
+
+    const FAILED_TIMER_WITHOUT_TRIGGER_SHOW: &str = "\
+NextElapseUSecRealtime=Sat 2026-06-13 17:30:00 UTC\n\
+LastTriggerUSec=Sat 2026-06-13 17:00:01 UTC\n\
+Id=placeholder-failed.timer\n\
+Triggers=\n\
+ActiveState=failed\n\
+UnitFileState=enabled\n";
+
+    const LIST_TIMERS_WITH_FAILED_TIMER: &str = "\
+Sat 2026-06-13 17:30:00 UTC 29min Sat 2026-06-13 17:00:01 UTC 1s ago placeholder-cleanup.timer placeholder-cleanup.service\n\
+Sat 2026-06-13 17:30:00 UTC 29min Sat 2026-06-13 17:00:01 UTC 1s ago placeholder-failed.timer\n";
+
+    const LIST_UNIT_FILES_WITH_FAILED_TIMER: &str = "\
+placeholder-cleanup.timer enabled enabled\n\
+placeholder-failed.timer enabled enabled\n";
+
+    const LIST_TIMERS_WITH_BROKEN_TIMER: &str = "\
+Sat 2026-06-13 17:30:00 UTC 29min Sat 2026-06-13 17:00:01 UTC 1s ago placeholder-cleanup.timer placeholder-cleanup.service\n\
+Sat 2026-06-13 17:30:00 UTC 29min Sat 2026-06-13 17:00:01 UTC 1s ago placeholder-broken.timer placeholder-broken.service\n";
+
+    const LIST_UNIT_FILES_WITH_BROKEN_TIMER: &str = "\
+placeholder-cleanup.timer enabled enabled\n\
+placeholder-broken.timer enabled enabled\n";
 
     #[test]
     fn parses_timer_and_successful_service_show_output() {
@@ -844,6 +946,23 @@ SubState=failed\n";
         assert_eq!(summary.last_exit.code, Some(2));
         assert_eq!(summary.last_exit.result, "exit-code");
         assert_eq!(summary.last_exit.at, Some(1_781_370_304));
+    }
+
+    #[test]
+    fn parses_failed_timer_without_triggered_unit_as_degraded_summary() {
+        let summary = parse_local_job_summary(FAILED_TIMER_WITHOUT_TRIGGER_SHOW, "").unwrap();
+
+        assert_eq!(summary.unit, "placeholder-failed.timer");
+        assert_eq!(summary.active_state, "failed");
+        assert_eq!(summary.triggered_unit, "");
+        assert!(summary.enabled);
+        assert_eq!(summary.unit_file_state, "enabled");
+        assert_eq!(summary.schedule.next_elapse_at, Some(1_781_371_800));
+        assert_eq!(summary.schedule.raw, "Sat 2026-06-13 17:30:00 UTC");
+        assert_eq!(summary.last_fired_at, Some(1_781_370_001));
+        assert_eq!(summary.last_exit.code, None);
+        assert_eq!(summary.last_exit.result, "unknown");
+        assert_eq!(summary.last_exit.at, None);
     }
 
     #[test]
@@ -998,6 +1117,27 @@ UnitFileState=enabled\n";
     }
 
     #[test]
+    fn rejects_run_now_without_triggered_service_before_building_invocation() {
+        let result = build_control_invocation(
+            LocalJobControl::Run,
+            "placeholder-failed.timer",
+            "",
+            &["placeholder-*.timer".to_string()],
+        );
+
+        let error = result.unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<SystemJobError>(),
+            Some(SystemJobError::MissingTriggeredUnit { unit }) if unit == "placeholder-failed.timer"
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("has no triggered service to run")
+        );
+    }
+
+    #[test]
     fn enable_and_disable_control_timer_with_now() {
         let allowlist = ["placeholder-cleanup.timer".to_string()];
         let enable = build_control_invocation(
@@ -1058,6 +1198,160 @@ UnitFileState=enabled\n";
                 "--no-block",
                 "placeholder-cleanup.service"
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_jobs_includes_failed_timer_without_trigger_and_healthy_timer() {
+        let scheduler =
+            SystemdUserScheduler::with_command_runner(|invocation, _timeout| async move {
+                if invocation.args.iter().any(|arg| arg == "list-timers") {
+                    return Ok(CommandOutput {
+                        stdout: LIST_TIMERS_WITH_FAILED_TIMER.to_string(),
+                    });
+                }
+                if invocation.args.iter().any(|arg| arg == "list-unit-files") {
+                    return Ok(CommandOutput {
+                        stdout: LIST_UNIT_FILES_WITH_FAILED_TIMER.to_string(),
+                    });
+                }
+                if invocation
+                    .args
+                    .iter()
+                    .any(|arg| arg == "placeholder-cleanup.timer")
+                {
+                    return Ok(CommandOutput {
+                        stdout: TIMER_SHOW.to_string(),
+                    });
+                }
+                if invocation
+                    .args
+                    .iter()
+                    .any(|arg| arg == "placeholder-cleanup.service")
+                {
+                    return Ok(CommandOutput {
+                        stdout: SERVICE_SUCCESS_SHOW.to_string(),
+                    });
+                }
+                if invocation
+                    .args
+                    .iter()
+                    .any(|arg| arg == "placeholder-failed.timer")
+                {
+                    return Ok(CommandOutput {
+                        stdout: FAILED_TIMER_WITHOUT_TRIGGER_SHOW.to_string(),
+                    });
+                }
+                panic!("unexpected invocation: {invocation:?}");
+            });
+
+        let summaries = scheduler
+            .list_jobs(&["placeholder-*.timer".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].unit, "placeholder-cleanup.timer");
+        assert_eq!(summaries[0].triggered_unit, "placeholder-cleanup.service");
+        assert_eq!(summaries[1].unit, "placeholder-failed.timer");
+        assert_eq!(summaries[1].active_state, "failed");
+        assert_eq!(summaries[1].triggered_unit, "");
+    }
+
+    #[tokio::test]
+    async fn list_jobs_skips_generic_single_unit_errors_without_failing_list() {
+        let scheduler =
+            SystemdUserScheduler::with_command_runner(|invocation, _timeout| async move {
+                if invocation.args.iter().any(|arg| arg == "list-timers") {
+                    return Ok(CommandOutput {
+                        stdout: LIST_TIMERS_WITH_BROKEN_TIMER.to_string(),
+                    });
+                }
+                if invocation.args.iter().any(|arg| arg == "list-unit-files") {
+                    return Ok(CommandOutput {
+                        stdout: LIST_UNIT_FILES_WITH_BROKEN_TIMER.to_string(),
+                    });
+                }
+                if invocation
+                    .args
+                    .iter()
+                    .any(|arg| arg == "placeholder-cleanup.timer")
+                {
+                    return Ok(CommandOutput {
+                        stdout: TIMER_SHOW.to_string(),
+                    });
+                }
+                if invocation
+                    .args
+                    .iter()
+                    .any(|arg| arg == "placeholder-cleanup.service")
+                {
+                    return Ok(CommandOutput {
+                        stdout: SERVICE_SUCCESS_SHOW.to_string(),
+                    });
+                }
+                if invocation
+                    .args
+                    .iter()
+                    .any(|arg| arg == "placeholder-broken.timer")
+                {
+                    return Err(anyhow::anyhow!("unit show failed"));
+                }
+                panic!("unexpected invocation: {invocation:?}");
+            });
+
+        let summaries = scheduler
+            .list_jobs(&["placeholder-*.timer".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].unit, "placeholder-cleanup.timer");
+    }
+
+    #[tokio::test]
+    async fn run_now_without_triggered_service_returns_typed_error_without_starting_service() {
+        let invocations = Arc::new(Mutex::new(Vec::new()));
+        let recorded_invocations = Arc::clone(&invocations);
+        let scheduler = SystemdUserScheduler::with_command_runner(move |invocation, _timeout| {
+            recorded_invocations
+                .lock()
+                .unwrap()
+                .push(invocation.clone());
+            async move {
+                if invocation
+                    .args
+                    .iter()
+                    .any(|arg| arg == "placeholder-failed.timer")
+                {
+                    return Ok(CommandOutput {
+                        stdout: FAILED_TIMER_WITHOUT_TRIGGER_SHOW.to_string(),
+                    });
+                }
+                panic!("unexpected invocation: {invocation:?}");
+            }
+        });
+
+        let error = scheduler
+            .control_job(
+                "placeholder-failed.timer",
+                LocalJobControl::Run,
+                &["placeholder-*.timer".to_string()],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<SystemJobError>(),
+            Some(SystemJobError::MissingTriggeredUnit { unit }) if unit == "placeholder-failed.timer"
+        ));
+        let invocations = invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 1);
+        assert!(invocations[0].args.iter().any(|arg| arg == "show"));
+        assert!(
+            !invocations
+                .iter()
+                .any(|invocation| invocation.args.iter().any(|arg| arg == "start"))
         );
     }
 }
