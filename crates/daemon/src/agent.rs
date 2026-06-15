@@ -4888,6 +4888,11 @@ fn build_initial_step_prompt(
     prompt: &str,
     worker: &WorkerSummary,
 ) -> String {
+    let next_action_instruction = if worker.parent_worker_id.is_none() {
+        "Return one JSON action for the next step. For broad or multi-step repo/workspace inspection, multi-file analysis, implementation, debugging, deep reasoning, or anything likely to need more than about 1-2 evidence/tool calls, return spawn_child_jobs first unless delegation is concretely impossible. Use tool_call only for trivial single-step inspection, targeted triage, validation, or a specific final join gap. If you need to persist a non-terminal checkpoint, return progress_update. Only return final_answer when it is a complete terminal response, never an action plan, progress update, or a description of what should happen next."
+    } else {
+        "Return one JSON action for the next step. If repo or workspace inspection is needed, return a tool_call. If you need to persist a non-terminal checkpoint, return progress_update. Only return final_answer when it is a complete terminal response, never an action plan, progress update, or a description of what should happen next."
+    };
     let project_context = if session.projects.is_empty() {
         format!(
             "No project is attached. Working directory: {}",
@@ -4912,7 +4917,7 @@ Session title: {}\n\
 Visible provider: {} / {}\n\
 Utility Worker provider: {} / {}\n\
 Prompt-time context and user request:\n{}\n\
-Return one JSON action for the next step. If repo or workspace inspection is needed, return a tool_call. If you need to persist a non-terminal checkpoint, return progress_update. Only return final_answer when it is a complete terminal response, never an action plan, progress update, or a description of what should happen next.\n\
+{}\n\
 If the current user request corrects, refines, or challenges the previous answer, treat it as a continuation of the unresolved task. Do not merely acknowledge or restate the correction; use the visible conversation history to continue troubleshooting or answer the corrected question.\n\
 If the current user asks why they still cannot see a previous UI/code change, mentions being on the wrong branch/worktree, or asks whether an update/release/instance mismatch explains what they see, first answer that deployment visibility question directly. Inspect git state, the active session worktree, and any managed-release install path as needed. Do not make another code edit unless the user explicitly asks for one after that diagnosis, and do not let Browser verification status replace the branch/worktree/release answer.",
         session.title,
@@ -4929,7 +4934,8 @@ If the current user asks why they still cannot see a previous UI/code change, me
         } else {
             worker.model.as_str()
         },
-        prompt
+        prompt,
+        next_action_instruction
     )
 }
 
@@ -9748,13 +9754,16 @@ fn normalize_action_item_text(value: &str) -> String {
 
 fn build_internal_action_item_retry_prompt(summary: &str, final_answer: &str) -> String {
     format!(
-        "Your previous final_answer was an internal action item, not a user-facing answer.\n\
-Previous summary: {}\n\
-Previous final_answer: {}\n\
-Return one valid Nucleus worker action JSON object. You may include brief thoughts before the action fields.\n\
-- If you need repo, workspace, file, git, search, or process information, return a tool_call instead of describing the action.\n\
-- Prefer auto-approved read actions such as project.inspect, fs.list, fs.read_text, rg.search, git.status, and git.diff when they can answer the request.\n\
-- Only return final_answer when the text directly answers the user.",
+        concat!(
+            "Your previous final_answer was an internal action item, not a user-facing answer.\n",
+            "Previous summary: {}\n",
+            "Previous final_answer: {}\n",
+            "Return one valid Nucleus worker action JSON object. You may include brief thoughts before the action fields.\n",
+            "- Follow your worker prompt's delegation rules: when spawn_child_jobs is an allowed root action and the remaining work is broad or multi-step, use it before direct tools.\n",
+            "- If you need targeted repo, workspace, file, git, search, or process information, return a tool_call instead of describing the action.\n",
+            "- Prefer auto-approved read actions such as project.inspect, fs.list, fs.read_text, rg.search, git.status, and git.diff only when they can answer the request directly or fill a specific evidence gap.\n",
+            "- Only return final_answer when the text directly answers the user."
+        ),
         excerpt(summary, 320),
         excerpt(final_answer, 1_200)
     )
@@ -9762,13 +9771,15 @@ Return one valid Nucleus worker action JSON object. You may include brief though
 
 fn build_incomplete_progress_retry_prompt(summary: &str, final_answer: &str) -> String {
     format!(
-        "Your previous final_answer said the requested work is incomplete, so it was a progress report rather than a completion answer.\n\
-Previous summary: {}\n\
-Previous final_answer: {}\n\
-Return one valid Nucleus worker action JSON object. You may include brief thoughts before the action fields.\n\
-- Do not final_answer progress updates, partial completion notes, or lists of remaining work.\n\
-- Continue with the next smallest useful tool_call unless you are genuinely blocked or the run budget is exhausted.\n\
-- Only return final_answer when the user's requested phase/task is fully complete and validated, or when you clearly cannot continue without user input.",
+        concat!(
+            "Your previous final_answer said the requested work is incomplete, so it was a progress report rather than a completion answer.\n",
+            "Previous summary: {}\n",
+            "Previous final_answer: {}\n",
+            "Return one valid Nucleus worker action JSON object. You may include brief thoughts before the action fields.\n",
+            "- Do not final_answer progress updates, partial completion notes, or lists of remaining work.\n",
+            "- Follow your worker prompt's delegation rules: when spawn_child_jobs is an allowed root action and the remaining work is broad or multi-step, use it before direct tools; otherwise continue with the next smallest useful tool_call unless you are genuinely blocked or the run budget is exhausted.\n",
+            "- Only return final_answer when the user's requested phase/task is fully complete and validated, or when you clearly cannot continue without user input."
+        ),
         excerpt(summary, 320),
         excerpt(final_answer, 1_200)
     )
@@ -9780,15 +9791,18 @@ fn build_zero_tool_action_retry_prompt(
     final_answer: &str,
 ) -> String {
     format!(
-        "Your previous final_answer tried to complete an action-oriented request before any tool_call ran.\n\
-User request excerpt: {}\n\
-Previous summary: {}\n\
-Previous final_answer: {}\n\
-Return one valid Nucleus worker action JSON object and continue the job. You may include brief thoughts before the action fields.\n\
-- If the requested action can be performed, return the smallest useful tool_call now.\n\
-- If the action is ambiguous or requires user approval, return final_answer asking the specific confirmation question.\n\
-- If the action is blocked or impossible, return final_answer with the concrete blocker and evidence.\n\
-- Do not restate the requested action as if it completed.",
+        concat!(
+            "Your previous final_answer tried to complete an action-oriented request before any tool_call ran.\n",
+            "User request excerpt: {}\n",
+            "Previous summary: {}\n",
+            "Previous final_answer: {}\n",
+            "Return one valid Nucleus worker action JSON object and continue the job. You may include brief thoughts before the action fields.\n",
+            "- Follow your worker prompt's delegation rules: when spawn_child_jobs is an allowed root action and the requested action is broad or multi-step, use it before direct tools.\n",
+            "- If the requested action can be performed with one targeted local action, return the smallest useful tool_call now.\n",
+            "- If the action is ambiguous or requires user approval, return final_answer asking the specific confirmation question.\n",
+            "- If the action is blocked or impossible, return final_answer with the concrete blocker and evidence.\n",
+            "- Do not restate the requested action as if it completed."
+        ),
         excerpt(&job.prompt_excerpt, 320),
         excerpt(summary, 320),
         excerpt(final_answer, 1_200)
@@ -18097,8 +18111,10 @@ Working directory: {}\n",
     }
 
     let action_shapes = if is_root_worker {
-        "{\"kind\":\"final_answer\",\"thoughts\":\"brief reason the prompt is already answerable\",\"summary\":\"why the response is complete\",\"final_answer\":\"clean user-facing answer\",\"browser_verification\":{\"status\":\"passed|failed|not_performed|unavailable\",\"summary\":\"concise Browser verification result\",\"artifact_ids\":[\"artifact-id\"]}}\n\
-{\"kind\":\"tool_call\",\"thoughts\":\"brief reason this needs project evidence\",\"summary\":\"inspect the active project\",\"tool\":\"project.inspect\",\"args\":{}}\n\
+        "{\"kind\":\"spawn_child_jobs\",\"summary\":\"broad read-only investigation delegates focused utility checks\",\"jobs\":[{\"title\":\"Map relevant evidence\",\"prompt\":\"Scope: run a read-only map of likely files, directories, and tests relevant to the request. Expected output: concise path list with reasons, not deep analysis. Join criteria: root has enough locations to interpret child reports without repeating broad exploration.\",\"task_class\":\"local_project\",\"route_id\":\"utility\"},{\"title\":\"Analyze key files\",\"prompt\":\"Scope: inspect the most relevant files for the requested question without making edits. Expected output: evidence-backed findings with key file paths and uncertainties. Join criteria: enough findings for the root to answer from child reports.\",\"task_class\":\"local_project\",\"route_id\":\"utility\"},{\"title\":\"Collect validation signals\",\"prompt\":\"Scope: run cheap read-only checks for existing tests, docs, and validation commands. Expected output: concrete validation signals and gaps. Join criteria: root can state confidence and remaining risk.\",\"task_class\":\"local_project\",\"route_id\":\"utility\"}]}\n\
+{\"kind\":\"spawn_child_jobs\",\"summary\":\"run a cheap deterministic check on utility\",\"jobs\":[{\"title\":\"focused check\",\"prompt\":\"precise bounded check and expected report\",\"task_class\":\"local_project\",\"route_id\":\"utility\"}]}\n\
+{\"kind\":\"final_answer\",\"thoughts\":\"brief reason the prompt is already answerable\",\"summary\":\"why the response is complete\",\"final_answer\":\"clean user-facing answer\",\"browser_verification\":{\"status\":\"passed|failed|not_performed|unavailable\",\"summary\":\"concise Browser verification result\",\"artifact_ids\":[\"artifact-id\"]}}\n\
+{\"kind\":\"tool_call\",\"thoughts\":\"brief reason this needs targeted root triage or validation\",\"summary\":\"inspect the active project\",\"tool\":\"project.inspect\",\"args\":{}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"list likely project directories\",\"tool\":\"fs.list\",\"args\":{\"path\":\".\",\"recursive\":false,\"limit\":100}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"fetch inline PR review threads\",\"tool\":\"github.pr_review_threads\",\"args\":{\"pr_number\":123}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"fetch direct PR lifecycle state\",\"tool\":\"github.pr_state\",\"args\":{\"pr_number\":123}}\n\
@@ -18107,8 +18123,6 @@ Working directory: {}\n",
 {\"kind\":\"tool_call\",\"summary\":\"verify the UI in Browser\",\"tool\":\"browser.navigate\",\"args\":{\"url\":\"http://127.0.0.1:5299\"}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"read Browser refs\",\"tool\":\"browser.snapshot\",\"args\":{}}\n\
 {\"kind\":\"tool_call\",\"summary\":\"click a Browser control by ref\",\"tool\":\"browser.click\",\"args\":{\"target_ref\":\"ref-1\"}}\n\
-{\"kind\":\"spawn_child_jobs\",\"summary\":\"delegate bounded execution to child workers\",\"jobs\":[{\"title\":\"focused implementation\",\"prompt\":\"precise bounded task, expected output, budget guidance, and join criteria\",\"task_class\":\"local_project\",\"working_dir\":\"optional/path/inside/scope\"}]}\n\
-{\"kind\":\"spawn_child_jobs\",\"summary\":\"run a cheap deterministic check on utility\",\"jobs\":[{\"title\":\"focused check\",\"prompt\":\"precise bounded check and expected report\",\"task_class\":\"local_project\",\"working_dir\":\"optional/path/inside/scope\",\"route_id\":\"utility\"}]}\n\
 {\"kind\":\"progress_update\",\"summary\":\"durable checkpoint, not done\",\"detail\":\"completed evidence and exact continuation point\"}\n\
 {\"kind\":\"wait\",\"summary\":\"park until an external condition is ready\",\"until\":{\"kind\":\"delay_seconds\",\"delay_seconds\":60},\"max_wait_seconds\":1800,\"wake_note\":\"optional wake-up context\"}\n\
 {\"kind\":\"wait\",\"summary\":\"park until memory classification finishes\",\"until\":{\"kind\":\"audit_event\",\"event_kind\":\"memory.classifier.completed\",\"target_pattern\":\"session:\",\"status\":\"success\"},\"max_wait_seconds\":1800}\n\
@@ -18149,19 +18163,41 @@ Working directory: {}\n",
         .collect::<Vec<_>>()
         .join("\n");
     let child_job_rules = if is_root_worker {
-        "- You are the root Utility Worker: orchestrate, gate, budget, approve, and join child results.\n\
-- Do not do heavy implementation or deep reasoning yourself when the work can be bounded for a child worker.\n\
-- Use spawn_child_jobs for heavy implementation, multi-step investigation, broad search, or work that benefits from the main session model. A child with no route_id uses the main lane and the session main model.\n\
-- Use route_id=\"utility\" only for cheap deterministic child checks that should stay on the utility lane.\n\
+        "- You are the root Utility Worker: a lightweight coordinator that gates budgets, delegates bounded work, and joins child results.\n\
+- You do not do broad repository exploration, heavy implementation, or deep reasoning yourself when the work can be bounded for a child worker.\n\
+- Use spawn_child_jobs for heavy implementation, multi-step investigation, broad search, or work that benefits from bounded delegation.\n\
+- Use route_id=\"utility\" for broad read-only investigation and cheap deterministic child checks that should stay on the utility lane.\n\
+- For implementation, deep debugging, or work that needs main-lane reasoning/edit capability, spawn a main-lane child with no route_id only when the main route is usable; if a required main-lane child is concretely unavailable, state that blocker instead of silently doing the broad work yourself.\n\
 - Only root workers may fan out child jobs. Main-lane children inherit your granted tool set and bounded write scope; utility children are for read-only checks.\n\
 - When spawning write-capable sibling children, give each child a dedicated working_dir inside your scope so its write root and lock are narrowed to that path.\n\
-- Use at most 5 child jobs in a single spawn_child_jobs action.\n"
+- Use at most 5 child jobs in a single spawn_child_jobs action.\n\
+- Multi-child main-lane fan-out must use distinct existing working_dir values from visible context or targeted triage; if the root cannot identify those directories, that is a concrete reason to do one targeted triage action before spawning.\n\
+- When full-repo read-only scope is needed, prefer 2-4 focused utility children. Use one main-lane child for full-repo scope only when the task needs implementation, deep debugging, or main-lane reasoning capability and that route is usable.\n\
+- After child results satisfy the request, synthesize from their reports directly. Do not repeat the children's exploration; use direct tools only for a specific identified gap.\n\
+- Failure-case few-shot: if the user asks \"thoroughly investigate this codebase across many files\", the correct root response is one spawn_child_jobs action with 2-4 focused child jobs:\n\
+{\"kind\":\"spawn_child_jobs\",\"summary\":\"thorough read-only codebase investigation delegates focused utility checks before the root joins\",\"jobs\":[{\"title\":\"Map relevant files\",\"prompt\":\"Scope: run a read-only catalog of likely files, directories, and tests relevant to the request. Expected output: concise path list with reasons, not deep analysis. Join criteria: root has enough locations to interpret child reports without repeating broad exploration.\",\"task_class\":\"local_project\",\"route_id\":\"utility\"},{\"title\":\"Analyze key files\",\"prompt\":\"Scope: inspect the most relevant files for the requested question without making edits. Expected output: evidence-backed findings with key file paths, uncertainties, and recommended follow-up. Join criteria: enough findings for the root to answer from child reports.\",\"task_class\":\"local_project\",\"route_id\":\"utility\"},{\"title\":\"Review tests and risks\",\"prompt\":\"Scope: run cheap read-only checks for existing tests, docs, and validation commands. Expected output: concrete validation signals and gaps. Join criteria: root can state confidence and remaining risk.\",\"task_class\":\"local_project\",\"route_id\":\"utility\"}]}\n"
+    } else {
+        ""
+    };
+
+    let root_action_rules = if is_root_worker {
+        "- Mandatory delegation rule: for broad investigation, multi-file analysis, implementation, debugging, deep reasoning, or anything likely to need more than about 1-2 evidence/tool calls, issue spawn_child_jobs first unless there is a concrete reason delegation is impossible; if delegation is impossible, state that reason.\n\
+- Trivial single-step asks, such as reading one named file or answering from visible context, may be answered directly or with one targeted direct tool.\n\
+- Direct root tools are for triage, targeted validation, and final join gaps; they are not for broad repository exploration or heavy reasoning.\n"
+    } else {
+        "- Choose the smallest useful next action when the request needs action, external state, or local evidence.\n\
+- Use tools only when they materially improve the answer.\n"
+    };
+
+    let root_orchestration_note = if is_root_worker {
+        "Root-only orchestration:\n\
+- spawn_child_jobs is a primary root operation for bounded fan-out to child workers. Prefer it before direct tools whenever the request is broad, multi-step, or likely to exceed about 1-2 evidence/tool calls.\n"
     } else {
         ""
     };
 
     let worker_intro = if is_root_worker {
-        "Respond to the user as the root Utility Worker. You are the orchestrator and deterministic gate for this Nucleus session. Use tools only when the task actually needs them."
+        "Respond to the user as the root Utility Worker. You are a lightweight coordinator for this Nucleus session: coordinate, gate budgets, delegate bounded work, and join results. Mandatory delegation rule: broad investigation, multi-file analysis, implementation, debugging, deep reasoning, or anything likely to need more than about 1-2 evidence/tool calls must start with spawn_child_jobs unless delegation is concretely impossible. Direct tools are for triage, targeted validation, and final join gaps, not broad exploration."
             .to_string()
     } else {
         format!(
@@ -18178,8 +18214,7 @@ Allowed response shapes:\n\
 Rules:\n\
 - Think briefly in the thoughts field first, then choose the action.\n\
 - If the user's prompt is conversational or already answerable from visible context, answer directly with final_answer.\n\
-- Choose the smallest useful next action when the request needs action, external state, or local evidence.\n\
-- Use tools only when they materially improve the answer.\n\
+{}\
 - Never invent tool output.\n\
 - Stay inside the granted repo scope.\n\
 {}\
@@ -18202,12 +18237,15 @@ Rules:\n\
 - Do not wrap JSON in markdown fences.\n\
 Available tools:\n{}\n\
 {}\n\
+{}\
 Worker lane: {}\n\
 Working directory: {}\n",
         worker_intro,
         action_shapes,
+        root_action_rules,
         child_job_rules,
         tool_help,
+        root_orchestration_note,
         python_runtime_prompt_status(
             Path::new(&worker.working_dir),
             Some(Path::new(&worker.working_dir)),
@@ -19250,9 +19288,72 @@ mod tests {
         assert!(root_prompt.contains("already answerable from visible context"));
         assert!(!root_prompt.contains("and nothing else"));
         assert!(
-            root_prompt.find("{\"kind\":\"final_answer\"")
+            root_prompt.find("{\"kind\":\"spawn_child_jobs\"")
                 < root_prompt.find("{\"kind\":\"tool_call\""),
-            "worker prompt should present final_answer before tool_call examples"
+            "root worker prompt should present spawn_child_jobs before direct tool_call examples"
+        );
+        assert!(
+            root_prompt.contains("Mandatory delegation rule: for broad investigation"),
+            "root prompt should make delegation mandatory for broad work"
+        );
+        assert!(
+            root_prompt.contains("lightweight coordinator"),
+            "root prompt should frame the root as a lightweight coordinator"
+        );
+        assert!(
+            root_prompt.contains(
+                "Direct root tools are for triage, targeted validation, and final join gaps"
+            ),
+            "root prompt should narrow direct root tools to triage, validation, and join gaps"
+        );
+        assert!(
+            root_prompt.contains("Root-only orchestration"),
+            "root prompt should surface spawn_child_jobs near available tools"
+        );
+        assert!(
+            root_prompt.contains("thoroughly investigate this codebase across many files"),
+            "root prompt should include the broad-investigation few-shot"
+        );
+        assert!(
+            root_prompt.contains("one spawn_child_jobs action with 2-4 focused child jobs"),
+            "root prompt few-shot should require one bounded fan-out action"
+        );
+        assert!(
+            root_prompt.contains("broad read-only investigation delegates focused utility checks")
+                && root_prompt.contains("Map relevant evidence")
+                && root_prompt.contains("Analyze key files")
+                && root_prompt.contains("Map relevant files")
+                && root_prompt.contains("Review tests and risks")
+                && root_prompt.contains("\"route_id\":\"utility\""),
+            "root prompt should show project-neutral utility-routed read-only investigation checks"
+        );
+        assert!(
+            !root_prompt.contains("Full-codebase investigation lead"),
+            "read-only broad-investigation few-shot should not spawn a default main child"
+        );
+        assert!(
+            root_prompt.contains(
+                "spawn a main-lane child with no route_id only when the main route is usable"
+            ),
+            "root prompt should gate main-lane child guidance on route usability"
+        );
+        assert!(
+            root_prompt
+                .contains("Multi-child main-lane fan-out must use distinct existing working_dir"),
+            "root prompt should explain the existing-directory constraint for multi-main fan-out"
+        );
+        assert!(
+            root_prompt.contains("Do not repeat the children's exploration"),
+            "root prompt should strengthen the join contract"
+        );
+        assert!(
+            !root_prompt.contains("Use tools only when the task actually needs them"),
+            "root prompt should not keep the old self-service tool framing"
+        );
+        assert!(
+            !root_prompt
+                .contains("Choose the smallest useful next action when the request needs action"),
+            "root prompt should not use the generic smallest-action rule"
         );
         assert!(
             !root_prompt.contains("{{\"kind\""),
@@ -22190,7 +22291,8 @@ Cleanup status: clean";
         );
 
         assert!(prompt.contains("progress report rather than a completion answer"));
-        assert!(prompt.contains("Continue with the next smallest useful tool_call"));
+        assert!(prompt.contains("when spawn_child_jobs is an allowed root action"));
+        assert!(prompt.contains("otherwise continue with the next smallest useful tool_call"));
         assert!(prompt.contains(
             "Only return final_answer when the user's requested phase/task is fully complete"
         ));
@@ -27749,6 +27851,9 @@ Thanks."#,
 
         assert!(prompt.contains("corrects, refines, or challenges the previous answer"));
         assert!(prompt.contains("Do not merely acknowledge or restate the correction"));
+        assert!(prompt.contains("return spawn_child_jobs first"));
+        assert!(prompt.contains("Use tool_call only for trivial single-step inspection"));
+        assert!(!prompt.contains("If repo or workspace inspection is needed, return a tool_call"));
         assert!(prompt.contains("wrong branch/worktree"));
         assert!(prompt.contains("deployment visibility question directly"));
         assert!(prompt.contains("do not let Browser verification status replace"));
