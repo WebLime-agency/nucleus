@@ -2997,9 +2997,9 @@ impl StateStore {
     ) -> Result<Vec<ToolCapabilitySummary>> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         let worker = load_worker_summary(&connection, worker_id)?;
-        if worker.lane != "utility" && !grants.is_empty() {
+        if worker.lane != "utility" && worker.parent_worker_id.is_none() && !grants.is_empty() {
             bail!(
-                "worker '{}' is lane '{}' and cannot receive action capability grants; only utility workers may receive action grants",
+                "worker '{}' is lane '{}' and cannot receive action capability grants unless it is a spawned sub-worker",
                 worker_id,
                 worker.lane
             );
