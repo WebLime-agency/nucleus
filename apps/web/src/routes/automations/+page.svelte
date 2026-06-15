@@ -42,7 +42,7 @@
     updatePlaybook
   } from '$lib/nucleus/client';
   import { compactPath, formatDateTime, formatState } from '$lib/nucleus/format';
-  import { localJobBadgeVariant, localJobCanToggle } from '$lib/nucleus/local-jobs';
+  import { localJobBadgeVariant, localJobCanRun, localJobCanToggle } from '$lib/nucleus/local-jobs';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
   import type {
     DaemonEvent,
@@ -380,7 +380,7 @@
     try {
       const detail = await fetchLocalJobDetail(unit);
       localJobDetail = detail;
-      expandedLogUnit = unit;
+      expandedLogUnit = localJobCanRun(detail.summary) ? unit : null;
       syncLocalJobSummary(detail.summary);
       error = null;
     } catch (cause) {
@@ -1204,7 +1204,7 @@
                   {/if}
                   <Button
                     onclick={() => void handleLocalJobAction(job.unit, 'run')}
-                    disabled={localJobAction !== null}
+                    disabled={localJobAction !== null || !localJobCanRun(job)}
                   >
                     <Play class="size-4" />
                     {localJobAction === localJobActionKey(job.unit, 'run') ? 'Starting' : 'Run now'}
@@ -1227,7 +1227,7 @@
                 </div>
                 <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-3">
                   <div class="text-[11px] uppercase tracking-[0.18em] text-zinc-500">Triggers</div>
-                  <div class="mt-2 break-all font-mono text-xs text-zinc-100">{job.triggered_unit}</div>
+                  <div class="mt-2 break-all font-mono text-xs text-zinc-100">{job.triggered_unit.trim() || '—'}</div>
                 </div>
               </div>
             </div>
@@ -1297,30 +1297,32 @@
                 {/if}
                 <Button
                   onclick={() => void handleLocalJobAction(selectedLocalJob.unit, 'run')}
-                  disabled={localJobAction !== null}
+                  disabled={localJobAction !== null || !localJobCanRun(selectedLocalJob)}
                 >
                   <Play class="size-4" />
                   Run now
                 </Button>
-                <Button
-                  variant="outline"
-                  onclick={() => {
-                    expandedLogUnit = expandedLogUnit === selectedLocalJob.unit ? null : selectedLocalJob.unit;
-                    if (expandedLogUnit === selectedLocalJob.unit && !localJobDetail) {
-                      void loadLocalJobDetail(selectedLocalJob.unit, true);
-                    }
-                  }}
-                >
-                  {#if expandedLogUnit === selectedLocalJob.unit}
-                    <ChevronDown class="size-4" />
-                  {:else}
-                    <ScrollText class="size-4" />
-                  {/if}
-                  Log tail
-                </Button>
+                {#if localJobCanRun(selectedLocalJob)}
+                  <Button
+                    variant="outline"
+                    onclick={() => {
+                      expandedLogUnit = expandedLogUnit === selectedLocalJob.unit ? null : selectedLocalJob.unit;
+                      if (expandedLogUnit === selectedLocalJob.unit && !localJobDetail) {
+                        void loadLocalJobDetail(selectedLocalJob.unit, true);
+                      }
+                    }}
+                  >
+                    {#if expandedLogUnit === selectedLocalJob.unit}
+                      <ChevronDown class="size-4" />
+                    {:else}
+                      <ScrollText class="size-4" />
+                    {/if}
+                    Log tail
+                  </Button>
+                {/if}
               </div>
 
-              {#if expandedLogUnit === selectedLocalJob.unit}
+              {#if localJobCanRun(selectedLocalJob) && expandedLogUnit === selectedLocalJob.unit}
                 <div class="space-y-3">
                   <div class="flex items-center gap-2 text-sm font-medium text-zinc-200">
                     <ScrollText class="size-4" />
