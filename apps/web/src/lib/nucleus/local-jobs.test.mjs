@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { localJobBadgeVariant, localJobCanToggle, localJobLastRunFailed } from './local-jobs.ts';
+import { localJobBadgeVariant, localJobCanRun, localJobCanToggle, localJobLastRunFailed } from './local-jobs.ts';
 
 function job(result) {
   return {
@@ -46,4 +46,10 @@ test('local job result classification keeps success and never-run non-failed', (
 test('local job toggle availability follows daemon manageability', () => {
   assert.equal(localJobCanToggle(job('success')), true);
   assert.equal(localJobCanToggle({ ...job('success'), unit_file_state: 'static', manageable: false }), false);
+});
+
+test('local job run availability requires a triggered service', () => {
+  assert.equal(localJobCanRun(job('success')), true);
+  assert.equal(localJobCanRun({ ...job('success'), triggered_unit: '' }), false);
+  assert.equal(localJobCanRun({ ...job('success'), triggered_unit: '   ' }), false);
 });
