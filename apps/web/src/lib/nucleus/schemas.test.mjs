@@ -38,6 +38,11 @@ test('local job summary schema reads managed flag with legacy default', () => {
   assert.equal(localJobSummarySchema.parse(localJobSummary({ managed: true })).managed, true);
 });
 
+test('local job summary schema reads authored flag with legacy default', () => {
+  assert.equal(localJobSummarySchema.parse(localJobSummary()).authored, false);
+  assert.equal(localJobSummarySchema.parse(localJobSummary({ authored: true })).authored, true);
+});
+
 test('session request schemas accept canonical attachment modes', () => {
   for (const attachment_mode of ['new_worktree', 'project_root', 'scratch']) {
     assert.equal(createSessionRequestSchema.parse({ attachment_mode }).attachment_mode, attachment_mode);

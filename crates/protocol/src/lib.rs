@@ -1865,6 +1865,8 @@ pub struct LocalJobSummary {
     pub backend: String,
     #[serde(default)]
     pub managed: bool,
+    #[serde(default)]
+    pub authored: bool,
     pub enabled: bool,
     pub unit_file_state: String,
     pub manageable: bool,
@@ -1889,6 +1891,53 @@ pub struct LocalJobsAllowlistRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalJobsAllowlistResponse {
     pub globs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemJobAuthoringScheduleKind {
+    Interval,
+    Calendar,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SystemJobAuthoringSchedule {
+    pub kind: SystemJobAuthoringScheduleKind,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SystemJobAuthoringSpec {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub command: String,
+    pub schedule: SystemJobAuthoringSchedule,
+    #[serde(default)]
+    pub working_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SystemJobRenderedUnits {
+    pub name: String,
+    pub timer_unit: String,
+    pub service_unit: String,
+    pub timer: String,
+    pub service: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SystemJobTemplate {
+    pub id: String,
+    pub title: String,
+    pub summary: String,
+    pub spec: SystemJobAuthoringSpec,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SystemJobAuthoredRecord {
+    pub name: String,
+    pub spec: SystemJobAuthoringSpec,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

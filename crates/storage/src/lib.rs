@@ -17,9 +17,9 @@ use nucleus_protocol::{
     McpServerSummary, MemoryCandidate, MemoryEntry, MemorySearchResult, PlaybookDetail,
     PlaybookSummary, PolicyDecisionSummary, ProjectSummary, RouteTarget, RouterProfileSummary,
     RunBudgetSummary, RuntimeSummary, SessionDetail, SessionProjectSummary, SessionSummary,
-    SessionTurn, SessionTurnImage, SkillManifest, StorageSummary, ToolCallSummary,
-    ToolCapabilitySummary, WorkerSummary, WorkspaceModelConfig, WorkspaceProfileSummary,
-    WorkspaceSummary, WorktreeSummary,
+    SessionTurn, SessionTurnImage, SkillManifest, StorageSummary, SystemJobAuthoredRecord,
+    ToolCallSummary, ToolCapabilitySummary, WorkerSummary, WorkspaceModelConfig,
+    WorkspaceProfileSummary, WorkspaceSummary, WorktreeSummary,
 };
 #[cfg(test)]
 use nucleus_protocol::{
@@ -35,6 +35,7 @@ const LOCAL_AUTH_TOKEN_HASH_KEY: &str = "auth.local_token_hash";
 const LOCAL_AUTH_TOKEN_FILE_NAME: &str = "local-auth-token";
 const UPDATE_STATE_KEY: &str = "updates.state.v1";
 const SYSTEM_JOBS_UNIT_GLOBS_KEY: &str = "system_jobs_unit_globs";
+const SYSTEM_JOBS_AUTHORED_UNITS_KEY: &str = "system_jobs_authored_units.v1";
 const MEMORY_CLASSIFIER_KIND_KEY: &str = "memory.classifier_kind";
 const DEFAULT_MEMORY_CLASSIFIER_KIND: &str = "llm";
 const PLAYBOOK_RECENT_JOB_LIMIT: usize = 12;
@@ -1058,6 +1059,53 @@ impl StateStore {
         let payload = serde_json::to_string(globs)
             .context("failed to serialize system jobs unit allowlist")?;
         set_setting_value(&connection, SYSTEM_JOBS_UNIT_GLOBS_KEY, &payload)
+    }
+
+    pub fn system_jobs_authored_units(&self) -> Result<Vec<SystemJobAuthoredRecord>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let Some(payload) = setting_value_optional(&connection, SYSTEM_JOBS_AUTHORED_UNITS_KEY)?
+        else {
+            return Ok(Vec::new());
+        };
+        if payload.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        serde_json::from_str(&payload).context("failed to decode authored system jobs")
+    }
+
+    pub fn system_job_authored_unit(&self, name: &str) -> Result<Option<SystemJobAuthoredRecord>> {
+        Ok(self
+            .system_jobs_authored_units()?
+            .into_iter()
+            .find(|record| record.name == name))
+    }
+
+    pub fn upsert_system_job_authored_unit(
+        &self,
+        record: SystemJobAuthoredRecord,
+    ) -> Result<Vec<SystemJobAuthoredRecord>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let mut records = read_system_jobs_authored_units(&connection)?;
+        records.retain(|existing| existing.name != record.name);
+        records.push(record);
+        records.sort_by(|left, right| left.name.cmp(&right.name));
+        write_system_jobs_authored_units(&connection, &records)?;
+        Ok(records)
+    }
+
+    pub fn remove_system_job_authored_unit(
+        &self,
+        name: &str,
+    ) -> Result<Option<SystemJobAuthoredRecord>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let mut records = read_system_jobs_authored_units(&connection)?;
+        let Some(index) = records.iter().position(|record| record.name == name) else {
+            return Ok(None);
+        };
+        let removed = records.remove(index);
+        write_system_jobs_authored_units(&connection, &records)?;
+        Ok(Some(removed))
     }
 
     pub fn list_runtimes(&self) -> Result<Vec<RuntimeSummary>> {
@@ -6724,6 +6772,28 @@ fn set_setting_value(connection: &Connection, key: &str, value: &str) -> Result<
     Ok(())
 }
 
+fn read_system_jobs_authored_units(
+    connection: &Connection,
+) -> Result<Vec<SystemJobAuthoredRecord>> {
+    let Some(payload) = setting_value_optional(connection, SYSTEM_JOBS_AUTHORED_UNITS_KEY)? else {
+        return Ok(Vec::new());
+    };
+    if payload.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    serde_json::from_str(&payload).context("failed to decode authored system jobs")
+}
+
+fn write_system_jobs_authored_units(
+    connection: &Connection,
+    records: &[SystemJobAuthoredRecord],
+) -> Result<()> {
+    let payload =
+        serde_json::to_string(records).context("failed to serialize authored system jobs")?;
+    set_setting_value(connection, SYSTEM_JOBS_AUTHORED_UNITS_KEY, &payload)
+}
+
 fn generate_local_auth_token() -> String {
     format!(
         "nuctk_{}{}",
@@ -10495,6 +10565,56 @@ mod tests {
                 "placeholder-cleanup.timer".to_string(),
                 "placeholder-*.timer".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn system_jobs_authored_units_round_trip_through_settings() {
+        let state_dir = test_state_dir("system-jobs-authored-units");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+
+        assert!(
+            store
+                .system_jobs_authored_units()
+                .expect("missing authored units load")
+                .is_empty()
+        );
+
+        let record = SystemJobAuthoredRecord {
+            name: "placeholder-sync.timer".to_string(),
+            spec: nucleus_protocol::SystemJobAuthoringSpec {
+                name: "placeholder-sync.timer".to_string(),
+                description: Some("Placeholder sync".to_string()),
+                command: "/usr/bin/printf 'hello world'".to_string(),
+                schedule: nucleus_protocol::SystemJobAuthoringSchedule {
+                    kind: nucleus_protocol::SystemJobAuthoringScheduleKind::Interval,
+                    value: "30min".to_string(),
+                },
+                working_dir: None,
+            },
+        };
+        store
+            .upsert_system_job_authored_unit(record.clone())
+            .expect("authored unit stores");
+
+        let reopened = StateStore::initialize_at(&state_dir).expect("store should reopen");
+        assert_eq!(
+            reopened
+                .system_job_authored_unit("placeholder-sync.timer")
+                .expect("authored unit loads"),
+            Some(record.clone())
+        );
+        assert_eq!(
+            reopened
+                .remove_system_job_authored_unit("placeholder-sync.timer")
+                .expect("authored unit removes"),
+            Some(record)
+        );
+        assert!(
+            reopened
+                .system_jobs_authored_units()
+                .expect("authored units reload")
+                .is_empty()
         );
     }
 

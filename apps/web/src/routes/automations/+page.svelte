@@ -32,9 +32,11 @@
   import {
     createPlaybook,
     deletePlaybook,
+    deleteAuthoredLocalJob,
     disableLocalJob,
     enableLocalJob,
     fetchAvailableLocalJobs,
+    fetchSystemJobTemplates,
     fetchJobDetail,
     fetchLocalJobDetail,
     fetchLocalJobs,
@@ -42,6 +44,8 @@
     fetchOverview,
     fetchPlaybookDetail,
     fetchPlaybooks,
+    installAuthoredLocalJob,
+    renderAuthoredLocalJob,
     runLocalJob,
     runPlaybook,
     updateLocalJobsAllowlist,
@@ -66,6 +70,9 @@
     PlaybookDetail,
     PlaybookSummary,
     RuntimeOverview,
+    SystemJobAuthoringSpec,
+    SystemJobRenderedUnits,
+    SystemJobTemplate,
     WorkspaceProfileSummary
   } from '$lib/nucleus/schemas';
 
@@ -114,6 +121,7 @@
   let localJobs = $state<LocalJobSummary[]>([]);
   let availableLocalJobs = $state<LocalJobSummary[]>([]);
   let localJobsAllowlist = $state<string[]>([]);
+  let systemJobTemplates = $state<SystemJobTemplate[]>([]);
   let playbookDetail = $state<PlaybookDetail | null>(null);
   let localJobDetail = $state<LocalJobDetail | null>(null);
   let activeSurface = $state<'playbooks' | 'local_jobs'>('playbooks');
@@ -137,6 +145,16 @@
   let localJobsDiscoverySearch = $state('');
   let localJobsDiscoveryFilter = $state<'all' | 'unmanaged' | 'managed'>('all');
   let localJobsAllowlistDraft = $state('');
+  let authoringTemplateId = $state('custom-command');
+  let authoringName = $state('placeholder-custom.timer');
+  let authoringDescription = $state('');
+  let authoringCommand = $state('/usr/bin/printf custom');
+  let authoringScheduleKind = $state<'interval' | 'calendar'>('interval');
+  let authoringScheduleValue = $state('1h');
+  let authoringWorkingDir = $state('');
+  let authoredPreview = $state<SystemJobRenderedUnits | null>(null);
+  let authoringBusy = $state(false);
+  let deletingAuthoredUnit = $state<string | null>(null);
   let expandedLogUnit = $state<string | null>(null);
   let streamStatus = $state<StreamStatus>('connecting');
   let error = $state<string | null>(null);
@@ -179,6 +197,11 @@
         .includes(search);
     });
   });
+  let selectedSystemJobTemplate = $derived(
+    systemJobTemplates.find((template) => template.id === authoringTemplateId) ??
+      systemJobTemplates[0] ??
+      null
+  );
   let selectedProfile = $derived(
     workspaceProfiles.find((profile) => profile.id === draftProfileId) ?? null
   );
@@ -265,6 +288,97 @@
 
   function localJobManagedByGlob(job: LocalJobSummary): boolean {
     return job.managed && localJobHasNonLiteralAllowlistMatch(job, localJobsAllowlist);
+  }
+
+  function applySystemJobTemplate(template: SystemJobTemplate) {
+    authoringTemplateId = template.id;
+    authoringName = template.spec.name;
+    authoringDescription = template.spec.description ?? '';
+    authoringCommand = template.spec.command;
+    authoringScheduleKind = template.spec.schedule.kind;
+    authoringScheduleValue = template.spec.schedule.value;
+    authoringWorkingDir = template.spec.working_dir ?? '';
+    authoredPreview = null;
+  }
+
+  function authoredSpecFromDraft(): SystemJobAuthoringSpec {
+    return {
+      name: authoringName.trim(),
+      description: authoringDescription.trim() || null,
+      command: authoringCommand.trim(),
+      schedule: {
+        kind: authoringScheduleKind,
+        value: authoringScheduleValue.trim()
+      },
+      working_dir: authoringWorkingDir.trim() || null
+    };
+  }
+
+  function invalidateAuthoredPreview() {
+    authoredPreview = null;
+  }
+
+  async function previewAuthoredLocalJob() {
+    authoringBusy = true;
+    success = null;
+
+    try {
+      authoredPreview = await renderAuthoredLocalJob(authoredSpecFromDraft());
+      error = null;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to render the local job units.';
+    } finally {
+      authoringBusy = false;
+    }
+  }
+
+  async function installAuthoredFromPreview() {
+    if (!authoredPreview) {
+      await previewAuthoredLocalJob();
+      if (!authoredPreview) return;
+    }
+    authoringBusy = true;
+    success = null;
+
+    try {
+      const next = await installAuthoredLocalJob(authoredSpecFromDraft());
+      syncLocalJobSummary(next);
+      selectedLocalJobUnit = next.unit;
+      authoredPreview = null;
+      const allowlist = await fetchLocalJobsAllowlist();
+      syncLocalJobsAllowlist(allowlist.globs);
+      await refreshLocalJobsAfterAllowlistChange();
+      success = 'Local job installed.';
+      error = null;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to install the local job.';
+    } finally {
+      authoringBusy = false;
+    }
+  }
+
+  async function deleteAuthoredJob(job: LocalJobSummary) {
+    if (!job.authored) return;
+    const confirmed = window.confirm(`Delete ${job.unit}?`);
+    if (!confirmed) return;
+    deletingAuthoredUnit = job.unit;
+    success = null;
+
+    try {
+      const allowlist = await deleteAuthoredLocalJob(job.unit);
+      syncLocalJobsAllowlist(allowlist.globs);
+      await refreshLocalJobsAfterAllowlistChange();
+      if (selectedLocalJobUnit === job.unit) {
+        selectedLocalJobUnit = localJobs[0]?.unit ?? '';
+        localJobDetail = null;
+      }
+      success = 'Local job deleted.';
+      error = null;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to delete the local job.';
+    } finally {
+      deletingAuthoredUnit = null;
+    }
   }
 
   function syncLocalJobSummary(next: LocalJobSummary) {
@@ -585,12 +699,17 @@
     refreshing = silent;
 
     try {
-      const [nextOverview, nextPlaybooks] = await Promise.all([
+      const [nextOverview, nextPlaybooks, nextTemplates] = await Promise.all([
         fetchOverview(),
-        fetchPlaybooks()
+        fetchPlaybooks(),
+        fetchSystemJobTemplates()
       ]);
       overview = nextOverview;
       playbooks = nextPlaybooks;
+      systemJobTemplates = nextTemplates;
+      if (!systemJobTemplates.some((template) => template.id === authoringTemplateId)) {
+        authoringTemplateId = systemJobTemplates[0]?.id ?? authoringTemplateId;
+      }
       error = null;
 
       try {
@@ -1295,6 +1414,111 @@
       </div>
     {/if}
 
+    <Card>
+      <CardHeader>
+        <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+          <div>
+            <CardTitle>Add automation</CardTitle>
+            <CardDescription>
+              Preview the systemd user timer and service before installing them.
+            </CardDescription>
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <Button onclick={() => void previewAuthoredLocalJob()} disabled={authoringBusy}>
+              <ScrollText class="size-4" />
+              {authoringBusy ? 'Rendering' : 'Preview'}
+            </Button>
+            <Button
+              variant="outline"
+              onclick={() => void installAuthoredFromPreview()}
+              disabled={authoringBusy || !authoredPreview}
+            >
+              <Plus class="size-4" />
+              Confirm install
+            </Button>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent class="space-y-4">
+        <div class="grid gap-3 lg:grid-cols-[18rem_minmax(0,1fr)_12rem]">
+          <select
+            class="h-10 rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100"
+            value={authoringTemplateId}
+            aria-label="Automation template"
+            onchange={(event) => {
+              const template = systemJobTemplates.find(
+                (candidate) => candidate.id === (event.currentTarget as HTMLSelectElement).value
+              );
+              if (template) applySystemJobTemplate(template);
+            }}
+          >
+            {#each systemJobTemplates as template}
+              <option value={template.id}>{template.title}</option>
+            {/each}
+          </select>
+          <Input
+            placeholder="placeholder-sync.timer"
+            bind:value={authoringName}
+            oninput={invalidateAuthoredPreview}
+          />
+          <select
+            class="h-10 rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100"
+            bind:value={authoringScheduleKind}
+            aria-label="Schedule type"
+            onchange={invalidateAuthoredPreview}
+          >
+            <option value="interval">Interval</option>
+            <option value="calendar">Calendar</option>
+          </select>
+        </div>
+        {#if selectedSystemJobTemplate}
+          <div class="text-xs text-zinc-500">{selectedSystemJobTemplate.summary}</div>
+        {/if}
+        <div class="grid gap-3 lg:grid-cols-2">
+          <Input
+            placeholder="Description"
+            bind:value={authoringDescription}
+            oninput={invalidateAuthoredPreview}
+          />
+          <Input
+            placeholder={authoringScheduleKind === 'interval' ? '30min' : '*-*-* 04:00:00'}
+            bind:value={authoringScheduleValue}
+            oninput={invalidateAuthoredPreview}
+          />
+        </div>
+        <Textarea
+          class="min-h-20 font-mono text-xs"
+          placeholder="/usr/bin/printf hello"
+          bind:value={authoringCommand}
+          oninput={invalidateAuthoredPreview}
+        ></Textarea>
+        <Input
+          placeholder="Working directory"
+          bind:value={authoringWorkingDir}
+          oninput={invalidateAuthoredPreview}
+        />
+
+        {#if authoredPreview}
+          <div class="grid gap-3 xl:grid-cols-2">
+            <div class="space-y-2">
+              <div class="flex items-center gap-2 text-sm font-medium text-zinc-200">
+                <TimerReset class="size-4" />
+                {authoredPreview.timer_unit}
+              </div>
+              <pre class="max-h-80 overflow-auto rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-3 text-xs leading-5 text-zinc-400">{authoredPreview.timer}</pre>
+            </div>
+            <div class="space-y-2">
+              <div class="flex items-center gap-2 text-sm font-medium text-zinc-200">
+                <Cog class="size-4" />
+                {authoredPreview.service_unit}
+              </div>
+              <pre class="max-h-80 overflow-auto rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-3 text-xs leading-5 text-zinc-400">{authoredPreview.service}</pre>
+            </div>
+          </div>
+        {/if}
+      </CardContent>
+    </Card>
+
     <section class="grid gap-4 xl:grid-cols-[minmax(0,1fr)_24rem]">
       <Card>
         <CardHeader>
@@ -1346,6 +1570,11 @@
                           {:else}
                             <Badge variant="secondary">Read-only</Badge>
                           {/if}
+                          {#if job.authored}
+                            <Badge variant="warning">Authored</Badge>
+                          {:else}
+                            <Badge variant="secondary">Discovered</Badge>
+                          {/if}
                           <Badge variant={localJobBadgeVariant(job)}>{job.active_state}</Badge>
                           <Badge variant="secondary">{job.unit_file_state}</Badge>
                         </div>
@@ -1378,6 +1607,17 @@
                           </Button>
                         {:else if localJobManagedByGlob(job)}
                           <Badge variant="secondary">Managed by glob</Badge>
+                        {/if}
+                        {#if job.authored}
+                          <Button
+                            size="sm"
+                            variant="destructive"
+                            onclick={() => void deleteAuthoredJob(job)}
+                            disabled={deletingAuthoredUnit !== null}
+                          >
+                            <Trash2 class="size-3.5" />
+                            {deletingAuthoredUnit === job.unit ? 'Deleting' : 'Delete'}
+                          </Button>
                         {/if}
                       </div>
                     </div>
@@ -1457,6 +1697,11 @@
                     <Cog class="size-4 text-zinc-400" />
                     <span class="text-sm font-medium text-zinc-100">{job.title}</span>
                     <Badge variant="secondary">systemd · user</Badge>
+                    {#if job.authored}
+                      <Badge variant="warning">Authored</Badge>
+                    {:else}
+                      <Badge variant="secondary">Discovered</Badge>
+                    {/if}
                     <Badge variant={job.enabled ? 'default' : 'secondary'}>
                       {job.enabled ? 'enabled' : 'disabled'}
                     </Badge>
@@ -1493,6 +1738,16 @@
                     <Play class="size-4" />
                     {localJobAction === localJobActionKey(job.unit, 'run') ? 'Starting' : 'Run now'}
                   </Button>
+                  {#if job.authored}
+                    <Button
+                      variant="destructive"
+                      onclick={() => void deleteAuthoredJob(job)}
+                      disabled={deletingAuthoredUnit !== null}
+                    >
+                      <Trash2 class="size-4" />
+                      {deletingAuthoredUnit === job.unit ? 'Deleting' : 'Delete'}
+                    </Button>
+                  {/if}
                 </div>
               </div>
 
@@ -1536,7 +1791,14 @@
               <div class="grid gap-3 sm:grid-cols-2">
                 <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-3">
                   <div class="text-[11px] uppercase tracking-[0.18em] text-zinc-500">Backend</div>
-                  <div class="mt-2 text-sm text-zinc-100">systemd · user</div>
+                  <div class="mt-2 flex flex-wrap items-center gap-2 text-sm text-zinc-100">
+                    <span>systemd · user</span>
+                    {#if selectedLocalJob.authored}
+                      <Badge variant="warning">Authored</Badge>
+                    {:else}
+                      <Badge variant="secondary">Discovered</Badge>
+                    {/if}
+                  </div>
                 </div>
                 <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-3">
                   <div class="text-[11px] uppercase tracking-[0.18em] text-zinc-500">Active state</div>
@@ -1586,6 +1848,16 @@
                   <Play class="size-4" />
                   Run now
                 </Button>
+                {#if selectedLocalJob.authored}
+                  <Button
+                    variant="destructive"
+                    onclick={() => void deleteAuthoredJob(selectedLocalJob)}
+                    disabled={deletingAuthoredUnit !== null}
+                  >
+                    <Trash2 class="size-4" />
+                    {deletingAuthoredUnit === selectedLocalJob.unit ? 'Deleting' : 'Delete'}
+                  </Button>
+                {/if}
                 {#if localJobCanRun(selectedLocalJob)}
                   <Button
                     variant="outline"
