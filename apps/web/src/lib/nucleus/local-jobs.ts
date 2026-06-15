@@ -21,5 +21,5 @@ export function localJobCanToggle(job: LocalJobSummary): boolean {
 }
 
 export function localJobCanRun(job: LocalJobSummary): boolean {
-  return job.triggered_unit.trim().length > 0;
+  return job.triggered_unit.trim().endsWith('.service');
 }

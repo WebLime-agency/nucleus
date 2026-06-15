@@ -32,7 +32,10 @@ impl fmt::Display for SystemJobError {
             }
             Self::InvalidUnit { reason } => write!(formatter, "systemd unit {reason}"),
             Self::UnsupportedTriggeredUnit { unit } => {
-                write!(formatter, "triggered unit '{unit}' must end with .service")
+                write!(
+                    formatter,
+                    "triggered unit '{unit}' is not supported for this operation"
+                )
             }
             Self::MissingTriggeredUnit { unit } => {
                 write!(
@@ -270,14 +273,14 @@ impl SystemdUserScheduler {
         let timer = parse_key_values(&timer_output.stdout);
         let triggered_unit = optional_triggered_unit(&timer).unwrap_or_default();
         if !triggered_unit.is_empty() {
-            validate_triggered_service_unit(&triggered_unit)?;
+            validate_triggered_unit(&triggered_unit)?;
         }
-        let service_stdout = if triggered_unit.is_empty() {
-            String::new()
-        } else {
+        let service_stdout = if triggered_unit.ends_with(".service") {
             self.run_command(service_show_invocation(&triggered_unit))
                 .await?
                 .stdout
+        } else {
+            String::new()
         };
 
         let mut summary = parse_local_job_summary_with_listed_next(
@@ -354,7 +357,7 @@ fn parse_local_job_summary_with_listed_next(
     validate_timer_unit(&unit)?;
     let triggered_unit = optional_triggered_unit(&timer).unwrap_or_default();
     if !triggered_unit.is_empty() {
-        validate_triggered_service_unit(&triggered_unit)?;
+        validate_triggered_unit(&triggered_unit)?;
     }
 
     let next_elapse_realtime = timer.get("NextElapseUSecRealtime");
@@ -749,6 +752,19 @@ fn validate_service_unit(unit: &str) -> Result<()> {
     validate_unit_name(unit, ".service")
 }
 
+fn validate_triggered_unit(unit: &str) -> Result<()> {
+    if unit.ends_with(".timer") {
+        return Err(SystemJobError::UnsupportedTriggeredUnit {
+            unit: unit.to_string(),
+        }
+        .into());
+    }
+    let suffix = unit_suffix(unit).ok_or_else(|| SystemJobError::InvalidUnit {
+        reason: "must include a unit suffix".to_string(),
+    })?;
+    validate_unit_name(unit, suffix)
+}
+
 fn validate_triggered_service_unit(unit: &str) -> Result<()> {
     if !unit.ends_with(".service") {
         return Err(SystemJobError::UnsupportedTriggeredUnit {
@@ -757,6 +773,11 @@ fn validate_triggered_service_unit(unit: &str) -> Result<()> {
         .into());
     }
     validate_service_unit(unit)
+}
+
+fn unit_suffix(unit: &str) -> Option<&str> {
+    let suffix_index = unit.rfind('.')?;
+    Some(&unit[suffix_index..])
 }
 
 fn validate_unit_name(unit: &str, suffix: &str) -> Result<()> {
@@ -973,6 +994,15 @@ Triggers=placeholder-discovered.service\n\
 ActiveState=inactive\n\
 UnitFileState=disabled\n";
 
+    const TARGET_TIMER_SHOW: &str = "\
+NextElapseUSecRealtime=n/a\n\
+NextElapseUSecMonotonic=123456789\n\
+LastTriggerUSec=n/a\n\
+Id=placeholder-target.timer\n\
+Triggers=placeholder.target\n\
+ActiveState=inactive\n\
+UnitFileState=disabled\n";
+
     const LIST_TIMERS_WITH_BROKEN_TIMER: &str = "\
 Sat 2026-06-13 17:30:00 UTC 29min Sat 2026-06-13 17:00:01 UTC 1s ago placeholder-cleanup.timer placeholder-cleanup.service\n\
 Sat 2026-06-13 17:30:00 UTC 29min Sat 2026-06-13 17:00:01 UTC 1s ago placeholder-broken.timer placeholder-broken.service\n";
@@ -1025,6 +1055,16 @@ placeholder-broken.timer enabled enabled\n";
         assert_eq!(summary.last_exit.code, None);
         assert_eq!(summary.last_exit.result, "unknown");
         assert_eq!(summary.last_exit.at, None);
+    }
+
+    #[test]
+    fn parses_timer_triggering_non_service_unit_as_degraded_summary() {
+        let summary = parse_local_job_summary(TARGET_TIMER_SHOW, "").unwrap();
+
+        assert_eq!(summary.unit, "placeholder-target.timer");
+        assert_eq!(summary.triggered_unit, "placeholder.target");
+        assert_eq!(summary.last_exit.code, None);
+        assert_eq!(summary.last_exit.result, "unknown");
     }
 
     #[test]
@@ -1343,12 +1383,18 @@ UnitFileState=enabled\n";
             SystemdUserScheduler::with_command_runner(|invocation, _timeout| async move {
                 if invocation.args.iter().any(|arg| arg == "list-timers") {
                     return Ok(CommandOutput {
-                        stdout: LIST_TIMERS_WITH_AVAILABLE_TIMERS.to_string(),
+                        stdout: format!(
+                            "{}n/a n/a n/a n/a placeholder-target.timer placeholder.target\n",
+                            LIST_TIMERS_WITH_AVAILABLE_TIMERS
+                        ),
                     });
                 }
                 if invocation.args.iter().any(|arg| arg == "list-unit-files") {
                     return Ok(CommandOutput {
-                        stdout: LIST_UNIT_FILES_WITH_AVAILABLE_TIMERS.to_string(),
+                        stdout: format!(
+                            "{}placeholder-target.timer disabled disabled\n",
+                            LIST_UNIT_FILES_WITH_AVAILABLE_TIMERS
+                        ),
                     });
                 }
                 if invocation
@@ -1396,6 +1442,15 @@ UnitFileState=enabled\n";
                         stdout: FAILED_TIMER_WITHOUT_TRIGGER_SHOW.to_string(),
                     });
                 }
+                if invocation
+                    .args
+                    .iter()
+                    .any(|arg| arg == "placeholder-target.timer")
+                {
+                    return Ok(CommandOutput {
+                        stdout: TARGET_TIMER_SHOW.to_string(),
+                    });
+                }
                 panic!("unexpected invocation: {invocation:?}");
             });
 
@@ -1404,7 +1459,7 @@ UnitFileState=enabled\n";
             .await
             .unwrap();
 
-        assert_eq!(summaries.len(), 3);
+        assert_eq!(summaries.len(), 4);
         assert_eq!(summaries[0].unit, "placeholder-cleanup.timer");
         assert!(summaries[0].managed);
         assert_eq!(summaries[1].unit, "placeholder-discovered.timer");
@@ -1412,6 +1467,9 @@ UnitFileState=enabled\n";
         assert_eq!(summaries[2].unit, "placeholder-failed.timer");
         assert_eq!(summaries[2].active_state, "failed");
         assert!(!summaries[2].managed);
+        assert_eq!(summaries[3].unit, "placeholder-target.timer");
+        assert_eq!(summaries[3].triggered_unit, "placeholder.target");
+        assert!(!summaries[3].managed);
     }
 
     #[tokio::test]

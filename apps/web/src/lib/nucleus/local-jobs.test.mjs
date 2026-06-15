@@ -50,6 +50,7 @@ test('local job toggle availability follows daemon manageability', () => {
 
 test('local job run availability requires a triggered service', () => {
   assert.equal(localJobCanRun(job('success')), true);
+  assert.equal(localJobCanRun({ ...job('success'), triggered_unit: 'placeholder.target' }), false);
   assert.equal(localJobCanRun({ ...job('success'), triggered_unit: '' }), false);
   assert.equal(localJobCanRun({ ...job('success'), triggered_unit: '   ' }), false);
 });
