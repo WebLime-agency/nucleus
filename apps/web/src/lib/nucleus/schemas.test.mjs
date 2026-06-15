@@ -3,9 +3,40 @@ import { test } from 'node:test';
 
 import {
   createSessionRequestSchema,
+  localJobSummarySchema,
   sessionSummarySchema,
   updateSessionRequestSchema
 } from './schemas.ts';
+
+function localJobSummary(overrides = {}) {
+  return {
+    unit: 'placeholder-cleanup.timer',
+    title: 'Placeholder Cleanup',
+    backend: 'systemd-user',
+    enabled: true,
+    unit_file_state: 'enabled',
+    manageable: true,
+    active_state: 'active',
+    schedule: {
+      next_elapse_at: null,
+      interval_hint: null,
+      raw: ''
+    },
+    last_fired_at: null,
+    last_exit: {
+      code: null,
+      result: 'success',
+      at: null
+    },
+    triggered_unit: 'placeholder-cleanup.service',
+    ...overrides
+  };
+}
+
+test('local job summary schema reads managed flag with legacy default', () => {
+  assert.equal(localJobSummarySchema.parse(localJobSummary()).managed, false);
+  assert.equal(localJobSummarySchema.parse(localJobSummary({ managed: true })).managed, true);
+});
 
 test('session request schemas accept canonical attachment modes', () => {
   for (const attachment_mode of ['new_worktree', 'project_root', 'scratch']) {
