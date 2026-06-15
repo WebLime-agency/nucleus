@@ -2598,8 +2598,12 @@ async fn run_job_loop(
 
         let attach_initial_images = should_attach_initial_worker_images(&checkpoint);
         let prompt = checkpoint.next_prompt.take().unwrap_or_else(|| {
-            let initial =
-                build_initial_step_prompt(&session.session, &assembled_prompt.prompt, &worker);
+            let initial = build_initial_step_prompt(
+                &session.session,
+                &assembled_prompt.prompt,
+                &worker,
+                low_context_turn,
+            );
             let prompt = if checkpoint.patch_loop_guardrail_triggered {
                 build_patch_loop_guardrail_prompt(initial)
             } else {
@@ -4887,8 +4891,9 @@ fn build_initial_step_prompt(
     session: &SessionSummary,
     prompt: &str,
     worker: &WorkerSummary,
+    low_context_turn: bool,
 ) -> String {
-    let next_action_instruction = if worker.parent_worker_id.is_none() {
+    let next_action_instruction = if worker.parent_worker_id.is_none() && !low_context_turn {
         "Return one JSON action for the next step. For broad or multi-step repo/workspace inspection, multi-file analysis, implementation, debugging, deep reasoning, or anything likely to need more than about 1-2 evidence/tool calls, return spawn_child_jobs first unless delegation is concretely impossible. Use tool_call only for trivial single-step inspection, targeted triage, validation, or a specific final join gap. If you need to persist a non-terminal checkpoint, return progress_update. Only return final_answer when it is a complete terminal response, never an action plan, progress update, or a description of what should happen next."
     } else {
         "Return one JSON action for the next step. If repo or workspace inspection is needed, return a tool_call. If you need to persist a non-terminal checkpoint, return progress_update. Only return final_answer when it is a complete terminal response, never an action plan, progress update, or a description of what should happen next."
@@ -18214,7 +18219,7 @@ Allowed response shapes:\n\
 Rules:\n\
 - Think briefly in the thoughts field first, then choose the action.\n\
 - If the user's prompt is conversational or already answerable from visible context, answer directly with final_answer.\n\
-{}\
+{}\n\
 - Never invent tool output.\n\
 - Stay inside the granted repo scope.\n\
 {}\
@@ -18237,7 +18242,7 @@ Rules:\n\
 - Do not wrap JSON in markdown fences.\n\
 Available tools:\n{}\n\
 {}\n\
-{}\
+{}\n\
 Worker lane: {}\n\
 Working directory: {}\n",
         worker_intro,
@@ -19286,6 +19291,11 @@ mod tests {
         assert!(root_prompt.contains("Nucleus worker action JSON contract"));
         assert!(root_prompt.contains("Think briefly in the thoughts field first"));
         assert!(root_prompt.contains("already answerable from visible context"));
+        let root_python_runtime_section = root_prompt
+            .split("Python runtime:")
+            .nth(1)
+            .expect("root prompt should include Python runtime status");
+        assert!(root_python_runtime_section.contains("\nWorker lane:"));
         assert!(!root_prompt.contains("and nothing else"));
         assert!(
             root_prompt.find("{\"kind\":\"spawn_child_jobs\"")
@@ -27847,6 +27857,7 @@ Thanks."#,
             &session,
             "That's the URL because it auto forwards there.",
             &worker,
+            false,
         );
 
         assert!(prompt.contains("corrects, refines, or challenges the previous answer"));
@@ -27857,6 +27868,19 @@ Thanks."#,
         assert!(prompt.contains("wrong branch/worktree"));
         assert!(prompt.contains("deployment visibility question directly"));
         assert!(prompt.contains("do not let Browser verification status replace"));
+
+        let low_context_prompt = build_initial_step_prompt(
+            &session,
+            "That's the URL because it auto forwards there.",
+            &worker,
+            true,
+        );
+
+        assert!(
+            low_context_prompt
+                .contains("If repo or workspace inspection is needed, return a tool_call")
+        );
+        assert!(!low_context_prompt.contains("return spawn_child_jobs first"));
     }
 
     #[tokio::test]
