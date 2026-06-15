@@ -5189,7 +5189,8 @@ fn map_system_job_error(error: anyhow::Error) -> ApiError {
         return match system_error {
             system_jobs::SystemJobError::NotAllowlisted { .. } => ApiError::forbidden(message),
             system_jobs::SystemJobError::InvalidUnit { .. }
-            | system_jobs::SystemJobError::UnsupportedTriggeredUnit { .. } => {
+            | system_jobs::SystemJobError::UnsupportedTriggeredUnit { .. }
+            | system_jobs::SystemJobError::MissingTriggeredUnit { .. } => {
                 ApiError::bad_request(message)
             }
         };

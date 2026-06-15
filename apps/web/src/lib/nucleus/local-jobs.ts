@@ -19,3 +19,7 @@ export function localJobLastRunFailed(job: LocalJobSummary): boolean {
 export function localJobCanToggle(job: LocalJobSummary): boolean {
   return job.manageable;
 }
+
+export function localJobCanRun(job: LocalJobSummary): boolean {
+  return job.triggered_unit.trim().length > 0;
+}
