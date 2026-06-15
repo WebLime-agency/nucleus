@@ -5158,6 +5158,7 @@ async fn update_local_jobs_allowlist(
     )
     .await;
     if globs.is_empty() {
+        clear_local_jobs_stream_cache().await;
         let _ = state.events.send(DaemonEvent::LocalJobsUpdated(Vec::new()));
     } else if let Err(error) = publish_local_jobs_event(&state, true).await {
         warn!(error = %error, "failed to publish local job state after allowlist update");
@@ -5566,6 +5567,7 @@ async fn throttled_local_jobs_snapshot_if_configured(
 ) -> anyhow::Result<Option<Vec<LocalJobSummary>>> {
     let allowlist = state.store.system_jobs_unit_globs()?;
     if allowlist.is_empty() {
+        clear_local_jobs_stream_cache().await;
         return Ok(None);
     }
 
@@ -5612,10 +5614,28 @@ async fn throttled_local_jobs_snapshot_if_configured(
     refresh.notify_waiters();
 
     let jobs = result?;
+    let latest_allowlist = state.store.system_jobs_unit_globs()?;
+    if latest_allowlist != allowlist {
+        if latest_allowlist.is_empty() {
+            cache.allowlist.clear();
+            cache.last_refreshed_at = Some(Instant::now());
+            cache.jobs = Some(Vec::new());
+        }
+        return Ok(None);
+    }
     cache.allowlist = allowlist;
     cache.last_refreshed_at = Some(Instant::now());
     cache.jobs = Some(jobs.clone());
     Ok(Some(jobs))
+}
+
+async fn clear_local_jobs_stream_cache() {
+    let cache = LOCAL_JOBS_STREAM_CACHE
+        .get_or_init(|| tokio::sync::Mutex::new(LocalJobsStreamCache::default()));
+    let mut cache = cache.lock().await;
+    cache.allowlist.clear();
+    cache.last_refreshed_at = Some(Instant::now());
+    cache.jobs = Some(Vec::new());
 }
 
 async fn publish_overview_event(state: &AppState) -> anyhow::Result<()> {

@@ -48,7 +48,14 @@
     updatePlaybook
   } from '$lib/nucleus/client';
   import { compactPath, formatDateTime, formatState } from '$lib/nucleus/format';
-  import { localJobBadgeVariant, localJobCanRun, localJobCanToggle } from '$lib/nucleus/local-jobs';
+  import {
+    localJobBadgeVariant,
+    localJobCanRemoveLiteralAllowlistEntry,
+    localJobCanRun,
+    localJobCanToggle,
+    localJobHasLiteralAllowlistEntry,
+    localJobHasNonLiteralAllowlistMatch
+  } from '$lib/nucleus/local-jobs';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
   import type {
     DaemonEvent,
@@ -256,12 +263,8 @@
       .filter(Boolean);
   }
 
-  function localJobHasLiteralAllowlistEntry(job: LocalJobSummary): boolean {
-    return localJobsAllowlist.includes(job.unit);
-  }
-
-  function localJobManagedByPatternOnly(job: LocalJobSummary): boolean {
-    return job.managed && !localJobHasLiteralAllowlistEntry(job);
+  function localJobManagedByGlob(job: LocalJobSummary): boolean {
+    return job.managed && localJobHasNonLiteralAllowlistMatch(job, localJobsAllowlist);
   }
 
   function syncLocalJobSummary(next: LocalJobSummary) {
@@ -362,7 +365,7 @@
   }
 
   async function manageLocalJob(job: LocalJobSummary) {
-    if (localJobHasLiteralAllowlistEntry(job)) {
+    if (localJobHasLiteralAllowlistEntry(job, localJobsAllowlist)) {
       return;
     }
     await replaceLocalJobsAllowlist([...localJobsAllowlist, job.unit], 'Local job added to management.');
@@ -370,7 +373,7 @@
   }
 
   async function unmanageLocalJob(job: LocalJobSummary) {
-    if (!localJobHasLiteralAllowlistEntry(job)) {
+    if (!localJobCanRemoveLiteralAllowlistEntry(job, localJobsAllowlist)) {
       return;
     }
     await replaceLocalJobsAllowlist(
@@ -1363,7 +1366,7 @@
                             <Plus class="size-3.5" />
                             Manage
                           </Button>
-                        {:else if localJobHasLiteralAllowlistEntry(job)}
+                        {:else if localJobCanRemoveLiteralAllowlistEntry(job, localJobsAllowlist)}
                           <Button
                             size="sm"
                             variant="outline"
@@ -1373,7 +1376,7 @@
                             <Trash2 class="size-3.5" />
                             Unmanage
                           </Button>
-                        {:else if localJobManagedByPatternOnly(job)}
+                        {:else if localJobManagedByGlob(job)}
                           <Badge variant="secondary">Managed by glob</Badge>
                         {/if}
                       </div>

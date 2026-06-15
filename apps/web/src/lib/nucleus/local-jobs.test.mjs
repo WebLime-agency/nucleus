@@ -1,7 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { localJobBadgeVariant, localJobCanRun, localJobCanToggle, localJobLastRunFailed } from './local-jobs.ts';
+import {
+  localJobBadgeVariant,
+  localJobCanRemoveLiteralAllowlistEntry,
+  localJobCanRun,
+  localJobCanToggle,
+  localJobHasLiteralAllowlistEntry,
+  localJobHasNonLiteralAllowlistMatch,
+  localJobLastRunFailed,
+  localJobMatchesAllowlistGlob
+} from './local-jobs.ts';
 
 function job(result) {
   return {
@@ -53,4 +62,16 @@ test('local job run availability requires a triggered service', () => {
   assert.equal(localJobCanRun({ ...job('success'), triggered_unit: 'placeholder.target' }), false);
   assert.equal(localJobCanRun({ ...job('success'), triggered_unit: '' }), false);
   assert.equal(localJobCanRun({ ...job('success'), triggered_unit: '   ' }), false);
+});
+
+test('local job allowlist helpers distinguish exact entries from broader globs', () => {
+  const summary = job('success');
+
+  assert.equal(localJobMatchesAllowlistGlob('placeholder-*.timer', summary.unit), true);
+  assert.equal(localJobMatchesAllowlistGlob('placeholder-cleanu?.timer', summary.unit), true);
+  assert.equal(localJobMatchesAllowlistGlob('other-*.timer', summary.unit), false);
+  assert.equal(localJobHasLiteralAllowlistEntry(summary, [summary.unit, 'placeholder-*.timer']), true);
+  assert.equal(localJobHasNonLiteralAllowlistMatch(summary, [summary.unit, 'placeholder-*.timer']), true);
+  assert.equal(localJobCanRemoveLiteralAllowlistEntry(summary, [summary.unit]), true);
+  assert.equal(localJobCanRemoveLiteralAllowlistEntry(summary, [summary.unit, 'placeholder-*.timer']), false);
 });
