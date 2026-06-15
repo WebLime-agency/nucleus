@@ -145,6 +145,8 @@ struct LocalJobsStreamCache {
 static LOCAL_JOBS_STREAM_CACHE: OnceLock<tokio::sync::Mutex<LocalJobsStreamCache>> =
     OnceLock::new();
 const SYSTEM_JOBS_ALLOWLIST_MAX_GLOBS: usize = 200;
+const SYSTEM_JOBS_ALLOWLIST_MAX_GLOB_BYTES: usize = 256;
+const SYSTEM_JOBS_ALLOWLIST_MAX_TOTAL_BYTES: usize = 16_000;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -5174,11 +5176,22 @@ fn normalize_system_jobs_unit_globs(globs: Vec<String>) -> Result<Vec<String>, A
         if glob.is_empty() || !seen.insert(glob.clone()) {
             continue;
         }
+        if glob.len() > SYSTEM_JOBS_ALLOWLIST_MAX_GLOB_BYTES {
+            return Err(ApiError::bad_request(format!(
+                "system job allowlist entries cannot be longer than {SYSTEM_JOBS_ALLOWLIST_MAX_GLOB_BYTES} bytes"
+            )));
+        }
         normalized.push(glob);
     }
     if normalized.len() > SYSTEM_JOBS_ALLOWLIST_MAX_GLOBS {
         return Err(ApiError::bad_request(format!(
             "system job allowlist cannot contain more than {SYSTEM_JOBS_ALLOWLIST_MAX_GLOBS} entries"
+        )));
+    }
+    let total_bytes = normalized.iter().map(String::len).sum::<usize>();
+    if total_bytes > SYSTEM_JOBS_ALLOWLIST_MAX_TOTAL_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "system job allowlist entries cannot total more than {SYSTEM_JOBS_ALLOWLIST_MAX_TOTAL_BYTES} bytes"
         )));
     }
     Ok(normalized)
@@ -10391,6 +10404,29 @@ mod tests {
 
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert!(error.message.contains("cannot contain more than"));
+    }
+
+    #[test]
+    fn rejects_system_jobs_unit_globs_above_entry_length_cap() {
+        let overlong = format!("{}.timer", "a".repeat(SYSTEM_JOBS_ALLOWLIST_MAX_GLOB_BYTES));
+
+        let error =
+            normalize_system_jobs_unit_globs(vec![overlong]).expect_err("cap should reject");
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("cannot be longer"));
+    }
+
+    #[test]
+    fn rejects_system_jobs_unit_globs_above_total_length_cap() {
+        let globs = (0..SYSTEM_JOBS_ALLOWLIST_MAX_GLOBS)
+            .map(|index| format!("{}-{index}.timer", "a".repeat(80)))
+            .collect();
+
+        let error = normalize_system_jobs_unit_globs(globs).expect_err("total cap should reject");
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("cannot total more than"));
     }
 
     fn set_default_profile_model_target(
