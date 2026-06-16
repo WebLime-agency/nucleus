@@ -380,6 +380,14 @@ async fn execute_openai_compatible_prompt(
                     });
                 }
 
+                let empty_provider_output = is_empty_completed_provider_output(&error);
+                let recoverable_provider_output =
+                    empty_provider_output || is_malformed_provider_output_error(&error);
+
+                if recoverable_provider_output {
+                    provider_retry_nudge = true;
+                }
+
                 if stream
                     && may_try_non_streaming_fallback
                     && !tried_non_streaming_fallback
@@ -388,18 +396,6 @@ async fn execute_openai_compatible_prompt(
                     force_non_streaming = true;
                     tried_non_streaming_fallback = true;
                     continue;
-                }
-
-                let empty_provider_output = is_empty_completed_provider_output(&error);
-                let recoverable_provider_output =
-                    empty_provider_output || is_malformed_provider_output_error(&error);
-                if empty_provider_output {
-                    if stream && may_try_non_streaming_fallback && !tried_non_streaming_fallback {
-                        provider_retry_nudge = true;
-                        force_non_streaming = true;
-                        tried_non_streaming_fallback = true;
-                        continue;
-                    }
                 }
 
                 attempt = attempt.saturating_add(1);
@@ -436,7 +432,7 @@ fn openai_compatible_messages_for_attempt(
     if provider_retry_nudge {
         messages.push(json!({
             "role": "user",
-            "content": "The previous provider response was empty or malformed. Retry this turn and return one non-empty response that follows the current Nucleus worker action instructions."
+            "content": "The previous provider response was empty or malformed. Retry this turn and return one non-empty response that follows the current instructions."
         }));
     }
     messages
@@ -1233,6 +1229,30 @@ mod tests {
                 .expect("final answer should be text")
                 .contains("cannot continue")
         );
+    }
+
+    #[test]
+    fn provider_retry_nudge_is_schema_neutral() {
+        let messages = openai_compatible_messages_for_attempt(Vec::new(), true);
+        let content = messages
+            .last()
+            .and_then(|message| message.get("content"))
+            .and_then(serde_json::Value::as_str)
+            .expect("retry nudge should add a user message");
+
+        assert!(content.contains("current instructions"));
+        assert!(!content.contains("worker action"));
+    }
+
+    #[test]
+    fn empty_stream_fallback_error_requests_retry_nudge() {
+        let error: anyhow::Error = ProviderTransportError::Stream {
+            detail: "stream completed with empty response".to_string(),
+        }
+        .into();
+
+        assert!(should_try_non_streaming_fallback(&error));
+        assert!(should_nudge_provider_retry(&error));
     }
 
     fn test_session_summary(model: &str) -> SessionSummary {
