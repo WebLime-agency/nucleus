@@ -12,5 +12,8 @@ permissions:
 
 jobs:
   review:
+    if: |
+      !github.event.pull_request.draft &&
+      github.event.pull_request.head.repo.full_name == github.repository
     uses: WebLime-agency/.github/.github/workflows/claude-review-reusable.yml@9381ae7b41dccb4ac15133f7b22ba02e77e18b0f
     secrets: inherit
