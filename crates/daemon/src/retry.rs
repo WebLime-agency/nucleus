@@ -69,7 +69,7 @@ pub(crate) fn classify_provider_error(
                 return classify_http_status(*status, attempt, retry_after);
             }
             ProviderTransportError::Stream { detail } => {
-                if is_retryable_transport_text(detail) {
+                if is_retryable_stream_detail(detail) {
                     return RetryDecision::Retry {
                         backoff: exponential_backoff(attempt, retry_after),
                     };
@@ -113,7 +113,7 @@ pub(crate) fn provider_error_class(err: &anyhow::Error) -> String {
     if let Some(provider_error) = err.downcast_ref::<ProviderTransportError>() {
         return match provider_error {
             ProviderTransportError::Http { status, .. } => format!("http_{status}"),
-            ProviderTransportError::Stream { detail } if is_retryable_transport_text(detail) => {
+            ProviderTransportError::Stream { detail } if is_retryable_stream_detail(detail) => {
                 "stream_eof".to_string()
             }
             ProviderTransportError::Stream { .. } => "stream_malformed".to_string(),
@@ -192,6 +192,15 @@ fn is_retryable_transport_text(text: &str) -> bool {
         || lower.contains("connect")
         || lower.contains("eof")
         || lower.contains("stream ended before")
+        || lower.contains("stream completed with empty response")
+        || lower.contains("completion completed with empty response")
+        || lower.contains("failed to decode openai-compatible stream chunk")
+        || lower.contains("failed to decode openai-compatible completion response")
+        || lower.contains("openai-compatible stream was not valid utf-8")
+}
+
+fn is_retryable_stream_detail(detail: &str) -> bool {
+    is_retryable_transport_text(detail) || detail.to_ascii_lowercase().contains("malformed")
 }
 
 #[cfg(test)]
@@ -281,9 +290,19 @@ mod tests {
 
         assert!(matches!(
             classify_provider_error(&error, 1, None),
-            RetryDecision::GiveUp { .. }
+            RetryDecision::Retry { .. }
         ));
-        assert_eq!(provider_error_class(&error), "stream_malformed");
+        assert_eq!(provider_error_class(&error), "stream_eof");
+    }
+
+    #[test]
+    fn retries_malformed_provider_completion_text() {
+        let error = anyhow!("failed to decode OpenAI-compatible completion response");
+
+        assert!(matches!(
+            classify_provider_error(&error, 1, None),
+            RetryDecision::Retry { .. }
+        ));
     }
 
     #[test]
