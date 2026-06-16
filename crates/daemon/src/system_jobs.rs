@@ -267,15 +267,27 @@ impl SystemdUserScheduler {
 
     async fn delete_authored(&self, unit: &str) -> Result<()> {
         validate_timer_unit(unit)?;
-        self.run_command(disable_timer_invocation(unit)).await?;
+        self.run_cleanup_command_ignoring_missing(disable_timer_invocation(unit))
+            .await?;
         let unit_dir = self.unit_dir()?;
         let service_unit = service_unit_for_timer(unit)?;
-        self.run_command(stop_unit_invocation(&service_unit))
+        self.run_cleanup_command_ignoring_missing(stop_unit_invocation(&service_unit))
             .await?;
         remove_unit_file_if_exists(unit_dir.join(unit))?;
         remove_unit_file_if_exists(unit_dir.join(service_unit))?;
         self.run_command(daemon_reload_invocation()).await?;
         Ok(())
+    }
+
+    async fn run_cleanup_command_ignoring_missing(
+        &self,
+        invocation: CommandInvocation,
+    ) -> Result<()> {
+        match self.run_command(invocation).await {
+            Ok(_) => Ok(()),
+            Err(error) if systemctl_error_is_missing_unit(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     async fn ensure_authored_units_not_visible(
@@ -1704,6 +1716,13 @@ fn stop_unit_invocation(unit: &str) -> CommandInvocation {
     }
 }
 
+fn systemctl_error_is_missing_unit(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("does not exist")
+        || message.contains("not loaded")
+        || message.contains("not found")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommandOutput {
     stdout: String,
@@ -2230,6 +2249,49 @@ placeholder-broken.timer enabled enabled\n";
             invocations[1].args,
             vec!["--user", "stop", "placeholder-sync.service"]
         );
+        assert_eq!(invocations[2].args, vec!["--user", "daemon-reload"]);
+
+        let _ = fs::remove_dir_all(unit_dir);
+    }
+
+    #[tokio::test]
+    async fn delete_authored_tolerates_already_removed_units() {
+        let unit_dir = test_unit_dir("delete-missing");
+        fs::create_dir_all(&unit_dir).unwrap();
+        let invocations = Arc::new(Mutex::new(Vec::new()));
+        let recorded_invocations = Arc::clone(&invocations);
+        let scheduler = SystemdUserScheduler::with_command_runner_and_unit_dir(
+            move |invocation, _timeout| {
+                recorded_invocations
+                    .lock()
+                    .unwrap()
+                    .push(invocation.clone());
+                async move {
+                    if invocation.args == ["--user", "disable", "--now", "placeholder-sync.timer"] {
+                        anyhow::bail!(
+                            "systemctl --user disable --now placeholder-sync.timer failed: unit placeholder-sync.timer does not exist"
+                        );
+                    }
+                    if invocation.args == ["--user", "stop", "placeholder-sync.service"] {
+                        anyhow::bail!(
+                            "systemctl --user stop placeholder-sync.service failed: unit placeholder-sync.service not loaded"
+                        );
+                    }
+                    Ok(CommandOutput {
+                        stdout: String::new(),
+                    })
+                }
+            },
+            unit_dir.clone(),
+        );
+
+        scheduler
+            .delete_authored("placeholder-sync.timer")
+            .await
+            .unwrap();
+
+        let invocations = invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 3);
         assert_eq!(invocations[2].args, vec!["--user", "daemon-reload"]);
 
         let _ = fs::remove_dir_all(unit_dir);
