@@ -5311,7 +5311,7 @@ async fn delete_authored_local_job(
 }
 
 fn with_allowlisted_local_job(mut globs: Vec<String>, unit: &str) -> Result<Vec<String>, ApiError> {
-    if !globs.iter().any(|glob| glob == unit) {
+    if !system_jobs::unit_is_allowlisted(unit, &globs) {
         globs.push(unit.to_string());
     }
     normalize_system_jobs_unit_globs(globs)
@@ -5739,8 +5739,14 @@ async fn local_jobs_snapshot_if_configured(
 }
 
 async fn publish_local_jobs_event(state: &AppState, force_refresh: bool) -> anyhow::Result<()> {
-    if let Some(jobs) = throttled_local_jobs_snapshot_if_configured(state, force_refresh).await? {
-        let _ = state.events.send(DaemonEvent::LocalJobsUpdated(jobs));
+    match throttled_local_jobs_snapshot_if_configured(state, force_refresh).await? {
+        Some(jobs) => {
+            let _ = state.events.send(DaemonEvent::LocalJobsUpdated(jobs));
+        }
+        None if state.store.system_jobs_unit_globs()?.is_empty() => {
+            let _ = state.events.send(DaemonEvent::LocalJobsUpdated(Vec::new()));
+        }
+        None => {}
     }
     Ok(())
 }
@@ -10597,6 +10603,35 @@ mod tests {
 
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert!(error.message.contains("cannot contain more than"));
+    }
+
+    #[test]
+    fn with_allowlisted_local_job_reuses_matching_wildcard_at_capacity() {
+        let mut globs = (0..SYSTEM_JOBS_ALLOWLIST_MAX_GLOBS - 1)
+            .map(|index| format!("other-{index}.timer"))
+            .collect::<Vec<_>>();
+        globs.push("placeholder-*.timer".to_string());
+
+        let updated = with_allowlisted_local_job(globs.clone(), "placeholder-new.timer")
+            .expect("matching wildcard should already allow the unit");
+
+        assert_eq!(updated, globs);
+    }
+
+    #[tokio::test]
+    async fn publish_local_jobs_event_emits_empty_update_for_empty_allowlist() {
+        let (_state_dir, state) = test_named_app_state("local-jobs-empty-update");
+        let mut events = state.events.subscribe();
+
+        publish_local_jobs_event(&state, true)
+            .await
+            .expect("empty local jobs event should publish");
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("empty local jobs event should arrive")
+            .expect("event channel should remain open");
+
+        assert!(matches!(event, DaemonEvent::LocalJobsUpdated(jobs) if jobs.is_empty()));
     }
 
     #[test]

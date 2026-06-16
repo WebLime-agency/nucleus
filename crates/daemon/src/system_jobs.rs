@@ -1388,7 +1388,7 @@ fn ensure_unit_allowlisted(unit: &str, allowlist_globs: &[String]) -> Result<()>
     }
 }
 
-fn unit_is_allowlisted(unit: &str, allowlist_globs: &[String]) -> bool {
+pub(crate) fn unit_is_allowlisted(unit: &str, allowlist_globs: &[String]) -> bool {
     allowlist_globs
         .iter()
         .any(|glob| glob_matches(glob.trim(), unit))
