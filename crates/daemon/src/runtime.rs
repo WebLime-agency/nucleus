@@ -932,7 +932,7 @@ fn graceful_provider_output_failure_result(
             "kind": "final_answer",
             "summary": "provider response was unusable",
             "final_answer": format!(
-                "The Utility model '{}' did not return a usable response after retrying. Try again, or choose a different Utility model for this profile.",
+                "The Utility model '{}' did not return a usable response after retrying, so this worker cannot continue with the current Utility model. Try again, or choose a different Utility model for this profile.",
                 session.model
             ),
             "metadata": {
@@ -1214,6 +1214,86 @@ mod tests {
         assert_eq!(payload["stream"], false);
         assert!(payload.get("stream_options").is_none());
         assert!(payload.get("response_format").is_none());
+    }
+
+    #[test]
+    fn graceful_provider_output_failure_reports_blocker() {
+        let result = graceful_provider_output_failure_result(
+            &test_session_summary("utility-empty-model"),
+            true,
+        );
+        let content: serde_json::Value =
+            serde_json::from_str(&result.content).expect("synthetic action should be JSON");
+
+        assert!(result.synthetic_failure);
+        assert_eq!(content["kind"], "final_answer");
+        assert!(
+            content["final_answer"]
+                .as_str()
+                .expect("final answer should be text")
+                .contains("cannot continue")
+        );
+    }
+
+    fn test_session_summary(model: &str) -> SessionSummary {
+        SessionSummary {
+            id: "test-session".to_string(),
+            title: "Test session".to_string(),
+            profile_id: String::new(),
+            profile_title: String::new(),
+            route_id: String::new(),
+            route_title: String::new(),
+            project_id: String::new(),
+            project_title: String::new(),
+            project_path: String::new(),
+            provider: AdapterKind::OpenAiCompatible.as_str().to_string(),
+            model: model.to_string(),
+            provider_base_url: "http://127.0.0.1:12345/v1".to_string(),
+            provider_api_key: String::new(),
+            working_dir: String::new(),
+            working_dir_kind: String::new(),
+            workspace_mode: String::new(),
+            attachment_mode: String::new(),
+            worktree_id: String::new(),
+            source_project_path: String::new(),
+            git_root: String::new(),
+            worktree_path: String::new(),
+            git_branch: String::new(),
+            git_base_ref: String::new(),
+            git_head: String::new(),
+            git_dirty: false,
+            git_untracked_count: 0,
+            git_remote_tracking_branch: String::new(),
+            base_ref: String::new(),
+            base_commit: String::new(),
+            behind_by: None,
+            session_state_observed_at: None,
+            workspace_warnings: Vec::new(),
+            scope: "workspace".to_string(),
+            approval_mode: String::new(),
+            execution_mode: String::new(),
+            run_budget_mode: String::new(),
+            run_budget: Default::default(),
+            project_count: 0,
+            projects: Vec::new(),
+            state: String::new(),
+            provider_session_id: String::new(),
+            last_error: String::new(),
+            user_error: None,
+            capabilities: Vec::new(),
+            last_message_excerpt: String::new(),
+            turn_count: 0,
+            last_resumed_at: None,
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
+            created_at: 0,
+            updated_at: 0,
+        }
     }
 
     #[test]
