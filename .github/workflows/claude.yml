@@ -1,8 +1,5 @@
 name: Claude Code
 
-# Optional per-repo caller for the @claude responder (issues + PR comments).
-# Added only when rollout.sh is run with --with-mention.
-
 on:
   issue_comment:
     types: [created]
@@ -13,7 +10,14 @@ on:
   pull_request_review:
     types: [submitted]
 
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write
+  actions: read
+
 jobs:
   claude:
-    uses: WebLime-agency/.github/.github/workflows/claude-mention-reusable.yml@main
+    uses: WebLime-agency/.github/.github/workflows/claude-mention-reusable.yml@9381ae7b41dccb4ac15133f7b22ba02e77e18b0f
     secrets: inherit
