@@ -5,6 +5,7 @@ use std::{
     io::ErrorKind,
     path::{Path, PathBuf},
     pin::Pin,
+    process::Command as StdCommand,
     process::Stdio,
     sync::Arc,
     time::{Duration, Instant},
@@ -16,7 +17,7 @@ use nucleus_protocol::{
     SystemJobAuthoringScheduleKind, SystemJobAuthoringSpec, SystemJobRenderedUnits,
     SystemJobTemplate,
 };
-use tokio::{process::Command, time::timeout};
+use tokio::{process::Command as TokioCommand, time::timeout};
 use tracing::warn;
 
 const BACKEND_SYSTEMD_USER: &str = "systemd-user";
@@ -481,11 +482,19 @@ pub fn render_authored_units(spec: &SystemJobAuthoringSpec) -> Result<SystemJobR
         .join(" ");
     let schedule_line = match spec.schedule.kind {
         SystemJobAuthoringScheduleKind::Interval => {
-            let value = validate_schedule_value(&spec.schedule.value, "interval")?;
+            let value = validate_schedule_value(
+                &spec.schedule.value,
+                "interval",
+                SystemJobAuthoringScheduleKind::Interval,
+            )?;
             format!("OnUnitActiveSec={}", escape_systemd_value(&value))
         }
         SystemJobAuthoringScheduleKind::Calendar => {
-            let value = validate_schedule_value(&spec.schedule.value, "calendar")?;
+            let value = validate_schedule_value(
+                &spec.schedule.value,
+                "calendar",
+                SystemJobAuthoringScheduleKind::Calendar,
+            )?;
             format!("OnCalendar={}", escape_systemd_value(&value))
         }
     };
@@ -625,7 +634,11 @@ fn validate_optional_unit_text(value: Option<&str>, field: &str) -> Result<Optio
     Ok(Some(value.to_string()))
 }
 
-fn validate_schedule_value(value: &str, label: &str) -> Result<String> {
+fn validate_schedule_value(
+    value: &str,
+    label: &str,
+    kind: SystemJobAuthoringScheduleKind,
+) -> Result<String> {
     let value = value.trim();
     if value.is_empty()
         || value.len() > 160
@@ -637,7 +650,166 @@ fn validate_schedule_value(value: &str, label: &str) -> Result<String> {
         }
         .into());
     }
+    validate_systemd_schedule(value, label, kind)?;
     Ok(value.to_string())
+}
+
+fn validate_systemd_schedule(
+    value: &str,
+    label: &str,
+    kind: SystemJobAuthoringScheduleKind,
+) -> Result<()> {
+    match systemd_analyze_schedule(value, &kind) {
+        ScheduleProbe::Valid => Ok(()),
+        ScheduleProbe::Invalid => Err(SystemJobError::InvalidAuthoringSpec {
+            reason: format!("{label} schedule is not a valid systemd expression"),
+        }
+        .into()),
+        ScheduleProbe::Unavailable => {
+            let valid = match kind {
+                SystemJobAuthoringScheduleKind::Interval => fallback_interval_schedule(value),
+                SystemJobAuthoringScheduleKind::Calendar => fallback_calendar_schedule(value),
+            };
+            if valid {
+                Ok(())
+            } else {
+                Err(SystemJobError::InvalidAuthoringSpec {
+                    reason: format!(
+                        "{label} schedule does not look like a valid systemd expression"
+                    ),
+                }
+                .into())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScheduleProbe {
+    Valid,
+    Invalid,
+    Unavailable,
+}
+
+fn systemd_analyze_schedule(value: &str, kind: &SystemJobAuthoringScheduleKind) -> ScheduleProbe {
+    let subcommand = match kind {
+        SystemJobAuthoringScheduleKind::Interval => "timespan",
+        SystemJobAuthoringScheduleKind::Calendar => "calendar",
+    };
+    match StdCommand::new("systemd-analyze")
+        .arg(subcommand)
+        .arg(value)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(output) if output.status.success() => ScheduleProbe::Valid,
+        Ok(_) => ScheduleProbe::Invalid,
+        Err(error) if error.kind() == ErrorKind::NotFound => ScheduleProbe::Unavailable,
+        Err(_) => ScheduleProbe::Unavailable,
+    }
+}
+
+fn fallback_interval_schedule(value: &str) -> bool {
+    let compact = value
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    let mut chars = compact.char_indices().peekable();
+    let mut saw_component = false;
+    while chars.peek().is_some() {
+        let number_start = chars.peek().map(|(index, _)| *index).unwrap_or(0);
+        while matches!(chars.peek(), Some((_, ch)) if ch.is_ascii_digit()) {
+            chars.next();
+        }
+        let number_end = chars
+            .peek()
+            .map(|(index, _)| *index)
+            .unwrap_or(compact.len());
+        if number_start == number_end {
+            return false;
+        }
+        let unit_start = number_end;
+        while matches!(chars.peek(), Some((_, ch)) if ch.is_ascii_alphabetic()) {
+            chars.next();
+        }
+        let unit_end = chars
+            .peek()
+            .map(|(index, _)| *index)
+            .unwrap_or(compact.len());
+        if unit_start == unit_end {
+            return false;
+        }
+        let number = &compact[number_start..number_end];
+        let unit = compact[unit_start..unit_end].to_ascii_lowercase();
+        if number
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .is_none()
+            || !matches!(
+                unit.as_str(),
+                "usec"
+                    | "us"
+                    | "ms"
+                    | "millisecond"
+                    | "milliseconds"
+                    | "s"
+                    | "sec"
+                    | "second"
+                    | "seconds"
+                    | "m"
+                    | "min"
+                    | "minute"
+                    | "minutes"
+                    | "h"
+                    | "hr"
+                    | "hour"
+                    | "hours"
+                    | "d"
+                    | "day"
+                    | "days"
+                    | "w"
+                    | "week"
+                    | "weeks"
+                    | "month"
+                    | "months"
+                    | "y"
+                    | "year"
+                    | "years"
+            )
+        {
+            return false;
+        }
+        saw_component = true;
+    }
+    saw_component
+}
+
+fn fallback_calendar_schedule(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "minutely"
+            | "hourly"
+            | "daily"
+            | "weekly"
+            | "monthly"
+            | "quarterly"
+            | "semiannually"
+            | "annually"
+            | "yearly"
+    ) {
+        return true;
+    }
+    value.chars().any(|ch| ch.is_ascii_digit())
+        && value.contains(':')
+        && value.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || ch.is_ascii_whitespace()
+                || matches!(ch, '*' | '-' | '_' | ':' | ',' | '/' | '.' | '~')
+        })
 }
 
 fn validate_working_dir(value: &str) -> Result<String> {
@@ -736,10 +908,22 @@ fn validate_direct_command(argv: &[String]) -> Result<()> {
         }
         .into());
     }
+    if !Path::new(executable).is_absolute() {
+        return Err(SystemJobError::InvalidAuthoringSpec {
+            reason: "command executable must be an absolute path".to_string(),
+        }
+        .into());
+    }
     let basename = executable.rsplit('/').next().unwrap_or(executable);
     if matches!(basename, "nucleus" | "nucleus-daemon") {
         return Err(SystemJobError::InvalidAuthoringSpec {
             reason: "command may not call back into the Nucleus daemon".to_string(),
+        }
+        .into());
+    }
+    if matches!(basename, "sh" | "bash" | "dash" | "zsh" | "fish" | "env") {
+        return Err(SystemJobError::InvalidAuthoringSpec {
+            reason: "command may not use a shell or env wrapper".to_string(),
         }
         .into());
     }
@@ -1390,7 +1574,7 @@ async fn run_system_command(
     timeout_duration: Duration,
 ) -> Result<CommandOutput> {
     let started_at = Instant::now();
-    let output = Command::new(&invocation.program)
+    let output = TokioCommand::new(&invocation.program)
         .args(&invocation.args)
         .kill_on_drop(true)
         .stdin(Stdio::null())
@@ -1537,6 +1721,18 @@ placeholder-broken.timer enabled enabled\n";
         ))
     }
 
+    fn assert_invalid_authoring_reason(error: anyhow::Error, expected: &str) {
+        match error.downcast_ref::<SystemJobError>() {
+            Some(SystemJobError::InvalidAuthoringSpec { reason }) => {
+                assert!(
+                    reason.contains(expected),
+                    "expected error reason to contain {expected:?}, got {reason:?}"
+                );
+            }
+            other => panic!("expected invalid authoring spec error, got {other:?}"),
+        }
+    }
+
     #[test]
     fn renders_authored_interval_units_with_direct_escaped_exec_start() {
         let rendered = render_authored_units(&authored_spec()).unwrap();
@@ -1563,6 +1759,28 @@ placeholder-broken.timer enabled enabled\n";
     }
 
     #[test]
+    fn rejects_authored_relative_or_bare_executable() {
+        let mut spec = authored_spec();
+        spec.command = "python /tmp/example.py".to_string();
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "executable must be an absolute path");
+
+        spec = authored_spec();
+        spec.command = "./run.sh".to_string();
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "executable must be an absolute path");
+
+        spec = authored_spec();
+        spec.command = "/usr/bin/printf absolute".to_string();
+        let rendered = render_authored_units(&spec).unwrap();
+        assert!(
+            rendered
+                .service
+                .contains("ExecStart=\"/usr/bin/printf\" \"absolute\"")
+        );
+    }
+
+    #[test]
     fn renders_authored_calendar_units() {
         let mut spec = authored_spec();
         spec.schedule.kind = SystemJobAuthoringScheduleKind::Calendar;
@@ -1581,13 +1799,37 @@ placeholder-broken.timer enabled enabled\n";
         assert!(render_authored_units(&spec).is_err());
 
         spec = authored_spec();
-        spec.command = "nucleus run-placeholder".to_string();
+        spec.command = "/opt/nucleus/bin/nucleus run-placeholder".to_string();
         let error = render_authored_units(&spec).unwrap_err();
-        assert!(error.to_string().contains("may not call back"));
+        assert_invalid_authoring_reason(error, "may not call back");
+
+        spec = authored_spec();
+        spec.command = "/bin/sh -c 'nucleus run-placeholder'".to_string();
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "shell or env wrapper");
+
+        spec = authored_spec();
+        spec.command = "/usr/bin/env nucleus run-placeholder".to_string();
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "shell or env wrapper");
 
         spec = authored_spec();
         spec.command = "/usr/bin/printf 'unterminated".to_string();
         assert!(render_authored_units(&spec).is_err());
+    }
+
+    #[test]
+    fn rejects_authored_invalid_schedule() {
+        let mut spec = authored_spec();
+        spec.schedule.value = "definitely-not-a-timespan".to_string();
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "schedule");
+
+        spec = authored_spec();
+        spec.schedule.kind = SystemJobAuthoringScheduleKind::Calendar;
+        spec.schedule.value = "not a calendar".to_string();
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "schedule");
     }
 
     #[tokio::test]
