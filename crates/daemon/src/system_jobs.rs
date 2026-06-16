@@ -1022,6 +1022,12 @@ fn validate_direct_command(argv: &[String]) -> Result<()> {
         }
         .into());
     }
+    if argv.iter().any(|arg| arg == ";") {
+        return Err(SystemJobError::InvalidAuthoringSpec {
+            reason: "command may not include systemd ExecStart separators".to_string(),
+        }
+        .into());
+    }
     if argv.iter().any(|arg| arg.chars().any(char::is_control)) {
         return Err(SystemJobError::InvalidAuthoringSpec {
             reason: "command contains unsupported characters".to_string(),
@@ -1969,6 +1975,11 @@ placeholder-broken.timer enabled enabled\n";
         spec.command = "/usr/bin/env nucleus run-placeholder".to_string();
         let error = render_authored_units(&spec).unwrap_err();
         assert_invalid_authoring_reason(error, "shell or env wrapper");
+
+        spec = authored_spec();
+        spec.command = "/usr/bin/printf ok ; /opt/nucleus/bin/nucleus run-placeholder".to_string();
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "ExecStart separators");
 
         spec = authored_spec();
         spec.command = "/usr/bin/printf 'unterminated".to_string();
