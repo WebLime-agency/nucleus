@@ -145,6 +145,7 @@ struct LocalJobsStreamCache {
 
 static LOCAL_JOBS_STREAM_CACHE: OnceLock<tokio::sync::Mutex<LocalJobsStreamCache>> =
     OnceLock::new();
+static SYSTEM_JOBS_ALLOWLIST_MUTATION_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const SYSTEM_JOBS_ALLOWLIST_MAX_GLOBS: usize = 200;
 const SYSTEM_JOBS_ALLOWLIST_MAX_GLOB_BYTES: usize = 256;
 const SYSTEM_JOBS_ALLOWLIST_MAX_TOTAL_BYTES: usize = 16_000;
@@ -5119,6 +5120,13 @@ async fn available_local_jobs(
     Ok(Json(jobs))
 }
 
+async fn lock_system_jobs_allowlist_mutation() -> tokio::sync::MutexGuard<'static, ()> {
+    SYSTEM_JOBS_ALLOWLIST_MUTATION_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
 async fn local_jobs_allowlist(
     State(state): State<AppState>,
 ) -> Result<Json<LocalJobsAllowlistResponse>, ApiError> {
@@ -5133,7 +5141,10 @@ async fn update_local_jobs_allowlist(
 ) -> Result<Json<LocalJobsAllowlistResponse>, ApiError> {
     let payload = decode_json::<LocalJobsAllowlistRequest>(&body)?;
     let globs = normalize_system_jobs_unit_globs(payload.globs)?;
-    state.store.set_system_jobs_unit_globs(&globs)?;
+    {
+        let _allowlist_guard = lock_system_jobs_allowlist_mutation().await;
+        state.store.set_system_jobs_unit_globs(&globs)?;
+    }
     let _ = try_record_audit_event(
         &state,
         AuditEventRecord {
@@ -5191,36 +5202,40 @@ async fn install_authored_local_job(
     let rendered_preview = system_jobs::SystemScheduler::systemd_user()
         .render_authored(&spec)
         .map_err(map_system_job_error)?;
-    if state
-        .store
-        .system_job_authored_unit(&rendered_preview.timer_unit)?
-        .is_some()
-    {
-        return Err(map_system_job_error(
-            system_jobs::SystemJobError::UnitAlreadyExists {
-                unit: rendered_preview.timer_unit,
-            }
-            .into(),
-        ));
-    }
-    let globs = with_allowlisted_local_job(
-        state.store.system_jobs_unit_globs()?,
-        &rendered_preview.timer_unit,
-    )?;
+    let (rendered, allowlist, allowlist_entries) = {
+        let _allowlist_guard = lock_system_jobs_allowlist_mutation().await;
+        if state
+            .store
+            .system_job_authored_unit(&rendered_preview.timer_unit)?
+            .is_some()
+        {
+            return Err(map_system_job_error(
+                system_jobs::SystemJobError::UnitAlreadyExists {
+                    unit: rendered_preview.timer_unit,
+                }
+                .into(),
+            ));
+        }
+        let globs = with_allowlisted_local_job(
+            state.store.system_jobs_unit_globs()?,
+            &rendered_preview.timer_unit,
+        )?;
 
-    let rendered = system_jobs::SystemScheduler::systemd_user()
-        .install_authored(&spec)
-        .await
-        .map_err(map_system_job_error)?;
-    state
-        .store
-        .upsert_system_job_authored_unit(SystemJobAuthoredRecord {
-            name: rendered.timer_unit.clone(),
-            spec,
-        })?;
-    state.store.set_system_jobs_unit_globs(&globs)?;
+        let rendered = system_jobs::SystemScheduler::systemd_user()
+            .install_authored(&spec)
+            .await
+            .map_err(map_system_job_error)?;
+        state
+            .store
+            .upsert_system_job_authored_unit(SystemJobAuthoredRecord {
+                name: rendered.timer_unit.clone(),
+                spec,
+            })?;
+        state.store.set_system_jobs_unit_globs(&globs)?;
 
-    let allowlist = state.store.system_jobs_unit_globs()?;
+        let allowlist = state.store.system_jobs_unit_globs()?;
+        (rendered, allowlist, globs.len())
+    };
     let mut summary = system_jobs::SystemScheduler::systemd_user()
         .job_summary(&rendered.timer_unit, &allowlist)
         .await
@@ -5235,9 +5250,7 @@ async fn install_authored_local_job(
             summary: format!("Installed local system job '{}'.", rendered.timer_unit),
             detail: format!(
                 "timer={} service={} allowlist_entries={}",
-                rendered.timer_unit,
-                rendered.service_unit,
-                globs.len()
+                rendered.timer_unit, rendered.service_unit, allowlist_entries
             ),
         },
     )
@@ -5264,29 +5277,34 @@ async fn delete_authored_local_job(
             working_dir: None,
         })
         .map_err(map_system_job_error)?;
-    if state
-        .store
-        .system_job_authored_unit(&rendered.timer_unit)?
-        .is_none()
-    {
-        return Err(map_system_job_error(
-            system_jobs::SystemJobError::NotAuthored {
-                unit: rendered.timer_unit,
-            }
-            .into(),
-        ));
-    }
-
-    system_jobs::SystemScheduler::systemd_user()
-        .delete_authored(&rendered.timer_unit)
-        .await
-        .map_err(map_system_job_error)?;
-    state
-        .store
-        .remove_system_job_authored_unit(&rendered.timer_unit)?;
-    let globs =
-        without_allowlisted_local_job(state.store.system_jobs_unit_globs()?, &rendered.timer_unit)?;
-    state.store.set_system_jobs_unit_globs(&globs)?;
+    let globs = {
+        let _allowlist_guard = lock_system_jobs_allowlist_mutation().await;
+        if state
+            .store
+            .system_job_authored_unit(&rendered.timer_unit)?
+            .is_none()
+        {
+            return Err(map_system_job_error(
+                system_jobs::SystemJobError::NotAuthored {
+                    unit: rendered.timer_unit,
+                }
+                .into(),
+            ));
+        }
+        system_jobs::SystemScheduler::systemd_user()
+            .delete_authored(&rendered.timer_unit)
+            .await
+            .map_err(map_system_job_error)?;
+        state
+            .store
+            .remove_system_job_authored_unit(&rendered.timer_unit)?;
+        let globs = without_allowlisted_local_job(
+            state.store.system_jobs_unit_globs()?,
+            &rendered.timer_unit,
+        )?;
+        state.store.set_system_jobs_unit_globs(&globs)?;
+        globs
+    };
     let _ = try_record_audit_event(
         &state,
         AuditEventRecord {
