@@ -3,7 +3,7 @@ use std::{
     fmt, fs,
     future::Future,
     io::ErrorKind,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     pin::Pin,
     process::Command as StdCommand,
     process::Stdio,
@@ -487,7 +487,8 @@ pub fn render_authored_units(spec: &SystemJobAuthoringSpec) -> Result<SystemJobR
                 "interval",
                 SystemJobAuthoringScheduleKind::Interval,
             )?;
-            format!("OnUnitActiveSec={}", escape_systemd_value(&value))
+            let value = escape_systemd_value(&value);
+            format!("OnActiveSec={value}\nOnUnitActiveSec={value}")
         }
         SystemJobAuthoringScheduleKind::Calendar => {
             let value = validate_schedule_value(
@@ -821,6 +822,18 @@ fn validate_working_dir(value: &str) -> Result<String> {
     {
         return Err(SystemJobError::InvalidAuthoringSpec {
             reason: "working_dir contains unsupported characters".to_string(),
+        }
+        .into());
+    }
+    let path = Path::new(value);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| component == Component::ParentDir)
+    {
+        return Err(SystemJobError::InvalidAuthoringSpec {
+            reason: "working_dir must be an absolute path without parent-directory traversal"
+                .to_string(),
         }
         .into());
     }
@@ -1740,6 +1753,7 @@ placeholder-broken.timer enabled enabled\n";
         assert_eq!(rendered.timer_unit, "placeholder-sync.timer");
         assert_eq!(rendered.service_unit, "placeholder-sync.service");
         assert!(rendered.timer.contains("# Nucleus-authored"));
+        assert!(rendered.timer.contains("OnActiveSec=30min"));
         assert!(rendered.timer.contains("OnUnitActiveSec=30min"));
         assert!(rendered.timer.contains("Unit=placeholder-sync.service"));
         assert!(rendered.service.contains("# Nucleus-authored"));
@@ -1789,6 +1803,7 @@ placeholder-broken.timer enabled enabled\n";
         let rendered = render_authored_units(&spec).unwrap();
 
         assert!(rendered.timer.contains("OnCalendar=*-*-* 04:00:00"));
+        assert!(!rendered.timer.contains("OnActiveSec="));
         assert!(!rendered.timer.contains("OnUnitActiveSec="));
     }
 
@@ -1830,6 +1845,19 @@ placeholder-broken.timer enabled enabled\n";
         spec.schedule.value = "not a calendar".to_string();
         let error = render_authored_units(&spec).unwrap_err();
         assert_invalid_authoring_reason(error, "schedule");
+    }
+
+    #[test]
+    fn rejects_authored_invalid_working_dir() {
+        let mut spec = authored_spec();
+        spec.working_dir = Some("relative/path".to_string());
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "working_dir must be an absolute path");
+
+        spec = authored_spec();
+        spec.working_dir = Some("/tmp/../workspace".to_string());
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "without parent-directory traversal");
     }
 
     #[tokio::test]
