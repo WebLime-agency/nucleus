@@ -511,7 +511,7 @@ pub fn render_authored_units(spec: &SystemJobAuthoringSpec) -> Result<SystemJobR
         .transpose()?;
     let working_dir_line = working_dir
         .as_ref()
-        .map(|dir| format!("WorkingDirectory={}\n", quote_systemd_exec_arg(dir)))
+        .map(|dir| format!("WorkingDirectory={}\n", escape_systemd_value(dir)))
         .unwrap_or_default();
     let description = escape_systemd_value(&description);
     let timer = format!(
@@ -1801,7 +1801,7 @@ placeholder-broken.timer enabled enabled\n";
         assert!(
             rendered
                 .service
-                .contains("WorkingDirectory=\"/tmp/placeholder workspace\"")
+                .contains("WorkingDirectory=/tmp/placeholder workspace")
         );
         assert!(!rendered.service.contains("sh -c"));
         assert!(!rendered.service.contains("nucleus run"));
