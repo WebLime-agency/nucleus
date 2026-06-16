@@ -704,18 +704,24 @@ fn interval_schedule_has_positive_component(value: &str) -> bool {
         while matches!(chars.peek(), Some((_, ch)) if ch.is_ascii_digit()) {
             chars.next();
         }
+        if matches!(chars.peek(), Some((_, '.'))) {
+            chars.next();
+            while matches!(chars.peek(), Some((_, ch)) if ch.is_ascii_digit()) {
+                chars.next();
+            }
+        }
         let number_end = chars
             .peek()
             .map(|(index, _)| *index)
             .unwrap_or(compact.len());
         if number_start == number_end {
-            return true;
+            return false;
         }
         saw_number = true;
         if compact[number_start..number_end]
-            .parse::<u64>()
+            .parse::<f64>()
             .ok()
-            .is_some_and(|number| number > 0)
+            .is_some_and(|number| number.is_finite() && number > 0.0)
         {
             saw_positive = true;
         }
@@ -1966,6 +1972,11 @@ placeholder-broken.timer enabled enabled\n";
 
         spec = authored_spec();
         spec.schedule.value = "0s".to_string();
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "greater than zero");
+
+        spec = authored_spec();
+        spec.schedule.value = "infinity".to_string();
         let error = render_authored_units(&spec).unwrap_err();
         assert_invalid_authoring_reason(error, "greater than zero");
 
