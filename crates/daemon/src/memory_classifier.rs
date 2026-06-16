@@ -78,7 +78,7 @@ pub(crate) async fn classify_memory_for_turn(
         &execution.provider,
         &execution.model,
         &execution.provider_base_url,
-        result.transport,
+        &result,
     );
 
     parse_memory_classifier_response(&result.content)
