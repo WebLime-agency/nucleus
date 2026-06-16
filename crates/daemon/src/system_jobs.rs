@@ -117,6 +117,14 @@ impl SystemScheduler {
         self.backend.job_detail(unit, allowlist_globs).await
     }
 
+    pub async fn job_summary(
+        &self,
+        unit: &str,
+        allowlist_globs: &[String],
+    ) -> Result<LocalJobSummary> {
+        self.backend.summary_for_unit(unit, allowlist_globs).await
+    }
+
     pub async fn control_job(
         &self,
         unit: &str,
@@ -671,8 +679,51 @@ fn validate_schedule_value(
         }
         .into());
     }
+    if matches!(kind, SystemJobAuthoringScheduleKind::Interval)
+        && !interval_schedule_has_positive_component(value)
+    {
+        return Err(SystemJobError::InvalidAuthoringSpec {
+            reason: format!("{label} schedule must be greater than zero"),
+        }
+        .into());
+    }
     validate_systemd_schedule(value, label, kind)?;
     Ok(value.to_string())
+}
+
+fn interval_schedule_has_positive_component(value: &str) -> bool {
+    let compact = value
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    let mut chars = compact.char_indices().peekable();
+    let mut saw_number = false;
+    let mut saw_positive = false;
+    while chars.peek().is_some() {
+        let number_start = chars.peek().map(|(index, _)| *index).unwrap_or(0);
+        while matches!(chars.peek(), Some((_, ch)) if ch.is_ascii_digit()) {
+            chars.next();
+        }
+        let number_end = chars
+            .peek()
+            .map(|(index, _)| *index)
+            .unwrap_or(compact.len());
+        if number_start == number_end {
+            return true;
+        }
+        saw_number = true;
+        if compact[number_start..number_end]
+            .parse::<u64>()
+            .ok()
+            .is_some_and(|number| number > 0)
+        {
+            saw_positive = true;
+        }
+        while matches!(chars.peek(), Some((_, ch)) if ch.is_ascii_alphabetic()) {
+            chars.next();
+        }
+    }
+    saw_number && saw_positive
 }
 
 fn validate_systemd_schedule(
@@ -1916,6 +1967,11 @@ placeholder-broken.timer enabled enabled\n";
         assert_invalid_authoring_reason(error, "schedule");
 
         spec = authored_spec();
+        spec.schedule.value = "0s".to_string();
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "greater than zero");
+
+        spec = authored_spec();
         spec.schedule.kind = SystemJobAuthoringScheduleKind::Calendar;
         spec.schedule.value = "not a calendar".to_string();
         let error = render_authored_units(&spec).unwrap_err();
@@ -2097,6 +2153,42 @@ placeholder-broken.timer enabled enabled\n";
         assert_eq!(invocations[1].args, vec!["--user", "daemon-reload"]);
 
         let _ = fs::remove_dir_all(unit_dir);
+    }
+
+    #[tokio::test]
+    async fn summary_for_unit_does_not_tail_journal() {
+        let scheduler =
+            SystemdUserScheduler::with_command_runner(move |invocation, _timeout| async move {
+                if invocation.program == "journalctl" {
+                    anyhow::bail!("summary should not tail journals");
+                }
+                let stdout = if invocation.args.iter().any(|arg| arg == "list-timers") {
+                    LIST_TIMERS_WITH_AVAILABLE_TIMERS.to_string()
+                } else if invocation
+                    .args
+                    .iter()
+                    .any(|arg| arg == "placeholder-cleanup.timer")
+                {
+                    TIMER_SHOW.to_string()
+                } else if invocation
+                    .args
+                    .iter()
+                    .any(|arg| arg == "placeholder-cleanup.service")
+                {
+                    SERVICE_SUCCESS_SHOW.to_string()
+                } else {
+                    String::new()
+                };
+                Ok(CommandOutput { stdout })
+            });
+
+        let summary = scheduler
+            .summary_for_unit("placeholder-cleanup.timer", &["placeholder-*".to_string()])
+            .await
+            .expect("summary should not require journal access");
+
+        assert_eq!(summary.unit, "placeholder-cleanup.timer");
+        assert_eq!(summary.triggered_unit, "placeholder-cleanup.service");
     }
 
     #[test]

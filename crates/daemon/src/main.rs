@@ -5222,10 +5222,9 @@ async fn install_authored_local_job(
 
     let allowlist = state.store.system_jobs_unit_globs()?;
     let mut summary = system_jobs::SystemScheduler::systemd_user()
-        .job_detail(&rendered.timer_unit, &allowlist)
+        .job_summary(&rendered.timer_unit, &allowlist)
         .await
-        .map_err(map_system_job_error)?
-        .summary;
+        .map_err(map_system_job_error)?;
     summary.authored = true;
     let _ = try_record_audit_event(
         &state,
