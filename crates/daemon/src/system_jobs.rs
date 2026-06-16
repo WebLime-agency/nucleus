@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::OsStr,
     fmt, fs,
     future::Future,
     io::ErrorKind,
@@ -267,8 +268,10 @@ impl SystemdUserScheduler {
         if let Some(unit_dir) = &self.unit_dir {
             return Ok(unit_dir.clone());
         }
-        let home = dirs::home_dir().context("failed to resolve home directory")?;
-        Ok(home.join(".config/systemd/user"))
+        default_systemd_user_unit_dir(
+            std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+            dirs::home_dir(),
+        )
     }
 
     async fn list_jobs(&self, allowlist_globs: &[String]) -> Result<Vec<LocalJobSummary>> {
@@ -1006,6 +1009,17 @@ fn remove_unit_file_if_exists(path: impl AsRef<Path>) -> Result<()> {
     }
 }
 
+fn default_systemd_user_unit_dir(
+    xdg_config_home: Option<&OsStr>,
+    home_dir: Option<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(value) = xdg_config_home.filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(value).join("systemd/user"));
+    }
+    let home = home_dir.context("failed to resolve home directory")?;
+    Ok(home.join(".config/systemd/user"))
+}
+
 pub fn parse_local_job_summary(timer_show: &str, service_show: &str) -> Result<LocalJobSummary> {
     parse_local_job_summary_with_listed_next(timer_show, service_show, None)
 }
@@ -1732,6 +1746,27 @@ placeholder-broken.timer enabled enabled\n";
             "nucleus-system-jobs-{label}-{}-{suffix}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn default_unit_dir_honors_xdg_config_home() {
+        let unit_dir = default_systemd_user_unit_dir(
+            Some(OsStr::new("/tmp/nucleus-xdg-config")),
+            Some(PathBuf::from("/home/example")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            unit_dir,
+            PathBuf::from("/tmp/nucleus-xdg-config/systemd/user")
+        );
+
+        let fallback =
+            default_systemd_user_unit_dir(None, Some(PathBuf::from("/home/example"))).unwrap();
+        assert_eq!(
+            fallback,
+            PathBuf::from("/home/example/.config/systemd/user")
+        );
     }
 
     fn assert_invalid_authoring_reason(error: anyhow::Error, expected: &str) {

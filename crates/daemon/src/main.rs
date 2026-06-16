@@ -5203,6 +5203,10 @@ async fn install_authored_local_job(
             .into(),
         ));
     }
+    let globs = with_allowlisted_local_job(
+        state.store.system_jobs_unit_globs()?,
+        &rendered_preview.timer_unit,
+    )?;
 
     let rendered = system_jobs::SystemScheduler::systemd_user()
         .install_authored(&spec)
@@ -5214,8 +5218,6 @@ async fn install_authored_local_job(
             name: rendered.timer_unit.clone(),
             spec,
         })?;
-    let globs =
-        with_allowlisted_local_job(state.store.system_jobs_unit_globs()?, &rendered.timer_unit)?;
     state.store.set_system_jobs_unit_globs(&globs)?;
 
     let allowlist = state.store.system_jobs_unit_globs()?;
@@ -10579,6 +10581,19 @@ mod tests {
             .collect();
 
         let error = normalize_system_jobs_unit_globs(globs).expect_err("cap should reject");
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("cannot contain more than"));
+    }
+
+    #[test]
+    fn with_allowlisted_local_job_rejects_capacity_before_install_side_effects() {
+        let globs = (0..SYSTEM_JOBS_ALLOWLIST_MAX_GLOBS)
+            .map(|index| format!("placeholder-{index}.timer"))
+            .collect();
+
+        let error = with_allowlisted_local_job(globs, "placeholder-new.timer")
+            .expect_err("allowlist capacity should reject before install");
 
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert!(error.message.contains("cannot contain more than"));
