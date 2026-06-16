@@ -5225,15 +5225,36 @@ async fn install_authored_local_job(
             .install_authored(&spec)
             .await
             .map_err(map_system_job_error)?;
-        state
-            .store
-            .upsert_system_job_authored_unit(SystemJobAuthoredRecord {
-                name: rendered.timer_unit.clone(),
-                spec,
-            })?;
-        state.store.set_system_jobs_unit_globs(&globs)?;
+        let persistence_result = (|| -> anyhow::Result<()> {
+            state
+                .store
+                .upsert_system_job_authored_unit(SystemJobAuthoredRecord {
+                    name: rendered.timer_unit.clone(),
+                    spec,
+                })?;
+            state.store.set_system_jobs_unit_globs(&globs)?;
+            Ok(())
+        })();
 
-        let allowlist = state.store.system_jobs_unit_globs()?;
+        let allowlist = match persistence_result {
+            Ok(()) => globs.clone(),
+            Err(error) => {
+                if let Err(rollback_error) = system_jobs::SystemScheduler::systemd_user()
+                    .delete_authored(&rendered.timer_unit)
+                    .await
+                {
+                    warn!(error = %rollback_error, unit = %rendered.timer_unit, "failed to roll back authored systemd unit after persistence error");
+                }
+                if let Err(cleanup_error) = state
+                    .store
+                    .remove_system_job_authored_unit(&rendered.timer_unit)
+                {
+                    warn!(error = %cleanup_error, unit = %rendered.timer_unit, "failed to clean authored record after persistence error");
+                }
+                return Err(ApiError::from(error));
+            }
+        };
+
         (rendered, allowlist, globs.len())
     };
     let mut summary = system_jobs::SystemScheduler::systemd_user()
