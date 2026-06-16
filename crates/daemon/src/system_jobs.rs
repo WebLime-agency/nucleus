@@ -912,6 +912,7 @@ fn validate_working_dir(value: &str) -> Result<String> {
     if value.is_empty()
         || value.len() > 4096
         || value.contains('\0')
+        || value.contains('\\')
         || value.chars().any(|ch| ch == '\n' || ch == '\r')
     {
         return Err(SystemJobError::InvalidAuthoringSpec {
@@ -2040,6 +2041,11 @@ placeholder-broken.timer enabled enabled\n";
         spec.working_dir = Some("/tmp/../workspace".to_string());
         let error = render_authored_units(&spec).unwrap_err();
         assert_invalid_authoring_reason(error, "without parent-directory traversal");
+
+        spec = authored_spec();
+        spec.working_dir = Some("/tmp/placeholder\\".to_string());
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "unsupported characters");
     }
 
     #[tokio::test]
