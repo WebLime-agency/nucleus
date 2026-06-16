@@ -1055,7 +1055,6 @@ async fn check_workspace_profile(
     match probe_profile_check_transport(&target, config).await {
         Ok(probe) => {
             let transport = model_transport_capability_from_provider(probe.transport);
-            let json_object = probe_profile_check_json_object(&target, probe.transport).await;
             let action_contract =
                 probe_profile_check_action_contract(&target, probe.transport).await;
             let (json_object, transport, action_contract, persisted) =
@@ -1064,7 +1063,7 @@ async fn check_workspace_profile(
                     &profile,
                     &role,
                     &target,
-                    json_object,
+                    Some(ModelJsonObjectCapability::Unknown),
                     transport,
                     action_contract,
                 )?;
@@ -1146,34 +1145,6 @@ fn should_try_profile_check_non_streaming_fallback(error: &anyhow::Error) -> boo
             ProviderTransportError::Stream { .. } => false,
         },
     )
-}
-
-async fn probe_profile_check_json_object(
-    target: &SessionTargetSelection,
-    transport: runtime::ProviderTurnTransport,
-) -> Option<ModelJsonObjectCapability> {
-    let stream = transport == runtime::ProviderTurnTransport::Streaming;
-    match runtime::probe_openai_compatible_json_object(
-        &target.provider_base_url,
-        &target.provider_api_key,
-        &target.model,
-        stream,
-    )
-    .await
-    {
-        Ok(result) => match serde_json::from_str::<Value>(&result.content) {
-            Ok(Value::Object(_)) => Some(ModelJsonObjectCapability::Supported),
-            _ => Some(ModelJsonObjectCapability::Unsupported),
-        },
-        Err(error) => error
-            .downcast_ref::<ProviderTransportError>()
-            .and_then(|provider_error| match provider_error {
-                ProviderTransportError::Http { status, .. } if matches!(*status, 400 | 422) => {
-                    Some(ModelJsonObjectCapability::Unsupported)
-                }
-                _ => None,
-            }),
-    }
 }
 
 async fn probe_profile_check_action_contract(
@@ -10725,10 +10696,7 @@ mod tests {
         }
     }
 
-    const PROFILE_CHECK_JSON_OBJECT_RESPONSE: &str =
-        r#"{"id":"json","choices":[{"message":{"content":"{\"ok\":true}"}}]}"#;
     const PROFILE_CHECK_ACTION_RESPONSE: &str = r#"{"id":"contract","choices":[{"message":{"content":"{\"kind\":\"final_answer\",\"message\":\"ok\"}"}}]}"#;
-    const PROFILE_CHECK_STREAM_JSON_OBJECT_RESPONSE: &str = "data: {\"id\":\"json\",\"choices\":[{\"delta\":{\"content\":\"{\\\"ok\\\":true}\"}}]}\n\ndata: [DONE]\n\n";
     const PROFILE_CHECK_STREAM_ACTION_RESPONSE: &str = "data: {\"id\":\"contract\",\"choices\":[{\"delta\":{\"content\":\"{\\\"kind\\\":\\\"final_answer\\\",\\\"message\\\":\\\"ok\\\"}\"}}]}\n\ndata: [DONE]\n\n";
 
     async fn read_profile_check_http_body(socket: &mut tokio::net::TcpStream) -> String {
@@ -10964,7 +10932,6 @@ mod tests {
             let state = test_app_state(&store);
             let mut responses = vec![(status, body)];
             if expected == ProfileCheckOutcome::Ok {
-                responses.push((200, PROFILE_CHECK_JSON_OBJECT_RESPONSE));
                 responses.push((200, PROFILE_CHECK_ACTION_RESPONSE));
             }
             let (base_url, server) = spawn_profile_check_openai_sequence_server(responses).await;
@@ -11055,7 +11022,6 @@ mod tests {
                 200,
                 r#"{"id":"ok","choices":[{"message":{"content":"pong"}}]}"#,
             ),
-            (200, PROFILE_CHECK_JSON_OBJECT_RESPONSE),
             (200, PROFILE_CHECK_ACTION_RESPONSE),
         ])
         .await;
@@ -11093,7 +11059,6 @@ mod tests {
                 200,
                 "data: {\"id\":\"stream-ok\",\"choices\":[{\"delta\":{\"content\":\"pong\"}}]}\n\ndata: [DONE]\n\n",
             ),
-            (200, PROFILE_CHECK_STREAM_JSON_OBJECT_RESPONSE),
             (200, PROFILE_CHECK_STREAM_ACTION_RESPONSE),
         ])
         .await;
@@ -11128,7 +11093,6 @@ mod tests {
                 200,
                 r#"{"id":"ok","choices":[{"message":{"content":"pong"}}]}"#,
             ),
-            (200, PROFILE_CHECK_JSON_OBJECT_RESPONSE),
             (200, PROFILE_CHECK_ACTION_RESPONSE),
         ])
         .await;
@@ -11143,25 +11107,22 @@ mod tests {
         let result = run_profile_check(state.clone(), &profile_id, "utility").await;
 
         assert_eq!(result.outcome, ProfileCheckOutcome::Ok);
-        assert_eq!(result.json_object, ModelJsonObjectCapability::Supported);
+        assert_eq!(result.json_object, ModelJsonObjectCapability::Unknown);
         assert_eq!(result.transport, ModelTransportCapability::NonStreaming);
         assert_eq!(
             result.action_contract,
             ModelActionContractCapability::Passed
         );
         let requests = server.await.expect("test server should finish");
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 3);
         let first: Value = serde_json::from_str(&requests[0]).expect("request body should parse");
         let second: Value = serde_json::from_str(&requests[1]).expect("request body should parse");
         let third: Value = serde_json::from_str(&requests[2]).expect("request body should parse");
-        let fourth: Value = serde_json::from_str(&requests[3]).expect("request body should parse");
         assert_eq!(first["stream"], true);
         assert_eq!(second["stream"], false);
         assert_eq!(third["stream"], false);
-        assert_eq!(third["response_format"]["type"], "json_object");
-        assert_eq!(fourth["stream"], false);
         assert!(
-            fourth["messages"][1]["content"]
+            third["messages"][1]["content"]
                 .as_str()
                 .expect("contract prompt should be text")
                 .contains("final_answer")
@@ -11174,7 +11135,7 @@ mod tests {
             .expect("profile should exist");
         assert_eq!(
             profile.utility.json_object,
-            ModelJsonObjectCapability::Supported
+            ModelJsonObjectCapability::Unknown
         );
         assert_eq!(
             profile.utility.transport,
@@ -11200,7 +11161,6 @@ mod tests {
                 200,
                 r#"{"id":"ok","choices":[{"message":{"content":"pong"}}]}"#,
             ),
-            (200, PROFILE_CHECK_JSON_OBJECT_RESPONSE),
             (200, PROFILE_CHECK_ACTION_RESPONSE),
         ])
         .await;
@@ -11217,7 +11177,7 @@ mod tests {
         assert_eq!(result.outcome, ProfileCheckOutcome::Ok);
         assert_eq!(result.transport, ModelTransportCapability::NonStreaming);
         let requests = server.await.expect("test server should finish");
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 3);
         let first: Value = serde_json::from_str(&requests[0]).expect("request body should parse");
         let second: Value = serde_json::from_str(&requests[1]).expect("request body should parse");
         assert_eq!(first["stream"], true);
@@ -11246,7 +11206,6 @@ mod tests {
                 200,
                 r#"{"id":"ok","choices":[{"message":{"content":"pong"}}]}"#,
             ),
-            (200, PROFILE_CHECK_JSON_OBJECT_RESPONSE),
             (
                 200,
                 r#"{"id":"contract","choices":[{"message":{"content":"plain text, not an action"}}]}"#,
@@ -11275,7 +11234,7 @@ mod tests {
             ModelActionContractCapability::Failed
         );
         let requests = server.await.expect("test server should finish");
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 2);
         let workspace = state.store.workspace().expect("workspace should load");
         let profile = workspace
             .profiles
@@ -11301,7 +11260,6 @@ mod tests {
                 200,
                 r#"{"id":"ok","choices":[{"message":{"content":"pong"}}]}"#,
             ),
-            (200, PROFILE_CHECK_JSON_OBJECT_RESPONSE),
             (500, r#"{"error":"temporary upstream failure"}"#),
         ])
         .await;
@@ -11322,13 +11280,13 @@ mod tests {
         let result = run_profile_check(state.clone(), &profile_id, "utility").await;
 
         assert_eq!(result.outcome, ProfileCheckOutcome::Ok);
-        assert_eq!(result.json_object, ModelJsonObjectCapability::Supported);
+        assert_eq!(result.json_object, ModelJsonObjectCapability::Unknown);
         assert_eq!(
             result.action_contract,
             ModelActionContractCapability::Unknown
         );
         let requests = server.await.expect("test server should finish");
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 2);
         let workspace = state.store.workspace().expect("workspace should load");
         let profile = workspace
             .profiles
@@ -11337,7 +11295,7 @@ mod tests {
             .expect("profile should exist");
         assert_eq!(
             profile.utility.json_object,
-            ModelJsonObjectCapability::Supported
+            ModelJsonObjectCapability::Unknown
         );
         assert_eq!(
             profile.utility.action_contract,
@@ -11357,7 +11315,6 @@ mod tests {
                 200,
                 r#"{"id":"ok","choices":[{"message":{"content":"pong"}}]}"#,
             ),
-            (200, PROFILE_CHECK_JSON_OBJECT_RESPONSE),
             (
                 200,
                 r#"{"id":"contract","choices":[{"message":{"content":"{\"kind\":\"final_answer\",\"message\":\"ready\"}"}}]}"#,
@@ -11386,7 +11343,7 @@ mod tests {
             ModelActionContractCapability::Passed
         );
         let requests = server.await.expect("test server should finish");
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 2);
         let workspace = state.store.workspace().expect("workspace should load");
         let profile = workspace
             .profiles
