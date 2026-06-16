@@ -10540,6 +10540,10 @@ fn record_successful_worker_transport_capability(
     worker: &WorkerSummary,
     result: &ProviderTurnResult,
 ) {
+    if result.synthetic_failure {
+        return;
+    }
+
     record_successful_transport_capability_for_role(
         state,
         session,
@@ -23587,6 +23591,7 @@ Thanks."#,
                 provider_session_id: String::new(),
                 content: String::new(),
                 transport: ProviderTurnTransport::NonStreaming,
+                synthetic_failure: false,
             },
         );
 
@@ -23600,6 +23605,46 @@ Thanks."#,
             profile.main.transport,
             ModelTransportCapability::NonStreaming
         );
+        assert_eq!(profile.utility.transport, ModelTransportCapability::Unknown);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn synthetic_provider_failure_does_not_update_transport_profile() {
+        let state_dir = test_state_dir("synthetic-provider-failure-transport-profile");
+        let state = initialize_test_state(&state_dir);
+        let base_url = "http://127.0.0.1:43210/v1";
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "synthetic-failure-model",
+            base_url,
+            "utility-key",
+        );
+
+        let mut worker = test_worker_summary("synthetic-provider-failure", 10, 10);
+        worker.provider = "openai_compatible".to_string();
+        worker.model = "synthetic-failure-model".to_string();
+        worker.provider_base_url = base_url.to_string();
+        record_successful_worker_transport_capability(
+            &state,
+            None,
+            &worker,
+            &ProviderTurnResult {
+                provider_session_id: String::new(),
+                content: r#"{"kind":"final_answer","final_answer":"blocked"}"#.to_string(),
+                transport: ProviderTurnTransport::NonStreaming,
+                synthetic_failure: true,
+            },
+        );
+
+        let workspace = state.store.workspace().expect("workspace should reload");
+        let profile = workspace
+            .profiles
+            .into_iter()
+            .find(|profile| profile.id == workspace.default_profile_id)
+            .expect("default profile should exist");
         assert_eq!(profile.utility.transport, ModelTransportCapability::Unknown);
 
         let _ = fs::remove_dir_all(&state_dir);
@@ -23935,6 +23980,14 @@ Thanks."#,
             server_request_count.fetch_add(1, Ordering::SeqCst);
 
             write_test_openai_sse_headers(&mut socket).await;
+            socket
+                .write_all(
+                    br#"data: {"id":"slow-first-token-turn","choices":[{"delta":{"role":"assistant"}}]}
+
+"#,
+                )
+                .await
+                .expect("test SSE role chunk should write");
             tokio::time::sleep(Duration::from_secs(16)).await;
             write_test_openai_sse_chunk(
                 &mut socket,

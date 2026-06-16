@@ -57,6 +57,7 @@ pub struct ProviderTurnResult {
     pub provider_session_id: String,
     pub content: String,
     pub transport: ProviderTurnTransport,
+    pub synthetic_failure: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -698,12 +699,12 @@ async fn read_openai_compatible_stream(
     let mut content = String::new();
     let mut pending = String::new();
     let mut saw_done = false;
-    let mut saw_activity = false;
+    let mut saw_model_output = false;
     let mut stream = response.bytes_stream();
 
     loop {
         let next_chunk = if let Some(stream_timeouts) = stream_timeouts {
-            let budget = if saw_activity {
+            let budget = if saw_model_output {
                 stream_timeouts.idle
             } else {
                 stream_timeouts.first_token
@@ -711,7 +712,7 @@ async fn read_openai_compatible_stream(
             match timeout(budget, stream.next()).await {
                 Ok(chunk) => chunk,
                 Err(error) => {
-                    return Err(anyhow!(error).context(if saw_activity {
+                    return Err(anyhow!(error).context(if saw_model_output {
                         format!(
                             "OpenAI-compatible stream exceeded streaming idle/read timeout {}",
                             format_duration(stream_timeouts.idle)
@@ -731,7 +732,6 @@ async fn read_openai_compatible_stream(
         let Some(chunk) = next_chunk else {
             break;
         };
-        saw_activity = true;
         let bytes = chunk.context("failed while reading the response stream")?;
         pending.push_str(
             std::str::from_utf8(&bytes).context("OpenAI-compatible stream was not valid UTF-8")?,
@@ -740,24 +740,29 @@ async fn read_openai_compatible_stream(
         while let Some(index) = pending.find('\n') {
             let line = pending[..index].trim().trim_end_matches('\r').to_string();
             pending = pending[index + 1..].to_string();
-            if handle_openai_compatible_line(
+            let outcome = handle_openai_compatible_line(
                 &line,
                 &mut provider_session_id,
                 &mut content,
                 &events,
-            )? {
+            )?;
+            if outcome.has_model_output {
+                saw_model_output = true;
+            }
+            if outcome.done {
                 saw_done = true;
             }
         }
     }
 
     if !pending.trim().is_empty() {
-        if handle_openai_compatible_line(
+        let outcome = handle_openai_compatible_line(
             pending.trim(),
             &mut provider_session_id,
             &mut content,
             &events,
-        )? {
+        )?;
+        if outcome.done {
             saw_done = true;
         }
     }
@@ -778,6 +783,7 @@ async fn read_openai_compatible_stream(
         provider_session_id,
         content,
         transport: ProviderTurnTransport::Streaming,
+        synthetic_failure: false,
     })
 }
 
@@ -836,6 +842,7 @@ async fn read_openai_compatible_completion(
         provider_session_id,
         content,
         transport: ProviderTurnTransport::NonStreaming,
+        synthetic_failure: false,
     })
 }
 
@@ -938,7 +945,14 @@ fn graceful_provider_output_failure_result(
         } else {
             ProviderTurnTransport::NonStreaming
         },
+        synthetic_failure: true,
     }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct OpenAiStreamLineOutcome {
+    done: bool,
+    has_model_output: bool,
 }
 
 fn handle_openai_compatible_line(
@@ -946,14 +960,17 @@ fn handle_openai_compatible_line(
     provider_session_id: &mut String,
     content: &mut String,
     events: &mpsc::UnboundedSender<PromptStreamEvent>,
-) -> Result<bool> {
+) -> Result<OpenAiStreamLineOutcome> {
     if line.is_empty() || !line.starts_with("data:") {
-        return Ok(false);
+        return Ok(OpenAiStreamLineOutcome::default());
     }
 
     let payload = line["data:".len()..].trim();
     if payload == "[DONE]" {
-        return Ok(true);
+        return Ok(OpenAiStreamLineOutcome {
+            done: true,
+            has_model_output: true,
+        });
     }
 
     let chunk = serde_json::from_str::<OpenAiStreamChunk>(payload)
@@ -979,8 +996,10 @@ fn handle_openai_compatible_line(
         });
     }
 
+    let mut has_model_output = false;
     for choice in chunk.choices {
         if let Some(reasoning) = choice.delta.reasoning_text() {
+            has_model_output = true;
             let _ = events.send(PromptStreamEvent::ReasoningSnapshot { text: reasoning });
         }
 
@@ -989,6 +1008,9 @@ fn handle_openai_compatible_line(
             .content
             .or(choice.message.and_then(|m| m.content))
         {
+            if !delta.is_empty() {
+                has_model_output = true;
+            }
             content.push_str(&delta);
             let _ = events.send(PromptStreamEvent::AssistantChunk { text: delta });
             let _ = events.send(PromptStreamEvent::AssistantSnapshot {
@@ -997,7 +1019,10 @@ fn handle_openai_compatible_line(
         }
     }
 
-    Ok(false)
+    Ok(OpenAiStreamLineOutcome {
+        done: false,
+        has_model_output,
+    })
 }
 
 fn retry_after_from_headers(headers: &HeaderMap) -> Option<Duration> {
@@ -1219,7 +1244,7 @@ mod tests {
         let (events, mut receiver) = mpsc::unbounded_channel();
         let mut provider_session_id = String::new();
         let mut content = String::new();
-        let done = handle_openai_compatible_line(
+        let outcome = handle_openai_compatible_line(
             r#"data: {"id":"chatcmpl-test","choices":[],"usage":{"prompt_tokens":120,"completion_tokens":45,"prompt_tokens_details":{"cached_tokens":30}}}"#,
             &mut provider_session_id,
             &mut content,
@@ -1227,7 +1252,7 @@ mod tests {
         )
         .expect("usage chunk should decode");
 
-        assert!(!done);
+        assert_eq!(outcome, OpenAiStreamLineOutcome::default());
         assert_eq!(provider_session_id, "chatcmpl-test");
         let mut saw_usage = false;
         while let Ok(event) = receiver.try_recv() {
