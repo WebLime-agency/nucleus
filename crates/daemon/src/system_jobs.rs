@@ -228,6 +228,7 @@ impl SystemdUserScheduler {
             }
             .into());
         }
+        self.ensure_authored_units_not_visible(&rendered).await?;
 
         write_new_unit_file(&timer_path, &rendered.timer)?;
         if let Err(error) = write_new_unit_file(&service_path, &rendered.service) {
@@ -261,6 +262,22 @@ impl SystemdUserScheduler {
         remove_unit_file_if_exists(unit_dir.join(unit))?;
         remove_unit_file_if_exists(unit_dir.join(service_unit))?;
         self.run_command(daemon_reload_invocation()).await?;
+        Ok(())
+    }
+
+    async fn ensure_authored_units_not_visible(
+        &self,
+        rendered: &SystemJobRenderedUnits,
+    ) -> Result<()> {
+        let units = [rendered.timer_unit.as_str(), rendered.service_unit.as_str()];
+        let output = self
+            .run_command(list_unit_files_for_units_invocation(&units))
+            .await?;
+        for unit in listed_unit_file_names(&output.stdout) {
+            if units.contains(&unit.as_str()) {
+                return Err(SystemJobError::UnitAlreadyExists { unit }.into());
+            }
+        }
         Ok(())
     }
 
@@ -1514,6 +1531,29 @@ fn list_unit_files_invocation() -> CommandInvocation {
     }
 }
 
+fn list_unit_files_for_units_invocation(units: &[&str]) -> CommandInvocation {
+    let mut args = vec![
+        "--user".to_string(),
+        "list-unit-files".to_string(),
+        "--full".to_string(),
+        "--no-pager".to_string(),
+        "--no-legend".to_string(),
+    ];
+    args.extend(units.iter().map(|unit| unit.to_string()));
+    CommandInvocation {
+        program: "systemctl".to_string(),
+        args,
+    }
+}
+
+fn listed_unit_file_names(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .map(str::to_string)
+        .collect()
+}
+
 fn timer_show_invocation(unit: &str) -> CommandInvocation {
     CommandInvocation {
         program: "systemctl".to_string(),
@@ -1921,10 +1961,22 @@ placeholder-broken.timer enabled enabled\n";
         assert!(unit_dir.join("placeholder-sync.timer").exists());
         assert!(unit_dir.join("placeholder-sync.service").exists());
         let invocations = invocations.lock().unwrap();
-        assert_eq!(invocations.len(), 2);
-        assert_eq!(invocations[0].args, vec!["--user", "daemon-reload"]);
+        assert_eq!(invocations.len(), 3);
         assert_eq!(
-            invocations[1].args,
+            invocations[0].args,
+            vec![
+                "--user",
+                "list-unit-files",
+                "--full",
+                "--no-pager",
+                "--no-legend",
+                "placeholder-sync.timer",
+                "placeholder-sync.service"
+            ]
+        );
+        assert_eq!(invocations[1].args, vec!["--user", "daemon-reload"]);
+        assert_eq!(
+            invocations[2].args,
             vec!["--user", "enable", "--now", "placeholder-sync.timer"]
         );
 
@@ -1963,6 +2015,45 @@ placeholder-broken.timer enabled enabled\n";
             Some(SystemJobError::UnitAlreadyExists { unit }) if unit == "placeholder-sync.timer"
         ));
         assert!(invocations.lock().unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(unit_dir);
+    }
+
+    #[tokio::test]
+    async fn install_authored_refuses_visible_systemd_unit_collision() {
+        let unit_dir = test_unit_dir("visible-collision");
+        let invocations = Arc::new(Mutex::new(Vec::new()));
+        let recorded_invocations = Arc::clone(&invocations);
+        let scheduler = SystemdUserScheduler::with_command_runner_and_unit_dir(
+            move |invocation, _timeout| {
+                recorded_invocations
+                    .lock()
+                    .unwrap()
+                    .push(invocation.clone());
+                async move {
+                    let stdout = if invocation.args.iter().any(|arg| arg == "list-unit-files") {
+                        "placeholder-sync.service enabled enabled\n".to_string()
+                    } else {
+                        String::new()
+                    };
+                    Ok(CommandOutput { stdout })
+                }
+            },
+            unit_dir.clone(),
+        );
+
+        let error = scheduler
+            .install_authored(&authored_spec())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<SystemJobError>(),
+            Some(SystemJobError::UnitAlreadyExists { unit }) if unit == "placeholder-sync.service"
+        ));
+        assert_eq!(invocations.lock().unwrap().len(), 1);
+        assert!(!unit_dir.join("placeholder-sync.timer").exists());
+        assert!(!unit_dir.join("placeholder-sync.service").exists());
 
         let _ = fs::remove_dir_all(unit_dir);
     }
