@@ -10561,8 +10561,12 @@ pub(crate) fn record_successful_utility_transport_capability(
     provider: &str,
     model: &str,
     base_url: &str,
-    transport: ProviderTurnTransport,
+    result: &ProviderTurnResult,
 ) {
+    if result.synthetic_failure {
+        return;
+    }
+
     record_successful_transport_capability_for_role(
         state,
         session,
@@ -10570,7 +10574,7 @@ pub(crate) fn record_successful_utility_transport_capability(
         provider,
         model,
         base_url,
-        transport,
+        result.transport,
     );
 }
 
@@ -23631,6 +23635,44 @@ Thanks."#,
             &state,
             None,
             &worker,
+            &ProviderTurnResult {
+                provider_session_id: String::new(),
+                content: r#"{"kind":"final_answer","final_answer":"blocked"}"#.to_string(),
+                transport: ProviderTurnTransport::NonStreaming,
+                synthetic_failure: true,
+            },
+        );
+
+        let workspace = state.store.workspace().expect("workspace should reload");
+        let profile = workspace
+            .profiles
+            .into_iter()
+            .find(|profile| profile.id == workspace.default_profile_id)
+            .expect("default profile should exist");
+        assert_eq!(profile.utility.transport, ModelTransportCapability::Unknown);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn synthetic_utility_provider_failure_does_not_update_transport_profile() {
+        let state_dir = test_state_dir("synthetic-utility-provider-failure-transport-profile");
+        let state = initialize_test_state(&state_dir);
+        let base_url = "http://127.0.0.1:43210/v1";
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "synthetic-utility-failure-model",
+            base_url,
+            "utility-key",
+        );
+
+        record_successful_utility_transport_capability(
+            &state,
+            None,
+            "openai_compatible",
+            "synthetic-utility-failure-model",
+            base_url,
             &ProviderTurnResult {
                 provider_session_id: String::new(),
                 content: r#"{"kind":"final_answer","final_answer":"blocked"}"#.to_string(),
