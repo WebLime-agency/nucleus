@@ -1863,6 +1863,8 @@ pub struct LocalJobSummary {
     pub unit: String,
     pub title: String,
     pub backend: String,
+    #[serde(default)]
+    pub managed: bool,
     pub enabled: bool,
     pub unit_file_state: String,
     pub manageable: bool,
@@ -1877,6 +1879,16 @@ pub struct LocalJobSummary {
 pub struct LocalJobDetail {
     pub summary: LocalJobSummary,
     pub log_tail: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalJobsAllowlistRequest {
+    pub globs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalJobsAllowlistResponse {
+    pub globs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

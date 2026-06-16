@@ -11,6 +11,7 @@
     RefreshCw,
     Save,
     ScrollText,
+    Search,
     TimerReset,
     Trash2,
     Workflow
@@ -26,23 +27,35 @@
     CardHeader,
     CardTitle
   } from '$lib/components/ui/card';
+  import { Input } from '$lib/components/ui/input';
+  import { Textarea } from '$lib/components/ui/textarea';
   import {
     createPlaybook,
     deletePlaybook,
     disableLocalJob,
     enableLocalJob,
+    fetchAvailableLocalJobs,
     fetchJobDetail,
     fetchLocalJobDetail,
     fetchLocalJobs,
+    fetchLocalJobsAllowlist,
     fetchOverview,
     fetchPlaybookDetail,
     fetchPlaybooks,
     runLocalJob,
     runPlaybook,
+    updateLocalJobsAllowlist,
     updatePlaybook
   } from '$lib/nucleus/client';
   import { compactPath, formatDateTime, formatState } from '$lib/nucleus/format';
-  import { localJobBadgeVariant, localJobCanRun, localJobCanToggle } from '$lib/nucleus/local-jobs';
+  import {
+    localJobBadgeVariant,
+    localJobCanRemoveLiteralAllowlistEntry,
+    localJobCanRun,
+    localJobCanToggle,
+    localJobHasLiteralAllowlistEntry,
+    localJobHasNonLiteralAllowlistMatch
+  } from '$lib/nucleus/local-jobs';
   import { connectDaemonStream, type StreamStatus } from '$lib/nucleus/realtime';
   import type {
     DaemonEvent,
@@ -99,6 +112,8 @@
   let overview = $state<RuntimeOverview | null>(null);
   let playbooks = $state<PlaybookSummary[]>([]);
   let localJobs = $state<LocalJobSummary[]>([]);
+  let availableLocalJobs = $state<LocalJobSummary[]>([]);
+  let localJobsAllowlist = $state<string[]>([]);
   let playbookDetail = $state<PlaybookDetail | null>(null);
   let localJobDetail = $state<LocalJobDetail | null>(null);
   let activeSurface = $state<'playbooks' | 'local_jobs'>('playbooks');
@@ -114,8 +129,14 @@
   let running = $state(false);
   let jobLoading = $state(false);
   let localJobLoading = $state(false);
+  let localJobsDiscovering = $state(false);
+  let localJobsDiscovered = $state(false);
+  let localJobsAllowlistSaving = $state(false);
   let localJobAction = $state<string | null>(null);
   let localJobLoadError = $state<string | null>(null);
+  let localJobsDiscoverySearch = $state('');
+  let localJobsDiscoveryFilter = $state<'all' | 'unmanaged' | 'managed'>('all');
+  let localJobsAllowlistDraft = $state('');
   let expandedLogUnit = $state<string | null>(null);
   let streamStatus = $state<StreamStatus>('connecting');
   let error = $state<string | null>(null);
@@ -146,6 +167,18 @@
       localJobs.find((job) => job.unit === selectedLocalJobUnit) ??
       null
   );
+  let filteredAvailableLocalJobs = $derived.by(() => {
+    const search = localJobsDiscoverySearch.trim().toLowerCase();
+    return availableLocalJobs.filter((job) => {
+      if (localJobsDiscoveryFilter === 'managed' && !job.managed) return false;
+      if (localJobsDiscoveryFilter === 'unmanaged' && job.managed) return false;
+      if (!search) return true;
+      return [job.unit, job.title, job.active_state, job.unit_file_state, job.triggered_unit]
+        .join(' ')
+        .toLowerCase()
+        .includes(search);
+    });
+  });
   let selectedProfile = $derived(
     workspaceProfiles.find((profile) => profile.id === draftProfileId) ?? null
   );
@@ -219,6 +252,21 @@
     return `${unit}:${action}`;
   }
 
+  function allowlistDraftFromGlobs(globs: string[]): string {
+    return globs.join('\n');
+  }
+
+  function allowlistGlobsFromDraft(value: string): string[] {
+    return value
+      .split(/\r?\n|,/)
+      .map((glob) => glob.trim())
+      .filter(Boolean);
+  }
+
+  function localJobManagedByGlob(job: LocalJobSummary): boolean {
+    return job.managed && localJobHasNonLiteralAllowlistMatch(job, localJobsAllowlist);
+  }
+
   function syncLocalJobSummary(next: LocalJobSummary) {
     const remaining = localJobs.filter((job) => job.unit !== next.unit);
     localJobs = [next, ...remaining].sort((left, right) => left.unit.localeCompare(right.unit));
@@ -236,6 +284,109 @@
     if (localJobDetail && !localJobs.some((job) => job.unit === localJobDetail?.summary.unit)) {
       localJobDetail = null;
     }
+  }
+
+  function syncAvailableLocalJobs(next: LocalJobSummary[]) {
+    availableLocalJobs = [...next].sort((left, right) => left.unit.localeCompare(right.unit));
+  }
+
+  function syncLocalJobsAllowlist(globs: string[]) {
+    localJobsAllowlist = globs;
+    localJobsAllowlistDraft = allowlistDraftFromGlobs(globs);
+  }
+
+  async function loadLocalJobsAllowlist(silent = false) {
+    if (!silent) {
+      localJobsAllowlistSaving = true;
+    }
+
+    try {
+      const allowlist = await fetchLocalJobsAllowlist();
+      syncLocalJobsAllowlist(allowlist.globs);
+      error = null;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to load the local jobs allowlist.';
+    } finally {
+      localJobsAllowlistSaving = false;
+    }
+  }
+
+  async function discoverLocalJobs() {
+    localJobsDiscovering = true;
+    localJobLoadError = null;
+
+    try {
+      const [allowlist, available] = await Promise.all([
+        fetchLocalJobsAllowlist(),
+        fetchAvailableLocalJobs()
+      ]);
+      syncLocalJobsAllowlist(allowlist.globs);
+      syncAvailableLocalJobs(available);
+      localJobsDiscovered = true;
+      error = null;
+    } catch (cause) {
+      localJobLoadError = cause instanceof Error ? cause.message : 'Failed to discover local jobs.';
+    } finally {
+      localJobsDiscovering = false;
+    }
+  }
+
+  async function refreshLocalJobsAfterAllowlistChange() {
+    try {
+      syncLocalJobs(await fetchLocalJobs());
+      localJobLoadError = null;
+    } catch (cause) {
+      localJobLoadError = cause instanceof Error ? cause.message : 'Failed to refresh local jobs.';
+    }
+    if (localJobsDiscovered) {
+      try {
+        syncAvailableLocalJobs(await fetchAvailableLocalJobs());
+      } catch (cause) {
+        localJobLoadError = cause instanceof Error ? cause.message : 'Failed to refresh discovered timers.';
+      }
+    }
+  }
+
+  async function replaceLocalJobsAllowlist(globs: string[], message: string) {
+    localJobsAllowlistSaving = true;
+    success = null;
+
+    try {
+      const allowlist = await updateLocalJobsAllowlist(globs);
+      syncLocalJobsAllowlist(allowlist.globs);
+      await refreshLocalJobsAfterAllowlistChange();
+      success = message;
+      error = null;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Failed to update the local jobs allowlist.';
+    } finally {
+      localJobsAllowlistSaving = false;
+    }
+  }
+
+  async function manageLocalJob(job: LocalJobSummary) {
+    if (localJobHasLiteralAllowlistEntry(job, localJobsAllowlist)) {
+      return;
+    }
+    await replaceLocalJobsAllowlist([...localJobsAllowlist, job.unit], 'Local job added to management.');
+    selectedLocalJobUnit = job.unit;
+  }
+
+  async function unmanageLocalJob(job: LocalJobSummary) {
+    if (!localJobCanRemoveLiteralAllowlistEntry(job, localJobsAllowlist)) {
+      return;
+    }
+    await replaceLocalJobsAllowlist(
+      localJobsAllowlist.filter((glob) => glob !== job.unit),
+      'Local job removed from management.'
+    );
+  }
+
+  async function saveLocalJobsAllowlist() {
+    await replaceLocalJobsAllowlist(
+      allowlistGlobsFromDraft(localJobsAllowlistDraft),
+      'Local jobs allowlist saved.'
+    );
   }
 
   async function loadSelectedLocalJobDetail(silent = true, refreshLoaded = false) {
@@ -447,6 +598,13 @@
         localJobLoadError = null;
       } catch (cause) {
         localJobLoadError = cause instanceof Error ? cause.message : 'Failed to load local jobs.';
+      }
+
+      try {
+        const allowlist = await fetchLocalJobsAllowlist();
+        syncLocalJobsAllowlist(allowlist.globs);
+      } catch (cause) {
+        localJobLoadError = cause instanceof Error ? cause.message : 'Failed to load local jobs allowlist.';
       }
 
       const nextSelectedPlaybookId =
@@ -1137,6 +1295,129 @@
       </div>
     {/if}
 
+    <section class="grid gap-4 xl:grid-cols-[minmax(0,1fr)_24rem]">
+      <Card>
+        <CardHeader>
+          <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <CardTitle>Discover timers</CardTitle>
+              <CardDescription>
+                {localJobsDiscovered
+                  ? `${availableLocalJobs.length} systemd user timers discovered.`
+                  : 'Find systemd user timers before choosing which ones Nucleus can manage.'}
+              </CardDescription>
+            </div>
+            <Button onclick={() => void discoverLocalJobs()} disabled={localJobsDiscovering}>
+              <Search class="size-4" />
+              {localJobsDiscovering ? 'Discovering' : 'Discover timers'}
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent class="space-y-4">
+          {#if localJobsDiscovered}
+            <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_12rem]">
+              <Input placeholder="Search timers" bind:value={localJobsDiscoverySearch} />
+              <select
+                class="h-10 rounded-md border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-100"
+                bind:value={localJobsDiscoveryFilter}
+                aria-label="Timer discovery filter"
+              >
+                <option value="all">All timers</option>
+                <option value="unmanaged">Unmanaged</option>
+                <option value="managed">Managed</option>
+              </select>
+            </div>
+
+            {#if filteredAvailableLocalJobs.length === 0}
+              <div class="rounded-xl border border-dashed border-zinc-800 bg-zinc-950/60 px-4 py-5 text-sm text-zinc-500">
+                No discovered timers match the current filter.
+              </div>
+            {:else}
+              <div class="max-h-[28rem] space-y-3 overflow-auto pr-1">
+                {#each filteredAvailableLocalJobs as job}
+                  <div class="rounded-xl border border-zinc-800 bg-zinc-950/60 px-4 py-4">
+                    <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                      <div class="min-w-0">
+                        <div class="flex flex-wrap items-center gap-2">
+                          <Cog class="size-4 text-zinc-400" />
+                          <span class="text-sm font-medium text-zinc-100">{job.title}</span>
+                          {#if job.managed}
+                            <Badge variant="default">Managed</Badge>
+                          {:else}
+                            <Badge variant="secondary">Read-only</Badge>
+                          {/if}
+                          <Badge variant={localJobBadgeVariant(job)}>{job.active_state}</Badge>
+                          <Badge variant="secondary">{job.unit_file_state}</Badge>
+                        </div>
+                        <div class="mt-2 break-all font-mono text-xs text-zinc-500">{job.unit}</div>
+                        <div class="mt-3 grid gap-2 text-xs text-zinc-400 sm:grid-cols-3">
+                          <span>Next: {formatOptionalDate(job.schedule.next_elapse_at)}</span>
+                          <span>Last: {formatOptionalDate(job.last_fired_at)}</span>
+                          <span>{formatLocalJobExit(job)}</span>
+                        </div>
+                      </div>
+                      <div class="flex shrink-0 flex-wrap gap-2">
+                        {#if !job.managed}
+                          <Button
+                            size="sm"
+                            onclick={() => void manageLocalJob(job)}
+                            disabled={localJobsAllowlistSaving}
+                          >
+                            <Plus class="size-3.5" />
+                            Manage
+                          </Button>
+                        {:else if localJobCanRemoveLiteralAllowlistEntry(job, localJobsAllowlist)}
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onclick={() => void unmanageLocalJob(job)}
+                            disabled={localJobsAllowlistSaving}
+                          >
+                            <Trash2 class="size-3.5" />
+                            Unmanage
+                          </Button>
+                        {:else if localJobManagedByGlob(job)}
+                          <Badge variant="secondary">Managed by glob</Badge>
+                        {/if}
+                      </div>
+                    </div>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          {:else}
+            <div class="rounded-xl border border-dashed border-zinc-800 bg-zinc-950/60 px-4 py-5 text-sm text-zinc-500">
+              Discovery runs only when requested.
+            </div>
+          {/if}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Advanced allowlist</CardTitle>
+          <CardDescription>{localJobsAllowlist.length} allowlist entries.</CardDescription>
+        </CardHeader>
+        <CardContent class="space-y-3">
+          <Textarea
+            class="min-h-36 font-mono text-xs"
+            bind:value={localJobsAllowlistDraft}
+            placeholder="placeholder-cleanup.timer&#10;placeholder-*.timer"
+          ></Textarea>
+          <div class="flex flex-wrap gap-2">
+            <Button onclick={() => void saveLocalJobsAllowlist()} disabled={localJobsAllowlistSaving}>
+              <Save class="size-4" />
+              {localJobsAllowlistSaving ? 'Saving' : 'Save'}
+            </Button>
+            <Button variant="outline" onclick={() => void loadLocalJobsAllowlist()} disabled={localJobsAllowlistSaving}>
+              <RefreshCw class="size-4" />
+              Reload
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+    </section>
+
     {#if localJobs.length === 0}
       <Card>
         <CardHeader>
@@ -1146,9 +1427,12 @@
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <div class="rounded-xl border border-dashed border-zinc-800 bg-zinc-950/60 px-4 py-5 text-sm leading-6 text-zinc-500">
-            Add unit globs to the daemon setting <span class="font-mono text-zinc-300">system_jobs_unit_globs</span>
-            to observe existing OS-scheduled user timers here.
+          <div class="flex flex-col gap-3 rounded-xl border border-dashed border-zinc-800 bg-zinc-950/60 px-4 py-5 text-sm leading-6 text-zinc-500 sm:flex-row sm:items-center sm:justify-between">
+            <span>No timers have been selected for management yet.</span>
+            <Button onclick={() => void discoverLocalJobs()} disabled={localJobsDiscovering}>
+              <Search class="size-4" />
+              {localJobsDiscovering ? 'Discovering' : 'Discover timers'}
+            </Button>
           </div>
         </CardContent>
       </Card>
