@@ -279,7 +279,7 @@ impl SystemdUserScheduler {
     ) -> Result<()> {
         let units = [rendered.timer_unit.as_str(), rendered.service_unit.as_str()];
         let output = self
-            .run_command(list_unit_files_for_units_invocation(&units))
+            .run_command(list_unit_files_for_collision_invocation())
             .await?;
         for unit in listed_unit_file_names(&output.stdout) {
             if units.contains(&unit.as_str()) {
@@ -1582,18 +1582,16 @@ fn list_unit_files_invocation() -> CommandInvocation {
     }
 }
 
-fn list_unit_files_for_units_invocation(units: &[&str]) -> CommandInvocation {
-    let mut args = vec![
-        "--user".to_string(),
-        "list-unit-files".to_string(),
-        "--full".to_string(),
-        "--no-pager".to_string(),
-        "--no-legend".to_string(),
-    ];
-    args.extend(units.iter().map(|unit| unit.to_string()));
+fn list_unit_files_for_collision_invocation() -> CommandInvocation {
     CommandInvocation {
         program: "systemctl".to_string(),
-        args,
+        args: vec![
+            "--user".to_string(),
+            "list-unit-files".to_string(),
+            "--full".to_string(),
+            "--no-pager".to_string(),
+            "--no-legend".to_string(),
+        ],
     }
 }
 
@@ -2025,9 +2023,7 @@ placeholder-broken.timer enabled enabled\n";
                 "list-unit-files",
                 "--full",
                 "--no-pager",
-                "--no-legend",
-                "placeholder-sync.timer",
-                "placeholder-sync.service"
+                "--no-legend"
             ]
         );
         assert_eq!(invocations[1].args, vec!["--user", "daemon-reload"]);
