@@ -525,7 +525,7 @@ pub fn render_authored_units(spec: &SystemJobAuthoringSpec) -> Result<SystemJobR
         .map(|arg| quote_systemd_exec_arg(arg))
         .collect::<Vec<_>>()
         .join(" ");
-    let schedule_line = match spec.schedule.kind {
+    let schedule_line = match &spec.schedule.kind {
         SystemJobAuthoringScheduleKind::Interval => {
             let value = validate_schedule_value(
                 &spec.schedule.value,
