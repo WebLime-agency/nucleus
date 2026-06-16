@@ -253,6 +253,9 @@ impl SystemdUserScheduler {
             .run_command(enable_timer_invocation(&rendered.timer_unit))
             .await
         {
+            let _ = self
+                .run_command(disable_timer_invocation(&rendered.timer_unit))
+                .await;
             let _ = fs::remove_file(&timer_path);
             let _ = fs::remove_file(&service_path);
             let _ = self.run_command(daemon_reload_invocation()).await;
@@ -267,6 +270,8 @@ impl SystemdUserScheduler {
         self.run_command(disable_timer_invocation(unit)).await?;
         let unit_dir = self.unit_dir()?;
         let service_unit = service_unit_for_timer(unit)?;
+        self.run_command(stop_unit_invocation(&service_unit))
+            .await?;
         remove_unit_file_if_exists(unit_dir.join(unit))?;
         remove_unit_file_if_exists(unit_dir.join(service_unit))?;
         self.run_command(daemon_reload_invocation()).await?;
@@ -1686,6 +1691,13 @@ fn disable_timer_invocation(unit: &str) -> CommandInvocation {
     }
 }
 
+fn stop_unit_invocation(unit: &str) -> CommandInvocation {
+    CommandInvocation {
+        program: "systemctl".to_string(),
+        args: vec!["--user".to_string(), "stop".to_string(), unit.to_string()],
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommandOutput {
     stdout: String,
@@ -2122,6 +2134,52 @@ placeholder-broken.timer enabled enabled\n";
     }
 
     #[tokio::test]
+    async fn install_authored_disables_timer_when_enable_fails() {
+        let unit_dir = test_unit_dir("enable-fails");
+        let invocations = Arc::new(Mutex::new(Vec::new()));
+        let recorded_invocations = Arc::clone(&invocations);
+        let scheduler = SystemdUserScheduler::with_command_runner_and_unit_dir(
+            move |invocation, _timeout| {
+                recorded_invocations
+                    .lock()
+                    .unwrap()
+                    .push(invocation.clone());
+                async move {
+                    if invocation.args.iter().any(|arg| arg == "enable") {
+                        return Err(anyhow::anyhow!("enable failed"));
+                    }
+                    Ok(CommandOutput {
+                        stdout: String::new(),
+                    })
+                }
+            },
+            unit_dir.clone(),
+        );
+
+        let error = scheduler
+            .install_authored(&authored_spec())
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("enable failed"));
+        assert!(!unit_dir.join("placeholder-sync.timer").exists());
+        assert!(!unit_dir.join("placeholder-sync.service").exists());
+        let invocations = invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 5);
+        assert_eq!(
+            invocations[2].args,
+            vec!["--user", "enable", "--now", "placeholder-sync.timer"]
+        );
+        assert_eq!(
+            invocations[3].args,
+            vec!["--user", "disable", "--now", "placeholder-sync.timer"]
+        );
+        assert_eq!(invocations[4].args, vec!["--user", "daemon-reload"]);
+
+        let _ = fs::remove_dir_all(unit_dir);
+    }
+
+    #[tokio::test]
     async fn delete_authored_disables_removes_units_and_reloads() {
         let unit_dir = test_unit_dir("delete");
         fs::create_dir_all(&unit_dir).unwrap();
@@ -2152,12 +2210,16 @@ placeholder-broken.timer enabled enabled\n";
         assert!(!unit_dir.join("placeholder-sync.timer").exists());
         assert!(!unit_dir.join("placeholder-sync.service").exists());
         let invocations = invocations.lock().unwrap();
-        assert_eq!(invocations.len(), 2);
+        assert_eq!(invocations.len(), 3);
         assert_eq!(
             invocations[0].args,
             vec!["--user", "disable", "--now", "placeholder-sync.timer"]
         );
-        assert_eq!(invocations[1].args, vec!["--user", "daemon-reload"]);
+        assert_eq!(
+            invocations[1].args,
+            vec!["--user", "stop", "placeholder-sync.service"]
+        );
+        assert_eq!(invocations[2].args, vec!["--user", "daemon-reload"]);
 
         let _ = fs::remove_dir_all(unit_dir);
     }
