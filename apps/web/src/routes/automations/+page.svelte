@@ -153,6 +153,7 @@
   let authoringScheduleValue = $state('1h');
   let authoringWorkingDir = $state('');
   let authoredPreview = $state<SystemJobRenderedUnits | null>(null);
+  let authoredDraftVersion = $state(0);
   let authoringBusy = $state(false);
   let deletingAuthoredUnit = $state<string | null>(null);
   let expandedLogUnit = $state<string | null>(null);
@@ -298,7 +299,7 @@
     authoringScheduleKind = template.spec.schedule.kind;
     authoringScheduleValue = template.spec.schedule.value;
     authoringWorkingDir = template.spec.working_dir ?? '';
-    authoredPreview = null;
+    invalidateAuthoredPreview();
   }
 
   function authoredSpecFromDraft(): SystemJobAuthoringSpec {
@@ -315,18 +316,26 @@
   }
 
   function invalidateAuthoredPreview() {
+    authoredDraftVersion += 1;
     authoredPreview = null;
   }
 
   async function previewAuthoredLocalJob() {
+    const previewVersion = authoredDraftVersion;
+    const spec = authoredSpecFromDraft();
     authoringBusy = true;
     success = null;
 
     try {
-      authoredPreview = await renderAuthoredLocalJob(authoredSpecFromDraft());
-      error = null;
+      const preview = await renderAuthoredLocalJob(spec);
+      if (previewVersion === authoredDraftVersion) {
+        authoredPreview = preview;
+        error = null;
+      }
     } catch (cause) {
-      error = cause instanceof Error ? cause.message : 'Failed to render the local job units.';
+      if (previewVersion === authoredDraftVersion) {
+        error = cause instanceof Error ? cause.message : 'Failed to render the local job units.';
+      }
     } finally {
       authoringBusy = false;
     }
