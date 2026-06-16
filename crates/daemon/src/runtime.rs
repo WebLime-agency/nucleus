@@ -26,6 +26,10 @@ const PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
 // Utility providers should connect promptly and keep streamed responses moving,
 // while healthy long worker generations retain the main total backstop.
 const UTILITY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const UTILITY_FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(90);
+#[cfg(test)]
+const UTILITY_FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(20);
 const UTILITY_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const RUNTIME_CACHE_TTL: Duration = Duration::from_secs(30);
 #[cfg(not(test))]
@@ -59,6 +63,12 @@ pub struct ProviderTurnResult {
 pub enum ProviderTurnTransport {
     Streaming,
     NonStreaming,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamingTimeouts {
+    first_token: Duration,
+    idle: Duration,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -317,9 +327,7 @@ async fn execute_openai_compatible_prompt(
         .transpose()?;
 
     let messages = compiled_turn_openai_messages(compiled_turn);
-    let json_object_supported = capabilities.json_object == ModelJsonObjectCapability::Supported;
-    let request_json_object =
-        json_object_supported && compiled_turn_requires_json_object(compiled_turn);
+    let mut provider_retry_nudge = false;
     let mut force_non_streaming = capabilities.transport == ModelTransportCapability::NonStreaming;
     let may_try_non_streaming_fallback =
         capabilities.transport == ModelTransportCapability::Unknown;
@@ -334,8 +342,7 @@ async fn execute_openai_compatible_prompt(
         let stream = !force_non_streaming;
         let payload = openai_compatible_payload(
             &session.model,
-            messages.clone(),
-            request_json_object,
+            openai_compatible_messages_for_attempt(messages.clone(), provider_retry_nudge),
             stream,
         );
         let client = if stream {
@@ -344,8 +351,19 @@ async fn execute_openai_compatible_prompt(
             non_streaming_client.as_ref().unwrap_or(&streaming_client)
         };
 
+        let stream_timeouts = (utility_lane && stream).then_some(StreamingTimeouts {
+            first_token: UTILITY_FIRST_TOKEN_TIMEOUT,
+            idle: UTILITY_READ_TIMEOUT,
+        });
+
         match execute_openai_compatible_prompt_once(
-            session, base_url, client, &payload, stream, &events,
+            session,
+            base_url,
+            client,
+            &payload,
+            stream,
+            stream_timeouts,
+            &events,
         )
         .await
         {
@@ -371,19 +389,23 @@ async fn execute_openai_compatible_prompt(
                     continue;
                 }
 
-                if is_empty_completed_provider_output(&error) {
+                let empty_provider_output = is_empty_completed_provider_output(&error);
+                let recoverable_provider_output =
+                    empty_provider_output || is_malformed_provider_output_error(&error);
+                if empty_provider_output {
                     if stream && may_try_non_streaming_fallback && !tried_non_streaming_fallback {
+                        provider_retry_nudge = true;
                         force_non_streaming = true;
                         tried_non_streaming_fallback = true;
                         continue;
                     }
-                    return Err(empty_utility_model_output_error(session));
                 }
 
                 attempt = attempt.saturating_add(1);
                 let retry_after = retry_after_from_error(&error);
                 match classify_provider_error(&error, attempt, retry_after) {
                     RetryDecision::Retry { backoff } => {
+                        provider_retry_nudge = should_nudge_provider_retry(&error);
                         let _ = events.send(PromptStreamEvent::ProviderRetry {
                             attempt,
                             error_class: provider_error_class(&error),
@@ -392,6 +414,9 @@ async fn execute_openai_compatible_prompt(
                         wait_for_retry_backoff(backoff, cancel_rx.as_mut()).await?;
                     }
                     RetryDecision::GiveUp { reason } => {
+                        if recoverable_provider_output {
+                            return Ok(graceful_provider_output_failure_result(session, stream));
+                        }
                         let detail = error.to_string();
                         return Err(error).with_context(|| {
                             format!("provider retry policy gave up: {reason}; {detail}")
@@ -403,12 +428,34 @@ async fn execute_openai_compatible_prompt(
     }
 }
 
+fn openai_compatible_messages_for_attempt(
+    mut messages: Vec<serde_json::Value>,
+    provider_retry_nudge: bool,
+) -> Vec<serde_json::Value> {
+    if provider_retry_nudge {
+        messages.push(json!({
+            "role": "user",
+            "content": "The previous provider response was empty or malformed. Retry this turn and return one non-empty response that follows the current Nucleus worker action instructions."
+        }));
+    }
+    messages
+}
+
+fn should_nudge_provider_retry(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ProviderTransportError>()
+        .is_some_and(|provider_error| {
+            matches!(provider_error, ProviderTransportError::Stream { .. })
+        })
+        || is_malformed_provider_output_error(error)
+}
+
 fn build_openai_compatible_client(utility_lane: bool, stream: bool) -> Result<reqwest::Client> {
     let client_builder = reqwest::Client::builder().timeout(PROMPT_TIMEOUT);
     let client_builder = if utility_lane {
         let client_builder = client_builder.connect_timeout(UTILITY_CONNECT_TIMEOUT);
         if stream {
-            client_builder.read_timeout(UTILITY_READ_TIMEOUT)
+            client_builder.read_timeout(UTILITY_FIRST_TOKEN_TIMEOUT)
         } else {
             client_builder
         }
@@ -432,27 +479,6 @@ pub(crate) async fn probe_openai_compatible_endpoint(
         api_key,
         model,
         vec![json!({ "role": "user", "content": "ping" })],
-        false,
-        stream,
-    )
-    .await
-}
-
-pub(crate) async fn probe_openai_compatible_json_object(
-    base_url: &str,
-    api_key: &str,
-    model: &str,
-    stream: bool,
-) -> Result<ProviderTurnResult> {
-    probe_openai_compatible_endpoint_with_messages(
-        base_url,
-        api_key,
-        model,
-        vec![json!({
-            "role": "user",
-            "content": "Return exactly this JSON object and no other text: {\"ok\":true}"
-        })],
-        true,
         stream,
     )
     .await
@@ -478,7 +504,6 @@ pub(crate) async fn probe_openai_compatible_action_contract(
                 "content": "Return exactly this valid action shape with any short message: {\"kind\":\"final_answer\",\"message\":\"ok\"}"
             }),
         ],
-        false,
         stream,
     )
     .await
@@ -489,12 +514,11 @@ async fn probe_openai_compatible_endpoint_with_messages(
     api_key: &str,
     model: &str,
     messages: Vec<serde_json::Value>,
-    request_json_object: bool,
     stream: bool,
 ) -> Result<ProviderTurnResult> {
     let base_url = base_url.trim().trim_end_matches('/').to_string();
     let client = build_openai_compatible_client(true, stream)?;
-    let payload = openai_compatible_payload(model, messages, request_json_object, stream);
+    let payload = openai_compatible_payload(model, messages, stream);
 
     let session = SessionSummary {
         id: "profile-check".to_string(),
@@ -559,7 +583,16 @@ async fn probe_openai_compatible_endpoint_with_messages(
     timeout(
         PROFILE_CHECK_TIMEOUT,
         execute_openai_compatible_prompt_once(
-            &session, &base_url, &client, &payload, stream, &events,
+            &session,
+            &base_url,
+            &client,
+            &payload,
+            stream,
+            stream.then_some(StreamingTimeouts {
+                first_token: UTILITY_FIRST_TOKEN_TIMEOUT,
+                idle: UTILITY_READ_TIMEOUT,
+            }),
+            &events,
         ),
     )
     .await
@@ -572,6 +605,7 @@ async fn execute_openai_compatible_prompt_once(
     client: &reqwest::Client,
     payload: &serde_json::Value,
     stream: bool,
+    stream_timeouts: Option<StreamingTimeouts>,
     events: &mpsc::UnboundedSender<PromptStreamEvent>,
 ) -> Result<ProviderTurnResult> {
     // The OpenAI-compatible adapter does not expose a portable idempotency key
@@ -609,7 +643,7 @@ async fn execute_openai_compatible_prompt_once(
     }
 
     if stream {
-        read_openai_compatible_stream(response, events.clone()).await
+        read_openai_compatible_stream(response, events.clone(), stream_timeouts).await
     } else {
         read_openai_compatible_completion(response, events.clone()).await
     }
@@ -618,7 +652,6 @@ async fn execute_openai_compatible_prompt_once(
 fn openai_compatible_payload(
     model: &str,
     messages: Vec<serde_json::Value>,
-    request_json_object: bool,
     stream: bool,
 ) -> serde_json::Value {
     let mut payload = json!({
@@ -628,9 +661,6 @@ fn openai_compatible_payload(
     });
     if stream {
         payload["stream_options"] = json!({ "include_usage": true });
-    }
-    if request_json_object {
-        payload["response_format"] = json!({ "type": "json_object" });
     }
     payload
 }
@@ -662,14 +692,46 @@ async fn wait_for_retry_backoff(
 async fn read_openai_compatible_stream(
     response: reqwest::Response,
     events: mpsc::UnboundedSender<PromptStreamEvent>,
+    stream_timeouts: Option<StreamingTimeouts>,
 ) -> Result<ProviderTurnResult> {
     let mut provider_session_id = String::new();
     let mut content = String::new();
     let mut pending = String::new();
     let mut saw_done = false;
+    let mut saw_activity = false;
     let mut stream = response.bytes_stream();
 
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next_chunk = if let Some(stream_timeouts) = stream_timeouts {
+            let budget = if saw_activity {
+                stream_timeouts.idle
+            } else {
+                stream_timeouts.first_token
+            };
+            match timeout(budget, stream.next()).await {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    return Err(anyhow!(error).context(if saw_activity {
+                        format!(
+                            "OpenAI-compatible stream exceeded streaming idle/read timeout {}",
+                            format_duration(stream_timeouts.idle)
+                        )
+                    } else {
+                        format!(
+                            "OpenAI-compatible stream exceeded time-to-first-token timeout {}",
+                            format_duration(stream_timeouts.first_token)
+                        )
+                    }));
+                }
+            }
+        } else {
+            stream.next().await
+        };
+
+        let Some(chunk) = next_chunk else {
+            break;
+        };
+        saw_activity = true;
         let bytes = chunk.context("failed while reading the response stream")?;
         pending.push_str(
             std::str::from_utf8(&bytes).context("OpenAI-compatible stream was not valid UTF-8")?,
@@ -789,6 +851,15 @@ fn is_empty_completed_provider_output(error: &anyhow::Error) -> bool {
     )
 }
 
+fn is_malformed_provider_output_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let text = cause.to_string();
+        text.contains("failed to decode OpenAI-compatible stream chunk")
+            || text.contains("failed to decode OpenAI-compatible completion response")
+            || text.contains("OpenAI-compatible stream was not valid UTF-8")
+    })
+}
+
 pub(crate) fn should_try_non_streaming_fallback(error: &anyhow::Error) -> bool {
     error.downcast_ref::<ProviderTransportError>().is_some_and(
         |provider_error| match provider_error {
@@ -822,8 +893,9 @@ pub(crate) fn is_provider_timeout_error(error: &anyhow::Error) -> bool {
 fn utility_timeout_detail(stream: bool) -> String {
     if stream {
         format!(
-            "connect timeout {}, streaming idle/read timeout {}",
+            "connect timeout {}, time-to-first-token timeout {}, streaming idle/read timeout {}",
             format_duration(UTILITY_CONNECT_TIMEOUT),
+            format_duration(UTILITY_FIRST_TOKEN_TIMEOUT),
             format_duration(UTILITY_READ_TIMEOUT)
         )
     } else {
@@ -843,13 +915,30 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
-fn empty_utility_model_output_error(session: &SessionSummary) -> anyhow::Error {
-    anyhow!(ProviderTransportError::Stream {
-        detail: format!(
-            "Utility model '{}' completed without producing a valid action. Check this profile or pick another Utility model.",
-            session.model
-        ),
-    })
+fn graceful_provider_output_failure_result(
+    session: &SessionSummary,
+    stream: bool,
+) -> ProviderTurnResult {
+    ProviderTurnResult {
+        provider_session_id: String::new(),
+        content: json!({
+            "kind": "final_answer",
+            "summary": "provider response was unusable",
+            "final_answer": format!(
+                "The Utility model '{}' did not return a usable response after retrying. Try again, or choose a different Utility model for this profile.",
+                session.model
+            ),
+            "metadata": {
+                "status": "blocked_unusable_provider_response"
+            }
+        })
+        .to_string(),
+        transport: if stream {
+            ProviderTurnTransport::Streaming
+        } else {
+            ProviderTurnTransport::NonStreaming
+        },
+    }
 }
 
 fn handle_openai_compatible_line(
@@ -925,16 +1014,6 @@ fn retry_after_from_headers(headers: &HeaderMap) -> Option<Duration> {
         deadline
             .duration_since(SystemTime::now())
             .unwrap_or_default()
-    })
-}
-
-fn compiled_turn_requires_json_object(compiled_turn: &CompiledTurn) -> bool {
-    compiled_turn.history.iter().any(|turn| {
-        turn.role == "system"
-            && (turn.content.contains("Nucleus worker action JSON contract")
-                || turn
-                    .content
-                    .contains("Return exactly one JSON object and nothing else."))
     })
 }
 
@@ -1095,72 +1174,8 @@ mod tests {
     }
 
     #[test]
-    fn openai_worker_turns_detect_json_object_contract() {
-        let history = vec![SessionTurn {
-            id: "system".to_string(),
-            session_id: "job".to_string(),
-            role: "system".to_string(),
-            content: "Nucleus worker action JSON contract: return one valid Nucleus worker action JSON object."
-                .to_string(),
-            images: Vec::new(),
-            created_at: 0,
-        }];
-        let compiled = compiled_turn_from_prompt(
-            &history,
-            "Decide the next step.",
-            &[],
-            "main",
-            &[],
-            &[],
-            &[],
-        );
-
-        assert!(compiled_turn_requires_json_object(&compiled));
-    }
-
-    #[test]
-    fn openai_legacy_json_object_contract_still_detected() {
-        let history = vec![SessionTurn {
-            id: "system".to_string(),
-            session_id: "job".to_string(),
-            role: "system".to_string(),
-            content: "Return exactly one JSON object and nothing else.".to_string(),
-            images: Vec::new(),
-            created_at: 0,
-        }];
-        let compiled = compiled_turn_from_prompt(
-            &history,
-            "Decide the next step.",
-            &[],
-            "main",
-            &[],
-            &[],
-            &[],
-        );
-
-        assert!(compiled_turn_requires_json_object(&compiled));
-    }
-
-    #[test]
-    fn openai_regular_turns_do_not_detect_json_object_contract() {
-        let history = vec![SessionTurn {
-            id: "user".to_string(),
-            session_id: "session".to_string(),
-            role: "user".to_string(),
-            content: "Nucleus worker action JSON contract: return one valid Nucleus worker action JSON object."
-                .to_string(),
-            images: Vec::new(),
-            created_at: 0,
-        }];
-        let compiled =
-            compiled_turn_from_prompt(&history, "Summarize.", &[], "main", &[], &[], &[]);
-
-        assert!(!compiled_turn_requires_json_object(&compiled));
-    }
-
-    #[test]
-    fn openai_payload_omits_json_mode_when_capability_is_unknown() {
-        let payload = openai_compatible_payload("utility-model", Vec::new(), false, true);
+    fn openai_payload_omits_json_mode_for_streaming_requests() {
+        let payload = openai_compatible_payload("utility-model", Vec::new(), true);
 
         assert_eq!(payload["stream"], true);
         assert!(payload.get("stream_options").is_some());
@@ -1169,18 +1184,11 @@ mod tests {
 
     #[test]
     fn openai_payload_uses_non_streaming_without_stream_options() {
-        let payload = openai_compatible_payload("utility-model", Vec::new(), false, false);
+        let payload = openai_compatible_payload("utility-model", Vec::new(), false);
 
         assert_eq!(payload["stream"], false);
         assert!(payload.get("stream_options").is_none());
         assert!(payload.get("response_format").is_none());
-    }
-
-    #[test]
-    fn openai_payload_sends_json_mode_only_when_requested() {
-        let payload = openai_compatible_payload("utility-model", Vec::new(), true, true);
-
-        assert_eq!(payload["response_format"], json!({ "type": "json_object" }));
     }
 
     #[test]

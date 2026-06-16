@@ -23466,13 +23466,13 @@ Thanks."#,
     }
 
     #[tokio::test]
-    async fn call_worker_model_sends_json_mode_when_profile_supports_it() {
-        let state_dir = test_state_dir("worker-provider-json-mode-supported");
+    async fn call_worker_model_omits_json_mode_even_when_profile_supports_it() {
+        let state_dir = test_state_dir("worker-provider-json-mode-stale-supported");
         let state = initialize_test_state(&state_dir);
         let (base_url, request_count, request_bodies, server) =
             spawn_dynamic_openai_server(1, |_index, _body| {
                 DynamicOpenAiProviderResponse::content(
-                    r#"{"kind":"final_answer","summary":"json mode","final_answer":"Done."}"#,
+                    r#"{"kind":"final_answer","summary":"no json mode","final_answer":"Done."}"#,
                 )
             })
             .await;
@@ -23528,14 +23528,14 @@ Thanks."#,
             &mut cancel_rx,
         )
         .await
-        .expect("supported JSON mode profile should still run");
+        .expect("stale JSON mode profile should still run");
 
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         let bodies = request_bodies
             .lock()
             .expect("request bodies lock should not be poisoned");
-        assert!(bodies[0].contains("response_format"));
-        assert!(bodies[0].contains("json_object"));
+        assert!(!bodies[0].contains("response_format"));
+        assert!(!bodies[0].contains("json_object"));
 
         server.await.expect("test server should finish");
         let _ = fs::remove_dir_all(&state_dir);
@@ -23606,16 +23606,19 @@ Thanks."#,
     }
 
     #[tokio::test]
-    async fn call_worker_model_empty_completed_stream_fails_fast_without_main_fallback() {
-        let state_dir = test_state_dir("worker-provider-empty-fast-fail");
+    async fn call_worker_model_retries_empty_completed_stream_without_main_fallback() {
+        let state_dir = test_state_dir("worker-provider-empty-retry");
         let state = initialize_test_state(&state_dir);
-        let (base_url, request_count, server) =
-            spawn_retry_openai_server(vec![TestOpenAiProviderResponse {
-                status: 200,
-                retry_after_secs: None,
-                body: "",
-                content: Some(""),
-            }])
+        let (base_url, request_count, request_bodies, server) =
+            spawn_dynamic_openai_server(2, |index, _body| {
+                if index == 0 {
+                    DynamicOpenAiProviderResponse::content("")
+                } else {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"final_answer","summary":"retried provider","final_answer":"Done after retry."}"#,
+                    )
+                }
+            })
             .await;
 
         set_default_profile_utility_target(
@@ -23651,8 +23654,7 @@ Thanks."#,
         worker.model = "utility-empty-model".to_string();
         worker.working_dir = state_dir.display().to_string();
         let (_cancel_tx, mut cancel_rx) = watch::channel(false);
-        let started = Instant::now();
-        let error = call_worker_model(
+        let response = call_worker_model(
             &state,
             None,
             &worker,
@@ -23663,14 +23665,24 @@ Thanks."#,
             &mut cancel_rx,
         )
         .await
-        .expect_err("empty completed stream should fail fast");
+        .expect("empty completed stream should be retried");
 
-        assert!(started.elapsed() < Duration::from_secs(5));
-        assert_eq!(request_count.load(Ordering::SeqCst), 1);
-        let detail = error.to_string();
-        assert!(detail.contains("Utility model 'utility-empty-model'"));
-        assert!(detail.contains("completed without producing a valid action"));
-        assert!(!detail.contains("main"));
+        assert!(matches!(
+            response.action,
+            WorkerAction::FinalAnswer { final_answer, .. } if final_answer == "Done after retry."
+        ));
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        let bodies = request_bodies
+            .lock()
+            .expect("request bodies lock should not be poisoned");
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[1].contains("previous provider response was empty or malformed"));
+        for body in bodies.iter() {
+            assert!(body.contains("utility-empty-model"));
+            assert!(!body.contains("response_format"));
+            assert!(!body.contains("main"));
+        }
+        drop(bodies);
 
         server.await.expect("test server should finish");
         let _ = fs::remove_dir_all(&state_dir);
@@ -23706,10 +23718,10 @@ Thanks."#,
                     .lock()
                     .expect("request bodies lock should not be poisoned")
                     .push(body);
-                tokio::time::sleep(Duration::from_secs(16)).await;
+                tokio::time::sleep(Duration::from_secs(21)).await;
             });
 
-            while accepted_at.elapsed() < Duration::from_secs(17) {
+            while accepted_at.elapsed() < Duration::from_secs(22) {
                 match timeout(Duration::from_millis(100), listener.accept()).await {
                     Ok(Ok((_socket, _))) => {
                         server_request_count.fetch_add(1, Ordering::SeqCst);
@@ -23888,6 +23900,103 @@ Thanks."#,
         ));
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         assert_utility_model_requests(&request_bodies, "utility-slow-stream-model", &main_model);
+
+        server.await.expect("test server should finish");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn call_worker_model_slow_first_token_utility_model_survives_idle_timeout() {
+        let state_dir = test_state_dir("worker-provider-slow-first-token-survives");
+        let state = initialize_test_state(&state_dir);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener addr should be available")
+        );
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_bodies = Arc::new(TestMutex::new(Vec::new()));
+        let server_request_count = request_count.clone();
+        let server_request_bodies = request_bodies.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("test request should connect");
+            let body = read_test_http_body(&mut socket).await;
+            server_request_bodies
+                .lock()
+                .expect("request bodies lock should not be poisoned")
+                .push(body);
+            server_request_count.fetch_add(1, Ordering::SeqCst);
+
+            write_test_openai_sse_headers(&mut socket).await;
+            tokio::time::sleep(Duration::from_secs(16)).await;
+            write_test_openai_sse_chunk(
+                &mut socket,
+                "slow-first-token-turn",
+                r#"{"kind":"final_answer","summary":"slow first token","final_answer":"Done after first-token wait."}"#,
+            )
+            .await;
+            write_test_openai_sse_done(&mut socket).await;
+        });
+
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-slow-first-token-model",
+            &base_url,
+            "utility-key",
+        );
+        let workspace = state.store.workspace().expect("workspace should load");
+        let main_model = workspace
+            .profiles
+            .iter()
+            .find(|profile| profile.id == workspace.default_profile_id)
+            .expect("default profile should exist")
+            .main
+            .model
+            .clone();
+
+        let mut worker = test_worker_summary("provider-slow-first-token-survives", 10, 10);
+        worker.provider_base_url = base_url;
+        worker.model = "utility-slow-first-token-model".to_string();
+        worker.working_dir = state_dir.display().to_string();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let started = Instant::now();
+        let response = call_worker_model(
+            &state,
+            None,
+            &worker,
+            &[],
+            "Ping.",
+            &[],
+            false,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("slow first token should complete within first-token budget");
+
+        assert!(started.elapsed() > Duration::from_secs(15));
+        assert!(matches!(
+            response.action,
+            WorkerAction::FinalAnswer { final_answer, .. } if final_answer == "Done after first-token wait."
+        ));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_utility_model_requests(
+            &request_bodies,
+            "utility-slow-first-token-model",
+            &main_model,
+        );
+        let bodies = request_bodies
+            .lock()
+            .expect("request bodies lock should not be poisoned");
+        assert!(!bodies[0].contains("response_format"));
+        drop(bodies);
 
         server.await.expect("test server should finish");
         let _ = fs::remove_dir_all(&state_dir);
