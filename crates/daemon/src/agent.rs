@@ -71,6 +71,7 @@ const DEFAULT_CHILD_JOB_MAX_STEPS: usize = 24;
 const DEFAULT_CHILD_JOB_MAX_TOOL_CALLS: usize = 48;
 const UTILITY_CHILD_MAX_STEPS: usize = 4;
 const UTILITY_CHILD_MAX_TOOL_CALLS: usize = 3;
+const DELEGATED_SUBTASK_TASK_CLASS: &str = "delegated_subtask";
 const CHILD_JOB_POLL_INTERVAL_MS: u64 = 250;
 const SESSION_HISTORY_TURN_LIMIT: usize = 8;
 const TOOL_OUTPUT_CHAR_LIMIT: usize = 8_000;
@@ -838,6 +839,137 @@ fn is_tiny_deterministic_utility_child(proposal: &ChildJobProposal) -> bool {
         && contains_any_phrase(&normalized, TINY_UTILITY_CHECK_PHRASES)
 }
 
+const NARROW_DELEGATED_CHILD_PHRASES: &[&str] = &[
+    "read-only",
+    "read only",
+    "inspect",
+    "investigate",
+    "probe",
+    "run a command",
+    "run command",
+    "command-only",
+    "command only",
+    "check",
+    "list",
+    "search",
+    "summarize",
+    "report",
+];
+
+const WRITE_DELEGATED_CHILD_PHRASES: &[&str] = &[
+    "implement",
+    "fix",
+    "change",
+    "modify",
+    "write",
+    "edit",
+    "create",
+    "delete",
+    "remove",
+    "replace",
+    "rename",
+    "move",
+    "copy",
+    "refactor",
+    "rewrite",
+    "generate",
+    "scaffold",
+    "apply",
+    "configure",
+    "install",
+    "upgrade",
+    "downgrade",
+    "bump",
+    "migrate",
+    "swap",
+    "save",
+    "persist",
+    "add ",
+    "update",
+    "patch",
+    "commit",
+    "stage",
+    "pull request",
+    "pr ",
+    "publish",
+    "deploy",
+    "release",
+    "ship",
+    "merge",
+];
+
+fn normalized_delegation_text(value: &str) -> String {
+    value
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn normalized_child_task_class(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let normalized = value.replace('-', "_").to_ascii_lowercase();
+    match normalized.as_str() {
+        "github_pr" | "research" | "automation" | "local_project" | "delegated_subtask"
+        | "deployment" | "memory_session" | "process_server" => Some(normalized),
+        _ => Some(value.to_string()),
+    }
+}
+
+fn is_narrow_delegated_child_contract(proposal: &ChildJobProposal) -> bool {
+    let task_class = normalized_child_task_class(proposal.task_class.as_deref());
+    let explicit_delegated_subtask = task_class.as_deref() == Some(DELEGATED_SUBTASK_TASK_CLASS);
+    if task_class
+        .as_deref()
+        .filter(|task_class| {
+            !task_class.is_empty()
+                && *task_class != "local_project"
+                && *task_class != DELEGATED_SUBTASK_TASK_CLASS
+        })
+        .is_some()
+    {
+        return false;
+    }
+
+    let text = normalized_delegation_text(&format!(
+        "{}\n{}\n{}",
+        proposal.title,
+        proposal.prompt,
+        task_class.as_deref().unwrap_or_default()
+    ));
+    if contains_any_phrase(&text, PROCESS_STATUS_CHECK_PHRASES)
+        || contains_any_phrase(&text, WRITE_DELEGATED_CHILD_PHRASES)
+    {
+        return false;
+    }
+    explicit_delegated_subtask || contains_any_phrase(&text, NARROW_DELEGATED_CHILD_PHRASES)
+}
+
+fn effective_child_task_class(proposal: &ChildJobProposal) -> Option<String> {
+    if is_narrow_delegated_child_contract(proposal) {
+        return Some(DELEGATED_SUBTASK_TASK_CLASS.to_string());
+    }
+    let task_class = normalized_child_task_class(proposal.task_class.as_deref())?;
+    if task_class == DELEGATED_SUBTASK_TASK_CLASS {
+        return Some("local_project".to_string());
+    }
+    Some(task_class)
+}
+
+fn child_delegation_key(proposal: &ChildJobProposal) -> String {
+    normalized_delegation_text(&format!(
+        "title={}\nprompt={}\ntask_class={}\nworking_dir={}\nroute_id={}",
+        proposal.title,
+        proposal.prompt,
+        effective_child_task_class(proposal).unwrap_or_default(),
+        proposal.working_dir.as_deref().unwrap_or_default(),
+        proposal.route_id.as_deref().unwrap_or_default(),
+    ))
+}
+
 fn root_evidence_tool_call_count(detail: &JobDetail, worker_id: &str) -> usize {
     detail
         .tool_calls
@@ -990,23 +1122,31 @@ fn delegated_task_class(
     parent_task_class: Option<&str>,
     jobs: &[ChildJobProposal],
 ) -> Option<String> {
+    let normalized_parent_task_class = parent_task_class
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if normalized_parent_task_class == Some("local_project") {
+        return Some("local_project".to_string());
+    }
+    if !jobs.is_empty() && jobs.iter().all(is_narrow_delegated_child_contract) {
+        return Some(DELEGATED_SUBTASK_TASK_CLASS.to_string());
+    }
     let mut explicit_classes = jobs.iter().filter_map(|proposal| {
-        proposal
-            .task_class
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+        let task_class = normalized_child_task_class(proposal.task_class.as_deref())?;
+        if task_class == DELEGATED_SUBTASK_TASK_CLASS
+            && !is_narrow_delegated_child_contract(proposal)
+        {
+            return Some("local_project".to_string());
+        }
+        Some(task_class)
     });
     let first = explicit_classes.next();
     if let Some(first) = first {
         if explicit_classes.all(|value| value == first) {
-            return Some(first.to_string());
+            return Some(first);
         }
     }
-    parent_task_class
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
+    normalized_parent_task_class.map(str::to_string)
 }
 
 fn build_enforced_delegation_for_tool(
@@ -1474,6 +1614,166 @@ struct CommandRunArgs {
     network_policy: Option<String>,
     #[serde(default)]
     env: BTreeMap<String, String>,
+}
+
+fn command_run_schema_guidance() -> &'static str {
+    "Expected command.run args: {\"command\":\"program\",\"args\":[\"arg\"],\"cwd\":\".\",\"timeout_secs\":20,\"output_limit_bytes\":8192}. Supported aliases: cmd, timeout_seconds, timeout_ms, max_output_bytes. Use cmd for a shell command string or command+args for argv form."
+}
+
+fn command_run_invalid_args(message: impl Into<String>) -> anyhow::Error {
+    anyhow!(
+        "invalid command.run args: {}. {}",
+        message.into(),
+        command_run_schema_guidance()
+    )
+}
+
+fn json_value_to_u64(field: &str, value: &Value) -> Result<u64> {
+    if let Some(value) = value.as_u64() {
+        return Ok(value);
+    }
+    if let Some(value) = value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return value
+            .parse::<u64>()
+            .map_err(|_| command_run_invalid_args(format!("{field} must be an unsigned integer")));
+    }
+    Err(command_run_invalid_args(format!(
+        "{field} must be an unsigned integer"
+    )))
+}
+
+fn command_string_looks_like_shell(command: &str) -> bool {
+    command.chars().any(char::is_whitespace)
+        || command.chars().any(|character| {
+            matches!(
+                character,
+                ';' | '|'
+                    | '&'
+                    | '<'
+                    | '>'
+                    | '$'
+                    | '`'
+                    | '('
+                    | ')'
+                    | '{'
+                    | '}'
+                    | '['
+                    | ']'
+                    | '*'
+                    | '?'
+                    | '~'
+            )
+        })
+}
+
+fn command_run_argv_from_array(value: &[Value]) -> Result<(String, Vec<String>)> {
+    let mut parts = Vec::with_capacity(value.len());
+    for part in value {
+        let Some(part) = part.as_str().map(str::trim).filter(|part| !part.is_empty()) else {
+            return Err(command_run_invalid_args(
+                "command/cmd array values must be non-empty strings",
+            ));
+        };
+        parts.push(part.to_string());
+    }
+    let Some(command) = parts.first().cloned() else {
+        return Err(command_run_invalid_args(
+            "command/cmd array must contain at least a program name",
+        ));
+    };
+    Ok((command, parts.into_iter().skip(1).collect()))
+}
+
+fn normalize_command_run_args(args: Value) -> Result<Value> {
+    let Some(object) = args.as_object() else {
+        return Err(command_run_invalid_args("args must be a JSON object"));
+    };
+    let mut normalized = object.clone();
+
+    if !normalized.contains_key("output_limit_bytes") {
+        if let Some(value) = normalized.get("max_output_bytes").cloned() {
+            normalized.insert("output_limit_bytes".to_string(), value);
+        }
+    }
+    if !normalized.contains_key("timeout_secs") {
+        if let Some(value) = normalized.get("timeout_seconds").cloned() {
+            normalized.insert("timeout_secs".to_string(), value);
+        } else if let Some(value) = normalized.get("timeout_ms") {
+            let millis = json_value_to_u64("timeout_ms", value)?;
+            let seconds = millis.saturating_add(999) / 1_000;
+            normalized.insert("timeout_secs".to_string(), json!(seconds.max(1)));
+        }
+    }
+    if !normalized.contains_key("cwd") {
+        if let Some(value) = normalized
+            .get("workdir")
+            .or_else(|| normalized.get("working_dir"))
+            .cloned()
+        {
+            normalized.insert("cwd".to_string(), value);
+        }
+    }
+
+    let (command_key, command_value) = if let Some(value) = object.get("cmd") {
+        ("cmd", value)
+    } else if let Some(value) = object.get("command") {
+        ("command", value)
+    } else {
+        return Err(command_run_invalid_args(
+            "missing command string/array or cmd string/array",
+        ));
+    };
+
+    match command_value {
+        Value::String(command) => {
+            let command = command.trim();
+            if command.is_empty() {
+                return Err(command_run_invalid_args("command/cmd must not be empty"));
+            }
+            let has_explicit_args = object.get("args").is_some_and(|value| !value.is_null());
+            if command_key == "cmd"
+                || (!has_explicit_args && command_string_looks_like_shell(command))
+            {
+                normalized.insert("command".to_string(), Value::String("sh".to_string()));
+                normalized.insert(
+                    "args".to_string(),
+                    Value::Array(vec![
+                        Value::String("-lc".to_string()),
+                        Value::String(command.to_string()),
+                    ]),
+                );
+            } else {
+                normalized.insert("command".to_string(), Value::String(command.to_string()));
+            }
+        }
+        Value::Array(parts) => {
+            let (command, argv) = command_run_argv_from_array(parts)?;
+            normalized.insert("command".to_string(), Value::String(command));
+            if !object.get("args").is_some_and(|value| !value.is_null()) {
+                normalized.insert(
+                    "args".to_string(),
+                    Value::Array(argv.into_iter().map(Value::String).collect()),
+                );
+            }
+        }
+        _ => {
+            return Err(command_run_invalid_args(
+                "command/cmd must be a string or an array of strings",
+            ));
+        }
+    }
+
+    Ok(Value::Object(normalized))
+}
+
+fn parse_command_run_args(args: Value) -> Result<CommandRunArgs> {
+    let normalized = normalize_command_run_args(args)?;
+    serde_json::from_value::<CommandRunArgs>(normalized)
+        .map_err(|error| command_run_invalid_args(format!("{error}")))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4323,7 +4623,26 @@ async fn handle_tool_call_proposal(
     })?;
 
     if requires_approval {
-        let preview = preview_approval_tool(state, worker, &tool, &args)?;
+        let preview = match preview_approval_tool(state, worker, &tool, &args) {
+            Ok(preview) => preview,
+            Err(error) => {
+                let pending = PendingToolAction {
+                    action_kind: "tool".to_string(),
+                    tool_call_id: tool_call_id.clone(),
+                    approval_id: None,
+                    command_session_id: None,
+                    child_job_ids: Vec::new(),
+                    summary: summary.clone(),
+                    tool: tool.clone(),
+                    args,
+                };
+                return record_recoverable_tool_failure(
+                    state, session, job_id, worker, checkpoint, step, tool_calls, &pending,
+                    cancel_rx, error,
+                )
+                .await;
+            }
+        };
         let artifact_ids = if let Some(draft) = preview.artifact {
             let artifact =
                 write_job_artifact(state, job_id, Some(&worker.id), Some(&tool_call_id), draft)?;
@@ -4514,6 +4833,13 @@ async fn handle_child_job_proposal(
         record_delegation_enforcement_event(state, job_id, &worker.id, &enforcement);
         summary = enforcement.summary;
         jobs = vec![enforcement.child];
+    }
+
+    if let Some(disposition) =
+        reuse_equivalent_child_jobs_if_any(state, job_id, worker, checkpoint, step, &summary, &jobs)
+            .await?
+    {
+        return Ok(disposition);
     }
 
     let mut child_plans = Vec::with_capacity(jobs.len());
@@ -4986,6 +5312,10 @@ async fn create_child_job_with_limits(
     if prompt.is_empty() {
         bail!("child job prompts must not be empty");
     }
+    let effective_task_class = effective_child_task_class(&proposal);
+    let delegation_key = child_delegation_key(&proposal);
+    let parent_generation =
+        parent_delegation_generation(&state.store.get_job(parent_job_id)?, &BTreeSet::new());
     // `working_dir` is per-child and scope-checked here. It is not a lock:
     // parents that spawn write-capable siblings should pass a dedicated
     // worktree path for each child.
@@ -5019,7 +5349,7 @@ async fn create_child_job_with_limits(
         session_id: Some(session.session.id.clone()),
         parent_job_id: Some(parent_job_id.to_string()),
         template_id: None,
-        task_class: proposal.task_class.clone(),
+        task_class: effective_task_class.clone(),
         title: format!("Child {}", title),
         purpose: title.to_string(),
         trigger_kind: "child_job".to_string(),
@@ -5057,6 +5387,11 @@ async fn create_child_job_with_limits(
         &child_job_id,
         JobPatch {
             root_worker_id: Some(child_worker_id.clone()),
+            metadata_json: Some(json!({
+                "child_contract": effective_task_class.clone().unwrap_or_default(),
+                "delegation_key": delegation_key,
+                "parent_generation": parent_generation,
+            })),
             ..JobPatch::default()
         },
     )?;
@@ -5191,6 +5526,212 @@ fn wait_condition_label(until: &WaitUntil) -> String {
             format!("artifact kind '{artifact_kind}' on job {job_id}")
         }
     }
+}
+
+fn reusable_child_rank(state: &str) -> Option<u8> {
+    match state {
+        "completed" => Some(0),
+        "queued" | "running" | "paused" | "waiting" => Some(1),
+        "blocked" | "failed" => Some(2),
+        _ => None,
+    }
+}
+
+fn parent_delegation_generation(detail: &JobDetail, exclude_child_ids: &BTreeSet<String>) -> usize {
+    let parent_tool_changes = detail
+        .tool_calls
+        .iter()
+        .filter(|call| {
+            matches!(
+                call.status.as_str(),
+                "completed" | "failed" | "denied" | "canceled"
+            )
+        })
+        .count();
+    let sibling_terminal_changes = detail
+        .child_jobs
+        .iter()
+        .filter(|child| {
+            !exclude_child_ids.contains(&child.id) && is_terminal_job_state(&child.state)
+        })
+        .count();
+    parent_tool_changes + sibling_terminal_changes
+}
+
+async fn reuse_equivalent_child_jobs_if_any(
+    state: &AppState,
+    job_id: &str,
+    worker: &mut WorkerSummary,
+    checkpoint: &mut WorkerCheckpoint,
+    step: &mut usize,
+    summary: &str,
+    jobs: &[ChildJobProposal],
+) -> Result<Option<LoopDisposition>> {
+    let requested_keys = jobs.iter().map(child_delegation_key).collect::<Vec<_>>();
+    if requested_keys.is_empty() {
+        return Ok(None);
+    }
+    let parent = state.store.get_job(job_id)?;
+    let requested_key_set = requested_keys.iter().cloned().collect::<BTreeSet<_>>();
+    let mut candidates_by_key = BTreeMap::<String, Vec<(u64, u8, i64, String)>>::new();
+    for child in &parent.child_jobs {
+        let Some(key) = child
+            .metadata_json
+            .get("delegation_key")
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if !requested_key_set.contains(key) {
+            continue;
+        }
+        let Some(rank) = reusable_child_rank(&child.state) else {
+            continue;
+        };
+        let Some(parent_generation) = child
+            .metadata_json
+            .get("parent_generation")
+            .and_then(Value::as_u64)
+        else {
+            continue;
+        };
+        candidates_by_key.entry(key.to_string()).or_default().push((
+            parent_generation,
+            rank,
+            child.created_at,
+            child.id.clone(),
+        ));
+    }
+    if requested_keys
+        .iter()
+        .any(|key| !candidates_by_key.contains_key(key))
+    {
+        return Ok(None);
+    }
+
+    let candidate_generations = candidates_by_key
+        .values()
+        .flat_map(|candidates| candidates.iter().map(|(generation, _, _, _)| *generation))
+        .collect::<BTreeSet<_>>();
+    let mut best_match: Option<(u32, u64, Vec<String>)> = None;
+    for generation in candidate_generations.iter().rev() {
+        let mut generation_rank = 0u32;
+        let mut matched_child_ids = Vec::with_capacity(requested_keys.len());
+        for key in &requested_keys {
+            let Some((_, rank, _, child_id)) = candidates_by_key.get(key).and_then(|candidates| {
+                candidates
+                    .iter()
+                    .filter(|(candidate_generation, _, _, _)| candidate_generation == generation)
+                    .min_by_key(|(_, rank, created_at, child_id)| {
+                        (*rank, *created_at, child_id.as_str())
+                    })
+            }) else {
+                matched_child_ids.clear();
+                break;
+            };
+            generation_rank = generation_rank.saturating_add(*rank as u32);
+            matched_child_ids.push(child_id.clone());
+        }
+        if matched_child_ids.len() != requested_keys.len() {
+            continue;
+        }
+        matched_child_ids.sort();
+        matched_child_ids.dedup();
+        let matched_child_id_set = matched_child_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let current_generation = parent_delegation_generation(&parent, &matched_child_id_set);
+        if current_generation as u64 != *generation {
+            continue;
+        }
+        let replace = best_match
+            .as_ref()
+            .is_none_or(|(best_rank, best_generation, _)| {
+                generation_rank < *best_rank
+                    || (generation_rank == *best_rank && *generation > *best_generation)
+            });
+        if replace {
+            best_match = Some((generation_rank, *generation, matched_child_ids));
+        }
+    }
+    let Some((_, _, matched_child_ids)) = best_match else {
+        return Ok(None);
+    };
+    let child_details = matched_child_ids
+        .iter()
+        .map(|child_job_id| state.store.get_job(child_job_id))
+        .collect::<Result<Vec<_>>>()?;
+    let all_terminal = child_details
+        .iter()
+        .all(|detail| is_terminal_job_state(&detail.job.state));
+    let completed_count = child_details
+        .iter()
+        .filter(|detail| detail.job.state == "completed")
+        .count();
+
+    *step += 1;
+    *worker = state.store.update_worker(
+        &worker.id,
+        WorkerPatch {
+            state: Some("running".to_string()),
+            step_count: Some(*step),
+            last_error: Some(String::new()),
+            ..WorkerPatch::default()
+        },
+    )?;
+
+    if all_terminal {
+        let reuse_summary = if completed_count == child_details.len() {
+            format!("Reusing equivalent child job result for: {summary}")
+        } else {
+            format!(
+                "Equivalent child job already ended without success for: {summary}. Do not spawn a duplicate; surface the blocker or choose a distinct recovery."
+            )
+        };
+        let results = child_details
+            .iter()
+            .map(child_job_result_json)
+            .collect::<Result<Vec<_>>>()?;
+        checkpoint.pending_action = None;
+        checkpoint.next_prompt = Some(build_child_job_results_prompt(&reuse_summary, &results));
+    } else {
+        checkpoint.pending_action = Some(PendingToolAction {
+            action_kind: "child_jobs".to_string(),
+            tool_call_id: String::new(),
+            approval_id: None,
+            command_session_id: None,
+            child_job_ids: matched_child_ids.clone(),
+            summary: format!("Waiting for equivalent child job(s) already in flight: {summary}"),
+            tool: String::new(),
+            args: Value::Null,
+        });
+        checkpoint.next_prompt = None;
+    }
+    state.store.write_worker_checkpoint(
+        &worker.id,
+        &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+    )?;
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: job_id.to_string(),
+        worker_id: Some(worker.id.clone()),
+        event_type: "child.jobs.reused".to_string(),
+        status: if all_terminal { "completed" } else { "running" }.to_string(),
+        summary: format!("Reused {} equivalent child job(s)", matched_child_ids.len()),
+        detail: if all_terminal {
+            format!(
+                "{} child job(s) completed and {} ended without success.",
+                completed_count,
+                child_details.len().saturating_sub(completed_count)
+            )
+        } else {
+            "An equivalent child fan-out is already in flight.".to_string()
+        },
+        data_json: json!({
+            "child_job_ids": matched_child_ids,
+            "requested_keys": requested_keys,
+        }),
+    });
+    publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+    publish_worker_updated(state, worker).await;
+    Ok(Some(LoopDisposition::Continue))
 }
 
 fn wait_remaining_seconds(wait: &WorkerWaitRecord, now: i64) -> Option<i64> {
@@ -12799,8 +13340,7 @@ async fn execute_granted_tool(
             execute_github_comment_tool(state, job_id, worker, args).await
         }
         "command.run" => {
-            let args = serde_json::from_value::<CommandRunArgs>(args)
-                .context("invalid args for command.run")?;
+            let args = parse_command_run_args(args)?;
             execute_command_run_tool(
                 state,
                 job_id,
@@ -12984,8 +13524,7 @@ fn preview_approval_tool(
             Ok(preview_github_comment(args))
         }
         "command.run" => {
-            let args = serde_json::from_value::<CommandRunArgs>(args.clone())
-                .context("invalid args for command.run")?;
+            let args = parse_command_run_args(args.clone())?;
             preview_command_run(worker, args)
         }
         "python.run" => {
@@ -20365,6 +20904,84 @@ mod tests {
     }
 
     #[test]
+    fn delegated_subtask_classifier_rejects_explicit_write_contracts() {
+        let explicit_read_only = ChildJobProposal {
+            title: "Read-only listing".to_string(),
+            prompt: "List README.md and summarize findings.".to_string(),
+            task_class: Some(DELEGATED_SUBTASK_TASK_CLASS.to_string()),
+            working_dir: None,
+            route_id: None,
+        };
+        assert!(is_narrow_delegated_child_contract(&explicit_read_only));
+        assert_eq!(
+            effective_child_task_class(&explicit_read_only).as_deref(),
+            Some(DELEGATED_SUBTASK_TASK_CLASS)
+        );
+
+        let explicit_write = ChildJobProposal {
+            title: "Implementation owner".to_string(),
+            prompt: "Implement the fix, edit the code, and run validation.".to_string(),
+            task_class: Some(DELEGATED_SUBTASK_TASK_CLASS.to_string()),
+            working_dir: None,
+            route_id: None,
+        };
+        assert!(!is_narrow_delegated_child_contract(&explicit_write));
+        assert_eq!(
+            effective_child_task_class(&explicit_write).as_deref(),
+            Some("local_project")
+        );
+        assert_eq!(
+            delegated_task_class(None, &[explicit_write]),
+            Some("local_project".to_string())
+        );
+
+        let explicit_hyphenated_write = ChildJobProposal {
+            title: "Implementation owner".to_string(),
+            prompt: "Modify the code and run validation.".to_string(),
+            task_class: Some("Delegated-Subtask".to_string()),
+            working_dir: None,
+            route_id: None,
+        };
+        assert!(!is_narrow_delegated_child_contract(
+            &explicit_hyphenated_write
+        ));
+        assert_eq!(
+            effective_child_task_class(&explicit_hyphenated_write).as_deref(),
+            Some("local_project")
+        );
+        assert_eq!(
+            delegated_task_class(None, &[explicit_hyphenated_write]),
+            Some("local_project".to_string())
+        );
+
+        let search_replace = ChildJobProposal {
+            title: "Search and replace".to_string(),
+            prompt: "Search and replace Foo with Bar in the code.".to_string(),
+            task_class: Some("local_project".to_string()),
+            working_dir: None,
+            route_id: None,
+        };
+        assert!(!is_narrow_delegated_child_contract(&search_replace));
+        assert_eq!(
+            effective_child_task_class(&search_replace).as_deref(),
+            Some("local_project")
+        );
+
+        let rename_component = ChildJobProposal {
+            title: "Rename component".to_string(),
+            prompt: "Inspect usages and rename the component.".to_string(),
+            task_class: Some(DELEGATED_SUBTASK_TASK_CLASS.to_string()),
+            working_dir: None,
+            route_id: None,
+        };
+        assert!(!is_narrow_delegated_child_contract(&rename_component));
+        assert_eq!(
+            effective_child_task_class(&rename_component).as_deref(),
+            Some("local_project")
+        );
+    }
+
+    #[test]
     fn stale_session_title_does_not_force_main_delegation() {
         let state_dir = test_state_dir("stale-session-title-not-heavy");
         let state = initialize_test_state(&state_dir);
@@ -22962,6 +23579,66 @@ Cleanup status: clean";
             &ungated,
             &PublicationOutcomePatch::default()
         ));
+    }
+
+    #[test]
+    fn command_run_args_normalize_common_aliases() {
+        let args = parse_command_run_args(json!({
+            "cmd": "printf NUCLEUS_COMMAND_RUN_PROBE",
+            "cwd": ".",
+            "timeout_seconds": 20,
+            "max_output_bytes": 4096,
+        }))
+        .expect("cmd alias should normalize");
+
+        assert_eq!(args.command, "sh");
+        assert_eq!(args.args, vec!["-lc", "printf NUCLEUS_COMMAND_RUN_PROBE"]);
+        assert_eq!(args.cwd.as_deref(), Some("."));
+        assert_eq!(args.timeout_secs, Some(20));
+        assert_eq!(args.output_limit_bytes, Some(4096));
+    }
+
+    #[test]
+    fn command_run_args_normalize_timeout_ms_and_shell_command_field() {
+        let args = parse_command_run_args(json!({
+            "command": "cargo test --manifest-path Cargo.toml",
+            "timeout_ms": 1500,
+        }))
+        .expect("shell command string should normalize");
+
+        assert_eq!(args.command, "sh");
+        assert_eq!(
+            args.args,
+            vec!["-lc", "cargo test --manifest-path Cargo.toml"]
+        );
+        assert_eq!(args.timeout_secs, Some(2));
+    }
+
+    #[test]
+    fn command_run_args_preserve_canonical_argv() {
+        let args = parse_command_run_args(json!({
+            "command": "cargo",
+            "args": ["test"],
+            "timeout_secs": 30,
+            "output_limit_bytes": 8192,
+        }))
+        .expect("canonical args should parse");
+
+        assert_eq!(args.command, "cargo");
+        assert_eq!(args.args, vec!["test"]);
+        assert_eq!(args.timeout_secs, Some(30));
+        assert_eq!(args.output_limit_bytes, Some(8192));
+    }
+
+    #[test]
+    fn command_run_args_invalid_shape_returns_schema_guidance() {
+        let error = parse_command_run_args(json!({"timeout_seconds": 20}))
+            .expect_err("missing command should fail");
+        let message = error.to_string();
+
+        assert!(message.contains("invalid command.run args"));
+        assert!(message.contains("Supported aliases"));
+        assert!(message.contains("command"));
     }
 
     #[test]
@@ -31218,6 +31895,233 @@ Thanks."#,
     }
 
     #[tokio::test]
+    async fn utility_root_accepts_successful_delegated_command_child_without_duplicate_fanout() {
+        let state_dir = test_state_dir("delegated-command-child-converges");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let spawn_action = json!({
+            "kind": "spawn_child_jobs",
+            "summary": "delegate read-only command probe",
+            "jobs": [
+                {
+                    "title": "Command Probe",
+                    "prompt": "Run exactly this read-only command and report stdout: sh -lc 'printf NUCLEUS_COMMAND_RUN_PROBE'",
+                    "task_class": "local_project",
+                    "working_dir": null
+                }
+            ],
+        })
+        .to_string();
+        let (utility_base_url, utility_count, _utility_bodies, utility_server) =
+            spawn_dynamic_openai_server(3, move |index, _body| {
+                if index <= 1 {
+                    DynamicOpenAiProviderResponse::content(spawn_action.clone())
+                } else {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"final_answer","summary":"joined","final_answer":"The delegated probe returned NUCLEUS_COMMAND_RUN_PROBE."}"#,
+                    )
+                }
+            })
+            .await;
+        let (main_base_url, main_count, _main_bodies, main_server) =
+            spawn_dynamic_openai_server(2, move |index, _body| {
+                if index == 0 {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"tool_call","summary":"run canonical probe","tool":"command.run","args":{"command":"sh","args":["-lc","printf NUCLEUS_COMMAND_RUN_PROBE"],"cwd":".","timeout_secs":20}}"#,
+                    )
+                } else {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"final_answer","summary":"probe done","final_answer":"NUCLEUS_COMMAND_RUN_PROBE"}"#,
+                    )
+                }
+            })
+            .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-command-probe-model",
+            &utility_base_url,
+            "utility-key",
+        );
+        let session_id = "delegated-command-child-session".to_string();
+        let mut session_record =
+            test_session_record(&session_id, "Delegated command child", &workspace_root);
+        session_record.model = "main-command-probe-model".to_string();
+        session_record.provider_base_url = main_base_url.clone();
+        session_record.provider_api_key = "main-key".to_string();
+        session_record.approval_mode = "trusted".to_string();
+        state
+            .store
+            .create_session(session_record)
+            .expect("session should persist");
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            SessionPromptRequest {
+                prompt: "Delegate one main child to run the command probe.".to_string(),
+                images: vec![],
+                task_class: None,
+                role: "main".to_string(),
+            },
+            current,
+            "Delegate one main child to run the command probe.".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("prompt should queue");
+
+        let _ = wait_for_session_state(&state, &session_id, "active").await;
+        utility_server.await.expect("utility server should finish");
+        main_server.await.expect("main server should finish");
+        assert_eq!(utility_count.load(Ordering::SeqCst), 3);
+        assert_eq!(main_count.load(Ordering::SeqCst), 2);
+
+        let parent = latest_job_detail(&state, &session_id);
+        assert_eq!(parent.job.state, "completed");
+        assert_eq!(parent.child_jobs.len(), 1);
+        assert!(
+            parent
+                .events
+                .iter()
+                .any(|event| event.event_type == "child.jobs.reused")
+        );
+        let child = parent.child_jobs.first().expect("child should exist");
+        assert_eq!(child.executor_lane, MAIN_EXECUTOR_LANE);
+        let child_detail = state.store.get_job(&child.id).expect("child should load");
+        assert_eq!(
+            child_detail.job.task_class.as_deref(),
+            Some(DELEGATED_SUBTASK_TASK_CLASS)
+        );
+        assert_eq!(child_detail.job.state, "completed");
+        assert_eq!(child_detail.job.completion_status, "satisfied");
+        assert!(
+            child_detail
+                .tool_calls
+                .iter()
+                .any(|call| call.tool_id == "command.run" && call.status == "completed")
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn equivalent_child_reuse_respects_parent_generation() {
+        let state_dir = test_state_dir("delegated-child-reuse-generation");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, mut worker) =
+            create_parent_fanout_context(&state, "reuse-generation", &workspace_root, "");
+        let proposal = ChildJobProposal {
+            title: "Command Probe".to_string(),
+            prompt: "Run exactly this read-only command and report stdout.".to_string(),
+            task_class: Some("local_project".to_string()),
+            working_dir: None,
+            route_id: None,
+        };
+        let delegation_key = child_delegation_key(&proposal);
+        let create_completed_child = |id: &str, key: Option<&str>, generation: Option<u64>| {
+            state
+                .store
+                .create_job(JobRecord {
+                    id: id.to_string(),
+                    session_id: Some(session.session.id.clone()),
+                    parent_job_id: Some(parent_job_id.clone()),
+                    template_id: None,
+                    task_class: Some(DELEGATED_SUBTASK_TASK_CLASS.to_string()),
+                    title: format!("Child {id}"),
+                    purpose: "generation reuse test child".to_string(),
+                    trigger_kind: "child_job".to_string(),
+                    state: "completed".to_string(),
+                    requested_by: "agent".to_string(),
+                    prompt_excerpt: String::new(),
+                    publication_intent_text: None,
+                })
+                .expect("child job should persist");
+            let metadata_json = match (key, generation) {
+                (Some(key), Some(generation)) => json!({
+                    "child_contract": DELEGATED_SUBTASK_TASK_CLASS,
+                    "delegation_key": key,
+                    "parent_generation": generation,
+                }),
+                _ => json!({}),
+            };
+            state
+                .store
+                .update_job(
+                    id,
+                    JobPatch {
+                        metadata_json: Some(metadata_json),
+                        result_summary: Some(format!("{id} result")),
+                        ..JobPatch::default()
+                    },
+                )
+                .expect("child metadata should persist");
+        };
+        create_completed_child("old-equivalent-child", Some(&delegation_key), Some(0));
+        create_completed_child("intervening-terminal-child", None, None);
+
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "reuse generation test".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let mut step = 0;
+        let stale_reuse = reuse_equivalent_child_jobs_if_any(
+            &state,
+            &parent_job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            "delegate command probe",
+            std::slice::from_ref(&proposal),
+        )
+        .await
+        .expect("stale reuse check should not fail");
+        assert!(stale_reuse.is_none());
+        assert_eq!(step, 0);
+
+        create_completed_child("fresh-equivalent-child", Some(&delegation_key), Some(2));
+        let fresh_reuse = reuse_equivalent_child_jobs_if_any(
+            &state,
+            &parent_job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            "delegate command probe",
+            &[proposal],
+        )
+        .await
+        .expect("fresh reuse check should not fail");
+        assert_eq!(fresh_reuse, Some(LoopDisposition::Continue));
+        assert_eq!(step, 1);
+        let next_prompt = checkpoint
+            .next_prompt
+            .as_deref()
+            .expect("fresh reuse should provide child results");
+        assert!(next_prompt.contains("fresh-equivalent-child"));
+        assert!(!next_prompt.contains("old-equivalent-child"));
+        let parent = state.store.get_job(&parent_job_id).expect("parent loads");
+        assert!(parent.events.iter().any(|event| {
+            event.event_type == "child.jobs.reused"
+                && event.data_json["child_job_ids"][0] == "fresh-equivalent-child"
+        }));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
     async fn delegated_main_child_write_inherits_scope_and_stays_approval_gated() {
         let state_dir = test_state_dir("spawn-child-jobs-main-write-approval");
         let state = initialize_test_state(&state_dir);
@@ -33565,6 +34469,7 @@ Return one JSON action for the next step."
         assert_eq!(parent.child_jobs.len(), 1);
         let child = parent.child_jobs.first().expect("child should exist");
         assert_eq!(child.executor_lane, MAIN_EXECUTOR_LANE);
+        assert_eq!(child.task_class.as_deref(), Some("local_project"));
         assert!(parent.events.iter().any(|event| {
             event.event_type == "worker.delegation.escalated_to_main"
                 && event.data_json["chosen_route"] == "main"

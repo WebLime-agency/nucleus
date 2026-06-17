@@ -632,6 +632,16 @@ pub fn task_evidence_contract_catalog() -> Vec<TaskEvidenceContractSummary> {
             ],
         ),
         task_evidence_contract(
+            "delegated_subtask",
+            "Delegated sub-task",
+            "Accept bounded child work that reports back to a parent job without requiring the full top-level local project validation contract.",
+            &[(
+                "child_report",
+                "Child report",
+                "Persist the child worker's terminal report for the parent Utility Worker to join.",
+            )],
+        ),
+        task_evidence_contract(
             "deployment",
             "Deployment/release work",
             "Ground shipped/released claims in remote deployment, version, and health evidence.",
@@ -902,6 +912,7 @@ fn task_class_gate(
         "research" => Some(research_gate(job, terminal)),
         "automation" => Some(automation_gate(job, terminal)),
         "local_project" => Some(local_project_gate(job, terminal)),
+        "delegated_subtask" => Some(delegated_subtask_gate(job, terminal)),
         "deployment" => Some(deployment_gate(job, terminal)),
         "memory_session" => Some(memory_session_gate(job, terminal)),
         "process_server" => Some(process_server_gate(job, terminal)),
@@ -1425,6 +1436,42 @@ fn local_project_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary
         "local_project",
         required_evidence_for("local_project", &["validation"]),
         evidence_for_requirements(job, &["validation", "failed_command", "waiver"]),
+    )
+}
+
+fn delegated_subtask_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary {
+    let failed = evidence_with_prefix(job, "failed_command");
+    let waived = has_evidence(job, "waiver:command_failure");
+    let state = if !failed.is_empty() && !waived {
+        "blocked"
+    } else if job.state == "completed" {
+        "done"
+    } else if terminal {
+        "blocked"
+    } else {
+        "pending"
+    };
+    let summary = match state {
+        "done" => "Delegated sub-task report is available to the parent job.".to_string(),
+        "pending" => "Delegated sub-task is still running.".to_string(),
+        _ => format!(
+            "Delegated sub-task did not complete successfully{}.",
+            if failed.is_empty() {
+                String::new()
+            } else {
+                format!(": recent command failure: {}", failed.join(", "))
+            }
+        ),
+    };
+
+    completion_gate(
+        "delegated_subtask_evidence",
+        "Delegated sub-task evidence",
+        state,
+        summary,
+        "delegated_subtask",
+        required_evidence_for("delegated_subtask", &["child_report"]),
+        evidence_for_requirements(job, &["child_report", "failed_command", "waiver"]),
     )
 }
 
@@ -3863,6 +3910,11 @@ mod tests {
                 "local_project_evidence",
             ),
             (
+                "delegated_subtask",
+                Vec::new(),
+                "delegated_subtask_evidence",
+            ),
+            (
                 "deployment",
                 vec![
                     "deployment_status:deploy command passed".to_string(),
@@ -3896,10 +3948,54 @@ mod tests {
             }));
 
             let blocked = task_class_job(task_class, Vec::new()).with_completion_gates();
-            assert_eq!(blocked.completion_status, "blocked", "{task_class}");
-            assert!(blocked.completion_blockers.iter().any(|blocker| {
-                blocker.to_ascii_lowercase().contains("without")
-                    || blocker.to_ascii_lowercase().contains("missing")
+            if task_class == "delegated_subtask" {
+                assert_eq!(blocked.completion_status, "satisfied", "{task_class}");
+            } else {
+                assert_eq!(blocked.completion_status, "blocked", "{task_class}");
+                assert!(blocked.completion_blockers.iter().any(|blocker| {
+                    blocker.to_ascii_lowercase().contains("without")
+                        || blocker.to_ascii_lowercase().contains("missing")
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn delegated_subtask_gate_accepts_completed_child_without_validation() {
+        let delegated = task_class_job("delegated_subtask", Vec::new()).with_completion_gates();
+
+        assert_eq!(delegated.completion_status, "satisfied");
+        assert!(
+            delegated
+                .completion_gates
+                .iter()
+                .any(|gate| { gate.id == "delegated_subtask_evidence" && gate.state == "done" })
+        );
+        assert!(delegated.completion_blockers.is_empty());
+
+        let local_project = task_class_job("local_project", Vec::new()).with_completion_gates();
+        assert_eq!(local_project.completion_status, "blocked");
+        assert!(
+            local_project
+                .completion_blockers
+                .iter()
+                .any(|blocker| { blocker.contains("without successful validation evidence") })
+        );
+    }
+
+    #[test]
+    fn delegated_subtask_gate_blocks_unsuccessful_terminal_child_without_validation() {
+        for state in ["failed", "blocked", "canceled"] {
+            let mut delegated = task_class_job("delegated_subtask", Vec::new());
+            delegated.state = state.to_string();
+            let delegated = delegated.with_completion_gates();
+
+            assert_eq!(delegated.completion_status, "blocked", "{state}");
+            assert!(delegated.completion_gates.iter().any(|gate| {
+                gate.id == "delegated_subtask_evidence" && gate.state == "blocked"
+            }));
+            assert!(delegated.completion_blockers.iter().any(|blocker| {
+                blocker.contains("Delegated sub-task did not complete successfully")
             }));
         }
     }
