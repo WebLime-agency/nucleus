@@ -426,6 +426,7 @@ export const localJobSummarySchema = z.object({
   title: z.string(),
   backend: z.literal('systemd-user'),
   managed: z.boolean().default(false),
+  authored: z.boolean().default(false),
   enabled: z.boolean(),
   unit_file_state: z.string().default('unknown'),
   manageable: z.boolean().default(true),
@@ -443,6 +444,34 @@ export const localJobDetailSchema = z.object({
 
 export const localJobsAllowlistSchema = z.object({
   globs: z.array(z.string()).default([])
+});
+
+export const systemJobAuthoringScheduleSchema = z.object({
+  kind: z.enum(['interval', 'calendar']),
+  value: z.string()
+});
+
+export const systemJobAuthoringSpecSchema = z.object({
+  name: z.string(),
+  description: z.string().nullable().optional(),
+  command: z.string(),
+  schedule: systemJobAuthoringScheduleSchema,
+  working_dir: z.string().nullable().optional()
+});
+
+export const systemJobRenderedUnitsSchema = z.object({
+  name: z.string(),
+  timer_unit: z.string(),
+  service_unit: z.string(),
+  timer: z.string(),
+  service: z.string()
+});
+
+export const systemJobTemplateSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  summary: z.string(),
+  spec: systemJobAuthoringSpecSchema
 });
 
 export const promptProgressUpdateSchema = z.object({
@@ -1398,6 +1427,10 @@ export type LocalJobExit = z.infer<typeof localJobExitSchema>;
 export type LocalJobSummary = z.infer<typeof localJobSummarySchema>;
 export type LocalJobDetail = z.infer<typeof localJobDetailSchema>;
 export type LocalJobsAllowlist = z.infer<typeof localJobsAllowlistSchema>;
+export type SystemJobAuthoringSchedule = z.infer<typeof systemJobAuthoringScheduleSchema>;
+export type SystemJobAuthoringSpec = z.infer<typeof systemJobAuthoringSpecSchema>;
+export type SystemJobRenderedUnits = z.infer<typeof systemJobRenderedUnitsSchema>;
+export type SystemJobTemplate = z.infer<typeof systemJobTemplateSchema>;
 export type PromptProgressUpdate = z.infer<typeof promptProgressUpdateSchema>;
 export type ApprovalResolutionRequest = z.infer<typeof approvalResolutionRequestSchema>;
 export type CreatePlaybookRequest = z.infer<typeof createPlaybookRequestSchema>;

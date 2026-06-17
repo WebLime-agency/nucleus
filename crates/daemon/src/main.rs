@@ -63,7 +63,8 @@ use nucleus_protocol::{
     SessionSummary, SettingsSummary, SkillImportRequest, SkillImportResponse, SkillInstallResult,
     SkillInstallVerification, SkillInstallationRecord, SkillInstallationUpsertRequest,
     SkillManifest, SkillPackageRecord, SkillPackageUpsertRequest, SkillReconcileCandidate,
-    SkillReconcileRequest, SkillReconcileScanResponse, StreamConnected, SystemStats,
+    SkillReconcileRequest, SkillReconcileScanResponse, StreamConnected, SystemJobAuthoredRecord,
+    SystemJobAuthoringSpec, SystemJobRenderedUnits, SystemJobTemplate, SystemStats,
     UpdateConfigRequest, UpdatePlaybookRequest, UpdateSessionRequest, UpdateStatus,
     UserFacingErrorSummary, VaultInitRequest, VaultSecretListResponse,
     VaultSecretPolicyListResponse, VaultSecretPolicySummary, VaultSecretPolicyUpsertRequest,
@@ -144,6 +145,7 @@ struct LocalJobsStreamCache {
 
 static LOCAL_JOBS_STREAM_CACHE: OnceLock<tokio::sync::Mutex<LocalJobsStreamCache>> =
     OnceLock::new();
+static SYSTEM_JOBS_ALLOWLIST_MUTATION_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const SYSTEM_JOBS_ALLOWLIST_MAX_GLOBS: usize = 200;
 const SYSTEM_JOBS_ALLOWLIST_MAX_GLOB_BYTES: usize = 256;
 const SYSTEM_JOBS_ALLOWLIST_MAX_TOTAL_BYTES: usize = 16_000;
@@ -421,6 +423,19 @@ fn app(state: AppState) -> Router {
         .route(
             "/system/jobs/allowlist",
             get(local_jobs_allowlist).put(update_local_jobs_allowlist),
+        )
+        .route("/system/jobs/templates", get(local_job_templates))
+        .route(
+            "/system/jobs/authored/render",
+            axum::routing::post(render_authored_local_job),
+        )
+        .route(
+            "/system/jobs/authored",
+            axum::routing::post(install_authored_local_job),
+        )
+        .route(
+            "/system/jobs/authored/{unit}",
+            axum::routing::delete(delete_authored_local_job),
         )
         .route("/system/jobs/{unit}", get(local_job_detail))
         .route(
@@ -5097,11 +5112,19 @@ async fn available_local_jobs(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<LocalJobSummary>>, ApiError> {
     let allowlist = state.store.system_jobs_unit_globs()?;
-    let jobs = system_jobs::SystemScheduler::systemd_user()
+    let mut jobs = system_jobs::SystemScheduler::systemd_user()
         .available_jobs(&allowlist)
         .await
         .map_err(map_system_job_error)?;
+    mark_authored_local_jobs(&mut jobs, &state)?;
     Ok(Json(jobs))
+}
+
+async fn lock_system_jobs_allowlist_mutation() -> tokio::sync::MutexGuard<'static, ()> {
+    SYSTEM_JOBS_ALLOWLIST_MUTATION_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
 }
 
 async fn local_jobs_allowlist(
@@ -5118,7 +5141,10 @@ async fn update_local_jobs_allowlist(
 ) -> Result<Json<LocalJobsAllowlistResponse>, ApiError> {
     let payload = decode_json::<LocalJobsAllowlistRequest>(&body)?;
     let globs = normalize_system_jobs_unit_globs(payload.globs)?;
-    state.store.set_system_jobs_unit_globs(&globs)?;
+    {
+        let _allowlist_guard = lock_system_jobs_allowlist_mutation().await;
+        state.store.set_system_jobs_unit_globs(&globs)?;
+    }
     let _ = try_record_audit_event(
         &state,
         AuditEventRecord {
@@ -5137,6 +5163,213 @@ async fn update_local_jobs_allowlist(
         warn!(error = %error, "failed to publish local job state after allowlist update");
     }
     Ok(Json(LocalJobsAllowlistResponse { globs }))
+}
+
+async fn local_job_templates() -> Json<Vec<SystemJobTemplate>> {
+    Json(system_jobs::SystemScheduler::templates())
+}
+
+async fn render_authored_local_job(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<SystemJobRenderedUnits>, ApiError> {
+    let spec = decode_json::<SystemJobAuthoringSpec>(&body)?;
+    let rendered = system_jobs::SystemScheduler::systemd_user()
+        .render_authored(&spec)
+        .map_err(map_system_job_error)?;
+    let _ = try_record_audit_event(
+        &state,
+        AuditEventRecord {
+            kind: "system_job.authored.rendered".to_string(),
+            target: format!("system_job:{}", rendered.timer_unit),
+            status: "success".to_string(),
+            summary: format!("Rendered local system job '{}'.", rendered.timer_unit),
+            detail: format!(
+                "timer={} service={} schedule_kind={:?}",
+                rendered.timer_unit, rendered.service_unit, spec.schedule.kind
+            ),
+        },
+    )
+    .await;
+    Ok(Json(rendered))
+}
+
+async fn install_authored_local_job(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<LocalJobSummary>, ApiError> {
+    let spec = decode_json::<SystemJobAuthoringSpec>(&body)?;
+    let rendered_preview = system_jobs::SystemScheduler::systemd_user()
+        .render_authored(&spec)
+        .map_err(map_system_job_error)?;
+    let (rendered, allowlist, allowlist_entries) = {
+        let _allowlist_guard = lock_system_jobs_allowlist_mutation().await;
+        if state
+            .store
+            .system_job_authored_unit(&rendered_preview.timer_unit)?
+            .is_some()
+        {
+            return Err(map_system_job_error(
+                system_jobs::SystemJobError::UnitAlreadyExists {
+                    unit: rendered_preview.timer_unit,
+                }
+                .into(),
+            ));
+        }
+        let globs = with_allowlisted_local_job(
+            state.store.system_jobs_unit_globs()?,
+            &rendered_preview.timer_unit,
+        )?;
+
+        let rendered = system_jobs::SystemScheduler::systemd_user()
+            .install_authored(&spec)
+            .await
+            .map_err(map_system_job_error)?;
+        let persistence_result = (|| -> anyhow::Result<()> {
+            state
+                .store
+                .upsert_system_job_authored_unit(SystemJobAuthoredRecord {
+                    name: rendered.timer_unit.clone(),
+                    spec,
+                })?;
+            state.store.set_system_jobs_unit_globs(&globs)?;
+            Ok(())
+        })();
+
+        let allowlist = match persistence_result {
+            Ok(()) => globs.clone(),
+            Err(error) => {
+                if let Err(rollback_error) = system_jobs::SystemScheduler::systemd_user()
+                    .delete_authored(&rendered.timer_unit)
+                    .await
+                {
+                    warn!(error = %rollback_error, unit = %rendered.timer_unit, "failed to roll back authored systemd unit after persistence error");
+                }
+                if let Err(cleanup_error) = state
+                    .store
+                    .remove_system_job_authored_unit(&rendered.timer_unit)
+                {
+                    warn!(error = %cleanup_error, unit = %rendered.timer_unit, "failed to clean authored record after persistence error");
+                }
+                return Err(ApiError::from(error));
+            }
+        };
+
+        (rendered, allowlist, globs.len())
+    };
+    let mut summary = system_jobs::SystemScheduler::systemd_user()
+        .job_summary(&rendered.timer_unit, &allowlist)
+        .await
+        .map_err(map_system_job_error)?;
+    summary.authored = true;
+    let _ = try_record_audit_event(
+        &state,
+        AuditEventRecord {
+            kind: "system_job.authored.installed".to_string(),
+            target: format!("system_job:{}", rendered.timer_unit),
+            status: "success".to_string(),
+            summary: format!("Installed local system job '{}'.", rendered.timer_unit),
+            detail: format!(
+                "timer={} service={} allowlist_entries={}",
+                rendered.timer_unit, rendered.service_unit, allowlist_entries
+            ),
+        },
+    )
+    .await;
+    if let Err(error) = publish_local_jobs_event(&state, true).await {
+        warn!(error = %error, "failed to publish local job state after authored install");
+    }
+    Ok(Json(summary))
+}
+
+async fn delete_authored_local_job(
+    State(state): State<AppState>,
+    Path(unit): Path<String>,
+) -> Result<Json<LocalJobsAllowlistResponse>, ApiError> {
+    let rendered = system_jobs::SystemScheduler::systemd_user()
+        .render_authored(&SystemJobAuthoringSpec {
+            name: unit.clone(),
+            description: None,
+            command: "/usr/bin/true".to_string(),
+            schedule: nucleus_protocol::SystemJobAuthoringSchedule {
+                kind: nucleus_protocol::SystemJobAuthoringScheduleKind::Interval,
+                value: "1h".to_string(),
+            },
+            working_dir: None,
+        })
+        .map_err(map_system_job_error)?;
+    let globs = {
+        let _allowlist_guard = lock_system_jobs_allowlist_mutation().await;
+        if state
+            .store
+            .system_job_authored_unit(&rendered.timer_unit)?
+            .is_none()
+        {
+            return Err(map_system_job_error(
+                system_jobs::SystemJobError::NotAuthored {
+                    unit: rendered.timer_unit,
+                }
+                .into(),
+            ));
+        }
+        system_jobs::SystemScheduler::systemd_user()
+            .delete_authored(&rendered.timer_unit)
+            .await
+            .map_err(map_system_job_error)?;
+        state
+            .store
+            .remove_system_job_authored_unit(&rendered.timer_unit)?;
+        let globs = without_allowlisted_local_job(
+            state.store.system_jobs_unit_globs()?,
+            &rendered.timer_unit,
+        )?;
+        state.store.set_system_jobs_unit_globs(&globs)?;
+        globs
+    };
+    let _ = try_record_audit_event(
+        &state,
+        AuditEventRecord {
+            kind: "system_job.authored.deleted".to_string(),
+            target: format!("system_job:{}", rendered.timer_unit),
+            status: "success".to_string(),
+            summary: format!("Deleted local system job '{}'.", rendered.timer_unit),
+            detail: format!(
+                "timer={} allowlist_entries={}",
+                rendered.timer_unit,
+                globs.len()
+            ),
+        },
+    )
+    .await;
+    clear_local_jobs_stream_cache().await;
+    if let Err(error) = publish_local_jobs_event(&state, true).await {
+        warn!(error = %error, "failed to publish local job state after authored delete");
+    }
+    Ok(Json(LocalJobsAllowlistResponse { globs }))
+}
+
+fn with_allowlisted_local_job(mut globs: Vec<String>, unit: &str) -> Result<Vec<String>, ApiError> {
+    if !system_jobs::unit_is_allowlisted(unit, &globs) {
+        globs.push(unit.to_string());
+    }
+    normalize_system_jobs_unit_globs(globs)
+}
+
+fn without_allowlisted_local_job(globs: Vec<String>, unit: &str) -> Result<Vec<String>, ApiError> {
+    normalize_system_jobs_unit_globs(globs.into_iter().filter(|glob| glob != unit).collect())
+}
+
+fn mark_authored_local_jobs(jobs: &mut [LocalJobSummary], state: &AppState) -> anyhow::Result<()> {
+    let authored = state
+        .store
+        .system_jobs_authored_units()?
+        .into_iter()
+        .map(|record| record.name)
+        .collect::<BTreeSet<_>>();
+    for job in jobs {
+        job.authored = authored.contains(&job.unit);
+    }
+    Ok(())
 }
 
 fn normalize_system_jobs_unit_globs(globs: Vec<String>) -> Result<Vec<String>, ApiError> {
@@ -5173,10 +5406,11 @@ async fn local_job_detail(
     Path(unit): Path<String>,
 ) -> Result<Json<LocalJobDetail>, ApiError> {
     let allowlist = state.store.system_jobs_unit_globs()?;
-    let detail = system_jobs::SystemScheduler::systemd_user()
+    let mut detail = system_jobs::SystemScheduler::systemd_user()
         .job_detail(&unit, &allowlist)
         .await
         .map_err(map_system_job_error)?;
+    mark_authored_local_jobs(std::slice::from_mut(&mut detail.summary), &state)?;
     Ok(Json(detail))
 }
 
@@ -5214,10 +5448,11 @@ async fn control_local_job(
     action: &str,
 ) -> Result<Json<LocalJobSummary>, ApiError> {
     let allowlist = state.store.system_jobs_unit_globs()?;
-    let summary = system_jobs::SystemScheduler::systemd_user()
+    let mut summary = system_jobs::SystemScheduler::systemd_user()
         .control_job(&unit, control, &allowlist)
         .await
         .map_err(map_system_job_error)?;
+    mark_authored_local_jobs(std::slice::from_mut(&mut summary), &state)?;
     let _ = try_record_audit_event(
         &state,
         AuditEventRecord {
@@ -5243,7 +5478,10 @@ fn map_system_job_error(error: anyhow::Error) -> ApiError {
         let message = system_error.to_string();
         return match system_error {
             system_jobs::SystemJobError::NotAllowlisted { .. } => ApiError::forbidden(message),
+            system_jobs::SystemJobError::NotAuthored { .. } => ApiError::forbidden(message),
+            system_jobs::SystemJobError::UnitAlreadyExists { .. } => ApiError::conflict(message),
             system_jobs::SystemJobError::InvalidUnit { .. }
+            | system_jobs::SystemJobError::InvalidAuthoringSpec { .. }
             | system_jobs::SystemJobError::UnsupportedTriggeredUnit { .. }
             | system_jobs::SystemJobError::MissingTriggeredUnit { .. } => {
                 ApiError::bad_request(message)
@@ -5539,8 +5777,14 @@ async fn local_jobs_snapshot_if_configured(
 }
 
 async fn publish_local_jobs_event(state: &AppState, force_refresh: bool) -> anyhow::Result<()> {
-    if let Some(jobs) = throttled_local_jobs_snapshot_if_configured(state, force_refresh).await? {
-        let _ = state.events.send(DaemonEvent::LocalJobsUpdated(jobs));
+    match throttled_local_jobs_snapshot_if_configured(state, force_refresh).await? {
+        Some(jobs) => {
+            let _ = state.events.send(DaemonEvent::LocalJobsUpdated(jobs));
+        }
+        None if state.store.system_jobs_unit_globs()?.is_empty() => {
+            let _ = state.events.send(DaemonEvent::LocalJobsUpdated(Vec::new()));
+        }
+        None => {}
     }
     Ok(())
 }
@@ -5597,7 +5841,8 @@ async fn throttled_local_jobs_snapshot_if_configured(
     }
     refresh.notify_waiters();
 
-    let jobs = result?;
+    let mut jobs = result?;
+    mark_authored_local_jobs(&mut jobs, state)?;
     let latest_allowlist = state.store.system_jobs_unit_globs()?;
     if latest_allowlist != allowlist {
         if latest_allowlist.is_empty() {
@@ -10264,6 +10509,14 @@ impl ApiError {
         }
     }
 
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "conflict",
+            message: message.into(),
+        }
+    }
+
     fn internal_message(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -10375,6 +10628,48 @@ mod tests {
 
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert!(error.message.contains("cannot contain more than"));
+    }
+
+    #[test]
+    fn with_allowlisted_local_job_rejects_capacity_before_install_side_effects() {
+        let globs = (0..SYSTEM_JOBS_ALLOWLIST_MAX_GLOBS)
+            .map(|index| format!("placeholder-{index}.timer"))
+            .collect();
+
+        let error = with_allowlisted_local_job(globs, "placeholder-new.timer")
+            .expect_err("allowlist capacity should reject before install");
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("cannot contain more than"));
+    }
+
+    #[test]
+    fn with_allowlisted_local_job_reuses_matching_wildcard_at_capacity() {
+        let mut globs = (0..SYSTEM_JOBS_ALLOWLIST_MAX_GLOBS - 1)
+            .map(|index| format!("other-{index}.timer"))
+            .collect::<Vec<_>>();
+        globs.push("placeholder-*.timer".to_string());
+
+        let updated = with_allowlisted_local_job(globs.clone(), "placeholder-new.timer")
+            .expect("matching wildcard should already allow the unit");
+
+        assert_eq!(updated, globs);
+    }
+
+    #[tokio::test]
+    async fn publish_local_jobs_event_emits_empty_update_for_empty_allowlist() {
+        let (_state_dir, state) = test_named_app_state("local-jobs-empty-update");
+        let mut events = state.events.subscribe();
+
+        publish_local_jobs_event(&state, true)
+            .await
+            .expect("empty local jobs event should publish");
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("empty local jobs event should arrive")
+            .expect("event channel should remain open");
+
+        assert!(matches!(event, DaemonEvent::LocalJobsUpdated(jobs) if jobs.is_empty()));
     }
 
     #[test]
