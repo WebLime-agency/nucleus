@@ -1,16 +1,24 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt,
+    ffi::OsStr,
+    fmt, fs,
     future::Future,
+    io::ErrorKind,
+    path::{Component, Path, PathBuf},
     pin::Pin,
+    process::Command as StdCommand,
     process::Stdio,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
-use nucleus_protocol::{LocalJobDetail, LocalJobExit, LocalJobSchedule, LocalJobSummary};
-use tokio::{process::Command, time::timeout};
+use nucleus_protocol::{
+    LocalJobDetail, LocalJobExit, LocalJobSchedule, LocalJobSummary,
+    SystemJobAuthoringScheduleKind, SystemJobAuthoringSpec, SystemJobRenderedUnits,
+    SystemJobTemplate,
+};
+use tokio::{process::Command as TokioCommand, time::timeout};
 use tracing::warn;
 
 const BACKEND_SYSTEMD_USER: &str = "systemd-user";
@@ -20,8 +28,11 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(12);
 pub enum SystemJobError {
     NotAllowlisted { unit: String },
     InvalidUnit { reason: String },
+    InvalidAuthoringSpec { reason: String },
     UnsupportedTriggeredUnit { unit: String },
     MissingTriggeredUnit { unit: String },
+    UnitAlreadyExists { unit: String },
+    NotAuthored { unit: String },
 }
 
 impl fmt::Display for SystemJobError {
@@ -31,6 +42,9 @@ impl fmt::Display for SystemJobError {
                 write!(formatter, "system job unit '{unit}' is not allowlisted")
             }
             Self::InvalidUnit { reason } => write!(formatter, "systemd unit {reason}"),
+            Self::InvalidAuthoringSpec { reason } => {
+                write!(formatter, "system job authoring spec {reason}")
+            }
             Self::UnsupportedTriggeredUnit { unit } => {
                 write!(
                     formatter,
@@ -41,6 +55,15 @@ impl fmt::Display for SystemJobError {
                 write!(
                     formatter,
                     "system job timer '{unit}' has no triggered service to run"
+                )
+            }
+            Self::UnitAlreadyExists { unit } => {
+                write!(formatter, "system job unit '{unit}' already exists")
+            }
+            Self::NotAuthored { unit } => {
+                write!(
+                    formatter,
+                    "system job unit '{unit}' was not authored by Nucleus"
                 )
             }
         }
@@ -94,6 +117,14 @@ impl SystemScheduler {
         self.backend.job_detail(unit, allowlist_globs).await
     }
 
+    pub async fn job_summary(
+        &self,
+        unit: &str,
+        allowlist_globs: &[String],
+    ) -> Result<LocalJobSummary> {
+        self.backend.summary_for_unit(unit, allowlist_globs).await
+    }
+
     pub async fn control_job(
         &self,
         unit: &str,
@@ -104,11 +135,31 @@ impl SystemScheduler {
             .control_job(unit, control, allowlist_globs)
             .await
     }
+
+    pub fn templates() -> Vec<SystemJobTemplate> {
+        authored_job_templates()
+    }
+
+    pub fn render_authored(&self, spec: &SystemJobAuthoringSpec) -> Result<SystemJobRenderedUnits> {
+        self.backend.render_authored(spec)
+    }
+
+    pub async fn install_authored(
+        &self,
+        spec: &SystemJobAuthoringSpec,
+    ) -> Result<SystemJobRenderedUnits> {
+        self.backend.install_authored(spec).await
+    }
+
+    pub async fn delete_authored(&self, unit: &str) -> Result<()> {
+        self.backend.delete_authored(unit).await
+    }
 }
 
 #[derive(Clone)]
 struct SystemdUserScheduler {
     command_runner: SystemCommandRunner,
+    unit_dir: Option<PathBuf>,
 }
 
 impl fmt::Debug for SystemdUserScheduler {
@@ -123,6 +174,7 @@ impl Default for SystemdUserScheduler {
             command_runner: Arc::new(|invocation, timeout_duration| {
                 Box::pin(run_system_command(invocation, timeout_duration))
             }),
+            unit_dir: None,
         }
     }
 }
@@ -138,11 +190,130 @@ impl SystemdUserScheduler {
             command_runner: Arc::new(move |invocation, timeout_duration| {
                 Box::pin(runner(invocation, timeout_duration))
             }),
+            unit_dir: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_command_runner_and_unit_dir<F, Fut>(runner: F, unit_dir: PathBuf) -> Self
+    where
+        F: Fn(CommandInvocation, Duration) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<CommandOutput>> + Send + 'static,
+    {
+        Self {
+            command_runner: Arc::new(move |invocation, timeout_duration| {
+                Box::pin(runner(invocation, timeout_duration))
+            }),
+            unit_dir: Some(unit_dir),
         }
     }
 
     async fn run_command(&self, invocation: CommandInvocation) -> Result<CommandOutput> {
         (self.command_runner)(invocation, COMMAND_TIMEOUT).await
+    }
+
+    fn render_authored(&self, spec: &SystemJobAuthoringSpec) -> Result<SystemJobRenderedUnits> {
+        render_authored_units(spec)
+    }
+
+    async fn install_authored(
+        &self,
+        spec: &SystemJobAuthoringSpec,
+    ) -> Result<SystemJobRenderedUnits> {
+        let rendered = self.render_authored(spec)?;
+        let unit_dir = self.unit_dir()?;
+        fs::create_dir_all(&unit_dir).with_context(|| {
+            format!(
+                "failed to create systemd user unit dir {}",
+                unit_dir.display()
+            )
+        })?;
+        let timer_path = unit_dir.join(&rendered.timer_unit);
+        let service_path = unit_dir.join(&rendered.service_unit);
+        if timer_path.exists() || service_path.exists() {
+            return Err(SystemJobError::UnitAlreadyExists {
+                unit: rendered.timer_unit.clone(),
+            }
+            .into());
+        }
+        self.ensure_authored_units_not_visible(&rendered).await?;
+
+        write_new_unit_file(&timer_path, &rendered.timer)?;
+        if let Err(error) = write_new_unit_file(&service_path, &rendered.service) {
+            let _ = fs::remove_file(&timer_path);
+            return Err(error);
+        }
+
+        if let Err(error) = self.run_command(daemon_reload_invocation()).await {
+            let _ = fs::remove_file(&timer_path);
+            let _ = fs::remove_file(&service_path);
+            return Err(error);
+        }
+        if let Err(error) = self
+            .run_command(enable_timer_invocation(&rendered.timer_unit))
+            .await
+        {
+            let _ = self
+                .run_command(disable_timer_invocation(&rendered.timer_unit))
+                .await;
+            let _ = fs::remove_file(&timer_path);
+            let _ = fs::remove_file(&service_path);
+            let _ = self.run_command(daemon_reload_invocation()).await;
+            return Err(error);
+        }
+
+        Ok(rendered)
+    }
+
+    async fn delete_authored(&self, unit: &str) -> Result<()> {
+        validate_timer_unit(unit)?;
+        self.run_cleanup_command_ignoring_missing(disable_timer_invocation(unit))
+            .await?;
+        let unit_dir = self.unit_dir()?;
+        let service_unit = service_unit_for_timer(unit)?;
+        self.run_cleanup_command_ignoring_missing(stop_unit_invocation(&service_unit))
+            .await?;
+        remove_unit_file_if_exists(unit_dir.join(unit))?;
+        remove_unit_file_if_exists(unit_dir.join(service_unit))?;
+        self.run_command(daemon_reload_invocation()).await?;
+        Ok(())
+    }
+
+    async fn run_cleanup_command_ignoring_missing(
+        &self,
+        invocation: CommandInvocation,
+    ) -> Result<()> {
+        match self.run_command(invocation).await {
+            Ok(_) => Ok(()),
+            Err(error) if systemctl_error_is_missing_unit(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn ensure_authored_units_not_visible(
+        &self,
+        rendered: &SystemJobRenderedUnits,
+    ) -> Result<()> {
+        let units = [rendered.timer_unit.as_str(), rendered.service_unit.as_str()];
+        let output = self
+            .run_command(list_unit_files_for_collision_invocation())
+            .await?;
+        for unit in listed_unit_file_names(&output.stdout) {
+            if units.contains(&unit.as_str()) {
+                return Err(SystemJobError::UnitAlreadyExists { unit }.into());
+            }
+        }
+        Ok(())
+    }
+
+    fn unit_dir(&self) -> Result<PathBuf> {
+        if let Some(unit_dir) = &self.unit_dir {
+            return Ok(unit_dir.clone());
+        }
+        default_systemd_user_unit_dir(
+            std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+            dirs::home_dir(),
+        )
     }
 
     async fn list_jobs(&self, allowlist_globs: &[String]) -> Result<Vec<LocalJobSummary>> {
@@ -342,6 +513,611 @@ pub fn build_control_invocation(
     }
 }
 
+pub fn render_authored_units(spec: &SystemJobAuthoringSpec) -> Result<SystemJobRenderedUnits> {
+    let timer_unit = normalize_authored_timer_name(&spec.name)?;
+    let service_unit = service_unit_for_timer(&timer_unit)?;
+    let description = validate_optional_unit_text(spec.description.as_deref(), "description")?
+        .unwrap_or_else(|| title_for_unit(&timer_unit));
+    let argv = parse_direct_command(&spec.command)?;
+    validate_direct_command(&argv)?;
+    let exec_start = argv
+        .iter()
+        .map(|arg| quote_systemd_exec_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let schedule_line = match &spec.schedule.kind {
+        SystemJobAuthoringScheduleKind::Interval => {
+            let value = validate_schedule_value(
+                &spec.schedule.value,
+                "interval",
+                SystemJobAuthoringScheduleKind::Interval,
+            )?;
+            let value = escape_systemd_value(&value);
+            format!("OnActiveSec={value}\nOnUnitActiveSec={value}")
+        }
+        SystemJobAuthoringScheduleKind::Calendar => {
+            let value = validate_schedule_value(
+                &spec.schedule.value,
+                "calendar",
+                SystemJobAuthoringScheduleKind::Calendar,
+            )?;
+            format!("OnCalendar={}", escape_systemd_value(&value))
+        }
+    };
+    let working_dir = spec
+        .working_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(validate_working_dir)
+        .transpose()?;
+    let working_dir_line = working_dir
+        .as_ref()
+        .map(|dir| format!("WorkingDirectory={}\n", escape_systemd_value(dir)))
+        .unwrap_or_default();
+    let description = escape_systemd_value(&description);
+    let timer = format!(
+        "# Nucleus-authored systemd user timer. Preview before installing; safe to delete through Nucleus.\n\
+[Unit]\n\
+Description={description}\n\
+\n\
+[Timer]\n\
+{schedule_line}\n\
+Unit={service_unit}\n\
+Persistent=true\n\
+\n\
+[Install]\n\
+WantedBy=timers.target\n"
+    );
+    let service = format!(
+        "# Nucleus-authored systemd user service. ExecStart runs the authored command directly.\n\
+[Unit]\n\
+Description={description}\n\
+\n\
+[Service]\n\
+Type=oneshot\n\
+{working_dir_line}\
+ExecStart={exec_start}\n"
+    );
+
+    Ok(SystemJobRenderedUnits {
+        name: timer_unit.clone(),
+        timer_unit,
+        service_unit,
+        timer,
+        service,
+    })
+}
+
+fn authored_job_templates() -> Vec<SystemJobTemplate> {
+    vec![
+        SystemJobTemplate {
+            id: "interval-command".to_string(),
+            title: "Run a command on an interval".to_string(),
+            summary: "A systemd user timer that runs a direct command repeatedly.".to_string(),
+            spec: SystemJobAuthoringSpec {
+                name: "placeholder-interval.timer".to_string(),
+                description: Some("Run placeholder interval command".to_string()),
+                command: "/usr/bin/printf interval".to_string(),
+                schedule: nucleus_protocol::SystemJobAuthoringSchedule {
+                    kind: SystemJobAuthoringScheduleKind::Interval,
+                    value: "30min".to_string(),
+                },
+                working_dir: None,
+            },
+        },
+        SystemJobTemplate {
+            id: "calendar-command".to_string(),
+            title: "Run a command on a calendar schedule".to_string(),
+            summary: "A systemd user timer that runs at a calendar time.".to_string(),
+            spec: SystemJobAuthoringSpec {
+                name: "placeholder-calendar.timer".to_string(),
+                description: Some("Run placeholder calendar command".to_string()),
+                command: "/usr/bin/printf calendar".to_string(),
+                schedule: nucleus_protocol::SystemJobAuthoringSchedule {
+                    kind: SystemJobAuthoringScheduleKind::Calendar,
+                    value: "*-*-* 04:00:00".to_string(),
+                },
+                working_dir: None,
+            },
+        },
+        SystemJobTemplate {
+            id: "custom-command".to_string(),
+            title: "Custom systemd user timer".to_string(),
+            summary: "Start from a blank direct command and choose the schedule.".to_string(),
+            spec: SystemJobAuthoringSpec {
+                name: "placeholder-custom.timer".to_string(),
+                description: None,
+                command: "/usr/bin/printf custom".to_string(),
+                schedule: nucleus_protocol::SystemJobAuthoringSchedule {
+                    kind: SystemJobAuthoringScheduleKind::Interval,
+                    value: "1h".to_string(),
+                },
+                working_dir: None,
+            },
+        },
+    ]
+}
+
+fn normalize_authored_timer_name(name: &str) -> Result<String> {
+    let name = name.trim();
+    validate_timer_unit(name)?;
+    let stem = name.strip_suffix(".timer").unwrap_or(name);
+    if stem.is_empty()
+        || !stem
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(SystemJobError::InvalidAuthoringSpec {
+            reason:
+                "name may contain only letters, numbers, dash, underscore, and the .timer suffix"
+                    .to_string(),
+        }
+        .into());
+    }
+    Ok(name.to_string())
+}
+
+fn service_unit_for_timer(timer_unit: &str) -> Result<String> {
+    let stem = timer_unit
+        .strip_suffix(".timer")
+        .ok_or_else(|| SystemJobError::InvalidUnit {
+            reason: "must end with .timer".to_string(),
+        })?;
+    Ok(format!("{stem}.service"))
+}
+
+fn validate_optional_unit_text(value: Option<&str>, field: &str) -> Result<Option<String>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.len() > 240 || value.chars().any(|ch| ch.is_control()) {
+        return Err(SystemJobError::InvalidAuthoringSpec {
+            reason: format!("{field} contains unsupported characters"),
+        }
+        .into());
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn validate_schedule_value(
+    value: &str,
+    label: &str,
+    kind: SystemJobAuthoringScheduleKind,
+) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 160
+        || value.starts_with('-')
+        || value.chars().any(|ch| ch.is_control() || ch == ';')
+    {
+        return Err(SystemJobError::InvalidAuthoringSpec {
+            reason: format!("{label} schedule contains unsupported characters"),
+        }
+        .into());
+    }
+    if matches!(kind, SystemJobAuthoringScheduleKind::Interval)
+        && !interval_schedule_has_positive_component(value)
+    {
+        return Err(SystemJobError::InvalidAuthoringSpec {
+            reason: format!("{label} schedule must be greater than zero"),
+        }
+        .into());
+    }
+    validate_systemd_schedule(value, label, kind)?;
+    Ok(value.to_string())
+}
+
+fn interval_schedule_has_positive_component(value: &str) -> bool {
+    let compact = value
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    let mut chars = compact.char_indices().peekable();
+    let mut saw_number = false;
+    let mut saw_positive = false;
+    while chars.peek().is_some() {
+        let number_start = chars.peek().map(|(index, _)| *index).unwrap_or(0);
+        while matches!(chars.peek(), Some((_, ch)) if ch.is_ascii_digit()) {
+            chars.next();
+        }
+        if matches!(chars.peek(), Some((_, '.'))) {
+            chars.next();
+            while matches!(chars.peek(), Some((_, ch)) if ch.is_ascii_digit()) {
+                chars.next();
+            }
+        }
+        let number_end = chars
+            .peek()
+            .map(|(index, _)| *index)
+            .unwrap_or(compact.len());
+        if number_start == number_end {
+            return false;
+        }
+        saw_number = true;
+        if compact[number_start..number_end]
+            .parse::<f64>()
+            .ok()
+            .is_some_and(|number| number.is_finite() && number > 0.0)
+        {
+            saw_positive = true;
+        }
+        while matches!(chars.peek(), Some((_, ch)) if ch.is_ascii_alphabetic()) {
+            chars.next();
+        }
+    }
+    saw_number && saw_positive
+}
+
+fn validate_systemd_schedule(
+    value: &str,
+    label: &str,
+    kind: SystemJobAuthoringScheduleKind,
+) -> Result<()> {
+    match systemd_analyze_schedule(value, &kind) {
+        ScheduleProbe::Valid => Ok(()),
+        ScheduleProbe::Invalid => Err(SystemJobError::InvalidAuthoringSpec {
+            reason: format!("{label} schedule is not a valid systemd expression"),
+        }
+        .into()),
+        ScheduleProbe::Unavailable => {
+            let valid = match kind {
+                SystemJobAuthoringScheduleKind::Interval => fallback_interval_schedule(value),
+                SystemJobAuthoringScheduleKind::Calendar => fallback_calendar_schedule(value),
+            };
+            if valid {
+                Ok(())
+            } else {
+                Err(SystemJobError::InvalidAuthoringSpec {
+                    reason: format!(
+                        "{label} schedule does not look like a valid systemd expression"
+                    ),
+                }
+                .into())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScheduleProbe {
+    Valid,
+    Invalid,
+    Unavailable,
+}
+
+fn systemd_analyze_schedule(value: &str, kind: &SystemJobAuthoringScheduleKind) -> ScheduleProbe {
+    let subcommand = match kind {
+        SystemJobAuthoringScheduleKind::Interval => "timespan",
+        SystemJobAuthoringScheduleKind::Calendar => "calendar",
+    };
+    match StdCommand::new("systemd-analyze")
+        .arg(subcommand)
+        .arg(value)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(output) if output.status.success() => ScheduleProbe::Valid,
+        Ok(_) => ScheduleProbe::Invalid,
+        Err(error) if error.kind() == ErrorKind::NotFound => ScheduleProbe::Unavailable,
+        Err(_) => ScheduleProbe::Unavailable,
+    }
+}
+
+fn fallback_interval_schedule(value: &str) -> bool {
+    let compact = value
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    let mut chars = compact.char_indices().peekable();
+    let mut saw_component = false;
+    while chars.peek().is_some() {
+        let number_start = chars.peek().map(|(index, _)| *index).unwrap_or(0);
+        while matches!(chars.peek(), Some((_, ch)) if ch.is_ascii_digit()) {
+            chars.next();
+        }
+        let number_end = chars
+            .peek()
+            .map(|(index, _)| *index)
+            .unwrap_or(compact.len());
+        if number_start == number_end {
+            return false;
+        }
+        let unit_start = number_end;
+        while matches!(chars.peek(), Some((_, ch)) if ch.is_ascii_alphabetic()) {
+            chars.next();
+        }
+        let unit_end = chars
+            .peek()
+            .map(|(index, _)| *index)
+            .unwrap_or(compact.len());
+        if unit_start == unit_end {
+            return false;
+        }
+        let number = &compact[number_start..number_end];
+        let unit = compact[unit_start..unit_end].to_ascii_lowercase();
+        if number
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .is_none()
+            || !matches!(
+                unit.as_str(),
+                "usec"
+                    | "us"
+                    | "ms"
+                    | "millisecond"
+                    | "milliseconds"
+                    | "s"
+                    | "sec"
+                    | "second"
+                    | "seconds"
+                    | "m"
+                    | "min"
+                    | "minute"
+                    | "minutes"
+                    | "h"
+                    | "hr"
+                    | "hour"
+                    | "hours"
+                    | "d"
+                    | "day"
+                    | "days"
+                    | "w"
+                    | "week"
+                    | "weeks"
+                    | "month"
+                    | "months"
+                    | "y"
+                    | "year"
+                    | "years"
+            )
+        {
+            return false;
+        }
+        saw_component = true;
+    }
+    saw_component
+}
+
+fn fallback_calendar_schedule(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "minutely"
+            | "hourly"
+            | "daily"
+            | "weekly"
+            | "monthly"
+            | "quarterly"
+            | "semiannually"
+            | "annually"
+            | "yearly"
+    ) {
+        return true;
+    }
+    value.chars().any(|ch| ch.is_ascii_digit())
+        && value.contains(':')
+        && value.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || ch.is_ascii_whitespace()
+                || matches!(ch, '*' | '-' | '_' | ':' | ',' | '/' | '.' | '~')
+        })
+}
+
+fn validate_working_dir(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 4096
+        || value.contains('\0')
+        || value.contains('\\')
+        || value.chars().any(|ch| ch == '\n' || ch == '\r')
+    {
+        return Err(SystemJobError::InvalidAuthoringSpec {
+            reason: "working_dir contains unsupported characters".to_string(),
+        }
+        .into());
+    }
+    let path = Path::new(value);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| component == Component::ParentDir)
+    {
+        return Err(SystemJobError::InvalidAuthoringSpec {
+            reason: "working_dir must be an absolute path without parent-directory traversal"
+                .to_string(),
+        }
+        .into());
+    }
+    Ok(value.to_string())
+}
+
+fn parse_direct_command(command: &str) -> Result<Vec<String>> {
+    let command = command.trim();
+    if command.is_empty()
+        || command
+            .chars()
+            .any(|ch| ch == '\0' || ch == '\n' || ch == '\r')
+    {
+        return Err(SystemJobError::InvalidAuthoringSpec {
+            reason: "command must be a non-empty single-line direct command".to_string(),
+        }
+        .into());
+    }
+
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut chars = command.chars().peekable();
+    let mut quote: Option<char> = None;
+    let mut token_started = false;
+
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (None, ch) if ch.is_whitespace() => {
+                if token_started {
+                    args.push(std::mem::take(&mut current));
+                    token_started = false;
+                }
+            }
+            (None, '\'' | '"') => {
+                quote = Some(ch);
+                token_started = true;
+            }
+            (Some(active), ch) if ch == active => {
+                quote = None;
+                token_started = true;
+            }
+            (_, '\\') => {
+                let Some(next) = chars.next() else {
+                    return Err(SystemJobError::InvalidAuthoringSpec {
+                        reason: "command contains a trailing escape".to_string(),
+                    }
+                    .into());
+                };
+                current.push(next);
+                token_started = true;
+            }
+            _ => {
+                current.push(ch);
+                token_started = true;
+            }
+        }
+    }
+
+    if quote.is_some() {
+        return Err(SystemJobError::InvalidAuthoringSpec {
+            reason: "command contains an unterminated quote".to_string(),
+        }
+        .into());
+    }
+    if token_started {
+        args.push(current);
+    }
+    if args.is_empty() {
+        return Err(SystemJobError::InvalidAuthoringSpec {
+            reason: "command must include an executable".to_string(),
+        }
+        .into());
+    }
+    Ok(args)
+}
+
+fn validate_direct_command(argv: &[String]) -> Result<()> {
+    let executable = argv.first().map(String::as_str).unwrap_or_default();
+    if executable.trim().is_empty()
+        || executable.starts_with('-')
+        || executable.contains('/') && executable.ends_with('/')
+    {
+        return Err(SystemJobError::InvalidAuthoringSpec {
+            reason: "command must include an executable".to_string(),
+        }
+        .into());
+    }
+    if !Path::new(executable).is_absolute() {
+        return Err(SystemJobError::InvalidAuthoringSpec {
+            reason: "command executable must be an absolute path".to_string(),
+        }
+        .into());
+    }
+    let basename = executable.rsplit('/').next().unwrap_or(executable);
+    if matches!(basename, "nucleus" | "nucleus-daemon") {
+        return Err(SystemJobError::InvalidAuthoringSpec {
+            reason: "command may not call back into the Nucleus daemon".to_string(),
+        }
+        .into());
+    }
+    if matches!(basename, "sh" | "bash" | "dash" | "zsh" | "fish" | "env") {
+        return Err(SystemJobError::InvalidAuthoringSpec {
+            reason: "command may not use a shell or env wrapper".to_string(),
+        }
+        .into());
+    }
+    if argv.iter().any(|arg| arg == ";") {
+        return Err(SystemJobError::InvalidAuthoringSpec {
+            reason: "command may not include systemd ExecStart separators".to_string(),
+        }
+        .into());
+    }
+    if argv.iter().any(|arg| arg.chars().any(char::is_control)) {
+        return Err(SystemJobError::InvalidAuthoringSpec {
+            reason: "command contains unsupported characters".to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn quote_systemd_exec_arg(value: &str) -> String {
+    let mut output = String::with_capacity(value.len() + 2);
+    output.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' | '"' => {
+                output.push('\\');
+                output.push(ch);
+            }
+            '%' => output.push_str("%%"),
+            '$' => output.push_str("$$"),
+            _ => output.push(ch),
+        }
+    }
+    output.push('"');
+    output
+}
+
+fn escape_systemd_value(value: &str) -> String {
+    value.replace('%', "%%")
+}
+
+fn write_new_unit_file(path: &Path, content: &str) -> Result<()> {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            file.write_all(content.as_bytes())
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            Ok(())
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            Err(SystemJobError::UnitAlreadyExists {
+                unit: path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("systemd unit")
+                    .to_string(),
+            }
+            .into())
+        }
+        Err(error) => Err(error).with_context(|| format!("failed to create {}", path.display())),
+    }
+}
+
+fn remove_unit_file_if_exists(path: impl AsRef<Path>) -> Result<()> {
+    let path = path.as_ref();
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+fn default_systemd_user_unit_dir(
+    xdg_config_home: Option<&OsStr>,
+    home_dir: Option<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(value) = xdg_config_home.filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(value).join("systemd/user"));
+    }
+    let home = home_dir.context("failed to resolve home directory")?;
+    Ok(home.join(".config/systemd/user"))
+}
+
 pub fn parse_local_job_summary(timer_show: &str, service_show: &str) -> Result<LocalJobSummary> {
     parse_local_job_summary_with_listed_next(timer_show, service_show, None)
 }
@@ -385,6 +1161,7 @@ fn parse_local_job_summary_with_listed_next(
         unit,
         backend: BACKEND_SYSTEMD_USER.to_string(),
         managed: false,
+        authored: false,
         enabled: unit_file_state.starts_with("enabled"),
         manageable: unit_file_state_is_manageable(&unit_file_state),
         unit_file_state,
@@ -709,7 +1486,7 @@ fn ensure_unit_allowlisted(unit: &str, allowlist_globs: &[String]) -> Result<()>
     }
 }
 
-fn unit_is_allowlisted(unit: &str, allowlist_globs: &[String]) -> bool {
+pub(crate) fn unit_is_allowlisted(unit: &str, allowlist_globs: &[String]) -> bool {
     allowlist_globs
         .iter()
         .any(|glob| glob_matches(glob.trim(), unit))
@@ -835,6 +1612,27 @@ fn list_unit_files_invocation() -> CommandInvocation {
     }
 }
 
+fn list_unit_files_for_collision_invocation() -> CommandInvocation {
+    CommandInvocation {
+        program: "systemctl".to_string(),
+        args: vec![
+            "--user".to_string(),
+            "list-unit-files".to_string(),
+            "--full".to_string(),
+            "--no-pager".to_string(),
+            "--no-legend".to_string(),
+        ],
+    }
+}
+
+fn listed_unit_file_names(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .map(str::to_string)
+        .collect()
+}
+
 fn timer_show_invocation(unit: &str) -> CommandInvocation {
     CommandInvocation {
         program: "systemctl".to_string(),
@@ -881,6 +1679,51 @@ fn journal_tail_invocation(unit: &str) -> CommandInvocation {
     }
 }
 
+fn daemon_reload_invocation() -> CommandInvocation {
+    CommandInvocation {
+        program: "systemctl".to_string(),
+        args: vec!["--user".to_string(), "daemon-reload".to_string()],
+    }
+}
+
+fn enable_timer_invocation(unit: &str) -> CommandInvocation {
+    CommandInvocation {
+        program: "systemctl".to_string(),
+        args: vec![
+            "--user".to_string(),
+            "enable".to_string(),
+            "--now".to_string(),
+            unit.to_string(),
+        ],
+    }
+}
+
+fn disable_timer_invocation(unit: &str) -> CommandInvocation {
+    CommandInvocation {
+        program: "systemctl".to_string(),
+        args: vec![
+            "--user".to_string(),
+            "disable".to_string(),
+            "--now".to_string(),
+            unit.to_string(),
+        ],
+    }
+}
+
+fn stop_unit_invocation(unit: &str) -> CommandInvocation {
+    CommandInvocation {
+        program: "systemctl".to_string(),
+        args: vec!["--user".to_string(), "stop".to_string(), unit.to_string()],
+    }
+}
+
+fn systemctl_error_is_missing_unit(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("does not exist")
+        || message.contains("not loaded")
+        || message.contains("not found")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommandOutput {
     stdout: String,
@@ -891,7 +1734,7 @@ async fn run_system_command(
     timeout_duration: Duration,
 ) -> Result<CommandOutput> {
     let started_at = Instant::now();
-    let output = Command::new(&invocation.program)
+    let output = TokioCommand::new(&invocation.program)
         .args(&invocation.args)
         .kill_on_drop(true)
         .stdin(Stdio::null())
@@ -934,7 +1777,10 @@ async fn run_system_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::{
+        sync::{Arc, Mutex},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     const TIMER_SHOW: &str = "\
 NextElapseUSecRealtime=Sat 2026-06-13 17:30:00 UTC\n\
@@ -1010,6 +1856,488 @@ Sat 2026-06-13 17:30:00 UTC 29min Sat 2026-06-13 17:00:01 UTC 1s ago placeholder
     const LIST_UNIT_FILES_WITH_BROKEN_TIMER: &str = "\
 placeholder-cleanup.timer enabled enabled\n\
 placeholder-broken.timer enabled enabled\n";
+
+    fn authored_spec() -> SystemJobAuthoringSpec {
+        SystemJobAuthoringSpec {
+            name: "placeholder-sync.timer".to_string(),
+            description: Some("Placeholder sync".to_string()),
+            command: "/usr/bin/printf 'hello world' \"$HOME\" 100%".to_string(),
+            schedule: nucleus_protocol::SystemJobAuthoringSchedule {
+                kind: SystemJobAuthoringScheduleKind::Interval,
+                value: "30min".to_string(),
+            },
+            working_dir: Some("/tmp/placeholder workspace".to_string()),
+        }
+    }
+
+    fn test_unit_dir(label: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "nucleus-system-jobs-{label}-{}-{suffix}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn default_unit_dir_honors_xdg_config_home() {
+        let unit_dir = default_systemd_user_unit_dir(
+            Some(OsStr::new("/tmp/nucleus-xdg-config")),
+            Some(PathBuf::from("/home/example")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            unit_dir,
+            PathBuf::from("/tmp/nucleus-xdg-config/systemd/user")
+        );
+
+        let fallback =
+            default_systemd_user_unit_dir(None, Some(PathBuf::from("/home/example"))).unwrap();
+        assert_eq!(
+            fallback,
+            PathBuf::from("/home/example/.config/systemd/user")
+        );
+    }
+
+    fn assert_invalid_authoring_reason(error: anyhow::Error, expected: &str) {
+        match error.downcast_ref::<SystemJobError>() {
+            Some(SystemJobError::InvalidAuthoringSpec { reason }) => {
+                assert!(
+                    reason.contains(expected),
+                    "expected error reason to contain {expected:?}, got {reason:?}"
+                );
+            }
+            other => panic!("expected invalid authoring spec error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn renders_authored_interval_units_with_direct_escaped_exec_start() {
+        let rendered = render_authored_units(&authored_spec()).unwrap();
+
+        assert_eq!(rendered.timer_unit, "placeholder-sync.timer");
+        assert_eq!(rendered.service_unit, "placeholder-sync.service");
+        assert!(rendered.timer.contains("# Nucleus-authored"));
+        assert!(rendered.timer.contains("OnActiveSec=30min"));
+        assert!(rendered.timer.contains("OnUnitActiveSec=30min"));
+        assert!(rendered.timer.contains("Unit=placeholder-sync.service"));
+        assert!(rendered.service.contains("# Nucleus-authored"));
+        assert!(rendered.service.contains("Type=oneshot"));
+        assert!(
+            rendered
+                .service
+                .contains("ExecStart=\"/usr/bin/printf\" \"hello world\" \"$$HOME\" \"100%%\"")
+        );
+        assert!(
+            rendered
+                .service
+                .contains("WorkingDirectory=/tmp/placeholder workspace")
+        );
+        assert!(!rendered.service.contains("sh -c"));
+        assert!(!rendered.service.contains("nucleus run"));
+    }
+
+    #[test]
+    fn rejects_authored_relative_or_bare_executable() {
+        let mut spec = authored_spec();
+        spec.command = "python /tmp/example.py".to_string();
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "executable must be an absolute path");
+
+        spec = authored_spec();
+        spec.command = "./run.sh".to_string();
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "executable must be an absolute path");
+
+        spec = authored_spec();
+        spec.command = "/usr/bin/printf absolute".to_string();
+        let rendered = render_authored_units(&spec).unwrap();
+        assert!(
+            rendered
+                .service
+                .contains("ExecStart=\"/usr/bin/printf\" \"absolute\"")
+        );
+    }
+
+    #[test]
+    fn renders_authored_calendar_units() {
+        let mut spec = authored_spec();
+        spec.schedule.kind = SystemJobAuthoringScheduleKind::Calendar;
+        spec.schedule.value = "*-*-* 04:00:00".to_string();
+
+        let rendered = render_authored_units(&spec).unwrap();
+
+        assert!(rendered.timer.contains("OnCalendar=*-*-* 04:00:00"));
+        assert!(!rendered.timer.contains("OnActiveSec="));
+        assert!(!rendered.timer.contains("OnUnitActiveSec="));
+    }
+
+    #[test]
+    fn rejects_authored_name_traversal_and_daemon_callbacks() {
+        let mut spec = authored_spec();
+        spec.name = "../placeholder.timer".to_string();
+        assert!(render_authored_units(&spec).is_err());
+
+        spec = authored_spec();
+        spec.command = "/opt/nucleus/bin/nucleus run-placeholder".to_string();
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "may not call back");
+
+        spec = authored_spec();
+        spec.command = "/bin/sh -c 'nucleus run-placeholder'".to_string();
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "shell or env wrapper");
+
+        spec = authored_spec();
+        spec.command = "/usr/bin/env nucleus run-placeholder".to_string();
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "shell or env wrapper");
+
+        spec = authored_spec();
+        spec.command = "/usr/bin/printf ok ; /opt/nucleus/bin/nucleus run-placeholder".to_string();
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "ExecStart separators");
+
+        spec = authored_spec();
+        spec.command = "/usr/bin/printf 'unterminated".to_string();
+        assert!(render_authored_units(&spec).is_err());
+    }
+
+    #[test]
+    fn rejects_authored_invalid_schedule() {
+        let mut spec = authored_spec();
+        spec.schedule.value = "definitely-not-a-timespan".to_string();
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "schedule");
+
+        spec = authored_spec();
+        spec.schedule.value = "0s".to_string();
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "greater than zero");
+
+        spec = authored_spec();
+        spec.schedule.value = "infinity".to_string();
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "greater than zero");
+
+        spec = authored_spec();
+        spec.schedule.kind = SystemJobAuthoringScheduleKind::Calendar;
+        spec.schedule.value = "not a calendar".to_string();
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "schedule");
+    }
+
+    #[test]
+    fn rejects_authored_invalid_working_dir() {
+        let mut spec = authored_spec();
+        spec.working_dir = Some("relative/path".to_string());
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "working_dir must be an absolute path");
+
+        spec = authored_spec();
+        spec.working_dir = Some("/tmp/../workspace".to_string());
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "without parent-directory traversal");
+
+        spec = authored_spec();
+        spec.working_dir = Some("/tmp/placeholder\\".to_string());
+        let error = render_authored_units(&spec).unwrap_err();
+        assert_invalid_authoring_reason(error, "unsupported characters");
+    }
+
+    #[tokio::test]
+    async fn install_authored_writes_units_and_runs_reload_enable() {
+        let unit_dir = test_unit_dir("install");
+        let invocations = Arc::new(Mutex::new(Vec::new()));
+        let recorded_invocations = Arc::clone(&invocations);
+        let scheduler = SystemdUserScheduler::with_command_runner_and_unit_dir(
+            move |invocation, _timeout| {
+                recorded_invocations
+                    .lock()
+                    .unwrap()
+                    .push(invocation.clone());
+                async move {
+                    Ok(CommandOutput {
+                        stdout: String::new(),
+                    })
+                }
+            },
+            unit_dir.clone(),
+        );
+
+        let rendered = scheduler.install_authored(&authored_spec()).await.unwrap();
+
+        assert_eq!(rendered.timer_unit, "placeholder-sync.timer");
+        assert!(unit_dir.join("placeholder-sync.timer").exists());
+        assert!(unit_dir.join("placeholder-sync.service").exists());
+        let invocations = invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 3);
+        assert_eq!(
+            invocations[0].args,
+            vec![
+                "--user",
+                "list-unit-files",
+                "--full",
+                "--no-pager",
+                "--no-legend"
+            ]
+        );
+        assert_eq!(invocations[1].args, vec!["--user", "daemon-reload"]);
+        assert_eq!(
+            invocations[2].args,
+            vec!["--user", "enable", "--now", "placeholder-sync.timer"]
+        );
+
+        let _ = fs::remove_dir_all(unit_dir);
+    }
+
+    #[tokio::test]
+    async fn install_authored_refuses_to_clobber_existing_unit() {
+        let unit_dir = test_unit_dir("clobber");
+        fs::create_dir_all(&unit_dir).unwrap();
+        fs::write(unit_dir.join("placeholder-sync.timer"), "existing").unwrap();
+        let invocations = Arc::new(Mutex::new(Vec::new()));
+        let recorded_invocations = Arc::clone(&invocations);
+        let scheduler = SystemdUserScheduler::with_command_runner_and_unit_dir(
+            move |invocation, _timeout| {
+                recorded_invocations
+                    .lock()
+                    .unwrap()
+                    .push(invocation.clone());
+                async move {
+                    Ok(CommandOutput {
+                        stdout: String::new(),
+                    })
+                }
+            },
+            unit_dir.clone(),
+        );
+
+        let error = scheduler
+            .install_authored(&authored_spec())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<SystemJobError>(),
+            Some(SystemJobError::UnitAlreadyExists { unit }) if unit == "placeholder-sync.timer"
+        ));
+        assert!(invocations.lock().unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(unit_dir);
+    }
+
+    #[tokio::test]
+    async fn install_authored_refuses_visible_systemd_unit_collision() {
+        let unit_dir = test_unit_dir("visible-collision");
+        let invocations = Arc::new(Mutex::new(Vec::new()));
+        let recorded_invocations = Arc::clone(&invocations);
+        let scheduler = SystemdUserScheduler::with_command_runner_and_unit_dir(
+            move |invocation, _timeout| {
+                recorded_invocations
+                    .lock()
+                    .unwrap()
+                    .push(invocation.clone());
+                async move {
+                    let stdout = if invocation.args.iter().any(|arg| arg == "list-unit-files") {
+                        "placeholder-sync.service enabled enabled\n".to_string()
+                    } else {
+                        String::new()
+                    };
+                    Ok(CommandOutput { stdout })
+                }
+            },
+            unit_dir.clone(),
+        );
+
+        let error = scheduler
+            .install_authored(&authored_spec())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<SystemJobError>(),
+            Some(SystemJobError::UnitAlreadyExists { unit }) if unit == "placeholder-sync.service"
+        ));
+        assert_eq!(invocations.lock().unwrap().len(), 1);
+        assert!(!unit_dir.join("placeholder-sync.timer").exists());
+        assert!(!unit_dir.join("placeholder-sync.service").exists());
+
+        let _ = fs::remove_dir_all(unit_dir);
+    }
+
+    #[tokio::test]
+    async fn install_authored_disables_timer_when_enable_fails() {
+        let unit_dir = test_unit_dir("enable-fails");
+        let invocations = Arc::new(Mutex::new(Vec::new()));
+        let recorded_invocations = Arc::clone(&invocations);
+        let scheduler = SystemdUserScheduler::with_command_runner_and_unit_dir(
+            move |invocation, _timeout| {
+                recorded_invocations
+                    .lock()
+                    .unwrap()
+                    .push(invocation.clone());
+                async move {
+                    if invocation.args.iter().any(|arg| arg == "enable") {
+                        return Err(anyhow::anyhow!("enable failed"));
+                    }
+                    Ok(CommandOutput {
+                        stdout: String::new(),
+                    })
+                }
+            },
+            unit_dir.clone(),
+        );
+
+        let error = scheduler
+            .install_authored(&authored_spec())
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("enable failed"));
+        assert!(!unit_dir.join("placeholder-sync.timer").exists());
+        assert!(!unit_dir.join("placeholder-sync.service").exists());
+        let invocations = invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 5);
+        assert_eq!(
+            invocations[2].args,
+            vec!["--user", "enable", "--now", "placeholder-sync.timer"]
+        );
+        assert_eq!(
+            invocations[3].args,
+            vec!["--user", "disable", "--now", "placeholder-sync.timer"]
+        );
+        assert_eq!(invocations[4].args, vec!["--user", "daemon-reload"]);
+
+        let _ = fs::remove_dir_all(unit_dir);
+    }
+
+    #[tokio::test]
+    async fn delete_authored_disables_removes_units_and_reloads() {
+        let unit_dir = test_unit_dir("delete");
+        fs::create_dir_all(&unit_dir).unwrap();
+        fs::write(unit_dir.join("placeholder-sync.timer"), "timer").unwrap();
+        fs::write(unit_dir.join("placeholder-sync.service"), "service").unwrap();
+        let invocations = Arc::new(Mutex::new(Vec::new()));
+        let recorded_invocations = Arc::clone(&invocations);
+        let scheduler = SystemdUserScheduler::with_command_runner_and_unit_dir(
+            move |invocation, _timeout| {
+                recorded_invocations
+                    .lock()
+                    .unwrap()
+                    .push(invocation.clone());
+                async move {
+                    Ok(CommandOutput {
+                        stdout: String::new(),
+                    })
+                }
+            },
+            unit_dir.clone(),
+        );
+
+        scheduler
+            .delete_authored("placeholder-sync.timer")
+            .await
+            .unwrap();
+
+        assert!(!unit_dir.join("placeholder-sync.timer").exists());
+        assert!(!unit_dir.join("placeholder-sync.service").exists());
+        let invocations = invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 3);
+        assert_eq!(
+            invocations[0].args,
+            vec!["--user", "disable", "--now", "placeholder-sync.timer"]
+        );
+        assert_eq!(
+            invocations[1].args,
+            vec!["--user", "stop", "placeholder-sync.service"]
+        );
+        assert_eq!(invocations[2].args, vec!["--user", "daemon-reload"]);
+
+        let _ = fs::remove_dir_all(unit_dir);
+    }
+
+    #[tokio::test]
+    async fn delete_authored_tolerates_already_removed_units() {
+        let unit_dir = test_unit_dir("delete-missing");
+        fs::create_dir_all(&unit_dir).unwrap();
+        let invocations = Arc::new(Mutex::new(Vec::new()));
+        let recorded_invocations = Arc::clone(&invocations);
+        let scheduler = SystemdUserScheduler::with_command_runner_and_unit_dir(
+            move |invocation, _timeout| {
+                recorded_invocations
+                    .lock()
+                    .unwrap()
+                    .push(invocation.clone());
+                async move {
+                    if invocation.args == ["--user", "disable", "--now", "placeholder-sync.timer"] {
+                        anyhow::bail!(
+                            "systemctl --user disable --now placeholder-sync.timer failed: unit placeholder-sync.timer does not exist"
+                        );
+                    }
+                    if invocation.args == ["--user", "stop", "placeholder-sync.service"] {
+                        anyhow::bail!(
+                            "systemctl --user stop placeholder-sync.service failed: unit placeholder-sync.service not loaded"
+                        );
+                    }
+                    Ok(CommandOutput {
+                        stdout: String::new(),
+                    })
+                }
+            },
+            unit_dir.clone(),
+        );
+
+        scheduler
+            .delete_authored("placeholder-sync.timer")
+            .await
+            .unwrap();
+
+        let invocations = invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 3);
+        assert_eq!(invocations[2].args, vec!["--user", "daemon-reload"]);
+
+        let _ = fs::remove_dir_all(unit_dir);
+    }
+
+    #[tokio::test]
+    async fn summary_for_unit_does_not_tail_journal() {
+        let scheduler =
+            SystemdUserScheduler::with_command_runner(move |invocation, _timeout| async move {
+                if invocation.program == "journalctl" {
+                    anyhow::bail!("summary should not tail journals");
+                }
+                let stdout = if invocation.args.iter().any(|arg| arg == "list-timers") {
+                    LIST_TIMERS_WITH_AVAILABLE_TIMERS.to_string()
+                } else if invocation
+                    .args
+                    .iter()
+                    .any(|arg| arg == "placeholder-cleanup.timer")
+                {
+                    TIMER_SHOW.to_string()
+                } else if invocation
+                    .args
+                    .iter()
+                    .any(|arg| arg == "placeholder-cleanup.service")
+                {
+                    SERVICE_SUCCESS_SHOW.to_string()
+                } else {
+                    String::new()
+                };
+                Ok(CommandOutput { stdout })
+            });
+
+        let summary = scheduler
+            .summary_for_unit("placeholder-cleanup.timer", &["placeholder-*".to_string()])
+            .await
+            .expect("summary should not require journal access");
+
+        assert_eq!(summary.unit, "placeholder-cleanup.timer");
+        assert_eq!(summary.triggered_unit, "placeholder-cleanup.service");
+    }
 
     #[test]
     fn parses_timer_and_successful_service_show_output() {

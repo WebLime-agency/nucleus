@@ -50,6 +50,8 @@ import {
   skillReconcileScanResponseSchema,
   skillPackageRecordSchema,
   skillPackageUpsertRequestSchema,
+  systemJobRenderedUnitsSchema,
+  systemJobTemplateSchema,
   updateConfigRequestSchema,
   systemStatsSchema,
   updateStatusSchema,
@@ -70,6 +72,7 @@ import {
   vaultStatusSummarySchema,
   writableMcpAuthKindSchema
 } from './schemas';
+import type { SystemJobAuthoringSpec } from './schemas';
 
 type FetchLike = typeof fetch;
 type ProcessSort = 'cpu' | 'memory';
@@ -263,6 +266,47 @@ export async function updateLocalJobsAllowlist(globs: string[], fetchImpl: Fetch
       method: 'PUT',
       headers: { accept: 'application/json', 'content-type': 'application/json' },
       body: JSON.stringify({ globs })
+    }),
+    localJobsAllowlistSchema
+  );
+}
+
+export async function fetchSystemJobTemplates(fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/system/jobs/templates', {
+      headers: { accept: 'application/json' }
+    }),
+    z.array(systemJobTemplateSchema)
+  );
+}
+
+export async function renderAuthoredLocalJob(spec: SystemJobAuthoringSpec, fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/system/jobs/authored/render', {
+      method: 'POST',
+      headers: { accept: 'application/json', 'content-type': 'application/json' },
+      body: JSON.stringify(spec)
+    }),
+    systemJobRenderedUnitsSchema
+  );
+}
+
+export async function installAuthoredLocalJob(spec: SystemJobAuthoringSpec, fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, '/api/system/jobs/authored', {
+      method: 'POST',
+      headers: { accept: 'application/json', 'content-type': 'application/json' },
+      body: JSON.stringify(spec)
+    }),
+    localJobSummarySchema
+  );
+}
+
+export async function deleteAuthoredLocalJob(unit: string, fetchImpl: FetchLike = fetch) {
+  return parseJson(
+    await daemonFetch(fetchImpl, `/api/system/jobs/authored/${encodeURIComponent(unit)}`, {
+      method: 'DELETE',
+      headers: { accept: 'application/json' }
     }),
     localJobsAllowlistSchema
   );

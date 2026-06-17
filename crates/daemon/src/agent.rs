@@ -5,7 +5,7 @@ use std::{
     net::TcpListener as StdTcpListener,
     path::{Component, Path, PathBuf},
     process::{ExitStatus, Stdio},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex as StdMutex, OnceLock},
     time::{Instant, UNIX_EPOCH},
 };
 
@@ -66,8 +66,11 @@ const MAX_CONFIGURED_JOB_WALL_CLOCK_SECS: u64 = 86_400;
 const LOW_CONTEXT_JOB_MAX_STEPS: usize = 12;
 const LOW_CONTEXT_JOB_MAX_TOOL_CALLS: usize = 16;
 const JOB_MAX_CHILDREN_PER_FANOUT: usize = 5;
+const ROOT_DIRECT_EVIDENCE_BEFORE_DELEGATION: usize = 2;
 const DEFAULT_CHILD_JOB_MAX_STEPS: usize = 24;
 const DEFAULT_CHILD_JOB_MAX_TOOL_CALLS: usize = 48;
+const UTILITY_CHILD_MAX_STEPS: usize = 4;
+const UTILITY_CHILD_MAX_TOOL_CALLS: usize = 3;
 const CHILD_JOB_POLL_INTERVAL_MS: u64 = 250;
 const SESSION_HISTORY_TURN_LIMIT: usize = 8;
 const TOOL_OUTPUT_CHAR_LIMIT: usize = 8_000;
@@ -139,6 +142,88 @@ const NON_IMPLEMENTATION_UI_INTENT_PHRASES: &[&str] = &[
     "what's your take",
     "question about",
     "ask about",
+];
+
+const ROOT_EVIDENCE_TOOLS: &[&str] = &[
+    "project.inspect",
+    "fs.list",
+    "fs.read_text",
+    "rg.search",
+    "git.status",
+    "git.diff",
+];
+
+const ROOT_EXECUTION_TOOLS: &[&str] = &["command.run", "python.run", "tests.run"];
+
+const ROOT_DIRECT_WORK_TOOLS: &[&str] = &[
+    "fs.apply_patch",
+    "fs.write_text",
+    "fs.move",
+    "fs.mkdir",
+    "git.stage_patch",
+    "github.comment",
+    "command.session.open",
+];
+
+const HEAVY_DELEGATION_PHRASES: &[&str] = &[
+    "implement",
+    "implementation",
+    "debug",
+    "fix",
+    "modify",
+    "edit",
+    "patch",
+    "test",
+    "tests",
+    "validation",
+    "open pr",
+    "open a pr",
+    "pull request",
+    "pr work",
+    "issue #",
+    "read issue",
+    "issue archaeology",
+    "thorough",
+    "investigate",
+    "investigation",
+    "codebase",
+    "repo research",
+    "repository research",
+    "multi-file",
+    "multiple files",
+    "many files",
+    "across files",
+    "across the codebase",
+    "architecture",
+    "broad search",
+    "broad repo",
+    "deep reasoning",
+];
+
+const TINY_UTILITY_CHECK_PHRASES: &[&str] = &[
+    "check",
+    "verify",
+    "confirm",
+    "status",
+    "exists",
+    "version",
+    "single",
+    "one",
+    "narrow",
+    "bounded",
+    "deterministic",
+    "signal",
+];
+
+const PROCESS_STATUS_CHECK_PHRASES: &[&str] = &[
+    "dev server",
+    "health check",
+    "localhost",
+    "listener",
+    "port",
+    "process",
+    "running",
+    "server status",
 ];
 const NON_IMPLEMENTATION_UI_INTENT_PREFIXES: &[&str] =
     &["explain ", "summarize ", "describe ", "discuss ", "review "];
@@ -444,6 +529,24 @@ async fn mark_job_ui_renderable_from_mutation(
     job_id: &str,
     reason: &str,
 ) -> Result<()> {
+    let parent_job_id = state.store.get_job(job_id)?.job.parent_job_id.clone();
+    mark_single_job_ui_renderable_from_mutation(state, job_id, reason).await?;
+    if let Some(parent_job_id) = parent_job_id.as_deref() {
+        mark_single_job_ui_renderable_from_mutation(
+            state,
+            parent_job_id,
+            &format!("Child job {job_id}: {reason}"),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn mark_single_job_ui_renderable_from_mutation(
+    state: &AppState,
+    job_id: &str,
+    reason: &str,
+) -> Result<()> {
     let detail = state.store.get_job(job_id)?;
     if detail.job.ui_renderable == "true" {
         return Ok(());
@@ -574,6 +677,624 @@ fn low_context_root_worker_max_tool_calls(session_max_tool_calls: usize) -> usiz
         0
     } else {
         session_max_tool_calls.min(LOW_CONTEXT_JOB_MAX_TOOL_CALLS)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EnforcedDelegation {
+    event_type: &'static str,
+    event_summary: String,
+    event_detail: String,
+    reason: &'static str,
+    summary: String,
+    child: ChildJobProposal,
+    intercepted_tool: Option<String>,
+    intercepted_child_count: usize,
+}
+
+fn is_root_evidence_tool(tool: &str) -> bool {
+    ROOT_EVIDENCE_TOOLS.contains(&tool)
+}
+
+fn is_root_self_service_tool(tool: &str) -> bool {
+    is_root_evidence_tool(tool)
+        || ROOT_EXECUTION_TOOLS.contains(&tool)
+        || ROOT_DIRECT_WORK_TOOLS.contains(&tool)
+}
+
+fn is_narrow_final_join_gap_tool_call(tool: &str, summary: &str, args: &Value) -> bool {
+    if !matches!(
+        tool,
+        "fs.read_text" | "git.status" | "git.diff" | "project.inspect"
+    ) {
+        return false;
+    }
+    let normalized = summary.to_ascii_lowercase();
+    if !contains_any_phrase(
+        &normalized,
+        &[
+            "child report",
+            "child result",
+            "final join",
+            "join gap",
+            "targeted validation",
+            "verify child",
+            "validate child",
+        ],
+    ) {
+        return false;
+    }
+    if tool == "fs.read_text" {
+        return args
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| {
+                let trimmed = path.trim();
+                !trimmed.is_empty() && trimmed != "." && trimmed != "/"
+            });
+    }
+    true
+}
+
+fn contains_any_phrase(text: &str, phrases: &[&str]) -> bool {
+    phrases.iter().any(|phrase| contains_phrase(text, phrase))
+}
+
+fn contains_phrase(text: &str, phrase: &str) -> bool {
+    if phrase
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return text
+            .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+            .any(|token| token == phrase);
+    }
+    text.contains(phrase)
+}
+
+fn heavy_delegation_text(parts: &[&str]) -> bool {
+    let normalized = parts
+        .iter()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("\n");
+    contains_any_phrase(&normalized, HEAVY_DELEGATION_PHRASES)
+}
+
+fn child_job_text(jobs: &[ChildJobProposal]) -> String {
+    jobs.iter()
+        .map(|job| {
+            format!(
+                "{}\n{}\n{}",
+                job.title,
+                job.prompt,
+                job.task_class.as_deref().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_heavy_delegation_request(
+    _session: &SessionSummary,
+    job: &JobSummary,
+    checkpoint_prompt: Option<&str>,
+    action_summary: &str,
+    proposed_text: &str,
+) -> bool {
+    if job.publication_requested {
+        return true;
+    }
+    heavy_delegation_text(&[
+        checkpoint_prompt.unwrap_or_default(),
+        &job.purpose,
+        &job.prompt_excerpt,
+        job.task_class.as_deref().unwrap_or_default(),
+        action_summary,
+        proposed_text,
+    ])
+}
+
+fn child_requests_utility_lane(proposal: &ChildJobProposal) -> bool {
+    proposal
+        .route_id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|route_id| route_id == ACTION_EXECUTOR_LANE)
+}
+
+fn child_requests_default_main_lane(proposal: &ChildJobProposal) -> bool {
+    proposal
+        .route_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|route_id| !route_id.is_empty())
+        .is_none()
+}
+
+fn child_job_delegation_images<'a>(
+    proposal: &ChildJobProposal,
+    delegation_images: &'a [SessionTurnImage],
+) -> &'a [SessionTurnImage] {
+    if delegation_images.is_empty() || child_requests_utility_lane(proposal) {
+        &[]
+    } else {
+        delegation_images
+    }
+}
+
+fn is_tiny_deterministic_utility_child(proposal: &ChildJobProposal) -> bool {
+    let text = format!(
+        "{}\n{}\n{}",
+        proposal.title,
+        proposal.prompt,
+        proposal.task_class.as_deref().unwrap_or_default()
+    );
+    let normalized = text.to_ascii_lowercase();
+    normalized.len() <= 700
+        && !contains_any_phrase(&normalized, HEAVY_DELEGATION_PHRASES)
+        && !contains_any_phrase(&normalized, PROCESS_STATUS_CHECK_PHRASES)
+        && contains_any_phrase(&normalized, TINY_UTILITY_CHECK_PHRASES)
+}
+
+fn root_evidence_tool_call_count(detail: &JobDetail, worker_id: &str) -> usize {
+    detail
+        .tool_calls
+        .iter()
+        .filter(|call| call.worker_id == worker_id && is_root_evidence_tool(&call.tool_id))
+        .count()
+}
+
+fn checkpoint_evidence_excerpt(checkpoint: &WorkerCheckpoint) -> String {
+    let mut snippets = checkpoint
+        .conversation
+        .iter()
+        .rev()
+        .filter(|message| message.role == "user" && message.content.starts_with("Tool result"))
+        .take(3)
+        .map(|message| excerpt(&message.content, 700))
+        .collect::<Vec<_>>();
+    snippets.reverse();
+    snippets.join("\n\n")
+}
+
+fn checkpoint_delegation_images(checkpoint: &WorkerCheckpoint) -> Vec<SessionTurnImage> {
+    if !checkpoint.images.is_empty() {
+        return checkpoint.images.clone();
+    }
+    let Some(last) = checkpoint.conversation.last() else {
+        return Vec::new();
+    };
+    if last.role != "assistant" {
+        return Vec::new();
+    }
+    if let Some(message) = checkpoint
+        .conversation
+        .iter()
+        .rev()
+        .nth(1)
+        .filter(|message| message.role == "user")
+        .and_then(checkpoint_message_delegation_images)
+    {
+        return message.to_vec();
+    }
+    let prompt = checkpoint.prompt_text.trim();
+    if prompt.is_empty() {
+        return Vec::new();
+    }
+    checkpoint
+        .conversation
+        .iter()
+        .rev()
+        .skip(1)
+        .filter_map(|message| {
+            checkpoint_message_delegation_images(message).map(|images| (message, images))
+        })
+        .find(|(message, _)| checkpoint_user_message_matches_prompt(&message.content, prompt))
+        .map(|(_, images)| images.to_vec())
+        .unwrap_or_default()
+}
+
+fn checkpoint_message_delegation_images(
+    message: &CheckpointMessage,
+) -> Option<&[SessionTurnImage]> {
+    if !message.images.is_empty() {
+        return Some(&message.images);
+    }
+    message
+        .compacted_range
+        .as_ref()
+        .map(|range| range.images.as_slice())
+        .filter(|images| !images.is_empty())
+}
+
+fn checkpoint_user_message_matches_prompt(content: &str, prompt: &str) -> bool {
+    let content = content.trim();
+    if content == prompt {
+        return true;
+    }
+    [
+        "Current user request:",
+        "User request:",
+        "Original user request:",
+    ]
+    .iter()
+    .any(|prefix| {
+        content
+            .strip_prefix(prefix)
+            .is_some_and(|rest| checkpoint_prompt_block_matches(rest, prompt))
+    }) || content
+        .split_once("Prompt-time context and user request:")
+        .is_some_and(|(_, rest)| checkpoint_prompt_block_matches(rest, prompt))
+}
+
+fn checkpoint_prompt_block_matches(content: &str, prompt: &str) -> bool {
+    let content = content.trim_start();
+    if content.trim() == prompt {
+        return true;
+    }
+    content.strip_prefix(prompt).is_some_and(|rest| {
+        rest.starts_with('\n') || rest.starts_with("\r\n") || rest.trim().is_empty()
+    })
+}
+
+fn main_delegation_child(
+    original_prompt: &str,
+    reason: &str,
+    intercepted: &str,
+    evidence_excerpt: &str,
+    task_class: Option<String>,
+) -> ChildJobProposal {
+    let evidence_section = if evidence_excerpt.trim().is_empty() {
+        "No root evidence was collected before delegation.".to_string()
+    } else {
+        format!(
+            "Root evidence already collected:\n{}",
+            evidence_excerpt.trim()
+        )
+    };
+    ChildJobProposal {
+        title: "Main work owner".to_string(),
+        prompt: format!(
+            "Original user request:\n{}\n\nDelegation reason: {}\nIntercepted root action/proposal: {}\n\n{}\n\nTask: Work on the main lane. Read the relevant repository context, reason through the request, make changes only when the original request calls for changes, run appropriate validation, and report concise results back to the root Utility Worker. The root Utility Worker remains responsible for joining child reports and completing the user-facing response.",
+            original_prompt.trim(),
+            reason,
+            intercepted.trim(),
+            evidence_section
+        ),
+        task_class,
+        working_dir: None,
+        route_id: None,
+    }
+}
+
+fn explicit_main_delegation_blocker(
+    summary: &str,
+    proposal: &ChildJobProposal,
+    child_count: usize,
+) -> EnforcedDelegation {
+    EnforcedDelegation {
+        event_type: "worker.delegation.blocked",
+        event_summary: "Main-lane delegation is unavailable.".to_string(),
+        event_detail: summary.to_string(),
+        reason: "explicit_main_child_unavailable",
+        summary: summary.to_string(),
+        child: proposal.clone(),
+        intercepted_tool: None,
+        intercepted_child_count: child_count,
+    }
+}
+
+fn delegated_task_class(
+    parent_task_class: Option<&str>,
+    jobs: &[ChildJobProposal],
+) -> Option<String> {
+    let mut explicit_classes = jobs.iter().filter_map(|proposal| {
+        proposal
+            .task_class
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    });
+    let first = explicit_classes.next();
+    if let Some(first) = first {
+        if explicit_classes.all(|value| value == first) {
+            return Some(first.to_string());
+        }
+    }
+    parent_task_class
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn build_enforced_delegation_for_tool(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &WorkerSummary,
+    checkpoint: &WorkerCheckpoint,
+    summary: &str,
+    tool: &str,
+    args: &Value,
+) -> Result<Option<EnforcedDelegation>> {
+    if worker.parent_worker_id.is_some()
+        || worker.lane != ACTION_EXECUTOR_LANE
+        || session.session.execution_mode != "act"
+        || !is_root_self_service_tool(tool)
+    {
+        return Ok(None);
+    }
+    let detail = state.store.get_job(job_id)?;
+    if is_low_context_session_job(&session.session, &detail.job) {
+        return Ok(None);
+    }
+    let has_child_jobs = !detail.child_jobs.is_empty();
+    let direct_evidence_count = root_evidence_tool_call_count(&detail, &worker.id);
+    let heavy = is_heavy_delegation_request(
+        &session.session,
+        &detail.job,
+        Some(&checkpoint.prompt_text),
+        summary,
+        tool,
+    );
+    let evidence_tool = is_root_evidence_tool(tool);
+    if has_child_jobs && is_narrow_final_join_gap_tool_call(tool, summary, args) {
+        return Ok(None);
+    }
+    if !heavy && (!evidence_tool || direct_evidence_count < ROOT_DIRECT_EVIDENCE_BEFORE_DELEGATION)
+    {
+        return Ok(None);
+    }
+
+    let reason = if heavy {
+        if evidence_tool {
+            "heavy_request_direct_evidence"
+        } else {
+            "heavy_request_direct_execution"
+        }
+    } else {
+        "root_direct_evidence_allowance_exhausted"
+    };
+    let intercepted = format!(
+        "tool_call {tool} with args {}",
+        excerpt(&args.to_string(), 500)
+    );
+    let evidence_excerpt = checkpoint_evidence_excerpt(checkpoint);
+    let child = main_delegation_child(
+        &checkpoint.prompt_text,
+        reason,
+        &intercepted,
+        &evidence_excerpt,
+        detail.job.task_class.clone(),
+    );
+    Ok(Some(EnforcedDelegation {
+        event_type: "worker.delegation.enforced",
+        event_summary: "Enforced main-lane delegation before root evidence work.".to_string(),
+        event_detail: summary.to_string(),
+        reason,
+        summary: "Delegate heavy work to the main lane".to_string(),
+        child,
+        intercepted_tool: Some(tool.to_string()),
+        intercepted_child_count: 0,
+    }))
+}
+
+fn build_escalated_delegation_for_child_jobs(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &WorkerSummary,
+    checkpoint: &WorkerCheckpoint,
+    summary: &str,
+    jobs: &[ChildJobProposal],
+) -> Result<Option<EnforcedDelegation>> {
+    if worker.parent_worker_id.is_some()
+        || worker.lane != ACTION_EXECUTOR_LANE
+        || session.session.execution_mode != "act"
+    {
+        return Ok(None);
+    }
+    let detail = state.store.get_job(job_id)?;
+    if is_low_context_session_job(&session.session, &detail.job) {
+        return Ok(None);
+    }
+    let utility_children = jobs
+        .iter()
+        .filter(|proposal| child_requests_utility_lane(proposal))
+        .collect::<Vec<_>>();
+    if utility_children.is_empty() {
+        return Ok(None);
+    }
+    let proposed_text = child_job_text(jobs);
+    let heavy = is_heavy_delegation_request(
+        &session.session,
+        &detail.job,
+        Some(&checkpoint.prompt_text),
+        summary,
+        &proposed_text,
+    );
+    let all_utility_children_are_tiny = utility_children
+        .iter()
+        .all(|proposal| is_tiny_deterministic_utility_child(proposal));
+    let has_main_child = jobs
+        .iter()
+        .any(|proposal| !child_requests_utility_lane(proposal));
+    let should_escalate = !all_utility_children_are_tiny || (heavy && !has_main_child);
+    if !should_escalate {
+        return Ok(None);
+    }
+
+    let reason = if heavy && !has_main_child {
+        "heavy_request_utility_only_fanout"
+    } else if heavy {
+        "heavy_request_broad_utility_child"
+    } else if !all_utility_children_are_tiny {
+        "non_tiny_utility_child"
+    } else {
+        "heavy_request_utility_child"
+    };
+    let main_child_seeds = jobs
+        .iter()
+        .filter(|proposal| !child_requests_utility_lane(proposal))
+        .collect::<Vec<_>>();
+    let main_child_seed = if main_child_seeds.len() == 1 {
+        main_child_seeds.first().copied()
+    } else {
+        None
+    };
+    let scoped_child_seed = main_child_seed.or_else(|| {
+        let mut scoped = jobs.iter();
+        let first = scoped.next()?;
+        let first_dir = first
+            .working_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        if scoped.all(|proposal| {
+            proposal
+                .working_dir
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                == Some(first_dir)
+        }) {
+            Some(first)
+        } else {
+            None
+        }
+    });
+    let mut child = main_delegation_child(
+        &checkpoint.prompt_text,
+        reason,
+        &format!(
+            "spawn_child_jobs proposed {} child job(s):\n{}",
+            jobs.len(),
+            excerpt(&proposed_text, 1_500)
+        ),
+        &checkpoint_evidence_excerpt(checkpoint),
+        delegated_task_class(detail.job.task_class.as_deref(), jobs),
+    );
+    if let Some(seed) = main_child_seed {
+        child.working_dir = seed.working_dir.clone();
+        child.route_id = seed.route_id.clone();
+        if seed.task_class.is_some() {
+            child.task_class = seed.task_class.clone();
+        }
+    } else if let Some(seed) = scoped_child_seed {
+        child.working_dir = seed.working_dir.clone();
+    }
+    Ok(Some(EnforcedDelegation {
+        event_type: "worker.delegation.escalated_to_main",
+        event_summary: "Escalated utility-lane child proposal to the main lane.".to_string(),
+        event_detail: summary.to_string(),
+        reason,
+        summary: "Escalate heavy work to the main lane".to_string(),
+        child,
+        intercepted_tool: None,
+        intercepted_child_count: jobs.len(),
+    }))
+}
+
+fn record_delegation_enforcement_event(
+    state: &AppState,
+    job_id: &str,
+    worker_id: &str,
+    enforcement: &EnforcedDelegation,
+) {
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: job_id.to_string(),
+        worker_id: Some(worker_id.to_string()),
+        event_type: enforcement.event_type.to_string(),
+        status: "running".to_string(),
+        summary: enforcement.event_summary.clone(),
+        detail: enforcement.event_detail.clone(),
+        data_json: json!({
+            "reason": enforcement.reason,
+            "chosen_route": "main",
+            "intercepted_tool": enforcement.intercepted_tool.clone(),
+            "intercepted_child_count": enforcement.intercepted_child_count,
+        }),
+    });
+}
+
+async fn continue_after_unavailable_main_delegation(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &mut WorkerSummary,
+    checkpoint: &mut WorkerCheckpoint,
+    step: &mut usize,
+    enforcement: &EnforcedDelegation,
+    error: anyhow::Error,
+) -> Result<LoopDisposition> {
+    let detail = format!(
+        "Main-lane delegation was required but no runnable main route was available: {}. Report this blocker to the user; do not continue broad or non-tiny work on the utility lane.",
+        error
+    );
+    checkpoint.next_prompt = Some(format!(
+        "Delegation blocker:\n{}\n\nOriginal delegation reason: {}\nRequested summary: {}",
+        detail, enforcement.reason, enforcement.summary
+    ));
+    state.store.write_worker_checkpoint(
+        &worker.id,
+        &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+    )?;
+    *step += 1;
+    *worker = state.store.update_worker(
+        &worker.id,
+        WorkerPatch {
+            state: Some("running".to_string()),
+            step_count: Some(*step),
+            last_error: Some(String::new()),
+            ..WorkerPatch::default()
+        },
+    )?;
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: job_id.to_string(),
+        worker_id: Some(worker.id.clone()),
+        event_type: "worker.delegation.blocked".to_string(),
+        status: "blocked".to_string(),
+        summary: "Main-lane delegation is unavailable.".to_string(),
+        detail,
+        data_json: json!({
+            "reason": enforcement.reason,
+            "chosen_route": "main",
+            "error": error.to_string(),
+        }),
+    });
+    publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+    publish_worker_updated(state, worker).await;
+    publish_prompt_status(
+        state,
+        &session.session,
+        worker,
+        "running",
+        "Delegation blocked",
+        "Main-lane delegation is unavailable.",
+        &[],
+    )
+    .await;
+    Ok(LoopDisposition::Continue)
+}
+
+fn child_job_limits_for_lane(lane: &str) -> ChildJobRunLimits {
+    let default_limits = ChildJobRunLimits {
+        max_steps: configured_child_job_max_steps(),
+        max_tool_calls: configured_child_job_max_tool_calls(),
+        max_wall_clock_secs: configured_job_max_wall_clock_secs(),
+    };
+    if lane == ACTION_EXECUTOR_LANE {
+        ChildJobRunLimits {
+            max_steps: default_limits.max_steps.min(UTILITY_CHILD_MAX_STEPS),
+            max_tool_calls: default_limits
+                .max_tool_calls
+                .min(UTILITY_CHILD_MAX_TOOL_CALLS),
+            max_wall_clock_secs: default_limits.max_wall_clock_secs,
+        }
+    } else {
+        default_limits
     }
 }
 
@@ -3537,6 +4258,44 @@ async fn handle_tool_call_proposal(
     tool: String,
     args: Value,
 ) -> Result<LoopDisposition> {
+    if let Some(enforcement) = build_enforced_delegation_for_tool(
+        state, session, job_id, worker, checkpoint, &summary, &tool, &args,
+    )? {
+        let delegation_images = checkpoint_delegation_images(checkpoint);
+        if let Err(error) = resolve_child_job_target_plan(
+            state,
+            &session.session,
+            &enforcement.child,
+            !delegation_images.is_empty(),
+        )
+        .await
+        {
+            return continue_after_unavailable_main_delegation(
+                state,
+                session,
+                job_id,
+                worker,
+                checkpoint,
+                step,
+                &enforcement,
+                error,
+            )
+            .await;
+        }
+        record_delegation_enforcement_event(state, job_id, &worker.id, &enforcement);
+        return handle_child_job_proposal(
+            state,
+            session,
+            job_id,
+            worker,
+            checkpoint,
+            step,
+            enforcement.summary,
+            vec![enforcement.child],
+        )
+        .await;
+    }
+
     ensure_worker_may_execute_actions(worker)?;
     *tool_calls += 1;
     let policy = policy_for_tool_with_mode(&tool, &session.session.approval_mode);
@@ -3716,6 +4475,8 @@ async fn handle_child_job_proposal(
     if worker.parent_worker_id.is_some() {
         bail!("only the root Utility Worker may spawn subtasks");
     }
+    let mut summary = summary;
+    let mut jobs = jobs;
     if jobs.is_empty() {
         bail!("spawn_child_jobs requires at least one child job");
     }
@@ -3725,17 +4486,85 @@ async fn handle_child_job_proposal(
             JOB_MAX_CHILDREN_PER_FANOUT
         );
     }
+    let delegation_images = checkpoint_delegation_images(checkpoint);
+
+    if let Some(enforcement) = build_escalated_delegation_for_child_jobs(
+        state, session, job_id, worker, checkpoint, &summary, &jobs,
+    )? {
+        if let Err(error) = resolve_child_job_target_plan(
+            state,
+            &session.session,
+            &enforcement.child,
+            !delegation_images.is_empty(),
+        )
+        .await
+        {
+            return continue_after_unavailable_main_delegation(
+                state,
+                session,
+                job_id,
+                worker,
+                checkpoint,
+                step,
+                &enforcement,
+                error,
+            )
+            .await;
+        }
+        record_delegation_enforcement_event(state, job_id, &worker.id, &enforcement);
+        summary = enforcement.summary;
+        jobs = vec![enforcement.child];
+    }
 
     let mut child_plans = Vec::with_capacity(jobs.len());
+    let mut child_image_sets = Vec::with_capacity(jobs.len());
     for proposal in &jobs {
-        child_plans.push(resolve_child_job_target_plan(state, &session.session, proposal).await?);
+        let child_images = child_job_delegation_images(proposal, &delegation_images).to_vec();
+        match resolve_child_job_target_plan(
+            state,
+            &session.session,
+            proposal,
+            !child_images.is_empty(),
+        )
+        .await
+        {
+            Ok(plan) => {
+                child_plans.push(plan);
+                child_image_sets.push(child_images);
+            }
+            Err(error) if child_requests_default_main_lane(proposal) => {
+                let enforcement = explicit_main_delegation_blocker(&summary, proposal, jobs.len());
+                return continue_after_unavailable_main_delegation(
+                    state,
+                    session,
+                    job_id,
+                    worker,
+                    checkpoint,
+                    step,
+                    &enforcement,
+                    error,
+                )
+                .await;
+            }
+            Err(error) => return Err(error),
+        }
     }
     validate_child_fanout_write_scopes(worker, &jobs, &child_plans)?;
 
     let mut child_job_ids = Vec::with_capacity(jobs.len());
-    for (proposal, target_plan) in jobs.into_iter().zip(child_plans) {
-        let child_job_id =
-            create_child_job(state, session, job_id, worker, proposal, target_plan).await?;
+    for ((proposal, target_plan), child_images) in
+        jobs.into_iter().zip(child_plans).zip(child_image_sets)
+    {
+        let child_job_id = create_child_job(
+            state,
+            session,
+            job_id,
+            worker,
+            proposal,
+            target_plan,
+            &child_images,
+        )
+        .await?;
         child_job_ids.push(child_job_id);
     }
 
@@ -4020,7 +4849,9 @@ async fn create_child_job(
     parent_worker: &WorkerSummary,
     proposal: ChildJobProposal,
     target_plan: ChildJobTargetPlan,
+    images: &[SessionTurnImage],
 ) -> Result<String> {
+    let limits = child_job_limits_for_lane(&target_plan.lane);
     create_child_job_with_limits(
         state,
         session,
@@ -4028,11 +4859,8 @@ async fn create_child_job(
         parent_worker,
         proposal,
         target_plan,
-        ChildJobRunLimits {
-            max_steps: configured_child_job_max_steps(),
-            max_tool_calls: configured_child_job_max_tool_calls(),
-            max_wall_clock_secs: configured_job_max_wall_clock_secs(),
-        },
+        limits,
+        images,
     )
     .await
 }
@@ -4054,6 +4882,7 @@ async fn resolve_child_job_target_plan(
     state: &AppState,
     session: &SessionSummary,
     proposal: &ChildJobProposal,
+    needs_vision_tools: bool,
 ) -> Result<ChildJobTargetPlan> {
     let requested_route_id = proposal
         .route_id
@@ -4067,7 +4896,7 @@ async fn resolve_child_job_target_plan(
                 state,
                 session,
                 ACTION_EXECUTOR_LANE,
-                false,
+                needs_vision_tools,
                 None,
             )
             .await
@@ -4089,11 +4918,12 @@ async fn resolve_child_job_target_plan(
             state,
             &route_session,
             MAIN_EXECUTOR_LANE,
-            false,
+            needs_vision_tools,
             Some(route_id),
         )
         .await
         .map_err(|error| anyhow!("worker_action.invalid: {}", error.message))?;
+        ensure_child_main_target_supports_images(&target, needs_vision_tools, Some(route_id))?;
         return Ok(ChildJobTargetPlan {
             lane: MAIN_EXECUTOR_LANE.to_string(),
             target,
@@ -4104,7 +4934,7 @@ async fn resolve_child_job_target_plan(
         state,
         session,
         MAIN_EXECUTOR_LANE,
-        false,
+        needs_vision_tools,
         None,
     )
     .await
@@ -4114,10 +4944,28 @@ async fn resolve_child_job_target_plan(
             error.message
         )
     })?;
+    ensure_child_main_target_supports_images(&target, needs_vision_tools, None)?;
     Ok(ChildJobTargetPlan {
         lane: MAIN_EXECUTOR_LANE.to_string(),
         target,
     })
+}
+
+fn ensure_child_main_target_supports_images(
+    target: &HiddenWorkerTarget,
+    needs_vision_tools: bool,
+    route_id: Option<&str>,
+) -> Result<()> {
+    if !needs_vision_tools || target_supports_vision_with_tools(target) {
+        return Ok(());
+    }
+    let route_label = route_id
+        .map(|id| format!("main child route '{id}'"))
+        .unwrap_or_else(|| "default main child route".to_string());
+    Err(anyhow!(
+        "worker_action.invalid: {route_label} is unavailable for image-bearing delegation: selected provider '{}' does not support vision with tools. Configure a vision-capable main model or set route_id=\"utility\" for a read-only utility child check; no automatic fallback was used.",
+        target.provider
+    ))
 }
 
 async fn create_child_job_with_limits(
@@ -4128,6 +4976,7 @@ async fn create_child_job_with_limits(
     proposal: ChildJobProposal,
     target_plan: ChildJobTargetPlan,
     limits: ChildJobRunLimits,
+    images: &[SessionTurnImage],
 ) -> Result<String> {
     let title = proposal.title.trim();
     if title.is_empty() {
@@ -4234,7 +5083,7 @@ async fn create_child_job_with_limits(
     let checkpoint = WorkerCheckpoint {
         session_id: session.session.id.clone(),
         prompt_text: prompt.to_string(),
-        images: Vec::new(),
+        images: images.to_vec(),
         conversation: vec![CheckpointMessage {
             role: "system".to_string(),
             content: worker_system_prompt(&child_worker),
@@ -12357,8 +13206,10 @@ async fn execute_rg_search_tool(worker: &WorkerSummary, args: RgSearchArgs) -> R
     command_args.push(args.pattern);
     command_args.push(target.display().to_string());
     let refs = command_args.iter().map(String::as_str).collect::<Vec<_>>();
-    let stdout = command_output("rg", &refs).await?;
-    let matches = stdout
+    let output = command_output_allowing_exit_codes("rg", &refs, &[1]).await?;
+    let no_matches = output.exit_code == Some(1);
+    let matches = output
+        .stdout
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| line.to_string())
@@ -12367,6 +13218,8 @@ async fn execute_rg_search_tool(worker: &WorkerSummary, args: RgSearchArgs) -> R
     Ok(json!({
         "path": target.display().to_string(),
         "matches": matches,
+        "status": if no_matches { "no_matches" } else { "matched" },
+        "no_matches": no_matches,
     }))
 }
 
@@ -16382,8 +17235,83 @@ async fn command_output(command: &str, args: &[&str]) -> Result<String> {
     command_output_in_dir(command, args, None).await
 }
 
+#[cfg(test)]
+static TEST_COMMAND_OVERRIDES: OnceLock<StdMutex<BTreeMap<String, PathBuf>>> = OnceLock::new();
+
+fn command_program(command: &str) -> PathBuf {
+    #[cfg(test)]
+    {
+        if let Some(path) = TEST_COMMAND_OVERRIDES
+            .get_or_init(|| StdMutex::new(BTreeMap::new()))
+            .lock()
+            .ok()
+            .and_then(|overrides| overrides.get(command).cloned())
+        {
+            return path;
+        }
+    }
+    PathBuf::from(command)
+}
+
+#[cfg(test)]
+fn set_test_command_override(command: &str, path: PathBuf) {
+    let overrides = TEST_COMMAND_OVERRIDES.get_or_init(|| StdMutex::new(BTreeMap::new()));
+    overrides
+        .lock()
+        .expect("test command overrides lock should not be poisoned")
+        .insert(command.to_string(), path);
+}
+
+#[derive(Debug)]
+struct CommandOutput {
+    stdout: String,
+    exit_code: Option<i32>,
+}
+
+async fn command_output_allowing_exit_codes(
+    command: &str,
+    args: &[&str],
+    allowed_exit_codes: &[i32],
+) -> Result<CommandOutput> {
+    let mut child = Command::new(command_program(command));
+    child.args(args);
+    if let Some(path) = command_path_env() {
+        child.env("PATH", path);
+    }
+    let output = child
+        .output()
+        .await
+        .with_context(|| format!("failed to start '{}'", command))?;
+    let exit_code = output.status.code();
+    if !output.status.success()
+        && !exit_code
+            .map(|code| allowed_exit_codes.contains(&code))
+            .unwrap_or(false)
+    {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        bail!(
+            "'{}' exited with {}{}",
+            command,
+            exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".to_string()),
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", excerpt(&detail, 240))
+            }
+        );
+    }
+    Ok(CommandOutput {
+        stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        exit_code,
+    })
+}
+
 async fn command_output_in_dir(command: &str, args: &[&str], cwd: Option<&Path>) -> Result<String> {
-    let mut child = Command::new(command);
+    let mut child = Command::new(command_program(command));
     child.args(args);
     if let Some(cwd) = cwd {
         child.current_dir(cwd);
@@ -18124,7 +19052,7 @@ Working directory: {}\n",
     }
 
     let action_shapes = if is_root_worker {
-        "{\"kind\":\"spawn_child_jobs\",\"summary\":\"broad read-only investigation delegates focused utility checks\",\"jobs\":[{\"title\":\"Map relevant evidence\",\"prompt\":\"Scope: run a read-only map of likely files, directories, and tests relevant to the request. Expected output: concise path list with reasons, not deep analysis. Join criteria: root has enough locations to interpret child reports without repeating broad exploration.\",\"task_class\":\"local_project\",\"route_id\":\"utility\"},{\"title\":\"Analyze key files\",\"prompt\":\"Scope: inspect the most relevant files for the requested question without making edits. Expected output: evidence-backed findings with key file paths and uncertainties. Join criteria: enough findings for the root to answer from child reports.\",\"task_class\":\"local_project\",\"route_id\":\"utility\"},{\"title\":\"Collect validation signals\",\"prompt\":\"Scope: run cheap read-only checks for existing tests, docs, and validation commands. Expected output: concrete validation signals and gaps. Join criteria: root can state confidence and remaining risk.\",\"task_class\":\"local_project\",\"route_id\":\"utility\"}]}\n\
+        "{\"kind\":\"spawn_child_jobs\",\"summary\":\"delegate implementation or repo research to main\",\"jobs\":[{\"title\":\"Main work owner\",\"prompt\":\"Scope: handle the requested implementation, debugging, broad repo research, validation, and concise report back to the root. Expected output: changes and validation when requested, or evidence-backed findings for read-only work. Join criteria: root can complete the user-facing answer from the child report without repeating broad exploration.\",\"task_class\":\"local_project\"}]}\n\
 {\"kind\":\"spawn_child_jobs\",\"summary\":\"run a cheap deterministic check on utility\",\"jobs\":[{\"title\":\"focused check\",\"prompt\":\"precise bounded check and expected report\",\"task_class\":\"local_project\",\"route_id\":\"utility\"}]}\n\
 {\"kind\":\"final_answer\",\"thoughts\":\"brief reason the prompt is already answerable\",\"summary\":\"why the response is complete\",\"final_answer\":\"clean user-facing answer\",\"browser_verification\":{\"status\":\"passed|failed|not_performed|unavailable\",\"summary\":\"concise Browser verification result\",\"artifact_ids\":[\"artifact-id\"]}}\n\
 {\"kind\":\"tool_call\",\"thoughts\":\"brief reason this needs targeted root triage or validation\",\"summary\":\"inspect the active project\",\"tool\":\"project.inspect\",\"args\":{}}\n\
@@ -18178,17 +19106,17 @@ Working directory: {}\n",
     let child_job_rules = if is_root_worker {
         "- You are the root Utility Worker: a lightweight coordinator that gates budgets, delegates bounded work, and joins child results.\n\
 - You do not do broad repository exploration, heavy implementation, or deep reasoning yourself when the work can be bounded for a child worker.\n\
-- Use spawn_child_jobs for heavy implementation, multi-step investigation, broad search, or work that benefits from bounded delegation.\n\
-- Use route_id=\"utility\" for broad read-only investigation and cheap deterministic child checks that should stay on the utility lane.\n\
-- For implementation, deep debugging, or work that needs main-lane reasoning/edit capability, spawn a main-lane child with no route_id only when the main route is usable; if a required main-lane child is concretely unavailable, state that blocker instead of silently doing the broad work yourself.\n\
+- Use spawn_child_jobs for heavy implementation, multi-step investigation, broad search, repo research, or work that benefits from bounded delegation.\n\
+- For implementation, debugging, broad repo research, multi-file investigation, issue archaeology, testing, or PR work, spawn one main-lane child with no route_id when the main route is usable; if a required main-lane child is concretely unavailable, state that blocker instead of silently doing the broad work yourself.\n\
+- Use route_id=\"utility\" only for cheap deterministic checks with small expected answers. Do not use utility children for broad repo research, issue archaeology, multi-file inspection, or implementation planning.\n\
 - Only root workers may fan out child jobs. Main-lane children inherit your granted tool set and bounded write scope; utility children are for read-only checks.\n\
 - When spawning write-capable sibling children, give each child a dedicated working_dir inside your scope so its write root and lock are narrowed to that path.\n\
 - Use at most 5 child jobs in a single spawn_child_jobs action.\n\
 - Multi-child main-lane fan-out must use distinct existing working_dir values from visible context or targeted triage; if the root cannot identify those directories, that is a concrete reason to do one targeted triage action before spawning.\n\
-- When full-repo read-only scope is needed, prefer 2-4 focused utility children. Use one main-lane child for full-repo scope only when the task needs implementation, deep debugging, or main-lane reasoning capability and that route is usable.\n\
+- When full-repo or multi-file scope is needed, prefer one main-lane child unless the task is only a tiny deterministic check.\n\
 - After child results satisfy the request, synthesize from their reports directly. Do not repeat the children's exploration; use direct tools only for a specific identified gap.\n\
-- Failure-case few-shot: if the user asks \"thoroughly investigate this codebase across many files\", the correct root response is one spawn_child_jobs action with 2-4 focused child jobs:\n\
-{\"kind\":\"spawn_child_jobs\",\"summary\":\"thorough read-only codebase investigation delegates focused utility checks before the root joins\",\"jobs\":[{\"title\":\"Map relevant files\",\"prompt\":\"Scope: run a read-only catalog of likely files, directories, and tests relevant to the request. Expected output: concise path list with reasons, not deep analysis. Join criteria: root has enough locations to interpret child reports without repeating broad exploration.\",\"task_class\":\"local_project\",\"route_id\":\"utility\"},{\"title\":\"Analyze key files\",\"prompt\":\"Scope: inspect the most relevant files for the requested question without making edits. Expected output: evidence-backed findings with key file paths, uncertainties, and recommended follow-up. Join criteria: enough findings for the root to answer from child reports.\",\"task_class\":\"local_project\",\"route_id\":\"utility\"},{\"title\":\"Review tests and risks\",\"prompt\":\"Scope: run cheap read-only checks for existing tests, docs, and validation commands. Expected output: concrete validation signals and gaps. Join criteria: root can state confidence and remaining risk.\",\"task_class\":\"local_project\",\"route_id\":\"utility\"}]}\n"
+- Failure-case few-shot: if the user asks \"thoroughly investigate this codebase across many files\", the correct root response is one spawn_child_jobs action with one main-lane child:\n\
+{\"kind\":\"spawn_child_jobs\",\"summary\":\"thorough codebase investigation delegates repo research to main\",\"jobs\":[{\"title\":\"Main investigation owner\",\"prompt\":\"Scope: inspect relevant files, tests, and docs across the codebase without making edits unless the original request asks for changes. Expected output: evidence-backed findings, key paths, uncertainties, and recommended validation. Join criteria: root can answer from the child report without repeating broad exploration.\",\"task_class\":\"local_project\"}]}\n"
     } else {
         ""
     };
@@ -19333,25 +20261,24 @@ mod tests {
             "root prompt should include the broad-investigation few-shot"
         );
         assert!(
-            root_prompt.contains("one spawn_child_jobs action with 2-4 focused child jobs"),
-            "root prompt few-shot should require one bounded fan-out action"
+            root_prompt.contains("one spawn_child_jobs action with one main-lane child"),
+            "root prompt few-shot should require one bounded main-lane child"
         );
         assert!(
-            root_prompt.contains("broad read-only investigation delegates focused utility checks")
-                && root_prompt.contains("Map relevant evidence")
-                && root_prompt.contains("Analyze key files")
-                && root_prompt.contains("Map relevant files")
-                && root_prompt.contains("Review tests and risks")
+            root_prompt.contains("delegate implementation or repo research to main")
+                && root_prompt.contains("Main work owner")
+                && root_prompt.contains("Main investigation owner")
+                && root_prompt.contains("run a cheap deterministic check on utility")
                 && root_prompt.contains("\"route_id\":\"utility\""),
-            "root prompt should show project-neutral utility-routed read-only investigation checks"
+            "root prompt should show main-first repo research with utility only for tiny checks"
         );
         assert!(
-            !root_prompt.contains("Full-codebase investigation lead"),
-            "read-only broad-investigation few-shot should not spawn a default main child"
+            !root_prompt.contains("broad read-only investigation delegates focused utility checks"),
+            "broad-investigation few-shot should not teach utility research fanout"
         );
         assert!(
             root_prompt.contains(
-                "spawn a main-lane child with no route_id only when the main route is usable"
+                "spawn one main-lane child with no route_id when the main route is usable"
             ),
             "root prompt should gate main-lane child guidance on route usability"
         );
@@ -19391,6 +20318,74 @@ mod tests {
             root_prompt.contains("Do not use provider-native tool wrappers"),
             "worker prompt should reject provider-native tool-call shapes"
         );
+    }
+
+    #[test]
+    fn delegation_classifier_is_conservative_about_heavy_work() {
+        assert!(heavy_delegation_text(&[
+            "Implement issue #395 with tests and validation"
+        ]));
+        assert!(heavy_delegation_text(&[
+            "thoroughly investigate this codebase across many files"
+        ]));
+        assert!(!heavy_delegation_text(&[
+            "Search one fixture for a missing token"
+        ]));
+        assert!(!heavy_delegation_text(&["Read README.md"]));
+
+        assert!(is_tiny_deterministic_utility_child(&ChildJobProposal {
+            title: "Verify README marker".to_string(),
+            prompt: "Check one bounded file existence signal.".to_string(),
+            task_class: Some("local_project".to_string()),
+            working_dir: None,
+            route_id: Some("utility".to_string()),
+        }));
+        assert!(!is_tiny_deterministic_utility_child(&ChildJobProposal {
+            title: "Verify port status".to_string(),
+            prompt: "Check one bounded port status signal.".to_string(),
+            task_class: Some("local_project".to_string()),
+            working_dir: None,
+            route_id: Some("utility".to_string()),
+        }));
+        assert!(!is_tiny_deterministic_utility_child(&ChildJobProposal {
+            title: "Verify process status".to_string(),
+            prompt: "Check whether the dev server process is running.".to_string(),
+            task_class: Some("local_project".to_string()),
+            working_dir: None,
+            route_id: Some("utility".to_string()),
+        }));
+        assert!(!is_tiny_deterministic_utility_child(&ChildJobProposal {
+            title: "Inspect implementation files".to_string(),
+            prompt: "Search the repo broadly and inspect many files for implementation points."
+                .to_string(),
+            task_class: Some("local_project".to_string()),
+            working_dir: None,
+            route_id: Some("utility".to_string()),
+        }));
+    }
+
+    #[test]
+    fn stale_session_title_does_not_force_main_delegation() {
+        let state_dir = test_state_dir("stale-session-title-not-heavy");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let (mut session, job_id, _worker) =
+            create_parent_fanout_context(&state, "stale-title", &workspace_root, "");
+        session.session.title = "Fix login bug across the repo with tests".to_string();
+        let mut job = state.store.get_job(&job_id).expect("job should load").job;
+        job.purpose = "Read one file".to_string();
+        job.prompt_excerpt = "Read README.md".to_string();
+        job.task_class = Some("local_project".to_string());
+
+        assert!(!is_heavy_delegation_request(
+            &session.session,
+            &job,
+            Some("Read README.md"),
+            "read one file",
+            "fs.read_text"
+        ));
+
+        let _ = fs::remove_dir_all(&state_dir);
     }
 
     #[test]
@@ -30301,7 +31296,7 @@ Thanks."#,
         .expect("prompt should queue");
 
         let _paused = wait_for_session_state(&state, &session_id, "paused").await;
-        assert_eq!(utility_count.load(Ordering::SeqCst), 1);
+        assert!(utility_count.load(Ordering::SeqCst) >= 1);
         assert_eq!(main_count.load(Ordering::SeqCst), 1);
         assert!(!target_file.exists(), "write must wait for approval");
         let approvals = state
@@ -30439,6 +31434,7 @@ Thanks."#,
                 working_dir: None,
                 route_id: None,
             },
+            false,
         )
         .await
         .expect_err("unavailable default main child should fail before child creation");
@@ -30448,6 +31444,93 @@ Thanks."#,
         assert!(detail.contains("default main child route is unavailable"));
         assert!(detail.contains("route_id=\"utility\""));
         assert!(detail.contains("no automatic fallback"));
+
+        let image_error = resolve_child_job_target_plan(
+            &state,
+            &session.session,
+            &ChildJobProposal {
+                title: "Default main with image".to_string(),
+                prompt: "use default main with the screenshot".to_string(),
+                task_class: None,
+                working_dir: None,
+                route_id: None,
+            },
+            true,
+        )
+        .await
+        .expect_err("image-bearing default main child should fail before child creation");
+
+        let image_detail = image_error.to_string();
+        assert!(image_detail.contains("worker_action.invalid"));
+        assert!(image_detail.contains("default main child route is unavailable"));
+        assert!(image_detail.contains("image-bearing delegation"));
+        assert!(image_detail.contains("vision with tools"));
+        assert!(image_detail.contains("no automatic fallback"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn spawn_child_jobs_default_main_unavailable_records_blocker() {
+        let state_dir = test_state_dir("spawn-child-jobs-main-unavailable-blocker");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let (mut session, job_id, mut worker) =
+            create_parent_fanout_context(&state, "main-unavailable-blocker", &workspace_root, "");
+        session.session.provider = "missing-provider".to_string();
+        session.session.model = "missing-model".to_string();
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "Implement the issue with broad repo research and validation.".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let mut step = 0;
+
+        let disposition = handle_child_job_proposal(
+            &state,
+            &session,
+            &job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            "delegate broad implementation work".to_string(),
+            vec![ChildJobProposal {
+                title: "Main implementation owner".to_string(),
+                prompt: "Handle the implementation, validation, and concise report back."
+                    .to_string(),
+                task_class: Some("local_project".to_string()),
+                working_dir: None,
+                route_id: None,
+            }],
+        )
+        .await
+        .expect("unavailable default main route should become worker-visible blocker");
+
+        assert_eq!(disposition, LoopDisposition::Continue);
+        assert_eq!(step, 1);
+        let parent = state.store.get_job(&job_id).expect("parent should load");
+        assert!(parent.child_jobs.is_empty());
+        assert!(parent.events.iter().any(|event| {
+            event.event_type == "worker.delegation.blocked"
+                && event.data_json["reason"] == "explicit_main_child_unavailable"
+                && event.data_json["chosen_route"] == "main"
+        }));
+        let persisted = state
+            .store
+            .read_worker_checkpoint(&worker.id)
+            .expect("checkpoint should load")
+            .expect("checkpoint should persist");
+        let persisted: WorkerCheckpoint =
+            serde_json::from_value(persisted).expect("checkpoint should decode");
+        let next_prompt = persisted.next_prompt.as_deref().unwrap_or_default();
+        assert!(next_prompt.contains("Main-lane delegation was required"));
+        assert!(next_prompt.contains("default main child route is unavailable"));
+        assert!(next_prompt.contains("explicit_main_child_unavailable"));
 
         let _ = fs::remove_dir_all(&state_dir);
     }
@@ -30897,6 +31980,1859 @@ Thanks."#,
     }
 
     #[tokio::test]
+    async fn rg_search_no_match_completes_without_visible_error() {
+        install_fake_rg_command();
+        let state_dir = test_state_dir("rg-search-no-match-success");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        fs::write(workspace_root.join("notes.txt"), "alpha beta gamma\n")
+            .expect("fixture should write");
+        let (utility_base_url, utility_count, _utility_bodies, utility_server) =
+            spawn_dynamic_openai_server(2, move |index, _body| {
+                if index == 0 {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"tool_call","summary":"search one fixture","tool":"rg.search","args":{"pattern":"definitely_absent_token","path":".","limit":10}}"#,
+                    )
+                } else {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"final_answer","summary":"done","final_answer":"The rg.search tool completed successfully with status no_matches and an empty matches array, so no matches were found."}"#,
+                    )
+                }
+            })
+            .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-rg-no-match-model",
+            &utility_base_url,
+            "utility-key",
+        );
+        let session_id = "rg-search-no-match-session".to_string();
+        state
+            .store
+            .create_session(test_session_record(
+                &session_id,
+                "RG no match",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            SessionPromptRequest {
+                prompt: "Search one fixture for a missing token.".to_string(),
+                images: vec![],
+                task_class: None,
+                role: "main".to_string(),
+            },
+            current,
+            "Search one fixture for a missing token.".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("prompt should queue");
+
+        let session_detail = wait_for_session_state(&state, &session_id, "active").await;
+        utility_server.await.expect("utility server should finish");
+        assert_eq!(utility_count.load(Ordering::SeqCst), 2);
+        let detail = latest_job_detail(&state, &session_id);
+        assert_eq!(detail.job.state, "completed");
+        assert_eq!(detail.job.last_error, "");
+        assert_eq!(detail.workers[0].last_error, "");
+        assert_eq!(session_detail.session.last_error, "");
+        let rg_call = detail
+            .tool_calls
+            .iter()
+            .find(|call| call.tool_id == "rg.search")
+            .expect("rg.search call should be recorded");
+        assert_eq!(rg_call.status, "completed");
+        let result = rg_call
+            .result_json
+            .as_ref()
+            .expect("rg result should persist");
+        assert_eq!(result["matches"].as_array().unwrap().len(), 0);
+        assert_eq!(result["no_matches"], true);
+        assert_eq!(result["status"], "no_matches");
+        assert!(detail.events.iter().any(|event| {
+            event.event_type == "tool.completed" && event.summary.contains("rg.search")
+        }));
+        assert!(!detail.events.iter().any(|event| {
+            event.event_type == "tool.failed" && event.detail.contains("exited with 1")
+        }));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn rg_search_real_error_records_recoverable_failure() {
+        install_fake_rg_command();
+        let state_dir = test_state_dir("rg-search-real-error");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        fs::write(workspace_root.join("notes.txt"), "alpha beta gamma\n")
+            .expect("fixture should write");
+        let (utility_base_url, utility_count, _utility_bodies, utility_server) =
+            spawn_dynamic_openai_server(2, move |index, _body| {
+                if index == 0 {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"tool_call","summary":"run invalid rg glob","tool":"rg.search","args":{"pattern":"alpha","path":".","glob":"[","limit":10}}"#,
+                    )
+                } else {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"final_answer","summary":"blocked","final_answer":"The search failed because the glob was invalid."}"#,
+                    )
+                }
+            })
+            .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-rg-error-model",
+            &utility_base_url,
+            "utility-key",
+        );
+        let session_id = "rg-search-real-error-session".to_string();
+        state
+            .store
+            .create_session(test_session_record(
+                &session_id,
+                "RG real error",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            SessionPromptRequest {
+                prompt: "Search one fixture with a supplied glob.".to_string(),
+                images: vec![],
+                task_class: None,
+                role: "main".to_string(),
+            },
+            current,
+            "Search one fixture with a supplied glob.".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("prompt should queue");
+
+        let _ = wait_for_session_state(&state, &session_id, "active").await;
+        utility_server.await.expect("utility server should finish");
+        assert_eq!(utility_count.load(Ordering::SeqCst), 2);
+        let detail = latest_job_detail(&state, &session_id);
+        let rg_call = detail
+            .tool_calls
+            .iter()
+            .find(|call| call.tool_id == "rg.search")
+            .expect("rg.search call should be recorded");
+        assert_eq!(rg_call.status, "failed");
+        assert_eq!(rg_call.error_class, "tool_error");
+        assert!(rg_call.error_detail.contains("'rg' exited with 2"));
+        assert!(detail.events.iter().any(|event| {
+            event.event_type == "tool.failed" && event.detail.contains("'rg' exited with 2")
+        }));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn heavy_root_direct_evidence_is_enforced_as_main_child() {
+        let state_dir = test_state_dir("heavy-direct-evidence-main-child");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (utility_base_url, utility_count, _utility_bodies, utility_server) =
+            spawn_dynamic_openai_server(2, move |index, _body| {
+                if index == 0 {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"tool_call","summary":"search broadly before implementation","tool":"rg.search","args":{"pattern":"delegation","path":".","limit":50}}"#,
+                    )
+                } else {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"final_answer","summary":"joined","final_answer":"Joined the main child report."}"#,
+                    )
+                }
+            })
+            .await;
+        let (main_base_url, main_count, main_bodies, main_server) =
+            spawn_dynamic_openai_server(1, |_index, _body| {
+                DynamicOpenAiProviderResponse::content(
+                    r#"{"kind":"final_answer","summary":"main done","final_answer":"Main child handled the repo work."}"#,
+                )
+            })
+            .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-heavy-direct-model",
+            &utility_base_url,
+            "utility-key",
+        );
+        let session_id = "heavy-direct-evidence-session".to_string();
+        let mut session_record =
+            test_session_record(&session_id, "Heavy direct evidence", &workspace_root);
+        session_record.model = "main-heavy-direct-model".to_string();
+        session_record.provider_base_url = main_base_url.clone();
+        session_record.provider_api_key = "main-key".to_string();
+        state
+            .store
+            .create_session(session_record)
+            .expect("session should persist");
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            SessionPromptRequest {
+                prompt: "Implement issue #395 with broad repo research, tests, and validation."
+                    .to_string(),
+                images: vec![],
+                task_class: Some("local_project".to_string()),
+                role: "main".to_string(),
+            },
+            current,
+            "Implement issue #395 with broad repo research, tests, and validation.".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("prompt should queue");
+
+        let _ = wait_for_session_state(&state, &session_id, "active").await;
+        utility_server.await.expect("utility server should finish");
+        main_server.await.expect("main server should finish");
+        assert_eq!(utility_count.load(Ordering::SeqCst), 2);
+        assert_eq!(main_count.load(Ordering::SeqCst), 1);
+        assert!(main_bodies.lock().unwrap()[0].contains("Delegation reason"));
+        let parent = latest_job_detail(&state, &session_id);
+        assert_eq!(parent.child_jobs.len(), 1);
+        let child = parent.child_jobs.first().expect("child should exist");
+        assert_eq!(child.executor_lane, MAIN_EXECUTOR_LANE);
+        assert_eq!(child.executor_model, "main-heavy-direct-model");
+        let child_detail = state.store.get_job(&child.id).expect("child should load");
+        assert_eq!(
+            child_detail.job.task_class.as_deref(),
+            Some("local_project")
+        );
+        assert!(
+            !parent
+                .tool_calls
+                .iter()
+                .any(|call| call.tool_id == "rg.search")
+        );
+        assert!(parent.events.iter().any(|event| {
+            event.event_type == "worker.delegation.enforced"
+                && event.data_json["chosen_route"] == "main"
+        }));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn heavy_root_direct_command_is_enforced_as_main_child() {
+        let state_dir = test_state_dir("heavy-direct-command-main-child");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (utility_base_url, utility_count, _utility_bodies, utility_server) =
+            spawn_dynamic_openai_server(2, move |index, _body| {
+                if index == 0 {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"tool_call","summary":"run the test suite before debugging","tool":"command.run","args":{"command":"sh","args":["-lc","cargo test --manifest-path Cargo.toml"],"cwd":".","timeout_secs":120}}"#,
+                    )
+                } else {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"final_answer","summary":"joined","final_answer":"Joined the main child report."}"#,
+                    )
+                }
+            })
+            .await;
+        let (main_base_url, main_count, main_bodies, main_server) =
+            spawn_dynamic_openai_server(1, |_index, _body| {
+                DynamicOpenAiProviderResponse::content(
+                    r#"{"kind":"final_answer","summary":"main done","final_answer":"Main child handled the failing build."}"#,
+                )
+            })
+            .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-heavy-command-model",
+            &utility_base_url,
+            "utility-key",
+        );
+        let session_id = "heavy-direct-command-session".to_string();
+        let mut session_record =
+            test_session_record(&session_id, "Heavy direct command", &workspace_root);
+        session_record.model = "main-heavy-command-model".to_string();
+        session_record.provider_base_url = main_base_url.clone();
+        session_record.provider_api_key = "main-key".to_string();
+        state
+            .store
+            .create_session(session_record)
+            .expect("session should persist");
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            SessionPromptRequest {
+                prompt: "Debug this failing build by running tests, inspecting failures, and fixing the code."
+                    .to_string(),
+                images: vec![],
+                task_class: Some("local_project".to_string()),
+                role: "main".to_string(),
+            },
+            current,
+            "Debug this failing build by running tests, inspecting failures, and fixing the code."
+                .to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("prompt should queue");
+
+        let _ = wait_for_session_state(&state, &session_id, "active").await;
+        utility_server.await.expect("utility server should finish");
+        main_server.await.expect("main server should finish");
+        assert_eq!(utility_count.load(Ordering::SeqCst), 2);
+        assert_eq!(main_count.load(Ordering::SeqCst), 1);
+        assert!(main_bodies.lock().unwrap()[0].contains("command.run"));
+        let parent = latest_job_detail(&state, &session_id);
+        assert_eq!(parent.child_jobs.len(), 1);
+        let child = parent.child_jobs.first().expect("child should exist");
+        assert_eq!(child.executor_lane, MAIN_EXECUTOR_LANE);
+        assert_eq!(child.executor_model, "main-heavy-command-model");
+        assert!(
+            !parent
+                .tool_calls
+                .iter()
+                .any(|call| call.tool_id == "command.run")
+        );
+        assert!(parent.events.iter().any(|event| {
+            event.event_type == "worker.delegation.enforced"
+                && event.data_json["reason"] == "heavy_request_direct_execution"
+        }));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn heavy_root_direct_write_is_enforced_as_main_child() {
+        let state_dir = test_state_dir("heavy-direct-write-main-child");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (utility_base_url, utility_count, _utility_bodies, utility_server) =
+            spawn_dynamic_openai_server(2, move |index, _body| {
+                if index == 0 {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"tool_call","summary":"write the implementation directly","tool":"fs.write_text","args":{"path":"src/lib.rs","content":"pub fn changed() -> bool { true }\n","create_parent_dirs":true}}"#,
+                    )
+                } else {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"final_answer","summary":"joined","final_answer":"Joined the main child report."}"#,
+                    )
+                }
+            })
+            .await;
+        let (main_base_url, main_count, main_bodies, main_server) =
+            spawn_dynamic_openai_server(1, |_index, _body| {
+                DynamicOpenAiProviderResponse::content(
+                    r#"{"kind":"final_answer","summary":"main done","final_answer":"Main child handled the implementation."}"#,
+                )
+            })
+            .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-heavy-write-model",
+            &utility_base_url,
+            "utility-key",
+        );
+        let session_id = "heavy-direct-write-session".to_string();
+        let mut session_record =
+            test_session_record(&session_id, "Heavy direct write", &workspace_root);
+        session_record.model = "main-heavy-write-model".to_string();
+        session_record.provider_base_url = main_base_url.clone();
+        session_record.provider_api_key = "main-key".to_string();
+        state
+            .store
+            .create_session(session_record)
+            .expect("session should persist");
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            SessionPromptRequest {
+                prompt: "Implement the requested code change after inspecting the repository."
+                    .to_string(),
+                images: vec![],
+                task_class: Some("local_project".to_string()),
+                role: "main".to_string(),
+            },
+            current,
+            "Implement the requested code change after inspecting the repository.".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("prompt should queue");
+
+        let _ = wait_for_session_state(&state, &session_id, "active").await;
+        utility_server.await.expect("utility server should finish");
+        main_server.await.expect("main server should finish");
+        assert_eq!(utility_count.load(Ordering::SeqCst), 2);
+        assert_eq!(main_count.load(Ordering::SeqCst), 1);
+        assert!(main_bodies.lock().unwrap()[0].contains("fs.write_text"));
+        let parent = latest_job_detail(&state, &session_id);
+        assert_eq!(parent.child_jobs.len(), 1);
+        let child = parent.child_jobs.first().expect("child should exist");
+        assert_eq!(child.executor_lane, MAIN_EXECUTOR_LANE);
+        assert_eq!(child.executor_model, "main-heavy-write-model");
+        assert!(
+            !parent
+                .tool_calls
+                .iter()
+                .any(|call| call.tool_id == "fs.write_text")
+        );
+        assert!(!workspace_root.join("src/lib.rs").exists());
+        assert!(parent.events.iter().any(|event| {
+            event.event_type == "worker.delegation.enforced"
+                && event.data_json["reason"] == "heavy_request_direct_execution"
+        }));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn delegated_ui_mutation_marks_parent_browser_verification_required() {
+        let state_dir = test_state_dir("delegated-ui-mutation-marks-parent");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        fs::create_dir_all(workspace_root.join("src")).expect("fixture src should exist");
+        fs::write(
+            workspace_root.join("Cargo.toml"),
+            "[package]\nname = \"delegated-ui-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("fixture manifest should write");
+        fs::write(workspace_root.join("src/lib.rs"), "pub fn fixture() {}\n")
+            .expect("fixture lib should write");
+        let (utility_base_url, utility_count, _utility_bodies, utility_server) =
+            spawn_dynamic_openai_server(2, move |index, _body| {
+                if index == 0 {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"tool_call","summary":"write the Svelte file directly","tool":"fs.write_text","args":{"path":"apps/web/src/App.svelte","content":"<main>Changed</main>\n","create_parent_dirs":true}}"#,
+                    )
+                } else {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"final_answer","summary":"joined","final_answer":"Joined the main child report.","validation_status":"passed","browser_verification":{"status":"passed","summary":"The unit test simulates rendered browser verification.","artifact_ids":[]}}"#,
+                    )
+                }
+            })
+            .await;
+        let (main_base_url, main_count, _main_bodies, main_server) =
+            spawn_dynamic_openai_server(3, move |index, _body| {
+                if index == 0 {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"tool_call","summary":"write delegated Svelte change","tool":"fs.write_text","args":{"path":"apps/web/src/App.svelte","content":"<main>Changed</main>\n","create_parent_dirs":true}}"#,
+                    )
+                } else if index == 1 {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"tool_call","summary":"validate delegated UI change","tool":"command.run","args":{"command":"cargo","args":["test","--manifest-path","Cargo.toml"],"cwd":".","timeout_secs":60}}"#,
+                    )
+                } else {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"final_answer","summary":"main done","final_answer":"Main child wrote the Svelte file.","validation_status":"passed","browser_verification":{"status":"passed","summary":"The unit test simulates rendered browser verification.","artifact_ids":[]}}"#,
+                    )
+                }
+            })
+            .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-delegated-ui-write-model",
+            &utility_base_url,
+            "utility-key",
+        );
+        let session_id = "delegated-ui-mutation-session".to_string();
+        let mut session_record =
+            test_session_record(&session_id, "Delegated Svelte mutation", &workspace_root);
+        session_record.model = "main-delegated-ui-write-model".to_string();
+        session_record.provider_base_url = main_base_url.clone();
+        session_record.provider_api_key = "main-key".to_string();
+        session_record.approval_mode = "trusted".to_string();
+        state
+            .store
+            .create_session(session_record)
+            .expect("session should persist");
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+
+        let prompt = "Implement the requested UI change in apps/web/src/App.svelte after inspecting the repository."
+            .to_string();
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            SessionPromptRequest {
+                prompt: prompt.clone(),
+                images: vec![],
+                task_class: Some("local_project".to_string()),
+                role: "main".to_string(),
+            },
+            current,
+            prompt,
+            "main".to_string(),
+        )
+        .await
+        .expect("prompt should queue");
+
+        let _ = wait_for_session_state(&state, &session_id, "active").await;
+        utility_server.await.expect("utility server should finish");
+        main_server.await.expect("main server should finish");
+        assert_eq!(utility_count.load(Ordering::SeqCst), 2);
+        assert_eq!(main_count.load(Ordering::SeqCst), 3);
+        assert!(workspace_root.join("apps/web/src/App.svelte").exists());
+        let parent = latest_job_detail(&state, &session_id);
+        assert_eq!(parent.child_jobs.len(), 1);
+        assert_eq!(parent.job.ui_renderable, "true");
+        assert!(parent.job.browser_verification_required);
+        let child = parent.child_jobs.first().expect("child should exist");
+        assert_eq!(child.executor_lane, MAIN_EXECUTOR_LANE);
+        let child_detail = state.store.get_job(&child.id).expect("child should load");
+        assert_eq!(child_detail.job.ui_renderable, "true");
+        assert!(child_detail.job.browser_verification_required);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn heavy_post_child_root_write_is_still_enforced_as_main_child() {
+        let state_dir = test_state_dir("post-child-root-write-enforced");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, job_id, worker) =
+            create_parent_fanout_context(&state, "post-child-write", &workspace_root, "");
+        state
+            .store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    task_class: Some(Some("local_project".to_string())),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("parent job task class should update");
+        create_manual_child_jobs(&state, &session.session.id, &job_id, 1);
+        let checkpoint = test_checkpoint_with_prompt(
+            "Implement the requested feature after repo research and validation.",
+        );
+
+        let enforcement = build_enforced_delegation_for_tool(
+            &state,
+            &session,
+            &job_id,
+            &worker,
+            &checkpoint,
+            "write final implementation directly after child report",
+            "fs.write_text",
+            &json!({"path":"src/lib.rs","content":"pub fn changed() {}\n","create_parent_dirs":true}),
+        )
+        .expect("enforcement should evaluate")
+        .expect("heavy post-child root write should still delegate");
+
+        assert_eq!(enforcement.reason, "heavy_request_direct_execution");
+        assert_eq!(
+            enforcement.intercepted_tool.as_deref(),
+            Some("fs.write_text")
+        );
+        assert!(enforcement.child.route_id.is_none());
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn post_child_targeted_join_gap_read_remains_allowed() {
+        let state_dir = test_state_dir("post-child-join-gap-read-allowed");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, job_id, worker) =
+            create_parent_fanout_context(&state, "post-child-join-read", &workspace_root, "");
+        state
+            .store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    task_class: Some(Some("local_project".to_string())),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("parent job task class should update");
+        create_manual_child_jobs(&state, &session.session.id, &job_id, 1);
+        let checkpoint = test_checkpoint_with_prompt(
+            "Implement the requested feature after repo research and validation.",
+        );
+
+        let enforcement = build_enforced_delegation_for_tool(
+            &state,
+            &session,
+            &job_id,
+            &worker,
+            &checkpoint,
+            "Read one file cited by the child report for the final join gap",
+            "fs.read_text",
+            &json!({"path":"src/lib.rs"}),
+        )
+        .expect("enforcement should evaluate");
+
+        assert!(enforcement.is_none());
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn heavy_utility_child_fanout_is_escalated_to_main() {
+        let state_dir = test_state_dir("heavy-utility-fanout-escalates");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let spawn_action = json!({
+            "kind": "spawn_child_jobs",
+            "summary": "fan out repo research on utility",
+            "jobs": [
+                {"title": "Read issue and repo", "prompt": "Inspect issue #161, search the repo broadly, and plan implementation work.", "task_class": "local_project", "working_dir": null, "route_id": "utility"},
+                {"title": "Inspect helpers", "prompt": "Run broad rg.search and fs.read_text across many files to find implementation points.", "task_class": "local_project", "working_dir": null, "route_id": "utility"}
+            ],
+        })
+        .to_string();
+        let (utility_base_url, utility_count, _utility_bodies, utility_server) =
+            spawn_dynamic_openai_server(2, move |index, _body| {
+                if index == 0 {
+                    DynamicOpenAiProviderResponse::content(spawn_action.clone())
+                } else {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"final_answer","summary":"joined","final_answer":"Joined the main child report."}"#,
+                    )
+                }
+            })
+            .await;
+        let (main_base_url, main_count, main_bodies, main_server) =
+            spawn_dynamic_openai_server(1, |_index, _body| {
+                DynamicOpenAiProviderResponse::content(
+                    r#"{"kind":"final_answer","summary":"main done","final_answer":"Main child handled the implementation research."}"#,
+                )
+            })
+            .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-heavy-fanout-model",
+            &utility_base_url,
+            "utility-key",
+        );
+        let session_id = "heavy-utility-fanout-session".to_string();
+        let mut session_record =
+            test_session_record(&session_id, "Heavy utility fanout", &workspace_root);
+        session_record.model = "main-heavy-fanout-model".to_string();
+        session_record.provider_base_url = main_base_url.clone();
+        session_record.provider_api_key = "main-key".to_string();
+        state
+            .store
+            .create_session(session_record)
+            .expect("session should persist");
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+        let long_prompt = format!(
+            "Implement issue #161 after broad repo research, tests, and PR preparation. {} Final constraint: preserve the delayed-constraint marker in the delegated main child prompt.",
+            "Keep reading the full request before acting. ".repeat(8)
+        );
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            SessionPromptRequest {
+                prompt: long_prompt.clone(),
+                images: vec![],
+                task_class: Some("local_project".to_string()),
+                role: "main".to_string(),
+            },
+            current,
+            long_prompt,
+            "main".to_string(),
+        )
+        .await
+        .expect("prompt should queue");
+
+        let _ = wait_for_session_state(&state, &session_id, "active").await;
+        utility_server.await.expect("utility server should finish");
+        main_server.await.expect("main server should finish");
+        assert_eq!(utility_count.load(Ordering::SeqCst), 2);
+        assert_eq!(main_count.load(Ordering::SeqCst), 1);
+        assert!(main_bodies.lock().unwrap()[0].contains("spawn_child_jobs proposed 2"));
+        assert!(main_bodies.lock().unwrap()[0].contains("delayed-constraint marker"));
+        assert!(main_bodies.lock().unwrap()[0].contains("Inspect issue #161"));
+        let parent = latest_job_detail(&state, &session_id);
+        assert_eq!(parent.child_jobs.len(), 1);
+        let child = parent.child_jobs.first().expect("child should exist");
+        assert_eq!(child.executor_lane, MAIN_EXECUTOR_LANE);
+        assert_eq!(child.executor_model, "main-heavy-fanout-model");
+        assert!(
+            !parent
+                .child_jobs
+                .iter()
+                .any(|child| child.executor_lane == ACTION_EXECUTOR_LANE)
+        );
+        assert!(parent.events.iter().any(|event| {
+            event.event_type == "worker.delegation.escalated_to_main"
+                && event.data_json["intercepted_child_count"] == 2
+        }));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn escalated_utility_only_fanout_preserves_scoped_working_dir() {
+        let state_dir = test_state_dir("utility-only-escalation-preserves-scope");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        create_child_workdirs(&workspace_root, 1);
+        let (session, job_id, mut worker) =
+            create_parent_fanout_context(&state, "utility-scope-escalation", &workspace_root, "");
+        state
+            .store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    task_class: Some(Some("local_project".to_string())),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("parent job task class should update");
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "Implement the scoped package change with repo research and validation."
+                .to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let mut step = 0;
+
+        handle_child_job_proposal(
+            &state,
+            &session,
+            &job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            "fan out scoped utility work".to_string(),
+            vec![ChildJobProposal {
+                title: "Scoped utility research".to_string(),
+                prompt: "Search the scoped package broadly for implementation points.".to_string(),
+                task_class: Some("local_project".to_string()),
+                working_dir: Some("child-0".to_string()),
+                route_id: Some("utility".to_string()),
+            }],
+        )
+        .await
+        .expect("utility-only fanout should escalate while preserving scope");
+
+        let parent = state.store.get_job(&job_id).expect("parent should load");
+        assert_eq!(parent.child_jobs.len(), 1);
+        let child = parent.child_jobs.first().expect("child should exist");
+        assert_eq!(child.executor_lane, MAIN_EXECUTOR_LANE);
+        assert_eq!(child.executor_route_id, "");
+        let child_detail = state.store.get_job(&child.id).expect("child should load");
+        let child_worker = child_detail.workers.first().expect("worker should exist");
+        assert_eq!(child_worker.lane, MAIN_EXECUTOR_LANE);
+        assert!(child_worker.working_dir.ends_with("/child-0"));
+        assert_eq!(
+            child_worker.read_roots,
+            vec![child_worker.working_dir.clone()]
+        );
+        assert_eq!(
+            child_worker.write_roots,
+            vec![child_worker.working_dir.clone()]
+        );
+        assert!(parent.events.iter().any(|event| {
+            event.event_type == "worker.delegation.escalated_to_main"
+                && event.data_json["chosen_route"] == "main"
+        }));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn escalated_utility_fanout_keeps_parent_scope_when_any_child_unscoped() {
+        let state_dir = test_state_dir("utility-escalation-mixed-scope-keeps-parent");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        create_child_workdirs(&workspace_root, 1);
+        let (session, job_id, mut worker) =
+            create_parent_fanout_context(&state, "utility-mixed-scope", &workspace_root, "");
+        state
+            .store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    task_class: Some(Some("local_project".to_string())),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("parent job task class should update");
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "Implement the package and workspace changes with repo research."
+                .to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let mut step = 0;
+
+        handle_child_job_proposal(
+            &state,
+            &session,
+            &job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            "fan out mixed scoped utility work".to_string(),
+            vec![
+                ChildJobProposal {
+                    title: "Scoped utility research".to_string(),
+                    prompt: "Search one scoped package broadly for implementation points."
+                        .to_string(),
+                    task_class: Some("local_project".to_string()),
+                    working_dir: Some("child-0".to_string()),
+                    route_id: Some("utility".to_string()),
+                },
+                ChildJobProposal {
+                    title: "Workspace utility research".to_string(),
+                    prompt: "Search the broader workspace for integration points.".to_string(),
+                    task_class: Some("local_project".to_string()),
+                    working_dir: None,
+                    route_id: Some("utility".to_string()),
+                },
+            ],
+        )
+        .await
+        .expect("mixed scoped utility fanout should escalate without narrowing");
+
+        let parent = state.store.get_job(&job_id).expect("parent should load");
+        assert_eq!(parent.child_jobs.len(), 1);
+        let child = parent.child_jobs.first().expect("child should exist");
+        assert_eq!(child.executor_lane, MAIN_EXECUTOR_LANE);
+        let child_detail = state.store.get_job(&child.id).expect("child should load");
+        let child_worker = child_detail.workers.first().expect("worker should exist");
+        assert_eq!(
+            child_worker.working_dir,
+            workspace_root.display().to_string()
+        );
+        assert_eq!(child_worker.read_roots, worker.read_roots);
+        assert_eq!(child_worker.write_roots, worker.write_roots);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn escalated_utility_fanout_preserves_checkpoint_images() {
+        let state_dir = test_state_dir("escalated-utility-fanout-preserves-images");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let (session, job_id, mut worker) =
+            create_parent_fanout_context(&state, "image-escalation", &workspace_root, "");
+        state
+            .store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    task_class: Some(Some("local_project".to_string())),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("parent job task class should update");
+        let attached = test_image("screenshot.png");
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text:
+                "Fix the UI bug shown in the screenshot after repo research and validation."
+                    .to_string(),
+            images: Vec::new(),
+            conversation: vec![
+                CheckpointMessage {
+                    role: "user".to_string(),
+                    content: "Fix the UI bug shown in the screenshot.".to_string(),
+                    images: vec![attached.clone()],
+                    compacted: false,
+                    compacted_range: None,
+                },
+                CheckpointMessage {
+                    role: "assistant".to_string(),
+                    content: "Delegating the screenshot-driven repo fix.".to_string(),
+                    images: Vec::new(),
+                    compacted: false,
+                    compacted_range: None,
+                },
+            ],
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let mut step = 0;
+
+        handle_child_job_proposal(
+            &state,
+            &session,
+            &job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            "fan out screenshot utility research".to_string(),
+            vec![ChildJobProposal {
+                title: "Broad utility screenshot research".to_string(),
+                prompt: "Search the repo broadly to fix the screenshot-driven UI bug.".to_string(),
+                task_class: Some("local_project".to_string()),
+                working_dir: None,
+                route_id: Some("utility".to_string()),
+            }],
+        )
+        .await
+        .expect("utility screenshot fanout should escalate");
+
+        let parent = state.store.get_job(&job_id).expect("parent should load");
+        assert_eq!(parent.child_jobs.len(), 1);
+        let child = parent.child_jobs.first().expect("child should exist");
+        assert_eq!(child.executor_lane, MAIN_EXECUTOR_LANE);
+        let child_detail = state.store.get_job(&child.id).expect("child should load");
+        assert_eq!(
+            child_detail.job.task_class.as_deref(),
+            Some("local_project")
+        );
+        let child_worker = child_detail.workers.first().expect("worker should exist");
+        let child_checkpoint = state
+            .store
+            .read_worker_checkpoint(&child_worker.id)
+            .expect("child checkpoint should load")
+            .expect("child checkpoint should exist");
+        let child_checkpoint: WorkerCheckpoint =
+            serde_json::from_value(child_checkpoint).expect("child checkpoint should decode");
+        assert_eq!(child_checkpoint.images, vec![attached]);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn checkpoint_delegation_images_ignore_stale_substring_prompt_match() {
+        let stale = test_image("old-fix-screenshot.png");
+        let checkpoint = WorkerCheckpoint {
+            session_id: "substring-image-session".to_string(),
+            prompt_text: "Fix".to_string(),
+            images: Vec::new(),
+            conversation: vec![
+                CheckpointMessage {
+                    role: "user".to_string(),
+                    content: "Fix the screenshot-rendered layout from the old turn.".to_string(),
+                    images: vec![stale],
+                    compacted: false,
+                    compacted_range: None,
+                },
+                CheckpointMessage {
+                    role: "assistant".to_string(),
+                    content: "Acknowledged the old screenshot task.".to_string(),
+                    images: Vec::new(),
+                    compacted: false,
+                    compacted_range: None,
+                },
+                CheckpointMessage {
+                    role: "user".to_string(),
+                    content: "Fix".to_string(),
+                    images: Vec::new(),
+                    compacted: false,
+                    compacted_range: None,
+                },
+                CheckpointMessage {
+                    role: "assistant".to_string(),
+                    content: "Delegating the current text-only task.".to_string(),
+                    images: Vec::new(),
+                    compacted: false,
+                    compacted_range: None,
+                },
+            ],
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+
+        assert!(checkpoint_delegation_images(&checkpoint).is_empty());
+    }
+
+    #[test]
+    fn checkpoint_delegation_images_preserve_initial_prompt_wrapper_image() {
+        let attached = test_image("wrapped-fix-screenshot.png");
+        let prompt_text = "Fix the UI bug shown in this screenshot.";
+        let checkpoint = WorkerCheckpoint {
+            session_id: "wrapped-image-session".to_string(),
+            prompt_text: prompt_text.to_string(),
+            images: Vec::new(),
+            conversation: vec![
+                CheckpointMessage {
+                    role: "user".to_string(),
+                    content: format!(
+                        "You are handling a Nucleus-owned session prompt.\n\
+Prompt-time context and user request:\n{prompt_text}\n\
+Return one JSON action for the next step."
+                    ),
+                    images: vec![attached.clone()],
+                    compacted: false,
+                    compacted_range: None,
+                },
+                CheckpointMessage {
+                    role: "assistant".to_string(),
+                    content: "Reading one file before delegation.".to_string(),
+                    images: Vec::new(),
+                    compacted: false,
+                    compacted_range: None,
+                },
+                CheckpointMessage {
+                    role: "user".to_string(),
+                    content: "Tool fs.read_text completed with repo triage evidence.".to_string(),
+                    images: Vec::new(),
+                    compacted: false,
+                    compacted_range: None,
+                },
+                CheckpointMessage {
+                    role: "assistant".to_string(),
+                    content: "Delegating the screenshot-driven task.".to_string(),
+                    images: Vec::new(),
+                    compacted: false,
+                    compacted_range: None,
+                },
+            ],
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+
+        assert_eq!(checkpoint_delegation_images(&checkpoint), vec![attached]);
+    }
+
+    #[test]
+    fn checkpoint_delegation_images_preserve_compacted_prompt_range_image() {
+        let attached = test_image("compacted-fix-screenshot.png");
+        let prompt_text = "Fix the UI bug shown in this screenshot.";
+        let checkpoint = WorkerCheckpoint {
+            session_id: "compacted-image-session".to_string(),
+            prompt_text: prompt_text.to_string(),
+            images: Vec::new(),
+            conversation: vec![
+                CheckpointMessage {
+                    role: "system".to_string(),
+                    content: format!(
+                        "[Compacted: conversation-1..conversation-9]\n\n\
+Prompt-time context and user request:\n{prompt_text}\n\
+Return one JSON action for the next step."
+                    ),
+                    images: Vec::new(),
+                    compacted: true,
+                    compacted_range: Some(CompactedRange {
+                        turn_id_start: "conversation-1".to_string(),
+                        turn_id_end: "conversation-9".to_string(),
+                        images: vec![attached.clone()],
+                    }),
+                },
+                CheckpointMessage {
+                    role: "user".to_string(),
+                    content: "Tool fs.read_text completed with repo triage evidence.".to_string(),
+                    images: Vec::new(),
+                    compacted: false,
+                    compacted_range: None,
+                },
+                CheckpointMessage {
+                    role: "assistant".to_string(),
+                    content: "Delegating the compacted screenshot-driven task.".to_string(),
+                    images: Vec::new(),
+                    compacted: false,
+                    compacted_range: None,
+                },
+            ],
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+
+        assert_eq!(checkpoint_delegation_images(&checkpoint), vec![attached]);
+    }
+
+    #[tokio::test]
+    async fn escalated_utility_fanout_preserves_current_images_after_root_triage() {
+        let state_dir = test_state_dir("escalated-utility-fanout-preserves-triage-images");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let (session, job_id, mut worker) =
+            create_parent_fanout_context(&state, "triage-image-escalation", &workspace_root, "");
+        state
+            .store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    task_class: Some(Some("local_project".to_string())),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("parent job task class should update");
+        let attached = test_image("triage-screenshot.png");
+        let prompt_text = "Fix the UI bug shown in the screenshot after repo triage.";
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: prompt_text.to_string(),
+            images: Vec::new(),
+            conversation: vec![
+                CheckpointMessage {
+                    role: "user".to_string(),
+                    content: format!("Current user request:\n{prompt_text}"),
+                    images: vec![attached.clone()],
+                    compacted: false,
+                    compacted_range: None,
+                },
+                CheckpointMessage {
+                    role: "assistant".to_string(),
+                    content: "Inspecting one file before delegation.".to_string(),
+                    images: Vec::new(),
+                    compacted: false,
+                    compacted_range: None,
+                },
+                CheckpointMessage {
+                    role: "user".to_string(),
+                    content: "Tool fs.read_text completed with repo triage evidence.".to_string(),
+                    images: Vec::new(),
+                    compacted: false,
+                    compacted_range: None,
+                },
+                CheckpointMessage {
+                    role: "assistant".to_string(),
+                    content: "Delegating the screenshot-driven repo fix.".to_string(),
+                    images: Vec::new(),
+                    compacted: false,
+                    compacted_range: None,
+                },
+            ],
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let mut step = 0;
+
+        handle_child_job_proposal(
+            &state,
+            &session,
+            &job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            "fan out screenshot utility research after triage".to_string(),
+            vec![ChildJobProposal {
+                title: "Broad utility screenshot research".to_string(),
+                prompt: "Search the repo broadly to fix the screenshot-driven UI bug.".to_string(),
+                task_class: Some("local_project".to_string()),
+                working_dir: None,
+                route_id: Some("utility".to_string()),
+            }],
+        )
+        .await
+        .expect("utility screenshot fanout should escalate");
+
+        let parent = state.store.get_job(&job_id).expect("parent should load");
+        assert_eq!(parent.child_jobs.len(), 1);
+        let child = parent.child_jobs.first().expect("child should exist");
+        assert_eq!(child.executor_lane, MAIN_EXECUTOR_LANE);
+        let child_detail = state.store.get_job(&child.id).expect("child should load");
+        assert_eq!(
+            child_detail.job.task_class.as_deref(),
+            Some("local_project")
+        );
+        let child_worker = child_detail.workers.first().expect("worker should exist");
+        let child_checkpoint = state
+            .store
+            .read_worker_checkpoint(&child_worker.id)
+            .expect("child checkpoint should load")
+            .expect("child checkpoint should exist");
+        let child_checkpoint: WorkerCheckpoint =
+            serde_json::from_value(child_checkpoint).expect("child checkpoint should decode");
+        assert_eq!(child_checkpoint.images, vec![attached]);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn mixed_image_fanout_keeps_utility_child_text_only() {
+        let state_dir = test_state_dir("mixed-image-fanout-utility-text-only");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let (session, job_id, mut worker) =
+            create_parent_fanout_context(&state, "mixed-image-fanout", &workspace_root, "");
+        let attached = test_image("mixed-fanout-screenshot.png");
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "Fix the UI bug shown in this screenshot and run a cheap repo check."
+                .to_string(),
+            images: vec![attached.clone()],
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let mut step = 0;
+
+        handle_child_job_proposal(
+            &state,
+            &session,
+            &job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            "fan out screenshot fix and cheap check".to_string(),
+            vec![
+                ChildJobProposal {
+                    title: "Main screenshot fix".to_string(),
+                    prompt: "Fix the UI bug shown in the screenshot and report validation."
+                        .to_string(),
+                    task_class: Some("local_project".to_string()),
+                    working_dir: None,
+                    route_id: None,
+                },
+                ChildJobProposal {
+                    title: "focused check".to_string(),
+                    prompt: "Report whether package.json exists.".to_string(),
+                    task_class: Some("local_project".to_string()),
+                    working_dir: None,
+                    route_id: Some("utility".to_string()),
+                },
+            ],
+        )
+        .await
+        .expect("mixed image fanout should spawn children");
+
+        let parent = state.store.get_job(&job_id).expect("parent should load");
+        assert_eq!(parent.child_jobs.len(), 2);
+        let mut saw_main = false;
+        let mut saw_utility = false;
+        for child in &parent.child_jobs {
+            let child_detail = state.store.get_job(&child.id).expect("child should load");
+            let child_worker = child_detail.workers.first().expect("worker should exist");
+            let child_checkpoint = state
+                .store
+                .read_worker_checkpoint(&child_worker.id)
+                .expect("child checkpoint should load")
+                .expect("child checkpoint should exist");
+            let child_checkpoint: WorkerCheckpoint =
+                serde_json::from_value(child_checkpoint).expect("child checkpoint should decode");
+            if child.executor_lane == MAIN_EXECUTOR_LANE {
+                saw_main = true;
+                assert_eq!(child_checkpoint.images, vec![attached.clone()]);
+            } else if child.executor_lane == ACTION_EXECUTOR_LANE {
+                saw_utility = true;
+                assert!(child_checkpoint.images.is_empty());
+            }
+        }
+        assert!(saw_main);
+        assert!(saw_utility);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn escalated_utility_fanout_ignores_stale_history_images() {
+        let state_dir = test_state_dir("escalated-utility-fanout-ignores-stale-images");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let (session, job_id, mut worker) =
+            create_parent_fanout_context(&state, "stale-image-escalation", &workspace_root, "");
+        state
+            .store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    task_class: Some(Some("local_project".to_string())),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("parent job task class should update");
+        let stale = test_image("old-screenshot.png");
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "Implement the text-only repo task after research and validation."
+                .to_string(),
+            images: Vec::new(),
+            conversation: vec![
+                CheckpointMessage {
+                    role: "user".to_string(),
+                    content: "Earlier screenshot for a different task.".to_string(),
+                    images: vec![stale],
+                    compacted: false,
+                    compacted_range: None,
+                },
+                CheckpointMessage {
+                    role: "assistant".to_string(),
+                    content: "Acknowledged.".to_string(),
+                    images: Vec::new(),
+                    compacted: false,
+                    compacted_range: None,
+                },
+                CheckpointMessage {
+                    role: "user".to_string(),
+                    content: "Now implement the text-only repo task.".to_string(),
+                    images: Vec::new(),
+                    compacted: false,
+                    compacted_range: None,
+                },
+                CheckpointMessage {
+                    role: "assistant".to_string(),
+                    content: "Delegating the repo task.".to_string(),
+                    images: Vec::new(),
+                    compacted: false,
+                    compacted_range: None,
+                },
+            ],
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let mut step = 0;
+
+        handle_child_job_proposal(
+            &state,
+            &session,
+            &job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            "fan out broad utility repo research".to_string(),
+            vec![ChildJobProposal {
+                title: "Broad utility repo research".to_string(),
+                prompt: "Search the repo broadly and implement the requested fix.".to_string(),
+                task_class: Some("local_project".to_string()),
+                working_dir: None,
+                route_id: Some("utility".to_string()),
+            }],
+        )
+        .await
+        .expect("utility repo fanout should escalate");
+
+        let parent = state.store.get_job(&job_id).expect("parent should load");
+        assert_eq!(parent.child_jobs.len(), 1);
+        let child = parent.child_jobs.first().expect("child should exist");
+        assert_eq!(child.executor_lane, MAIN_EXECUTOR_LANE);
+        let child_detail = state.store.get_job(&child.id).expect("child should load");
+        assert_eq!(
+            child_detail.job.task_class.as_deref(),
+            Some("local_project")
+        );
+        let child_worker = child_detail.workers.first().expect("worker should exist");
+        let child_checkpoint = state
+            .store
+            .read_worker_checkpoint(&child_worker.id)
+            .expect("child checkpoint should load")
+            .expect("child checkpoint should exist");
+        let child_checkpoint: WorkerCheckpoint =
+            serde_json::from_value(child_checkpoint).expect("child checkpoint should decode");
+        assert!(child_checkpoint.images.is_empty());
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn tiny_deterministic_utility_child_remains_allowed_and_bounded() {
+        let state_dir = test_state_dir("tiny-utility-child-allowed");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let (session, job_id, mut worker) =
+            create_parent_fanout_context(&state, "tiny-utility-child", &workspace_root, "");
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "verify one process status".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let mut step = 0;
+
+        handle_child_job_proposal(
+            &state,
+            &session,
+            &job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            "run one deterministic utility check".to_string(),
+            vec![ChildJobProposal {
+                title: "Verify README marker".to_string(),
+                prompt: "Verify one bounded file existence signal and report yes or no."
+                    .to_string(),
+                task_class: Some("local_project".to_string()),
+                working_dir: None,
+                route_id: Some("utility".to_string()),
+            }],
+        )
+        .await
+        .expect("tiny utility child should be accepted");
+
+        let parent = state.store.get_job(&job_id).expect("parent should load");
+        assert_eq!(parent.child_jobs.len(), 1);
+        let child = parent.child_jobs.first().expect("child should exist");
+        assert_eq!(child.executor_lane, ACTION_EXECUTOR_LANE);
+        let child_detail = state.store.get_job(&child.id).expect("child should load");
+        let child_worker = child_detail.workers.first().expect("worker should exist");
+        assert_eq!(child_worker.lane, ACTION_EXECUTOR_LANE);
+        assert_eq!(child_worker.max_steps, UTILITY_CHILD_MAX_STEPS);
+        assert_eq!(child_worker.max_tool_calls, UTILITY_CHILD_MAX_TOOL_CALLS);
+        assert!(
+            !parent
+                .events
+                .iter()
+                .any(|event| event.event_type == "worker.delegation.escalated_to_main")
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn process_status_utility_child_is_escalated_to_main() {
+        let state_dir = test_state_dir("process-status-utility-child-escalates");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let (session, job_id, mut worker) =
+            create_parent_fanout_context(&state, "process-status-child", &workspace_root, "");
+        state
+            .store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    task_class: Some(Some("local_project".to_string())),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("parent job task class should update");
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "verify one server process status".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let mut step = 0;
+
+        handle_child_job_proposal(
+            &state,
+            &session,
+            &job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            "run one process status check".to_string(),
+            vec![ChildJobProposal {
+                title: "Verify process status".to_string(),
+                prompt: "Check whether the dev server process is running.".to_string(),
+                task_class: Some("local_project".to_string()),
+                working_dir: None,
+                route_id: Some("utility".to_string()),
+            }],
+        )
+        .await
+        .expect("process status utility child should be escalated");
+
+        let parent = state.store.get_job(&job_id).expect("parent should load");
+        assert_eq!(parent.child_jobs.len(), 1);
+        let child = parent.child_jobs.first().expect("child should exist");
+        assert_eq!(child.executor_lane, MAIN_EXECUTOR_LANE);
+        assert_eq!(child.task_class.as_deref(), Some("local_project"));
+        assert!(
+            !parent
+                .child_jobs
+                .iter()
+                .any(|child| child.executor_lane == ACTION_EXECUTOR_LANE)
+        );
+        let event = parent
+            .events
+            .iter()
+            .find(|event| event.event_type == "worker.delegation.escalated_to_main")
+            .expect("delegation escalation event should persist");
+        assert_eq!(event.data_json["chosen_route"], "main");
+        assert!(event.data_json["reason"].as_str().is_some());
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn full_prompt_heavy_request_escalates_tiny_utility_fanout() {
+        let state_dir = test_state_dir("full-prompt-heavy-utility-fanout-escalates");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let (session, job_id, mut worker) =
+            create_parent_fanout_context(&state, "full-prompt-heavy-child", &workspace_root, "");
+        state
+            .store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    task_class: Some(Some("local_project".to_string())),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("parent job task class should update");
+        let prompt_text = format!(
+            "{} Implement the issue with repo research, code changes, tests, and validation.",
+            "Read these neutral setup notes before choosing a route. ".repeat(8)
+        );
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text,
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let mut step = 0;
+
+        handle_child_job_proposal(
+            &state,
+            &session,
+            &job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            "run one bounded check".to_string(),
+            vec![ChildJobProposal {
+                title: "Verify README marker".to_string(),
+                prompt: "Check one bounded file existence signal.".to_string(),
+                task_class: Some("local_project".to_string()),
+                working_dir: None,
+                route_id: Some("utility".to_string()),
+            }],
+        )
+        .await
+        .expect("heavy full prompt should escalate tiny utility fanout");
+
+        let parent = state.store.get_job(&job_id).expect("parent should load");
+        assert_eq!(parent.child_jobs.len(), 1);
+        let child = parent.child_jobs.first().expect("child should exist");
+        assert_eq!(child.executor_lane, MAIN_EXECUTOR_LANE);
+        assert!(parent.events.iter().any(|event| {
+            event.event_type == "worker.delegation.escalated_to_main"
+                && event.data_json["chosen_route"] == "main"
+        }));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn escalated_mixed_fanout_preserves_main_route_and_scope() {
+        let state_dir = test_state_dir("escalated-mixed-fanout-preserves-route-scope");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        create_child_workdirs(&workspace_root, 1);
+        upsert_test_route_profile(
+            &state,
+            "explicit-route",
+            "Explicit Route",
+            true,
+            "explicit-route-model",
+            "http://127.0.0.1:9",
+            "explicit-route-key",
+        );
+        let (session, job_id, mut worker) =
+            create_parent_fanout_context(&state, "mixed-escalation", &workspace_root, "");
+        state
+            .store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    task_class: Some(Some("local_project".to_string())),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("parent job task class should update");
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "Implement the issue with repo research and validation.".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let mut step = 0;
+
+        handle_child_job_proposal(
+            &state,
+            &session,
+            &job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            "fan out mixed route work".to_string(),
+            vec![
+                ChildJobProposal {
+                    title: "Broad utility search".to_string(),
+                    prompt: "Search the repo broadly across many files for implementation points."
+                        .to_string(),
+                    task_class: Some("local_project".to_string()),
+                    working_dir: None,
+                    route_id: Some("utility".to_string()),
+                },
+                ChildJobProposal {
+                    title: "Scoped main work".to_string(),
+                    prompt: "Handle the scoped implementation work.".to_string(),
+                    task_class: Some("local_project".to_string()),
+                    working_dir: Some("child-0".to_string()),
+                    route_id: Some("explicit-route".to_string()),
+                },
+            ],
+        )
+        .await
+        .expect("mixed fanout should escalate while preserving main metadata");
+
+        let parent = state.store.get_job(&job_id).expect("parent should load");
+        assert_eq!(parent.child_jobs.len(), 1);
+        let child = parent.child_jobs.first().expect("child should exist");
+        assert_eq!(child.executor_lane, MAIN_EXECUTOR_LANE);
+        assert_eq!(child.executor_route_id, "explicit-route");
+        assert_eq!(child.executor_model, "explicit-route-model");
+        let child_detail = state.store.get_job(&child.id).expect("child should load");
+        let child_worker = child_detail.workers.first().expect("worker should exist");
+        assert_eq!(child_worker.route_id, "explicit-route");
+        assert!(child_worker.working_dir.ends_with("/child-0"));
+        assert_eq!(
+            child_worker.read_roots,
+            vec![child_worker.working_dir.clone()]
+        );
+        assert_eq!(
+            child_worker.write_roots,
+            vec![child_worker.working_dir.clone()]
+        );
+        assert!(parent.events.iter().any(|event| {
+            event.event_type == "worker.delegation.escalated_to_main"
+                && event.data_json["chosen_route"] == "main"
+        }));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn escalated_mixed_multi_main_fanout_does_not_narrow_to_first_scope() {
+        let state_dir = test_state_dir("escalated-multi-main-fanout-keeps-parent-scope");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        create_child_workdirs(&workspace_root, 2);
+        let (session, job_id, mut worker) =
+            create_parent_fanout_context(&state, "multi-main-escalation", &workspace_root, "");
+        state
+            .store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    task_class: Some(Some("local_project".to_string())),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("parent job task class should update");
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text:
+                "Implement the feature across two packages with repo research and validation."
+                    .to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let mut step = 0;
+
+        handle_child_job_proposal(
+            &state,
+            &session,
+            &job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            "fan out mixed multi-main work".to_string(),
+            vec![
+                ChildJobProposal {
+                    title: "Broad utility search".to_string(),
+                    prompt: "Search the repo broadly across many files for implementation points."
+                        .to_string(),
+                    task_class: Some("local_project".to_string()),
+                    working_dir: None,
+                    route_id: Some("utility".to_string()),
+                },
+                ChildJobProposal {
+                    title: "First scoped main work".to_string(),
+                    prompt: "Handle the first scoped implementation work.".to_string(),
+                    task_class: Some("local_project".to_string()),
+                    working_dir: Some("child-0".to_string()),
+                    route_id: None,
+                },
+                ChildJobProposal {
+                    title: "Second scoped main work".to_string(),
+                    prompt: "Handle the second scoped implementation work.".to_string(),
+                    task_class: Some("local_project".to_string()),
+                    working_dir: Some("child-1".to_string()),
+                    route_id: None,
+                },
+            ],
+        )
+        .await
+        .expect("mixed multi-main fanout should escalate without first-scope narrowing");
+
+        let parent = state.store.get_job(&job_id).expect("parent should load");
+        assert_eq!(parent.child_jobs.len(), 1);
+        let child = parent.child_jobs.first().expect("child should exist");
+        assert_eq!(child.executor_lane, MAIN_EXECUTOR_LANE);
+        let child_detail = state.store.get_job(&child.id).expect("child should load");
+        let child_worker = child_detail.workers.first().expect("worker should exist");
+        assert_eq!(
+            child_worker.working_dir,
+            workspace_root.display().to_string()
+        );
+        assert_eq!(child_worker.read_roots, worker.read_roots);
+        assert_eq!(child_worker.write_roots, worker.write_roots);
+        assert!(parent.events.iter().any(|event| {
+            event.event_type == "worker.delegation.escalated_to_main"
+                && event.data_json["chosen_route"] == "main"
+        }));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn unavailable_main_route_records_delegation_blocker() {
+        let state_dir = test_state_dir("unavailable-main-delegation-blocker");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        let (mut session, job_id, mut worker) =
+            create_parent_fanout_context(&state, "main-route-blocker", &workspace_root, "");
+        session.session.provider = "missing-provider".to_string();
+        session.session.model = "missing-model".to_string();
+        state
+            .store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    task_class: Some(Some("local_project".to_string())),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("parent job task class should update");
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "Implement the issue with broad repo research and validation.".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let mut step = 0;
+
+        let disposition = handle_child_job_proposal(
+            &state,
+            &session,
+            &job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            "fan out broad utility work".to_string(),
+            vec![ChildJobProposal {
+                title: "Broad utility search".to_string(),
+                prompt: "Search the repo broadly across many files for implementation points."
+                    .to_string(),
+                task_class: Some("local_project".to_string()),
+                working_dir: None,
+                route_id: Some("utility".to_string()),
+            }],
+        )
+        .await
+        .expect("unavailable main route should become worker-visible blocker");
+
+        assert_eq!(disposition, LoopDisposition::Continue);
+        assert_eq!(step, 1);
+        let parent = state.store.get_job(&job_id).expect("parent should load");
+        assert!(parent.child_jobs.is_empty());
+        assert!(parent.events.iter().any(|event| {
+            event.event_type == "worker.delegation.blocked"
+                && event.data_json["chosen_route"] == "main"
+        }));
+        let persisted = state
+            .store
+            .read_worker_checkpoint(&worker.id)
+            .expect("checkpoint should load")
+            .expect("checkpoint should persist");
+        let persisted: WorkerCheckpoint =
+            serde_json::from_value(persisted).expect("checkpoint should decode");
+        assert!(
+            persisted
+                .next_prompt
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Main-lane delegation was required")
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
     async fn canceling_parent_cascades_to_in_flight_children_within_bound() {
         let state_dir = test_state_dir("spawn-child-jobs-cancel-cascade");
         let state = initialize_test_state(&state_dir);
@@ -31095,6 +34031,7 @@ Thanks."#,
                 max_tool_calls: configured_child_job_max_tool_calls(),
                 max_wall_clock_secs: configured_job_max_wall_clock_secs(),
             },
+            &[],
         )
         .await
         .expect("child job should be created");
@@ -33241,6 +36178,26 @@ for line in sys.stdin:
             fs::create_dir_all(workspace_root.join(format!("child-{index}")))
                 .expect("child workdir should exist");
         }
+    }
+
+    fn install_fake_rg_command() {
+        static FAKE_RG: OnceLock<PathBuf> = OnceLock::new();
+        let path = FAKE_RG.get_or_init(|| {
+            let path = env::temp_dir().join("nucleus-test-fake-rg");
+            fs::write(
+                &path,
+                "#!/usr/bin/env sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"[\" ]; then\n    echo \"invalid glob\" >&2\n    exit 2\n  fi\ndone\nexit 1\n",
+            )
+            .expect("fake rg should write");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+                    .expect("fake rg should be executable");
+            }
+            path
+        });
+        set_test_command_override("rg", path.clone());
     }
 
     fn test_child_target_plan(lane: &str) -> ChildJobTargetPlan {
