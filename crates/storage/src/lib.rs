@@ -5565,8 +5565,8 @@ fn normalize_task_class(value: Option<&str>) -> Option<String> {
     }
     let normalized = value.replace('-', "_").to_ascii_lowercase();
     match normalized.as_str() {
-        "github_pr" | "research" | "automation" | "local_project" | "deployment"
-        | "memory_session" | "process_server" => Some(normalized),
+        "github_pr" | "research" | "automation" | "local_project" | "delegated_subtask"
+        | "deployment" | "memory_session" | "process_server" => Some(normalized),
         _ => None,
     }
 }
