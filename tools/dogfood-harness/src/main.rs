@@ -1221,10 +1221,23 @@ fn command_matches_allowed_prefix(command: &str, allowed: &[&str]) -> bool {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
+    let candidates = command_policy_candidates(&normalized);
     allowed.iter().any(|prefix| {
         let prefix = prefix.to_lowercase();
-        normalized == prefix || normalized.starts_with(&format!("{prefix} "))
+        candidates
+            .iter()
+            .any(|candidate| candidate == &prefix || candidate.starts_with(&format!("{prefix} ")))
     })
+}
+
+fn command_policy_candidates(normalized: &str) -> Vec<String> {
+    let mut candidates = vec![normalized.to_string()];
+    for prefix in ["sh -lc ", "sh -c ", "bash -lc ", "bash -c "] {
+        if let Some(unwrapped) = normalized.strip_prefix(prefix) {
+            candidates.push(unwrapped.to_string());
+        }
+    }
+    candidates
 }
 
 fn script_contains_external_or_network_mutation(script: &str) -> bool {
@@ -1977,6 +1990,17 @@ mod tests {
         assert!(command_session_looks_like_check_validation(
             "npm run check:web"
         ));
+    }
+
+    #[test]
+    fn command_policy_allows_shell_wrapped_validation_commands() {
+        assert!(command_looks_like_read_build_or_test(
+            "sh -lc cargo test -p nucleus-core"
+        ));
+        assert!(command_looks_like_validation(
+            "sh -lc cargo test -p nucleus-core"
+        ));
+        assert!(command_looks_like_validation("bash -lc npm run check:web"));
     }
 
     #[test]
