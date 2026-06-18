@@ -13,7 +13,7 @@ use nucleus_protocol::{
     ToolCallSummary, WorkspaceSummary,
 };
 
-const READ_ONLY_PROBE_COMMAND: &str = "sh -lc printf NUCLEUS_COMMAND_RUN_PROBE";
+const READ_ONLY_PROBE_COMMAND: &str = "printf NUCLEUS_COMMAND_RUN_PROBE";
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Serialize;
 use serde_json::Value;
@@ -443,11 +443,13 @@ fn ladder() -> Vec<Rung> {
             acceptance: Acceptance::ReadOnlyProbe,
             prompt: r#"Dogfood ladder rung: read_only.
 
-Use the Nucleus delegation path. The root worker must stay utility/orchestration-only and should not run local tools itself. Delegate exactly one main child whose task is to run this exact tool call in its own worktree and report the command result:
+Spawn exactly one main child with task_class delegated_subtask. Child task text:
 
-{"command":"sh","args":["-lc","printf NUCLEUS_COMMAND_RUN_PROBE"],"cwd":".","timeout_secs":20}
+Run exactly this one command in your worktree and report only raw output:
 
-Do not edit files. Do not publish. Do not push. Do not create branches manually. Do not open pull requests. After the child reports, join the result and give a concise final answer with the child job id, lane/model if known, exit status, and stdout."#,
+{"command":"printf","args":["NUCLEUS_COMMAND_RUN_PROBE"],"cwd":".","timeout_secs":20}
+
+Root waits for that child, then answers with child job id, lane/model if known, exit code, and stdout."#,
         },
         Rung {
             name: "edit_and_test",
@@ -874,17 +876,47 @@ fn evaluate_command_run(call: &ToolCallSummary, worktree: &Path) -> ApprovalVerd
             vec![cwd.to_string()],
         );
     }
-    let command = command_text(&call.args_json);
-    if command.trim().is_empty() {
+    let Some(command) = normalize_command_run_like_args(&call.args_json) else {
         return deny("command.run command is missing", vec![cwd.to_string()]);
-    }
-    if command_is_publication_or_network_mutating(&command) {
+    };
+    let policy_command = match command_policy_command(&command) {
+        Ok(command) => command,
+        Err(reason) => {
+            return deny(
+                &format!("command shell wrapper is not a single simple command: {reason}"),
+                vec![cwd.to_string()],
+            );
+        }
+    };
+    if command_is_publication_or_network_mutating(&policy_command) {
         return deny(
             "command looks publication, git-mutating, or network-mutating",
             vec![cwd.to_string()],
         );
     }
-    if command_has_shell_escape_or_write(&command) {
+    if command_uses_external_git_diff(&policy_command)
+        || env_requests_external_git_diff(&call.args_json)
+    {
+        return deny(
+            "command requests an external git diff helper",
+            vec![cwd.to_string()],
+        );
+    }
+    if command_uses_git_output_file(&policy_command)
+        || command_uses_cargo_clippy_fix(&policy_command)
+    {
+        return deny(
+            "command requests write-like output or auto-fix behavior",
+            vec![cwd.to_string()],
+        );
+    }
+    if git_diff_or_log_missing_helper_disables(&policy_command) {
+        return deny(
+            "command git diff/log must disable external diff helpers",
+            vec![cwd.to_string()],
+        );
+    }
+    if command_has_shell_escape_or_write(&policy_command) {
         return deny(
             "command contains shell control, path traversal, or write-like operations",
             vec![cwd.to_string()],
@@ -902,9 +934,9 @@ fn evaluate_command_run(call: &ToolCallSummary, worktree: &Path) -> ApprovalVerd
             vec![cwd.to_string()],
         );
     }
-    if !command_looks_like_read_build_or_test(&command) {
+    if !command_looks_like_read_build_or_test(&policy_command) {
         return deny(
-            "command is not clearly read/build/test scoped",
+            "command program is not on the safe read/build/test allow-list",
             vec![cwd.to_string()],
         );
     }
@@ -983,23 +1015,53 @@ fn evaluate_tests_run(call: &ToolCallSummary, worktree: &Path) -> ApprovalVerdic
             vec![cwd.to_string()],
         );
     }
-    let command = command_text(&call.args_json);
-    if command.trim().is_empty() {
+    let Some(command) = normalize_tests_run_like_args(&call.args_json) else {
         return deny("tests.run command is missing", vec![cwd.to_string()]);
-    }
-    if command_is_publication_or_network_mutating(&command) {
+    };
+    let policy_command = match command_policy_command(&command) {
+        Ok(command) => command,
+        Err(reason) => {
+            return deny(
+                &format!("tests.run shell wrapper is not a single simple command: {reason}"),
+                vec![cwd.to_string()],
+            );
+        }
+    };
+    if command_is_publication_or_network_mutating(&policy_command) {
         return deny(
             "tests.run command looks publication, git-mutating, or network-mutating",
             vec![cwd.to_string()],
         );
     }
-    if command_has_shell_escape_or_write(&command) {
+    if command_uses_external_git_diff(&policy_command)
+        || env_requests_external_git_diff(&call.args_json)
+    {
+        return deny(
+            "tests.run command requests an external git diff helper",
+            vec![cwd.to_string()],
+        );
+    }
+    if command_uses_git_output_file(&policy_command)
+        || command_uses_cargo_clippy_fix(&policy_command)
+    {
+        return deny(
+            "tests.run command requests write-like output or auto-fix behavior",
+            vec![cwd.to_string()],
+        );
+    }
+    if git_diff_or_log_missing_helper_disables(&policy_command) {
+        return deny(
+            "tests.run git diff/log must disable external diff helpers",
+            vec![cwd.to_string()],
+        );
+    }
+    if command_has_shell_escape_or_write(&policy_command) {
         return deny(
             "tests.run command contains shell control, path traversal, or write-like operations",
             vec![cwd.to_string()],
         );
     }
-    if command_has_external_path_reference(&call.args_json, worktree) {
+    if normalized_command_has_external_path_reference(&command, &call.args_json, worktree) {
         return deny(
             "tests.run command references a path outside the worker worktree",
             vec![cwd.to_string()],
@@ -1011,9 +1073,9 @@ fn evaluate_tests_run(call: &ToolCallSummary, worktree: &Path) -> ApprovalVerdic
             vec![cwd.to_string()],
         );
     }
-    if !command_looks_like_validation(&command) {
+    if !command_looks_like_validation(&policy_command) {
         return deny(
-            "tests.run command is not clearly test scoped",
+            "tests.run command program is not on the safe test allow-list",
             vec![cwd.to_string()],
         );
     }
@@ -1082,26 +1144,159 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
-fn command_text(args: &Value) -> String {
-    let command = command_alias_text(args.get("cmd"))
-        .or_else(|| command_alias_text(args.get("command")))
-        .unwrap_or_default();
-    let argv = args
-        .get("args")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .unwrap_or_default();
-    if argv.trim().is_empty() {
-        command
-    } else {
-        format!("{command} {argv}")
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedCommandRun {
+    command: String,
+    args: Vec<String>,
+    timeout_secs: Option<u64>,
+}
+
+impl NormalizedCommandRun {
+    fn display(&self) -> String {
+        let mut parts = vec![self.command.clone()];
+        parts.extend(self.args.iter().cloned());
+        parts.join(" ")
     }
+}
+
+fn normalize_command_run_like_args(args: &Value) -> Option<NormalizedCommandRun> {
+    normalize_command_like_args(args, false)
+}
+
+fn normalize_tests_run_like_args(args: &Value) -> Option<NormalizedCommandRun> {
+    normalize_command_like_args(args, true)
+}
+
+fn normalize_command_like_args(
+    args: &Value,
+    split_command_string: bool,
+) -> Option<NormalizedCommandRun> {
+    let object = args.as_object()?;
+    let (command_key, command_value) = if let Some(value) = object.get("cmd") {
+        ("cmd", value)
+    } else {
+        ("command", object.get("command")?)
+    };
+    let explicit_args = object.get("args").filter(|value| !value.is_null());
+    let mut normalized_args = explicit_args
+        .and_then(command_args_value)
+        .unwrap_or_default();
+    let (command, mut argv) = match command_value {
+        Value::String(command) => {
+            let command = command.trim();
+            if command.is_empty() {
+                return None;
+            }
+            if split_command_string {
+                let mut parts = command_args_value(&Value::String(command.to_string()))?;
+                let command = parts.first().cloned()?;
+                let argv = parts.drain(1..).collect();
+                (command, argv)
+            } else if command_key == "cmd"
+                || (explicit_args.is_none() && command_string_looks_like_shell(command))
+            {
+                (
+                    "sh".to_string(),
+                    vec!["-lc".to_string(), command.to_string()],
+                )
+            } else {
+                (command.to_string(), Vec::new())
+            }
+        }
+        Value::Array(values) => {
+            let mut parts = command_args_value(&Value::Array(values.clone()))?;
+            let command = parts.first().cloned()?;
+            let argv = if explicit_args.is_some() && !split_command_string {
+                Vec::new()
+            } else {
+                parts.drain(1..).collect()
+            };
+            (command, argv)
+        }
+        _ => return None,
+    };
+
+    if !normalized_args.is_empty() {
+        argv.append(&mut normalized_args);
+    }
+
+    Some(NormalizedCommandRun {
+        command,
+        args: argv,
+        timeout_secs: command_timeout_secs(args),
+    })
+}
+
+fn command_args_value(value: &Value) -> Option<Vec<String>> {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|part| !part.is_empty())
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|parts| parts.into_iter().map(str::to_string).collect()),
+        Value::String(value) => Some(
+            value
+                .split_whitespace()
+                .filter(|part| !part.trim().is_empty())
+                .map(str::to_string)
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+fn command_timeout_secs(args: &Value) -> Option<u64> {
+    args.get("timeout_secs")
+        .and_then(json_value_to_u64_lossy)
+        .or_else(|| {
+            args.get("timeout_seconds")
+                .and_then(json_value_to_u64_lossy)
+        })
+        .or_else(|| {
+            let millis = args.get("timeout_ms").and_then(json_value_to_u64_lossy)?;
+            Some(millis.saturating_add(999) / 1_000).map(|seconds| seconds.max(1))
+        })
+}
+
+fn json_value_to_u64_lossy(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str()?.trim().parse().ok())
+}
+
+fn command_string_looks_like_shell(command: &str) -> bool {
+    command.chars().any(char::is_whitespace)
+        || command.chars().any(|character| {
+            matches!(
+                character,
+                ';' | '|'
+                    | '&'
+                    | '<'
+                    | '>'
+                    | '$'
+                    | '`'
+                    | '('
+                    | ')'
+                    | '{'
+                    | '}'
+                    | '['
+                    | ']'
+                    | '*'
+                    | '?'
+                    | '~'
+            )
+        })
+}
+
+fn command_text(args: &Value) -> String {
+    normalize_command_run_like_args(args)
+        .map(|command| command.display())
+        .unwrap_or_default()
 }
 
 fn has_conflicting_command_aliases(args: &Value) -> bool {
@@ -1117,20 +1312,6 @@ fn command_alias_present(value: Option<&Value>) -> bool {
             .any(|value| !value.trim().is_empty()),
         Some(Value::Null) | None => false,
         Some(_) => true,
-    }
-}
-
-fn command_alias_text(value: Option<&Value>) -> Option<String> {
-    match value? {
-        Value::String(value) => Some(value.to_string()),
-        Value::Array(values) => Some(
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(" "),
-        ),
-        _ => None,
     }
 }
 
@@ -1172,6 +1353,100 @@ fn command_is_publication_or_network_mutating(command: &str) -> bool {
     denied_needles.iter().any(|needle| lower.contains(needle))
 }
 
+fn command_uses_external_git_diff(command: &str) -> bool {
+    let normalized = command
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !normalized.starts_with("git ") {
+        return false;
+    }
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    let runs_external_diff_command = tokens.iter().any(|token| matches!(*token, "diff" | "log"));
+    runs_external_diff_command
+        && (tokens.iter().any(|token| {
+            *token == "--ext-diff"
+                || token.starts_with("--ext-diff=")
+                || token.starts_with("--config=diff.external")
+                || token.starts_with("diff.external")
+        }) || tokens
+            .windows(2)
+            .any(|window| window[0] == "-c" && window[1].starts_with("diff.external")))
+}
+
+fn command_uses_git_output_file(command: &str) -> bool {
+    let normalized = command
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !normalized.starts_with("git ") {
+        return false;
+    }
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    let writes_output = tokens
+        .iter()
+        .any(|token| *token == "--output" || token.starts_with("--output="));
+    writes_output && tokens.iter().any(|token| matches!(*token, "diff" | "log"))
+}
+
+fn git_diff_or_log_missing_helper_disables(command: &str) -> bool {
+    let normalized = command
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !normalized.starts_with("git ") {
+        return false;
+    }
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    let runs_diff_or_log = tokens.iter().any(|token| matches!(*token, "diff" | "log"));
+    if !runs_diff_or_log {
+        return false;
+    }
+    if tokens.iter().any(|token| *token == "--textconv") {
+        return true;
+    }
+    !(tokens.iter().any(|token| *token == "--no-ext-diff")
+        && tokens.iter().any(|token| *token == "--no-textconv"))
+}
+
+fn command_uses_cargo_clippy_fix(command: &str) -> bool {
+    let lower = command.to_lowercase();
+    let tokens = lower.split_whitespace().collect::<Vec<_>>();
+    tokens.first() == Some(&"cargo")
+        && tokens.iter().any(|token| *token == "clippy")
+        && tokens.iter().any(|token| *token == "--fix")
+}
+
+fn env_requests_external_git_diff(args: &Value) -> bool {
+    let Some(env) = args.get("env").and_then(Value::as_object) else {
+        return false;
+    };
+    env.iter().any(|(key, value)| {
+        let key = key.to_ascii_uppercase();
+        if key == "GIT_EXTERNAL_DIFF" {
+            return true;
+        }
+        let Some(value) = env_value_text(value) else {
+            return false;
+        };
+        let value = value.to_ascii_lowercase();
+        (key == "GIT_CONFIG_PARAMETERS" || key.starts_with("GIT_CONFIG_KEY_"))
+            && value.contains("diff.external")
+    })
+}
+
+fn env_value_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Null | Value::Array(_) | Value::Object(_) => None,
+    }
+}
+
 fn command_has_shell_escape_or_write(command: &str) -> bool {
     let lower = command.to_lowercase();
     let denied_needles = [
@@ -1202,10 +1477,127 @@ fn command_has_shell_escape_or_write(command: &str) -> bool {
     denied_needles.iter().any(|needle| lower.contains(needle))
 }
 
+fn command_policy_command(command: &NormalizedCommandRun) -> Result<String, String> {
+    command_policy_command_inner(command, 0)
+}
+
+fn command_policy_command_inner(
+    command: &NormalizedCommandRun,
+    depth: usize,
+) -> Result<String, String> {
+    if depth > 2 {
+        return Err("too many nested shell wrappers".to_string());
+    }
+    if !is_shell_program(&command.command) {
+        return Ok(command.display());
+    }
+    let Some(flag) = command.args.first().map(String::as_str) else {
+        return Err("shell wrapper missing -c/-lc".to_string());
+    };
+    if !matches!(flag, "-c" | "-lc") {
+        return Err("shell wrapper must use -c or -lc".to_string());
+    }
+    if command.args.len() != 2 {
+        return Err("shell wrapper must contain exactly one inner command".to_string());
+    }
+    let inner = command.args[1].trim();
+    if inner.is_empty() {
+        return Err("shell wrapper inner command is empty".to_string());
+    }
+    if shell_string_has_unsafe_control(inner) {
+        return Err("inner command contains shell control".to_string());
+    }
+    let tokens = shell_words(inner)?;
+    if tokens.is_empty() {
+        return Err("inner command is empty".to_string());
+    }
+    let nested = NormalizedCommandRun {
+        command: tokens[0].clone(),
+        args: tokens.into_iter().skip(1).collect(),
+        timeout_secs: command.timeout_secs,
+    };
+    command_policy_command_inner(&nested, depth + 1)
+}
+
+fn is_shell_program(program: &str) -> bool {
+    matches!(
+        program,
+        "sh" | "bash" | "/bin/sh" | "/usr/bin/sh" | "/bin/bash" | "/usr/bin/bash"
+    )
+}
+
+fn shell_string_has_unsafe_control(command: &str) -> bool {
+    if command.contains('\\') {
+        return true;
+    }
+    let mut chars = command.chars().peekable();
+    let mut quote: Option<char> = None;
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(current) if ch == current => quote = None,
+            Some(_) => {}
+            None => match ch {
+                '\'' | '"' => quote = Some(ch),
+                ';' | '|' | '>' | '<' | '`' | '$' | '{' | '}' | '\n' => return true,
+                '&' => return true,
+                _ => {}
+            },
+        }
+    }
+    quote.is_some()
+}
+
+fn shell_words(command: &str) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for ch in command.chars() {
+        match quote {
+            Some(current_quote) if ch == current_quote => quote = None,
+            Some(_) => current.push(ch),
+            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            None if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(ch),
+        }
+    }
+    if quote.is_some() {
+        return Err("unterminated quote".to_string());
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    Ok(words)
+}
+
 fn command_has_external_path_reference(args: &Value, worktree: &Path) -> bool {
-    command_tokens(args)
+    let Some(command) = normalize_command_run_like_args(args) else {
+        return command_tokens_have_external_path_reference(command_tokens(args), worktree);
+    };
+    normalized_command_has_external_path_reference(&command, args, worktree)
+}
+
+fn normalized_command_has_external_path_reference(
+    command: &NormalizedCommandRun,
+    args: &Value,
+    worktree: &Path,
+) -> bool {
+    let tokens = command_policy_command(command)
+        .ok()
+        .and_then(|command| shell_words(&command).ok())
+        .unwrap_or_else(|| command_tokens(args));
+    command_tokens_have_external_path_reference(tokens, worktree)
+}
+
+fn command_tokens_have_external_path_reference(tokens: Vec<String>, worktree: &Path) -> bool {
+    tokens
         .iter()
-        .filter_map(|token| path_like_command_token(token))
+        .enumerate()
+        .filter(|(index, _)| *index != 0)
+        .filter_map(|(_, token)| path_like_command_token(token))
         .any(|path| !path_is_inside_worktree(worktree, &path))
 }
 
@@ -1306,25 +1698,40 @@ fn path_like_value(token: &str) -> Option<PathBuf> {
 fn command_looks_like_read_build_or_test(command: &str) -> bool {
     let allowed = [
         "printf",
-        READ_ONLY_PROBE_COMMAND,
+        "/usr/bin/printf",
+        "echo",
+        "true",
         "pwd",
+        "cat",
         "ls",
+        "head",
+        "tail",
+        "wc",
         "find",
         "rg",
         "grep",
+        "git status",
+        "git diff",
+        "git log",
         "cargo test",
         "cargo check",
         "cargo build",
+        "cargo fmt --check",
+        "cargo clippy",
         "npm run check",
         "npm run check:web",
         "npm run build",
         "npm run build:web",
+        "npm run test",
         "npm test",
+        "npm build",
         "pnpm test",
+        "pnpm build",
         "pnpm run check",
         "pnpm run build",
         "pnpm run test",
         "yarn test",
+        "yarn build",
         "yarn run check",
         "yarn run build",
         "yarn run test",
@@ -1343,16 +1750,22 @@ fn command_looks_like_validation(command: &str) -> bool {
         "cargo test",
         "cargo check",
         "cargo build",
+        "cargo fmt --check",
+        "cargo clippy",
         "npm run check",
         "npm run check:web",
         "npm run build",
         "npm run build:web",
+        "npm run test",
         "npm test",
+        "npm build",
         "pnpm test",
+        "pnpm build",
         "pnpm run check",
         "pnpm run build",
         "pnpm run test",
         "yarn test",
+        "yarn build",
         "yarn run check",
         "yarn run build",
         "yarn run test",
@@ -1370,12 +1783,17 @@ fn command_session_looks_like_check_validation(command: &str) -> bool {
     let allowed = [
         "cargo check",
         "cargo build",
+        "cargo fmt --check",
+        "cargo clippy",
         "npm run check",
         "npm run check:web",
         "npm run build",
         "npm run build:web",
+        "npm build",
+        "pnpm build",
         "pnpm run check",
         "pnpm run build",
+        "yarn build",
         "yarn run check",
         "yarn run build",
         "just check",
@@ -2264,7 +2682,18 @@ fn tool_call_is_successful_test_run(call: &ToolCallSummary) -> bool {
     (call.tool_id == "tests.run" || call.tool_id == "command.run")
         && call.status == "completed"
         && tool_result_exit_zero(call)
-        && command_looks_like_validation(&command_text(&call.args_json))
+        && command_looks_like_validation(&tool_call_command_text(call))
+}
+
+fn tool_call_command_text(call: &ToolCallSummary) -> String {
+    let command = if call.tool_id == "tests.run" {
+        normalize_tests_run_like_args(&call.args_json)
+    } else {
+        normalize_command_run_like_args(&call.args_json)
+    };
+    command
+        .map(|command| command_policy_command(&command).unwrap_or_else(|_| command.display()))
+        .unwrap_or_default()
 }
 
 fn command_session_text(session: &CommandSessionSummary) -> String {
@@ -2373,6 +2802,89 @@ mod tests {
     }
 
     #[test]
+    fn command_policy_allows_benign_shell_wrapped_commands() {
+        for args in [
+            json!({"command":"sh","args":["-lc","printf NUCLEUS_COMMAND_RUN_PROBE"],"cwd":"."}),
+            json!({"command":"bash","args":["-c","cargo test"],"cwd":"."}),
+            json!({"command":"sh","args":["-lc","npm test"],"cwd":"."}),
+        ] {
+            let call = tool_call_with_args("command.run", args);
+
+            let verdict = evaluate_command_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+            assert!(verdict.approve, "{}", verdict.reason);
+        }
+    }
+
+    #[test]
+    fn command_policy_allows_nested_cmd_alias_shell_probe_when_inner_is_safe() {
+        let call = tool_call_with_args(
+            "command.run",
+            json!({"cmd":"sh -lc 'printf NUCLEUS_COMMAND_RUN_PROBE'","cwd":".","timeout_seconds":30}),
+        );
+
+        let verdict = evaluate_command_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(verdict.approve, "{}", verdict.reason);
+    }
+
+    #[test]
+    fn command_policy_rejects_dangerous_shell_wrapped_commands() {
+        for (args, expected_reason) in [
+            (
+                json!({"command":"sh","args":["-lc","rm -rf x"],"cwd":"."}),
+                "allow-list",
+            ),
+            (
+                json!({"command":"sh","args":["-lc","git push"],"cwd":"."}),
+                "publication",
+            ),
+            (
+                json!({"command":"sh","args":["-lc","curl http://example.invalid"],"cwd":"."}),
+                "network",
+            ),
+            (
+                json!({"command":"sh","args":["-lc","echo x > /etc/y"],"cwd":"."}),
+                "single simple",
+            ),
+            (
+                json!({"command":"sh","args":["-lc","a && b"],"cwd":"."}),
+                "single simple",
+            ),
+            (
+                json!({"command":"sh","args":["-lc","cat $(pwd)"],"cwd":"."}),
+                "single simple",
+            ),
+            (
+                json!({"command":"./sh","args":["-lc","cargo test"],"cwd":"."}),
+                "allow-list",
+            ),
+            (
+                json!({"command":"tools/bash","args":["-lc","cargo test"],"cwd":"."}),
+                "allow-list",
+            ),
+            (
+                json!({"command":"sh","args":["-lc","custom-tool check"],"cwd":"."}),
+                "allow-list",
+            ),
+        ] {
+            let call = tool_call_with_args("command.run", args);
+
+            let verdict = evaluate_command_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+            assert!(
+                !verdict.approve,
+                "unexpected approval for {expected_reason}"
+            );
+            assert!(
+                verdict.reason.contains(expected_reason),
+                "reason '{}' did not contain '{expected_reason}'",
+                verdict.reason
+            );
+        }
+    }
+
+    #[test]
     fn command_policy_rejects_external_path_arguments() {
         let call = tool_call_with_args(
             "command.run",
@@ -2430,6 +2942,39 @@ mod tests {
 
         assert_eq!(command_text(&args), "sh -lc cargo test -p nucleus-core");
         assert!(command_looks_like_validation(&command_text(&args)));
+    }
+
+    #[test]
+    fn command_policy_normalizes_cmd_and_timeout_aliases() {
+        let args = json!({"cmd":"printf NUCLEUS_COMMAND_RUN_PROBE","cwd":".","timeout_ms":1500});
+        let normalized = normalize_command_run_like_args(&args).expect("normalize command args");
+
+        assert_eq!(normalized.command, "sh");
+        assert_eq!(
+            normalized.args,
+            vec!["-lc", "printf NUCLEUS_COMMAND_RUN_PROBE"]
+        );
+        assert_eq!(normalized.timeout_secs, Some(2));
+
+        let call = tool_call_with_args("command.run", args);
+        let verdict = evaluate_command_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(verdict.approve, "{}", verdict.reason);
+    }
+
+    #[test]
+    fn tests_run_policy_preserves_mixed_cmd_and_args_aliases() {
+        let args = json!({"cmd":"cargo test","args":["-p","nucleus-daemon"],"cwd":".","timeout_seconds":120});
+        let normalized = normalize_tests_run_like_args(&args).expect("normalize tests args");
+
+        assert_eq!(normalized.command, "cargo");
+        assert_eq!(normalized.args, vec!["test", "-p", "nucleus-daemon"]);
+        assert_eq!(normalized.timeout_secs, Some(120));
+
+        let call = tool_call_with_args("tests.run", args);
+        let verdict = evaluate_tests_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(verdict.approve, "{}", verdict.reason);
     }
 
     #[test]
@@ -2507,6 +3052,181 @@ mod tests {
     }
 
     #[test]
+    fn command_policy_rejects_raw_interpreters_and_installs() {
+        for args in [
+            json!({"command":"node","args":["scripts/check.js"],"cwd":"."}),
+            json!({"command":"python","args":["scripts/check.py"],"cwd":"."}),
+            json!({"command":"python3","args":["scripts/check.py"],"cwd":"."}),
+            json!({"command":"npm","args":["ci"],"cwd":"."}),
+            json!({"command":"pnpm","args":["ci"],"cwd":"."}),
+            json!({"command":"yarn","args":["install","--immutable"],"cwd":"."}),
+        ] {
+            let call = tool_call_with_args("command.run", args);
+
+            let verdict = evaluate_command_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+            assert!(!verdict.approve, "unexpected approval for {call:?}");
+            assert!(verdict.reason.contains("allow-list") || verdict.reason.contains("network"));
+        }
+    }
+
+    #[test]
+    fn command_policy_rejects_external_git_diff_helpers() {
+        for args in [
+            json!({"command":"git","args":["diff","--ext-diff"],"cwd":"."}),
+            json!({"command":"git","args":["log","--ext-diff","-p","-1"],"cwd":"."}),
+            json!({"command":"git","args":["diff"],"cwd":".","env":{"GIT_EXTERNAL_DIFF":"sh -c echo"}}),
+            json!({"command":"git","args":["diff"],"cwd":".","env":{"GIT_CONFIG_COUNT":"1","GIT_CONFIG_KEY_0":"diff.external","GIT_CONFIG_VALUE_0":"sh -c echo"}}),
+            json!({"command":"git","args":["diff"],"cwd":".","env":{"GIT_CONFIG_PARAMETERS":"'diff.external=sh -c echo'"}}),
+            json!({"command":"git","args":["diff","-c","diff.external=sh -c echo"],"cwd":"."}),
+            json!({"command":"git","args":["-c","diff.external=sh -c echo","diff"],"cwd":"."}),
+            json!({"cmd":"git -c diff.external=sh diff","cwd":"."}),
+        ] {
+            let call = tool_call_with_args("command.run", args);
+
+            let verdict = evaluate_command_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+            assert!(!verdict.approve, "unexpected approval for {call:?}");
+            assert!(verdict.reason.contains("external git diff"));
+        }
+    }
+
+    #[test]
+    fn command_policy_rejects_write_like_git_and_clippy_options() {
+        for args in [
+            json!({"command":"git","args":["diff","--output=probe.patch"],"cwd":"."}),
+            json!({"command":"git","args":["log","--output","probe.log"],"cwd":"."}),
+            json!({"command":"cargo","args":["clippy","--fix"],"cwd":"."}),
+            json!({"command":"sh","args":["-c","cargo clippy --fi\\x"],"cwd":"."}),
+            json!({"command":"bash","args":["-lc","cat {/etc/passwd,./Cargo.toml}"],"cwd":"."}),
+        ] {
+            let call = tool_call_with_args("command.run", args);
+
+            let verdict = evaluate_command_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+            assert!(!verdict.approve, "unexpected approval for {call:?}");
+            assert!(
+                verdict.reason.contains("write-like")
+                    || verdict.reason.contains("auto-fix")
+                    || verdict.reason.contains("shell wrapper")
+                    || verdict.reason.contains("shell control")
+            );
+        }
+    }
+
+    #[test]
+    fn command_policy_requires_git_diff_log_helper_disables() {
+        for args in [
+            json!({"command":"git","args":["diff"],"cwd":"."}),
+            json!({"command":"git","args":["log","-p","-1"],"cwd":"."}),
+            json!({"command":"git","args":["diff","--no-ext-diff","--no-textconv","--textconv"],"cwd":"."}),
+        ] {
+            let call = tool_call_with_args("command.run", args);
+
+            let verdict = evaluate_command_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+            assert!(!verdict.approve, "unexpected approval for {call:?}");
+            assert!(verdict.reason.contains("disable external diff helpers"));
+        }
+
+        for args in [
+            json!({"command":"git","args":["diff","--no-ext-diff","--no-textconv"],"cwd":"."}),
+            json!({"command":"git","args":["log","--no-ext-diff","--no-textconv","-p","-1"],"cwd":"."}),
+        ] {
+            let call = tool_call_with_args("command.run", args);
+
+            let verdict = evaluate_command_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+            assert!(
+                verdict.approve,
+                "unexpected denial for {call:?}: {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tests_run_policy_rejects_external_git_diff_helpers() {
+        for args in [
+            json!({"command":"git","args":["-c","diff.external=sh -c echo","diff"],"cwd":"."}),
+            json!({"command":"git","args":["log","--ext-diff","-p","-1"],"cwd":"."}),
+            json!({"command":"git","args":["diff"],"cwd":".","env":{"GIT_CONFIG_COUNT":"1","GIT_CONFIG_KEY_0":"diff.external","GIT_CONFIG_VALUE_0":"sh -c echo"}}),
+        ] {
+            let call = tool_call_with_args("tests.run", args);
+
+            let verdict = evaluate_tests_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+            assert!(!verdict.approve, "unexpected approval for {call:?}");
+            assert!(verdict.reason.contains("external git diff"));
+        }
+    }
+
+    #[test]
+    fn tests_run_policy_rejects_write_like_git_and_clippy_options() {
+        for args in [
+            json!({"command":"git","args":["diff","--output=probe.patch"],"cwd":"."}),
+            json!({"command":"cargo","args":["clippy","--fix"],"cwd":"."}),
+            json!({"command":"sh","args":["-c","cargo clippy --fi\\x"],"cwd":"."}),
+            json!({"command":"bash","args":["-lc","cat {/etc/passwd,./Cargo.toml}"],"cwd":"."}),
+        ] {
+            let call = tool_call_with_args("tests.run", args);
+
+            let verdict = evaluate_tests_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+            assert!(!verdict.approve, "unexpected approval for {call:?}");
+            assert!(
+                verdict.reason.contains("write-like")
+                    || verdict.reason.contains("auto-fix")
+                    || verdict.reason.contains("shell wrapper")
+                    || verdict.reason.contains("shell control")
+            );
+        }
+    }
+
+    #[test]
+    fn tests_run_policy_allows_array_command_with_explicit_args() {
+        let call = tool_call_with_args(
+            "tests.run",
+            json!({"command":["cargo","test"],"args":["-p","nucleus-core"],"cwd":"."}),
+        );
+
+        let verdict = evaluate_tests_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(verdict.approve, "unexpected denial: {verdict:?}");
+    }
+
+    #[test]
+    fn tests_run_policy_rejects_array_tail_external_paths() {
+        let call = tool_call_with_args(
+            "tests.run",
+            json!({"command":["cargo","test","--manifest-path=/tmp/other/Cargo.toml"],"args":["-p","nucleus-core"],"cwd":"."}),
+        );
+
+        let verdict = evaluate_tests_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(!verdict.approve);
+        assert!(verdict.reason.contains("outside the worker worktree"));
+    }
+
+    #[test]
+    fn command_policy_requires_cargo_fmt_check() {
+        let bare_fmt = tool_call_with_args(
+            "tests.run",
+            json!({"command":"cargo","args":["fmt"],"cwd":"."}),
+        );
+        let checked_fmt = tool_call_with_args(
+            "tests.run",
+            json!({"command":"cargo","args":["fmt","--check"],"cwd":"."}),
+        );
+
+        let bare = evaluate_tests_run(&bare_fmt, Path::new("/tmp/nucleus-dogfood-worktree"));
+        let checked = evaluate_tests_run(&checked_fmt, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(!bare.approve);
+        assert!(bare.reason.contains("allow-list"));
+        assert!(checked.approve, "{}", checked.reason);
+    }
+
+    #[test]
     fn command_policy_allows_repo_web_validation_scripts() {
         assert!(command_looks_like_read_build_or_test("npm run check:web"));
         assert!(command_looks_like_read_build_or_test("npm run build:web"));
@@ -2569,6 +3289,30 @@ mod tests {
     }
 
     #[test]
+    fn validation_tool_call_uses_tests_run_array_normalization() {
+        let mut call = tool_call_with_args(
+            "tests.run",
+            json!({"command":["cargo","test"],"args":["-p","nucleus-core"],"cwd":"."}),
+        );
+        call.status = "completed".to_string();
+        call.result_json = Some(json!({"exit_code": 0}));
+
+        assert!(tool_call_is_successful_test_run(&call));
+    }
+
+    #[test]
+    fn validation_tool_call_unwraps_command_run_shell_alias() {
+        let mut call = tool_call_with_args(
+            "command.run",
+            json!({"cmd":"sh -lc 'cargo test'","cwd":"."}),
+        );
+        call.status = "completed".to_string();
+        call.result_json = Some(json!({"exit_code": 0}));
+
+        assert!(tool_call_is_successful_test_run(&call));
+    }
+
+    #[test]
     fn validation_tool_call_rejects_no_tests_matched() {
         let mut no_match = tool_call("tests.run", "completed", Some(0));
         no_match.result_json = Some(json!({
@@ -2582,7 +3326,14 @@ mod tests {
     #[test]
     fn command_session_validation_fallback_excludes_test_commands() {
         assert!(!command_session_looks_like_check_validation("cargo test"));
+        assert!(!command_session_looks_like_check_validation("npm test"));
+        assert!(!command_session_looks_like_check_validation("npm run test"));
+        assert!(!command_session_looks_like_check_validation("pnpm test"));
+        assert!(!command_session_looks_like_check_validation("yarn test"));
         assert!(command_session_looks_like_check_validation("cargo check"));
+        assert!(command_session_looks_like_check_validation(
+            "npm run check:web"
+        ));
     }
 
     #[test]
@@ -2767,15 +3518,51 @@ mod tests {
     #[test]
     fn read_only_probe_requires_exact_command() {
         assert!(command_is_exact_read_only_probe(
-            "sh -lc printf NUCLEUS_COMMAND_RUN_PROBE"
+            "printf NUCLEUS_COMMAND_RUN_PROBE"
         ));
         assert!(command_looks_like_read_build_or_test(
-            "sh -lc printf NUCLEUS_COMMAND_RUN_PROBE"
+            "printf NUCLEUS_COMMAND_RUN_PROBE"
         ));
         assert!(!command_is_exact_read_only_probe("pwd"));
-        assert!(!command_is_exact_read_only_probe(
-            "sh -lc printf WRONG_PROBE"
+        assert!(!command_is_exact_read_only_probe("printf WRONG_PROBE"));
+    }
+
+    #[test]
+    fn read_only_probe_prompt_uses_argv_and_avoids_narrow_trigger_words() {
+        let read_only = ladder()
+            .into_iter()
+            .find(|rung| rung.name == "read_only")
+            .expect("read_only rung");
+        let prompt = read_only.prompt.to_lowercase();
+
+        assert!(read_only.prompt.contains(
+            r#"{"command":"printf","args":["NUCLEUS_COMMAND_RUN_PROBE"],"cwd":".","timeout_secs":20}"#
         ));
+        for trigger in [
+            "investigation",
+            "editing",
+            "files",
+            "implement",
+            "implementation",
+            "test",
+            "tests",
+            "validation",
+            "write",
+            "create",
+            "delete",
+            "remove",
+            "replace",
+            "publish",
+            "commit",
+            "pull request",
+            "pr ",
+            "status",
+        ] {
+            assert!(
+                !prompt.contains(trigger),
+                "read_only prompt contains trigger word {trigger}"
+            );
+        }
     }
 
     #[test]
@@ -2932,7 +3719,7 @@ mod tests {
         });
         let mut probe = tool_call_with_args(
             "command.run",
-            json!({"command":"sh","args":["-lc","printf NUCLEUS_COMMAND_RUN_PROBE"],"cwd":"."}),
+            json!({"command":"printf","args":["NUCLEUS_COMMAND_RUN_PROBE"],"cwd":"."}),
         );
         probe.status = "completed".to_string();
         probe.result_json = Some(json!({"exit_code": 0}));
