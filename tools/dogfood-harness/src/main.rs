@@ -776,6 +776,12 @@ fn evaluate_command_run(call: &ToolCallSummary, worktree: &Path) -> ApprovalVerd
             vec![cwd.to_string()],
         );
     }
+    if command_has_external_path_reference(&call.args_json, worktree) {
+        return deny(
+            "command references a path outside the worker worktree",
+            vec![cwd.to_string()],
+        );
+    }
     if !command_looks_like_read_build_or_test(&command) {
         return deny(
             "command is not clearly read/build/test scoped",
@@ -852,6 +858,12 @@ fn evaluate_tests_run(call: &ToolCallSummary, worktree: &Path) -> ApprovalVerdic
     if command_has_shell_escape_or_write(&command) {
         return deny(
             "tests.run command contains shell control, path traversal, or write-like operations",
+            vec![cwd.to_string()],
+        );
+    }
+    if command_has_external_path_reference(&call.args_json, worktree) {
+        return deny(
+            "tests.run command references a path outside the worker worktree",
             vec![cwd.to_string()],
         );
     }
@@ -1013,6 +1025,49 @@ fn command_has_shell_escape_or_write(command: &str) -> bool {
     denied_needles.iter().any(|needle| lower.contains(needle))
 }
 
+fn command_has_external_path_reference(args: &Value, worktree: &Path) -> bool {
+    command_tokens(args)
+        .iter()
+        .filter_map(|token| path_like_command_token(token))
+        .any(|path| !path_is_inside_worktree(worktree, &path))
+}
+
+fn command_tokens(args: &Value) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for field in ["command", "cmd"] {
+        if let Some(command) = args.get(field).and_then(Value::as_str) {
+            tokens.extend(command.split_whitespace().map(clean_command_token));
+        }
+    }
+    if let Some(values) = args.get("args").and_then(Value::as_array) {
+        for value in values.iter().filter_map(Value::as_str) {
+            tokens.extend(value.split_whitespace().map(clean_command_token));
+        }
+    }
+    tokens
+}
+
+fn clean_command_token(token: &str) -> String {
+    token
+        .trim_matches(|ch| matches!(ch, '\'' | '"' | ',' | ';' | '(' | ')' | '[' | ']'))
+        .to_string()
+}
+
+fn path_like_command_token(token: &str) -> Option<PathBuf> {
+    let token = token.trim();
+    if token.is_empty() || token.starts_with('-') {
+        return None;
+    }
+    if token.starts_with('/') || token.starts_with("../") || token == ".." || token.starts_with('~')
+    {
+        return Some(PathBuf::from(token));
+    }
+    if token.contains("/../") || token.ends_with("/..") {
+        return Some(PathBuf::from(token));
+    }
+    None
+}
+
 fn command_looks_like_read_build_or_test(command: &str) -> bool {
     let lower = command.to_lowercase();
     let allowed = [
@@ -1064,6 +1119,7 @@ fn command_looks_like_validation(command: &str) -> bool {
 }
 
 fn script_contains_external_or_network_mutation(script: &str) -> bool {
+    let compact: String = script.chars().filter(|ch| !ch.is_whitespace()).collect();
     let denied = [
         "requests.",
         "urllib",
@@ -1101,7 +1157,9 @@ fn script_contains_external_or_network_mutation(script: &str) -> bool {
         "unlink('/",
         "rmtree('/",
     ];
-    denied.iter().any(|needle| script.contains(needle))
+    denied
+        .iter()
+        .any(|needle| script.contains(needle) || compact.contains(needle))
 }
 
 fn tool_name_is_publication(tool: &str) -> bool {
@@ -1704,6 +1762,19 @@ mod tests {
     }
 
     #[test]
+    fn command_policy_rejects_external_path_arguments() {
+        let call = tool_call_with_args(
+            "command.run",
+            json!({"command":"rg","args":["token","/home/eba/.ssh"],"cwd":"."}),
+        );
+
+        let verdict = evaluate_command_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(!verdict.approve);
+        assert!(verdict.reason.contains("outside the worker worktree"));
+    }
+
+    #[test]
     fn validation_tool_call_requires_zero_exit() {
         let failed = tool_call("tests.run", "completed", Some(1));
         let passed = tool_call("tests.run", "completed", Some(0));
@@ -1759,6 +1830,19 @@ mod tests {
         let call = tool_call_with_args(
             "python.run",
             json!({"cwd":".","script":"from pathlib import Path\nPath(\"/tmp/nucleus-dogfood-leak\").touch()"}),
+        );
+
+        let verdict = evaluate_python_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(!verdict.approve);
+        assert!(verdict.reason.contains("worker worktree"));
+    }
+
+    #[test]
+    fn python_policy_rejects_spaced_external_reads() {
+        let call = tool_call_with_args(
+            "python.run",
+            json!({"cwd":".","script":"from pathlib import Path\nPath (\"/etc/passwd\").read_text()"}),
         );
 
         let verdict = evaluate_python_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
