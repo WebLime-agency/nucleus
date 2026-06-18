@@ -1,0 +1,21 @@
+[package]
+name = "nucleus-dogfood-harness"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Operator dogfood/regression harness for live Nucleus delegated sessions."
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+nucleus-protocol.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+url.workspace = true
+
