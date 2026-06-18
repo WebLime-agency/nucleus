@@ -855,7 +855,7 @@ fn evaluate_tests_run(call: &ToolCallSummary, worktree: &Path) -> ApprovalVerdic
             vec![cwd.to_string()],
         );
     }
-    if !command_looks_like_read_build_or_test(&command) {
+    if !command_looks_like_validation(&command) {
         return deny(
             "tests.run command is not clearly test scoped",
             vec![cwd.to_string()],
@@ -1002,6 +1002,9 @@ fn command_has_shell_escape_or_write(command: &str) -> bool {
         " mv ",
         " cp ",
         " tee ",
+        " -delete",
+        " -exec",
+        " -execdir",
         "sed -i",
         "perl -pi",
         "python -c",
@@ -1029,6 +1032,27 @@ fn command_looks_like_read_build_or_test(command: &str) -> bool {
         "pnpm run",
         "yarn test",
         "yarn run",
+        "bun test",
+        "pytest",
+        "go test",
+        "make test",
+        "just test",
+        "just check",
+    ];
+    allowed.iter().any(|needle| lower.contains(needle))
+}
+
+fn command_looks_like_validation(command: &str) -> bool {
+    let lower = command.to_lowercase();
+    let allowed = [
+        "cargo test",
+        "cargo check",
+        "cargo build",
+        "npm run check",
+        "npm run build",
+        "npm test",
+        "pnpm test",
+        "yarn test",
         "bun test",
         "pytest",
         "go test",
@@ -1579,16 +1603,15 @@ fn child_has_successful_test_run(child: &JobDetail) -> bool {
         .any(tool_call_is_successful_test_run)
         || child.command_sessions.iter().any(|session| {
             command_session_success(session)
-                && command_looks_like_read_build_or_test(&command_session_text(session))
+                && command_looks_like_validation(&command_session_text(session))
         })
 }
 
 fn tool_call_is_successful_test_run(call: &ToolCallSummary) -> bool {
-    (call.tool_id == "tests.run"
-        || (call.tool_id == "command.run"
-            && command_looks_like_read_build_or_test(&command_text(&call.args_json))))
+    (call.tool_id == "tests.run" || call.tool_id == "command.run")
         && call.status == "completed"
         && tool_result_exit_zero(call)
+        && command_looks_like_validation(&command_text(&call.args_json))
 }
 
 fn command_session_text(session: &CommandSessionSummary) -> String {
@@ -1673,12 +1696,36 @@ mod tests {
     }
 
     #[test]
+    fn command_policy_rejects_destructive_find() {
+        let command = "find . -delete";
+
+        assert!(command_looks_like_read_build_or_test(command));
+        assert!(command_has_shell_escape_or_write(command));
+    }
+
+    #[test]
     fn validation_tool_call_requires_zero_exit() {
         let failed = tool_call("tests.run", "completed", Some(1));
         let passed = tool_call("tests.run", "completed", Some(0));
 
         assert!(!tool_call_is_successful_test_run(&failed));
         assert!(tool_call_is_successful_test_run(&passed));
+    }
+
+    #[test]
+    fn validation_tool_call_requires_validation_command() {
+        let mut read_only =
+            tool_call_with_args("command.run", json!({"command":"pwd","args":[],"cwd":"."}));
+        read_only.status = "completed".to_string();
+        read_only.result_json = Some(json!({"exit_code": 0}));
+
+        assert!(command_looks_like_read_build_or_test(&command_text(
+            &read_only.args_json
+        )));
+        assert!(!command_looks_like_validation(&command_text(
+            &read_only.args_json
+        )));
+        assert!(!tool_call_is_successful_test_run(&read_only));
     }
 
     #[test]
