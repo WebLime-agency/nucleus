@@ -43,7 +43,7 @@ Endpoint usage was matched to `apps/web/src/lib/nucleus/client.ts`:
 - `GET /api/approvals`
 - `POST /api/approvals/{approval_id}/approve`
 - `POST /api/approvals/{approval_id}/deny`
-- `DELETE /api/sessions/{session_id}` for cleanup
+- `DELETE /api/sessions/{session_id}` for cleanup after passing rungs
 
 The report uses `crates/protocol` response types through `nucleus-protocol` rather than local copies of the web Zod schemas.
 
@@ -66,14 +66,14 @@ Denied:
 - Any command or path whose `cwd` or target path resolves outside the worker worktree
 - Any unknown tool or ambiguous approval
 
-Cleanup always attempts to cancel the root job, deny remaining current-run approvals, reset/clean only the harness-created managed worktree for that session, and delete the session so the managed worktree is removed.
+Cleanup always attempts to cancel the root job and deny remaining current-run approvals. Passing rungs reset/clean only the harness-created managed worktree for that session and delete the session so the managed worktree is removed. Failed rungs preserve the session/job for inspection and print the preserved `session_id` and `root_job_id` in the summary.
 
 ## Ladder Rungs
 
-- `read_only`: delegate one main child to run exactly `{"command":"sh","args":["-lc","printf NUCLEUS_COMMAND_RUN_PROBE"],"cwd":".","timeout_secs":20}`. PASS requires a utility root, at least one main child, a child command exit 0, accepted/completed child status without validation-evidence blocking, no duplicate fanout beyond the configured threshold, and root convergence.
+- `read_only`: delegate one main child to run exactly `{"command":"sh","args":["-lc","printf NUCLEUS_COMMAND_RUN_PROBE"],"cwd":".","timeout_secs":20}`. PASS requires a utility root, Phase 1 child acceptance with no duplicate fanout, Phase 2 root convergence, a captured exact probe command exit 0, and no validation-evidence blocking.
 - `edit_and_test`: delegate one main child to add a tiny helper plus unit test in the child worktree and run a focused test. PASS requires an edit, validation, accepted child status, root convergence, and no fanout.
-- `feature_161`: delegate issue #161 implementation. PASS requires bounded single-child convergence to implementation+validation evidence or a precise blocker.
-- `debug`: delegate a bounded diagnose-and-fix task. PASS requires bounded children and convergence to completion or a precise blocker.
+- `feature_161`: delegate issue #161 implementation. PASS requires Phase 1 child acceptance with no duplicate fanout, Phase 2 root convergence, and accepted implementation+validation evidence.
+- `debug`: delegate a bounded diagnose-and-fix task. PASS requires Phase 1 child acceptance with no duplicate fanout, Phase 2 root convergence, and at least one child diagnosis.
 
 To add a rung, add a `Rung` entry in `src/main.rs` with a prompt, fanout limit, and acceptance mode. If the acceptance criteria are new, add a new `Acceptance` variant and keep the report shape unchanged.
 
@@ -82,7 +82,8 @@ To add a rung, add a `Rung` entry in `src/main.rs` with a prompt, fanout limit, 
 The JSON report includes:
 
 - `install { url, version, routes }`, with routes limited to the workspace default profile and without API keys
-- per rung `name`, `sessionId`, `rootJobId`, `status`, `reasons`, `rootWorker`, `children`, `counts`, `approvals`, and `keyEvents`
+- per rung `name`, `session_id`, `root_job_id`, `status`, `reasons`, `phase1`, `phase2`, `root_final`, `read_only_exact_probe_exit_0`, `root_worker`, `children`, `counts`, `approvals`, `cleanup`, and `key_events`
+- per child `task_class`, `executor_lane`, `executor_model`, `state`, `completion_status`, `completion_blockers`, and compact `tool_calls` with tool id, args summary, exit code, and status
 - `overall { passed, failed, total }`
 
 The harness also prints a short human summary table.
