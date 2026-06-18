@@ -21,9 +21,10 @@ use nucleus_protocol::{
 };
 use nucleus_storage::{
     ApprovalRequestRecord, AuditEventRecord, CommandSessionPatch, CommandSessionRecord,
-    JobArtifactPatch, JobArtifactRecord, JobEventRecord, JobPatch, JobRecord, PlaybookPatch,
-    PlaybookRecord, PolicyDecisionRecord, SessionPatch, SessionRecord, ToolCallPatch,
-    ToolCallRecord, ToolCapabilityGrantRecord, WorkerPatch, WorkerRecord, WorkerUsageDelta,
+    JobArtifactPatch, JobArtifactRecord, JobEventRecord, JobPatch, JobRecord,
+    MutationReceiptRecord, PlaybookPatch, PlaybookRecord, PolicyDecisionRecord, SessionPatch,
+    SessionRecord, ToolCallPatch, ToolCallRecord, ToolCapabilityGrantRecord, WorkerPatch,
+    WorkerRecord, WorkerUsageDelta,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -8039,6 +8040,7 @@ struct ObservedSessionGitState {
     git_branch: String,
     git_dirty: bool,
     git_untracked_count: usize,
+    dirty_paths: Vec<String>,
 }
 
 fn session_state_evidence_and_refresh(
@@ -8077,22 +8079,29 @@ fn session_state_evidence_and_refresh(
         git_branch: session.git_branch.clone(),
         git_dirty: session.git_dirty,
         git_untracked_count: session.git_untracked_count,
+        dirty_paths: Vec::new(),
     };
     let legacy_uninitialized =
         stored.git_head.trim().is_empty() && stored.git_branch.trim().is_empty();
-    let drifted = !legacy_uninitialized && stored != observed;
-    let matching_audit = if drifted {
+    let drifted = !legacy_uninitialized && !session_git_state_metadata_matches(&stored, &observed);
+    let matching_receipts = if drifted {
+        mutation_receipts_explaining_session_state(state, session, job_id, &stored, &observed)?
+    } else {
+        Vec::new()
+    };
+    let matching_audit = if drifted && matching_receipts.is_empty() {
         mutation_audit_explaining_session_state(state, session, job_id, &stored, &observed)?
     } else {
         None
     };
-    let matching_command_session = if drifted && matching_audit.is_none() {
-        mutation_command_session_explaining_session_state(
-            state, session, job_id, &stored, &observed,
-        )?
-    } else {
-        None
-    };
+    let matching_command_session =
+        if drifted && matching_receipts.is_empty() && matching_audit.is_none() {
+            mutation_command_session_explaining_session_state(
+                state, session, job_id, &stored, &observed,
+            )?
+        } else {
+            None
+        };
     let observed_at = unix_timestamp();
     let _ = state.store.update_session(
         &session.id,
@@ -8106,11 +8115,31 @@ fn session_state_evidence_and_refresh(
         },
     )?;
 
-    let (status, reason, audit_event_id, command_session_id) = if drifted {
-        if let Some(audit) = matching_audit {
+    let (status, reason, receipt_ids, audit_event_id, command_session_id) = if drifted {
+        if !matching_receipts.is_empty() {
+            let receipt_ids = matching_receipts
+                .iter()
+                .map(|receipt| receipt.id)
+                .collect::<Vec<_>>();
+            (
+                "satisfied",
+                format!(
+                    "drift explained by mutation receipt(s) {}",
+                    receipt_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                receipt_ids,
+                None,
+                None,
+            )
+        } else if let Some(audit) = matching_audit {
             (
                 "satisfied",
                 format!("drift explained by audit event {}", audit.id),
+                Vec::new(),
                 Some(audit.id),
                 None,
             )
@@ -8118,6 +8147,7 @@ fn session_state_evidence_and_refresh(
             (
                 "satisfied",
                 format!("drift explained by command session {}", command_session.id),
+                Vec::new(),
                 None,
                 Some(command_session.id),
             )
@@ -8125,6 +8155,7 @@ fn session_state_evidence_and_refresh(
             (
                 "blocked",
                 "stored session git metadata differed from observed disk state without a matching daemon-observed mutation".to_string(),
+                Vec::new(),
                 None,
                 None,
             )
@@ -8133,11 +8164,12 @@ fn session_state_evidence_and_refresh(
         (
             "satisfied",
             "legacy session git metadata was initialized from disk".to_string(),
+            Vec::new(),
             None,
             None,
         )
     } else {
-        ("satisfied", String::new(), None, None)
+        ("satisfied", String::new(), Vec::new(), None, None)
     };
 
     Ok(json!({
@@ -8146,10 +8178,21 @@ fn session_state_evidence_and_refresh(
         "stored": stored_session_git_state_json_from(&stored),
         "observed": stored_session_git_state_json_from(&observed),
         "observed_at": observed_at,
+        "mutation_receipt_ids": receipt_ids,
         "audit_event_id": audit_event_id,
         "mutation_command_session_id": command_session_id,
-        "audit_hint": "If a daemon-observed mutation exists but was not matched, inspect audit_events around this job/session and compare the mutation target to the stored/observed values."
+        "audit_hint": "If a daemon-observed mutation exists but was not matched, inspect mutation_receipts and audit_events around this job/session and compare the mutation target to the stored/observed values."
     }))
+}
+
+fn session_git_state_metadata_matches(
+    left: &ObservedSessionGitState,
+    right: &ObservedSessionGitState,
+) -> bool {
+    left.git_head == right.git_head
+        && left.git_branch == right.git_branch
+        && left.git_dirty == right.git_dirty
+        && left.git_untracked_count == right.git_untracked_count
 }
 
 fn declared_session_git_path(session: &SessionSummary) -> Option<PathBuf> {
@@ -8178,14 +8221,41 @@ fn observe_session_git_state(worktree_path: &Path) -> Result<ObservedSessionGitS
         .or_else(|| git_stdout(worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"]))
         .filter(|branch| branch != "HEAD")
         .unwrap_or_default();
-    let status = git_command_stdout(worktree_path, &["status", "--porcelain"])?;
+    let status = git_command_stdout_raw(worktree_path, &["status", "--porcelain=v1"])?;
+    let dirty_paths = git_status_dirty_paths(&status);
     let git_untracked_count = status.lines().filter(|line| line.starts_with("??")).count();
     Ok(ObservedSessionGitState {
         git_head,
         git_branch,
         git_dirty: !status.trim().is_empty(),
         git_untracked_count,
+        dirty_paths,
     })
+}
+
+fn git_status_dirty_paths(status: &str) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    for line in status.lines() {
+        let line = line.trim_end();
+        if line.len() < 4 {
+            continue;
+        }
+        let path = line[3..].trim();
+        if path.is_empty() {
+            continue;
+        }
+        if let Some((from, to)) = path.split_once(" -> ") {
+            if !from.trim().is_empty() {
+                paths.insert(from.trim().to_string());
+            }
+            if !to.trim().is_empty() {
+                paths.insert(to.trim().to_string());
+            }
+        } else {
+            paths.insert(path.to_string());
+        }
+    }
+    paths.into_iter().collect()
 }
 
 fn worktree_has_unborn_head(worktree_path: &Path) -> bool {
@@ -8199,6 +8269,10 @@ fn worktree_has_unborn_head(worktree_path: &Path) -> bool {
 }
 
 fn git_command_stdout(cwd: &Path, args: &[&str]) -> Result<String> {
+    Ok(git_command_stdout_raw(cwd, args)?.trim().to_string())
+}
+
+fn git_command_stdout_raw(cwd: &Path, args: &[&str]) -> Result<String> {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(cwd)
@@ -8206,7 +8280,7 @@ fn git_command_stdout(cwd: &Path, args: &[&str]) -> Result<String> {
         .output()
         .with_context(|| format!("failed to run git {}", args.join(" ")))?;
     if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if stderr.is_empty() {
@@ -8230,7 +8304,98 @@ fn stored_session_git_state_json_from(state: &ObservedSessionGitState) -> Value 
         "git_branch": state.git_branch,
         "git_dirty": state.git_dirty,
         "git_untracked_count": state.git_untracked_count,
+        "dirty_paths": state.dirty_paths,
     })
+}
+
+fn mutation_receipts_explaining_session_state(
+    state: &AppState,
+    session: &SessionSummary,
+    job_id: &str,
+    stored: &ObservedSessionGitState,
+    observed: &ObservedSessionGitState,
+) -> Result<Vec<nucleus_protocol::MutationReceipt>> {
+    let since = session
+        .session_state_observed_at
+        .unwrap_or(session.created_at)
+        .saturating_sub(1);
+    let mut receipts = state
+        .store
+        .list_mutation_receipts_for_session(&session.id)?;
+    receipts.retain(|receipt| {
+        receipt.job_id == job_id
+            && receipt.created_at > since
+            && receipt.expected_dirty == receipt.after_git_dirty
+    });
+    receipts.sort_by_key(|receipt| (receipt.created_at, receipt.id));
+
+    if let Some(receipt) = receipts.iter().find(|receipt| {
+        session_git_state_metadata_matches(&mutation_receipt_before_state(receipt), stored)
+            && session_git_state_metadata_matches(&mutation_receipt_after_state(receipt), observed)
+            && mutation_receipt_paths_cover_observed(
+                &receipt.paths.iter().cloned().collect::<BTreeSet<_>>(),
+                observed,
+            )
+    }) {
+        return Ok(vec![receipt.clone()]);
+    }
+
+    let mut current = stored.clone();
+    let mut matched = Vec::new();
+    let mut covered_paths = BTreeSet::new();
+    for receipt in receipts {
+        let before = mutation_receipt_before_state(&receipt);
+        if !session_git_state_metadata_matches(&current, &before) {
+            continue;
+        }
+        current = mutation_receipt_after_state(&receipt);
+        for path in &receipt.paths {
+            covered_paths.insert(path.clone());
+        }
+        matched.push(receipt);
+        if session_git_state_metadata_matches(&current, observed)
+            && mutation_receipt_paths_cover_observed(&covered_paths, observed)
+        {
+            return Ok(matched);
+        }
+    }
+
+    Ok(Vec::new())
+}
+
+fn mutation_receipt_before_state(
+    receipt: &nucleus_protocol::MutationReceipt,
+) -> ObservedSessionGitState {
+    ObservedSessionGitState {
+        git_head: receipt.before_git_head.clone(),
+        git_branch: receipt.before_git_branch.clone(),
+        git_dirty: receipt.before_git_dirty,
+        git_untracked_count: receipt.before_git_untracked_count,
+        dirty_paths: Vec::new(),
+    }
+}
+
+fn mutation_receipt_after_state(
+    receipt: &nucleus_protocol::MutationReceipt,
+) -> ObservedSessionGitState {
+    ObservedSessionGitState {
+        git_head: receipt.after_git_head.clone(),
+        git_branch: receipt.after_git_branch.clone(),
+        git_dirty: receipt.after_git_dirty,
+        git_untracked_count: receipt.after_git_untracked_count,
+        dirty_paths: Vec::new(),
+    }
+}
+
+fn mutation_receipt_paths_cover_observed(
+    covered_paths: &BTreeSet<String>,
+    observed: &ObservedSessionGitState,
+) -> bool {
+    observed.dirty_paths.is_empty()
+        || observed
+            .dirty_paths
+            .iter()
+            .all(|path| covered_paths.contains(path))
 }
 
 fn mutation_audit_explaining_session_state(
@@ -13358,6 +13523,7 @@ async fn execute_pending_tool_action(
         job_id,
         worker,
         &pending.tool_call_id,
+        pending.approval_id.as_deref(),
         checkpoint,
         cancel_rx,
         &tool,
@@ -13694,6 +13860,7 @@ async fn execute_granted_tool(
     job_id: &str,
     worker: &WorkerSummary,
     tool_call_id: &str,
+    approval_id: Option<&str>,
     checkpoint: &mut WorkerCheckpoint,
     cancel_rx: &mut watch::Receiver<bool>,
     tool: &str,
@@ -13708,7 +13875,8 @@ async fn execute_granted_tool(
         bail!("tool '{}' is not granted to worker '{}'", tool, worker.id);
     }
 
-    match tool {
+    let receipt_before = mutation_receipt_before_execution(tool, &session.session);
+    let result = match tool {
         "project.inspect" => execute_project_inspect_tool(session, worker).await,
         "fs.list" => {
             let args =
@@ -13889,7 +14057,141 @@ async fn execute_granted_tool(
                 bail!("unsupported tool '{}'", other)
             }
         }
+    }?;
+
+    if let Some((worktree_path, before)) = receipt_before {
+        record_mutation_receipt_after_execution(
+            state,
+            &session.session,
+            job_id,
+            worker,
+            tool_call_id,
+            approval_id,
+            tool,
+            &worktree_path,
+            before,
+            &result,
+        );
     }
+
+    Ok(result)
+}
+
+fn mutation_receipt_before_execution(
+    tool: &str,
+    session: &SessionSummary,
+) -> Option<(PathBuf, ObservedSessionGitState)> {
+    if !is_receipted_mutation_tool(tool) {
+        return None;
+    }
+    let worktree_path = declared_session_git_path(session)?;
+    let before = observe_session_git_state(&worktree_path).ok()?;
+    Some((worktree_path, before))
+}
+
+fn is_receipted_mutation_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "fs.apply_patch" | "fs.write_text" | "fs.move" | "python.run" | "command.run"
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_mutation_receipt_after_execution(
+    state: &AppState,
+    session: &SessionSummary,
+    job_id: &str,
+    worker: &WorkerSummary,
+    tool_call_id: &str,
+    approval_id: Option<&str>,
+    tool: &str,
+    worktree_path: &Path,
+    before: ObservedSessionGitState,
+    result: &Value,
+) {
+    let Ok(after) = observe_session_git_state(worktree_path) else {
+        return;
+    };
+    let paths = mutation_receipt_paths(worktree_path, &before, &after, result);
+    let _ = state.store.append_mutation_receipt(MutationReceiptRecord {
+        job_id: job_id.to_string(),
+        worker_id: worker.id.clone(),
+        tool_call_id: tool_call_id.to_string(),
+        session_id: session.id.clone(),
+        tool: tool.to_string(),
+        approval_id: approval_id.map(ToOwned::to_owned),
+        paths,
+        before_git_head: before.git_head,
+        before_git_branch: before.git_branch,
+        before_git_dirty: before.git_dirty,
+        before_git_untracked_count: before.git_untracked_count,
+        after_git_head: after.git_head,
+        after_git_branch: after.git_branch,
+        after_git_dirty: after.git_dirty,
+        after_git_untracked_count: after.git_untracked_count,
+        expected_dirty: after.git_dirty,
+    });
+}
+
+fn mutation_receipt_paths(
+    worktree_path: &Path,
+    _before: &ObservedSessionGitState,
+    after: &ObservedSessionGitState,
+    result: &Value,
+) -> Vec<String> {
+    let mut paths = after.dirty_paths.iter().cloned().collect::<BTreeSet<_>>();
+    if paths.is_empty() {
+        paths.extend(mutation_receipt_result_paths(worktree_path, result));
+    }
+    paths.into_iter().collect()
+}
+
+fn mutation_receipt_result_paths(worktree_path: &Path, result: &Value) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    if let Some(path) = result.get("path").and_then(Value::as_str) {
+        if let Some(path) = normalize_mutation_receipt_path(worktree_path, path) {
+            paths.insert(path);
+        }
+    }
+    for key in ["from_path", "to_path"] {
+        if let Some(path) = result.get(key).and_then(Value::as_str) {
+            if let Some(path) = normalize_mutation_receipt_path(worktree_path, path) {
+                paths.insert(path);
+            }
+        }
+    }
+    if let Some(values) = result.get("paths").and_then(Value::as_array) {
+        for value in values {
+            if let Some(path) = value.as_str() {
+                if let Some(path) = normalize_mutation_receipt_path(worktree_path, path) {
+                    paths.insert(path);
+                }
+            }
+        }
+    }
+    paths.into_iter().collect()
+}
+
+fn normalize_mutation_receipt_path(worktree_path: &Path, path: &str) -> Option<String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let path = Path::new(path);
+    let relative = if path.is_absolute() {
+        path.strip_prefix(worktree_path).ok()?.to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+    let normalized = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn ensure_root_worker_is_utility(worker: &WorkerSummary) -> Result<()> {
@@ -29342,12 +29644,14 @@ Thanks."#,
             git_branch: "dev".to_string(),
             git_dirty: false,
             git_untracked_count: 0,
+            dirty_paths: Vec::new(),
         };
         let observed_git_state = ObservedSessionGitState {
             git_head: "2222222222222222222222222222222222222222".to_string(),
             git_branch: "dev".to_string(),
             git_dirty: false,
             git_untracked_count: 0,
+            dirty_paths: Vec::new(),
         };
         let mut generic_clean = direct_git.clone();
         generic_clean.args = vec!["clean".to_string(), "-fd".to_string()];
@@ -29995,6 +30299,363 @@ Thanks."#,
             observe_session_git_state(&repo.worktree).expect("detached state should observe");
         assert_eq!(detached.git_head, head);
         assert_eq!(detached.git_branch, "");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn approved_mutation_tools_emit_receipts_and_satisfy_dirty_session_state() {
+        let state_dir = test_state_dir("mutation-receipt-tool-execution");
+        let state = initialize_test_state(&state_dir);
+        let repo = context_integrity_repo(&state_dir, "receipt-tools");
+        let session_id = "receipt-tool-session";
+        let job_id = "receipt-tool-job";
+        let worker_id = "receipt-tool-worker";
+
+        state
+            .store
+            .create_session(test_git_session_record(
+                session_id,
+                "Receipt tool session",
+                &repo,
+            ))
+            .expect("session should persist");
+        state
+            .store
+            .create_job(JobRecord {
+                id: job_id.to_string(),
+                session_id: Some(session_id.to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("local_project".to_string()),
+                title: "Receipt tool job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "running".to_string(),
+                requested_by: "test".to_string(),
+                prompt_excerpt: String::new(),
+                publication_intent_text: None,
+            })
+            .expect("job should persist");
+        let worker = state
+            .store
+            .create_worker(WorkerRecord {
+                id: worker_id.to_string(),
+                job_id: job_id.to_string(),
+                parent_worker_id: None,
+                title: "Receipt worker".to_string(),
+                lane: ACTION_EXECUTOR_LANE.to_string(),
+                state: "running".to_string(),
+                provider: "test".to_string(),
+                model: "test".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: repo.worktree.display().to_string(),
+                read_roots: vec![repo.worktree.display().to_string()],
+                write_roots: vec![repo.worktree.display().to_string()],
+                max_steps: 10,
+                max_tool_calls: 10,
+                max_wall_clock_secs: 30,
+            })
+            .expect("worker should persist");
+        state
+            .store
+            .replace_tool_capability_grants(&worker.id, &root_worker_capabilities())
+            .expect("capabilities should persist");
+        let worker = state
+            .store
+            .get_job(job_id)
+            .expect("job should reload")
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.id == worker.id)
+            .expect("worker should reload with capabilities");
+        let session = state
+            .store
+            .get_session(session_id)
+            .expect("session should load");
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session_id.to_string(),
+            prompt_text: String::new(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        for (tool_call_id, tool_id) in [
+            ("tool-call-apply", "fs.apply_patch"),
+            ("tool-call-move", "fs.move"),
+            ("tool-call-write", "fs.write_text"),
+            ("tool-call-python", "python.run"),
+            ("tool-call-command", "command.run"),
+        ] {
+            state
+                .store
+                .create_tool_call(ToolCallRecord {
+                    id: tool_call_id.to_string(),
+                    job_id: job_id.to_string(),
+                    worker_id: worker.id.clone(),
+                    tool_id: tool_id.to_string(),
+                    status: "running".to_string(),
+                    summary: format!("Run {tool_id}"),
+                    args_json: json!({}),
+                    result_json: None,
+                    policy_decision: None,
+                    artifact_ids: Vec::new(),
+                    error_class: String::new(),
+                    error_detail: String::new(),
+                    started_at: Some(unix_timestamp()),
+                    completed_at: None,
+                })
+                .expect("tool call should persist");
+        }
+
+        execute_granted_tool(
+            &state,
+            &session,
+            job_id,
+            &worker,
+            "tool-call-apply",
+            Some("approval-apply"),
+            &mut checkpoint,
+            &mut cancel_rx,
+            "fs.apply_patch",
+            json!({
+                "path": "file.txt",
+                "edits": [{"find": "initial", "replace": "apply"}],
+            }),
+        )
+        .await
+        .expect("fs.apply_patch should execute");
+        execute_granted_tool(
+            &state,
+            &session,
+            job_id,
+            &worker,
+            "tool-call-move",
+            Some("approval-move"),
+            &mut checkpoint,
+            &mut cancel_rx,
+            "fs.move",
+            json!({"from_path": "file.txt", "to_path": "moved.txt"}),
+        )
+        .await
+        .expect("fs.move should execute");
+        execute_granted_tool(
+            &state,
+            &session,
+            job_id,
+            &worker,
+            "tool-call-write",
+            Some("approval-write"),
+            &mut checkpoint,
+            &mut cancel_rx,
+            "fs.write_text",
+            json!({"path": "write.txt", "content": "write\n"}),
+        )
+        .await
+        .expect("fs.write_text should execute");
+        execute_granted_tool(
+            &state,
+            &session,
+            job_id,
+            &worker,
+            "tool-call-python",
+            Some("approval-python"),
+            &mut checkpoint,
+            &mut cancel_rx,
+            "python.run",
+            json!({
+                "script": "from pathlib import Path\nPath('python.txt').write_text('python\\n')",
+                "cwd": ".",
+                "timeout_secs": 20,
+            }),
+        )
+        .await
+        .expect("python.run should execute");
+        execute_granted_tool(
+            &state,
+            &session,
+            job_id,
+            &worker,
+            "tool-call-command",
+            Some("approval-command"),
+            &mut checkpoint,
+            &mut cancel_rx,
+            "command.run",
+            json!({
+                "command": "sh",
+                "args": ["-c", "printf command > command.txt"],
+                "cwd": ".",
+                "timeout_secs": 20,
+            }),
+        )
+        .await
+        .expect("command.run should execute");
+
+        let receipts = state
+            .store
+            .list_mutation_receipts_for_session(session_id)
+            .expect("receipts should load");
+        assert_eq!(receipts.len(), 5);
+        let receipt_paths = receipts
+            .iter()
+            .flat_map(|receipt| receipt.paths.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        assert!(receipt_paths.contains("file.txt"));
+        assert!(receipt_paths.contains("moved.txt"));
+        assert!(receipt_paths.contains("write.txt"));
+        assert!(receipt_paths.contains("python.txt"));
+        assert!(receipt_paths.contains("command.txt"));
+        assert!(receipts.iter().all(|receipt| receipt.expected_dirty));
+        assert!(
+            receipts
+                .iter()
+                .all(|receipt| receipt.session_id == session_id)
+        );
+
+        let clean_session = state
+            .store
+            .get_session(session_id)
+            .expect("session should still contain clean baseline")
+            .session;
+        let evidence = session_state_evidence_and_refresh(&state, &clean_session, job_id)
+            .expect("receipts should explain dirty state");
+        assert_eq!(evidence["status"], "satisfied");
+        assert_eq!(
+            evidence["mutation_receipt_ids"].as_array().unwrap().len(),
+            5
+        );
+        assert!(evidence["audit_event_id"].is_null());
+        assert!(evidence["mutation_command_session_id"].is_null());
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn session_state_receipt_requires_matching_dirty_paths() {
+        let state_dir = test_state_dir("mutation-receipt-path-guard");
+        let state = initialize_test_state(&state_dir);
+        let repo = context_integrity_repo(&state_dir, "receipt-paths");
+        let session_id = "receipt-path-session";
+        let job_id = "receipt-path-job";
+
+        state
+            .store
+            .create_session(test_git_session_record(
+                session_id,
+                "Receipt path session",
+                &repo,
+            ))
+            .expect("session should persist");
+        state
+            .store
+            .create_job(JobRecord {
+                id: job_id.to_string(),
+                session_id: Some(session_id.to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("local_project".to_string()),
+                title: "Receipt path job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "running".to_string(),
+                requested_by: "test".to_string(),
+                prompt_excerpt: String::new(),
+                publication_intent_text: None,
+            })
+            .expect("job should persist");
+
+        fs::write(repo.worktree.join("file.txt"), "dirty\n").expect("tracked file should write");
+        let observed =
+            observe_session_git_state(&repo.worktree).expect("dirty state should observe");
+        state
+            .store
+            .append_mutation_receipt(MutationReceiptRecord {
+                job_id: job_id.to_string(),
+                worker_id: "worker".to_string(),
+                tool_call_id: "tool-call-wrong".to_string(),
+                session_id: session_id.to_string(),
+                tool: "fs.write_text".to_string(),
+                approval_id: Some("approval-wrong".to_string()),
+                paths: vec!["other.txt".to_string()],
+                before_git_head: repo.initial_sha.clone(),
+                before_git_branch: "dev".to_string(),
+                before_git_dirty: false,
+                before_git_untracked_count: 0,
+                after_git_head: observed.git_head.clone(),
+                after_git_branch: observed.git_branch.clone(),
+                after_git_dirty: observed.git_dirty,
+                after_git_untracked_count: observed.git_untracked_count,
+                expected_dirty: observed.git_dirty,
+            })
+            .expect("wrong-path receipt should persist");
+
+        let session = state
+            .store
+            .get_session(session_id)
+            .expect("session should load")
+            .session;
+        let blocked = session_state_evidence_and_refresh(&state, &session, job_id)
+            .expect("wrong-path receipt should not explain drift");
+        assert_eq!(blocked["status"], "blocked");
+        assert!(
+            blocked["mutation_receipt_ids"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        state
+            .store
+            .update_session(
+                session_id,
+                SessionPatch {
+                    git_head: Some(repo.initial_sha.clone()),
+                    git_branch: Some("dev".to_string()),
+                    git_dirty: Some(false),
+                    git_untracked_count: Some(0),
+                    session_state_observed_at: Some(Some(1)),
+                    ..SessionPatch::default()
+                },
+            )
+            .expect("session baseline should reset");
+        let matching_receipt = state
+            .store
+            .append_mutation_receipt(MutationReceiptRecord {
+                job_id: job_id.to_string(),
+                worker_id: "worker".to_string(),
+                tool_call_id: "tool-call-matching".to_string(),
+                session_id: session_id.to_string(),
+                tool: "fs.write_text".to_string(),
+                approval_id: Some("approval-matching".to_string()),
+                paths: vec!["file.txt".to_string()],
+                before_git_head: repo.initial_sha.clone(),
+                before_git_branch: "dev".to_string(),
+                before_git_dirty: false,
+                before_git_untracked_count: 0,
+                after_git_head: observed.git_head,
+                after_git_branch: observed.git_branch,
+                after_git_dirty: observed.git_dirty,
+                after_git_untracked_count: observed.git_untracked_count,
+                expected_dirty: observed.git_dirty,
+            })
+            .expect("matching receipt should persist");
+        let session = state
+            .store
+            .get_session(session_id)
+            .expect("session should load")
+            .session;
+        let explained = session_state_evidence_and_refresh(&state, &session, job_id)
+            .expect("matching receipt should explain drift");
+        assert_eq!(explained["status"], "satisfied");
+        assert_eq!(explained["mutation_receipt_ids"][0], matching_receipt.id);
 
         let _ = fs::remove_dir_all(&state_dir);
     }
@@ -31519,6 +32180,7 @@ Thanks."#,
             &job_id,
             &forged_worker,
             "tool-call-main-lane",
+            None,
             &mut checkpoint,
             &mut cancel_rx,
             "fs.list",
@@ -31603,6 +32265,7 @@ Thanks."#,
             &job_id,
             &child_worker,
             "tool-call-main-subworker",
+            None,
             &mut checkpoint,
             &mut cancel_rx,
             "fs.list",
@@ -36585,6 +37248,7 @@ for line in sys.stdin:
             &job_id,
             &worker,
             &tool_call_id,
+            None,
             &mut checkpoint,
             &mut cancel_rx,
             "cloudflare-api.search",
@@ -38161,6 +38825,31 @@ for line in sys.stdin:
             execution_mode: "act".to_string(),
             run_budget_mode: "inherit".to_string(),
         }
+    }
+
+    fn test_git_session_record(
+        id: &str,
+        title: &str,
+        repo: &ContextIntegrityRepo,
+    ) -> SessionRecord {
+        let mut record = test_session_record(id, title, &repo.worktree);
+        record.scope = "project".to_string();
+        record.project_path = repo.source.display().to_string();
+        record.working_dir_kind = "project_root".to_string();
+        record.workspace_mode = "isolated_worktree".to_string();
+        record.attachment_mode = "new_worktree".to_string();
+        record.worktree_id = id.to_string();
+        record.source_project_path = repo.source.display().to_string();
+        record.git_root = repo.worktree.display().to_string();
+        record.worktree_path = repo.worktree.display().to_string();
+        record.git_branch = "dev".to_string();
+        record.git_base_ref = "dev".to_string();
+        record.git_head = repo.initial_sha.clone();
+        record.git_dirty = false;
+        record.git_untracked_count = 0;
+        record.git_remote_tracking_branch = "origin/dev".to_string();
+        record.session_state_observed_at = Some(1);
+        record
     }
 
     fn test_worker_summary(id: &str, max_steps: usize, max_tool_calls: usize) -> WorkerSummary {
