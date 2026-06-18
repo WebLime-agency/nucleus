@@ -1147,8 +1147,8 @@ fn env_path_tokens(value: &str) -> Vec<String> {
 fn command_tokens(args: &Value) -> Vec<String> {
     let mut tokens = Vec::new();
     for field in ["command", "cmd"] {
-        if let Some(command) = args.get(field).and_then(Value::as_str) {
-            tokens.extend(command.split_whitespace().map(clean_command_token));
+        if let Some(alias) = args.get(field) {
+            tokens.extend(command_alias_tokens(alias));
         }
     }
     if let Some(values) = args.get("args").and_then(Value::as_array) {
@@ -1157,6 +1157,21 @@ fn command_tokens(args: &Value) -> Vec<String> {
         }
     }
     tokens
+}
+
+fn command_alias_tokens(value: &Value) -> Vec<String> {
+    match value {
+        Value::String(command) => command
+            .split_whitespace()
+            .map(clean_command_token)
+            .collect(),
+        Value::Array(values) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .flat_map(|value| value.split_whitespace().map(clean_command_token))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn clean_command_token(token: &str) -> String {
@@ -2020,6 +2035,19 @@ mod tests {
         let call = tool_call_with_args(
             "command.run",
             json!({"command":"rg","args":["token","/home/eba/.ssh"],"cwd":"."}),
+        );
+
+        let verdict = evaluate_command_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(!verdict.approve);
+        assert!(verdict.reason.contains("outside the worker worktree"));
+    }
+
+    #[test]
+    fn command_policy_rejects_array_alias_external_paths() {
+        let call = tool_call_with_args(
+            "command.run",
+            json!({"cmd":["rg","token","/home/eba/.ssh"],"cwd":"."}),
         );
 
         let verdict = evaluate_command_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
