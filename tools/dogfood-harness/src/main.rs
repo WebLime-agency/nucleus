@@ -1054,7 +1054,12 @@ fn clean_command_token(token: &str) -> String {
 }
 
 fn path_like_command_token(token: &str) -> Option<PathBuf> {
-    let token = token.trim();
+    let raw = token.trim();
+    let token = if raw.starts_with('-') {
+        raw.split_once('=').map(|(_, value)| value.trim())?
+    } else {
+        raw
+    };
     if token.is_empty() || token.starts_with('-') {
         return None;
     }
@@ -1084,9 +1089,13 @@ fn command_looks_like_read_build_or_test(command: &str) -> bool {
         "npm run build",
         "npm test",
         "pnpm test",
-        "pnpm run",
+        "pnpm run check",
+        "pnpm run build",
+        "pnpm run test",
         "yarn test",
-        "yarn run",
+        "yarn run check",
+        "yarn run build",
+        "yarn run test",
         "bun test",
         "pytest",
         "go test",
@@ -1107,7 +1116,13 @@ fn command_looks_like_validation(command: &str) -> bool {
         "npm run build",
         "npm test",
         "pnpm test",
+        "pnpm run check",
+        "pnpm run build",
+        "pnpm run test",
         "yarn test",
+        "yarn run check",
+        "yarn run build",
+        "yarn run test",
         "bun test",
         "pytest",
         "go test",
@@ -1772,6 +1787,28 @@ mod tests {
 
         assert!(!verdict.approve);
         assert!(verdict.reason.contains("outside the worker worktree"));
+    }
+
+    #[test]
+    fn command_policy_rejects_option_attached_external_paths() {
+        let call = tool_call_with_args(
+            "command.run",
+            json!({"command":"cargo","args":["test","--manifest-path=/tmp/other/Cargo.toml"],"cwd":"."}),
+        );
+
+        let verdict = evaluate_command_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(!verdict.approve);
+        assert!(verdict.reason.contains("outside the worker worktree"));
+    }
+
+    #[test]
+    fn command_policy_rejects_unbounded_package_scripts() {
+        let deploy = "pnpm run deploy";
+        let check = "pnpm run check";
+
+        assert!(!command_looks_like_read_build_or_test(deploy));
+        assert!(command_looks_like_read_build_or_test(check));
     }
 
     #[test]
