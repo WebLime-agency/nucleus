@@ -10,7 +10,8 @@ Default target is the DevProjects install at `http://127.0.0.1:5202`:
 
 ```bash
 cargo run -p nucleus-dogfood-harness -- \
-  --output tools/dogfood-harness/reports/latest.json
+  --output tools/dogfood-harness/reports/latest.json \
+  --allow-failures
 ```
 
 Useful options:
@@ -23,6 +24,7 @@ Useful options:
 --rungs <list|all>        Comma-separated rung names or all. Default: all
 --timeout-secs <seconds>  Per-rung wall-clock timeout. Default: 900
 --output <path>           JSON report path. Default: tools/dogfood-harness/reports/latest.json
+--allow-failures          Exit 0 even when one or more rungs FAIL; intended for capturing known-red baselines
 ```
 
 The token is read into memory and never printed. Prefer the token file or environment variable over passing the token as a shell argument.

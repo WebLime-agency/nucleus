@@ -55,6 +55,8 @@ struct Args {
     timeout_secs: u64,
     #[arg(long, env = "NUCLEUS_DOGFOOD_OUTPUT", default_value = DEFAULT_OUTPUT_PATH)]
     output: PathBuf,
+    #[arg(long, env = "NUCLEUS_DOGFOOD_ALLOW_FAILURES", default_value_t = false)]
+    allow_failures: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +265,9 @@ async fn main() -> Result<()> {
 
     write_report(&args.output, &report)?;
     print_summary(&report, &args.output);
+    if failed > 0 && !args.allow_failures {
+        bail!("dogfood harness reported {failed} failing rung(s)");
+    }
     Ok(())
 }
 
@@ -1078,6 +1083,7 @@ fn path_like_command_token(token: &str) -> Option<PathBuf> {
 fn command_looks_like_read_build_or_test(command: &str) -> bool {
     let allowed = [
         "printf",
+        READ_ONLY_PROBE_COMMAND,
         "pwd",
         "ls",
         "find",
@@ -1139,9 +1145,10 @@ fn command_matches_allowed_prefix(command: &str, allowed: &[&str]) -> bool {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    allowed
-        .iter()
-        .any(|prefix| normalized == *prefix || normalized.starts_with(&format!("{prefix} ")))
+    allowed.iter().any(|prefix| {
+        let prefix = prefix.to_lowercase();
+        normalized == prefix || normalized.starts_with(&format!("{prefix} "))
+    })
 }
 
 fn script_contains_external_or_network_mutation(script: &str) -> bool {
@@ -1949,6 +1956,9 @@ mod tests {
     #[test]
     fn read_only_probe_requires_exact_command() {
         assert!(command_is_exact_read_only_probe(
+            "sh -lc printf NUCLEUS_COMMAND_RUN_PROBE"
+        ));
+        assert!(command_looks_like_read_build_or_test(
             "sh -lc printf NUCLEUS_COMMAND_RUN_PROBE"
         ));
         assert!(!command_is_exact_read_only_probe("pwd"));
