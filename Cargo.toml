@@ -10,6 +10,7 @@ members = [
   "crates/protocol",
   "crates/release",
   "crates/storage",
+  "tools/dogfood-harness",
 ]
 
 [workspace.package]

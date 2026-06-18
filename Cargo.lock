@@ -1109,6 +1109,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nucleus-dogfood-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "nucleus-protocol",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "nucleus-protocol"
 version = "0.1.0"
 dependencies = [

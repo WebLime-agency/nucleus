@@ -3001,6 +3001,29 @@ pub struct AuditEvent {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MutationReceipt {
+    pub id: i64,
+    pub job_id: String,
+    pub worker_id: String,
+    pub tool_call_id: String,
+    pub session_id: String,
+    pub tool: String,
+    pub approval_id: Option<String>,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    pub before_git_head: String,
+    pub before_git_branch: String,
+    pub before_git_dirty: bool,
+    pub before_git_untracked_count: usize,
+    pub after_git_head: String,
+    pub after_git_branch: String,
+    pub after_git_dirty: bool,
+    pub after_git_untracked_count: usize,
+    pub expected_dirty: bool,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InstanceLogEntry {
     pub id: i64,
