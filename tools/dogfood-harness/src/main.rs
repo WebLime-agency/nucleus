@@ -823,6 +823,12 @@ fn evaluate_python_run(call: &ToolCallSummary, worktree: &Path) -> ApprovalVerdi
     if script.trim().is_empty() {
         return deny("python.run script is missing", vec![cwd.to_string()]);
     }
+    if args_have_external_path_reference(&call.args_json, worktree) {
+        return deny(
+            "python.run args reference a path outside the worker worktree",
+            vec![cwd.to_string()],
+        );
+    }
     if script_contains_external_or_network_mutation(&script) {
         return deny(
             "python script is not clearly scoped to the worker worktree",
@@ -1037,6 +1043,17 @@ fn command_has_external_path_reference(args: &Value, worktree: &Path) -> bool {
         .any(|path| !path_is_inside_worktree(worktree, &path))
 }
 
+fn args_have_external_path_reference(args: &Value, worktree: &Path) -> bool {
+    args.get("args")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .flat_map(|value| value.split_whitespace().map(clean_command_token))
+        .filter_map(|token| path_like_command_token(&token))
+        .any(|path| !path_is_inside_worktree(worktree, &path))
+}
+
 fn command_tokens(args: &Value) -> Vec<String> {
     let mut tokens = Vec::new();
     for field in ["command", "cmd"] {
@@ -1134,6 +1151,21 @@ fn command_looks_like_validation(command: &str) -> bool {
         "go test",
         "make test",
         "just test",
+        "just check",
+    ];
+    command_matches_allowed_prefix(command, &allowed)
+}
+
+fn command_session_looks_like_check_validation(command: &str) -> bool {
+    let allowed = [
+        "cargo check",
+        "cargo build",
+        "npm run check",
+        "npm run build",
+        "pnpm run check",
+        "pnpm run build",
+        "yarn run check",
+        "yarn run build",
         "just check",
     ];
     command_matches_allowed_prefix(command, &allowed)
@@ -1662,11 +1694,13 @@ fn command_session_success(session: &CommandSessionSummary) -> bool {
 }
 
 fn tool_result_exit_zero(call: &ToolCallSummary) -> bool {
-    call.result_json
-        .as_ref()
-        .and_then(|value| value.get("exit_code"))
-        .and_then(Value::as_i64)
-        == Some(0)
+    call.result_json.as_ref().is_some_and(|value| {
+        value.get("exit_code").and_then(Value::as_i64) == Some(0)
+            && value
+                .pointer("/validation_interpretation/status")
+                .and_then(Value::as_str)
+                != Some("no_tests_matched")
+    })
 }
 
 fn child_accepted(child: &JobDetail) -> bool {
@@ -1697,7 +1731,7 @@ fn child_has_successful_test_run(child: &JobDetail) -> bool {
         .any(tool_call_is_successful_test_run)
         || child.command_sessions.iter().any(|session| {
             command_session_success(session)
-                && command_looks_like_validation(&command_session_text(session))
+                && command_session_looks_like_check_validation(&command_session_text(session))
         })
 }
 
@@ -1862,6 +1896,23 @@ mod tests {
     }
 
     #[test]
+    fn validation_tool_call_rejects_no_tests_matched() {
+        let mut no_match = tool_call("tests.run", "completed", Some(0));
+        no_match.result_json = Some(json!({
+            "exit_code": 0,
+            "validation_interpretation": {"status": "no_tests_matched"}
+        }));
+
+        assert!(!tool_call_is_successful_test_run(&no_match));
+    }
+
+    #[test]
+    fn command_session_validation_fallback_excludes_test_commands() {
+        assert!(!command_session_looks_like_check_validation("cargo test"));
+        assert!(command_session_looks_like_check_validation("cargo check"));
+    }
+
+    #[test]
     fn validation_tool_call_requires_validation_command() {
         let mut read_only =
             tool_call_with_args("command.run", json!({"command":"pwd","args":[],"cwd":"."}));
@@ -1940,6 +1991,19 @@ mod tests {
 
         assert!(!verdict.approve);
         assert!(verdict.reason.contains("worker worktree"));
+    }
+
+    #[test]
+    fn python_policy_rejects_external_args() {
+        let call = tool_call_with_args(
+            "python.run",
+            json!({"cwd":".","script":"from pathlib import Path\nprint(Path(__import__('sys').argv[1]).read_text())","args":["/home/eba/.ssh/id_rsa"]}),
+        );
+
+        let verdict = evaluate_python_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(!verdict.approve);
+        assert!(verdict.reason.contains("outside the worker worktree"));
     }
 
     #[test]
