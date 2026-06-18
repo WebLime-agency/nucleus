@@ -28,8 +28,8 @@
   "rungs": [
     {
       "name": "read_only",
-      "session_id": "05042181-f774-44b2-a4e1-b46102bd3d39",
-      "root_job_id": "4ecc14ad-c1f8-4dc5-8422-fbb55c917765",
+      "session_id": "1dc0fa1a-f3cb-4490-ae82-6acb4a574a1c",
+      "root_job_id": "50dc0a97-a2d5-48e2-be79-5c8674b97df0",
       "status": "FAIL",
       "reasons": [
         "root did not converge with a completed result"
@@ -41,16 +41,7 @@
       },
       "children": [
         {
-          "id": "418996bb-80f5-48a5-aefa-bf95deb9b239",
-          "lane": "main",
-          "model": "cx/gpt-5.5",
-          "state": "completed",
-          "completion_status": "satisfied",
-          "completion_blockers": [],
-          "tool_failures": []
-        },
-        {
-          "id": "a530c8cc-228e-4767-b1bd-18051f078e99",
+          "id": "6b7d301b-c60c-4b49-8412-979f8e8b1ef0",
           "lane": "main",
           "model": "cx/gpt-5.5",
           "state": "completed",
@@ -60,25 +51,16 @@
         }
       ],
       "counts": {
-        "children": 2,
-        "main_children": 2,
+        "children": 1,
+        "main_children": 1,
         "utility_children": 0,
         "fanout_detected": false
       },
       "approvals": {
         "approved": [
           {
-            "id": "b0781e19-ee34-4bc0-b159-a277a21e5c64",
-            "job_id": "418996bb-80f5-48a5-aefa-bf95deb9b239",
-            "tool": "command.run",
-            "target_paths": [
-              "."
-            ],
-            "reason": "bounded read/build/test command in worker worktree"
-          },
-          {
-            "id": "5c356e12-100c-4cb3-9649-9881fe4ac85a",
-            "job_id": "a530c8cc-228e-4767-b1bd-18051f078e99",
+            "id": "ba1c591f-aefd-4d3b-aae8-9f9985e677ad",
+            "job_id": "6b7d301b-c60c-4b49-8412-979f8e8b1ef0",
             "tool": "command.run",
             "target_paths": [
               "."
@@ -90,116 +72,84 @@
       },
       "key_events": [
         {
-          "job_id": "4ecc14ad-c1f8-4dc5-8422-fbb55c917765",
+          "job_id": "50dc0a97-a2d5-48e2-be79-5c8674b97df0",
           "event_type": "job.publication.git_baseline",
           "status": "captured",
           "summary": "Captured publication git hygiene baseline"
         },
         {
-          "job_id": "4ecc14ad-c1f8-4dc5-8422-fbb55c917765",
+          "job_id": "50dc0a97-a2d5-48e2-be79-5c8674b97df0",
           "event_type": "child.jobs.spawned",
           "status": "running",
           "summary": "Spawned 1 child jobs"
         },
         {
-          "job_id": "4ecc14ad-c1f8-4dc5-8422-fbb55c917765",
-          "event_type": "child.jobs.spawned",
-          "status": "running",
-          "summary": "Spawned 1 child jobs"
-        },
-        {
-          "job_id": "4ecc14ad-c1f8-4dc5-8422-fbb55c917765",
+          "job_id": "50dc0a97-a2d5-48e2-be79-5c8674b97df0",
           "event_type": "child.jobs.reused",
           "status": "completed",
           "summary": "Reused 1 equivalent child job(s)"
         },
         {
-          "job_id": "4ecc14ad-c1f8-4dc5-8422-fbb55c917765",
+          "job_id": "50dc0a97-a2d5-48e2-be79-5c8674b97df0",
+          "event_type": "worker.retry",
+          "status": "retrying",
+          "summary": "Requested explicit publication outcome metadata."
+        },
+        {
+          "job_id": "50dc0a97-a2d5-48e2-be79-5c8674b97df0",
           "event_type": "job.blocked",
           "status": "blocked",
-          "summary": "Read-only probe completed successfully in the delegated main child."
+          "summary": "Delegated read-only command probe completed successfully; no publication or browser verification was involved."
         },
         {
-          "job_id": "4ecc14ad-c1f8-4dc5-8422-fbb55c917765",
+          "job_id": "50dc0a97-a2d5-48e2-be79-5c8674b97df0",
           "event_type": "job.publication.completed",
           "status": "not_requested",
-          "summary": "Read-only probe completed successfully in the delegated main child."
+          "summary": "Read-only probe only; no PR, merge, or publication step was requested or performed."
         },
         {
-          "job_id": "418996bb-80f5-48a5-aefa-bf95deb9b239",
+          "job_id": "6b7d301b-c60c-4b49-8412-979f8e8b1ef0",
           "event_type": "approval.requested",
           "status": "paused",
           "summary": "Approval required for command.run"
         },
         {
-          "job_id": "418996bb-80f5-48a5-aefa-bf95deb9b239",
+          "job_id": "6b7d301b-c60c-4b49-8412-979f8e8b1ef0",
           "event_type": "approval.resolved",
           "status": "approved",
-          "summary": "Approved run the requested read-only probe command"
+          "summary": "Approved run the requested probe command"
         },
         {
-          "job_id": "418996bb-80f5-48a5-aefa-bf95deb9b239",
+          "job_id": "6b7d301b-c60c-4b49-8412-979f8e8b1ef0",
           "event_type": "command.session.updated",
           "status": "completed",
           "summary": "Completed Nucleus-owned command"
         },
         {
-          "job_id": "418996bb-80f5-48a5-aefa-bf95deb9b239",
+          "job_id": "6b7d301b-c60c-4b49-8412-979f8e8b1ef0",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed command.run"
         },
         {
-          "job_id": "418996bb-80f5-48a5-aefa-bf95deb9b239",
+          "job_id": "6b7d301b-c60c-4b49-8412-979f8e8b1ef0",
           "event_type": "job.completed",
           "status": "completed",
-          "summary": "The requested command completed successfully with the captured result."
-        },
-        {
-          "job_id": "a530c8cc-228e-4767-b1bd-18051f078e99",
-          "event_type": "approval.requested",
-          "status": "paused",
-          "summary": "Approval required for command.run"
-        },
-        {
-          "job_id": "a530c8cc-228e-4767-b1bd-18051f078e99",
-          "event_type": "approval.resolved",
-          "status": "approved",
-          "summary": "Approved run requested read-only command probe"
-        },
-        {
-          "job_id": "a530c8cc-228e-4767-b1bd-18051f078e99",
-          "event_type": "command.session.updated",
-          "status": "completed",
-          "summary": "Completed Nucleus-owned command"
-        },
-        {
-          "job_id": "a530c8cc-228e-4767-b1bd-18051f078e99",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed command.run"
-        },
-        {
-          "job_id": "a530c8cc-228e-4767-b1bd-18051f078e99",
-          "event_type": "job.completed",
-          "status": "completed",
-          "summary": "Requested command completed successfully with captured status and output."
+          "summary": "The requested command completed and the raw result is available."
         }
       ]
     },
     {
       "name": "edit_and_test",
-      "session_id": "bcff0a04-7de8-4c58-be03-15ceed1f7122",
-      "root_job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
+      "session_id": "1cb9c197-6bc9-433f-8818-41f43b96bf3f",
+      "root_job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
       "status": "FAIL",
       "reasons": [
         "root job ended in state running",
-        "fanout detected: 5 main children exceeds limit 1",
-        "child 16fc5a38-6f7a-4eab-b3f4-bbb0cbca6cc5 was still running, not terminal",
-        "child 94b176c7-d20b-4807-9d7f-6928530e3752 was still running, not terminal",
+        "fanout detected: 2 main children exceeds limit 1",
+        "child 75710b81-7835-41ed-9b6f-b6ec67de3651 was still running, not terminal",
         "root did not converge with a completed result",
-        "no child reached accepted/completed completion state",
-        "job 07f041f7-e449-4c0a-8c54-226a5922e1b0 reported publication status blocked"
+        "no child reached accepted/completed completion state"
       ],
       "root_worker": {
         "lane": "utility",
@@ -208,7 +158,7 @@
       },
       "children": [
         {
-          "id": "a81a1206-d9d4-4b18-90dc-bc5f7a881738",
+          "id": "6677e3b2-0af3-4de2-9404-fe59ef1bb916",
           "lane": "main",
           "model": "cx/gpt-5.5",
           "state": "blocked",
@@ -227,6 +177,712 @@
               "status": "failed",
               "error_class": "tool_error",
               "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "python.run",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for python.run"
+            },
+            {
+              "tool": "command.run",
+              "status": "denied",
+              "error_class": "approval_denied",
+              "error_detail": "command contains shell control, path traversal, or write-like operations"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "python.run",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for python.run"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "python.run",
+              "status": "denied",
+              "error_class": "approval_denied",
+              "error_detail": "python script is not clearly scoped to the worker worktree"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            }
+          ]
+        },
+        {
+          "id": "75710b81-7835-41ed-9b6f-b6ec67de3651",
+          "lane": "main",
+          "model": "cx/gpt-5.5",
+          "state": "running",
+          "completion_status": "pending",
+          "completion_blockers": [],
+          "tool_failures": [
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "tests.run",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "tests.run only supports common test/build executables like cargo, npm, pnpm, yarn, bun, pytest, go, make, and just"
+            },
+            {
+              "tool": "tests.run",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for tests.run"
+            }
+          ]
+        }
+      ],
+      "counts": {
+        "children": 2,
+        "main_children": 2,
+        "utility_children": 0,
+        "fanout_detected": true
+      },
+      "approvals": {
+        "approved": [
+          {
+            "id": "edc1e622-65c7-4d07-a8c9-3567080600da",
+            "job_id": "6677e3b2-0af3-4de2-9404-fe59ef1bb916",
+            "tool": "fs.apply_patch",
+            "target_paths": [
+              "crates/core/src/lib.rs"
+            ],
+            "reason": "worktree-local file mutation"
+          },
+          {
+            "id": "b3bec1f6-ef92-40d1-b285-0da141559a25",
+            "job_id": "6677e3b2-0af3-4de2-9404-fe59ef1bb916",
+            "tool": "fs.apply_patch",
+            "target_paths": [
+              "crates/core/src/lib.rs"
+            ],
+            "reason": "worktree-local file mutation"
+          },
+          {
+            "id": "c685950a-a852-4180-a10c-1d300cd6aa28",
+            "job_id": "75710b81-7835-41ed-9b6f-b6ec67de3651",
+            "tool": "fs.apply_patch",
+            "target_paths": [
+              "crates/core/src/lib.rs"
+            ],
+            "reason": "worktree-local file mutation"
+          },
+          {
+            "id": "bf5369e5-8cb6-4abd-ba5a-a33baa76f9f1",
+            "job_id": "75710b81-7835-41ed-9b6f-b6ec67de3651",
+            "tool": "command.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "bounded read/build/test command in worker worktree"
+          }
+        ],
+        "denied": [
+          {
+            "id": "b6ce3087-6504-440f-bbe8-3316425bcf6d",
+            "job_id": "6677e3b2-0af3-4de2-9404-fe59ef1bb916",
+            "tool": "command.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "command contains shell control, path traversal, or write-like operations"
+          },
+          {
+            "id": "9c716a60-e949-438d-8901-06c7e4b24f47",
+            "job_id": "6677e3b2-0af3-4de2-9404-fe59ef1bb916",
+            "tool": "python.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "python script is not clearly scoped to the worker worktree"
+          }
+        ]
+      },
+      "key_events": [
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "job.publication.git_baseline",
+          "status": "captured",
+          "summary": "Captured publication git hygiene baseline"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.spawned",
+          "status": "running",
+          "summary": "Spawned 1 child jobs"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "completed",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "worker.retry",
+          "status": "retrying",
+          "summary": "Rejected incomplete progress report as final answer."
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "worker.delegation.enforced",
+          "status": "running",
+          "summary": "Enforced main-lane delegation before root evidence work."
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.spawned",
+          "status": "running",
+          "summary": "Spawned 1 child jobs"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "worker.delegation.enforced",
+          "status": "running",
+          "summary": "Enforced main-lane delegation before root evidence work."
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "worker.delegation.enforced",
+          "status": "running",
+          "summary": "Enforced main-lane delegation before root evidence work."
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "worker.delegation.enforced",
+          "status": "running",
+          "summary": "Enforced main-lane delegation before root evidence work."
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "worker.delegation.enforced",
+          "status": "running",
+          "summary": "Enforced main-lane delegation before root evidence work."
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "worker.delegation.enforced",
+          "status": "running",
+          "summary": "Enforced main-lane delegation before root evidence work."
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "worker.delegation.enforced",
+          "status": "running",
+          "summary": "Enforced main-lane delegation before root evidence work."
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "worker.delegation.enforced",
+          "status": "running",
+          "summary": "Enforced main-lane delegation before root evidence work."
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "worker.delegation.enforced",
+          "status": "running",
+          "summary": "Enforced main-lane delegation before root evidence work."
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "worker.delegation.enforced",
+          "status": "running",
+          "summary": "Enforced main-lane delegation before root evidence work."
+        },
+        {
+          "job_id": "2fe373cf-bf2e-4181-847b-21ad9250f4f5",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "6677e3b2-0af3-4de2-9404-fe59ef1bb916",
+          "event_type": "job.publication.git_baseline",
+          "status": "captured",
+          "summary": "Captured publication git hygiene baseline"
+        },
+        {
+          "job_id": "6677e3b2-0af3-4de2-9404-fe59ef1bb916",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed project.inspect"
+        },
+        {
+          "job_id": "6677e3b2-0af3-4de2-9404-fe59ef1bb916",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "6677e3b2-0af3-4de2-9404-fe59ef1bb916",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "6677e3b2-0af3-4de2-9404-fe59ef1bb916",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "6677e3b2-0af3-4de2-9404-fe59ef1bb916",
+          "event_type": "approval.resolved",
+          "status": "denied",
+          "summary": "Denied edit crates/core/src/lib.rs with exact anchors"
+        },
+        {
+          "job_id": "6677e3b2-0af3-4de2-9404-fe59ef1bb916",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "6677e3b2-0af3-4de2-9404-fe59ef1bb916",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "6677e3b2-0af3-4de2-9404-fe59ef1bb916",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for python.run"
+        },
+        {
+          "job_id": "6677e3b2-0af3-4de2-9404-fe59ef1bb916",
+          "event_type": "approval.resolved",
+          "status": "denied",
+          "summary": "Denied insert helper and unit test with bounded Python script"
+        },
+        {
+          "job_id": "6677e3b2-0af3-4de2-9404-fe59ef1bb916",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for fs.apply_patch"
+        },
+        {
+          "job_id": "6677e3b2-0af3-4de2-9404-fe59ef1bb916",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved insert activity helper using edits find/replace schema"
+        },
+        {
+          "job_id": "6677e3b2-0af3-4de2-9404-fe59ef1bb916",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.apply_patch"
+        },
+        {
+          "job_id": "6677e3b2-0af3-4de2-9404-fe59ef1bb916",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for fs.apply_patch"
+        },
+        {
+          "job_id": "6677e3b2-0af3-4de2-9404-fe59ef1bb916",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved insert focused activity helper unit test"
+        },
+        {
+          "job_id": "75710b81-7835-41ed-9b6f-b6ec67de3651",
+          "event_type": "job.publication.git_baseline",
+          "status": "captured",
+          "summary": "Captured publication git hygiene baseline"
+        },
+        {
+          "job_id": "75710b81-7835-41ed-9b6f-b6ec67de3651",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed project.inspect"
+        },
+        {
+          "job_id": "75710b81-7835-41ed-9b6f-b6ec67de3651",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "75710b81-7835-41ed-9b6f-b6ec67de3651",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "75710b81-7835-41ed-9b6f-b6ec67de3651",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "75710b81-7835-41ed-9b6f-b6ec67de3651",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for fs.apply_patch"
+        },
+        {
+          "job_id": "75710b81-7835-41ed-9b6f-b6ec67de3651",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved insert focused activity status unit test"
+        },
+        {
+          "job_id": "75710b81-7835-41ed-9b6f-b6ec67de3651",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.apply_patch"
+        },
+        {
+          "job_id": "75710b81-7835-41ed-9b6f-b6ec67de3651",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "75710b81-7835-41ed-9b6f-b6ec67de3651",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved run focused core crate cargo test"
+        },
+        {
+          "job_id": "75710b81-7835-41ed-9b6f-b6ec67de3651",
+          "event_type": "command.session.updated",
+          "status": "completed",
+          "summary": "Completed Nucleus-owned command"
+        },
+        {
+          "job_id": "75710b81-7835-41ed-9b6f-b6ec67de3651",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed command.run"
+        },
+        {
+          "job_id": "75710b81-7835-41ed-9b6f-b6ec67de3651",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed git.diff"
+        }
+      ]
+    },
+    {
+      "name": "feature_161",
+      "session_id": "dea7f80e-b257-48ca-a46e-02823e3d03f0",
+      "root_job_id": "a5f50238-e66a-48a2-a811-a28791f9b864",
+      "status": "FAIL",
+      "reasons": [
+        "root job ended in state waiting",
+        "fanout detected: 2 main children exceeds limit 1",
+        "job 5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0 reported publication status blocked"
+      ],
+      "root_worker": {
+        "lane": "utility",
+        "model": "cx/gpt-5.4-mini",
+        "tool_calls": 0
+      },
+      "children": [
+        {
+          "id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
+          "lane": "main",
+          "model": "cx/gpt-5.5",
+          "state": "blocked",
+          "completion_status": "blocked",
+          "completion_blockers": [
+            "Reached current step budget",
+            "Validation is not performed.",
+            "Browser verification is required for this UI-renderable job, but Browser tools are not granted in this session mode.",
+            "Cleanup is required or unknown before completion can be claimed.",
+            "Local project completion was claimed without successful validation evidence."
+          ],
+          "tool_failures": [
+            {
+              "tool": "command.run",
+              "status": "denied",
+              "error_class": "approval_denied",
+              "error_detail": "command contains shell control, path traversal, or write-like operations"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "python.run",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for python.run"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "python.run",
+              "status": "denied",
+              "error_class": "approval_denied",
+              "error_detail": "python script is not clearly scoped to the worker worktree"
+            },
+            {
+              "tool": "tests.run",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "failed to resolve '/home/eba/.nucleus-dev-projects/worktrees/nucleus/dea7f80e-b257-48ca-a46e-02823e3d03f0/node --test apps/web/src/lib/nucleus/session-ux.test.mjs'"
             },
             {
               "tool": "command.run",
@@ -237,974 +893,7 @@
           ]
         },
         {
-          "id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "lane": "main",
-          "model": "cx/gpt-5.5",
-          "state": "blocked",
-          "completion_status": "blocked",
-          "completion_blockers": [
-            "Corrects the overconfident parts while preserving the supported edit and validation evidence.",
-            "Browser verification is missing or blocked.",
-            "Cleanup required for .tmp-*."
-          ],
-          "tool_failures": [
-            {
-              "tool": "fs.apply_patch",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for fs.apply_patch"
-            },
-            {
-              "tool": "fs.apply_patch",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for fs.apply_patch"
-            },
-            {
-              "tool": "fs.apply_patch",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for fs.apply_patch"
-            },
-            {
-              "tool": "fs.apply_patch",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for fs.apply_patch"
-            },
-            {
-              "tool": "fs.apply_patch",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for fs.apply_patch"
-            },
-            {
-              "tool": "python.run",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for python.run"
-            },
-            {
-              "tool": "command.run",
-              "status": "denied",
-              "error_class": "approval_denied",
-              "error_detail": "command contains shell control, path traversal, or write-like operations"
-            },
-            {
-              "tool": "fs.apply_patch",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for fs.apply_patch"
-            },
-            {
-              "tool": "tests.run",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "tests.run only supports common test/build executables like cargo, npm, pnpm, yarn, bun, pytest, go, make, and just"
-            },
-            {
-              "tool": "tests.run",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for tests.run"
-            },
-            {
-              "tool": "tests.run",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for tests.run"
-            }
-          ]
-        },
-        {
-          "id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "lane": "main",
-          "model": "cx/gpt-5.5",
-          "state": "blocked",
-          "completion_status": "blocked",
-          "completion_blockers": [
-            "Implemented and validated the Nucleus core helper change; no publication actions were requested or performed.",
-            "Browser verification is missing or blocked.",
-            "Cleanup required for .tmp-*."
-          ],
-          "tool_failures": [
-            {
-              "tool": "fs.apply_patch",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for fs.apply_patch"
-            },
-            {
-              "tool": "python.run",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for python.run"
-            },
-            {
-              "tool": "fs.apply_patch",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for fs.apply_patch"
-            },
-            {
-              "tool": "fs.apply_patch",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for fs.apply_patch"
-            },
-            {
-              "tool": "python.run",
-              "status": "denied",
-              "error_class": "approval_denied",
-              "error_detail": "python script is not clearly scoped to the worker worktree"
-            },
-            {
-              "tool": "command.run",
-              "status": "denied",
-              "error_class": "approval_denied",
-              "error_detail": "command contains shell control, path traversal, or write-like operations"
-            },
-            {
-              "tool": "fs.apply_patch",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for fs.apply_patch"
-            },
-            {
-              "tool": "tests.run",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "tests.run only supports common test/build executables like cargo, npm, pnpm, yarn, bun, pytest, go, make, and just"
-            },
-            {
-              "tool": "tests.run",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for tests.run"
-            },
-            {
-              "tool": "tests.run",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for tests.run"
-            }
-          ]
-        },
-        {
-          "id": "16fc5a38-6f7a-4eab-b3f4-bbb0cbca6cc5",
-          "lane": "main",
-          "model": "cx/gpt-5.5",
-          "state": "running",
-          "completion_status": "pending",
-          "completion_blockers": [],
-          "tool_failures": [
-            {
-              "tool": "tests.run",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for tests.run"
-            }
-          ]
-        },
-        {
-          "id": "94b176c7-d20b-4807-9d7f-6928530e3752",
-          "lane": "main",
-          "model": "cx/gpt-5.5",
-          "state": "running",
-          "completion_status": "pending",
-          "completion_blockers": [],
-          "tool_failures": []
-        }
-      ],
-      "counts": {
-        "children": 5,
-        "main_children": 5,
-        "utility_children": 0,
-        "fanout_detected": true
-      },
-      "approvals": {
-        "approved": [
-          {
-            "id": "05ebb2c3-09b1-44c8-8b18-52818e2f349f",
-            "job_id": "a81a1206-d9d4-4b18-90dc-bc5f7a881738",
-            "tool": "fs.apply_patch",
-            "target_paths": [
-              "crates/core/src/lib.rs"
-            ],
-            "reason": "worktree-local file mutation"
-          },
-          {
-            "id": "71e3d603-230e-45a8-955b-b4a1d84cc1e6",
-            "job_id": "a81a1206-d9d4-4b18-90dc-bc5f7a881738",
-            "tool": "fs.apply_patch",
-            "target_paths": [
-              "crates/core/src/lib.rs"
-            ],
-            "reason": "worktree-local file mutation"
-          },
-          {
-            "id": "e91a6664-ca2e-4cb8-9a1b-42b45883f064",
-            "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-            "tool": "fs.apply_patch",
-            "target_paths": [
-              "crates/core/src/lib.rs"
-            ],
-            "reason": "worktree-local file mutation"
-          },
-          {
-            "id": "81622509-18ff-487f-a338-99d99d045ac0",
-            "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-            "tool": "command.run",
-            "target_paths": [
-              "."
-            ],
-            "reason": "bounded read/build/test command in worker worktree"
-          },
-          {
-            "id": "408f87b7-672b-4529-9eef-f3c100b3ae75",
-            "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-            "tool": "command.run",
-            "target_paths": [
-              "."
-            ],
-            "reason": "bounded read/build/test command in worker worktree"
-          },
-          {
-            "id": "25523803-6d48-4838-b0c2-5ef1de90f81d",
-            "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-            "tool": "command.run",
-            "target_paths": [
-              "."
-            ],
-            "reason": "bounded read/build/test command in worker worktree"
-          },
-          {
-            "id": "d3cdb108-16c2-41ab-8a18-592af8d75ba3",
-            "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-            "tool": "tests.run",
-            "target_paths": [
-              "."
-            ],
-            "reason": "bounded tests.run in worker worktree"
-          },
-          {
-            "id": "f8e4cff9-fae1-407d-92aa-a22758634d6c",
-            "job_id": "16fc5a38-6f7a-4eab-b3f4-bbb0cbca6cc5",
-            "tool": "command.run",
-            "target_paths": [
-              "."
-            ],
-            "reason": "bounded read/build/test command in worker worktree"
-          }
-        ],
-        "denied": [
-          {
-            "id": "1269fc91-2529-4d4d-937d-67ace733a617",
-            "job_id": "a81a1206-d9d4-4b18-90dc-bc5f7a881738",
-            "tool": "command.run",
-            "target_paths": [
-              "."
-            ],
-            "reason": "command is not clearly read/build/test scoped"
-          },
-          {
-            "id": "b4a71902-1dfa-4bf0-9ed0-85ea2afa6bee",
-            "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-            "tool": "command.run",
-            "target_paths": [
-              "."
-            ],
-            "reason": "command contains shell control, path traversal, or write-like operations"
-          },
-          {
-            "id": "fa8a2523-bd33-41e3-a3ea-006537b9c14d",
-            "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-            "tool": "python.run",
-            "target_paths": [
-              "."
-            ],
-            "reason": "python script is not clearly scoped to the worker worktree"
-          },
-          {
-            "id": "682bfc98-4995-455d-8ff1-5806f158be2a",
-            "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-            "tool": "command.run",
-            "target_paths": [
-              "."
-            ],
-            "reason": "command contains shell control, path traversal, or write-like operations"
-          }
-        ]
-      },
-      "key_events": [
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "job.publication.git_baseline",
-          "status": "captured",
-          "summary": "Captured publication git hygiene baseline"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.spawned",
-          "status": "running",
-          "summary": "Spawned 1 child jobs"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.spawned",
-          "status": "running",
-          "summary": "Spawned 1 child jobs"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.spawned",
-          "status": "running",
-          "summary": "Spawned 1 child jobs"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.spawned",
-          "status": "running",
-          "summary": "Spawned 1 child jobs"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "3f5c0c0f-2c92-4ceb-8daa-c95b5456679f",
-          "event_type": "child.jobs.spawned",
-          "status": "running",
-          "summary": "Spawned 1 child jobs"
-        },
-        {
-          "job_id": "a81a1206-d9d4-4b18-90dc-bc5f7a881738",
-          "event_type": "job.publication.git_baseline",
-          "status": "captured",
-          "summary": "Captured publication git hygiene baseline"
-        },
-        {
-          "job_id": "a81a1206-d9d4-4b18-90dc-bc5f7a881738",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed project.inspect"
-        },
-        {
-          "job_id": "a81a1206-d9d4-4b18-90dc-bc5f7a881738",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "a81a1206-d9d4-4b18-90dc-bc5f7a881738",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed rg.search"
-        },
-        {
-          "job_id": "a81a1206-d9d4-4b18-90dc-bc5f7a881738",
-          "event_type": "approval.requested",
-          "status": "paused",
-          "summary": "Approval required for command.run"
-        },
-        {
-          "job_id": "a81a1206-d9d4-4b18-90dc-bc5f7a881738",
-          "event_type": "approval.resolved",
-          "status": "denied",
-          "summary": "Denied read focused region around product banner and tests"
-        },
-        {
-          "job_id": "a81a1206-d9d4-4b18-90dc-bc5f7a881738",
-          "event_type": "approval.requested",
-          "status": "paused",
-          "summary": "Approval required for fs.apply_patch"
-        },
-        {
-          "job_id": "a81a1206-d9d4-4b18-90dc-bc5f7a881738",
-          "event_type": "approval.resolved",
-          "status": "approved",
-          "summary": "Approved add activity status helper with scoped replacement"
-        },
-        {
-          "job_id": "a81a1206-d9d4-4b18-90dc-bc5f7a881738",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.apply_patch"
-        },
-        {
-          "job_id": "a81a1206-d9d4-4b18-90dc-bc5f7a881738",
-          "event_type": "approval.requested",
-          "status": "paused",
-          "summary": "Approval required for fs.apply_patch"
-        },
-        {
-          "job_id": "a81a1206-d9d4-4b18-90dc-bc5f7a881738",
-          "event_type": "approval.resolved",
-          "status": "approved",
-          "summary": "Approved insert focused unit test for activity status helper"
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "job.publication.git_baseline",
-          "status": "captured",
-          "summary": "Captured publication git hygiene baseline"
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed project.inspect"
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed rg.search"
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "approval.requested",
-          "status": "paused",
-          "summary": "Approval required for command.run"
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "approval.resolved",
-          "status": "denied",
-          "summary": "Denied insert focused unit test with bounded shell edit"
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "approval.requested",
-          "status": "paused",
-          "summary": "Approval required for fs.apply_patch"
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "approval.resolved",
-          "status": "approved",
-          "summary": "Approved add focused activity helper test"
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.apply_patch"
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "approval.requested",
-          "status": "paused",
-          "summary": "Approval required for command.run"
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "approval.resolved",
-          "status": "approved",
-          "summary": "Approved run focused cargo test for nucleus-core"
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "command.session.updated",
-          "status": "completed",
-          "summary": "Completed Nucleus-owned command"
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed command.run"
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "approval.requested",
-          "status": "paused",
-          "summary": "Approval required for command.run"
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "approval.resolved",
-          "status": "approved",
-          "summary": "Approved run focused cargo test invocation"
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "command.session.updated",
-          "status": "completed",
-          "summary": "Completed Nucleus-owned command"
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed command.run"
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed git.status"
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.list"
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "job.publication.completed",
-          "status": "not_requested",
-          "summary": "Corrects the overconfident parts while preserving the supported edit and validation evidence."
-        },
-        {
-          "job_id": "cb21d165-4936-47b6-a8c2-57bd30a6eace",
-          "event_type": "job.publication.cleanup_required",
-          "status": "cleanup_required",
-          "summary": "Publication job left repo-local temp artifacts"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "job.publication.git_baseline",
-          "status": "captured",
-          "summary": "Captured publication git hygiene baseline"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed project.inspect"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed git.diff"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed rg.search"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "approval.requested",
-          "status": "paused",
-          "summary": "Approval required for python.run"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "approval.resolved",
-          "status": "denied",
-          "summary": "Denied insert focused unit test in crates/core/src/lib.rs"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "approval.requested",
-          "status": "paused",
-          "summary": "Approval required for command.run"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "approval.resolved",
-          "status": "denied",
-          "summary": "Denied insert focused unit test in crates/core/src/lib.rs"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "approval.requested",
-          "status": "paused",
-          "summary": "Approval required for command.run"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "approval.resolved",
-          "status": "approved",
-          "summary": "Approved run focused cargo test for nucleus-core helper"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "command.session.updated",
-          "status": "completed",
-          "summary": "Completed Nucleus-owned command"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed command.run"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "approval.requested",
-          "status": "paused",
-          "summary": "Approval required for tests.run"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "approval.resolved",
-          "status": "approved",
-          "summary": "Approved run focused cargo test for nucleus-core helper"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "command.session.updated",
-          "status": "completed",
-          "summary": "Completed Nucleus-owned test run"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed tests.run"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed git.status"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed git.diff"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.list"
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "worker.retry",
-          "status": "retrying",
-          "summary": "Requested explicit publication outcome metadata."
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "job.blocked",
-          "status": "blocked",
-          "summary": "Implemented and validated the Nucleus core helper change; no publication actions were requested or performed."
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "job.publication.blocked",
-          "status": "blocked",
-          "summary": "Implemented and validated the Nucleus core helper change; no publication actions were requested or performed."
-        },
-        {
-          "job_id": "07f041f7-e449-4c0a-8c54-226a5922e1b0",
-          "event_type": "job.publication.cleanup_required",
-          "status": "cleanup_required",
-          "summary": "Publication job left repo-local temp artifacts"
-        },
-        {
-          "job_id": "16fc5a38-6f7a-4eab-b3f4-bbb0cbca6cc5",
-          "event_type": "job.publication.git_baseline",
-          "status": "captured",
-          "summary": "Captured publication git hygiene baseline"
-        },
-        {
-          "job_id": "16fc5a38-6f7a-4eab-b3f4-bbb0cbca6cc5",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed project.inspect"
-        },
-        {
-          "job_id": "16fc5a38-6f7a-4eab-b3f4-bbb0cbca6cc5",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed git.diff"
-        },
-        {
-          "job_id": "16fc5a38-6f7a-4eab-b3f4-bbb0cbca6cc5",
-          "event_type": "approval.requested",
-          "status": "paused",
-          "summary": "Approval required for command.run"
-        },
-        {
-          "job_id": "16fc5a38-6f7a-4eab-b3f4-bbb0cbca6cc5",
-          "event_type": "approval.resolved",
-          "status": "approved",
-          "summary": "Approved run focused cargo test for nucleus-core helper"
-        },
-        {
-          "job_id": "16fc5a38-6f7a-4eab-b3f4-bbb0cbca6cc5",
-          "event_type": "command.session.updated",
-          "status": "completed",
-          "summary": "Completed Nucleus-owned command"
-        },
-        {
-          "job_id": "16fc5a38-6f7a-4eab-b3f4-bbb0cbca6cc5",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed command.run"
-        },
-        {
-          "job_id": "16fc5a38-6f7a-4eab-b3f4-bbb0cbca6cc5",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed git.status"
-        },
-        {
-          "job_id": "16fc5a38-6f7a-4eab-b3f4-bbb0cbca6cc5",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.list"
-        },
-        {
-          "job_id": "94b176c7-d20b-4807-9d7f-6928530e3752",
-          "event_type": "job.publication.git_baseline",
-          "status": "captured",
-          "summary": "Captured publication git hygiene baseline"
-        },
-        {
-          "job_id": "94b176c7-d20b-4807-9d7f-6928530e3752",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed project.inspect"
-        }
-      ]
-    },
-    {
-      "name": "feature_161",
-      "session_id": "b41a56a4-21f4-4d40-ab78-edc4a7c157fc",
-      "root_job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
-      "status": "FAIL",
-      "reasons": [
-        "root job ended in state waiting",
-        "fanout detected: 2 main children exceeds limit 1",
-        "job 3e0c1440-f720-461b-861a-785f47c0530d reported publication status blocked"
-      ],
-      "root_worker": {
-        "lane": "utility",
-        "model": "cx/gpt-5.4-mini",
-        "tool_calls": 0
-      },
-      "children": [
-        {
-          "id": "6104b918-af03-447e-862e-c8851265b537",
+          "id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
           "lane": "main",
           "model": "cx/gpt-5.5",
           "state": "blocked",
@@ -1219,16 +908,16 @@
           ],
           "tool_failures": [
             {
-              "tool": "rg.search",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "failed to resolve '/home/eba/.nucleus-dev-projects/worktrees/nucleus/b41a56a4-21f4-4d40-ab78-edc4a7c157fc/apps/web/src/lib apps/web/src/routes'"
-            },
-            {
               "tool": "fs.read_text",
               "status": "failed",
               "error_class": "tool_error",
-              "error_detail": "failed to resolve '/home/eba/.nucleus-dev-projects/worktrees/nucleus/b41a56a4-21f4-4d40-ab78-edc4a7c157fc/apps/web/src/lib/nucleus/session-ux.ts'"
+              "error_detail": "failed to resolve '/home/eba/.nucleus-dev-projects/worktrees/nucleus/dea7f80e-b257-48ca-a46e-02823e3d03f0/apps/web/src/lib/nucleus/session-ux.ts'"
+            },
+            {
+              "tool": "command.run",
+              "status": "denied",
+              "error_class": "approval_denied",
+              "error_detail": "command contains shell control, path traversal, or write-like operations"
             },
             {
               "tool": "python.run",
@@ -1243,74 +932,10 @@
               "error_detail": "invalid args for fs.apply_patch"
             },
             {
-              "tool": "python.run",
-              "status": "denied",
-              "error_class": "approval_denied",
-              "error_detail": "python script is not clearly scoped to the worker worktree"
-            },
-            {
               "tool": "fs.apply_patch",
               "status": "failed",
               "error_class": "tool_error",
               "error_detail": "invalid args for fs.apply_patch"
-            },
-            {
-              "tool": "command.run",
-              "status": "denied",
-              "error_class": "approval_denied",
-              "error_detail": "command contains shell control, path traversal, or write-like operations"
-            },
-            {
-              "tool": "fs.apply_patch",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for fs.apply_patch"
-            }
-          ]
-        },
-        {
-          "id": "3e0c1440-f720-461b-861a-785f47c0530d",
-          "lane": "main",
-          "model": "cx/gpt-5.5",
-          "state": "blocked",
-          "completion_status": "blocked",
-          "completion_blockers": [
-            "Reached current step budget",
-            "Validation is not performed.",
-            "Browser verification is missing or blocked.",
-            "Cleanup is required or unknown before completion can be claimed.",
-            "Local project completion was claimed without successful validation evidence."
-          ],
-          "tool_failures": [
-            {
-              "tool": "rg.search",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "failed to resolve '/home/eba/.nucleus-dev-projects/worktrees/nucleus/b41a56a4-21f4-4d40-ab78-edc4a7c157fc/web'"
-            },
-            {
-              "tool": "fs.apply_patch",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for fs.apply_patch"
-            },
-            {
-              "tool": "python.run",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for python.run"
-            },
-            {
-              "tool": "fs.apply_patch",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for fs.apply_patch"
-            },
-            {
-              "tool": "command.run",
-              "status": "denied",
-              "error_class": "approval_denied",
-              "error_detail": "command contains shell control, path traversal, or write-like operations"
             },
             {
               "tool": "python.run",
@@ -1330,8 +955,8 @@
       "approvals": {
         "approved": [
           {
-            "id": "4049c799-cc95-48b6-a1bb-5ab1ffaebd91",
-            "job_id": "6104b918-af03-447e-862e-c8851265b537",
+            "id": "de9a7685-2d18-4519-8b64-e841b1441274",
+            "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
             "tool": "command.run",
             "target_paths": [
               "."
@@ -1339,8 +964,8 @@
             "reason": "bounded read/build/test command in worker worktree"
           },
           {
-            "id": "de04341b-382f-499f-af87-b7bcf2d36eff",
-            "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
+            "id": "df85e920-332a-4f51-9716-6894891ab672",
+            "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
             "tool": "command.run",
             "target_paths": [
               "."
@@ -1348,8 +973,17 @@
             "reason": "bounded read/build/test command in worker worktree"
           },
           {
-            "id": "fa634f69-c66f-466b-abfd-1924a260f6f7",
-            "job_id": "6104b918-af03-447e-862e-c8851265b537",
+            "id": "654e0922-9d50-42eb-b964-a844a4c80912",
+            "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
+            "tool": "python.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "bounded python.run in worker worktree"
+          },
+          {
+            "id": "0a9817b4-940b-4ab2-b39d-269a31d984d8",
+            "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
             "tool": "fs.apply_patch",
             "target_paths": [
               "apps/web/src/lib/nucleus/session-ux.js"
@@ -1357,28 +991,46 @@
             "reason": "worktree-local file mutation"
           },
           {
-            "id": "3674154c-cddb-43be-a5e5-b3dc626a8657",
-            "job_id": "6104b918-af03-447e-862e-c8851265b537",
+            "id": "b3eea87d-c6f6-43dd-9efe-3adc6c0c4b8b",
+            "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
+            "tool": "fs.write_text",
+            "target_paths": [
+              "apps/web/src/lib/nucleus/activity-phrases.js"
+            ],
+            "reason": "worktree-local file mutation"
+          },
+          {
+            "id": "fdd64f93-5df2-4b8a-be3e-eb55300e00f8",
+            "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
             "tool": "fs.apply_patch",
             "target_paths": [
               "apps/web/src/lib/nucleus/session-ux.js"
+            ],
+            "reason": "worktree-local file mutation"
+          },
+          {
+            "id": "e5830bd4-b96f-4c00-a8b8-67c5ab82adf5",
+            "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
+            "tool": "fs.apply_patch",
+            "target_paths": [
+              "apps/web/src/lib/components/app/session/reasoning-activity.svelte"
+            ],
+            "reason": "worktree-local file mutation"
+          },
+          {
+            "id": "a69a8105-8075-43e4-9c2d-ffc65ce32223",
+            "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
+            "tool": "fs.apply_patch",
+            "target_paths": [
+              "apps/web/src/lib/nucleus/session-ux.test.mjs"
             ],
             "reason": "worktree-local file mutation"
           }
         ],
         "denied": [
           {
-            "id": "b1ed774d-d0e6-4c74-a640-27069c809973",
-            "job_id": "6104b918-af03-447e-862e-c8851265b537",
-            "tool": "python.run",
-            "target_paths": [
-              "."
-            ],
-            "reason": "python script is not clearly scoped to the worker worktree"
-          },
-          {
-            "id": "590432e6-3817-4009-9915-d07aa261c518",
-            "job_id": "6104b918-af03-447e-862e-c8851265b537",
+            "id": "935b1947-e7ca-4a0e-b1a2-24537a540672",
+            "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
             "tool": "command.run",
             "target_paths": [
               "."
@@ -1386,8 +1038,8 @@
             "reason": "command contains shell control, path traversal, or write-like operations"
           },
           {
-            "id": "815a98ea-f40c-49c7-b7e2-4bd3dd59e8e7",
-            "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
+            "id": "bfc847d9-55c9-47cf-89e1-4331ed34e5eb",
+            "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
             "tool": "command.run",
             "target_paths": [
               "."
@@ -1395,494 +1047,464 @@
             "reason": "command contains shell control, path traversal, or write-like operations"
           },
           {
-            "id": "4908ddfd-ee04-442b-b160-35d24f10a405",
-            "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
+            "id": "546f1d18-a402-4641-a913-ad01559dde93",
+            "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
             "tool": "python.run",
             "target_paths": [
               "."
             ],
             "reason": "python script is not clearly scoped to the worker worktree"
+          },
+          {
+            "id": "08ba09d9-ef27-4b31-a37c-a70d29a4633f",
+            "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
+            "tool": "python.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "python script is not clearly scoped to the worker worktree"
+          },
+          {
+            "id": "dd3373f0-6469-45cc-96ca-8ebe2a86b615",
+            "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
+            "tool": "command.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "command is not clearly read/build/test scoped"
           }
         ]
       },
       "key_events": [
         {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
+          "job_id": "a5f50238-e66a-48a2-a811-a28791f9b864",
           "event_type": "job.publication.git_baseline",
           "status": "captured",
           "summary": "Captured publication git hygiene baseline"
         },
         {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
+          "job_id": "a5f50238-e66a-48a2-a811-a28791f9b864",
           "event_type": "child.jobs.spawned",
           "status": "running",
           "summary": "Spawned 1 child jobs"
         },
         {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
+          "job_id": "a5f50238-e66a-48a2-a811-a28791f9b864",
           "event_type": "child.jobs.reused",
           "status": "running",
           "summary": "Reused 1 equivalent child job(s)"
         },
         {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
+          "job_id": "a5f50238-e66a-48a2-a811-a28791f9b864",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "a5f50238-e66a-48a2-a811-a28791f9b864",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "a5f50238-e66a-48a2-a811-a28791f9b864",
           "event_type": "child.jobs.spawned",
           "status": "running",
           "summary": "Spawned 1 child jobs"
         },
         {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
+          "job_id": "a5f50238-e66a-48a2-a811-a28791f9b864",
           "event_type": "child.jobs.reused",
           "status": "running",
           "summary": "Reused 1 equivalent child job(s)"
         },
         {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
+          "job_id": "a5f50238-e66a-48a2-a811-a28791f9b864",
           "event_type": "child.jobs.reused",
           "status": "running",
           "summary": "Reused 1 equivalent child job(s)"
         },
         {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
+          "job_id": "a5f50238-e66a-48a2-a811-a28791f9b864",
           "event_type": "child.jobs.reused",
           "status": "running",
           "summary": "Reused 1 equivalent child job(s)"
         },
         {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
+          "job_id": "a5f50238-e66a-48a2-a811-a28791f9b864",
           "event_type": "child.jobs.reused",
           "status": "running",
           "summary": "Reused 1 equivalent child job(s)"
         },
         {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
-          "event_type": "worker.progress",
-          "status": "running",
-          "summary": "delegation remains in flight"
-        },
-        {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
-          "event_type": "worker.progress",
-          "status": "running",
-          "summary": "awaiting child work product"
-        },
-        {
-          "job_id": "539c703c-2b37-4f5b-b020-b661415cc91c",
-          "event_type": "worker.progress",
-          "status": "running",
-          "summary": "waiting for delegated issue #161 work to finish"
-        },
-        {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
           "event_type": "job.publication.git_baseline",
           "status": "captured",
           "summary": "Captured publication git hygiene baseline"
         },
         {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed project.inspect"
         },
         {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
           "event_type": "approval.requested",
           "status": "paused",
           "summary": "Approval required for command.run"
         },
         {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
           "event_type": "approval.resolved",
-          "status": "approved",
-          "summary": "Approved read issue #161"
+          "status": "denied",
+          "summary": "Denied read issue 161 and inspect repo layout"
         },
         {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.list"
+        },
+        {
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved read issue 161"
+        },
+        {
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
           "event_type": "command.session.updated",
           "status": "completed",
           "summary": "Completed Nucleus-owned command"
         },
         {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed command.run"
         },
         {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed rg.search"
         },
         {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
           "event_type": "tool.completed",
           "status": "completed",
-          "summary": "Completed fs.list"
+          "summary": "Completed fs.read_text"
         },
         {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed rg.search"
         },
         {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.list"
-        },
-        {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed fs.read_text"
         },
         {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed rg.search"
-        },
-        {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed fs.read_text"
         },
         {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed rg.search"
-        },
-        {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
           "event_type": "approval.requested",
           "status": "paused",
           "summary": "Approval required for python.run"
         },
         {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
           "event_type": "approval.resolved",
-          "status": "denied",
-          "summary": "Denied edit session UX helper for rotating activity messages"
+          "status": "approved",
+          "summary": "Approved run a tiny Python capability check"
         },
         {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
+          "event_type": "command.session.updated",
+          "status": "completed",
+          "summary": "Completed Nucleus-owned Python runtime"
+        },
+        {
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed python.run"
+        },
+        {
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
           "event_type": "approval.requested",
           "status": "paused",
-          "summary": "Approval required for command.run"
+          "summary": "Approval required for python.run"
         },
         {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
           "event_type": "approval.resolved",
           "status": "denied",
-          "summary": "Denied edit session UX helper with bounded Node script"
+          "summary": "Denied insert activity phrase helpers"
         },
         {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed fs.read_text"
         },
         {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
           "event_type": "approval.requested",
           "status": "paused",
           "summary": "Approval required for fs.apply_patch"
         },
         {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
           "event_type": "approval.resolved",
           "status": "approved",
-          "summary": "Approved add activity message constants to session UX helper"
+          "summary": "Approved add exported phrase constants"
         },
         {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed fs.apply_patch"
         },
         {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
           "event_type": "approval.requested",
           "status": "paused",
           "summary": "Approval required for fs.apply_patch"
         },
         {
-          "job_id": "6104b918-af03-447e-862e-c8851265b537",
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
           "event_type": "approval.resolved",
           "status": "approved",
-          "summary": "Approved add rotating activity message view functions"
+          "summary": "Approved add activity phrase view helpers"
         },
         {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.apply_patch"
+        },
+        {
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for fs.apply_patch"
+        },
+        {
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved wire activity phrases into component"
+        },
+        {
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.apply_patch"
+        },
+        {
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for fs.apply_patch"
+        },
+        {
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved add phrase helper tests"
+        },
+        {
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.apply_patch"
+        },
+        {
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
+          "event_type": "approval.resolved",
+          "status": "denied",
+          "summary": "Denied run focused session UX test file"
+        },
+        {
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
+          "event_type": "worker.progress",
+          "status": "running",
+          "summary": "Implemented the focused web changes and added tests, but validation is blocked by command approval at the current budget edge."
+        },
+        {
+          "job_id": "5c4b455b-4c41-4fb2-9efb-fc3e3ba2fde0",
+          "event_type": "job.publication.blocked",
+          "status": "blocked",
+          "summary": "Reached current step budget"
+        },
+        {
+          "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
           "event_type": "job.publication.git_baseline",
           "status": "captured",
           "summary": "Captured publication git hygiene baseline"
         },
         {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
+          "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed project.inspect"
         },
         {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
+          "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
           "event_type": "approval.requested",
           "status": "paused",
           "summary": "Approval required for command.run"
         },
         {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
+          "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
           "event_type": "approval.resolved",
           "status": "approved",
-          "summary": "Approved read issue #161 with gh"
+          "summary": "Approved read GitHub issue 161"
         },
         {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
+          "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
           "event_type": "command.session.updated",
           "status": "completed",
           "summary": "Completed Nucleus-owned command"
         },
         {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
+          "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed command.run"
         },
         {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
+          "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed fs.list"
         },
         {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
+          "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed rg.search"
         },
         {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed rg.search"
-        },
-        {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed rg.search"
-        },
-        {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.list"
-        },
-        {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.list"
-        },
-        {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.list"
-        },
-        {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed project.inspect"
-        },
-        {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
+          "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
           "event_type": "approval.requested",
           "status": "paused",
           "summary": "Approval required for command.run"
         },
         {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
+          "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
           "event_type": "approval.resolved",
           "status": "denied",
-          "summary": "Denied apply activity message edits with a bounded script"
+          "summary": "Denied read session workspace relevant section"
         },
         {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
+          "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
           "event_type": "approval.requested",
           "status": "paused",
           "summary": "Approval required for python.run"
         },
         {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
+          "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
           "event_type": "approval.resolved",
           "status": "denied",
-          "summary": "Denied apply focused edits through Python snippet runner"
+          "summary": "Denied insert activity phrase helper with Python"
         },
         {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
+          "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for fs.write_text"
         },
         {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
-          "event_type": "worker.progress",
-          "status": "running",
-          "summary": "checkpoint: inspected issue and session UX activity paths; implementation still incomplete"
-        },
-        {
-          "job_id": "3e0c1440-f720-461b-861a-785f47c0530d",
-          "event_type": "job.publication.blocked",
-          "status": "blocked",
-          "summary": "Reached current step budget"
+          "job_id": "4d3dc1bc-f9ce-42c0-be4f-630f68016467",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved create centralized activity phrase helper"
         }
       ]
     },
     {
       "name": "debug",
-      "session_id": "18bc2485-e659-4f55-ace1-26a1bee4f4f3",
-      "root_job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
+      "session_id": "c80f2525-a139-42a1-8552-78df247b96a3",
+      "root_job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
       "status": "FAIL",
       "reasons": [
         "root job ended in state running",
         "fanout detected: 4 main children exceeds limit 2",
-        "child 6b52609c-95e1-4f80-8e54-bcfb1d249e0a was still running, not terminal",
-        "child 5df4243c-273f-49df-9786-3accb74b37f1 was still running, not terminal",
+        "child 7fe02d4c-c35f-41f3-abfd-848c98945136 was still running, not terminal",
+        "child 3dde3d87-84ca-4871-b7a8-248bdba6ee5b was still running, not terminal",
+        "child de68f79c-e6c8-451b-9576-470f8bc5076e was still running, not terminal",
         "debug rung did not converge to completion or a precise blocker",
-        "job 6cd13ef8-ed6e-4404-8689-947096dad784 reported publication status blocked",
-        "job 11dbe055-4e6b-4336-869f-3db3c80c89b4 reported publication status blocked"
+        "job 322f7143-64e7-4b68-9a66-2c2c24ff3bc2 reported publication status blocked"
       ],
       "root_worker": {
         "lane": "utility",
@@ -1891,153 +1513,7 @@
       },
       "children": [
         {
-          "id": "6cd13ef8-ed6e-4404-8689-947096dad784",
-          "lane": "main",
-          "model": "cx/gpt-5.5",
-          "state": "blocked",
-          "completion_status": "blocked",
-          "completion_blockers": [
-            "Reached current step budget",
-            "Validation is not performed.",
-            "Browser verification is missing or blocked.",
-            "Cleanup is required or unknown before completion can be claimed.",
-            "Local project completion was claimed without successful validation evidence."
-          ],
-          "tool_failures": [
-            {
-              "tool": "command.run",
-              "status": "denied",
-              "error_class": "approval_denied",
-              "error_detail": "command is not clearly read/build/test scoped"
-            },
-            {
-              "tool": "python.run",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for python.run"
-            },
-            {
-              "tool": "fs.apply_patch",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for fs.apply_patch"
-            },
-            {
-              "tool": "python.run",
-              "status": "denied",
-              "error_class": "approval_denied",
-              "error_detail": "python script is not clearly scoped to the worker worktree"
-            },
-            {
-              "tool": "fs.apply_patch",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "patch edit did not match any content"
-            },
-            {
-              "tool": "rg.search",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "'rg' exited with 2: rg: the literal \"\\n\" is not allowed in a regex\n\nConsider enabling multiline mode with the --multiline flag (or -U for short).\nWhen multiline mode is enabled, new line characters can be matched."
-            },
-            {
-              "tool": "command.run",
-              "status": "denied",
-              "error_class": "approval_denied",
-              "error_detail": "command contains shell control, path traversal, or write-like operations"
-            },
-            {
-              "tool": "python.run",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for python.run"
-            },
-            {
-              "tool": "fs.apply_patch",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "patch edit did not match any content"
-            }
-          ]
-        },
-        {
-          "id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "lane": "main",
-          "model": "cx/gpt-5.5",
-          "state": "blocked",
-          "completion_status": "blocked",
-          "completion_blockers": [
-            "Reached current step budget",
-            "Validation is not performed.",
-            "Browser verification is missing or blocked.",
-            "Cleanup is required or unknown before completion can be claimed.",
-            "Local project completion was claimed without successful validation evidence."
-          ],
-          "tool_failures": [
-            {
-              "tool": "command.run",
-              "status": "denied",
-              "error_class": "approval_denied",
-              "error_detail": "command is not clearly read/build/test scoped"
-            },
-            {
-              "tool": "python.run",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for python.run"
-            },
-            {
-              "tool": "fs.apply_patch",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for fs.apply_patch"
-            },
-            {
-              "tool": "fs.apply_patch",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for fs.apply_patch"
-            },
-            {
-              "tool": "python.run",
-              "status": "denied",
-              "error_class": "approval_denied",
-              "error_detail": "python script is not clearly scoped to the worker worktree"
-            },
-            {
-              "tool": "command.run",
-              "status": "denied",
-              "error_class": "approval_denied",
-              "error_detail": "command contains shell control, path traversal, or write-like operations"
-            },
-            {
-              "tool": "fs.apply_patch",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for fs.apply_patch"
-            },
-            {
-              "tool": "fs.apply_patch",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for fs.apply_patch"
-            },
-            {
-              "tool": "fs.apply_patch",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for fs.apply_patch"
-            },
-            {
-              "tool": "fs.apply_patch",
-              "status": "failed",
-              "error_class": "tool_error",
-              "error_detail": "invalid args for fs.apply_patch"
-            }
-          ]
-        },
-        {
-          "id": "6b52609c-95e1-4f80-8e54-bcfb1d249e0a",
+          "id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
           "lane": "main",
           "model": "cx/gpt-5.5",
           "state": "running",
@@ -2055,11 +1531,157 @@
               "status": "failed",
               "error_class": "tool_error",
               "error_detail": "invalid args for python.run"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "python.run",
+              "status": "denied",
+              "error_class": "approval_denied",
+              "error_detail": "python script is not clearly scoped to the worker worktree"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "command.run",
+              "status": "denied",
+              "error_class": "approval_denied",
+              "error_detail": "command.run command is missing"
+            },
+            {
+              "tool": "command.run",
+              "status": "denied",
+              "error_class": "approval_denied",
+              "error_detail": "command.run command is missing"
+            },
+            {
+              "tool": "command.run",
+              "status": "denied",
+              "error_class": "approval_denied",
+              "error_detail": "command contains shell control, path traversal, or write-like operations"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
             }
           ]
         },
         {
-          "id": "5df4243c-273f-49df-9786-3accb74b37f1",
+          "id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
+          "lane": "main",
+          "model": "cx/gpt-5.5",
+          "state": "blocked",
+          "completion_status": "blocked",
+          "completion_blockers": [
+            "Reached current step budget",
+            "Validation is not performed.",
+            "Browser verification is missing or blocked.",
+            "Cleanup is required or unknown before completion can be claimed.",
+            "Local project completion was claimed without successful validation evidence."
+          ],
+          "tool_failures": [
+            {
+              "tool": "command.run",
+              "status": "denied",
+              "error_class": "approval_denied",
+              "error_detail": "command is not clearly read/build/test scoped"
+            },
+            {
+              "tool": "python.run",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for python.run"
+            },
+            {
+              "tool": "python.run",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for python.run"
+            },
+            {
+              "tool": "python.run",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for python.run"
+            },
+            {
+              "tool": "command.run",
+              "status": "denied",
+              "error_class": "approval_denied",
+              "error_detail": "command contains shell control, path traversal, or write-like operations"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "python.run",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for python.run"
+            }
+          ]
+        },
+        {
+          "id": "3dde3d87-84ca-4871-b7a8-248bdba6ee5b",
+          "lane": "main",
+          "model": "cx/gpt-5.5",
+          "state": "running",
+          "completion_status": "pending",
+          "completion_blockers": [],
+          "tool_failures": [
+            {
+              "tool": "command.run",
+              "status": "denied",
+              "error_class": "approval_denied",
+              "error_detail": "command is not clearly read/build/test scoped"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "python.run",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for python.run"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            }
+          ]
+        },
+        {
+          "id": "de68f79c-e6c8-451b-9576-470f8bc5076e",
           "lane": "main",
           "model": "cx/gpt-5.5",
           "state": "running",
@@ -2077,8 +1699,8 @@
       "approvals": {
         "approved": [
           {
-            "id": "2816ee4c-6396-4908-aa59-04e0d6aea215",
-            "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
+            "id": "771cbe51-1174-4ad9-93be-71ba1b0c558e",
+            "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
             "tool": "python.run",
             "target_paths": [
               "."
@@ -2086,8 +1708,26 @@
             "reason": "bounded python.run in worker worktree"
           },
           {
-            "id": "ab0d6537-f71e-40cf-8a14-d96ba6e42055",
-            "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
+            "id": "24648176-8c50-4aef-9477-2929be1c321e",
+            "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+            "tool": "python.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "bounded python.run in worker worktree"
+          },
+          {
+            "id": "3ba2e0af-6053-49b7-8ca5-0b14bd379ce5",
+            "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+            "tool": "python.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "bounded python.run in worker worktree"
+          },
+          {
+            "id": "00b11bd9-8307-40b3-82cf-9b7f28043955",
+            "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
             "tool": "python.run",
             "target_paths": [
               "."
@@ -2097,8 +1737,8 @@
         ],
         "denied": [
           {
-            "id": "97daa6c2-bbf5-4ad4-b9fd-8cd6c5d25bcf",
-            "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
+            "id": "27b6254f-253d-40de-8e27-ca857566592f",
+            "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
             "tool": "command.run",
             "target_paths": [
               "."
@@ -2106,8 +1746,8 @@
             "reason": "command is not clearly read/build/test scoped"
           },
           {
-            "id": "2f8d91be-2370-4f98-a5bd-78f7d05e91fc",
-            "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
+            "id": "6134d40a-26f8-4c60-ac56-40819e7f00de",
+            "job_id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
             "tool": "command.run",
             "target_paths": [
               "."
@@ -2115,8 +1755,8 @@
             "reason": "command is not clearly read/build/test scoped"
           },
           {
-            "id": "7d567e3d-3dfd-4e19-8a0f-af28d494ae8e",
-            "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
+            "id": "e167f890-8878-468c-94c2-68b3b464668a",
+            "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
             "tool": "python.run",
             "target_paths": [
               "."
@@ -2124,8 +1764,17 @@
             "reason": "python script is not clearly scoped to the worker worktree"
           },
           {
-            "id": "1e4d9827-9fb2-4bc7-86bf-33565a8eae71",
-            "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
+            "id": "3bccdf68-b702-49cf-8a29-c2b1aefd1a0e",
+            "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+            "tool": "command.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "command.run command is missing"
+          },
+          {
+            "id": "8ee463f7-586e-4b12-bd91-9e6218b6b8d5",
+            "job_id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
             "tool": "command.run",
             "target_paths": [
               "."
@@ -2133,682 +1782,598 @@
             "reason": "command contains shell control, path traversal, or write-like operations"
           },
           {
-            "id": "c1409d16-be2b-4358-ab0f-7b8c67434b27",
-            "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-            "tool": "python.run",
-            "target_paths": [
-              "."
-            ],
-            "reason": "python script is not clearly scoped to the worker worktree"
-          },
-          {
-            "id": "5add5bed-e783-41b0-8516-66bed955f827",
-            "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-            "tool": "command.run",
-            "target_paths": [
-              "."
-            ],
-            "reason": "command contains shell control, path traversal, or write-like operations"
-          },
-          {
-            "id": "3a403d7f-56e4-49b3-a148-6590703b9821",
-            "job_id": "6b52609c-95e1-4f80-8e54-bcfb1d249e0a",
+            "id": "fefd3771-8a20-46b2-bc66-05dc8e9eca51",
+            "job_id": "3dde3d87-84ca-4871-b7a8-248bdba6ee5b",
             "tool": "command.run",
             "target_paths": [
               "."
             ],
             "reason": "command is not clearly read/build/test scoped"
+          },
+          {
+            "id": "ae886936-1bc4-414c-a11a-2fdbda3d4cba",
+            "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+            "tool": "command.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "command.run command is missing"
+          },
+          {
+            "id": "42be3844-0743-4359-b8ca-4793deccbaf0",
+            "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+            "tool": "command.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "command contains shell control, path traversal, or write-like operations"
           }
         ]
       },
       "key_events": [
         {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
           "event_type": "job.publication.git_baseline",
           "status": "captured",
           "summary": "Captured publication git hygiene baseline"
         },
         {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
           "event_type": "child.jobs.spawned",
           "status": "running",
           "summary": "Spawned 1 child jobs"
         },
         {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.spawned",
-          "status": "running",
-          "summary": "Spawned 1 child jobs"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.spawned",
-          "status": "running",
-          "summary": "Spawned 1 child jobs"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.spawned",
-          "status": "running",
-          "summary": "Spawned 1 child jobs"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "77cb44dd-49a8-4e56-901e-90f5789a0206",
-          "event_type": "child.jobs.reused",
-          "status": "running",
-          "summary": "Reused 1 equivalent child job(s)"
-        },
-        {
-          "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
-          "event_type": "job.publication.git_baseline",
-          "status": "captured",
-          "summary": "Captured publication git hygiene baseline"
-        },
-        {
-          "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed project.inspect"
-        },
-        {
-          "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed rg.search"
-        },
-        {
-          "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed rg.search"
-        },
-        {
-          "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
-          "event_type": "approval.requested",
-          "status": "paused",
-          "summary": "Approval required for command.run"
-        },
-        {
-          "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
-          "event_type": "approval.resolved",
-          "status": "denied",
-          "summary": "Denied print exact publish_prompt_status area"
-        },
-        {
-          "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed rg.search"
-        },
-        {
-          "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed rg.search"
-        },
-        {
-          "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed rg.search"
-        },
-        {
-          "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed rg.search"
-        },
-        {
-          "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
-          "event_type": "approval.requested",
-          "status": "paused",
-          "summary": "Approval required for python.run"
-        },
-        {
-          "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
-          "event_type": "approval.resolved",
-          "status": "denied",
-          "summary": "Denied patch agent.rs with narrow helper and test"
-        },
-        {
-          "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed rg.search"
-        },
-        {
-          "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed rg.search"
-        },
-        {
-          "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
-          "event_type": "approval.requested",
-          "status": "paused",
-          "summary": "Approval required for command.run"
-        },
-        {
-          "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
-          "event_type": "approval.resolved",
-          "status": "denied",
-          "summary": "Denied read exact publish_prompt_status block with grep"
-        },
-        {
-          "job_id": "6cd13ef8-ed6e-4404-8689-947096dad784",
-          "event_type": "job.publication.blocked",
-          "status": "blocked",
-          "summary": "Reached current step budget"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "job.publication.git_baseline",
-          "status": "captured",
-          "summary": "Captured publication git hygiene baseline"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed project.inspect"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed rg.search"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed rg.search"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "approval.requested",
-          "status": "paused",
-          "summary": "Approval required for command.run"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "approval.resolved",
-          "status": "denied",
-          "summary": "Denied read exact normalization block with line numbers"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed rg.search"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed rg.search"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed rg.search"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed rg.search"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "approval.requested",
-          "status": "paused",
-          "summary": "Approval required for python.run"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "approval.resolved",
-          "status": "approved",
-          "summary": "Approved read validation and normalization slices"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "command.session.updated",
-          "status": "completed",
-          "summary": "Completed Nucleus-owned Python runtime"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed python.run"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "approval.requested",
-          "status": "paused",
-          "summary": "Approval required for python.run"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "approval.resolved",
-          "status": "approved",
-          "summary": "Approved read final answer normalization block"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "command.session.updated",
-          "status": "completed",
-          "summary": "Completed Nucleus-owned Python runtime"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed python.run"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "approval.requested",
-          "status": "paused",
-          "summary": "Approval required for python.run"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "approval.resolved",
-          "status": "denied",
-          "summary": "Denied edit worker_action.rs to reject blank browser verification status"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "approval.requested",
-          "status": "paused",
-          "summary": "Approval required for command.run"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "approval.resolved",
-          "status": "denied",
-          "summary": "Denied apply scoped edit to worker_action.rs"
-        },
-        {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
           "event_type": "worker.progress",
           "status": "running",
-          "summary": "Checkpoint: identified minimal fix, but no file mutation completed before budget edge"
+          "summary": "awaiting bounded child diagnosis and fix report"
         },
         {
-          "job_id": "11dbe055-4e6b-4336-869f-3db3c80c89b4",
-          "event_type": "job.publication.blocked",
-          "status": "blocked",
-          "summary": "Reached current step budget"
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
         },
         {
-          "job_id": "6b52609c-95e1-4f80-8e54-bcfb1d249e0a",
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
+          "event_type": "child.jobs.spawned",
+          "status": "running",
+          "summary": "Spawned 1 child jobs"
+        },
+        {
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
+          "event_type": "worker.progress",
+          "status": "running",
+          "summary": "awaiting the bounded child worker’s diagnosis and focused test result"
+        },
+        {
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
+          "event_type": "worker.progress",
+          "status": "running",
+          "summary": "awaiting the bounded child worker’s report"
+        },
+        {
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
+          "event_type": "worker.progress",
+          "status": "running",
+          "summary": "parked while awaiting the bounded child worker report"
+        },
+        {
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
+          "event_type": "worker.progress",
+          "status": "running",
+          "summary": "waiting for the delegated child worker result"
+        },
+        {
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
+          "event_type": "worker.progress",
+          "status": "running",
+          "summary": "awaiting delegated child worker output"
+        },
+        {
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
+          "event_type": "worker.progress",
+          "status": "running",
+          "summary": "awaiting child-worker completion for the bounded Rust fix"
+        },
+        {
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
+          "event_type": "worker.progress",
+          "status": "running",
+          "summary": "child worker report still pending for the bounded Rust fix"
+        },
+        {
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
+          "event_type": "worker.delegation.enforced",
+          "status": "running",
+          "summary": "Enforced main-lane delegation before root evidence work."
+        },
+        {
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
+          "event_type": "child.jobs.spawned",
+          "status": "running",
+          "summary": "Spawned 1 child jobs"
+        },
+        {
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
+          "event_type": "worker.delegation.enforced",
+          "status": "running",
+          "summary": "Enforced main-lane delegation before root evidence work."
+        },
+        {
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
+          "event_type": "worker.delegation.enforced",
+          "status": "running",
+          "summary": "Enforced main-lane delegation before root evidence work."
+        },
+        {
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
+          "event_type": "worker.delegation.enforced",
+          "status": "running",
+          "summary": "Enforced main-lane delegation before root evidence work."
+        },
+        {
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "c21756e5-f048-4667-ac74-bc3be561b27e",
+          "event_type": "child.jobs.spawned",
+          "status": "running",
+          "summary": "Spawned 1 child jobs"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
           "event_type": "job.publication.git_baseline",
           "status": "captured",
           "summary": "Captured publication git hygiene baseline"
         },
         {
-          "job_id": "6b52609c-95e1-4f80-8e54-bcfb1d249e0a",
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed project.inspect"
         },
         {
-          "job_id": "6b52609c-95e1-4f80-8e54-bcfb1d249e0a",
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed rg.search"
         },
         {
-          "job_id": "6b52609c-95e1-4f80-8e54-bcfb1d249e0a",
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed fs.read_text"
         },
         {
-          "job_id": "6b52609c-95e1-4f80-8e54-bcfb1d249e0a",
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed rg.search"
         },
         {
-          "job_id": "6b52609c-95e1-4f80-8e54-bcfb1d249e0a",
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed fs.read_text"
         },
         {
-          "job_id": "6b52609c-95e1-4f80-8e54-bcfb1d249e0a",
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
           "event_type": "approval.requested",
           "status": "paused",
           "summary": "Approval required for command.run"
         },
         {
-          "job_id": "6b52609c-95e1-4f80-8e54-bcfb1d249e0a",
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
           "event_type": "approval.resolved",
           "status": "denied",
-          "summary": "Denied print worker_action validation slice"
+          "summary": "Denied show exact validation lines"
         },
         {
-          "job_id": "6b52609c-95e1-4f80-8e54-bcfb1d249e0a",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed rg.search"
-        },
-        {
-          "job_id": "6b52609c-95e1-4f80-8e54-bcfb1d249e0a",
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed fs.read_text"
         },
         {
-          "job_id": "6b52609c-95e1-4f80-8e54-bcfb1d249e0a",
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed rg.search"
         },
         {
-          "job_id": "5df4243c-273f-49df-9786-3accb74b37f1",
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for python.run"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved read exact worker_action snippets with line numbers"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "command.session.updated",
+          "status": "completed",
+          "summary": "Completed Nucleus-owned Python runtime"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed python.run"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for python.run"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved read validation helper only"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "command.session.updated",
+          "status": "completed",
+          "summary": "Completed Nucleus-owned Python runtime"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed python.run"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for python.run"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved read validate_worker_action body"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "command.session.updated",
+          "status": "completed",
+          "summary": "Completed Nucleus-owned Python runtime"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed python.run"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for python.run"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved read parse error definitions"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "command.session.updated",
+          "status": "completed",
+          "summary": "Completed Nucleus-owned Python runtime"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed python.run"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for python.run"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "approval.resolved",
+          "status": "denied",
+          "summary": "Denied apply minimal worker_action.rs edit"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "approval.resolved",
+          "status": "denied",
+          "summary": "Denied apply scoped validation/test edit to crates/daemon/src/worker_action.rs"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "approval.resolved",
+          "status": "denied",
+          "summary": "Denied apply scoped validation/test edit to crates/daemon/src/worker_action.rs"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "7fe02d4c-c35f-41f3-abfd-848c98945136",
+          "event_type": "approval.resolved",
+          "status": "denied",
+          "summary": "Denied apply scoped validation/test edit to crates/daemon/src/worker_action.rs"
+        },
+        {
+          "job_id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
           "event_type": "job.publication.git_baseline",
           "status": "captured",
           "summary": "Captured publication git hygiene baseline"
         },
         {
-          "job_id": "5df4243c-273f-49df-9786-3accb74b37f1",
+          "job_id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed project.inspect"
         },
         {
-          "job_id": "5df4243c-273f-49df-9786-3accb74b37f1",
+          "job_id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed rg.search"
         },
         {
-          "job_id": "5df4243c-273f-49df-9786-3accb74b37f1",
+          "job_id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed fs.read_text"
         },
         {
-          "job_id": "5df4243c-273f-49df-9786-3accb74b37f1",
-          "event_type": "tool.completed",
-          "status": "completed",
-          "summary": "Completed fs.read_text"
-        },
-        {
-          "job_id": "5df4243c-273f-49df-9786-3accb74b37f1",
+          "job_id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed rg.search"
         },
         {
-          "job_id": "5df4243c-273f-49df-9786-3accb74b37f1",
+          "job_id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
           "event_type": "tool.completed",
           "status": "completed",
           "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
+          "event_type": "approval.resolved",
+          "status": "denied",
+          "summary": "Denied print create_job and update_job code range"
+        },
+        {
+          "job_id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
+          "event_type": "approval.resolved",
+          "status": "denied",
+          "summary": "Denied read exact source ranges with line numbers"
+        },
+        {
+          "job_id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "322f7143-64e7-4b68-9a66-2c2c24ff3bc2",
+          "event_type": "job.publication.blocked",
+          "status": "blocked",
+          "summary": "Reached current step budget"
+        },
+        {
+          "job_id": "3dde3d87-84ca-4871-b7a8-248bdba6ee5b",
+          "event_type": "job.publication.git_baseline",
+          "status": "captured",
+          "summary": "Captured publication git hygiene baseline"
+        },
+        {
+          "job_id": "3dde3d87-84ca-4871-b7a8-248bdba6ee5b",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed project.inspect"
+        },
+        {
+          "job_id": "3dde3d87-84ca-4871-b7a8-248bdba6ee5b",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "3dde3d87-84ca-4871-b7a8-248bdba6ee5b",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "3dde3d87-84ca-4871-b7a8-248bdba6ee5b",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "3dde3d87-84ca-4871-b7a8-248bdba6ee5b",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "3dde3d87-84ca-4871-b7a8-248bdba6ee5b",
+          "event_type": "approval.resolved",
+          "status": "denied",
+          "summary": "Denied read focused test section from error_display"
+        },
+        {
+          "job_id": "3dde3d87-84ca-4871-b7a8-248bdba6ee5b",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "de68f79c-e6c8-451b-9576-470f8bc5076e",
+          "event_type": "job.publication.git_baseline",
+          "status": "captured",
+          "summary": "Captured publication git hygiene baseline"
+        },
+        {
+          "job_id": "de68f79c-e6c8-451b-9576-470f8bc5076e",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed project.inspect"
+        },
+        {
+          "job_id": "de68f79c-e6c8-451b-9576-470f8bc5076e",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "de68f79c-e6c8-451b-9576-470f8bc5076e",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "de68f79c-e6c8-451b-9576-470f8bc5076e",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
         }
       ]
     }

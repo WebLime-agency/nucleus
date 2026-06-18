@@ -12,6 +12,8 @@ use nucleus_protocol::{
     HealthResponse, JobDetail, JobEvent, JobSummary, SessionDetail, SessionPromptRequest,
     ToolCallSummary, WorkspaceSummary,
 };
+
+const READ_ONLY_PROBE_COMMAND: &str = "sh -lc printf NUCLEUS_COMMAND_RUN_PROBE";
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Serialize;
 use serde_json::Value;
@@ -949,7 +951,7 @@ fn network_policy_allows_network(args: &Value) -> bool {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .is_some_and(|value| !matches!(value, "none" | "disabled" | "off" | "deny"))
+        .is_some_and(|value| !matches!(value, "inherit" | "none" | "disabled" | "off" | "deny"))
 }
 
 fn command_is_publication_or_network_mutating(command: &str) -> bool {
@@ -1060,9 +1062,11 @@ fn script_contains_external_or_network_mutation(script: &str) -> bool {
         "open(",
         "open('/",
         "path('/",
+        "path(\"/",
         "write_text(",
         "write_bytes(",
         ".write(",
+        "touch(",
         "mkdir(",
         "rename(",
         "replace(",
@@ -1415,9 +1419,9 @@ fn read_only_reasons(root: &JobDetail, child_details: &[JobDetail], reasons: &mu
     if root.job.state != "completed" {
         reasons.push("root did not converge with a completed result".to_string());
     }
-    let command_ok = child_details.iter().any(child_command_exited_zero);
+    let command_ok = child_details.iter().any(child_ran_read_only_probe);
     if !command_ok {
-        reasons.push("no child command.run/command session exited 0".to_string());
+        reasons.push("no child ran the exact read_only probe command with exit 0".to_string());
     }
     if !child_details.iter().any(child_accepted) {
         reasons.push("no child reached accepted/completed completion state".to_string());
@@ -1513,16 +1517,26 @@ fn external_artifact_reasons(
     }
 }
 
-fn child_command_exited_zero(child: &JobDetail) -> bool {
+fn child_ran_read_only_probe(child: &JobDetail) -> bool {
     child
         .command_sessions
         .iter()
-        .any(|session| command_session_success(session))
+        .any(command_session_is_successful_read_only_probe)
         || child.tool_calls.iter().any(|call| {
             call.tool_id == "command.run"
                 && call.status == "completed"
                 && tool_result_exit_zero(call)
+                && command_is_exact_read_only_probe(&command_text(&call.args_json))
         })
+}
+
+fn command_session_is_successful_read_only_probe(session: &CommandSessionSummary) -> bool {
+    command_session_success(session)
+        && command_is_exact_read_only_probe(&command_session_text(session))
+}
+
+fn command_is_exact_read_only_probe(command: &str) -> bool {
+    command.split_whitespace().collect::<Vec<_>>().join(" ") == READ_ONLY_PROBE_COMMAND
 }
 
 fn command_session_success(session: &CommandSessionSummary) -> bool {
@@ -1691,6 +1705,41 @@ mod tests {
 
         assert!(!verdict.approve);
         assert!(verdict.reason.contains("worker worktree"));
+    }
+
+    #[test]
+    fn python_policy_rejects_absolute_path_writes() {
+        let call = tool_call_with_args(
+            "python.run",
+            json!({"cwd":".","script":"from pathlib import Path\nPath(\"/tmp/nucleus-dogfood-leak\").touch()"}),
+        );
+
+        let verdict = evaluate_python_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(!verdict.approve);
+        assert!(verdict.reason.contains("worker worktree"));
+    }
+
+    #[test]
+    fn explicit_inherit_network_policy_matches_default() {
+        assert!(!network_policy_allows_network(
+            &json!({"network_policy":"inherit"})
+        ));
+        assert!(!network_policy_allows_network(&json!({})));
+        assert!(network_policy_allows_network(
+            &json!({"network_policy":"enabled"})
+        ));
+    }
+
+    #[test]
+    fn read_only_probe_requires_exact_command() {
+        assert!(command_is_exact_read_only_probe(
+            "sh -lc printf NUCLEUS_COMMAND_RUN_PROBE"
+        ));
+        assert!(!command_is_exact_read_only_probe("pwd"));
+        assert!(!command_is_exact_read_only_probe(
+            "sh -lc printf WRONG_PROBE"
+        ));
     }
 
     fn tool_call(tool_id: &str, status: &str, exit_code: Option<i32>) -> ToolCallSummary {
