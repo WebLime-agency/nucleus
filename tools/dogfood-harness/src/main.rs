@@ -1063,8 +1063,10 @@ fn path_like_command_token(token: &str) -> Option<PathBuf> {
     if token.is_empty() || token.starts_with('-') {
         return None;
     }
-    if token.starts_with('/') || token.starts_with("../") || token == ".." || token.starts_with('~')
-    {
+    if token.starts_with('~') {
+        return Some(PathBuf::from("/~"));
+    }
+    if token.starts_with('/') || token.starts_with("../") || token == ".." {
         return Some(PathBuf::from(token));
     }
     if token.contains("/../") || token.ends_with("/..") {
@@ -1144,6 +1146,7 @@ fn script_contains_external_or_network_mutation(script: &str) -> bool {
         "socket",
         "os.system",
         "os.popen",
+        "os.listdir",
         "shutil.",
         "git push",
         "git commit",
@@ -1152,6 +1155,8 @@ fn script_contains_external_or_network_mutation(script: &str) -> bool {
         "cargo publish",
         "../",
         "..\\",
+        "'/",
+        "\"/",
         ".parent",
         "parents[",
         "open(",
@@ -1803,6 +1808,19 @@ mod tests {
     }
 
     #[test]
+    fn command_policy_rejects_shell_home_paths() {
+        let call = tool_call_with_args(
+            "command.run",
+            json!({"command":"sh","args":["-lc","grep token ~/.ssh/id_rsa"],"cwd":"."}),
+        );
+
+        let verdict = evaluate_command_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(!verdict.approve);
+        assert!(verdict.reason.contains("outside the worker worktree"));
+    }
+
+    #[test]
     fn command_policy_rejects_unbounded_package_scripts() {
         let deploy = "pnpm run deploy";
         let check = "pnpm run check";
@@ -1880,6 +1898,19 @@ mod tests {
         let call = tool_call_with_args(
             "python.run",
             json!({"cwd":".","script":"from pathlib import Path\nPath (\"/etc/passwd\").read_text()"}),
+        );
+
+        let verdict = evaluate_python_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(!verdict.approve);
+        assert!(verdict.reason.contains("worker worktree"));
+    }
+
+    #[test]
+    fn python_policy_rejects_absolute_path_strings() {
+        let call = tool_call_with_args(
+            "python.run",
+            json!({"cwd":".","script":"import os\nprint(os.listdir('/home/eba/.ssh'))"}),
         );
 
         let verdict = evaluate_python_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
