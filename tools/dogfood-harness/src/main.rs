@@ -1110,7 +1110,9 @@ fn command_looks_like_read_build_or_test(command: &str) -> bool {
         "cargo check",
         "cargo build",
         "npm run check",
+        "npm run check:web",
         "npm run build",
+        "npm run build:web",
         "npm test",
         "pnpm test",
         "pnpm run check",
@@ -1136,7 +1138,9 @@ fn command_looks_like_validation(command: &str) -> bool {
         "cargo check",
         "cargo build",
         "npm run check",
+        "npm run check:web",
         "npm run build",
+        "npm run build:web",
         "npm test",
         "pnpm test",
         "pnpm run check",
@@ -1161,7 +1165,9 @@ fn command_session_looks_like_check_validation(command: &str) -> bool {
         "cargo check",
         "cargo build",
         "npm run check",
+        "npm run check:web",
         "npm run build",
+        "npm run build:web",
         "pnpm run check",
         "pnpm run build",
         "yarn run check",
@@ -1716,12 +1722,14 @@ fn child_blocked_on_validation_evidence(child: &JobDetail) -> bool {
 }
 
 fn child_has_mutation(child: &JobDetail) -> bool {
-    child.tool_calls.iter().any(|call| {
-        matches!(
-            call.tool_id.as_str(),
-            "fs.apply_patch" | "fs.write_text" | "fs.move" | "fs.mkdir"
-        ) && call.status == "completed"
-    })
+    child.tool_calls.iter().any(tool_call_is_file_mutation)
+}
+
+fn tool_call_is_file_mutation(call: &ToolCallSummary) -> bool {
+    matches!(
+        call.tool_id.as_str(),
+        "fs.apply_patch" | "fs.write_text" | "fs.move"
+    ) && call.status == "completed"
 }
 
 fn child_has_successful_test_run(child: &JobDetail) -> bool {
@@ -1879,6 +1887,17 @@ mod tests {
     }
 
     #[test]
+    fn command_policy_allows_repo_web_validation_scripts() {
+        assert!(command_looks_like_read_build_or_test("npm run check:web"));
+        assert!(command_looks_like_read_build_or_test("npm run build:web"));
+        assert!(command_looks_like_validation("npm run check:web"));
+        assert!(command_looks_like_validation("npm run build:web"));
+        assert!(command_session_looks_like_check_validation(
+            "npm run check:web"
+        ));
+    }
+
+    #[test]
     fn command_policy_uses_anchored_allow_list_matches() {
         assert!(!command_looks_like_read_build_or_test(
             "eslint --fix apps/web/src"
@@ -1910,6 +1929,17 @@ mod tests {
     fn command_session_validation_fallback_excludes_test_commands() {
         assert!(!command_session_looks_like_check_validation("cargo test"));
         assert!(command_session_looks_like_check_validation("cargo check"));
+    }
+
+    #[test]
+    fn mutation_evidence_requires_file_edit() {
+        let mut mkdir = tool_call_with_args("fs.mkdir", json!({"path":"tmp"}));
+        mkdir.status = "completed".to_string();
+        let mut patch = tool_call_with_args("fs.apply_patch", json!({"path":"src/lib.rs"}));
+        patch.status = "completed".to_string();
+
+        assert!(!tool_call_is_file_mutation(&mkdir));
+        assert!(tool_call_is_file_mutation(&patch));
     }
 
     #[test]
