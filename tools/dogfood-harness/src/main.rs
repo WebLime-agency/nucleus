@@ -768,6 +768,12 @@ fn evaluate_command_run(call: &ToolCallSummary, worktree: &Path) -> ApprovalVerd
             vec![cwd.to_string()],
         );
     }
+    if command_has_shell_escape_or_write(&command) {
+        return deny(
+            "command contains shell control, path traversal, or write-like operations",
+            vec![cwd.to_string()],
+        );
+    }
     if !command_looks_like_read_build_or_test(&command) {
         return deny(
             "command is not clearly read/build/test scoped",
@@ -944,6 +950,32 @@ fn command_is_publication_or_network_mutating(command: &str) -> bool {
         "pnpm install",
         "yarn install",
         "bun install",
+    ];
+    denied_needles.iter().any(|needle| lower.contains(needle))
+}
+
+fn command_has_shell_escape_or_write(command: &str) -> bool {
+    let lower = command.to_lowercase();
+    let denied_needles = [
+        ";",
+        "&&",
+        "||",
+        "|",
+        ">",
+        "<",
+        "\n",
+        "`",
+        "$(",
+        "../",
+        " rm ",
+        " rm -",
+        " mv ",
+        " cp ",
+        " tee ",
+        "sed -i",
+        "perl -pi",
+        "python -c",
+        "python3 -c",
     ];
     denied_needles.iter().any(|needle| lower.contains(needle))
 }
@@ -1356,7 +1388,7 @@ fn edit_and_test_reasons(root: &JobDetail, child_details: &[JobDetail], reasons:
     if !child_details.iter().any(child_has_mutation) {
         reasons.push("no child made an approved worktree edit".to_string());
     }
-    if !child_details.iter().any(child_has_test_run) {
+    if !child_details.iter().any(child_has_successful_test_run) {
         reasons.push("no child ran a focused validation command".to_string());
     }
     if !child_details.iter().any(child_accepted) {
@@ -1366,7 +1398,7 @@ fn edit_and_test_reasons(root: &JobDetail, child_details: &[JobDetail], reasons:
 
 fn feature_reasons(root: &JobDetail, child_details: &[JobDetail], reasons: &mut Vec<String>) {
     let has_implementation_validation = child_details.iter().any(|child| {
-        child_accepted(child) && child_has_mutation(child) && child_has_test_run(child)
+        child_accepted(child) && child_has_mutation(child) && child_has_successful_test_run(child)
     });
     let has_terminal_blocker =
         root_has_precise_blocker(root) && all_children_terminal(child_details);
@@ -1477,13 +1509,27 @@ fn child_has_mutation(child: &JobDetail) -> bool {
     })
 }
 
-fn child_has_test_run(child: &JobDetail) -> bool {
-    child.tool_calls.iter().any(|call| {
-        (call.tool_id == "tests.run" || call.tool_id == "command.run")
-            && call.status == "completed"
-            && (call.tool_id == "tests.run"
-                || command_looks_like_read_build_or_test(&command_text(&call.args_json)))
-    })
+fn child_has_successful_test_run(child: &JobDetail) -> bool {
+    child
+        .tool_calls
+        .iter()
+        .any(tool_call_is_successful_test_run)
+        || child.command_sessions.iter().any(|session| {
+            command_session_success(session)
+                && command_looks_like_read_build_or_test(&command_session_text(session))
+        })
+}
+
+fn tool_call_is_successful_test_run(call: &ToolCallSummary) -> bool {
+    (call.tool_id == "tests.run"
+        || (call.tool_id == "command.run"
+            && command_looks_like_read_build_or_test(&command_text(&call.args_json))))
+        && call.status == "completed"
+        && tool_result_exit_zero(call)
+}
+
+fn command_session_text(session: &CommandSessionSummary) -> String {
+    format!("{} {}", session.command, session.args.join(" "))
 }
 
 fn root_has_precise_blocker(root: &JobDetail) -> bool {
@@ -1548,4 +1594,47 @@ fn print_summary(report: &HarnessReport, output: &Path) {
         "\noverall: {}/{} passed, {} failed",
         report.overall.passed, report.overall.total, report.overall.failed
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn command_policy_rejects_compound_shell_mutation() {
+        let command = "sh -lc cargo test; rm -rf ../other";
+
+        assert!(command_looks_like_read_build_or_test(command));
+        assert!(command_has_shell_escape_or_write(command));
+    }
+
+    #[test]
+    fn validation_tool_call_requires_zero_exit() {
+        let failed = tool_call("tests.run", "completed", Some(1));
+        let passed = tool_call("tests.run", "completed", Some(0));
+
+        assert!(!tool_call_is_successful_test_run(&failed));
+        assert!(tool_call_is_successful_test_run(&passed));
+    }
+
+    fn tool_call(tool_id: &str, status: &str, exit_code: Option<i32>) -> ToolCallSummary {
+        ToolCallSummary {
+            id: "tool-call".to_string(),
+            job_id: "job".to_string(),
+            worker_id: "worker".to_string(),
+            tool_id: tool_id.to_string(),
+            status: status.to_string(),
+            summary: String::new(),
+            args_json: json!({"command":"cargo","args":["test"],"cwd":"."}),
+            result_json: exit_code.map(|exit_code| json!({"exit_code": exit_code})),
+            policy_decision: None,
+            artifact_ids: Vec::new(),
+            error_class: String::new(),
+            error_detail: String::new(),
+            created_at: 0,
+            started_at: None,
+            completed_at: None,
+        }
+    }
 }
