@@ -397,7 +397,7 @@ Use the Nucleus delegation path. The root worker must stay utility/orchestration
 
 {"command":"sh","args":["-lc","printf NUCLEUS_COMMAND_RUN_PROBE"],"cwd":".","timeout_secs":20}
 
-Do not edit files. Do not publish, push, create branches manually, or create a PR. After the child reports, join the result and give a concise final answer with the child job id, lane/model if known, exit status, and stdout."#,
+Do not edit files. Do not publish. Do not push. Do not create branches manually. Do not open pull requests. After the child reports, join the result and give a concise final answer with the child job id, lane/model if known, exit status, and stdout."#,
         },
         Rung {
             name: "edit_and_test",
@@ -407,7 +407,7 @@ Do not edit files. Do not publish, push, create branches manually, or create a P
 
 Use the Nucleus delegation path. The root worker must stay utility/orchestration-only and should not edit or run validation itself. Delegate one main child to make a tiny, well-scoped code change in its isolated worktree: add a small pure helper in crates/core/src/lib.rs and a focused unit test for it in the same crate. The helper should be Nucleus-themed and low-risk, for example formatting a short activity/status phrase. The child must use daemon file tools for edits and run a focused cargo test for the touched crate.
 
-Do not publish, push, create branches manually, stage changes, commit, or create a PR. Join the child result and report the changed file(s), test command, and validation result."#,
+Do not publish. Do not push. Do not create branches manually. Do not stage changes. Do not commit. Do not open pull requests. Join the child result and report the changed file(s), test command, and validation result."#,
         },
         Rung {
             name: "feature_161",
@@ -417,7 +417,7 @@ Do not publish, push, create branches manually, stage changes, commit, or create
 
 Implement issue #161: subtle Nucleus-themed activity messages with rate-limited rotation. Use the Nucleus delegation path. The root worker must stay utility/orchestration-only. Delegate one main child to read issue #161 and the web client, add a small feature with a focused test, and validate it. If the child hits a daemon gate or missing contract, recover deterministically if possible; otherwise surface a precise blocker with evidence.
 
-Do not publish, push, create branches manually, stage changes, commit, or create a PR. Join the child result into one concise final answer with implementation/validation evidence or the precise blocker."#,
+Do not publish. Do not push. Do not create branches manually. Do not stage changes. Do not commit. Do not open pull requests. Join the child result into one concise final answer with implementation/validation evidence or the precise blocker."#,
         },
         Rung {
             name: "debug",
@@ -427,7 +427,7 @@ Do not publish, push, create branches manually, stage changes, commit, or create
 
 Use the Nucleus delegation path. The root worker must stay utility/orchestration-only. Delegate a bounded main child to diagnose and fix this small issue in its isolated worktree: find a focused unit test or helper in the Rust workspace that can be improved to reject empty human-facing status text, make the smallest reasonable fix, and run a focused test. If no appropriate fix is safe, return a precise blocker with the files inspected.
 
-Do not publish, push, create branches manually, stage changes, commit, or create a PR. Join the child result and report the diagnosis, changed file(s), and validation result or precise blocker."#,
+Do not publish. Do not push. Do not create branches manually. Do not stage changes. Do not commit. Do not open pull requests. Join the child result and report the diagnosis, changed file(s), and validation result or precise blocker."#,
         },
     ]
 }
@@ -1231,13 +1231,59 @@ fn command_matches_allowed_prefix(command: &str, allowed: &[&str]) -> bool {
 }
 
 fn command_policy_candidates(normalized: &str) -> Vec<String> {
-    let mut candidates = vec![normalized.to_string()];
+    let mut candidates = Vec::new();
+    push_command_policy_candidate(&mut candidates, normalized);
     for prefix in ["sh -lc ", "sh -c ", "bash -lc ", "bash -c "] {
         if let Some(unwrapped) = normalized.strip_prefix(prefix) {
-            candidates.push(unwrapped.to_string());
+            push_command_policy_candidate(&mut candidates, unwrapped);
         }
     }
     candidates
+}
+
+fn push_command_policy_candidate(candidates: &mut Vec<String>, command: &str) {
+    let command = command.to_string();
+    if !candidates.contains(&command) {
+        candidates.push(command.clone());
+    }
+    if let Some(stripped) = strip_npm_workspace_flags(&command) {
+        if !candidates.contains(&stripped) {
+            candidates.push(stripped);
+        }
+    }
+}
+
+fn strip_npm_workspace_flags(command: &str) -> Option<String> {
+    let parts = command.split_whitespace().collect::<Vec<_>>();
+    if parts.first().copied() != Some("npm") {
+        return None;
+    }
+
+    let mut stripped = vec!["npm"];
+    let mut index = 1;
+    let mut changed = false;
+    while index < parts.len() {
+        match parts[index] {
+            "--workspace" | "-w" => {
+                changed = true;
+                index += 2;
+            }
+            "--workspaces" => {
+                changed = true;
+                index += 1;
+            }
+            part if part.starts_with("--workspace=") || part.starts_with("-w=") => {
+                changed = true;
+                index += 1;
+            }
+            part => {
+                stripped.push(part);
+                index += 1;
+            }
+        }
+    }
+
+    changed.then(|| stripped.join(" "))
 }
 
 fn script_contains_external_or_network_mutation(script: &str) -> bool {
@@ -2001,6 +2047,22 @@ mod tests {
             "sh -lc cargo test -p nucleus-core"
         ));
         assert!(command_looks_like_validation("bash -lc npm run check:web"));
+    }
+
+    #[test]
+    fn command_policy_allows_npm_workspace_validation_flags() {
+        assert!(command_looks_like_validation(
+            "npm --workspace @nucleus/web test -- src/activity.test.ts"
+        ));
+        assert!(command_looks_like_validation(
+            "npm --workspace=@nucleus/web run check:web"
+        ));
+        assert!(command_looks_like_validation(
+            "sh -lc npm -w @nucleus/web test -- src/activity.test.ts"
+        ));
+        assert!(!command_looks_like_validation(
+            "npm --workspace @nucleus/web run deploy"
+        ));
     }
 
     #[test]
