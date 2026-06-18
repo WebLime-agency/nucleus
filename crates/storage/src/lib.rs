@@ -14,12 +14,12 @@ use nucleus_protocol::{
     ApprovalRequestSummary, ArtifactSummary, AuditEvent, CommandSessionSummary,
     DEFAULT_JOB_MAX_STEPS, DEFAULT_JOB_MAX_TOOL_CALLS, DEFAULT_JOB_MAX_WALL_CLOCK_SECS,
     InstanceLogCategorySummary, InstanceLogEntry, JobDetail, JobEvent, JobSummary, McpServerRecord,
-    McpServerSummary, MemoryCandidate, MemoryEntry, MemorySearchResult, PlaybookDetail,
-    PlaybookSummary, PolicyDecisionSummary, ProjectSummary, RouteTarget, RouterProfileSummary,
-    RunBudgetSummary, RuntimeSummary, SessionDetail, SessionProjectSummary, SessionSummary,
-    SessionTurn, SessionTurnImage, SkillManifest, StorageSummary, SystemJobAuthoredRecord,
-    ToolCallSummary, ToolCapabilitySummary, WorkerSummary, WorkspaceModelConfig,
-    WorkspaceProfileSummary, WorkspaceSummary, WorktreeSummary,
+    McpServerSummary, MemoryCandidate, MemoryEntry, MemorySearchResult, MutationReceipt,
+    PlaybookDetail, PlaybookSummary, PolicyDecisionSummary, ProjectSummary, RouteTarget,
+    RouterProfileSummary, RunBudgetSummary, RuntimeSummary, SessionDetail, SessionProjectSummary,
+    SessionSummary, SessionTurn, SessionTurnImage, SkillManifest, StorageSummary,
+    SystemJobAuthoredRecord, ToolCallSummary, ToolCapabilitySummary, WorkerSummary,
+    WorkspaceModelConfig, WorkspaceProfileSummary, WorkspaceSummary, WorktreeSummary,
 };
 #[cfg(test)]
 use nucleus_protocol::{
@@ -466,6 +466,26 @@ pub struct AuditEventRecord {
     pub status: String,
     pub summary: String,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutationReceiptRecord {
+    pub job_id: String,
+    pub worker_id: String,
+    pub tool_call_id: String,
+    pub session_id: String,
+    pub tool: String,
+    pub approval_id: Option<String>,
+    pub paths: Vec<String>,
+    pub before_git_head: String,
+    pub before_git_branch: String,
+    pub before_git_dirty: bool,
+    pub before_git_untracked_count: usize,
+    pub after_git_head: String,
+    pub after_git_branch: String,
+    pub after_git_dirty: bool,
+    pub after_git_untracked_count: usize,
+    pub expected_dirty: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2476,6 +2496,55 @@ impl StateStore {
         load_audit_event(&connection, event_id)
     }
 
+    pub fn append_mutation_receipt(
+        &self,
+        record: MutationReceiptRecord,
+    ) -> Result<MutationReceipt> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let paths_json = serde_json::to_string(&record.paths)
+            .context("failed to encode mutation receipt paths")?;
+        connection.execute(
+            "
+            INSERT INTO mutation_receipts (
+                job_id, worker_id, tool_call_id, session_id, tool, approval_id, paths_json,
+                before_git_head, before_git_branch, before_git_dirty, before_git_untracked_count,
+                after_git_head, after_git_branch, after_git_dirty, after_git_untracked_count,
+                expected_dirty
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            ",
+            params![
+                record.job_id,
+                record.worker_id,
+                record.tool_call_id,
+                record.session_id,
+                record.tool,
+                record.approval_id,
+                paths_json,
+                record.before_git_head,
+                record.before_git_branch,
+                record.before_git_dirty,
+                record.before_git_untracked_count as i64,
+                record.after_git_head,
+                record.after_git_branch,
+                record.after_git_dirty,
+                record.after_git_untracked_count as i64,
+                record.expected_dirty,
+            ],
+        )?;
+
+        let receipt_id = connection.last_insert_rowid();
+        load_mutation_receipt(&connection, receipt_id)
+    }
+
+    pub fn list_mutation_receipts_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<MutationReceipt>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        list_mutation_receipts_for_session_with_connection(&connection, session_id)
+    }
+
     pub fn append_instance_log(&self, record: InstanceLogRecord) -> Result<InstanceLogEntry> {
         let connection = self.connection.lock().expect("storage mutex poisoned");
         let related_ids_json =
@@ -4166,6 +4235,32 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             detail TEXT NOT NULL,
             created_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
+
+        CREATE TABLE IF NOT EXISTS mutation_receipts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            tool_call_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            tool TEXT NOT NULL,
+            approval_id TEXT,
+            paths_json TEXT NOT NULL DEFAULT '[]',
+            before_git_head TEXT NOT NULL DEFAULT '',
+            before_git_branch TEXT NOT NULL DEFAULT '',
+            before_git_dirty INTEGER NOT NULL DEFAULT 0,
+            before_git_untracked_count INTEGER NOT NULL DEFAULT 0,
+            after_git_head TEXT NOT NULL DEFAULT '',
+            after_git_branch TEXT NOT NULL DEFAULT '',
+            after_git_dirty INTEGER NOT NULL DEFAULT 0,
+            after_git_untracked_count INTEGER NOT NULL DEFAULT 0,
+            expected_dirty INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mutation_receipts_session_created
+            ON mutation_receipts(session_id, created_at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_mutation_receipts_job_tool_call
+            ON mutation_receipts(job_id, tool_call_id);
 
         CREATE TABLE IF NOT EXISTS instance_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -8380,6 +8475,76 @@ fn map_audit_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEvent> {
     })
 }
 
+fn list_mutation_receipts_for_session_with_connection(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<MutationReceipt>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT
+            id, job_id, worker_id, tool_call_id, session_id, tool, approval_id, paths_json,
+            before_git_head, before_git_branch, before_git_dirty, before_git_untracked_count,
+            after_git_head, after_git_branch, after_git_dirty, after_git_untracked_count,
+            expected_dirty, created_at
+        FROM mutation_receipts
+        WHERE session_id = ?1
+        ORDER BY created_at DESC, id DESC
+        ",
+    )?;
+
+    let rows = statement.query_map(params![session_id], map_mutation_receipt)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load mutation receipts for session")
+}
+
+fn load_mutation_receipt(connection: &Connection, receipt_id: i64) -> Result<MutationReceipt> {
+    connection
+        .query_row(
+            "
+            SELECT
+                id, job_id, worker_id, tool_call_id, session_id, tool, approval_id, paths_json,
+                before_git_head, before_git_branch, before_git_dirty, before_git_untracked_count,
+                after_git_head, after_git_branch, after_git_dirty, after_git_untracked_count,
+                expected_dirty, created_at
+            FROM mutation_receipts
+            WHERE id = ?1
+            ",
+            params![receipt_id],
+            map_mutation_receipt,
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("mutation receipt '{receipt_id}' was not found"))
+}
+
+fn map_mutation_receipt(row: &rusqlite::Row<'_>) -> rusqlite::Result<MutationReceipt> {
+    let paths_json: String = row.get(7)?;
+    let paths = serde_json::from_str::<Vec<String>>(&paths_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let before_untracked: i64 = row.get(11)?;
+    let after_untracked: i64 = row.get(15)?;
+    Ok(MutationReceipt {
+        id: row.get(0)?,
+        job_id: row.get(1)?,
+        worker_id: row.get(2)?,
+        tool_call_id: row.get(3)?,
+        session_id: row.get(4)?,
+        tool: row.get(5)?,
+        approval_id: row.get(6)?,
+        paths,
+        before_git_head: row.get(8)?,
+        before_git_branch: row.get(9)?,
+        before_git_dirty: row.get(10)?,
+        before_git_untracked_count: before_untracked.max(0) as usize,
+        after_git_head: row.get(12)?,
+        after_git_branch: row.get(13)?,
+        after_git_dirty: row.get(14)?,
+        after_git_untracked_count: after_untracked.max(0) as usize,
+        expected_dirty: row.get(16)?,
+        created_at: row.get(17)?,
+    })
+}
+
 fn load_instance_log(connection: &Connection, log_id: i64) -> Result<InstanceLogEntry> {
     connection
         .query_row(
@@ -10651,6 +10816,76 @@ mod tests {
         assert_eq!(recent[0].summary, "Refreshed runtime health.");
         assert_eq!(recent[1].id, first.id);
         assert_eq!(recent[1].target, "session:test-1");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn persists_and_lists_mutation_receipts_by_session() {
+        let state_dir = test_state_dir("mutation-receipts");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+
+        let receipt = store
+            .append_mutation_receipt(MutationReceiptRecord {
+                job_id: "job-1".to_string(),
+                worker_id: "worker-1".to_string(),
+                tool_call_id: "tool-call-1".to_string(),
+                session_id: "session-1".to_string(),
+                tool: "fs.write_text".to_string(),
+                approval_id: Some("approval-1".to_string()),
+                paths: vec!["src/lib.rs".to_string()],
+                before_git_head: "before".to_string(),
+                before_git_branch: "dev".to_string(),
+                before_git_dirty: false,
+                before_git_untracked_count: 0,
+                after_git_head: "after".to_string(),
+                after_git_branch: "dev".to_string(),
+                after_git_dirty: true,
+                after_git_untracked_count: 1,
+                expected_dirty: true,
+            })
+            .expect("receipt should persist");
+        store
+            .append_mutation_receipt(MutationReceiptRecord {
+                session_id: "session-2".to_string(),
+                tool_call_id: "tool-call-2".to_string(),
+                paths: vec!["other.txt".to_string()],
+                ..MutationReceiptRecord {
+                    job_id: "job-2".to_string(),
+                    worker_id: "worker-2".to_string(),
+                    tool_call_id: String::new(),
+                    session_id: String::new(),
+                    tool: "command.run".to_string(),
+                    approval_id: None,
+                    paths: Vec::new(),
+                    before_git_head: "before".to_string(),
+                    before_git_branch: "dev".to_string(),
+                    before_git_dirty: false,
+                    before_git_untracked_count: 0,
+                    after_git_head: "before".to_string(),
+                    after_git_branch: "dev".to_string(),
+                    after_git_dirty: true,
+                    after_git_untracked_count: 0,
+                    expected_dirty: true,
+                }
+            })
+            .expect("other receipt should persist");
+
+        let listed = store
+            .list_mutation_receipts_for_session("session-1")
+            .expect("receipts should load");
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, receipt.id);
+        assert_eq!(listed[0].job_id, "job-1");
+        assert_eq!(listed[0].worker_id, "worker-1");
+        assert_eq!(listed[0].tool_call_id, "tool-call-1");
+        assert_eq!(listed[0].approval_id.as_deref(), Some("approval-1"));
+        assert_eq!(listed[0].paths, vec!["src/lib.rs"]);
+        assert!(!listed[0].before_git_dirty);
+        assert!(listed[0].after_git_dirty);
+        assert_eq!(listed[0].after_git_untracked_count, 1);
+        assert!(listed[0].expected_dirty);
 
         let _ = fs::remove_dir_all(&state_dir);
     }
