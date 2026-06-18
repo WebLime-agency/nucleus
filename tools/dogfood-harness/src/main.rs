@@ -807,6 +807,9 @@ fn evaluate_python_run(call: &ToolCallSummary, worktree: &Path) -> ApprovalVerdi
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_lowercase();
+    if script.trim().is_empty() {
+        return deny("python.run script is missing", vec![cwd.to_string()]);
+    }
     if script_contains_external_or_network_mutation(&script) {
         return deny(
             "python script is not clearly scoped to the worker worktree",
@@ -828,6 +831,31 @@ fn evaluate_tests_run(call: &ToolCallSummary, worktree: &Path) -> ApprovalVerdic
     if !path_is_inside_worktree(worktree, Path::new(cwd)) {
         return deny(
             "tests.run cwd resolves outside the worker worktree",
+            vec![cwd.to_string()],
+        );
+    }
+    if network_policy_allows_network(&call.args_json) {
+        return deny("tests.run requests network access", vec![cwd.to_string()]);
+    }
+    let command = command_text(&call.args_json);
+    if command.trim().is_empty() {
+        return deny("tests.run command is missing", vec![cwd.to_string()]);
+    }
+    if command_is_publication_or_network_mutating(&command) {
+        return deny(
+            "tests.run command looks publication, git-mutating, or network-mutating",
+            vec![cwd.to_string()],
+        );
+    }
+    if command_has_shell_escape_or_write(&command) {
+        return deny(
+            "tests.run command contains shell control, path traversal, or write-like operations",
+            vec![cwd.to_string()],
+        );
+    }
+    if !command_looks_like_read_build_or_test(&command) {
+        return deny(
+            "tests.run command is not clearly test scoped",
             vec![cwd.to_string()],
         );
     }
@@ -1017,10 +1045,31 @@ fn script_contains_external_or_network_mutation(script: &str) -> bool {
         "https://",
         "subprocess",
         "socket",
+        "os.system",
+        "os.popen",
+        "shutil.",
         "git push",
+        "git commit",
         "gh pr",
+        "npm publish",
+        "cargo publish",
+        "../",
+        "..\\",
+        ".parent",
+        "parents[",
+        "open(",
         "open('/",
         "path('/",
+        "write_text(",
+        "write_bytes(",
+        ".write(",
+        "mkdir(",
+        "rename(",
+        "replace(",
+        "remove(",
+        "unlink(",
+        "rmdir(",
+        "rmtree(",
         "unlink('/",
         "rmtree('/",
     ];
@@ -1618,16 +1667,52 @@ mod tests {
         assert!(tool_call_is_successful_test_run(&passed));
     }
 
+    #[test]
+    fn tests_run_policy_rejects_publication_subcommand() {
+        let call = tool_call_with_args(
+            "tests.run",
+            json!({"command":"npm","args":["publish"],"cwd":"."}),
+        );
+
+        let verdict = evaluate_tests_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(!verdict.approve);
+        assert!(verdict.reason.contains("publication"));
+    }
+
+    #[test]
+    fn python_policy_rejects_parent_path_writes() {
+        let call = tool_call_with_args(
+            "python.run",
+            json!({"cwd":".","script":"from pathlib import Path\nPath('../other-session/file').write_text('x')"}),
+        );
+
+        let verdict = evaluate_python_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(!verdict.approve);
+        assert!(verdict.reason.contains("worker worktree"));
+    }
+
     fn tool_call(tool_id: &str, status: &str, exit_code: Option<i32>) -> ToolCallSummary {
+        let mut call = tool_call_with_args(
+            tool_id,
+            json!({"command":"cargo","args":["test"],"cwd":"."}),
+        );
+        call.status = status.to_string();
+        call.result_json = exit_code.map(|exit_code| json!({"exit_code": exit_code}));
+        call
+    }
+
+    fn tool_call_with_args(tool_id: &str, args_json: Value) -> ToolCallSummary {
         ToolCallSummary {
             id: "tool-call".to_string(),
             job_id: "job".to_string(),
             worker_id: "worker".to_string(),
             tool_id: tool_id.to_string(),
-            status: status.to_string(),
+            status: "pending".to_string(),
             summary: String::new(),
-            args_json: json!({"command":"cargo","args":["test"],"cwd":"."}),
-            result_json: exit_code.map(|exit_code| json!({"exit_code": exit_code})),
+            args_json,
+            result_json: None,
             policy_decision: None,
             artifact_ids: Vec::new(),
             error_class: String::new(),
