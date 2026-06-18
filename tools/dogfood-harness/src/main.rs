@@ -1076,14 +1076,13 @@ fn path_like_command_token(token: &str) -> Option<PathBuf> {
 }
 
 fn command_looks_like_read_build_or_test(command: &str) -> bool {
-    let lower = command.to_lowercase();
     let allowed = [
-        "printf ",
+        "printf",
         "pwd",
         "ls",
         "find",
-        "rg ",
-        "grep ",
+        "rg",
+        "grep",
         "cargo test",
         "cargo check",
         "cargo build",
@@ -1105,11 +1104,10 @@ fn command_looks_like_read_build_or_test(command: &str) -> bool {
         "just test",
         "just check",
     ];
-    allowed.iter().any(|needle| lower.contains(needle))
+    command_matches_allowed_prefix(command, &allowed)
 }
 
 fn command_looks_like_validation(command: &str) -> bool {
-    let lower = command.to_lowercase();
     let allowed = [
         "cargo test",
         "cargo check",
@@ -1132,7 +1130,18 @@ fn command_looks_like_validation(command: &str) -> bool {
         "just test",
         "just check",
     ];
-    allowed.iter().any(|needle| lower.contains(needle))
+    command_matches_allowed_prefix(command, &allowed)
+}
+
+fn command_matches_allowed_prefix(command: &str, allowed: &[&str]) -> bool {
+    let normalized = command
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    allowed
+        .iter()
+        .any(|prefix| normalized == *prefix || normalized.starts_with(&format!("{prefix} ")))
 }
 
 fn script_contains_external_or_network_mutation(script: &str) -> bool {
@@ -1769,7 +1778,6 @@ mod tests {
     fn command_policy_rejects_compound_shell_mutation() {
         let command = "sh -lc cargo test; rm -rf ../other";
 
-        assert!(command_looks_like_read_build_or_test(command));
         assert!(command_has_shell_escape_or_write(command));
     }
 
@@ -1827,6 +1835,14 @@ mod tests {
 
         assert!(!command_looks_like_read_build_or_test(deploy));
         assert!(command_looks_like_read_build_or_test(check));
+    }
+
+    #[test]
+    fn command_policy_uses_anchored_allow_list_matches() {
+        assert!(!command_looks_like_read_build_or_test(
+            "eslint --fix apps/web/src"
+        ));
+        assert!(command_looks_like_read_build_or_test("ls apps/web/src"));
     }
 
     #[test]
