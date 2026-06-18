@@ -128,11 +128,30 @@ struct RungReport {
     root_job_id: String,
     status: String,
     reasons: Vec<String>,
+    phase1: PhaseReport,
+    phase2: PhaseReport,
+    root_final: RootFinalReport,
+    read_only_exact_probe_exit_0: Option<bool>,
     root_worker: Option<WorkerReport>,
     children: Vec<ChildReport>,
     counts: CountReport,
     approvals: ApprovalReport,
+    cleanup: CleanupReport,
     key_events: Vec<EventReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PhaseReport {
+    passed: bool,
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RootFinalReport {
+    state: String,
+    completion_status: String,
+    result_summary: String,
+    mutation_receipt_ids: Vec<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -145,12 +164,22 @@ struct WorkerReport {
 #[derive(Debug, Serialize)]
 struct ChildReport {
     id: String,
-    lane: String,
-    model: String,
+    task_class: Option<String>,
+    executor_lane: String,
+    executor_model: String,
     state: String,
     completion_status: String,
     completion_blockers: Vec<String>,
+    tool_calls: Vec<ToolCallReport>,
     tool_failures: Vec<ToolFailureReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolCallReport {
+    tool_id: String,
+    args_summary: String,
+    exit_code: Option<i64>,
+    status: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -173,6 +202,14 @@ struct CountReport {
 struct ApprovalReport {
     approved: Vec<ApprovalDecisionReport>,
     denied: Vec<ApprovalDecisionReport>,
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+struct CleanupReport {
+    root_cancel_attempted: bool,
+    session_deleted: bool,
+    evidence_preserved: bool,
+    reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -234,6 +271,10 @@ async fn main() -> Result<()> {
                 root_job_id: String::new(),
                 status: "FAIL".to_string(),
                 reasons: vec![error.to_string()],
+                phase1: failed_phase("rung did not start"),
+                phase2: failed_phase("rung did not start"),
+                root_final: empty_root_final(),
+                read_only_exact_probe_exit_0: read_only_probe_field(&rung, false),
                 root_worker: None,
                 children: Vec::new(),
                 counts: CountReport {
@@ -243,6 +284,7 @@ async fn main() -> Result<()> {
                     fanout_detected: false,
                 },
                 approvals: ApprovalReport::default(),
+                cleanup: CleanupReport::default(),
                 key_events: Vec::new(),
             }),
         }
@@ -498,26 +540,79 @@ async fn run_rung(
     )
     .await;
 
-    let cleanup_reasons = cleanup(
+    let mut report = match result {
+        Ok(report) => report,
+        Err(error) => failed_rung_report(rung, &session_id, root_job_id.as_str(), error),
+    };
+    let cleanup_mode = cleanup_mode_for_status(&report.status);
+    let cleanup_report = cleanup(
         client,
         &session_id,
         root_job_id.as_str(),
         &mut approval_report,
+        cleanup_mode,
     )
     .await;
 
-    let mut report = result?;
     report.approvals.approved.extend(approval_report.approved);
     report.approvals.denied.extend(approval_report.denied);
-    if !cleanup_reasons.is_empty() {
+    if !cleanup_report.reasons.is_empty() {
         report.reasons.extend(
-            cleanup_reasons
-                .into_iter()
+            cleanup_report
+                .reasons
+                .iter()
                 .map(|reason| format!("cleanup: {reason}")),
         );
         report.status = "FAIL".to_string();
     }
+    report.cleanup = cleanup_report;
     Ok(RungOutcome { report })
+}
+
+fn failed_rung_report(
+    rung: &Rung,
+    session_id: &str,
+    root_job_id: &str,
+    error: anyhow::Error,
+) -> RungReport {
+    RungReport {
+        name: rung.name.to_string(),
+        session_id: session_id.to_string(),
+        root_job_id: root_job_id.to_string(),
+        status: "FAIL".to_string(),
+        reasons: vec![error.to_string()],
+        phase1: failed_phase("rung failed before evaluation"),
+        phase2: failed_phase("rung failed before evaluation"),
+        root_final: empty_root_final(),
+        read_only_exact_probe_exit_0: read_only_probe_field(rung, false),
+        root_worker: None,
+        children: Vec::new(),
+        counts: CountReport {
+            children: 0,
+            main_children: 0,
+            utility_children: 0,
+            fanout_detected: false,
+        },
+        approvals: ApprovalReport::default(),
+        cleanup: CleanupReport::default(),
+        key_events: Vec::new(),
+    }
+}
+
+fn failed_phase(reason: &str) -> PhaseReport {
+    PhaseReport {
+        passed: false,
+        reasons: vec![reason.to_string()],
+    }
+}
+
+fn empty_root_final() -> RootFinalReport {
+    RootFinalReport {
+        state: String::new(),
+        completion_status: String::new(),
+        result_summary: String::new(),
+        mutation_receipt_ids: Vec::new(),
+    }
 }
 
 async fn create_rung_session(
@@ -1449,25 +1544,72 @@ fn approval_action_report(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupMode {
+    DeleteSession,
+    PreserveEvidence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupOperation {
+    CancelRoot,
+    DenyPendingApprovals,
+    CleanHarnessWorktree,
+    DeleteSession,
+}
+
+impl CleanupMode {
+    fn preserve_evidence(self) -> bool {
+        matches!(self, CleanupMode::PreserveEvidence)
+    }
+}
+
+fn cleanup_mode_for_status(status: &str) -> CleanupMode {
+    if status == "PASS" {
+        CleanupMode::DeleteSession
+    } else {
+        CleanupMode::PreserveEvidence
+    }
+}
+
+fn cleanup_operations(mode: CleanupMode) -> Vec<CleanupOperation> {
+    let mut operations = vec![
+        CleanupOperation::CancelRoot,
+        CleanupOperation::DenyPendingApprovals,
+    ];
+    if mode == CleanupMode::DeleteSession {
+        operations.push(CleanupOperation::CleanHarnessWorktree);
+        operations.push(CleanupOperation::DeleteSession);
+    }
+    operations
+}
+
 async fn cleanup(
     client: &HarnessClient,
     session_id: &str,
     root_job_id: &str,
     approvals: &mut ApprovalReport,
-) -> Vec<String> {
-    let mut reasons = Vec::new();
+    mode: CleanupMode,
+) -> CleanupReport {
+    let operations = cleanup_operations(mode);
+    let mut report = CleanupReport {
+        evidence_preserved: mode.preserve_evidence(),
+        ..CleanupReport::default()
+    };
     let session_detail = client
         .get::<SessionDetail>(&format!("/api/sessions/{session_id}"))
         .await
         .ok();
-    if !root_job_id.is_empty() {
+    if operations.contains(&CleanupOperation::CancelRoot) && !root_job_id.is_empty() {
+        report.root_cancel_attempted = true;
         let _ = client
             .post::<JobDetail, Value>(&format!("/api/jobs/{root_job_id}/cancel"), None)
             .await;
         wait_for_job_terminal(client, root_job_id, Duration::from_secs(60)).await;
-        if let Ok(root) = client
-            .get::<JobDetail>(&format!("/api/jobs/{root_job_id}"))
-            .await
+        if operations.contains(&CleanupOperation::DenyPendingApprovals)
+            && let Ok(root) = client
+                .get::<JobDetail>(&format!("/api/jobs/{root_job_id}"))
+                .await
         {
             if let Ok(pending) = client
                 .get::<Vec<ApprovalRequestSummary>>("/api/approvals")
@@ -1497,27 +1639,38 @@ async fn cleanup(
             }
         }
     }
-    if let Err(error) = clean_harness_worktree(session_id, session_detail.as_ref()) {
-        reasons.push(error.to_string());
+    if !operations.contains(&CleanupOperation::DeleteSession) {
+        return report;
+    }
+    if operations.contains(&CleanupOperation::CleanHarnessWorktree)
+        && let Err(error) = clean_harness_worktree(session_id, session_detail.as_ref())
+    {
+        report.reasons.push(error.to_string());
     }
     if let Err(first_error) = client
         .delete_empty(&format!("/api/sessions/{session_id}"))
         .await
     {
-        if let Err(error) = clean_harness_worktree(session_id, session_detail.as_ref()) {
-            reasons.push(error.to_string());
+        if operations.contains(&CleanupOperation::CleanHarnessWorktree)
+            && let Err(error) = clean_harness_worktree(session_id, session_detail.as_ref())
+        {
+            report.reasons.push(error.to_string());
         }
         sleep(Duration::from_secs(2)).await;
         if let Err(second_error) = client
             .delete_empty(&format!("/api/sessions/{session_id}"))
             .await
         {
-            reasons.push(format!(
+            report.reasons.push(format!(
                 "failed to delete session after retry: first={first_error}; second={second_error}"
             ));
+        } else {
+            report.session_deleted = true;
         }
+    } else {
+        report.session_deleted = true;
     }
-    reasons
+    report
 }
 
 async fn wait_for_job_terminal(client: &HarnessClient, job_id: &str, timeout: Duration) {
@@ -1599,17 +1752,40 @@ fn build_rung_report(
     let children = child_reports(&root, &child_details);
     let counts = count_report(&root, rung.max_main_children);
     let key_events = key_events(&root, &child_details);
-    let reasons = acceptance_reasons(rung, &root, &child_details, &counts, &root_worker);
+    let phase1 = phase1_report(&root, &child_details, &counts, rung.max_main_children);
+    let phase2 = phase2_report(&root);
+    let root_final = root_final_report(&root);
+    let read_only_exact_probe_exit_0 =
+        read_only_probe_field(rung, child_details.iter().any(child_ran_read_only_probe));
+    let reasons = acceptance_reasons(
+        rung,
+        &root,
+        &child_details,
+        &root_worker,
+        &phase1,
+        &phase2,
+        read_only_exact_probe_exit_0,
+    );
+    let status = if phase1.passed && phase2.passed && reasons.is_empty() {
+        "PASS"
+    } else {
+        "FAIL"
+    };
     RungReport {
         name: rung.name.to_string(),
         session_id: session_id.to_string(),
         root_job_id: root_job_id.to_string(),
-        status: if reasons.is_empty() { "PASS" } else { "FAIL" }.to_string(),
+        status: status.to_string(),
         reasons,
+        phase1,
+        phase2,
+        root_final,
+        read_only_exact_probe_exit_0,
         root_worker,
         children,
         counts,
         approvals,
+        cleanup: CleanupReport::default(),
         key_events,
     }
 }
@@ -1637,20 +1813,63 @@ fn child_reports(root: &JobDetail, child_details: &[JobDetail]) -> Vec<ChildRepo
         .iter()
         .map(|child| {
             let detail = details_by_id.get(child.id.as_str()).copied();
+            let job = detail.map(|detail| &detail.job).unwrap_or(child);
+            let tool_calls = detail
+                .map(|detail| tool_call_reports(&detail.tool_calls))
+                .unwrap_or_default();
             let tool_failures = detail
                 .map(|detail| tool_failures(&detail.tool_calls))
                 .unwrap_or_default();
             ChildReport {
                 id: child.id.clone(),
-                lane: child.executor_lane.clone(),
-                model: child.executor_model.clone(),
-                state: child.state.clone(),
-                completion_status: child.completion_status.clone(),
-                completion_blockers: child.completion_blockers.clone(),
+                task_class: job.task_class.clone(),
+                executor_lane: child.executor_lane.clone(),
+                executor_model: child.executor_model.clone(),
+                state: job.state.clone(),
+                completion_status: job.completion_status.clone(),
+                completion_blockers: job.completion_blockers.clone(),
+                tool_calls,
                 tool_failures,
             }
         })
         .collect()
+}
+
+fn tool_call_reports(calls: &[ToolCallSummary]) -> Vec<ToolCallReport> {
+    calls
+        .iter()
+        .map(|call| ToolCallReport {
+            tool_id: call.tool_id.clone(),
+            args_summary: tool_call_args_summary(call),
+            exit_code: tool_result_exit_code(call),
+            status: call.status.clone(),
+        })
+        .collect()
+}
+
+fn tool_call_args_summary(call: &ToolCallSummary) -> String {
+    if call.tool_id == "command.run" || call.tool_id == "tests.run" {
+        let command = command_text(&call.args_json);
+        if !command.trim().is_empty() {
+            return truncate_summary(&command);
+        }
+    }
+    if !call.summary.trim().is_empty() {
+        return truncate_summary(&call.summary);
+    }
+    let args = serde_json::to_string(&call.args_json).unwrap_or_default();
+    truncate_summary(&args)
+}
+
+fn truncate_summary(value: &str) -> String {
+    const MAX_LEN: usize = 180;
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.chars().count() <= MAX_LEN {
+        return value;
+    }
+    let mut truncated = value.chars().take(MAX_LEN - 3).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn tool_failures(calls: &[ToolCallSummary]) -> Vec<ToolFailureReport> {
@@ -1709,34 +1928,150 @@ fn is_key_event(event: &JobEvent) -> bool {
     KEY_EVENT_TERMS.iter().any(|term| haystack.contains(term))
 }
 
+fn root_final_report(root: &JobDetail) -> RootFinalReport {
+    RootFinalReport {
+        state: root.job.state.clone(),
+        completion_status: root.job.completion_status.clone(),
+        result_summary: root.job.result_summary.clone(),
+        mutation_receipt_ids: mutation_receipt_ids(root),
+    }
+}
+
+fn mutation_receipt_ids(job: &JobDetail) -> Vec<i64> {
+    let mut ids = BTreeSet::new();
+    collect_mutation_receipt_ids(&job.job.metadata_json, &mut ids);
+    for evidence in [
+        &job.job.command_session_cwd_evidence_json,
+        &job.job.target_entity_evidence_json,
+        &job.job.process_state_evidence_json,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Ok(value) = serde_json::from_str::<Value>(evidence) {
+            collect_mutation_receipt_ids(&value, &mut ids);
+        }
+    }
+    for event in &job.events {
+        collect_mutation_receipt_ids(&event.data_json, &mut ids);
+    }
+    ids.into_iter().collect()
+}
+
+fn collect_mutation_receipt_ids(value: &Value, ids: &mut BTreeSet<i64>) {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                if key == "mutation_receipt_ids" {
+                    collect_i64_values(value, ids);
+                } else if key == "mutation_receipt_id" {
+                    collect_i64_value(value, ids);
+                }
+                collect_mutation_receipt_ids(value, ids);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_mutation_receipt_ids(value, ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_i64_values(value: &Value, ids: &mut BTreeSet<i64>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_i64_value(value, ids);
+            }
+        }
+        value => collect_i64_value(value, ids),
+    }
+}
+
+fn collect_i64_value(value: &Value, ids: &mut BTreeSet<i64>) {
+    if let Some(id) = value.as_i64() {
+        ids.insert(id);
+    } else if let Some(text) = value.as_str()
+        && let Ok(id) = text.parse::<i64>()
+    {
+        ids.insert(id);
+    }
+}
+
+fn phase1_report(
+    root: &JobDetail,
+    child_details: &[JobDetail],
+    counts: &CountReport,
+    max_main_children: usize,
+) -> PhaseReport {
+    let mut reasons = Vec::new();
+    if !job_tree_has_accepted_main_child(root, child_details) {
+        reasons.push("no main child reached completed/accepted completion state".to_string());
+    }
+    if counts.main_children > max_main_children {
+        reasons.push(format!(
+            "fanout detected: {} main children exceeds limit {}",
+            counts.main_children, max_main_children
+        ));
+    }
+    PhaseReport {
+        passed: reasons.is_empty(),
+        reasons,
+    }
+}
+
+fn phase2_report(root: &JobDetail) -> PhaseReport {
+    let mut reasons = Vec::new();
+    if root.job.state != "completed" {
+        reasons.push("root did not converge with a completed result".to_string());
+    }
+    if root.job.completion_status == "blocked" {
+        reasons.push("root completion status was blocked".to_string());
+    }
+    PhaseReport {
+        passed: reasons.is_empty(),
+        reasons,
+    }
+}
+
 fn acceptance_reasons(
     rung: &Rung,
     root: &JobDetail,
     child_details: &[JobDetail],
-    counts: &CountReport,
     root_worker: &Option<WorkerReport>,
+    phase1: &PhaseReport,
+    phase2: &PhaseReport,
+    read_only_exact_probe_exit_0: Option<bool>,
 ) -> Vec<String> {
-    let mut reasons = common_reasons(rung, root, counts, root_worker);
+    let mut reasons = common_reasons(root, root_worker);
+    reasons.extend(
+        phase1
+            .reasons
+            .iter()
+            .map(|reason| format!("phase1: {reason}")),
+    );
+    reasons.extend(
+        phase2
+            .reasons
+            .iter()
+            .map(|reason| format!("phase2: {reason}")),
+    );
     match rung.acceptance {
-        Acceptance::ReadOnlyProbe => read_only_reasons(root, child_details, &mut reasons),
-        Acceptance::EditAndTest => edit_and_test_reasons(root, child_details, &mut reasons),
-        Acceptance::Feature161 => feature_reasons(root, child_details, &mut reasons),
-        Acceptance::Debug => debug_reasons(root, child_details, &mut reasons),
+        Acceptance::ReadOnlyProbe => {
+            read_only_reasons(child_details, read_only_exact_probe_exit_0, &mut reasons)
+        }
+        Acceptance::EditAndTest => edit_and_test_reasons(child_details, &mut reasons),
+        Acceptance::Feature161 => feature_reasons(child_details, &mut reasons),
+        Acceptance::Debug => debug_reasons(child_details, &mut reasons),
     }
     external_artifact_reasons(root, child_details, &mut reasons);
     reasons
 }
 
-fn common_reasons(
-    rung: &Rung,
-    root: &JobDetail,
-    counts: &CountReport,
-    root_worker: &Option<WorkerReport>,
-) -> Vec<String> {
+fn common_reasons(root: &JobDetail, root_worker: &Option<WorkerReport>) -> Vec<String> {
     let mut reasons = Vec::new();
-    if root.job.state != "completed" && root.job.state != "blocked" {
-        reasons.push(format!("root job ended in state {}", root.job.state));
-    }
     match root_worker {
         Some(worker) if worker.lane == "utility" => {}
         Some(worker) => reasons.push(format!("root worker lane was {}, not utility", worker.lane)),
@@ -1750,15 +2085,6 @@ fn common_reasons(
             ));
         }
     }
-    if counts.main_children == 0 {
-        reasons.push("no main child was observed".to_string());
-    }
-    if counts.main_children > rung.max_main_children {
-        reasons.push(format!(
-            "fanout detected: {} main children exceeds limit {}",
-            counts.main_children, rung.max_main_children
-        ));
-    }
     for child in &root.child_jobs {
         if !TERMINAL_STATES.contains(&child.state.as_str()) {
             reasons.push(format!(
@@ -1770,16 +2096,13 @@ fn common_reasons(
     reasons
 }
 
-fn read_only_reasons(root: &JobDetail, child_details: &[JobDetail], reasons: &mut Vec<String>) {
-    if root.job.state != "completed" {
-        reasons.push("root did not converge with a completed result".to_string());
-    }
-    let command_ok = child_details.iter().any(child_ran_read_only_probe);
-    if !command_ok {
+fn read_only_reasons(
+    child_details: &[JobDetail],
+    read_only_exact_probe_exit_0: Option<bool>,
+    reasons: &mut Vec<String>,
+) {
+    if read_only_exact_probe_exit_0 != Some(true) {
         reasons.push("no child ran the exact read_only probe command with exit 0".to_string());
-    }
-    if !child_details.iter().any(child_accepted) {
-        reasons.push("no child reached accepted/completed completion state".to_string());
     }
     if child_details
         .iter()
@@ -1789,55 +2112,28 @@ fn read_only_reasons(root: &JobDetail, child_details: &[JobDetail], reasons: &mu
     }
 }
 
-fn edit_and_test_reasons(root: &JobDetail, child_details: &[JobDetail], reasons: &mut Vec<String>) {
-    if root.job.state != "completed" {
-        reasons.push("root did not converge with a completed result".to_string());
-    }
+fn edit_and_test_reasons(child_details: &[JobDetail], reasons: &mut Vec<String>) {
     if !child_details.iter().any(child_has_mutation) {
         reasons.push("no child made an approved worktree edit".to_string());
     }
     if !child_details.iter().any(child_has_successful_test_run) {
         reasons.push("no child ran a focused validation command".to_string());
     }
-    if !child_details.iter().any(child_accepted) {
-        reasons.push("no child reached accepted/completed completion state".to_string());
-    }
 }
 
-fn feature_reasons(root: &JobDetail, child_details: &[JobDetail], reasons: &mut Vec<String>) {
+fn feature_reasons(child_details: &[JobDetail], reasons: &mut Vec<String>) {
     let has_implementation_validation = child_details.iter().any(|child| {
         child_accepted(child) && child_has_mutation(child) && child_has_successful_test_run(child)
     });
-    let has_terminal_blocker =
-        root_has_precise_blocker(root) && all_children_terminal(child_details);
-    if root.job.state != "completed" && !has_terminal_blocker {
-        reasons
-            .push("feature rung did not converge to completion or a precise blocker".to_string());
-    }
-    if !has_implementation_validation && !has_terminal_blocker {
-        reasons.push(
-            "feature rung lacked implementation+validation evidence or a precise blocker"
-                .to_string(),
-        );
+    if !has_implementation_validation {
+        reasons.push("feature rung lacked accepted implementation+validation evidence".to_string());
     }
 }
 
-fn debug_reasons(root: &JobDetail, child_details: &[JobDetail], reasons: &mut Vec<String>) {
-    let has_terminal_blocker =
-        root_has_precise_blocker(root) && all_children_terminal(child_details);
-    if root.job.state != "completed" && !has_terminal_blocker {
-        reasons.push("debug rung did not converge to completion or a precise blocker".to_string());
-    }
+fn debug_reasons(child_details: &[JobDetail], reasons: &mut Vec<String>) {
     if child_details.is_empty() {
         reasons.push("debug rung produced no child diagnosis".to_string());
     }
-}
-
-fn all_children_terminal(child_details: &[JobDetail]) -> bool {
-    !child_details.is_empty()
-        && child_details
-            .iter()
-            .all(|child| TERMINAL_STATES.contains(&child.job.state.as_str()))
 }
 
 fn external_artifact_reasons(
@@ -1898,14 +2194,36 @@ fn command_session_success(session: &CommandSessionSummary) -> bool {
     session.state == "completed" && session.exit_code == Some(0)
 }
 
+fn tool_result_exit_code(call: &ToolCallSummary) -> Option<i64> {
+    call.result_json
+        .as_ref()
+        .and_then(|value| value.get("exit_code"))
+        .and_then(Value::as_i64)
+}
+
 fn tool_result_exit_zero(call: &ToolCallSummary) -> bool {
     call.result_json.as_ref().is_some_and(|value| {
-        value.get("exit_code").and_then(Value::as_i64) == Some(0)
+        tool_result_exit_code(call) == Some(0)
             && value
                 .pointer("/validation_interpretation/status")
                 .and_then(Value::as_str)
                 != Some("no_tests_matched")
     })
+}
+
+fn read_only_probe_field(rung: &Rung, value: bool) -> Option<bool> {
+    matches!(rung.acceptance, Acceptance::ReadOnlyProbe).then_some(value)
+}
+
+fn job_tree_has_accepted_main_child(root: &JobDetail, child_details: &[JobDetail]) -> bool {
+    child_details
+        .iter()
+        .any(|child| child.job.executor_lane == "main" && child_accepted(child))
+        || root.child_jobs.iter().any(|child| {
+            child.executor_lane == "main"
+                && child.state == "completed"
+                && child.completion_status != "blocked"
+        })
 }
 
 fn child_accepted(child: &JobDetail) -> bool {
@@ -1951,12 +2269,6 @@ fn tool_call_is_successful_test_run(call: &ToolCallSummary) -> bool {
 
 fn command_session_text(session: &CommandSessionSummary) -> String {
     format!("{} {}", session.command, session.args.join(" "))
-}
-
-fn root_has_precise_blocker(root: &JobDetail) -> bool {
-    !root.job.completion_blockers.is_empty()
-        || !root.job.last_error.trim().is_empty()
-        || root.job.result_summary.to_lowercase().contains("blocker")
 }
 
 fn routes_report(workspace: &WorkspaceSummary) -> RoutesReport {
@@ -2005,19 +2317,39 @@ fn print_summary(report: &HarnessReport, output: &Path) {
     println!("\nNucleus dogfood harness ({})", report.install.url);
     println!("version: {}", report.install.version);
     println!("report: {}", output.display());
-    println!("\n{:<16} {:<6} {}", "rung", "status", "reason");
+    println!(
+        "\n{:<16} {:<6} {:<8} {:<8} {}",
+        "rung", "status", "phase1", "phase2", "reason"
+    );
     for rung in &report.rungs {
         let reason = rung
             .reasons
             .first()
             .cloned()
             .unwrap_or_else(|| "ok".to_string());
-        println!("{:<16} {:<6} {}", rung.name, rung.status, reason);
+        println!(
+            "{:<16} {:<6} {:<8} {:<8} {}",
+            rung.name,
+            rung.status,
+            pass_fail(rung.phase1.passed),
+            pass_fail(rung.phase2.passed),
+            reason
+        );
+        if rung.cleanup.evidence_preserved {
+            println!(
+                "  preserved evidence: session_id={} root_job_id={}",
+                rung.session_id, rung.root_job_id
+            );
+        }
     }
     println!(
         "\noverall: {}/{} passed, {} failed",
         report.overall.passed, report.overall.total, report.overall.failed
     );
+}
+
+fn pass_fail(passed: bool) -> &'static str {
+    if passed { "PASS" } else { "FAIL" }
 }
 
 #[cfg(test)]
@@ -2462,6 +2794,198 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn rung_evaluator_splits_phase1_and_phase2() {
+        let rung = test_rung(Acceptance::Debug, 1);
+
+        let completed = build_rung_report(
+            &rung,
+            "session",
+            "root",
+            root_detail(
+                "completed",
+                "satisfied",
+                vec![child_summary("child", "completed", "satisfied")],
+            ),
+            vec![child_detail("child", "completed", "satisfied", Vec::new())],
+            ApprovalReport::default(),
+        );
+        assert_eq!(completed.status, "PASS");
+        assert!(completed.phase1.passed);
+        assert!(completed.phase2.passed);
+
+        let root_not_converged = build_rung_report(
+            &rung,
+            "session",
+            "root",
+            root_detail(
+                "blocked",
+                "pending",
+                vec![child_summary("child", "completed", "satisfied")],
+            ),
+            vec![child_detail("child", "completed", "satisfied", Vec::new())],
+            ApprovalReport::default(),
+        );
+        assert!(root_not_converged.phase1.passed);
+        assert!(!root_not_converged.phase2.passed);
+        assert!(
+            root_not_converged
+                .phase2
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("root did not converge"))
+        );
+
+        let child_blocked = build_rung_report(
+            &rung,
+            "session",
+            "root",
+            root_detail(
+                "completed",
+                "satisfied",
+                vec![child_summary("child", "blocked", "blocked")],
+            ),
+            vec![child_detail("child", "blocked", "blocked", Vec::new())],
+            ApprovalReport::default(),
+        );
+        assert!(!child_blocked.phase1.passed);
+        assert!(child_blocked.phase2.passed);
+
+        let fanout = build_rung_report(
+            &rung,
+            "session",
+            "root",
+            root_detail(
+                "completed",
+                "satisfied",
+                vec![
+                    child_summary("child-1", "completed", "satisfied"),
+                    child_summary("child-2", "completed", "satisfied"),
+                ],
+            ),
+            vec![
+                child_detail("child-1", "completed", "satisfied", Vec::new()),
+                child_detail("child-2", "completed", "satisfied", Vec::new()),
+            ],
+            ApprovalReport::default(),
+        );
+        assert!(!fanout.phase1.passed);
+        assert!(
+            fanout
+                .phase1
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("fanout detected"))
+        );
+
+        let utility_child_only = build_rung_report(
+            &rung,
+            "session",
+            "root",
+            root_detail(
+                "completed",
+                "satisfied",
+                vec![utility_child_summary(
+                    "utility-child",
+                    "completed",
+                    "satisfied",
+                )],
+            ),
+            vec![utility_child_detail(
+                "utility-child",
+                "completed",
+                "satisfied",
+                Vec::new(),
+            )],
+            ApprovalReport::default(),
+        );
+        assert!(!utility_child_only.phase1.passed);
+        assert!(
+            utility_child_only
+                .phase1
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("no main child"))
+        );
+    }
+
+    #[test]
+    fn report_serializer_includes_diagnostic_child_and_root_fields() {
+        let rung = test_rung(Acceptance::ReadOnlyProbe, 2);
+        let mut root = root_detail(
+            "completed",
+            "satisfied",
+            vec![child_summary("child", "completed", "satisfied")],
+        );
+        root.job.result_summary = "root joined child result".to_string();
+        root.job.metadata_json = json!({"context_integrity":{"mutation_receipt_ids":[7,"8"]}});
+        root.events.push(JobEvent {
+            id: 1,
+            job_id: "root".to_string(),
+            worker_id: None,
+            event_type: "completion.gate".to_string(),
+            status: "satisfied".to_string(),
+            summary: "receipt explained mutation".to_string(),
+            detail: String::new(),
+            data_json: json!({"mutation_receipt_id": 9}),
+            created_at: 0,
+        });
+        let mut probe = tool_call_with_args(
+            "command.run",
+            json!({"command":"sh","args":["-lc","printf NUCLEUS_COMMAND_RUN_PROBE"],"cwd":"."}),
+        );
+        probe.status = "completed".to_string();
+        probe.result_json = Some(json!({"exit_code": 0}));
+
+        let report = build_rung_report(
+            &rung,
+            "session",
+            "root",
+            root,
+            vec![child_detail("child", "completed", "satisfied", vec![probe])],
+            ApprovalReport::default(),
+        );
+        let value = serde_json::to_value(&report).expect("serialize report");
+
+        assert_eq!(value["root_final"]["state"], "completed");
+        assert_eq!(
+            value["root_final"]["result_summary"],
+            "root joined child result"
+        );
+        assert_eq!(
+            value["root_final"]["mutation_receipt_ids"],
+            json!([7, 8, 9])
+        );
+        assert_eq!(value["read_only_exact_probe_exit_0"], true);
+        assert_eq!(value["children"][0]["task_class"], "delegated_subtask");
+        assert_eq!(value["children"][0]["executor_lane"], "main");
+        assert_eq!(value["children"][0]["executor_model"], "cx/gpt-test");
+        assert_eq!(
+            value["children"][0]["tool_calls"][0]["tool_id"],
+            "command.run"
+        );
+        assert_eq!(value["children"][0]["tool_calls"][0]["exit_code"], 0);
+        assert_eq!(value["children"][0]["tool_calls"][0]["status"], "completed");
+    }
+
+    #[test]
+    fn cleanup_decision_preserves_failures_and_deletes_passes() {
+        assert_eq!(
+            cleanup_mode_for_status("FAIL"),
+            CleanupMode::PreserveEvidence
+        );
+        assert_eq!(cleanup_mode_for_status("PASS"), CleanupMode::DeleteSession);
+        let failure_operations = cleanup_operations(cleanup_mode_for_status("FAIL"));
+        let pass_operations = cleanup_operations(cleanup_mode_for_status("PASS"));
+
+        assert!(failure_operations.contains(&CleanupOperation::CancelRoot));
+        assert!(failure_operations.contains(&CleanupOperation::DenyPendingApprovals));
+        assert!(!failure_operations.contains(&CleanupOperation::DeleteSession));
+        assert!(!failure_operations.contains(&CleanupOperation::CleanHarnessWorktree));
+        assert!(pass_operations.contains(&CleanupOperation::DeleteSession));
+        assert!(pass_operations.contains(&CleanupOperation::CleanHarnessWorktree));
+    }
+
     fn tool_call(tool_id: &str, status: &str, exit_code: Option<i32>) -> ToolCallSummary {
         let mut call = tool_call_with_args(
             tool_id,
@@ -2489,6 +3013,233 @@ mod tests {
             created_at: 0,
             started_at: None,
             completed_at: None,
+        }
+    }
+
+    fn test_rung(acceptance: Acceptance, max_main_children: usize) -> Rung {
+        Rung {
+            name: "test",
+            prompt: "test",
+            max_main_children,
+            acceptance,
+        }
+    }
+
+    fn root_detail(state: &str, completion_status: &str, children: Vec<JobSummary>) -> JobDetail {
+        JobDetail {
+            job: job_summary(
+                "root",
+                state,
+                completion_status,
+                None,
+                "utility",
+                "cx/gpt-mini",
+            ),
+            workers: vec![worker_summary(
+                "root-worker",
+                "root",
+                "utility",
+                "cx/gpt-mini",
+            )],
+            child_jobs: children,
+            tool_calls: Vec::new(),
+            approvals: Vec::new(),
+            artifacts: Vec::new(),
+            command_sessions: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+
+    fn child_summary(id: &str, state: &str, completion_status: &str) -> JobSummary {
+        job_summary(
+            id,
+            state,
+            completion_status,
+            Some("delegated_subtask"),
+            "main",
+            "cx/gpt-test",
+        )
+    }
+
+    fn utility_child_summary(id: &str, state: &str, completion_status: &str) -> JobSummary {
+        job_summary(
+            id,
+            state,
+            completion_status,
+            Some("delegated_subtask"),
+            "utility",
+            "cx/gpt-mini-test",
+        )
+    }
+
+    fn child_detail(
+        id: &str,
+        state: &str,
+        completion_status: &str,
+        tool_calls: Vec<ToolCallSummary>,
+    ) -> JobDetail {
+        JobDetail {
+            job: child_summary(id, state, completion_status),
+            workers: vec![worker_summary("child-worker", id, "main", "cx/gpt-test")],
+            child_jobs: Vec::new(),
+            tool_calls,
+            approvals: Vec::new(),
+            artifacts: Vec::new(),
+            command_sessions: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+
+    fn utility_child_detail(
+        id: &str,
+        state: &str,
+        completion_status: &str,
+        tool_calls: Vec<ToolCallSummary>,
+    ) -> JobDetail {
+        JobDetail {
+            job: utility_child_summary(id, state, completion_status),
+            workers: vec![worker_summary(
+                "utility-child-worker",
+                id,
+                "utility",
+                "cx/gpt-mini-test",
+            )],
+            child_jobs: Vec::new(),
+            tool_calls,
+            approvals: Vec::new(),
+            artifacts: Vec::new(),
+            command_sessions: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+
+    fn worker_summary(
+        id: &str,
+        job_id: &str,
+        lane: &str,
+        model: &str,
+    ) -> nucleus_protocol::WorkerSummary {
+        nucleus_protocol::WorkerSummary {
+            id: id.to_string(),
+            job_id: job_id.to_string(),
+            parent_worker_id: None,
+            title: "Worker".to_string(),
+            lane: lane.to_string(),
+            state: "completed".to_string(),
+            provider: "test".to_string(),
+            model: model.to_string(),
+            route_id: String::new(),
+            route_title: String::new(),
+            provider_base_url: String::new(),
+            provider_api_key: String::new(),
+            provider_session_id: String::new(),
+            working_dir: "/tmp/nucleus-dogfood-worktree".to_string(),
+            read_roots: Vec::new(),
+            write_roots: Vec::new(),
+            max_steps: 10,
+            max_tool_calls: 10,
+            max_wall_clock_secs: 60,
+            step_count: 0,
+            tool_call_count: 0,
+            wait_until_json: None,
+            wait_started_at: None,
+            last_error: String::new(),
+            user_error: None,
+            capabilities: Vec::new(),
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn job_summary(
+        id: &str,
+        state: &str,
+        completion_status: &str,
+        task_class: Option<&str>,
+        lane: &str,
+        model: &str,
+    ) -> JobSummary {
+        JobSummary {
+            id: id.to_string(),
+            session_id: Some("session".to_string()),
+            parent_job_id: (id != "root").then(|| "root".to_string()),
+            template_id: None,
+            task_class: task_class.map(str::to_string),
+            title: id.to_string(),
+            purpose: String::new(),
+            trigger_kind: "manual".to_string(),
+            state: state.to_string(),
+            requested_by: "test".to_string(),
+            prompt_excerpt: String::new(),
+            root_worker_id: (id == "root").then(|| "root-worker".to_string()),
+            executor_lane: lane.to_string(),
+            executor_provider: "test".to_string(),
+            executor_model: model.to_string(),
+            executor_route_id: String::new(),
+            executor_route_title: String::new(),
+            visible_turn_id: None,
+            result_summary: String::new(),
+            last_error: String::new(),
+            user_error: None,
+            ui_renderable: String::new(),
+            browser_verification_required: false,
+            browser_verification_status: "not_required".to_string(),
+            browser_verification_summary: String::new(),
+            browser_verification_artifact_ids: Vec::new(),
+            publication_requested: false,
+            publication_status: "not_requested".to_string(),
+            publication_summary: String::new(),
+            pr_url: String::new(),
+            source_branch: String::new(),
+            target_branch: String::new(),
+            validation_status: "not_performed".to_string(),
+            cleanup_status: "unknown".to_string(),
+            cleanup_paths: Vec::new(),
+            task_evidence: Vec::new(),
+            metadata_json: json!({}),
+            worktree_base_ref: String::new(),
+            worktree_base_status: String::new(),
+            worktree_base_reason: String::new(),
+            worktree_origin_url: String::new(),
+            expected_origin_url: String::new(),
+            observed_git_branch: String::new(),
+            expected_git_branch: String::new(),
+            worktree_head_sha: String::new(),
+            canonical_base_sha: String::new(),
+            worktree_behind_by: None,
+            branch_repo_status: String::new(),
+            branch_repo_reason: String::new(),
+            command_session_cwd_evidence_json: None,
+            target_entity_evidence_json: None,
+            process_state_evidence_json: None,
+            session_state_observed_at: None,
+            completion_status: completion_status.to_string(),
+            completion_gates: Vec::new(),
+            completion_blockers: if completion_status == "blocked" {
+                vec!["blocked by test fixture".to_string()]
+            } else {
+                Vec::new()
+            },
+            worker_count: 1,
+            pending_approval_count: 0,
+            artifact_count: 0,
+            last_resumed_at: None,
+            last_reasoning: String::new(),
+            last_reasoning_at: None,
+            token_usage_known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_usd_estimate: None,
+            created_at: 0,
+            updated_at: 0,
         }
     }
 
