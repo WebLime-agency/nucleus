@@ -1182,11 +1182,17 @@ fn clean_command_token(token: &str) -> String {
 
 fn path_like_command_token(token: &str) -> Option<PathBuf> {
     let raw = token.trim();
-    let token = if raw.starts_with('-') {
-        raw.split_once('=').map(|(_, value)| value.trim())?
-    } else {
-        raw
-    };
+    if raw.starts_with('-') {
+        return raw
+            .split('=')
+            .skip(1)
+            .find_map(|value| path_like_value(value.trim()));
+    }
+    path_like_value(raw)
+}
+
+fn path_like_value(token: &str) -> Option<PathBuf> {
+    let token = token.trim();
     if token.is_empty() || token.starts_with('-') {
         return None;
     }
@@ -1380,6 +1386,10 @@ fn script_contains_external_or_network_mutation(script: &str) -> bool {
         "cargo publish",
         "../",
         "..\\",
+        "path('..')",
+        "path(\"..\")",
+        "open('..')",
+        "open(\"..\")",
         "'/",
         "\"/",
         "path.home",
@@ -2104,6 +2114,19 @@ mod tests {
     }
 
     #[test]
+    fn command_policy_rejects_nested_option_external_paths() {
+        let call = tool_call_with_args(
+            "command.run",
+            json!({"command":"cargo","args":["test","--config=build.rustc-wrapper=/tmp/evil"],"cwd":"."}),
+        );
+
+        let verdict = evaluate_command_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(!verdict.approve);
+        assert!(verdict.reason.contains("outside the worker worktree"));
+    }
+
+    #[test]
     fn command_policy_rejects_external_env_paths() {
         let call = tool_call_with_args(
             "command.run",
@@ -2288,6 +2311,19 @@ mod tests {
         let call = tool_call_with_args(
             "python.run",
             json!({"cwd":".","script":"from pathlib import Path\nPath('../other-session/file').write_text('x')"}),
+        );
+
+        let verdict = evaluate_python_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(!verdict.approve);
+        assert!(verdict.reason.contains("worker worktree"));
+    }
+
+    #[test]
+    fn python_policy_rejects_split_parent_path_reads() {
+        let call = tool_call_with_args(
+            "python.run",
+            json!({"cwd":".","script":"from pathlib import Path\nprint((Path('..') / 'other-session' / 'secret').read_text())"}),
         );
 
         let verdict = evaluate_python_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
