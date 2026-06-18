@@ -1036,6 +1036,7 @@ fn command_has_shell_escape_or_write(command: &str) -> bool {
         "<",
         "\n",
         "`",
+        "$",
         "$(",
         "../",
         " rm ",
@@ -1248,6 +1249,13 @@ fn script_contains_external_or_network_mutation(script: &str) -> bool {
         "..\\",
         "'/",
         "\"/",
+        "path.home",
+        ".home()",
+        "expanduser",
+        "os.environ",
+        "os.getenv",
+        "getenv(",
+        "environ[",
         ".parent",
         "parents[",
         "open(",
@@ -1939,6 +1947,19 @@ mod tests {
     }
 
     #[test]
+    fn command_policy_rejects_shell_env_expansion_paths() {
+        let call = tool_call_with_args(
+            "command.run",
+            json!({"command":"sh","args":["-lc","grep token $HOME/.ssh/id_rsa"],"cwd":"."}),
+        );
+
+        let verdict = evaluate_command_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(!verdict.approve);
+        assert!(verdict.reason.contains("shell control"));
+    }
+
+    #[test]
     fn command_policy_rejects_unbounded_package_scripts() {
         let deploy = "pnpm run deploy";
         let check = "pnpm run check";
@@ -2089,6 +2110,19 @@ mod tests {
         let call = tool_call_with_args(
             "python.run",
             json!({"cwd":".","script":"import os\nprint(os.listdir('/home/eba/.ssh'))"}),
+        );
+
+        let verdict = evaluate_python_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(!verdict.approve);
+        assert!(verdict.reason.contains("worker worktree"));
+    }
+
+    #[test]
+    fn python_policy_rejects_home_path_helpers() {
+        let call = tool_call_with_args(
+            "python.run",
+            json!({"cwd":".","script":"from pathlib import Path\nprint((Path.home() / '.ssh/id_rsa').read_text())"}),
         );
 
         let verdict = evaluate_python_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
