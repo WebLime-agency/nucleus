@@ -988,10 +988,8 @@ fn normalize_path(path: &Path) -> PathBuf {
 }
 
 fn command_text(args: &Value) -> String {
-    let command = args
-        .get("command")
-        .or_else(|| args.get("cmd"))
-        .and_then(Value::as_str)
+    let command = command_alias_text(args.get("cmd"))
+        .or_else(|| command_alias_text(args.get("command")))
         .unwrap_or_default();
     let argv = args
         .get("args")
@@ -1004,17 +1002,41 @@ fn command_text(args: &Value) -> String {
                 .join(" ")
         })
         .unwrap_or_default();
-    format!("{command} {argv}")
+    if argv.trim().is_empty() {
+        command
+    } else {
+        format!("{command} {argv}")
+    }
 }
 
 fn has_conflicting_command_aliases(args: &Value) -> bool {
-    args.get("command")
-        .and_then(Value::as_str)
-        .is_some_and(|value| !value.trim().is_empty())
-        && args
-            .get("cmd")
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
+    command_alias_present(args.get("command")) && command_alias_present(args.get("cmd"))
+}
+
+fn command_alias_present(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::String(value)) => !value.trim().is_empty(),
+        Some(Value::Array(values)) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|value| !value.trim().is_empty()),
+        Some(Value::Null) | None => false,
+        Some(_) => true,
+    }
+}
+
+fn command_alias_text(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(value) => Some(value.to_string()),
+        Value::Array(values) => Some(
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        _ => None,
+    }
 }
 
 fn network_policy_allows_network(args: &Value) -> bool {
@@ -2017,6 +2039,27 @@ mod tests {
 
         assert!(!verdict.approve);
         assert!(verdict.reason.contains("both command and cmd"));
+    }
+
+    #[test]
+    fn command_policy_rejects_conflicting_array_aliases() {
+        let call = tool_call_with_args(
+            "command.run",
+            json!({"command":"cargo test","cmd":["sh","-lc","git push"],"cwd":"."}),
+        );
+
+        let verdict = evaluate_command_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(!verdict.approve);
+        assert!(verdict.reason.contains("both command and cmd"));
+    }
+
+    #[test]
+    fn command_text_prefers_array_cmd_alias() {
+        let args = json!({"cmd":["sh","-lc","cargo test -p nucleus-core"],"cwd":"."});
+
+        assert_eq!(command_text(&args), "sh -lc cargo test -p nucleus-core");
+        assert!(command_looks_like_validation(&command_text(&args)));
     }
 
     #[test]
