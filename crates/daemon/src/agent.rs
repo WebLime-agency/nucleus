@@ -856,6 +856,30 @@ const NARROW_DELEGATED_CHILD_PHRASES: &[&str] = &[
     "report",
 ];
 
+const BROAD_DELEGATED_CHILD_PHRASES: &[&str] = &[
+    "implementation",
+    "validation",
+    "test",
+    "tests",
+    "testing",
+    "test suite",
+    "issue #",
+    "read issue",
+    "codebase",
+    "repo research",
+    "repository research",
+    "multi-file",
+    "multiple files",
+    "many files",
+    "across files",
+    "across the codebase",
+    "architecture",
+    "broad search",
+    "broad repo",
+    "broadly",
+    "deep reasoning",
+];
+
 const WRITE_DELEGATED_CHILD_PHRASES: &[&str] = &[
     "implement",
     "fix",
@@ -942,6 +966,7 @@ fn is_narrow_delegated_child_contract(proposal: &ChildJobProposal) -> bool {
     ));
     if contains_any_phrase(&text, PROCESS_STATUS_CHECK_PHRASES)
         || contains_any_phrase(&text, WRITE_DELEGATED_CHILD_PHRASES)
+        || contains_any_phrase(&text, BROAD_DELEGATED_CHILD_PHRASES)
     {
         return false;
     }
@@ -1086,15 +1111,25 @@ fn main_delegation_child(
             evidence_excerpt.trim()
         )
     };
-    ChildJobProposal {
-        title: "Main work owner".to_string(),
-        prompt: format!(
+    let prompt = if task_class.as_deref() == Some(DELEGATED_SUBTASK_TASK_CLASS) {
+        format!(
+            "Delegation reason: {}\nIntercepted root action/proposal: {}\n\n{}\n\nTask: Complete only the read-only investigation/probe scope in the intercepted proposal, then report concise findings back to the root Utility Worker.",
+            reason,
+            intercepted.trim(),
+            evidence_section
+        )
+    } else {
+        format!(
             "Original user request:\n{}\n\nDelegation reason: {}\nIntercepted root action/proposal: {}\n\n{}\n\nTask: Work on the main lane. Read the relevant repository context, reason through the request, make changes only when the original request calls for changes, run appropriate validation, and report concise results back to the root Utility Worker. The root Utility Worker remains responsible for joining child reports and completing the user-facing response.",
             original_prompt.trim(),
             reason,
             intercepted.trim(),
             evidence_section
-        ),
+        )
+    };
+    ChildJobProposal {
+        title: "Main work owner".to_string(),
+        prompt,
         task_class,
         working_dir: None,
         route_id: None,
@@ -1125,11 +1160,11 @@ fn delegated_task_class(
     let normalized_parent_task_class = parent_task_class
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    if normalized_parent_task_class == Some("local_project") {
-        return Some("local_project".to_string());
-    }
     if !jobs.is_empty() && jobs.iter().all(is_narrow_delegated_child_contract) {
         return Some(DELEGATED_SUBTASK_TASK_CLASS.to_string());
+    }
+    if normalized_parent_task_class == Some("local_project") {
+        return Some("local_project".to_string());
     }
     let mut explicit_classes = jobs.iter().filter_map(|proposal| {
         let task_class = normalized_child_task_class(proposal.task_class.as_deref())?;
@@ -1305,6 +1340,15 @@ fn build_escalated_delegation_for_child_jobs(
             None
         }
     });
+    let delegated_class = if reason == "heavy_request_utility_only_fanout" {
+        detail
+            .job
+            .task_class
+            .clone()
+            .or_else(|| delegated_task_class(None, jobs))
+    } else {
+        delegated_task_class(detail.job.task_class.as_deref(), jobs)
+    };
     let mut child = main_delegation_child(
         &checkpoint.prompt_text,
         reason,
@@ -1314,13 +1358,13 @@ fn build_escalated_delegation_for_child_jobs(
             excerpt(&proposed_text, 1_500)
         ),
         &checkpoint_evidence_excerpt(checkpoint),
-        delegated_task_class(detail.job.task_class.as_deref(), jobs),
+        delegated_class,
     );
     if let Some(seed) = main_child_seed {
         child.working_dir = seed.working_dir.clone();
         child.route_id = seed.route_id.clone();
         if seed.task_class.is_some() {
-            child.task_class = seed.task_class.clone();
+            child.task_class = effective_child_task_class(seed);
         }
     } else if let Some(seed) = scoped_child_seed {
         child.working_dir = seed.working_dir.clone();
@@ -1555,6 +1599,8 @@ struct FsReadTextArgs {
 struct RgSearchArgs {
     pattern: String,
     path: Option<String>,
+    #[serde(default)]
+    paths: Vec<String>,
     glob: Option<String>,
     limit: Option<usize>,
 }
@@ -1628,7 +1674,88 @@ fn command_run_invalid_args(message: impl Into<String>) -> anyhow::Error {
     )
 }
 
-fn json_value_to_u64(field: &str, value: &Value) -> Result<u64> {
+fn tool_schema_invalid_args(
+    tool: &'static str,
+    message: impl Into<String>,
+    guidance: &'static str,
+) -> anyhow::Error {
+    anyhow!("invalid {tool} args: {}. {guidance}", message.into())
+}
+
+fn fs_apply_patch_schema_guidance() -> &'static str {
+    "Expected fs.apply_patch args: {\"path\":\"file\",\"edits\":[{\"find\":\"old text\",\"replace\":\"new text\",\"replace_all\":false}]}. Supported aliases: file, file_path, target_path; edit old/search/before -> find and new/replacement/after -> replace."
+}
+
+fn fs_apply_patch_invalid_args(message: impl Into<String>) -> anyhow::Error {
+    tool_schema_invalid_args("fs.apply_patch", message, fs_apply_patch_schema_guidance())
+}
+
+fn python_run_schema_guidance() -> &'static str {
+    "Expected python.run args: {\"script\":\"print('hello')\",\"args\":[\"arg\"],\"cwd\":\".\",\"timeout_secs\":20,\"output_limit_bytes\":8192}. Supported aliases: code, source, snippet, timeout_seconds, timeout_ms, max_output_bytes, workdir, working_dir."
+}
+
+fn python_run_invalid_args(message: impl Into<String>) -> anyhow::Error {
+    tool_schema_invalid_args("python.run", message, python_run_schema_guidance())
+}
+
+fn tests_run_schema_guidance() -> &'static str {
+    "Expected tests.run args: {\"command\":\"cargo\",\"args\":[\"test\"],\"cwd\":\".\",\"timeout_secs\":120,\"output_limit_bytes\":8192}. Supported aliases: cmd, timeout_seconds, timeout_ms, max_output_bytes, workdir, working_dir. A simple command string like \"cargo test\" is split into argv form."
+}
+
+fn tests_run_invalid_args(message: impl Into<String>) -> anyhow::Error {
+    tool_schema_invalid_args("tests.run", message, tests_run_schema_guidance())
+}
+
+fn rg_search_schema_guidance() -> &'static str {
+    "Expected rg.search args: {\"pattern\":\"text\",\"path\":\".\",\"glob\":\"*.rs\",\"limit\":20}. Supported aliases: query, regex, term, paths, dir, directory. Multiple paths can be passed as an array or as a whitespace/colon-separated paths string."
+}
+
+fn rg_search_invalid_args(message: impl Into<String>) -> anyhow::Error {
+    tool_schema_invalid_args("rg.search", message, rg_search_schema_guidance())
+}
+
+fn first_present_value<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<&'a Value> {
+    keys.iter().find_map(|key| object.get(*key))
+}
+
+fn normalize_common_tool_aliases(
+    normalized: &mut serde_json::Map<String, Value>,
+    invalid_args: fn(String) -> anyhow::Error,
+) -> Result<()> {
+    if !normalized.contains_key("output_limit_bytes") {
+        if let Some(value) = normalized.get("max_output_bytes").cloned() {
+            normalized.insert("output_limit_bytes".to_string(), value);
+        }
+    }
+    if !normalized.contains_key("timeout_secs") {
+        if let Some(value) = normalized.get("timeout_seconds").cloned() {
+            normalized.insert("timeout_secs".to_string(), value);
+        } else if let Some(value) = normalized.get("timeout_ms") {
+            let millis = json_value_to_u64_with("timeout_ms", value, invalid_args)?;
+            let seconds = millis.saturating_add(999) / 1_000;
+            normalized.insert("timeout_secs".to_string(), json!(seconds.max(1)));
+        }
+    }
+    if !normalized.contains_key("cwd") {
+        if let Some(value) = normalized
+            .get("workdir")
+            .or_else(|| normalized.get("working_dir"))
+            .cloned()
+        {
+            normalized.insert("cwd".to_string(), value);
+        }
+    }
+    Ok(())
+}
+
+fn json_value_to_u64_with(
+    field: &str,
+    value: &Value,
+    invalid_args: fn(String) -> anyhow::Error,
+) -> Result<u64> {
     if let Some(value) = value.as_u64() {
         return Ok(value);
     }
@@ -1639,11 +1766,47 @@ fn json_value_to_u64(field: &str, value: &Value) -> Result<u64> {
     {
         return value
             .parse::<u64>()
-            .map_err(|_| command_run_invalid_args(format!("{field} must be an unsigned integer")));
+            .map_err(|_| invalid_args(format!("{field} must be an unsigned integer")));
     }
-    Err(command_run_invalid_args(format!(
-        "{field} must be an unsigned integer"
-    )))
+    Err(invalid_args(format!("{field} must be an unsigned integer")))
+}
+
+fn json_value_to_string_with(
+    field: &str,
+    value: &Value,
+    invalid_args: fn(String) -> anyhow::Error,
+) -> Result<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| invalid_args(format!("{field} must be a non-empty string")))
+}
+
+fn json_value_to_string_vec_with(
+    field: &str,
+    value: &Value,
+    invalid_args: fn(String) -> anyhow::Error,
+) -> Result<Vec<String>> {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .map(|value| json_value_to_string_with(field, value, invalid_args))
+            .collect(),
+        Value::String(value) => Ok(value
+            .split_whitespace()
+            .filter(|part| !part.is_empty())
+            .map(str::to_string)
+            .collect()),
+        _ => Err(invalid_args(format!(
+            "{field} must be a string or an array of strings"
+        ))),
+    }
+}
+
+fn json_value_to_u64(field: &str, value: &Value) -> Result<u64> {
+    json_value_to_u64_with(field, value, command_run_invalid_args)
 }
 
 fn command_string_looks_like_shell(command: &str) -> bool {
@@ -1774,6 +1937,275 @@ fn parse_command_run_args(args: Value) -> Result<CommandRunArgs> {
     let normalized = normalize_command_run_args(args)?;
     serde_json::from_value::<CommandRunArgs>(normalized)
         .map_err(|error| command_run_invalid_args(format!("{error}")))
+}
+
+fn normalize_patch_edit_args(args: Value) -> Result<Value> {
+    let Some(object) = args.as_object() else {
+        return Err(fs_apply_patch_invalid_args("edit must be a JSON object"));
+    };
+    let mut normalized = object.clone();
+    if !normalized.contains_key("find") {
+        if let Some(value) = first_present_value(
+            object,
+            &["old", "old_text", "search", "before", "original", "from"],
+        )
+        .cloned()
+        {
+            normalized.insert("find".to_string(), value);
+        }
+    }
+    if !normalized.contains_key("replace") {
+        if let Some(value) = first_present_value(
+            object,
+            &["new", "new_text", "replacement", "after", "updated", "to"],
+        )
+        .cloned()
+        {
+            normalized.insert("replace".to_string(), value);
+        }
+    }
+    if !normalized.contains_key("replace_all") {
+        if let Some(value) = object.get("all").or_else(|| object.get("global")).cloned() {
+            normalized.insert("replace_all".to_string(), value);
+        }
+    }
+    Ok(Value::Object(normalized))
+}
+
+fn normalize_fs_apply_patch_args(args: Value) -> Result<Value> {
+    let Some(object) = args.as_object() else {
+        return Err(fs_apply_patch_invalid_args("args must be a JSON object"));
+    };
+    let mut normalized = object.clone();
+    if !normalized.contains_key("path") {
+        if let Some(value) = first_present_value(
+            object,
+            &["file", "file_path", "filepath", "target", "target_path"],
+        )
+        .cloned()
+        {
+            normalized.insert("path".to_string(), value);
+        }
+    }
+
+    let edits_value = if let Some(edits) = object.get("edits") {
+        match edits {
+            Value::Array(edits) => Value::Array(
+                edits
+                    .iter()
+                    .cloned()
+                    .map(normalize_patch_edit_args)
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+            Value::Object(_) => Value::Array(vec![normalize_patch_edit_args(edits.clone())?]),
+            _ => {
+                return Err(fs_apply_patch_invalid_args(
+                    "edits must be an object or an array of objects",
+                ));
+            }
+        }
+    } else if first_present_value(
+        object,
+        &[
+            "find", "old", "old_text", "search", "before", "original", "from",
+        ],
+    )
+    .is_some()
+        || first_present_value(
+            object,
+            &[
+                "replace",
+                "new",
+                "new_text",
+                "replacement",
+                "after",
+                "updated",
+                "to",
+            ],
+        )
+        .is_some()
+    {
+        Value::Array(vec![normalize_patch_edit_args(Value::Object(
+            object.clone(),
+        ))?])
+    } else {
+        return Err(fs_apply_patch_invalid_args(
+            "missing edits array/object or top-level find/replace edit",
+        ));
+    };
+    normalized.insert("edits".to_string(), edits_value);
+    Ok(Value::Object(normalized))
+}
+
+fn parse_fs_apply_patch_args(args: Value) -> Result<FsApplyPatchArgs> {
+    let normalized = normalize_fs_apply_patch_args(args)?;
+    serde_json::from_value::<FsApplyPatchArgs>(normalized)
+        .map_err(|error| fs_apply_patch_invalid_args(format!("{error}")))
+}
+
+fn normalize_python_run_args(args: Value) -> Result<Value> {
+    let Some(object) = args.as_object() else {
+        return Err(python_run_invalid_args("args must be a JSON object"));
+    };
+    let mut normalized = object.clone();
+    normalize_common_tool_aliases(&mut normalized, python_run_invalid_args)?;
+    if !normalized.contains_key("script") {
+        if let Some(value) =
+            first_present_value(object, &["code", "source", "snippet", "python"]).cloned()
+        {
+            normalized.insert("script".to_string(), value);
+        }
+    }
+    if let Some(value) = normalized.get("args").cloned() {
+        normalized.insert(
+            "args".to_string(),
+            Value::Array(
+                json_value_to_string_vec_with("args", &value, python_run_invalid_args)?
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    Ok(Value::Object(normalized))
+}
+
+fn parse_python_run_args(args: Value) -> Result<PythonRunArgs> {
+    let normalized = normalize_python_run_args(args)?;
+    serde_json::from_value::<PythonRunArgs>(normalized)
+        .map_err(|error| python_run_invalid_args(format!("{error}")))
+}
+
+fn tests_run_argv_from_command_value(value: &Value) -> Result<(String, Vec<String>)> {
+    match value {
+        Value::String(command) => {
+            let parts = command
+                .split_whitespace()
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let Some(command) = parts.first().cloned() else {
+                return Err(tests_run_invalid_args("command/cmd must not be empty"));
+            };
+            Ok((command, parts.into_iter().skip(1).collect()))
+        }
+        Value::Array(parts) => {
+            let mut values = Vec::with_capacity(parts.len());
+            for part in parts {
+                values.push(json_value_to_string_with(
+                    "command/cmd",
+                    part,
+                    tests_run_invalid_args,
+                )?);
+            }
+            let Some(command) = values.first().cloned() else {
+                return Err(tests_run_invalid_args(
+                    "command/cmd array must contain at least a program name",
+                ));
+            };
+            Ok((command, values.into_iter().skip(1).collect()))
+        }
+        _ => Err(tests_run_invalid_args(
+            "command/cmd must be a string or an array of strings",
+        )),
+    }
+}
+
+fn normalize_tests_run_args(args: Value) -> Result<Value> {
+    let Some(object) = args.as_object() else {
+        return Err(tests_run_invalid_args("args must be a JSON object"));
+    };
+    let mut normalized = object.clone();
+    normalize_common_tool_aliases(&mut normalized, tests_run_invalid_args)?;
+    let command_value = object
+        .get("cmd")
+        .or_else(|| object.get("command"))
+        .ok_or_else(|| {
+            tests_run_invalid_args("missing command string/array or cmd string/array")
+        })?;
+    let explicit_args = object.get("args").filter(|value| !value.is_null());
+    let (command, mut normalized_args) = tests_run_argv_from_command_value(command_value)?;
+    normalized.insert("command".to_string(), Value::String(command));
+    if let Some(value) = explicit_args {
+        normalized_args.extend(json_value_to_string_vec_with(
+            "args",
+            value,
+            tests_run_invalid_args,
+        )?);
+    }
+    normalized.insert(
+        "args".to_string(),
+        Value::Array(normalized_args.into_iter().map(Value::String).collect()),
+    );
+    Ok(Value::Object(normalized))
+}
+
+fn parse_tests_run_args(args: Value) -> Result<TestsRunArgs> {
+    let normalized = normalize_tests_run_args(args)?;
+    serde_json::from_value::<TestsRunArgs>(normalized)
+        .map_err(|error| tests_run_invalid_args(format!("{error}")))
+}
+
+fn split_rg_paths(value: &str) -> Vec<String> {
+    value
+        .split(|character: char| character.is_whitespace() || character == ':')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn normalize_rg_search_args(args: Value) -> Result<Value> {
+    let Some(object) = args.as_object() else {
+        return Err(rg_search_invalid_args("args must be a JSON object"));
+    };
+    let mut normalized = object.clone();
+    if !normalized.contains_key("pattern") {
+        if let Some(value) =
+            first_present_value(object, &["query", "regex", "term", "text"]).cloned()
+        {
+            normalized.insert("pattern".to_string(), value);
+        }
+    }
+    if !normalized.contains_key("path") && !normalized.contains_key("paths") {
+        if let Some(value) = first_present_value(object, &["dir", "directory", "root"]).cloned() {
+            normalized.insert("path".to_string(), value);
+        }
+    }
+    if let Some(value) = normalized.get("paths").cloned() {
+        let paths = match value {
+            Value::String(value) => split_rg_paths(&value),
+            other => json_value_to_string_vec_with("paths", &other, rg_search_invalid_args)?,
+        };
+        if paths.is_empty() {
+            return Err(rg_search_invalid_args(
+                "paths must contain at least one non-empty path",
+            ));
+        }
+        normalized.insert(
+            "paths".to_string(),
+            Value::Array(paths.into_iter().map(Value::String).collect()),
+        );
+    } else if let Some(value) = normalized.get("path").cloned() {
+        let path = json_value_to_string_with("path", &value, rg_search_invalid_args)?;
+        normalized.insert("path".to_string(), Value::String(path));
+    }
+    Ok(Value::Object(normalized))
+}
+
+fn parse_rg_search_args(args: Value) -> Result<RgSearchArgs> {
+    let normalized = normalize_rg_search_args(args)?;
+    serde_json::from_value::<RgSearchArgs>(normalized)
+        .map_err(|error| rg_search_invalid_args(format!("{error}")))
+}
+
+fn collect_rg_matches(stdout: &str, limit: usize) -> Vec<String> {
+    stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .take(limit)
+        .collect()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -13289,8 +13721,7 @@ async fn execute_granted_tool(
             execute_fs_read_text_tool(worker, args).await
         }
         "rg.search" => {
-            let args = serde_json::from_value::<RgSearchArgs>(args)
-                .context("invalid args for rg.search")?;
+            let args = parse_rg_search_args(args)?;
             execute_rg_search_tool(worker, args).await
         }
         "git.status" => execute_git_status_tool(worker).await,
@@ -13310,8 +13741,7 @@ async fn execute_granted_tool(
             execute_github_pr_state_tool(worker, args).await
         }
         "fs.apply_patch" => {
-            let args = serde_json::from_value::<FsApplyPatchArgs>(args)
-                .context("invalid args for fs.apply_patch")?;
+            let args = parse_fs_apply_patch_args(args)?;
             execute_fs_apply_patch_tool(worker, args).await
         }
         "fs.write_text" => {
@@ -13353,8 +13783,7 @@ async fn execute_granted_tool(
             .await
         }
         "python.run" => {
-            let args = serde_json::from_value::<PythonRunArgs>(args)
-                .context("invalid args for python.run")?;
+            let args = parse_python_run_args(args)?;
             execute_python_run_tool(
                 state,
                 job_id,
@@ -13382,8 +13811,7 @@ async fn execute_granted_tool(
             execute_command_session_close_tool(state, job_id, worker, args).await
         }
         "tests.run" => {
-            let args = serde_json::from_value::<TestsRunArgs>(args)
-                .context("invalid args for tests.run")?;
+            let args = parse_tests_run_args(args)?;
             execute_tests_run_tool(
                 state,
                 job_id,
@@ -13494,8 +13922,7 @@ fn preview_approval_tool(
 ) -> Result<MutationPreview> {
     match tool {
         "fs.apply_patch" => {
-            let args = serde_json::from_value::<FsApplyPatchArgs>(args.clone())
-                .context("invalid args for fs.apply_patch")?;
+            let args = parse_fs_apply_patch_args(args.clone())?;
             preview_fs_apply_patch(worker, args)
         }
         "fs.write_text" => {
@@ -13528,8 +13955,7 @@ fn preview_approval_tool(
             preview_command_run(worker, args)
         }
         "python.run" => {
-            let args = serde_json::from_value::<PythonRunArgs>(args.clone())
-                .context("invalid args for python.run")?;
+            let args = parse_python_run_args(args.clone())?;
             preview_python_run(worker, args)
         }
         "command.session.open" => {
@@ -13543,8 +13969,7 @@ fn preview_approval_tool(
             preview_command_session_close(worker, args)
         }
         "tests.run" => {
-            let args = serde_json::from_value::<TestsRunArgs>(args.clone())
-                .context("invalid args for tests.run")?;
+            let args = parse_tests_run_args(args.clone())?;
             preview_tests_run(worker, args)
         }
         other if other.starts_with("browser.") => Ok(preview_browser_tool(other, args)),
@@ -13721,7 +14146,16 @@ async fn execute_rg_search_tool(worker: &WorkerSummary, args: RgSearchArgs) -> R
     if args.pattern.trim().is_empty() {
         bail!("rg.search requires a non-empty pattern");
     }
-    let target = resolve_scoped_path(worker, args.path.as_deref().unwrap_or("."), false)?;
+    let requested_paths = if args.paths.is_empty() {
+        vec![args.path.unwrap_or_else(|| ".".to_string())]
+    } else {
+        args.paths
+    };
+    let targets = requested_paths
+        .iter()
+        .map(|path| resolve_scoped_path(worker, path, false))
+        .collect::<Result<Vec<_>>>()?;
+    let limit = args.limit.unwrap_or(RG_LIMIT).clamp(1, RG_LIMIT);
     let mut command_args = vec![
         "-n".to_string(),
         "--with-filename".to_string(),
@@ -13729,10 +14163,7 @@ async fn execute_rg_search_tool(worker: &WorkerSummary, args: RgSearchArgs) -> R
         "--color".to_string(),
         "never".to_string(),
         "-m".to_string(),
-        args.limit
-            .unwrap_or(RG_LIMIT)
-            .clamp(1, RG_LIMIT)
-            .to_string(),
+        limit.to_string(),
     ];
     if let Some(glob) = args
         .glob
@@ -13743,19 +14174,14 @@ async fn execute_rg_search_tool(worker: &WorkerSummary, args: RgSearchArgs) -> R
         command_args.push(glob.to_string());
     }
     command_args.push(args.pattern);
-    command_args.push(target.display().to_string());
+    command_args.extend(targets.iter().map(|target| target.display().to_string()));
     let refs = command_args.iter().map(String::as_str).collect::<Vec<_>>();
     let output = command_output_allowing_exit_codes("rg", &refs, &[1]).await?;
     let no_matches = output.exit_code == Some(1);
-    let matches = output
-        .stdout
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| line.to_string())
-        .take(RG_LIMIT)
-        .collect::<Vec<_>>();
+    let matches = collect_rg_matches(&output.stdout, limit);
     Ok(json!({
-        "path": target.display().to_string(),
+        "path": targets.first().map(|target| target.display().to_string()).unwrap_or_default(),
+        "paths": targets.iter().map(|target| target.display().to_string()).collect::<Vec<_>>(),
         "matches": matches,
         "status": if no_matches { "no_matches" } else { "matched" },
         "no_matches": no_matches,
@@ -20917,6 +21343,13 @@ mod tests {
             effective_child_task_class(&explicit_read_only).as_deref(),
             Some(DELEGATED_SUBTASK_TASK_CLASS)
         );
+        assert_eq!(
+            delegated_task_class(
+                Some("local_project"),
+                std::slice::from_ref(&explicit_read_only)
+            ),
+            Some(DELEGATED_SUBTASK_TASK_CLASS.to_string())
+        );
 
         let explicit_write = ChildJobProposal {
             title: "Implementation owner".to_string(),
@@ -20931,7 +21364,11 @@ mod tests {
             Some("local_project")
         );
         assert_eq!(
-            delegated_task_class(None, &[explicit_write]),
+            delegated_task_class(None, std::slice::from_ref(&explicit_write)),
+            Some("local_project".to_string())
+        );
+        assert_eq!(
+            delegated_task_class(Some("local_project"), std::slice::from_ref(&explicit_write)),
             Some("local_project".to_string())
         );
 
@@ -20978,6 +21415,23 @@ mod tests {
         assert_eq!(
             effective_child_task_class(&rename_component).as_deref(),
             Some("local_project")
+        );
+
+        let test_only = ChildJobProposal {
+            title: "Test runner".to_string(),
+            prompt: "Run cargo test and report the result.".to_string(),
+            task_class: Some("local_project".to_string()),
+            working_dir: None,
+            route_id: Some("utility".to_string()),
+        };
+        assert!(!is_narrow_delegated_child_contract(&test_only));
+        assert_eq!(
+            effective_child_task_class(&test_only).as_deref(),
+            Some("local_project")
+        );
+        assert_eq!(
+            delegated_task_class(None, std::slice::from_ref(&test_only)),
+            Some("local_project".to_string())
         );
     }
 
@@ -23639,6 +24093,204 @@ Cleanup status: clean";
         assert!(message.contains("invalid command.run args"));
         assert!(message.contains("Supported aliases"));
         assert!(message.contains("command"));
+    }
+
+    #[test]
+    fn fs_apply_patch_args_normalize_alias_edit_shapes() {
+        let args = parse_fs_apply_patch_args(json!({
+            "file_path": "src/lib.rs",
+            "old": "before",
+            "new": "after",
+            "global": true,
+        }))
+        .expect("top-level aliases should normalize");
+
+        assert_eq!(args.path, "src/lib.rs");
+        assert_eq!(args.edits.len(), 1);
+        assert_eq!(args.edits[0].find, "before");
+        assert_eq!(args.edits[0].replace, "after");
+        assert_eq!(args.edits[0].replace_all, Some(true));
+
+        let canonical = parse_fs_apply_patch_args(json!({
+            "path": "src/lib.rs",
+            "edits": [{"find": "before", "replace": "after"}],
+        }))
+        .expect("canonical args should parse");
+        assert_eq!(canonical.path, "src/lib.rs");
+        assert_eq!(canonical.edits[0].replace, "after");
+    }
+
+    #[test]
+    fn fs_apply_patch_args_invalid_shape_returns_schema_guidance() {
+        let error = parse_fs_apply_patch_args(json!({"path": "src/lib.rs"}))
+            .expect_err("missing edits should fail");
+        let message = error.to_string();
+
+        assert!(message.contains("invalid fs.apply_patch args"));
+        assert!(message.contains("Expected fs.apply_patch args"));
+        assert!(message.contains("edits"));
+    }
+
+    #[test]
+    fn python_run_args_normalize_common_aliases() {
+        let args = parse_python_run_args(json!({
+            "code": "print('hello')",
+            "args": "one two",
+            "working_dir": "crates/daemon",
+            "timeout_ms": 1500,
+            "max_output_bytes": 4096,
+        }))
+        .expect("python aliases should normalize");
+
+        assert_eq!(args.script, "print('hello')");
+        assert_eq!(args.args, vec!["one", "two"]);
+        assert_eq!(args.cwd.as_deref(), Some("crates/daemon"));
+        assert_eq!(args.timeout_secs, Some(2));
+        assert_eq!(args.output_limit_bytes, Some(4096));
+
+        let canonical = parse_python_run_args(json!({
+            "script": "print('ok')",
+            "args": ["--flag"],
+        }))
+        .expect("canonical args should parse");
+        assert_eq!(canonical.script, "print('ok')");
+        assert_eq!(canonical.args, vec!["--flag"]);
+    }
+
+    #[test]
+    fn python_run_args_invalid_shape_returns_schema_guidance() {
+        let error = parse_python_run_args(json!({"args": ["--flag"]}))
+            .expect_err("missing script should fail");
+        let message = error.to_string();
+
+        assert!(message.contains("invalid python.run args"));
+        assert!(message.contains("Expected python.run args"));
+        assert!(message.contains("script"));
+    }
+
+    #[test]
+    fn tests_run_args_normalize_command_string_and_aliases() {
+        let args = parse_tests_run_args(json!({
+            "cmd": "cargo test -p nucleus-daemon",
+            "workdir": ".",
+            "timeout_seconds": 120,
+            "max_output_bytes": 4096,
+        }))
+        .expect("tests.run aliases should normalize");
+
+        assert_eq!(args.command, "cargo");
+        assert_eq!(args.args, vec!["test", "-p", "nucleus-daemon"]);
+        assert_eq!(args.cwd.as_deref(), Some("."));
+        assert_eq!(args.timeout_secs, Some(120));
+        assert_eq!(args.output_limit_bytes, Some(4096));
+
+        let canonical = parse_tests_run_args(json!({
+            "command": "cargo",
+            "args": ["test"],
+        }))
+        .expect("canonical args should parse");
+        assert_eq!(canonical.command, "cargo");
+        assert_eq!(canonical.args, vec!["test"]);
+
+        let mixed = parse_tests_run_args(json!({
+            "cmd": "cargo test",
+            "args": ["-p", "nucleus-daemon"],
+        }))
+        .expect("mixed command string and explicit args should parse");
+        assert_eq!(mixed.command, "cargo");
+        assert_eq!(mixed.args, vec!["test", "-p", "nucleus-daemon"]);
+    }
+
+    #[test]
+    fn tests_run_args_invalid_shape_returns_schema_guidance() {
+        let error = parse_tests_run_args(json!({"timeout_secs": 30}))
+            .expect_err("missing command should fail");
+        let message = error.to_string();
+
+        assert!(message.contains("invalid tests.run args"));
+        assert!(message.contains("Expected tests.run args"));
+        assert!(message.contains("command"));
+    }
+
+    #[test]
+    fn rg_search_args_normalize_aliases_and_multi_path_string() {
+        let args = parse_rg_search_args(json!({
+            "query": "delegated_task_class",
+            "paths": "crates/daemon/src/agent.rs:crates/storage/src/lib.rs",
+            "limit": 20,
+        }))
+        .expect("rg.search aliases should normalize");
+
+        assert_eq!(args.pattern, "delegated_task_class");
+        assert_eq!(args.path, None);
+        assert_eq!(
+            args.paths,
+            vec!["crates/daemon/src/agent.rs", "crates/storage/src/lib.rs"]
+        );
+        assert_eq!(args.limit, Some(20));
+
+        let canonical = parse_rg_search_args(json!({
+            "pattern": "TaskClass",
+            "path": ".",
+        }))
+        .expect("canonical args should parse");
+        assert_eq!(canonical.pattern, "TaskClass");
+        assert_eq!(canonical.path.as_deref(), Some("."));
+
+        let spaced_path = parse_rg_search_args(json!({
+            "pattern": "TaskClass",
+            "path": "docs/My Notes",
+        }))
+        .expect("canonical path with spaces should parse");
+        assert_eq!(spaced_path.path.as_deref(), Some("docs/My Notes"));
+        assert!(spaced_path.paths.is_empty());
+
+        let paths_alias = parse_rg_search_args(json!({
+            "pattern": "TaskClass",
+            "paths": "src:tests",
+        }))
+        .expect("paths string should parse");
+        assert_eq!(paths_alias.paths, vec!["src", "tests"]);
+    }
+
+    #[test]
+    fn rg_search_args_invalid_shape_returns_schema_guidance() {
+        let error =
+            parse_rg_search_args(json!({"path": "."})).expect_err("missing pattern should fail");
+        let message = error.to_string();
+
+        assert!(message.contains("invalid rg.search args"));
+        assert!(message.contains("Expected rg.search args"));
+        assert!(message.contains("pattern"));
+
+        let empty_string_paths = parse_rg_search_args(json!({
+            "pattern": "TaskClass",
+            "paths": "  ",
+        }))
+        .expect_err("empty paths string should fail");
+        assert!(
+            empty_string_paths
+                .to_string()
+                .contains("paths must contain at least one non-empty path")
+        );
+
+        let empty_array_paths = parse_rg_search_args(json!({
+            "pattern": "TaskClass",
+            "paths": [],
+        }))
+        .expect_err("empty paths array should fail");
+        assert!(
+            empty_array_paths
+                .to_string()
+                .contains("paths must contain at least one non-empty path")
+        );
+    }
+
+    #[test]
+    fn rg_search_match_collection_honors_requested_limit() {
+        let matches = collect_rg_matches("a.rs:1:first\n\nb.rs:1:second\nc.rs:1:third\n", 1);
+
+        assert_eq!(matches, vec!["a.rs:1:first"]);
     }
 
     #[test]
@@ -33697,6 +34349,202 @@ Thanks."#,
     }
 
     #[tokio::test]
+    async fn heavy_utility_only_fanout_without_parent_class_preserves_child_contract() {
+        let state_dir = test_state_dir("heavy-utility-fanout-without-parent-class");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (mut session, job_id, mut worker) = create_parent_fanout_context(
+            &state,
+            "heavy-utility-fanout-without-parent-class",
+            &workspace_root,
+            "",
+        );
+        session.session.project_id = "project".to_string();
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "Implement issue #161 after repo research and validation.".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let mut step = 0;
+
+        handle_child_job_proposal(
+            &state,
+            &session,
+            &job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            "fan out broad repo work on utility".to_string(),
+            vec![ChildJobProposal {
+                title: "Implementation research".to_string(),
+                prompt:
+                    "Inspect issue #161, search the repo broadly, and plan implementation work."
+                        .to_string(),
+                task_class: Some("local_project".to_string()),
+                working_dir: None,
+                route_id: Some("utility".to_string()),
+            }],
+        )
+        .await
+        .expect("heavy utility-only fanout should escalate");
+
+        let parent = state.store.get_job(&job_id).expect("parent should load");
+        assert_eq!(parent.job.task_class, None);
+        assert_eq!(parent.child_jobs.len(), 1);
+        let child = parent.child_jobs.first().expect("child should exist");
+        assert_eq!(child.executor_lane, MAIN_EXECUTOR_LANE);
+        assert_eq!(child.task_class.as_deref(), Some("local_project"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn test_only_utility_fanout_without_parent_class_preserves_local_project_gate() {
+        let state_dir = test_state_dir("test-only-fanout-without-parent-class");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (mut session, job_id, mut worker) = create_parent_fanout_context(
+            &state,
+            "test-only-fanout-without-parent-class",
+            &workspace_root,
+            "",
+        );
+        session.session.project_id = "project".to_string();
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "Implement issue #161 after repo research and validation.".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let mut step = 0;
+
+        handle_child_job_proposal(
+            &state,
+            &session,
+            &job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            "fan out test run on utility".to_string(),
+            vec![ChildJobProposal {
+                title: "Test runner".to_string(),
+                prompt: "Run cargo test and report the result.".to_string(),
+                task_class: Some("local_project".to_string()),
+                working_dir: None,
+                route_id: Some("utility".to_string()),
+            }],
+        )
+        .await
+        .expect("test-only utility fanout should escalate");
+
+        let parent = state.store.get_job(&job_id).expect("parent should load");
+        assert_eq!(parent.job.task_class, None);
+        assert_eq!(parent.child_jobs.len(), 1);
+        let child = parent.child_jobs.first().expect("child should exist");
+        assert_eq!(child.executor_lane, MAIN_EXECUTOR_LANE);
+        assert_eq!(child.task_class.as_deref(), Some("local_project"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn escalated_read_only_child_under_local_parent_uses_delegated_subtask_gate() {
+        let state_dir = test_state_dir("read-only-escalation-delegated-subtask");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, job_id, mut worker) = create_parent_fanout_context(
+            &state,
+            "read-only-escalation-delegated-subtask",
+            &workspace_root,
+            "",
+        );
+        state
+            .store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    task_class: Some(Some("local_project".to_string())),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("parent job task class should update");
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "Run a read-only probe and report the result.".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let mut step = 0;
+
+        handle_child_job_proposal(
+            &state,
+            &session,
+            &job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            "delegate a read-only probe".to_string(),
+            vec![ChildJobProposal {
+                title: "Read-only command probe".to_string(),
+                prompt: "Execute a read-only probe and report stdout.".to_string(),
+                task_class: Some("local_project".to_string()),
+                working_dir: None,
+                route_id: Some("utility".to_string()),
+            }],
+        )
+        .await
+        .expect("read-only utility fanout should escalate");
+
+        let parent = state.store.get_job(&job_id).expect("parent should load");
+        assert_eq!(parent.child_jobs.len(), 1);
+        assert!(
+            parent
+                .events
+                .iter()
+                .any(|event| { event.event_type == "worker.delegation.escalated_to_main" })
+        );
+        let child = parent.child_jobs.first().expect("child should exist");
+        let child_detail = state.store.get_job(&child.id).expect("child should load");
+        assert_eq!(
+            child_detail.job.task_class.as_deref(),
+            Some(DELEGATED_SUBTASK_TASK_CLASS)
+        );
+        assert_eq!(child_detail.job.completion_status, "pending");
+
+        let completed_child = state
+            .store
+            .update_job(
+                &child.id,
+                JobPatch {
+                    state: Some("completed".to_string()),
+                    result_summary: Some("read-only probe completed".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child should complete");
+        assert_eq!(completed_child.completion_status, "satisfied");
+        assert!(completed_child.completion_blockers.is_empty());
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
     async fn escalated_utility_fanout_keeps_parent_scope_when_any_child_unscoped() {
         let state_dir = test_state_dir("utility-escalation-mixed-scope-keeps-parent");
         let state = initialize_test_state(&state_dir);
@@ -37217,7 +38065,7 @@ for line in sys.stdin:
                 template_id: None,
                 task_class: None,
                 title: "Parent fanout job".to_string(),
-                purpose: "test parent".to_string(),
+                purpose: "parent".to_string(),
                 trigger_kind: "session_prompt".to_string(),
                 state: "running".to_string(),
                 requested_by: "user".to_string(),

@@ -13863,6 +13863,114 @@ and open a pull request to dev when it is ready."
     }
 
     #[test]
+    fn delegated_subtask_task_class_is_not_downgraded_by_command_inference() {
+        let state_dir = test_state_dir("delegated-subtask-task-class-not-downgraded");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let scratch_dir = store
+            .scratch_dir_for_session("delegated-subtask-inference-session")
+            .expect("scratch dir should resolve");
+        store
+            .create_session(test_session_record(
+                "delegated-subtask-inference-session",
+                "Delegated subtask inference",
+                "ad_hoc",
+                scratch_dir.clone(),
+            ))
+            .expect("session should persist");
+
+        for (job_id, task_class) in [
+            (
+                "delegated-subtask-command-job",
+                Some("delegated_subtask".to_string()),
+            ),
+            ("classless-command-job", None),
+        ] {
+            store
+                .create_job(JobRecord {
+                    id: job_id.to_string(),
+                    session_id: Some("delegated-subtask-inference-session".to_string()),
+                    parent_job_id: None,
+                    template_id: None,
+                    task_class,
+                    title: format!("{job_id} title"),
+                    purpose: "test".to_string(),
+                    trigger_kind: "session_prompt".to_string(),
+                    state: "running".to_string(),
+                    requested_by: "user".to_string(),
+                    prompt_excerpt: "run validation".to_string(),
+                    publication_intent_text: None,
+                })
+                .expect("job should persist");
+            store
+                .create_worker(WorkerRecord {
+                    id: format!("{job_id}-worker"),
+                    job_id: job_id.to_string(),
+                    parent_worker_id: None,
+                    title: "Worker".to_string(),
+                    lane: "utility".to_string(),
+                    state: "running".to_string(),
+                    provider: "openai_compatible".to_string(),
+                    model: "cx/gpt-5.4".to_string(),
+                    route_id: String::new(),
+                    route_title: String::new(),
+                    provider_base_url: String::new(),
+                    provider_api_key: String::new(),
+                    provider_session_id: String::new(),
+                    working_dir: scratch_dir.clone(),
+                    read_roots: vec![scratch_dir.clone()],
+                    write_roots: vec![scratch_dir.clone()],
+                    max_steps: 8,
+                    max_tool_calls: 8,
+                    max_wall_clock_secs: 60,
+                })
+                .expect("worker should persist");
+            store
+                .create_command_session(CommandSessionRecord {
+                    id: format!("{job_id}-command"),
+                    job_id: job_id.to_string(),
+                    worker_id: format!("{job_id}-worker"),
+                    tool_call_id: None,
+                    mode: "exec".to_string(),
+                    title: "cargo test".to_string(),
+                    state: "completed".to_string(),
+                    command: "cargo".to_string(),
+                    args: vec!["test".to_string()],
+                    cwd: scratch_dir.clone(),
+                    session_id: "delegated-subtask-inference-session".to_string(),
+                    project_id: String::new(),
+                    worktree_path: scratch_dir.clone(),
+                    branch: "dev".to_string(),
+                    port: None,
+                    env_json: json!({}),
+                    network_policy: "none".to_string(),
+                    timeout_secs: 60,
+                    output_limit_bytes: 1024,
+                    last_error: String::new(),
+                    exit_code: Some(0),
+                    stdout_artifact_id: None,
+                    stderr_artifact_id: None,
+                    started_at: None,
+                    completed_at: None,
+                })
+                .expect("command session should persist");
+        }
+
+        let delegated = store
+            .get_job("delegated-subtask-command-job")
+            .expect("delegated job should load")
+            .job;
+        assert_eq!(delegated.task_class.as_deref(), Some("delegated_subtask"));
+
+        let inferred = store
+            .get_job("classless-command-job")
+            .expect("classless job should load")
+            .job;
+        assert_eq!(inferred.task_class.as_deref(), Some("local_project"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
     fn failed_ui_renderable_job_terminalizes_pending_browser_verification() {
         let state_dir = test_state_dir("failed-browser-verification-terminal");
         let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
