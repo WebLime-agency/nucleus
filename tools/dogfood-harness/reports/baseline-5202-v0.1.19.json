@@ -1,0 +1,1859 @@
+{
+  "install": {
+    "url": "http://127.0.0.1:5202",
+    "version": "0.1.19",
+    "routes": {
+      "default_profile_id": "default",
+      "main_target": "route:local-openai",
+      "utility_target": "route:local-openai",
+      "profiles": [
+        {
+          "id": "default",
+          "title": "Default",
+          "is_default": true,
+          "main": {
+            "adapter": "openai_compatible",
+            "model": "cx/gpt-5.5",
+            "base_url": "http://127.0.0.1:20128/v1"
+          },
+          "utility": {
+            "adapter": "openai_compatible",
+            "model": "cx/gpt-5.4-mini",
+            "base_url": "http://127.0.0.1:20128/v1"
+          }
+        }
+      ]
+    }
+  },
+  "rungs": [
+    {
+      "name": "read_only",
+      "session_id": "c9ecc253-bc51-49a3-b998-7474cd17a88d",
+      "root_job_id": "0f187a3b-527a-46b8-a401-16a938debe4f",
+      "status": "FAIL",
+      "reasons": [
+        "fanout detected: 4 main children exceeds limit 2",
+        "root did not converge with a completed result",
+        "no child ran the exact read_only probe command with exit 0",
+        "child blocked on validation evidence"
+      ],
+      "root_worker": {
+        "lane": "utility",
+        "model": "cx/gpt-5.4-mini",
+        "tool_calls": 0
+      },
+      "children": [
+        {
+          "id": "5968fe07-1301-40ef-ac8d-57debea60124",
+          "lane": "main",
+          "model": "cx/gpt-5.5",
+          "state": "completed",
+          "completion_status": "satisfied",
+          "completion_blockers": [],
+          "tool_failures": []
+        },
+        {
+          "id": "1a98e952-6862-4d10-ad07-985f47616f8e",
+          "lane": "main",
+          "model": "cx/gpt-5.5",
+          "state": "blocked",
+          "completion_status": "blocked",
+          "completion_blockers": [
+            "Local project completion was claimed without successful validation evidence."
+          ],
+          "tool_failures": []
+        },
+        {
+          "id": "23d57274-cb3a-4a26-aedf-fec70574503e",
+          "lane": "main",
+          "model": "cx/gpt-5.5",
+          "state": "blocked",
+          "completion_status": "blocked",
+          "completion_blockers": [
+            "Local project completion was claimed without successful validation evidence."
+          ],
+          "tool_failures": []
+        },
+        {
+          "id": "1ac3d9fd-de98-4a6b-b461-0a0842ca9350",
+          "lane": "main",
+          "model": "cx/gpt-5.5",
+          "state": "blocked",
+          "completion_status": "blocked",
+          "completion_blockers": [
+            "Local project completion was claimed without successful validation evidence."
+          ],
+          "tool_failures": []
+        }
+      ],
+      "counts": {
+        "children": 4,
+        "main_children": 4,
+        "utility_children": 0,
+        "fanout_detected": true
+      },
+      "approvals": {
+        "approved": [
+          {
+            "id": "da8f7c5e-5c40-47fc-a589-35da3dd5b955",
+            "job_id": "5968fe07-1301-40ef-ac8d-57debea60124",
+            "tool": "command.run",
+            "target_paths": [
+              "/home/eba/.nucleus-dev-projects/worktrees/nucleus/c9ecc253-bc51-49a3-b998-7474cd17a88d"
+            ],
+            "reason": "bounded read/build/test command in worker worktree"
+          },
+          {
+            "id": "e3485366-f5e0-42f6-9510-e36c73cae441",
+            "job_id": "1a98e952-6862-4d10-ad07-985f47616f8e",
+            "tool": "command.run",
+            "target_paths": [
+              "/home/eba/.nucleus-dev-projects/worktrees/nucleus/c9ecc253-bc51-49a3-b998-7474cd17a88d"
+            ],
+            "reason": "bounded read/build/test command in worker worktree"
+          },
+          {
+            "id": "7ed7123b-f2f5-4d89-a928-541a40adc23d",
+            "job_id": "23d57274-cb3a-4a26-aedf-fec70574503e",
+            "tool": "command.run",
+            "target_paths": [
+              "/home/eba/.nucleus-dev-projects/worktrees/nucleus/c9ecc253-bc51-49a3-b998-7474cd17a88d"
+            ],
+            "reason": "bounded read/build/test command in worker worktree"
+          },
+          {
+            "id": "8640cae1-3e2c-4bdc-9f0f-17aa97dc8d1f",
+            "job_id": "1ac3d9fd-de98-4a6b-b461-0a0842ca9350",
+            "tool": "command.run",
+            "target_paths": [
+              "/home/eba/.nucleus-dev-projects/worktrees/nucleus/c9ecc253-bc51-49a3-b998-7474cd17a88d"
+            ],
+            "reason": "bounded read/build/test command in worker worktree"
+          }
+        ],
+        "denied": []
+      },
+      "key_events": [
+        {
+          "job_id": "0f187a3b-527a-46b8-a401-16a938debe4f",
+          "event_type": "job.publication.git_baseline",
+          "status": "captured",
+          "summary": "Captured publication git hygiene baseline"
+        },
+        {
+          "job_id": "0f187a3b-527a-46b8-a401-16a938debe4f",
+          "event_type": "child.jobs.spawned",
+          "status": "running",
+          "summary": "Spawned 1 child jobs"
+        },
+        {
+          "job_id": "0f187a3b-527a-46b8-a401-16a938debe4f",
+          "event_type": "child.jobs.spawned",
+          "status": "running",
+          "summary": "Spawned 1 child jobs"
+        },
+        {
+          "job_id": "0f187a3b-527a-46b8-a401-16a938debe4f",
+          "event_type": "child.jobs.spawned",
+          "status": "running",
+          "summary": "Spawned 1 child jobs"
+        },
+        {
+          "job_id": "0f187a3b-527a-46b8-a401-16a938debe4f",
+          "event_type": "child.jobs.spawned",
+          "status": "running",
+          "summary": "Spawned 1 child jobs"
+        },
+        {
+          "job_id": "0f187a3b-527a-46b8-a401-16a938debe4f",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "0f187a3b-527a-46b8-a401-16a938debe4f",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "0f187a3b-527a-46b8-a401-16a938debe4f",
+          "event_type": "child.jobs.reused",
+          "status": "completed",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "0f187a3b-527a-46b8-a401-16a938debe4f",
+          "event_type": "job.blocked",
+          "status": "blocked",
+          "summary": "Probe completed successfully with exact command output; no files were created."
+        },
+        {
+          "job_id": "0f187a3b-527a-46b8-a401-16a938debe4f",
+          "event_type": "job.publication.completed",
+          "status": "not_requested",
+          "summary": "No publication requested. The delegated read-only probe completed successfully in the child worker."
+        },
+        {
+          "job_id": "5968fe07-1301-40ef-ac8d-57debea60124",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "5968fe07-1301-40ef-ac8d-57debea60124",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved run the requested read-only command probe"
+        },
+        {
+          "job_id": "5968fe07-1301-40ef-ac8d-57debea60124",
+          "event_type": "command.session.updated",
+          "status": "completed",
+          "summary": "Completed Nucleus-owned command"
+        },
+        {
+          "job_id": "5968fe07-1301-40ef-ac8d-57debea60124",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed command.run"
+        },
+        {
+          "job_id": "5968fe07-1301-40ef-ac8d-57debea60124",
+          "event_type": "job.completed",
+          "status": "completed",
+          "summary": "The requested read-only command completed successfully and produced the expected probe output."
+        },
+        {
+          "job_id": "1a98e952-6862-4d10-ad07-985f47616f8e",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "1a98e952-6862-4d10-ad07-985f47616f8e",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved run the requested read-only probe command"
+        },
+        {
+          "job_id": "1a98e952-6862-4d10-ad07-985f47616f8e",
+          "event_type": "command.session.updated",
+          "status": "completed",
+          "summary": "Completed Nucleus-owned command"
+        },
+        {
+          "job_id": "1a98e952-6862-4d10-ad07-985f47616f8e",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed command.run"
+        },
+        {
+          "job_id": "1a98e952-6862-4d10-ad07-985f47616f8e",
+          "event_type": "job.blocked",
+          "status": "blocked",
+          "summary": "reported the completed read-only probe command result"
+        },
+        {
+          "job_id": "23d57274-cb3a-4a26-aedf-fec70574503e",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "23d57274-cb3a-4a26-aedf-fec70574503e",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved run the requested command exactly"
+        },
+        {
+          "job_id": "23d57274-cb3a-4a26-aedf-fec70574503e",
+          "event_type": "command.session.updated",
+          "status": "completed",
+          "summary": "Completed Nucleus-owned command"
+        },
+        {
+          "job_id": "23d57274-cb3a-4a26-aedf-fec70574503e",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed command.run"
+        },
+        {
+          "job_id": "23d57274-cb3a-4a26-aedf-fec70574503e",
+          "event_type": "job.blocked",
+          "status": "blocked",
+          "summary": "The requested command completed successfully and produced the expected probe output."
+        },
+        {
+          "job_id": "1ac3d9fd-de98-4a6b-b461-0a0842ca9350",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "1ac3d9fd-de98-4a6b-b461-0a0842ca9350",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved run the requested read-only command probe"
+        },
+        {
+          "job_id": "1ac3d9fd-de98-4a6b-b461-0a0842ca9350",
+          "event_type": "command.session.updated",
+          "status": "completed",
+          "summary": "Completed Nucleus-owned command"
+        },
+        {
+          "job_id": "1ac3d9fd-de98-4a6b-b461-0a0842ca9350",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed command.run"
+        },
+        {
+          "job_id": "1ac3d9fd-de98-4a6b-b461-0a0842ca9350",
+          "event_type": "job.blocked",
+          "status": "blocked",
+          "summary": "The requested read-only probe command completed successfully and the tool result contains all required report fields except lane/model and file creation, which are inferable from session context and command behavior."
+        }
+      ]
+    },
+    {
+      "name": "edit_and_test",
+      "session_id": "b7d2bd8a-610a-4d6c-9f6c-959893229553",
+      "root_job_id": "e686c075-861a-4d90-8280-868edf3be5d8",
+      "status": "FAIL",
+      "reasons": [
+        "root did not converge with a completed result",
+        "no child ran a focused validation command",
+        "no child reached accepted/completed completion state"
+      ],
+      "root_worker": {
+        "lane": "utility",
+        "model": "cx/gpt-5.4-mini",
+        "tool_calls": 0
+      },
+      "children": [
+        {
+          "id": "f8e439a1-54a8-4dd8-aba6-d6b0917a24d7",
+          "lane": "main",
+          "model": "cx/gpt-5.5",
+          "state": "blocked",
+          "completion_status": "blocked",
+          "completion_blockers": [
+            "Publication was requested, but no open PR URL and target branch evidence are recorded.",
+            "Validation is not performed.",
+            "Browser verification is missing or blocked.",
+            "Cleanup is required or unknown before completion can be claimed.",
+            "Stored session git metadata drifted from observed worktree state: stored session git metadata differed from observed disk state without a matching daemon-observed mutation.",
+            "Local project completion was claimed without successful validation evidence."
+          ],
+          "tool_failures": [
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            }
+          ]
+        }
+      ],
+      "counts": {
+        "children": 1,
+        "main_children": 1,
+        "utility_children": 0,
+        "fanout_detected": false
+      },
+      "approvals": {
+        "approved": [
+          {
+            "id": "777b9ff4-c38d-48dd-8880-e17ddc1c4a4d",
+            "job_id": "f8e439a1-54a8-4dd8-aba6-d6b0917a24d7",
+            "tool": "fs.apply_patch",
+            "target_paths": [
+              "crates/core/src/lib.rs"
+            ],
+            "reason": "worktree-local file mutation"
+          },
+          {
+            "id": "3af0db37-0823-4112-b796-939ed73bc9c1",
+            "job_id": "f8e439a1-54a8-4dd8-aba6-d6b0917a24d7",
+            "tool": "fs.apply_patch",
+            "target_paths": [
+              "crates/core/src/lib.rs"
+            ],
+            "reason": "worktree-local file mutation"
+          }
+        ],
+        "denied": []
+      },
+      "key_events": [
+        {
+          "job_id": "e686c075-861a-4d90-8280-868edf3be5d8",
+          "event_type": "job.publication.git_baseline",
+          "status": "captured",
+          "summary": "Captured publication git hygiene baseline"
+        },
+        {
+          "job_id": "e686c075-861a-4d90-8280-868edf3be5d8",
+          "event_type": "child.jobs.spawned",
+          "status": "running",
+          "summary": "Spawned 1 child jobs"
+        },
+        {
+          "job_id": "e686c075-861a-4d90-8280-868edf3be5d8",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "e686c075-861a-4d90-8280-868edf3be5d8",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "e686c075-861a-4d90-8280-868edf3be5d8",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "e686c075-861a-4d90-8280-868edf3be5d8",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "e686c075-861a-4d90-8280-868edf3be5d8",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "e686c075-861a-4d90-8280-868edf3be5d8",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "e686c075-861a-4d90-8280-868edf3be5d8",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "e686c075-861a-4d90-8280-868edf3be5d8",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "e686c075-861a-4d90-8280-868edf3be5d8",
+          "event_type": "child.jobs.reused",
+          "status": "completed",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "e686c075-861a-4d90-8280-868edf3be5d8",
+          "event_type": "job.publication.completed",
+          "status": "not_requested",
+          "summary": "Child work was blocked before any code change or validation. The blocker was context integrity drift: stored session git metadata differed from observed worktree state without a matching daemon-observed mutation."
+        },
+        {
+          "job_id": "f8e439a1-54a8-4dd8-aba6-d6b0917a24d7",
+          "event_type": "job.publication.git_baseline",
+          "status": "captured",
+          "summary": "Captured publication git hygiene baseline"
+        },
+        {
+          "job_id": "f8e439a1-54a8-4dd8-aba6-d6b0917a24d7",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed project.inspect"
+        },
+        {
+          "job_id": "f8e439a1-54a8-4dd8-aba6-d6b0917a24d7",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "f8e439a1-54a8-4dd8-aba6-d6b0917a24d7",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for fs.apply_patch"
+        },
+        {
+          "job_id": "f8e439a1-54a8-4dd8-aba6-d6b0917a24d7",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved insert helper using scoped replacement"
+        },
+        {
+          "job_id": "f8e439a1-54a8-4dd8-aba6-d6b0917a24d7",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.apply_patch"
+        },
+        {
+          "job_id": "f8e439a1-54a8-4dd8-aba6-d6b0917a24d7",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "f8e439a1-54a8-4dd8-aba6-d6b0917a24d7",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "f8e439a1-54a8-4dd8-aba6-d6b0917a24d7",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for fs.apply_patch"
+        },
+        {
+          "job_id": "f8e439a1-54a8-4dd8-aba6-d6b0917a24d7",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved add focused activity phrase unit test"
+        }
+      ]
+    },
+    {
+      "name": "feature_161",
+      "session_id": "4bf4c9a0-5237-4273-94d8-0939d38a9f91",
+      "root_job_id": "0e0ece02-0d41-4598-8c19-4066cc5c8524",
+      "status": "FAIL",
+      "reasons": [
+        "fanout detected: 2 main children exceeds limit 1",
+        "child d4605654-460f-4676-913c-83f3f02a36b8 was still running, not terminal",
+        "child 4cd30ea7-d353-4a0f-b13d-b4847835e2fd was still running, not terminal",
+        "feature rung did not converge to completion or a precise blocker",
+        "feature rung lacked implementation+validation evidence or a precise blocker"
+      ],
+      "root_worker": {
+        "lane": "utility",
+        "model": "cx/gpt-5.4-mini",
+        "tool_calls": 0
+      },
+      "children": [
+        {
+          "id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "lane": "main",
+          "model": "cx/gpt-5.5",
+          "state": "running",
+          "completion_status": "pending",
+          "completion_blockers": [],
+          "tool_failures": [
+            {
+              "tool": "fs.read_text",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "failed to resolve '/home/eba/.nucleus-dev-projects/worktrees/nucleus/4bf4c9a0-5237-4273-94d8-0939d38a9f91/apps/web/src/lib/nucleus/session-ux.ts'"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "python.run",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for python.run"
+            },
+            {
+              "tool": "command.run",
+              "status": "denied",
+              "error_class": "approval_denied",
+              "error_detail": "command contains shell control, path traversal, or write-like operations"
+            }
+          ]
+        },
+        {
+          "id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "lane": "main",
+          "model": "cx/gpt-5.5",
+          "state": "running",
+          "completion_status": "pending",
+          "completion_blockers": [],
+          "tool_failures": [
+            {
+              "tool": "fs.read_text",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "failed to resolve '/home/eba/.nucleus-dev-projects/worktrees/nucleus/4bf4c9a0-5237-4273-94d8-0939d38a9f91/apps/web/src/lib/nucleus/session-ux.ts'"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "python.run",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for python.run"
+            },
+            {
+              "tool": "python.run",
+              "status": "denied",
+              "error_class": "approval_denied",
+              "error_detail": "python script is not clearly scoped to the worker worktree"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "command.run",
+              "status": "denied",
+              "error_class": "approval_denied",
+              "error_detail": "command contains shell control, path traversal, or write-like operations"
+            }
+          ]
+        }
+      ],
+      "counts": {
+        "children": 2,
+        "main_children": 2,
+        "utility_children": 0,
+        "fanout_detected": true
+      },
+      "approvals": {
+        "approved": [
+          {
+            "id": "89be64a4-1220-48a8-8be2-86069c212e95",
+            "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+            "tool": "command.run",
+            "target_paths": [
+              "/home/eba/.nucleus-dev-projects/worktrees/nucleus/4bf4c9a0-5237-4273-94d8-0939d38a9f91"
+            ],
+            "reason": "bounded read/build/test command in worker worktree"
+          },
+          {
+            "id": "2c3cb8eb-8450-48de-b22b-86e33426b9cf",
+            "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+            "tool": "command.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "bounded read/build/test command in worker worktree"
+          },
+          {
+            "id": "5fd6968e-1deb-4bcc-9394-e899eaa54873",
+            "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+            "tool": "fs.apply_patch",
+            "target_paths": [
+              "apps/web/src/lib/nucleus/session-ux.js"
+            ],
+            "reason": "worktree-local file mutation"
+          }
+        ],
+        "denied": [
+          {
+            "id": "e971bf1b-c975-4149-b9f6-1ec96e2f0dab",
+            "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+            "tool": "python.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "python script is not clearly scoped to the worker worktree"
+          },
+          {
+            "id": "77e75ade-7269-4035-a639-b7cd8aec9fb1",
+            "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+            "tool": "command.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "command contains shell control, path traversal, or write-like operations"
+          },
+          {
+            "id": "6862e969-8e86-4ebd-b48b-8c8ce0284129",
+            "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+            "tool": "command.run",
+            "target_paths": [
+              "/home/eba/.nucleus-dev-projects/worktrees/nucleus/4bf4c9a0-5237-4273-94d8-0939d38a9f91"
+            ],
+            "reason": "command contains shell control, path traversal, or write-like operations"
+          }
+        ]
+      },
+      "key_events": [
+        {
+          "job_id": "0e0ece02-0d41-4598-8c19-4066cc5c8524",
+          "event_type": "job.publication.git_baseline",
+          "status": "captured",
+          "summary": "Captured publication git hygiene baseline"
+        },
+        {
+          "job_id": "0e0ece02-0d41-4598-8c19-4066cc5c8524",
+          "event_type": "child.jobs.spawned",
+          "status": "running",
+          "summary": "Spawned 1 child jobs"
+        },
+        {
+          "job_id": "0e0ece02-0d41-4598-8c19-4066cc5c8524",
+          "event_type": "child.jobs.spawned",
+          "status": "running",
+          "summary": "Spawned 1 child jobs"
+        },
+        {
+          "job_id": "0e0ece02-0d41-4598-8c19-4066cc5c8524",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "0e0ece02-0d41-4598-8c19-4066cc5c8524",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "0e0ece02-0d41-4598-8c19-4066cc5c8524",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "0e0ece02-0d41-4598-8c19-4066cc5c8524",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "0e0ece02-0d41-4598-8c19-4066cc5c8524",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "0e0ece02-0d41-4598-8c19-4066cc5c8524",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "0e0ece02-0d41-4598-8c19-4066cc5c8524",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "0e0ece02-0d41-4598-8c19-4066cc5c8524",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "0e0ece02-0d41-4598-8c19-4066cc5c8524",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "0e0ece02-0d41-4598-8c19-4066cc5c8524",
+          "event_type": "worker.progress",
+          "status": "running",
+          "summary": "await delegated child report for issue #161 implementation and validation"
+        },
+        {
+          "job_id": "0e0ece02-0d41-4598-8c19-4066cc5c8524",
+          "event_type": "worker.wait.completed",
+          "status": "completed",
+          "summary": "Worker wait 9f0327d9-8f1c-418e-810c-0484542f0d50 ended with reason satisfied"
+        },
+        {
+          "job_id": "0e0ece02-0d41-4598-8c19-4066cc5c8524",
+          "event_type": "worker.wait.completed",
+          "status": "completed",
+          "summary": "Worker wait 3fe22d15-089f-4e42-9720-5989eee26a83 ended with reason satisfied"
+        },
+        {
+          "job_id": "0e0ece02-0d41-4598-8c19-4066cc5c8524",
+          "event_type": "worker.wait.completed",
+          "status": "completed",
+          "summary": "Worker wait 7473ca70-5c79-47a1-ac05-145d4583b4d1 ended with reason satisfied"
+        },
+        {
+          "job_id": "0e0ece02-0d41-4598-8c19-4066cc5c8524",
+          "event_type": "worker.wait.completed",
+          "status": "completed",
+          "summary": "Worker wait e46ae0c7-4879-48f7-a606-c2da54ec4add ended with reason satisfied"
+        },
+        {
+          "job_id": "0e0ece02-0d41-4598-8c19-4066cc5c8524",
+          "event_type": "worker.wait.completed",
+          "status": "completed",
+          "summary": "Worker wait 4998ce34-0106-4458-90a0-80f4c13c50a3 ended with reason satisfied"
+        },
+        {
+          "job_id": "0e0ece02-0d41-4598-8c19-4066cc5c8524",
+          "event_type": "worker.wait.completed",
+          "status": "completed",
+          "summary": "Worker wait d30459b9-e064-4382-bbd6-e24ac50c2a5c ended with reason satisfied"
+        },
+        {
+          "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "event_type": "job.publication.git_baseline",
+          "status": "captured",
+          "summary": "Captured publication git hygiene baseline"
+        },
+        {
+          "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed project.inspect"
+        },
+        {
+          "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved fetch issue 161 from GitHub"
+        },
+        {
+          "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "event_type": "command.session.updated",
+          "status": "completed",
+          "summary": "Completed Nucleus-owned command"
+        },
+        {
+          "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed command.run"
+        },
+        {
+          "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.list"
+        },
+        {
+          "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.list"
+        },
+        {
+          "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.list"
+        },
+        {
+          "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "d4605654-460f-4676-913c-83f3f02a36b8",
+          "event_type": "approval.resolved",
+          "status": "denied",
+          "summary": "Denied edit session UX helper with centralized activity message rotation"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "job.publication.git_baseline",
+          "status": "captured",
+          "summary": "Captured publication git hygiene baseline"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed project.inspect"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.list"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved read GitHub issue #161"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "command.session.updated",
+          "status": "completed",
+          "summary": "Completed Nucleus-owned command"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed command.run"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.list"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for python.run"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "approval.resolved",
+          "status": "denied",
+          "summary": "Denied edit session UX helper with activity phrase rotation"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "approval.resolved",
+          "status": "denied",
+          "summary": "Denied apply session UX activity phrase changes"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for fs.apply_patch"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved apply scoped session UX phrase rotation edits"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.apply_patch"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "4cd30ea7-d353-4a0f-b13d-b4847835e2fd",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for fs.apply_patch"
+        }
+      ]
+    },
+    {
+      "name": "debug",
+      "session_id": "f44e8d57-dd1c-4298-b9a6-ece7012f5116",
+      "root_job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+      "status": "FAIL",
+      "reasons": [
+        "root job ended in state waiting",
+        "fanout detected: 4 main children exceeds limit 2",
+        "child ca7aa098-40cd-4bfe-b31c-048ad01a1612 was still running, not terminal",
+        "child 05e50a81-deae-455b-8a8e-ba7a112c252e was still running, not terminal",
+        "debug rung did not converge to completion or a precise blocker"
+      ],
+      "root_worker": {
+        "lane": "utility",
+        "model": "cx/gpt-5.4-mini",
+        "tool_calls": 0
+      },
+      "children": [
+        {
+          "id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "lane": "main",
+          "model": "cx/gpt-5.5",
+          "state": "blocked",
+          "completion_status": "blocked",
+          "completion_blockers": [
+            "Local project completion was claimed without successful validation evidence."
+          ],
+          "tool_failures": [
+            {
+              "tool": "command.run",
+              "status": "denied",
+              "error_class": "approval_denied",
+              "error_detail": "command is not clearly read/build/test scoped"
+            },
+            {
+              "tool": "python.run",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for python.run"
+            },
+            {
+              "tool": "python.run",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for python.run"
+            },
+            {
+              "tool": "command.run",
+              "status": "denied",
+              "error_class": "approval_denied",
+              "error_detail": "command contains shell control, path traversal, or write-like operations"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            }
+          ]
+        },
+        {
+          "id": "1a833f95-8de8-460e-a958-4f84770cdc1e",
+          "lane": "main",
+          "model": "cx/gpt-5.5",
+          "state": "blocked",
+          "completion_status": "blocked",
+          "completion_blockers": [
+            "Stored session git metadata drifted from observed worktree state: stored session git metadata differed from observed disk state without a matching daemon-observed mutation.",
+            "Local project completion was claimed without successful validation evidence."
+          ],
+          "tool_failures": [
+            {
+              "tool": "command.run",
+              "status": "denied",
+              "error_class": "approval_denied",
+              "error_detail": "command is not clearly read/build/test scoped"
+            },
+            {
+              "tool": "python.run",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for python.run"
+            }
+          ]
+        },
+        {
+          "id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "lane": "main",
+          "model": "cx/gpt-5.5",
+          "state": "running",
+          "completion_status": "pending",
+          "completion_blockers": [],
+          "tool_failures": [
+            {
+              "tool": "python.run",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for python.run"
+            },
+            {
+              "tool": "command.run",
+              "status": "denied",
+              "error_class": "approval_denied",
+              "error_detail": "command is not clearly read/build/test scoped"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid args for fs.apply_patch"
+            }
+          ]
+        },
+        {
+          "id": "05e50a81-deae-455b-8a8e-ba7a112c252e",
+          "lane": "main",
+          "model": "cx/gpt-5.5",
+          "state": "running",
+          "completion_status": "pending",
+          "completion_blockers": [],
+          "tool_failures": [
+            {
+              "tool": "command.run",
+              "status": "denied",
+              "error_class": "approval_denied",
+              "error_detail": "command contains shell control, path traversal, or write-like operations"
+            }
+          ]
+        }
+      ],
+      "counts": {
+        "children": 4,
+        "main_children": 4,
+        "utility_children": 0,
+        "fanout_detected": true
+      },
+      "approvals": {
+        "approved": [
+          {
+            "id": "8d9f4510-3f28-405d-a644-95e8876364e4",
+            "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+            "tool": "fs.apply_patch",
+            "target_paths": [
+              "crates/daemon/src/worker_action.rs"
+            ],
+            "reason": "worktree-local file mutation"
+          },
+          {
+            "id": "d4633485-3799-45b8-a6d7-866dd64bdd5c",
+            "job_id": "1a833f95-8de8-460e-a958-4f84770cdc1e",
+            "tool": "python.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "bounded python.run in worker worktree"
+          },
+          {
+            "id": "4b512379-7d1f-47ed-a3aa-f58bb73b44ff",
+            "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+            "tool": "python.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "bounded python.run in worker worktree"
+          },
+          {
+            "id": "6ef5ddde-de26-4067-be4b-08e5f8a436ef",
+            "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+            "tool": "python.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "bounded python.run in worker worktree"
+          }
+        ],
+        "denied": [
+          {
+            "id": "659597ca-03a3-4877-8ac1-c9f6970607c3",
+            "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+            "tool": "command.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "command is not clearly read/build/test scoped"
+          },
+          {
+            "id": "478564d6-481d-402c-8de6-eb792bb3cb4e",
+            "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+            "tool": "command.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "command contains shell control, path traversal, or write-like operations"
+          },
+          {
+            "id": "a2720e76-8073-451b-9bea-f39c66b294cf",
+            "job_id": "1a833f95-8de8-460e-a958-4f84770cdc1e",
+            "tool": "command.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "command is not clearly read/build/test scoped"
+          },
+          {
+            "id": "dc2b3a0f-321b-4255-8149-f79ae3bd9434",
+            "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+            "tool": "command.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "command is not clearly read/build/test scoped"
+          },
+          {
+            "id": "088fc050-4e1e-4cad-8603-ad2ce8284d28",
+            "job_id": "05e50a81-deae-455b-8a8e-ba7a112c252e",
+            "tool": "command.run",
+            "target_paths": [
+              "/home/eba/.nucleus-dev-projects/worktrees/nucleus/f44e8d57-dd1c-4298-b9a6-ece7012f5116"
+            ],
+            "reason": "command contains shell control, path traversal, or write-like operations"
+          }
+        ]
+      },
+      "key_events": [
+        {
+          "job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+          "event_type": "job.publication.git_baseline",
+          "status": "captured",
+          "summary": "Captured publication git hygiene baseline"
+        },
+        {
+          "job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+          "event_type": "child.jobs.spawned",
+          "status": "running",
+          "summary": "Spawned 1 child jobs"
+        },
+        {
+          "job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+          "event_type": "worker.progress",
+          "status": "running",
+          "summary": "waiting on delegated child result"
+        },
+        {
+          "job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+          "event_type": "worker.wait.completed",
+          "status": "completed",
+          "summary": "Worker wait 6b7c48cd-9253-421e-b3a8-2766a6c631b1 ended with reason satisfied"
+        },
+        {
+          "job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+          "event_type": "worker.wait.completed",
+          "status": "completed",
+          "summary": "Worker wait e1511114-b363-4f60-8ded-0deb33b96979 ended with reason satisfied"
+        },
+        {
+          "job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+          "event_type": "worker.wait.completed",
+          "status": "completed",
+          "summary": "Worker wait 5e166c18-0475-4bbd-90ed-b9604e3b6fbb ended with reason satisfied"
+        },
+        {
+          "job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+          "event_type": "child.jobs.spawned",
+          "status": "running",
+          "summary": "Spawned 1 child jobs"
+        },
+        {
+          "job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+          "event_type": "child.jobs.spawned",
+          "status": "running",
+          "summary": "Spawned 1 child jobs"
+        },
+        {
+          "job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+          "event_type": "worker.wait.completed",
+          "status": "completed",
+          "summary": "Worker wait 041b8e71-a4ef-4806-bc20-25867a59d35b ended with reason satisfied"
+        },
+        {
+          "job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+          "event_type": "worker.wait.completed",
+          "status": "completed",
+          "summary": "Worker wait 02a9bb87-c6a2-4e47-a23f-1239c67af920 ended with reason satisfied"
+        },
+        {
+          "job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+          "event_type": "worker.wait.completed",
+          "status": "completed",
+          "summary": "Worker wait 3e8eb859-259d-463d-ab95-94959bc0d007 ended with reason satisfied"
+        },
+        {
+          "job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+          "event_type": "child.jobs.spawned",
+          "status": "running",
+          "summary": "Spawned 1 child jobs"
+        },
+        {
+          "job_id": "2c113faf-0d55-45bd-979c-388852e456a0",
+          "event_type": "child.jobs.reused",
+          "status": "running",
+          "summary": "Reused 1 equivalent child job(s)"
+        },
+        {
+          "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed project.inspect"
+        },
+        {
+          "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "event_type": "approval.resolved",
+          "status": "denied",
+          "summary": "Denied show validation function lines"
+        },
+        {
+          "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "event_type": "approval.resolved",
+          "status": "denied",
+          "summary": "Denied read worker_action validator and focused tests"
+        },
+        {
+          "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for fs.apply_patch"
+        },
+        {
+          "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved apply validator summary guard using scoped edit list"
+        },
+        {
+          "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.apply_patch"
+        },
+        {
+          "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "215678b5-3790-46d5-9d2e-2a8fe17e2807",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "1a833f95-8de8-460e-a958-4f84770cdc1e",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed project.inspect"
+        },
+        {
+          "job_id": "1a833f95-8de8-460e-a958-4f84770cdc1e",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "1a833f95-8de8-460e-a958-4f84770cdc1e",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "1a833f95-8de8-460e-a958-4f84770cdc1e",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "1a833f95-8de8-460e-a958-4f84770cdc1e",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "1a833f95-8de8-460e-a958-4f84770cdc1e",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "1a833f95-8de8-460e-a958-4f84770cdc1e",
+          "event_type": "approval.resolved",
+          "status": "denied",
+          "summary": "Denied print wait_status_text helper region"
+        },
+        {
+          "job_id": "1a833f95-8de8-460e-a958-4f84770cdc1e",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "1a833f95-8de8-460e-a958-4f84770cdc1e",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "1a833f95-8de8-460e-a958-4f84770cdc1e",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for python.run"
+        },
+        {
+          "job_id": "1a833f95-8de8-460e-a958-4f84770cdc1e",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved print targeted agent.rs line ranges"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed project.inspect"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "approval.resolved",
+          "status": "denied",
+          "summary": "Denied print exact agent progress helper slice"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for python.run"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved print exact agent progress helper slice"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "command.session.updated",
+          "status": "completed",
+          "summary": "Completed Nucleus-owned Python runtime"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed python.run"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for python.run"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved print PromptProgressUpdate struct fields"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "command.session.updated",
+          "status": "completed",
+          "summary": "Completed Nucleus-owned Python runtime"
+        },
+        {
+          "job_id": "ca7aa098-40cd-4bfe-b31c-048ad01a1612",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed python.run"
+        },
+        {
+          "job_id": "05e50a81-deae-455b-8a8e-ba7a112c252e",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed project.inspect"
+        },
+        {
+          "job_id": "05e50a81-deae-455b-8a8e-ba7a112c252e",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "05e50a81-deae-455b-8a8e-ba7a112c252e",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "05e50a81-deae-455b-8a8e-ba7a112c252e",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "05e50a81-deae-455b-8a8e-ba7a112c252e",
+          "event_type": "approval.resolved",
+          "status": "denied",
+          "summary": "Denied read validation and tests region"
+        },
+        {
+          "job_id": "05e50a81-deae-455b-8a8e-ba7a112c252e",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        }
+      ]
+    }
+  ],
+  "overall": {
+    "passed": 0,
+    "failed": 4,
+    "total": 4
+  }
+}
