@@ -773,6 +773,12 @@ fn evaluate_command_run(call: &ToolCallSummary, worktree: &Path) -> ApprovalVerd
     if network_policy_allows_network(&call.args_json) {
         return deny("command requests network access", vec![cwd.to_string()]);
     }
+    if has_conflicting_command_aliases(&call.args_json) {
+        return deny(
+            "command.run specifies both command and cmd aliases",
+            vec![cwd.to_string()],
+        );
+    }
     let command = command_text(&call.args_json);
     if command.trim().is_empty() {
         return deny("command.run command is missing", vec![cwd.to_string()]);
@@ -875,6 +881,12 @@ fn evaluate_tests_run(call: &ToolCallSummary, worktree: &Path) -> ApprovalVerdic
     }
     if network_policy_allows_network(&call.args_json) {
         return deny("tests.run requests network access", vec![cwd.to_string()]);
+    }
+    if has_conflicting_command_aliases(&call.args_json) {
+        return deny(
+            "tests.run specifies both command and cmd aliases",
+            vec![cwd.to_string()],
+        );
     }
     let command = command_text(&call.args_json);
     if command.trim().is_empty() {
@@ -993,6 +1005,16 @@ fn command_text(args: &Value) -> String {
         })
         .unwrap_or_default();
     format!("{command} {argv}")
+}
+
+fn has_conflicting_command_aliases(args: &Value) -> bool {
+    args.get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+        && args
+            .get("cmd")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn network_policy_allows_network(args: &Value) -> bool {
@@ -1302,9 +1324,16 @@ fn script_contains_external_or_network_mutation(script: &str) -> bool {
         "http://",
         "https://",
         "subprocess",
+        "__import__(",
+        "importlib",
+        "getattr(",
+        "eval(",
+        "exec(",
         "socket",
         "os.system",
         "os.popen",
+        ".system(",
+        ".popen(",
         "os.listdir",
         "shutil.",
         "git push",
@@ -1913,7 +1942,10 @@ fn routes_report(workspace: &WorkspaceSummary) -> RoutesReport {
 }
 
 fn write_report(path: &Path, report: &HarnessReport) -> Result<()> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
@@ -1972,6 +2004,19 @@ mod tests {
 
         assert!(!verdict.approve);
         assert!(verdict.reason.contains("outside the worker worktree"));
+    }
+
+    #[test]
+    fn command_policy_rejects_conflicting_command_aliases() {
+        let call = tool_call_with_args(
+            "command.run",
+            json!({"command":"cargo test","cmd":"git push","cwd":"."}),
+        );
+
+        let verdict = evaluate_command_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(!verdict.approve);
+        assert!(verdict.reason.contains("both command and cmd"));
     }
 
     #[test]
@@ -2233,6 +2278,30 @@ mod tests {
     }
 
     #[test]
+    fn python_policy_rejects_dynamic_process_escape() {
+        let call = tool_call_with_args(
+            "python.run",
+            json!({"cwd":".","script":"__import__('os').system('touch /tmp/nucleus-dogfood-leak')"}),
+        );
+
+        let verdict = evaluate_python_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(!verdict.approve);
+        assert!(verdict.reason.contains("worker worktree"));
+    }
+
+    #[test]
+    fn write_report_allows_current_directory_output() {
+        let path = Path::new("nucleus-dogfood-report-current-dir-test.json");
+        let _ = fs::remove_file(path);
+
+        write_report(path, &minimal_report()).expect("write report in current dir");
+
+        assert!(path.exists());
+        fs::remove_file(path).expect("remove current-dir report fixture");
+    }
+
+    #[test]
     fn python_policy_rejects_external_args() {
         let call = tool_call_with_args(
             "python.run",
@@ -2313,6 +2382,27 @@ mod tests {
             created_at: 0,
             started_at: None,
             completed_at: None,
+        }
+    }
+
+    fn minimal_report() -> HarnessReport {
+        HarnessReport {
+            install: InstallReport {
+                url: "http://127.0.0.1:5202".to_string(),
+                version: "test".to_string(),
+                routes: RoutesReport {
+                    default_profile_id: String::new(),
+                    main_target: String::new(),
+                    utility_target: String::new(),
+                    profiles: Vec::new(),
+                },
+            },
+            rungs: Vec::new(),
+            overall: OverallReport {
+                passed: 0,
+                failed: 0,
+                total: 0,
+            },
         }
     }
 }
