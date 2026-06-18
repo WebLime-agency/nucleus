@@ -25,6 +25,7 @@ const DEFAULT_AUTH_TOKEN_PATH: &str = "/home/eba/.nucleus-dev-projects/local-aut
 const DEFAULT_PROJECT: &str = "nucleus";
 const DEFAULT_TIMEOUT_SECS: u64 = 900;
 const DEFAULT_OUTPUT_PATH: &str = "tools/dogfood-harness/reports/latest.json";
+const MAX_HTTP_REQUEST_TIMEOUT_SECS: u64 = 30;
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 const TERMINAL_STATES: &[&str] = &["completed", "blocked", "failed", "canceled"];
 const KEY_EVENT_TERMS: &[&str] = &[
@@ -212,7 +213,7 @@ struct HarnessClient {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let token = read_auth_token(&args)?;
-    let client = HarnessClient::new(&args.base_url, &token)?;
+    let client = HarnessClient::new(&args.base_url, &token, args.timeout_secs)?;
     let rungs = select_rungs(&args.rungs)?;
 
     let health: HealthResponse = client.get("/api/health").await?;
@@ -272,7 +273,7 @@ async fn main() -> Result<()> {
 }
 
 impl HarnessClient {
-    fn new(base_url: &str, token: &str) -> Result<Self> {
+    fn new(base_url: &str, token: &str, timeout_secs: u64) -> Result<Self> {
         let base_url = Url::parse(base_url).context("invalid base URL")?;
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
@@ -282,8 +283,11 @@ impl HarnessClient {
             HeaderValue::from_str(&format!("Bearer {token}"))
                 .context("auth token is not a valid HTTP header value")?,
         );
+        let request_timeout = http_request_timeout(timeout_secs);
         let client = reqwest::Client::builder()
             .default_headers(headers)
+            .timeout(request_timeout)
+            .connect_timeout(request_timeout.min(Duration::from_secs(10)))
             .build()
             .context("failed to build HTTP client")?;
         Ok(Self { base_url, client })
@@ -354,6 +358,10 @@ impl HarnessClient {
             .join(path)
             .with_context(|| format!("invalid API path {path}"))
     }
+}
+
+fn http_request_timeout(timeout_secs: u64) -> Duration {
+    Duration::from_secs(timeout_secs.clamp(1, MAX_HTTP_REQUEST_TIMEOUT_SECS))
 }
 
 fn read_auth_token(args: &Args) -> Result<String> {
@@ -2063,6 +2071,13 @@ mod tests {
         assert!(!command_looks_like_validation(
             "npm --workspace @nucleus/web run deploy"
         ));
+    }
+
+    #[test]
+    fn http_request_timeout_is_bounded_by_rung_timeout() {
+        assert_eq!(http_request_timeout(0), Duration::from_secs(1));
+        assert_eq!(http_request_timeout(5), Duration::from_secs(5));
+        assert_eq!(http_request_timeout(900), Duration::from_secs(30));
     }
 
     #[test]
