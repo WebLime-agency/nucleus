@@ -787,6 +787,12 @@ fn evaluate_command_run(call: &ToolCallSummary, worktree: &Path) -> ApprovalVerd
             vec![cwd.to_string()],
         );
     }
+    if env_has_external_path_reference(&call.args_json, worktree) {
+        return deny(
+            "command env references a path outside the worker worktree",
+            vec![cwd.to_string()],
+        );
+    }
     if !command_looks_like_read_build_or_test(&command) {
         return deny(
             "command is not clearly read/build/test scoped",
@@ -826,6 +832,12 @@ fn evaluate_python_run(call: &ToolCallSummary, worktree: &Path) -> ApprovalVerdi
     if args_have_external_path_reference(&call.args_json, worktree) {
         return deny(
             "python.run args reference a path outside the worker worktree",
+            vec![cwd.to_string()],
+        );
+    }
+    if env_has_external_path_reference(&call.args_json, worktree) {
+        return deny(
+            "python.run env references a path outside the worker worktree",
             vec![cwd.to_string()],
         );
     }
@@ -875,6 +887,12 @@ fn evaluate_tests_run(call: &ToolCallSummary, worktree: &Path) -> ApprovalVerdic
     if command_has_external_path_reference(&call.args_json, worktree) {
         return deny(
             "tests.run command references a path outside the worker worktree",
+            vec![cwd.to_string()],
+        );
+    }
+    if env_has_external_path_reference(&call.args_json, worktree) {
+        return deny(
+            "tests.run env references a path outside the worker worktree",
             vec![cwd.to_string()],
         );
     }
@@ -1052,6 +1070,25 @@ fn args_have_external_path_reference(args: &Value, worktree: &Path) -> bool {
         .flat_map(|value| value.split_whitespace().map(clean_command_token))
         .filter_map(|token| path_like_command_token(&token))
         .any(|path| !path_is_inside_worktree(worktree, &path))
+}
+
+fn env_has_external_path_reference(args: &Value, worktree: &Path) -> bool {
+    args.get("env")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|env| env.values())
+        .filter_map(Value::as_str)
+        .flat_map(env_path_tokens)
+        .filter_map(|token| path_like_command_token(&token))
+        .any(|path| !path_is_inside_worktree(worktree, &path))
+}
+
+fn env_path_tokens(value: &str) -> Vec<String> {
+    value
+        .split(|ch: char| ch.is_whitespace() || ch == ':')
+        .filter(|token| !token.trim().is_empty())
+        .map(clean_command_token)
+        .collect()
 }
 
 fn command_tokens(args: &Value) -> Vec<String> {
@@ -1358,8 +1395,7 @@ fn clean_harness_worktree(session_id: &str, detail: Option<&SessionDetail>) -> R
     if !path.is_absolute() || !path.exists() {
         return Ok(());
     }
-    let path_text = path.display().to_string();
-    if !path_text.contains(session_id) || !path_text.contains("/.nucleus-") {
+    if !is_harness_nucleus_worktree_path(path, session_id) {
         return Ok(());
     }
     if git_command(path, &["rev-parse", "--is-inside-work-tree"])?.trim() != "true" {
@@ -1368,6 +1404,18 @@ fn clean_harness_worktree(session_id: &str, detail: Option<&SessionDetail>) -> R
     git_command(path, &["reset", "--hard"])?;
     git_command(path, &["clean", "-fd"])?;
     Ok(())
+}
+
+fn is_harness_nucleus_worktree_path(path: &Path, session_id: &str) -> bool {
+    let path_text = path.display().to_string();
+    path_text.contains(session_id)
+        && path.components().any(|component| {
+            component.as_os_str() == ".nucleus"
+                || component
+                    .as_os_str()
+                    .to_string_lossy()
+                    .starts_with(".nucleus-")
+        })
 }
 
 fn git_command(worktree: &Path, args: &[&str]) -> Result<String> {
@@ -1865,6 +1913,19 @@ mod tests {
     }
 
     #[test]
+    fn command_policy_rejects_external_env_paths() {
+        let call = tool_call_with_args(
+            "command.run",
+            json!({"command":"cargo","args":["test"],"cwd":".","env":{"CARGO_TARGET_DIR":"/tmp/outside"}}),
+        );
+
+        let verdict = evaluate_command_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(!verdict.approve);
+        assert!(verdict.reason.contains("outside the worker worktree"));
+    }
+
+    #[test]
     fn command_policy_rejects_shell_home_paths() {
         let call = tool_call_with_args(
             "command.run",
@@ -1972,6 +2033,19 @@ mod tests {
     }
 
     #[test]
+    fn tests_run_policy_rejects_external_env_paths() {
+        let call = tool_call_with_args(
+            "tests.run",
+            json!({"command":"npm","args":["test"],"cwd":".","env":{"TMPDIR":"/tmp/outside"}}),
+        );
+
+        let verdict = evaluate_tests_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(!verdict.approve);
+        assert!(verdict.reason.contains("outside the worker worktree"));
+    }
+
+    #[test]
     fn python_policy_rejects_parent_path_writes() {
         let call = tool_call_with_args(
             "python.run",
@@ -2058,6 +2132,22 @@ mod tests {
         assert!(!command_is_exact_read_only_probe("pwd"));
         assert!(!command_is_exact_read_only_probe(
             "sh -lc printf WRONG_PROBE"
+        ));
+    }
+
+    #[test]
+    fn cleanup_recognizes_default_nucleus_state_worktree() {
+        assert!(is_harness_nucleus_worktree_path(
+            Path::new("/home/eba/.nucleus/worktrees/session-123/work"),
+            "session-123"
+        ));
+        assert!(is_harness_nucleus_worktree_path(
+            Path::new("/home/eba/.nucleus-dev-projects/worktrees/session-123/work"),
+            "session-123"
+        ));
+        assert!(!is_harness_nucleus_worktree_path(
+            Path::new("/home/eba/projects/session-123/work"),
+            "session-123"
         ));
     }
 
