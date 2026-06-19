@@ -4752,8 +4752,12 @@ async fn handle_pending_action(
                 .collect::<Result<Vec<_>>>()?;
             let parent_job = state.store.get_job(job_id)?.job;
             let child_outcomes = child_job_join_outcomes_json(&child_details);
-            let daemon_completion_join =
-                is_single_successful_delegated_child_join(&parent_job, worker, &child_details);
+            let daemon_completion_join = is_single_successful_delegated_child_join(
+                &parent_job,
+                checkpoint,
+                worker,
+                &child_details,
+            );
             checkpoint.pending_action = None;
             checkpoint.next_prompt = if daemon_completion_join {
                 None
@@ -5964,19 +5968,39 @@ fn child_job_join_outcomes_json(child_details: &[JobDetail]) -> Vec<Value> {
         .collect::<Vec<_>>()
 }
 
-fn parent_allows_daemon_child_join_completion(parent_job: &JobSummary) -> bool {
-    parent_job.task_class.as_deref().is_none_or(|task_class| {
-        task_class.trim().is_empty() || task_class == DELEGATED_SUBTASK_TASK_CLASS
-    })
+fn checkpoint_has_explicit_daemon_child_join_contract(checkpoint: &WorkerCheckpoint) -> bool {
+    let text = normalized_delegation_text(&checkpoint.prompt_text);
+    contains_any_phrase(&text, &["spawn exactly one main child"])
+        && contains_any_phrase(
+            &text,
+            &[
+                "task_class delegated_subtask",
+                "task class delegated subtask",
+            ],
+        )
+        && contains_any_phrase(&text, &["root waits for that child"])
+        && contains_any_phrase(&text, &["then answers"])
+}
+
+fn parent_allows_daemon_child_join_completion(
+    parent_job: &JobSummary,
+    checkpoint: &WorkerCheckpoint,
+) -> bool {
+    match parent_job.task_class.as_deref().map(str::trim) {
+        Some(DELEGATED_SUBTASK_TASK_CLASS) => true,
+        Some("") | None => checkpoint_has_explicit_daemon_child_join_contract(checkpoint),
+        Some(_) => false,
+    }
 }
 
 fn is_single_successful_delegated_child_join(
     parent_job: &JobSummary,
+    checkpoint: &WorkerCheckpoint,
     worker: &WorkerSummary,
     child_details: &[JobDetail],
 ) -> bool {
     worker.parent_worker_id.is_none()
-        && parent_allows_daemon_child_join_completion(parent_job)
+        && parent_allows_daemon_child_join_completion(parent_job, checkpoint)
         && child_details.len() == 1
         && child_details[0].job.task_class.as_deref() == Some(DELEGATED_SUBTASK_TASK_CLASS)
         && child_job_join_outcome(&child_details[0]) == CHILD_OUTCOME_SUCCEEDED
@@ -6257,7 +6281,12 @@ async fn reuse_equivalent_child_jobs_if_any(
         .count();
     let child_outcomes = child_job_join_outcomes_json(&child_details);
     let daemon_completion_join = all_terminal
-        && is_single_successful_delegated_child_join(&parent.job, worker, &child_details);
+        && is_single_successful_delegated_child_join(
+            &parent.job,
+            checkpoint,
+            worker,
+            &child_details,
+        );
 
     *step += 1;
     *worker = state.store.update_worker(
@@ -33467,7 +33496,7 @@ Thanks."#,
                 {
                     "title": "Command Probe",
                     "prompt": "Run exactly this read-only command and report stdout: sh -lc 'printf NUCLEUS_COMMAND_RUN_PROBE'",
-                    "task_class": "local_project",
+                    "task_class": DELEGATED_SUBTASK_TASK_CLASS,
                     "working_dir": null
                 }
             ],
@@ -33513,18 +33542,19 @@ Thanks."#,
             .store
             .get_session(&session_id)
             .expect("session should load");
+        let prompt = "Dogfood ladder rung: read_only.\n\nSpawn exactly one main child with task_class delegated_subtask.\n\nRoot waits for that child, then answers with the child stdout.";
 
         start_prompt_job(
             state.clone(),
             session_id.clone(),
             SessionPromptRequest {
-                prompt: "Delegate one main child to run the command probe.".to_string(),
+                prompt: prompt.to_string(),
                 images: vec![],
                 task_class: None,
                 role: "main".to_string(),
             },
             current,
-            "Delegate one main child to run the command probe.".to_string(),
+            prompt.to_string(),
             "main".to_string(),
         )
         .await
@@ -33877,16 +33907,21 @@ Thanks."#,
         )
         .await
         .expect("fresh reuse check should not fail");
-        assert_eq!(fresh_reuse, Some(LoopDisposition::Return));
+        assert_eq!(fresh_reuse, Some(LoopDisposition::Continue));
         assert_eq!(step, 1);
-        assert!(checkpoint.next_prompt.is_none());
+        let next_prompt = checkpoint
+            .next_prompt
+            .as_deref()
+            .expect("fresh reuse should provide child results");
+        assert!(next_prompt.contains("fresh-equivalent-child"));
+        assert!(!next_prompt.contains("old-equivalent-child"));
         let parent = state.store.get_job(&parent_job_id).expect("parent loads");
-        assert_eq!(parent.job.state, "completed");
+        assert_eq!(parent.job.state, "running");
         assert!(parent.events.iter().any(|event| {
             event.event_type == "child.jobs.reused"
                 && event.data_json["child_job_ids"][0] == "fresh-equivalent-child"
                 && event.data_json["child_outcomes"][0]["join_outcome"] == "succeeded"
-                && event.data_json["join_decision"]["daemon_completed_parent"] == true
+                && event.data_json["join_decision"]["daemon_completed_parent"] == false
         }));
 
         let _ = fs::remove_dir_all(&state_dir);
