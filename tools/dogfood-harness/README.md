@@ -70,7 +70,7 @@ Cleanup always attempts to cancel the root job and deny remaining current-run ap
 
 ## Ladder Rungs
 
-- `read_only`: delegate one main child to run exactly `{"command":"sh","args":["-lc","printf NUCLEUS_COMMAND_RUN_PROBE"],"cwd":".","timeout_secs":20}`. PASS requires a utility root, Phase 1 child acceptance with no duplicate fanout, Phase 2 root convergence, a captured exact probe command exit 0, and no validation-evidence blocking.
+- `read_only`: delegate one main child to run exactly `{"command":"printf","args":["NUCLEUS_COMMAND_RUN_PROBE"],"cwd":".","timeout_secs":20}`. PASS requires a utility root, Phase 1 child acceptance with no duplicate fanout, Phase 2 root convergence, a captured exact probe command exit 0, and no validation-evidence blocking.
 - `edit_and_test`: delegate one main child to add a tiny helper plus unit test in the child worktree and run a focused test. PASS requires an edit, validation, accepted child status, root convergence, and no fanout.
 - `feature_161`: delegate issue #161 implementation. PASS requires Phase 1 child acceptance with no duplicate fanout, Phase 2 root convergence, and accepted implementation+validation evidence.
 - `debug`: delegate a bounded diagnose-and-fix task. PASS requires Phase 1 child acceptance with no duplicate fanout, Phase 2 root convergence, and at least one child diagnosis.
