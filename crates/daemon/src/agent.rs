@@ -6003,6 +6003,7 @@ fn is_single_successful_delegated_child_join(
         && parent_allows_daemon_child_join_completion(parent_job, checkpoint)
         && child_details.len() == 1
         && child_details[0].job.task_class.as_deref() == Some(DELEGATED_SUBTASK_TASK_CLASS)
+        && child_details[0].job.executor_lane == MAIN_EXECUTOR_LANE
         && child_job_join_outcome(&child_details[0]) == CHILD_OUTCOME_SUCCEEDED
 }
 
@@ -6049,7 +6050,7 @@ async fn complete_parent_from_successful_delegated_child_join(
             "child_outcomes": child_outcomes,
         }
     });
-    complete_job_with_final_answer(
+    complete_job_with_final_answer_with_additional_context_commands(
         state,
         session,
         job_id,
@@ -6060,6 +6061,7 @@ async fn complete_parent_from_successful_delegated_child_join(
         &final_answer,
         &metadata,
         &[],
+        &child_detail.command_sessions,
     )
     .await
 }
@@ -6520,6 +6522,35 @@ async fn complete_job_with_final_answer(
     final_answer_metadata: &Value,
     final_answer_artifacts: &[FinalAnswerArtifact],
 ) -> Result<()> {
+    complete_job_with_final_answer_with_additional_context_commands(
+        state,
+        session,
+        job_id,
+        worker,
+        step_count,
+        tool_call_count,
+        summary,
+        final_answer,
+        final_answer_metadata,
+        final_answer_artifacts,
+        &[],
+    )
+    .await
+}
+
+async fn complete_job_with_final_answer_with_additional_context_commands(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &mut WorkerSummary,
+    step_count: usize,
+    tool_call_count: usize,
+    summary: &str,
+    final_answer: &str,
+    final_answer_metadata: &Value,
+    final_answer_artifacts: &[FinalAnswerArtifact],
+    additional_context_command_sessions: &[CommandSessionSummary],
+) -> Result<()> {
     let detail = state.store.get_job(job_id)?;
     let mut publication_patch = publication_outcome_patch_with_metadata(
         &detail.job,
@@ -6566,8 +6597,14 @@ async fn complete_job_with_final_answer(
     }
 
     let completion_job_result =
-        record_context_integrity_detection(state, &session.session, job_id, Some(final_answer))
-            .await;
+        record_context_integrity_detection_with_additional_command_sessions(
+            state,
+            &session.session,
+            job_id,
+            Some(final_answer),
+            additional_context_command_sessions,
+        )
+        .await;
     state
         .agent
         .terminate_job_command_sessions(
@@ -7081,15 +7118,39 @@ async fn record_context_integrity_detection(
     job_id: &str,
     final_answer: Option<&str>,
 ) -> Result<JobSummary> {
+    record_context_integrity_detection_with_additional_command_sessions(
+        state,
+        session,
+        job_id,
+        final_answer,
+        &[],
+    )
+    .await
+}
+
+async fn record_context_integrity_detection_with_additional_command_sessions(
+    state: &AppState,
+    session: &SessionSummary,
+    job_id: &str,
+    final_answer: Option<&str>,
+    additional_command_sessions: &[CommandSessionSummary],
+) -> Result<JobSummary> {
     let detail = state.store.get_job(job_id)?;
     let current = detail.job;
+    let mut command_sessions = detail.command_sessions.clone();
+    let mut command_session_ids = command_sessions
+        .iter()
+        .map(|command_session| command_session.id.clone())
+        .collect::<BTreeSet<_>>();
+    for command_session in additional_command_sessions {
+        if command_session_ids.insert(command_session.id.clone()) {
+            command_sessions.push(command_session.clone());
+        }
+    }
     let mut patch = context_integrity_patch(state, session, &current);
     patch.command_session_cwd_evidence_json = Some(Some(
-        serde_json::to_string(&command_session_cwd_evidence(
-            session,
-            &detail.command_sessions,
-        ))
-        .unwrap_or_else(|_| "{}".to_string()),
+        serde_json::to_string(&command_session_cwd_evidence(session, &command_sessions))
+            .unwrap_or_else(|_| "{}".to_string()),
     ));
     patch.metadata_json = Some(context_integrity_metadata_with_session_state(
         state, session, &current, job_id,
@@ -7100,14 +7161,14 @@ async fn record_context_integrity_detection(
                 state,
                 session,
                 &current,
-                &detail.command_sessions,
+                &command_sessions,
                 final_answer,
             )?)
             .unwrap_or_else(|_| "{}".to_string()),
         ));
         patch.process_state_evidence_json = Some(Some(
             serde_json::to_string(
-                &process_state_evidence(state, &detail.command_sessions, final_answer).await?,
+                &process_state_evidence(state, &command_sessions, final_answer).await?,
             )
             .unwrap_or_else(|_| "{}".to_string()),
         ));
@@ -33515,7 +33576,7 @@ Thanks."#,
                     )
                 } else {
                     DynamicOpenAiProviderResponse::content(
-                        r#"{"kind":"final_answer","summary":"probe done","final_answer":"NUCLEUS_COMMAND_RUN_PROBE"}"#,
+                        r#"{"kind":"final_answer","summary":"probe done","final_answer":"The command succeeded: NUCLEUS_COMMAND_RUN_PROBE"}"#,
                     )
                 }
             })
@@ -33569,6 +33630,18 @@ Thanks."#,
         let parent = latest_job_detail(&state, &session_id);
         assert_eq!(parent.job.state, "completed");
         assert_eq!(parent.child_jobs.len(), 1);
+        let process_evidence = parent
+            .job
+            .process_state_evidence_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .expect("parent should record process evidence");
+        assert_eq!(process_evidence["status"], "satisfied");
+        assert_eq!(
+            process_evidence["claims"][0]["entity_type"],
+            "command_session"
+        );
+        assert_eq!(process_evidence["claims"][0]["matched"], true);
         let join_event = parent
             .events
             .iter()
@@ -33802,6 +33875,137 @@ Thanks."#,
         assert_eq!(
             join_event.data_json["join_decision"]["parent_task_class"],
             "local_project"
+        );
+        assert!(checkpoint.pending_action.is_none());
+        assert!(checkpoint.next_prompt.is_some());
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn successful_utility_lane_child_does_not_daemon_complete_parent() {
+        let state_dir = test_state_dir("successful-utility-child-no-daemon-join");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, mut worker) =
+            create_parent_fanout_context(&state, "utility-child-join", &workspace_root, "");
+        let child_job_id = "successful-utility-delegated-child".to_string();
+        state
+            .store
+            .create_job(JobRecord {
+                id: child_job_id.clone(),
+                session_id: Some(session.session.id.clone()),
+                parent_job_id: Some(parent_job_id.clone()),
+                template_id: None,
+                task_class: Some(DELEGATED_SUBTASK_TASK_CLASS.to_string()),
+                title: "Child Successful utility delegated child".to_string(),
+                purpose: "successful utility delegated child".to_string(),
+                trigger_kind: "child_job".to_string(),
+                state: "completed".to_string(),
+                requested_by: "agent".to_string(),
+                prompt_excerpt: String::new(),
+                publication_intent_text: None,
+            })
+            .expect("child job should persist");
+        let child_worker_id = "successful-utility-delegated-child-worker".to_string();
+        state
+            .store
+            .create_worker(WorkerRecord {
+                id: child_worker_id.clone(),
+                job_id: child_job_id.clone(),
+                parent_worker_id: Some(worker.id.clone()),
+                title: "Utility child worker".to_string(),
+                lane: ACTION_EXECUTOR_LANE.to_string(),
+                state: "completed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "utility-child-model".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: "test-key".to_string(),
+                provider_session_id: String::new(),
+                working_dir: workspace_root.display().to_string(),
+                read_roots: vec![workspace_root.display().to_string()],
+                write_roots: Vec::new(),
+                max_steps: 10,
+                max_tool_calls: 10,
+                max_wall_clock_secs: 300,
+            })
+            .expect("child worker should persist");
+        state
+            .store
+            .update_job(
+                &child_job_id,
+                JobPatch {
+                    root_worker_id: Some(child_worker_id),
+                    result_summary: Some("utility child succeeded".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child root worker should persist");
+
+        let prompt = "Dogfood ladder rung: read_only. Spawn exactly one main child with task_class delegated_subtask. Root waits for that child, then answers with the child stdout.";
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: prompt.to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: Some(PendingToolAction {
+                action_kind: "child_jobs".to_string(),
+                tool_call_id: String::new(),
+                approval_id: None,
+                command_session_id: None,
+                child_job_ids: vec![child_job_id.clone()],
+                summary: "join successful utility delegated child".to_string(),
+                tool: String::new(),
+                args: Value::Null,
+            }),
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        state
+            .store
+            .write_worker_checkpoint(
+                &worker.id,
+                &serde_json::to_value(&checkpoint).expect("checkpoint should encode"),
+            )
+            .expect("checkpoint should persist");
+        let mut step = 1;
+        let mut tool_calls = 0;
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+
+        let disposition = handle_pending_action(
+            &state,
+            &session,
+            &parent_job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            &mut tool_calls,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("utility child join should be handled");
+
+        assert_eq!(disposition, LoopDisposition::Continue);
+        let parent = state.store.get_job(&parent_job_id).expect("parent loads");
+        assert_eq!(parent.job.state, "running");
+        let child = state.store.get_job(&child_job_id).expect("child loads");
+        assert_eq!(child.job.executor_lane, ACTION_EXECUTOR_LANE);
+        let join_event = parent
+            .events
+            .iter()
+            .find(|event| event.event_type == "child.jobs.joined")
+            .expect("join event should persist");
+        assert_eq!(
+            join_event.data_json["child_outcomes"][0]["join_outcome"],
+            "succeeded"
+        );
+        assert_eq!(
+            join_event.data_json["join_decision"]["daemon_completed_parent"],
+            false
         );
         assert!(checkpoint.pending_action.is_none());
         assert!(checkpoint.next_prompt.is_some());
