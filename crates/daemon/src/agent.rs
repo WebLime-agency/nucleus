@@ -4750,9 +4750,10 @@ async fn handle_pending_action(
                 .iter()
                 .map(child_job_result_json)
                 .collect::<Result<Vec<_>>>()?;
+            let parent_job = state.store.get_job(job_id)?.job;
             let child_outcomes = child_job_join_outcomes_json(&child_details);
             let daemon_completion_join =
-                is_single_successful_delegated_child_join(worker, &child_details);
+                is_single_successful_delegated_child_join(&parent_job, worker, &child_details);
             checkpoint.pending_action = None;
             checkpoint.next_prompt = if daemon_completion_join {
                 None
@@ -4785,6 +4786,7 @@ async fn handle_pending_action(
                         "daemon_completed_parent": daemon_completion_join,
                         "required_outcome": CHILD_OUTCOME_SUCCEEDED,
                         "join_kind": if daemon_completion_join { "single_successful_delegated_child" } else { "prompt_join" },
+                        "parent_task_class": parent_job.task_class,
                     },
                 }),
             });
@@ -5962,11 +5964,19 @@ fn child_job_join_outcomes_json(child_details: &[JobDetail]) -> Vec<Value> {
         .collect::<Vec<_>>()
 }
 
+fn parent_allows_daemon_child_join_completion(parent_job: &JobSummary) -> bool {
+    parent_job.task_class.as_deref().is_none_or(|task_class| {
+        task_class.trim().is_empty() || task_class == DELEGATED_SUBTASK_TASK_CLASS
+    })
+}
+
 fn is_single_successful_delegated_child_join(
+    parent_job: &JobSummary,
     worker: &WorkerSummary,
     child_details: &[JobDetail],
 ) -> bool {
     worker.parent_worker_id.is_none()
+        && parent_allows_daemon_child_join_completion(parent_job)
         && child_details.len() == 1
         && child_details[0].job.task_class.as_deref() == Some(DELEGATED_SUBTASK_TASK_CLASS)
         && child_job_join_outcome(&child_details[0]) == CHILD_OUTCOME_SUCCEEDED
@@ -6246,8 +6256,8 @@ async fn reuse_equivalent_child_jobs_if_any(
         .filter(|detail| detail.job.state == "completed")
         .count();
     let child_outcomes = child_job_join_outcomes_json(&child_details);
-    let daemon_completion_join =
-        all_terminal && is_single_successful_delegated_child_join(worker, &child_details);
+    let daemon_completion_join = all_terminal
+        && is_single_successful_delegated_child_join(&parent.job, worker, &child_details);
 
     *step += 1;
     *worker = state.store.update_worker(
@@ -6318,6 +6328,7 @@ async fn reuse_equivalent_child_jobs_if_any(
                 "daemon_completed_parent": daemon_completion_join,
                 "required_outcome": CHILD_OUTCOME_SUCCEEDED,
                 "join_kind": if daemon_completion_join { "single_successful_delegated_child" } else if all_terminal { "prompt_join" } else { "wait_for_in_flight" },
+                "parent_task_class": parent.job.task_class,
             },
         }),
     });
@@ -33655,6 +33666,112 @@ Thanks."#,
         assert_eq!(
             join_event.data_json["join_decision"]["daemon_completed_parent"],
             false
+        );
+        assert!(checkpoint.pending_action.is_none());
+        assert!(checkpoint.next_prompt.is_some());
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn successful_probe_child_does_not_complete_gated_local_project_parent() {
+        let state_dir = test_state_dir("successful-probe-child-local-project-parent");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, mut worker) =
+            create_parent_fanout_context(&state, "local-project-probe-join", &workspace_root, "");
+        state
+            .store
+            .update_job(
+                &parent_job_id,
+                JobPatch {
+                    task_class: Some(Some("local_project".to_string())),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("parent task class should persist");
+        let child_job_id = "successful-delegated-probe-child".to_string();
+        state
+            .store
+            .create_job(JobRecord {
+                id: child_job_id.clone(),
+                session_id: Some(session.session.id.clone()),
+                parent_job_id: Some(parent_job_id.clone()),
+                template_id: None,
+                task_class: Some(DELEGATED_SUBTASK_TASK_CLASS.to_string()),
+                title: "Child Successful delegated probe".to_string(),
+                purpose: "successful delegated probe".to_string(),
+                trigger_kind: "child_job".to_string(),
+                state: "completed".to_string(),
+                requested_by: "agent".to_string(),
+                prompt_excerpt: String::new(),
+                publication_intent_text: None,
+            })
+            .expect("child job should persist");
+
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "join successful child under local project parent".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: Some(PendingToolAction {
+                action_kind: "child_jobs".to_string(),
+                tool_call_id: String::new(),
+                approval_id: None,
+                command_session_id: None,
+                child_job_ids: vec![child_job_id.clone()],
+                summary: "join successful delegated probe".to_string(),
+                tool: String::new(),
+                args: Value::Null,
+            }),
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        state
+            .store
+            .write_worker_checkpoint(
+                &worker.id,
+                &serde_json::to_value(&checkpoint).expect("checkpoint should encode"),
+            )
+            .expect("checkpoint should persist");
+        let mut step = 1;
+        let mut tool_calls = 0;
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+
+        let disposition = handle_pending_action(
+            &state,
+            &session,
+            &parent_job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            &mut tool_calls,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("successful child join should be handled");
+
+        assert_eq!(disposition, LoopDisposition::Continue);
+        let parent = state.store.get_job(&parent_job_id).expect("parent loads");
+        assert_eq!(parent.job.state, "running");
+        let join_event = parent
+            .events
+            .iter()
+            .find(|event| event.event_type == "child.jobs.joined")
+            .expect("join event should persist");
+        assert_eq!(
+            join_event.data_json["child_outcomes"][0]["join_outcome"],
+            "succeeded"
+        );
+        assert_eq!(
+            join_event.data_json["join_decision"]["daemon_completed_parent"],
+            false
+        );
+        assert_eq!(
+            join_event.data_json["join_decision"]["parent_task_class"],
+            "local_project"
         );
         assert!(checkpoint.pending_action.is_none());
         assert!(checkpoint.next_prompt.is_some());
