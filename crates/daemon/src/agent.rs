@@ -73,6 +73,10 @@ const DEFAULT_CHILD_JOB_MAX_TOOL_CALLS: usize = 48;
 const UTILITY_CHILD_MAX_STEPS: usize = 4;
 const UTILITY_CHILD_MAX_TOOL_CALLS: usize = 3;
 const DELEGATED_SUBTASK_TASK_CLASS: &str = "delegated_subtask";
+const CHILD_OUTCOME_SUCCEEDED: &str = "succeeded";
+const CHILD_OUTCOME_BLOCKED_RECOVERABLE: &str = "blocked_recoverable";
+const CHILD_OUTCOME_BLOCKED_TERMINAL: &str = "blocked_terminal";
+const CHILD_OUTCOME_CANCELED: &str = "canceled";
 const CHILD_JOB_POLL_INTERVAL_MS: u64 = 250;
 const SESSION_HISTORY_TURN_LIMIT: usize = 8;
 const TOOL_OUTPUT_CHAR_LIMIT: usize = 8_000;
@@ -3961,6 +3965,10 @@ async fn run_job_loop(
             return Ok(());
         }
         let low_context_turn = is_low_context_session_job(&session.session, &current_job);
+        let waiting_on_child_jobs = checkpoint
+            .pending_action
+            .as_ref()
+            .is_some_and(is_pending_child_job_action);
         if let LoopDisposition::Return = handle_pending_action(
             state,
             &session,
@@ -4019,6 +4027,10 @@ async fn run_job_loop(
             )
             .await?;
             return Ok(());
+        }
+
+        if waiting_on_child_jobs && checkpoint.pending_action.is_some() {
+            continue;
         }
 
         if !checkpoint.images.is_empty() && !worker_supports_vision_with_tools(&worker) {
@@ -4194,6 +4206,7 @@ async fn run_job_loop(
                     &mut worker,
                     &mut checkpoint,
                     &mut step,
+                    tool_calls,
                     summary,
                     jobs,
                 )
@@ -4201,6 +4214,7 @@ async fn run_job_loop(
                 {
                     return Ok(());
                 }
+                continue;
             }
             WorkerAction::FinalAnswer {
                 summary,
@@ -4736,9 +4750,20 @@ async fn handle_pending_action(
                 .iter()
                 .map(child_job_result_json)
                 .collect::<Result<Vec<_>>>()?;
+            let parent_job = state.store.get_job(job_id)?.job;
+            let child_outcomes = child_job_join_outcomes_json(&child_details);
+            let daemon_completion_join = is_single_successful_delegated_child_join(
+                &parent_job,
+                checkpoint,
+                worker,
+                &child_details,
+            );
             checkpoint.pending_action = None;
-            checkpoint.next_prompt =
-                Some(build_child_job_results_prompt(&pending.summary, &results));
+            checkpoint.next_prompt = if daemon_completion_join {
+                None
+            } else {
+                Some(build_child_job_results_prompt(&pending.summary, &results))
+            };
             state.store.write_worker_checkpoint(
                 &worker.id,
                 &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
@@ -4752,7 +4777,7 @@ async fn handle_pending_action(
                 job_id: job_id.to_string(),
                 worker_id: Some(worker.id.clone()),
                 event_type: "child.jobs.joined".to_string(),
-                status: "running".to_string(),
+                status: if daemon_completion_join { "completed" } else { "running" }.to_string(),
                 summary: format!("Joined {} child jobs", child_details.len()),
                 detail: format!(
                     "{} child jobs completed and {} ended without success.",
@@ -4760,8 +4785,30 @@ async fn handle_pending_action(
                 ),
                 data_json: json!({
                     "child_job_ids": pending.child_job_ids,
+                    "child_outcomes": child_outcomes,
+                    "join_decision": {
+                        "daemon_completed_parent": daemon_completion_join,
+                        "required_outcome": CHILD_OUTCOME_SUCCEEDED,
+                        "join_kind": if daemon_completion_join { "single_successful_delegated_child" } else { "prompt_join" },
+                        "parent_task_class": parent_job.task_class,
+                    },
                 }),
             });
+            if daemon_completion_join {
+                complete_parent_from_successful_delegated_child_join(
+                    state,
+                    session,
+                    job_id,
+                    worker,
+                    step.saturating_add(1),
+                    *tool_calls,
+                    &pending.summary,
+                    &child_details[0],
+                    &child_outcomes,
+                )
+                .await?;
+                return Ok(LoopDisposition::Return);
+            }
             publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
             publish_worker_updated(state, worker).await;
             return Ok(LoopDisposition::Continue);
@@ -5023,6 +5070,7 @@ async fn handle_tool_call_proposal(
             worker,
             checkpoint,
             step,
+            *tool_calls,
             enforcement.summary,
             vec![enforcement.child],
         )
@@ -5221,6 +5269,7 @@ async fn handle_child_job_proposal(
     worker: &mut WorkerSummary,
     checkpoint: &mut WorkerCheckpoint,
     step: &mut usize,
+    tool_calls: usize,
     summary: String,
     jobs: Vec<ChildJobProposal>,
 ) -> Result<LoopDisposition> {
@@ -5268,9 +5317,10 @@ async fn handle_child_job_proposal(
         jobs = vec![enforcement.child];
     }
 
-    if let Some(disposition) =
-        reuse_equivalent_child_jobs_if_any(state, job_id, worker, checkpoint, step, &summary, &jobs)
-            .await?
+    if let Some(disposition) = reuse_equivalent_child_jobs_if_any(
+        state, session, job_id, worker, checkpoint, step, tool_calls, &summary, &jobs,
+    )
+    .await?
     {
         return Ok(disposition);
     }
@@ -5886,6 +5936,201 @@ Return one JSON action for the next step. If the work is done, return final_answ
     )
 }
 
+fn child_job_join_outcome(detail: &JobDetail) -> &'static str {
+    if detail.job.state == "completed"
+        && matches!(
+            detail.job.completion_status.as_str(),
+            "satisfied" | "not_gated"
+        )
+    {
+        return CHILD_OUTCOME_SUCCEEDED;
+    }
+    if detail.job.state == "canceled" {
+        return CHILD_OUTCOME_CANCELED;
+    }
+    if detail.job.completion_status == "blocked" || detail.job.state == "failed" {
+        return CHILD_OUTCOME_BLOCKED_TERMINAL;
+    }
+    CHILD_OUTCOME_BLOCKED_RECOVERABLE
+}
+
+fn child_job_join_outcome_json(detail: &JobDetail) -> Value {
+    json!({
+        "job_id": detail.job.id,
+        "title": detail.job.title,
+        "task_class": detail.job.task_class,
+        "state": detail.job.state,
+        "completion_status": detail.job.completion_status,
+        "completion_blockers": detail.job.completion_blockers,
+        "join_outcome": child_job_join_outcome(detail),
+    })
+}
+
+fn child_job_join_outcomes_json(child_details: &[JobDetail]) -> Vec<Value> {
+    child_details
+        .iter()
+        .map(child_job_join_outcome_json)
+        .collect::<Vec<_>>()
+}
+
+fn checkpoint_has_explicit_daemon_child_join_contract(checkpoint: &WorkerCheckpoint) -> bool {
+    let text = normalized_delegation_text(&checkpoint.prompt_text);
+    contains_any_phrase(&text, &["spawn exactly one main child"])
+        && contains_any_phrase(
+            &text,
+            &[
+                "task_class delegated_subtask",
+                "task class delegated subtask",
+            ],
+        )
+        && contains_any_phrase(&text, &["root waits for that child"])
+        && contains_any_phrase(&text, &["then answers"])
+}
+
+fn parent_allows_daemon_child_join_completion(
+    parent_job: &JobSummary,
+    checkpoint: &WorkerCheckpoint,
+) -> bool {
+    match parent_job.task_class.as_deref().map(str::trim) {
+        Some(DELEGATED_SUBTASK_TASK_CLASS) => true,
+        Some("") | None => checkpoint_has_explicit_daemon_child_join_contract(checkpoint),
+        Some(_) => false,
+    }
+}
+
+fn is_single_successful_delegated_child_join(
+    parent_job: &JobSummary,
+    checkpoint: &WorkerCheckpoint,
+    worker: &WorkerSummary,
+    child_details: &[JobDetail],
+) -> bool {
+    worker.parent_worker_id.is_none()
+        && parent_allows_daemon_child_join_completion(parent_job, checkpoint)
+        && child_details.len() == 1
+        && child_details[0].job.task_class.as_deref() == Some(DELEGATED_SUBTASK_TASK_CLASS)
+        && child_details[0].job.executor_lane == MAIN_EXECUTOR_LANE
+        && child_job_join_outcome(&child_details[0]) == CHILD_OUTCOME_SUCCEEDED
+}
+
+fn child_join_final_answer(detail: &JobDetail) -> String {
+    let report = child_job_full_report_text(detail);
+    if !report.trim().is_empty() {
+        return report.trim().to_string();
+    }
+    if !detail.job.result_summary.trim().is_empty() {
+        return detail.job.result_summary.trim().to_string();
+    }
+    format!("{} completed successfully.", detail.job.title)
+}
+
+fn child_join_final_summary(detail: &JobDetail) -> String {
+    if !detail.job.result_summary.trim().is_empty() {
+        format!(
+            "Joined delegated child: {}",
+            detail.job.result_summary.trim()
+        )
+    } else {
+        format!("Joined delegated child {}", detail.job.title)
+    }
+}
+
+async fn complete_parent_from_successful_delegated_child_join(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &mut WorkerSummary,
+    step_count: usize,
+    tool_call_count: usize,
+    join_summary: &str,
+    child_detail: &JobDetail,
+    child_outcomes: &[Value],
+) -> Result<()> {
+    let summary = child_join_final_summary(child_detail);
+    let final_answer = child_join_final_answer(child_detail);
+    propagate_child_browser_verification_for_join(state, job_id, child_detail)?;
+    let metadata = json!({
+        "daemon_child_join": {
+            "join_summary": join_summary,
+            "join_kind": "single_successful_delegated_child",
+            "required_outcome": CHILD_OUTCOME_SUCCEEDED,
+            "child_outcomes": child_outcomes,
+        }
+    });
+    complete_job_with_final_answer_with_additional_context_commands(
+        state,
+        session,
+        job_id,
+        worker,
+        step_count,
+        tool_call_count,
+        &summary,
+        &final_answer,
+        &metadata,
+        &[],
+        &child_detail.command_sessions,
+    )
+    .await
+}
+
+fn propagate_child_browser_verification_for_join(
+    state: &AppState,
+    parent_job_id: &str,
+    child_detail: &JobDetail,
+) -> Result<()> {
+    let parent_job = state.store.get_job(parent_job_id)?.job;
+    if !parent_job.browser_verification_required {
+        return Ok(());
+    }
+    let child_status = child_detail.job.browser_verification_status.as_str();
+    if !matches!(
+        child_status,
+        "passed" | "failed" | "not_performed" | "unavailable"
+    ) {
+        return Ok(());
+    }
+    let summary = if child_detail
+        .job
+        .browser_verification_summary
+        .trim()
+        .is_empty()
+    {
+        format!(
+            "Propagated browser verification outcome from delegated child {}.",
+            child_detail.job.id
+        )
+    } else {
+        child_detail.job.browser_verification_summary.clone()
+    };
+    let artifact_ids = append_unique_ids(
+        parent_job.browser_verification_artifact_ids,
+        &child_detail.job.browser_verification_artifact_ids,
+    );
+    state.store.update_job(
+        parent_job_id,
+        JobPatch {
+            browser_verification_status: Some(child_status.to_string()),
+            browser_verification_summary: Some(summary.clone()),
+            browser_verification_artifact_ids: Some(artifact_ids.clone()),
+            ..JobPatch::default()
+        },
+    )?;
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: parent_job_id.to_string(),
+        worker_id: None,
+        event_type: "job.browser_verification.completed".to_string(),
+        status: child_status.to_string(),
+        summary: browser_verification_completion_label(child_status).to_string(),
+        detail: summary,
+        data_json: json!({
+            "status": child_status,
+            "artifact_ids": artifact_ids,
+            "source": "delegated_child_join",
+            "child_job_id": child_detail.job.id,
+        }),
+    });
+    Ok(())
+}
+
 fn is_pending_child_job_action(pending: &PendingToolAction) -> bool {
     pending.action_kind == "child_jobs" || !pending.child_job_ids.is_empty()
 }
@@ -5993,10 +6238,12 @@ fn parent_delegation_generation(detail: &JobDetail, exclude_child_ids: &BTreeSet
 
 async fn reuse_equivalent_child_jobs_if_any(
     state: &AppState,
+    session: &SessionDetail,
     job_id: &str,
     worker: &mut WorkerSummary,
     checkpoint: &mut WorkerCheckpoint,
     step: &mut usize,
+    tool_calls: usize,
     summary: &str,
     jobs: &[ChildJobProposal],
 ) -> Result<Option<LoopDisposition>> {
@@ -6099,6 +6346,14 @@ async fn reuse_equivalent_child_jobs_if_any(
         .iter()
         .filter(|detail| detail.job.state == "completed")
         .count();
+    let child_outcomes = child_job_join_outcomes_json(&child_details);
+    let daemon_completion_join = all_terminal
+        && is_single_successful_delegated_child_join(
+            &parent.job,
+            checkpoint,
+            worker,
+            &child_details,
+        );
 
     *step += 1;
     *worker = state.store.update_worker(
@@ -6124,7 +6379,11 @@ async fn reuse_equivalent_child_jobs_if_any(
             .map(child_job_result_json)
             .collect::<Result<Vec<_>>>()?;
         checkpoint.pending_action = None;
-        checkpoint.next_prompt = Some(build_child_job_results_prompt(&reuse_summary, &results));
+        checkpoint.next_prompt = if daemon_completion_join {
+            None
+        } else {
+            Some(build_child_job_results_prompt(&reuse_summary, &results))
+        };
     } else {
         checkpoint.pending_action = Some(PendingToolAction {
             action_kind: "child_jobs".to_string(),
@@ -6160,8 +6419,30 @@ async fn reuse_equivalent_child_jobs_if_any(
         data_json: json!({
             "child_job_ids": matched_child_ids,
             "requested_keys": requested_keys,
+            "child_outcomes": child_outcomes,
+            "join_decision": {
+                "daemon_completed_parent": daemon_completion_join,
+                "required_outcome": CHILD_OUTCOME_SUCCEEDED,
+                "join_kind": if daemon_completion_join { "single_successful_delegated_child" } else if all_terminal { "prompt_join" } else { "wait_for_in_flight" },
+                "parent_task_class": parent.job.task_class,
+            },
         }),
     });
+    if daemon_completion_join {
+        complete_parent_from_successful_delegated_child_join(
+            state,
+            session,
+            job_id,
+            worker,
+            *step,
+            tool_calls,
+            summary,
+            &child_details[0],
+            &child_outcomes,
+        )
+        .await?;
+        return Ok(Some(LoopDisposition::Return));
+    }
     publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
     publish_worker_updated(state, worker).await;
     Ok(Some(LoopDisposition::Continue))
@@ -6210,16 +6491,14 @@ fn format_duration(seconds: u64) -> Option<String> {
 }
 
 fn child_job_result_json(detail: &JobDetail) -> Result<Value> {
-    let report = detail
-        .artifacts
-        .iter()
-        .find(|artifact| artifact.kind == "child-report")
-        .map(|artifact| artifact.preview_text.clone())
-        .unwrap_or_default();
+    let report = child_job_report_preview_text(detail);
     Ok(json!({
         "job_id": detail.job.id,
         "title": detail.job.title,
         "state": detail.job.state,
+        "completion_status": detail.job.completion_status,
+        "completion_blockers": detail.job.completion_blockers,
+        "join_outcome": child_job_join_outcome(detail),
         "purpose": detail.job.purpose,
         "result_summary": detail.job.result_summary,
         "last_error": detail.job.last_error,
@@ -6276,6 +6555,26 @@ fn child_job_result_json(detail: &JobDetail) -> Result<Value> {
     }))
 }
 
+fn child_job_report_preview_text(detail: &JobDetail) -> String {
+    detail
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == "child-report")
+        .map(|artifact| artifact.preview_text.clone())
+        .unwrap_or_default()
+}
+
+fn child_job_full_report_text(detail: &JobDetail) -> String {
+    let Some(artifact) = detail
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == "child-report")
+    else {
+        return String::new();
+    };
+    fs::read_to_string(&artifact.path).unwrap_or_else(|_| artifact.preview_text.clone())
+}
+
 async fn complete_job_with_final_answer(
     state: &AppState,
     session: &SessionDetail,
@@ -6287,6 +6586,35 @@ async fn complete_job_with_final_answer(
     final_answer: &str,
     final_answer_metadata: &Value,
     final_answer_artifacts: &[FinalAnswerArtifact],
+) -> Result<()> {
+    complete_job_with_final_answer_with_additional_context_commands(
+        state,
+        session,
+        job_id,
+        worker,
+        step_count,
+        tool_call_count,
+        summary,
+        final_answer,
+        final_answer_metadata,
+        final_answer_artifacts,
+        &[],
+    )
+    .await
+}
+
+async fn complete_job_with_final_answer_with_additional_context_commands(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &mut WorkerSummary,
+    step_count: usize,
+    tool_call_count: usize,
+    summary: &str,
+    final_answer: &str,
+    final_answer_metadata: &Value,
+    final_answer_artifacts: &[FinalAnswerArtifact],
+    additional_context_command_sessions: &[CommandSessionSummary],
 ) -> Result<()> {
     let detail = state.store.get_job(job_id)?;
     let mut publication_patch = publication_outcome_patch_with_metadata(
@@ -6334,8 +6662,14 @@ async fn complete_job_with_final_answer(
     }
 
     let completion_job_result =
-        record_context_integrity_detection(state, &session.session, job_id, Some(final_answer))
-            .await;
+        record_context_integrity_detection_with_additional_command_sessions(
+            state,
+            &session.session,
+            job_id,
+            Some(final_answer),
+            additional_context_command_sessions,
+        )
+        .await;
     state
         .agent
         .terminate_job_command_sessions(
@@ -6849,8 +7183,35 @@ async fn record_context_integrity_detection(
     job_id: &str,
     final_answer: Option<&str>,
 ) -> Result<JobSummary> {
+    record_context_integrity_detection_with_additional_command_sessions(
+        state,
+        session,
+        job_id,
+        final_answer,
+        &[],
+    )
+    .await
+}
+
+async fn record_context_integrity_detection_with_additional_command_sessions(
+    state: &AppState,
+    session: &SessionSummary,
+    job_id: &str,
+    final_answer: Option<&str>,
+    additional_command_sessions: &[CommandSessionSummary],
+) -> Result<JobSummary> {
     let detail = state.store.get_job(job_id)?;
     let current = detail.job;
+    let mut command_sessions = detail.command_sessions.clone();
+    let mut command_session_ids = command_sessions
+        .iter()
+        .map(|command_session| command_session.id.clone())
+        .collect::<BTreeSet<_>>();
+    for command_session in additional_command_sessions {
+        if command_session_ids.insert(command_session.id.clone()) {
+            command_sessions.push(command_session.clone());
+        }
+    }
     let mut patch = context_integrity_patch(state, session, &current);
     patch.command_session_cwd_evidence_json = Some(Some(
         serde_json::to_string(&command_session_cwd_evidence(
@@ -6868,14 +7229,14 @@ async fn record_context_integrity_detection(
                 state,
                 session,
                 &current,
-                &detail.command_sessions,
+                &command_sessions,
                 final_answer,
             )?)
             .unwrap_or_else(|_| "{}".to_string()),
         ));
         patch.process_state_evidence_json = Some(Some(
             serde_json::to_string(
-                &process_state_evidence(state, &detail.command_sessions, final_answer).await?,
+                &process_state_evidence(state, &command_sessions, final_answer).await?,
             )
             .unwrap_or_else(|_| "{}".to_string()),
         ));
@@ -23843,6 +24204,64 @@ Cleanup status: clean";
             result["events"][0]["data_json"]["final_response_metadata"]["cleanup_status"],
             "clean"
         );
+
+        let mut ungated_detail = detail;
+        ungated_detail.job.id = "child-ungated-outcome".to_string();
+        ungated_detail.job.task_class = None;
+        ungated_detail.job.publication_requested = false;
+        ungated_detail.job.publication_status = "not_requested".to_string();
+        ungated_detail.job.validation_status = "not_required".to_string();
+        ungated_detail.job.browser_verification_required = false;
+        ungated_detail.job.browser_verification_status = "not_required".to_string();
+        ungated_detail.job.cleanup_status = "not_required".to_string();
+        ungated_detail.job.completion_status = "not_gated".to_string();
+
+        let ungated_result =
+            child_job_result_json(&ungated_detail).expect("ungated child result should serialize");
+        assert_eq!(ungated_result["join_outcome"], "succeeded");
+        assert_eq!(ungated_result["completion_status"], "not_gated");
+    }
+
+    #[test]
+    fn child_join_final_answer_reads_full_child_report_artifact() {
+        let state_dir = test_state_dir("child-join-full-report");
+        fs::create_dir_all(&state_dir).expect("state dir should exist");
+        let report_path = state_dir.join("child-report.md");
+        let full_report = format!("{}-end", "full child report ".repeat(900));
+        fs::write(&report_path, &full_report).expect("report should persist");
+
+        let mut job = test_publication_job_summary("child-full-report");
+        job.title = "Child Full Report".to_string();
+        job.state = "completed".to_string();
+        job.result_summary = "short summary".to_string();
+        let detail = JobDetail {
+            job,
+            workers: Vec::new(),
+            child_jobs: Vec::new(),
+            tool_calls: Vec::new(),
+            approvals: Vec::new(),
+            artifacts: vec![ArtifactSummary {
+                id: "child-report-artifact".to_string(),
+                job_id: "child-full-report".to_string(),
+                worker_id: None,
+                tool_call_id: None,
+                command_session_id: None,
+                kind: "child-report".to_string(),
+                title: "Child report".to_string(),
+                path: report_path.display().to_string(),
+                mime_type: "text/markdown".to_string(),
+                size_bytes: full_report.len() as u64,
+                preview_text: "full child report ...".to_string(),
+                metadata_json: json!({}),
+                created_at: 0,
+            }],
+            command_sessions: Vec::new(),
+            events: Vec::new(),
+        };
+
+        assert_eq!(child_join_final_answer(&detail), full_report);
+
+        let _ = fs::remove_dir_all(&state_dir);
     }
 
     #[tokio::test]
@@ -33222,21 +33641,15 @@ Thanks."#,
                 {
                     "title": "Command Probe",
                     "prompt": "Run exactly this read-only command and report stdout: sh -lc 'printf NUCLEUS_COMMAND_RUN_PROBE'",
-                    "task_class": "local_project",
+                    "task_class": DELEGATED_SUBTASK_TASK_CLASS,
                     "working_dir": null
                 }
             ],
         })
         .to_string();
         let (utility_base_url, utility_count, _utility_bodies, utility_server) =
-            spawn_dynamic_openai_server(3, move |index, _body| {
-                if index <= 1 {
-                    DynamicOpenAiProviderResponse::content(spawn_action.clone())
-                } else {
-                    DynamicOpenAiProviderResponse::content(
-                        r#"{"kind":"final_answer","summary":"joined","final_answer":"The delegated probe returned NUCLEUS_COMMAND_RUN_PROBE."}"#,
-                    )
-                }
+            spawn_dynamic_openai_server(1, move |_index, _body| {
+                DynamicOpenAiProviderResponse::content(spawn_action.clone())
             })
             .await;
         let (main_base_url, main_count, _main_bodies, main_server) =
@@ -33247,7 +33660,7 @@ Thanks."#,
                     )
                 } else {
                     DynamicOpenAiProviderResponse::content(
-                        r#"{"kind":"final_answer","summary":"probe done","final_answer":"NUCLEUS_COMMAND_RUN_PROBE"}"#,
+                        r#"{"kind":"final_answer","summary":"probe done","final_answer":"The command succeeded: NUCLEUS_COMMAND_RUN_PROBE"}"#,
                     )
                 }
             })
@@ -33274,18 +33687,19 @@ Thanks."#,
             .store
             .get_session(&session_id)
             .expect("session should load");
+        let prompt = "Dogfood ladder rung: read_only.\n\nSpawn exactly one main child with task_class delegated_subtask.\n\nRoot waits for that child, then answers with the child stdout.";
 
         start_prompt_job(
             state.clone(),
             session_id.clone(),
             SessionPromptRequest {
-                prompt: "Delegate one main child to run the command probe.".to_string(),
+                prompt: prompt.to_string(),
                 images: vec![],
                 task_class: None,
                 role: "main".to_string(),
             },
             current,
-            "Delegate one main child to run the command probe.".to_string(),
+            prompt.to_string(),
             "main".to_string(),
         )
         .await
@@ -33294,17 +33708,36 @@ Thanks."#,
         let _ = wait_for_session_state(&state, &session_id, "active").await;
         utility_server.await.expect("utility server should finish");
         main_server.await.expect("main server should finish");
-        assert_eq!(utility_count.load(Ordering::SeqCst), 3);
+        assert_eq!(utility_count.load(Ordering::SeqCst), 1);
         assert_eq!(main_count.load(Ordering::SeqCst), 2);
 
         let parent = latest_job_detail(&state, &session_id);
         assert_eq!(parent.job.state, "completed");
         assert_eq!(parent.child_jobs.len(), 1);
-        assert!(
-            parent
-                .events
-                .iter()
-                .any(|event| event.event_type == "child.jobs.reused")
+        let process_evidence = parent
+            .job
+            .process_state_evidence_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .expect("parent should record process evidence");
+        assert_eq!(process_evidence["status"], "satisfied");
+        assert_eq!(
+            process_evidence["claims"][0]["entity_type"],
+            "command_session"
+        );
+        assert_eq!(process_evidence["claims"][0]["matched"], true);
+        let join_event = parent
+            .events
+            .iter()
+            .find(|event| event.event_type == "child.jobs.joined")
+            .expect("joined child event should persist");
+        assert_eq!(
+            join_event.data_json["child_outcomes"][0]["join_outcome"],
+            "succeeded"
+        );
+        assert_eq!(
+            join_event.data_json["join_decision"]["daemon_completed_parent"],
+            true
         );
         let child = parent.child_jobs.first().expect("child should exist");
         assert_eq!(child.executor_lane, MAIN_EXECUTOR_LANE);
@@ -33321,6 +33754,536 @@ Thanks."#,
                 .iter()
                 .any(|call| call.tool_id == "command.run" && call.status == "completed")
         );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn blocked_delegated_child_join_does_not_complete_parent() {
+        let state_dir = test_state_dir("blocked-delegated-child-join");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, mut worker) =
+            create_parent_fanout_context(&state, "blocked-child-join", &workspace_root, "");
+        let child_job_id = "blocked-delegated-child".to_string();
+        state
+            .store
+            .create_job(JobRecord {
+                id: child_job_id.clone(),
+                session_id: Some(session.session.id.clone()),
+                parent_job_id: Some(parent_job_id.clone()),
+                template_id: None,
+                task_class: Some(DELEGATED_SUBTASK_TASK_CLASS.to_string()),
+                title: "Child Blocked delegated child".to_string(),
+                purpose: "blocked delegated child".to_string(),
+                trigger_kind: "child_job".to_string(),
+                state: "blocked".to_string(),
+                requested_by: "agent".to_string(),
+                prompt_excerpt: String::new(),
+                publication_intent_text: None,
+            })
+            .expect("child job should persist");
+        state
+            .store
+            .update_job(
+                &child_job_id,
+                JobPatch {
+                    last_error: Some("Completion gate blocked the child.".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child job should update");
+
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "join blocked child".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: Some(PendingToolAction {
+                action_kind: "child_jobs".to_string(),
+                tool_call_id: String::new(),
+                approval_id: None,
+                command_session_id: None,
+                child_job_ids: vec![child_job_id.clone()],
+                summary: "join blocked delegated child".to_string(),
+                tool: String::new(),
+                args: Value::Null,
+            }),
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        state
+            .store
+            .write_worker_checkpoint(
+                &worker.id,
+                &serde_json::to_value(&checkpoint).expect("checkpoint should encode"),
+            )
+            .expect("checkpoint should persist");
+        let mut step = 1;
+        let mut tool_calls = 0;
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+
+        let disposition = handle_pending_action(
+            &state,
+            &session,
+            &parent_job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            &mut tool_calls,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("blocked child join should be handled");
+
+        assert_eq!(disposition, LoopDisposition::Continue);
+        let parent = state.store.get_job(&parent_job_id).expect("parent loads");
+        assert_eq!(parent.job.state, "running");
+        let join_event = parent
+            .events
+            .iter()
+            .find(|event| event.event_type == "child.jobs.joined")
+            .expect("join event should persist");
+        assert_eq!(
+            join_event.data_json["child_outcomes"][0]["join_outcome"],
+            "blocked_terminal"
+        );
+        assert_eq!(
+            join_event.data_json["join_decision"]["daemon_completed_parent"],
+            false
+        );
+        assert!(checkpoint.pending_action.is_none());
+        assert!(checkpoint.next_prompt.is_some());
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn successful_probe_child_does_not_complete_gated_local_project_parent() {
+        let state_dir = test_state_dir("successful-probe-child-local-project-parent");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, mut worker) =
+            create_parent_fanout_context(&state, "local-project-probe-join", &workspace_root, "");
+        state
+            .store
+            .update_job(
+                &parent_job_id,
+                JobPatch {
+                    task_class: Some(Some("local_project".to_string())),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("parent task class should persist");
+        let child_job_id = "successful-delegated-probe-child".to_string();
+        state
+            .store
+            .create_job(JobRecord {
+                id: child_job_id.clone(),
+                session_id: Some(session.session.id.clone()),
+                parent_job_id: Some(parent_job_id.clone()),
+                template_id: None,
+                task_class: Some(DELEGATED_SUBTASK_TASK_CLASS.to_string()),
+                title: "Child Successful delegated probe".to_string(),
+                purpose: "successful delegated probe".to_string(),
+                trigger_kind: "child_job".to_string(),
+                state: "completed".to_string(),
+                requested_by: "agent".to_string(),
+                prompt_excerpt: String::new(),
+                publication_intent_text: None,
+            })
+            .expect("child job should persist");
+
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "join successful child under local project parent".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: Some(PendingToolAction {
+                action_kind: "child_jobs".to_string(),
+                tool_call_id: String::new(),
+                approval_id: None,
+                command_session_id: None,
+                child_job_ids: vec![child_job_id.clone()],
+                summary: "join successful delegated probe".to_string(),
+                tool: String::new(),
+                args: Value::Null,
+            }),
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        state
+            .store
+            .write_worker_checkpoint(
+                &worker.id,
+                &serde_json::to_value(&checkpoint).expect("checkpoint should encode"),
+            )
+            .expect("checkpoint should persist");
+        let mut step = 1;
+        let mut tool_calls = 0;
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+
+        let disposition = handle_pending_action(
+            &state,
+            &session,
+            &parent_job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            &mut tool_calls,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("successful child join should be handled");
+
+        assert_eq!(disposition, LoopDisposition::Continue);
+        let parent = state.store.get_job(&parent_job_id).expect("parent loads");
+        assert_eq!(parent.job.state, "running");
+        let join_event = parent
+            .events
+            .iter()
+            .find(|event| event.event_type == "child.jobs.joined")
+            .expect("join event should persist");
+        assert_eq!(
+            join_event.data_json["child_outcomes"][0]["join_outcome"],
+            "succeeded"
+        );
+        assert_eq!(
+            join_event.data_json["join_decision"]["daemon_completed_parent"],
+            false
+        );
+        assert_eq!(
+            join_event.data_json["join_decision"]["parent_task_class"],
+            "local_project"
+        );
+        assert!(checkpoint.pending_action.is_none());
+        assert!(checkpoint.next_prompt.is_some());
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn successful_utility_lane_child_does_not_daemon_complete_parent() {
+        let state_dir = test_state_dir("successful-utility-child-no-daemon-join");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, mut worker) =
+            create_parent_fanout_context(&state, "utility-child-join", &workspace_root, "");
+        let child_job_id = "successful-utility-delegated-child".to_string();
+        state
+            .store
+            .create_job(JobRecord {
+                id: child_job_id.clone(),
+                session_id: Some(session.session.id.clone()),
+                parent_job_id: Some(parent_job_id.clone()),
+                template_id: None,
+                task_class: Some(DELEGATED_SUBTASK_TASK_CLASS.to_string()),
+                title: "Child Successful utility delegated child".to_string(),
+                purpose: "successful utility delegated child".to_string(),
+                trigger_kind: "child_job".to_string(),
+                state: "completed".to_string(),
+                requested_by: "agent".to_string(),
+                prompt_excerpt: String::new(),
+                publication_intent_text: None,
+            })
+            .expect("child job should persist");
+        let child_worker_id = "successful-utility-delegated-child-worker".to_string();
+        state
+            .store
+            .create_worker(WorkerRecord {
+                id: child_worker_id.clone(),
+                job_id: child_job_id.clone(),
+                parent_worker_id: Some(worker.id.clone()),
+                title: "Utility child worker".to_string(),
+                lane: ACTION_EXECUTOR_LANE.to_string(),
+                state: "completed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "utility-child-model".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: "test-key".to_string(),
+                provider_session_id: String::new(),
+                working_dir: workspace_root.display().to_string(),
+                read_roots: vec![workspace_root.display().to_string()],
+                write_roots: Vec::new(),
+                max_steps: 10,
+                max_tool_calls: 10,
+                max_wall_clock_secs: 300,
+            })
+            .expect("child worker should persist");
+        state
+            .store
+            .update_job(
+                &child_job_id,
+                JobPatch {
+                    root_worker_id: Some(child_worker_id),
+                    result_summary: Some("utility child succeeded".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child root worker should persist");
+
+        let prompt = "Dogfood ladder rung: read_only. Spawn exactly one main child with task_class delegated_subtask. Root waits for that child, then answers with the child stdout.";
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: prompt.to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: Some(PendingToolAction {
+                action_kind: "child_jobs".to_string(),
+                tool_call_id: String::new(),
+                approval_id: None,
+                command_session_id: None,
+                child_job_ids: vec![child_job_id.clone()],
+                summary: "join successful utility delegated child".to_string(),
+                tool: String::new(),
+                args: Value::Null,
+            }),
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        state
+            .store
+            .write_worker_checkpoint(
+                &worker.id,
+                &serde_json::to_value(&checkpoint).expect("checkpoint should encode"),
+            )
+            .expect("checkpoint should persist");
+        let mut step = 1;
+        let mut tool_calls = 0;
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+
+        let disposition = handle_pending_action(
+            &state,
+            &session,
+            &parent_job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            &mut tool_calls,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("utility child join should be handled");
+
+        assert_eq!(disposition, LoopDisposition::Continue);
+        let parent = state.store.get_job(&parent_job_id).expect("parent loads");
+        assert_eq!(parent.job.state, "running");
+        let child = state.store.get_job(&child_job_id).expect("child loads");
+        assert_eq!(child.job.executor_lane, ACTION_EXECUTOR_LANE);
+        let join_event = parent
+            .events
+            .iter()
+            .find(|event| event.event_type == "child.jobs.joined")
+            .expect("join event should persist");
+        assert_eq!(
+            join_event.data_json["child_outcomes"][0]["join_outcome"],
+            "succeeded"
+        );
+        assert_eq!(
+            join_event.data_json["join_decision"]["daemon_completed_parent"],
+            false
+        );
+        assert!(checkpoint.pending_action.is_none());
+        assert!(checkpoint.next_prompt.is_some());
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn successful_child_join_propagates_browser_verification_to_parent() {
+        let state_dir = test_state_dir("successful-child-join-browser-verification");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, mut worker) =
+            create_parent_fanout_context(&state, "browser-child-join", &workspace_root, "");
+        state
+            .store
+            .update_job(
+                &parent_job_id,
+                JobPatch {
+                    browser_verification_required: Some(true),
+                    browser_verification_status: Some("pending".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("parent browser gate should persist");
+        let child_job_id = "successful-browser-delegated-child".to_string();
+        state
+            .store
+            .create_job(JobRecord {
+                id: child_job_id.clone(),
+                session_id: Some(session.session.id.clone()),
+                parent_job_id: Some(parent_job_id.clone()),
+                template_id: None,
+                task_class: Some(DELEGATED_SUBTASK_TASK_CLASS.to_string()),
+                title: "Child Successful browser delegated child".to_string(),
+                purpose: "successful browser delegated child".to_string(),
+                trigger_kind: "child_job".to_string(),
+                state: "completed".to_string(),
+                requested_by: "agent".to_string(),
+                prompt_excerpt: String::new(),
+                publication_intent_text: None,
+            })
+            .expect("child job should persist");
+        let child_worker_id = "successful-browser-delegated-child-worker".to_string();
+        state
+            .store
+            .create_worker(WorkerRecord {
+                id: child_worker_id.clone(),
+                job_id: child_job_id.clone(),
+                parent_worker_id: Some(worker.id.clone()),
+                title: "Browser child worker".to_string(),
+                lane: MAIN_EXECUTOR_LANE.to_string(),
+                state: "completed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "main-child-model".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: "test-key".to_string(),
+                provider_session_id: String::new(),
+                working_dir: workspace_root.display().to_string(),
+                read_roots: vec![workspace_root.display().to_string()],
+                write_roots: vec![workspace_root.display().to_string()],
+                max_steps: 10,
+                max_tool_calls: 10,
+                max_wall_clock_secs: 300,
+            })
+            .expect("child worker should persist");
+        state
+            .store
+            .update_job(
+                &child_job_id,
+                JobPatch {
+                    root_worker_id: Some(child_worker_id),
+                    result_summary: Some("Verified the delegated UI change.".to_string()),
+                    browser_verification_required: Some(true),
+                    browser_verification_status: Some("passed".to_string()),
+                    browser_verification_summary: Some("Clicked through delegated UI.".to_string()),
+                    browser_verification_artifact_ids: Some(vec![
+                        "child-browser-artifact".to_string(),
+                    ]),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child browser verification should persist");
+
+        let prompt = "Dogfood ladder rung: read_only. Spawn exactly one main child with task_class delegated_subtask. Root waits for that child, then answers with the child stdout.";
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: prompt.to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: Some(PendingToolAction {
+                action_kind: "child_jobs".to_string(),
+                tool_call_id: String::new(),
+                approval_id: None,
+                command_session_id: None,
+                child_job_ids: vec![child_job_id.clone()],
+                summary: "join successful browser delegated child".to_string(),
+                tool: String::new(),
+                args: Value::Null,
+            }),
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        state
+            .store
+            .write_worker_checkpoint(
+                &worker.id,
+                &serde_json::to_value(&checkpoint).expect("checkpoint should encode"),
+            )
+            .expect("checkpoint should persist");
+        let mut step = 1;
+        let mut tool_calls = 0;
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+
+        let disposition = handle_pending_action(
+            &state,
+            &session,
+            &parent_job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            &mut tool_calls,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("browser child join should be handled");
+
+        assert_eq!(disposition, LoopDisposition::Return);
+        let parent = state.store.get_job(&parent_job_id).expect("parent loads");
+        assert_eq!(parent.job.state, "completed");
+        assert_eq!(parent.job.browser_verification_status, "passed");
+        assert_eq!(
+            parent.job.browser_verification_summary,
+            "Clicked through delegated UI."
+        );
+        assert_eq!(
+            parent.job.browser_verification_artifact_ids,
+            vec!["child-browser-artifact".to_string()]
+        );
+        assert!(parent.events.iter().any(|event| {
+            event.event_type == "job.browser_verification.completed"
+                && event.data_json["source"] == "delegated_child_join"
+                && event.data_json["child_job_id"] == child_job_id
+        }));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn child_command_evidence_does_not_pollute_parent_cwd_gate() {
+        let state_dir = test_state_dir("child-command-evidence-parent-cwd-gate");
+        let state = initialize_test_state(&state_dir);
+        let parent_root = state_dir.join("parent-root");
+        let child_root = state_dir.join("child-root");
+        fs::create_dir_all(&parent_root).expect("parent root should exist");
+        fs::create_dir_all(&child_root).expect("child root should exist");
+        let (session, parent_job_id, _worker) =
+            create_parent_fanout_context(&state, "child-command-cwd", &parent_root, "");
+        let mut child_command = test_command_session_summary("child-cmd", &child_root);
+        child_command.command = "cargo".to_string();
+        child_command.args = vec!["build".to_string()];
+        child_command.exit_code = Some(0);
+
+        record_context_integrity_detection_with_additional_command_sessions(
+            &state,
+            &session.session,
+            &parent_job_id,
+            Some("The command succeeded."),
+            &[child_command],
+        )
+        .await
+        .expect("context evidence should record");
+
+        let parent = state.store.get_job(&parent_job_id).expect("parent loads");
+        let cwd_evidence = parent
+            .job
+            .command_session_cwd_evidence_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .expect("cwd evidence should record");
+        assert_ne!(cwd_evidence["status"], "blocked");
+        assert!(cwd_evidence["observed_cwds"].as_array().unwrap().is_empty());
+        let process_evidence = parent
+            .job
+            .process_state_evidence_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .expect("process evidence should record");
+        assert_eq!(process_evidence["status"], "satisfied");
+        assert_eq!(process_evidence["claims"][0]["matched"], true);
 
         let _ = fs::remove_dir_all(&state_dir);
     }
@@ -33395,10 +34358,12 @@ Thanks."#,
         let mut step = 0;
         let stale_reuse = reuse_equivalent_child_jobs_if_any(
             &state,
+            &session,
             &parent_job_id,
             &mut worker,
             &mut checkpoint,
             &mut step,
+            0,
             "delegate command probe",
             std::slice::from_ref(&proposal),
         )
@@ -33410,10 +34375,12 @@ Thanks."#,
         create_completed_child("fresh-equivalent-child", Some(&delegation_key), Some(2));
         let fresh_reuse = reuse_equivalent_child_jobs_if_any(
             &state,
+            &session,
             &parent_job_id,
             &mut worker,
             &mut checkpoint,
             &mut step,
+            0,
             "delegate command probe",
             &[proposal],
         )
@@ -33428,9 +34395,12 @@ Thanks."#,
         assert!(next_prompt.contains("fresh-equivalent-child"));
         assert!(!next_prompt.contains("old-equivalent-child"));
         let parent = state.store.get_job(&parent_job_id).expect("parent loads");
+        assert_eq!(parent.job.state, "running");
         assert!(parent.events.iter().any(|event| {
             event.event_type == "child.jobs.reused"
                 && event.data_json["child_job_ids"][0] == "fresh-equivalent-child"
+                && event.data_json["child_outcomes"][0]["join_outcome"] == "succeeded"
+                && event.data_json["join_decision"]["daemon_completed_parent"] == false
         }));
 
         let _ = fs::remove_dir_all(&state_dir);
@@ -33613,6 +34583,7 @@ Thanks."#,
             &mut worker,
             &mut checkpoint,
             &mut step,
+            0,
             "fan out".to_string(),
             vec![ChildJobProposal {
                 title: "Missing route".to_string(),
@@ -33717,6 +34688,7 @@ Thanks."#,
             &mut worker,
             &mut checkpoint,
             &mut step,
+            0,
             "delegate broad implementation work".to_string(),
             vec![ChildJobProposal {
                 title: "Main implementation owner".to_string(),
@@ -33786,6 +34758,7 @@ Thanks."#,
                 &mut child_worker,
                 &mut checkpoint,
                 &mut step,
+                0,
                 "fan out".to_string(),
                 vec![ChildJobProposal {
                     title: "Nested".to_string(),
@@ -33840,6 +34813,7 @@ Thanks."#,
             &mut worker,
             &mut checkpoint,
             &mut step,
+            0,
             "fan out".to_string(),
             vec![ChildJobProposal {
                 title: "Disabled route".to_string(),
@@ -34974,6 +35948,7 @@ Thanks."#,
             &mut worker,
             &mut checkpoint,
             &mut step,
+            0,
             "fan out scoped utility work".to_string(),
             vec![ChildJobProposal {
                 title: "Scoped utility research".to_string(),
@@ -35043,6 +36018,7 @@ Thanks."#,
             &mut worker,
             &mut checkpoint,
             &mut step,
+            0,
             "fan out broad repo work on utility".to_string(),
             vec![ChildJobProposal {
                 title: "Implementation research".to_string(),
@@ -35099,6 +36075,7 @@ Thanks."#,
             &mut worker,
             &mut checkpoint,
             &mut step,
+            0,
             "fan out test run on utility".to_string(),
             vec![ChildJobProposal {
                 title: "Test runner".to_string(),
@@ -35162,6 +36139,7 @@ Thanks."#,
             &mut worker,
             &mut checkpoint,
             &mut step,
+            0,
             "delegate a read-only probe".to_string(),
             vec![ChildJobProposal {
                 title: "Read-only command probe".to_string(),
@@ -35245,6 +36223,7 @@ Thanks."#,
             &mut worker,
             &mut checkpoint,
             &mut step,
+            0,
             "fan out mixed scoped utility work".to_string(),
             vec![
                 ChildJobProposal {
@@ -35337,6 +36316,7 @@ Thanks."#,
             &mut worker,
             &mut checkpoint,
             &mut step,
+            0,
             "fan out screenshot utility research".to_string(),
             vec![ChildJobProposal {
                 title: "Broad utility screenshot research".to_string(),
@@ -35583,6 +36563,7 @@ Return one JSON action for the next step."
             &mut worker,
             &mut checkpoint,
             &mut step,
+            0,
             "fan out screenshot utility research after triage".to_string(),
             vec![ChildJobProposal {
                 title: "Broad utility screenshot research".to_string(),
@@ -35645,6 +36626,7 @@ Return one JSON action for the next step."
             &mut worker,
             &mut checkpoint,
             &mut step,
+            0,
             "fan out screenshot fix and cheap check".to_string(),
             vec![
                 ChildJobProposal {
@@ -35762,6 +36744,7 @@ Return one JSON action for the next step."
             &mut worker,
             &mut checkpoint,
             &mut step,
+            0,
             "fan out broad utility repo research".to_string(),
             vec![ChildJobProposal {
                 title: "Broad utility repo research".to_string(),
@@ -35822,6 +36805,7 @@ Return one JSON action for the next step."
             &mut worker,
             &mut checkpoint,
             &mut step,
+            0,
             "run one deterministic utility check".to_string(),
             vec![ChildJobProposal {
                 title: "Verify README marker".to_string(),
@@ -35890,6 +36874,7 @@ Return one JSON action for the next step."
             &mut worker,
             &mut checkpoint,
             &mut step,
+            0,
             "run one process status check".to_string(),
             vec![ChildJobProposal {
                 title: "Verify process status".to_string(),
@@ -35964,6 +36949,7 @@ Return one JSON action for the next step."
             &mut worker,
             &mut checkpoint,
             &mut step,
+            0,
             "run one bounded check".to_string(),
             vec![ChildJobProposal {
                 title: "Verify README marker".to_string(),
@@ -36035,6 +37021,7 @@ Return one JSON action for the next step."
             &mut worker,
             &mut checkpoint,
             &mut step,
+            0,
             "fan out mixed route work".to_string(),
             vec![
                 ChildJobProposal {
@@ -36122,6 +37109,7 @@ Return one JSON action for the next step."
             &mut worker,
             &mut checkpoint,
             &mut step,
+            0,
             "fan out mixed multi-main work".to_string(),
             vec![
                 ChildJobProposal {
@@ -36209,6 +37197,7 @@ Return one JSON action for the next step."
             &mut worker,
             &mut checkpoint,
             &mut step,
+            0,
             "fan out broad utility work".to_string(),
             vec![ChildJobProposal {
                 title: "Broad utility search".to_string(),
