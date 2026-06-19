@@ -7214,8 +7214,11 @@ async fn record_context_integrity_detection_with_additional_command_sessions(
     }
     let mut patch = context_integrity_patch(state, session, &current);
     patch.command_session_cwd_evidence_json = Some(Some(
-        serde_json::to_string(&command_session_cwd_evidence(session, &command_sessions))
-            .unwrap_or_else(|_| "{}".to_string()),
+        serde_json::to_string(&command_session_cwd_evidence(
+            session,
+            &detail.command_sessions,
+        ))
+        .unwrap_or_else(|_| "{}".to_string()),
     ));
     patch.metadata_json = Some(context_integrity_metadata_with_session_state(
         state, session, &current, job_id,
@@ -34235,6 +34238,52 @@ Thanks."#,
                 && event.data_json["source"] == "delegated_child_join"
                 && event.data_json["child_job_id"] == child_job_id
         }));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn child_command_evidence_does_not_pollute_parent_cwd_gate() {
+        let state_dir = test_state_dir("child-command-evidence-parent-cwd-gate");
+        let state = initialize_test_state(&state_dir);
+        let parent_root = state_dir.join("parent-root");
+        let child_root = state_dir.join("child-root");
+        fs::create_dir_all(&parent_root).expect("parent root should exist");
+        fs::create_dir_all(&child_root).expect("child root should exist");
+        let (session, parent_job_id, _worker) =
+            create_parent_fanout_context(&state, "child-command-cwd", &parent_root, "");
+        let mut child_command = test_command_session_summary("child-cmd", &child_root);
+        child_command.command = "cargo".to_string();
+        child_command.args = vec!["build".to_string()];
+        child_command.exit_code = Some(0);
+
+        record_context_integrity_detection_with_additional_command_sessions(
+            &state,
+            &session.session,
+            &parent_job_id,
+            Some("The command succeeded."),
+            &[child_command],
+        )
+        .await
+        .expect("context evidence should record");
+
+        let parent = state.store.get_job(&parent_job_id).expect("parent loads");
+        let cwd_evidence = parent
+            .job
+            .command_session_cwd_evidence_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .expect("cwd evidence should record");
+        assert_ne!(cwd_evidence["status"], "blocked");
+        assert!(cwd_evidence["observed_cwds"].as_array().unwrap().is_empty());
+        let process_evidence = parent
+            .job
+            .process_state_evidence_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .expect("process evidence should record");
+        assert_eq!(process_evidence["status"], "satisfied");
+        assert_eq!(process_evidence["claims"][0]["matched"], true);
 
         let _ = fs::remove_dir_all(&state_dir);
     }
