@@ -1406,9 +1406,10 @@ fn local_project_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary
     let failed = evidence_with_prefix(job, "failed_command");
     let waived = has_evidence(job, "waiver:command_failure");
     let has_validation = job.validation_status == "passed" || has_evidence(job, "validation");
+    let has_delegated_child_join = has_evidence(job, "delegated_child_join");
     let state = if !failed.is_empty() && !waived {
         "blocked"
-    } else if has_validation {
+    } else if has_validation || has_delegated_child_join {
         "done"
     } else if terminal || job.validation_status == "failed" {
         "blocked"
@@ -1416,6 +1417,9 @@ fn local_project_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary
         "pending"
     };
     let summary = match state {
+        "done" if has_delegated_child_join && !has_validation => {
+            "Delegated child evidence satisfies the parent join contract.".to_string()
+        }
         "done" => "Local validation evidence is recorded.".to_string(),
         "pending" => "Local validation evidence is still pending.".to_string(),
         _ if !failed.is_empty() && !waived => {
@@ -1435,7 +1439,15 @@ fn local_project_gate(job: &JobSummary, terminal: bool) -> CompletionGateSummary
         summary,
         "local_project",
         required_evidence_for("local_project", &["validation"]),
-        evidence_for_requirements(job, &["validation", "failed_command", "waiver"]),
+        evidence_for_requirements(
+            job,
+            &[
+                "validation",
+                "delegated_child_join",
+                "failed_command",
+                "waiver",
+            ],
+        ),
     )
 }
 
@@ -4004,6 +4016,32 @@ mod tests {
                 .iter()
                 .any(|blocker| { blocker.contains("without successful validation evidence") })
         );
+    }
+
+    #[test]
+    fn local_project_gate_accepts_daemon_delegated_child_join_evidence() {
+        let local_project = task_class_job(
+            "local_project",
+            vec!["delegated_child_join:Joined 1 child jobs".to_string()],
+        )
+        .with_completion_gates();
+
+        assert_eq!(local_project.completion_status, "satisfied");
+        let gate = local_project
+            .completion_gates
+            .iter()
+            .find(|gate| gate.id == "local_project_evidence")
+            .expect("local project gate should exist");
+        assert_eq!(gate.state, "done");
+        assert!(
+            gate.evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("delegated_child_join:"))
+        );
+        assert!(local_project.completion_blockers.is_empty());
+
+        let direct_claim = task_class_job("local_project", Vec::new()).with_completion_gates();
+        assert_eq!(direct_claim.completion_status, "blocked");
     }
 
     #[test]
