@@ -6042,6 +6042,7 @@ async fn complete_parent_from_successful_delegated_child_join(
 ) -> Result<()> {
     let summary = child_join_final_summary(child_detail);
     let final_answer = child_join_final_answer(child_detail);
+    propagate_child_browser_verification_for_join(state, job_id, child_detail)?;
     let metadata = json!({
         "daemon_child_join": {
             "join_summary": join_summary,
@@ -6064,6 +6065,65 @@ async fn complete_parent_from_successful_delegated_child_join(
         &child_detail.command_sessions,
     )
     .await
+}
+
+fn propagate_child_browser_verification_for_join(
+    state: &AppState,
+    parent_job_id: &str,
+    child_detail: &JobDetail,
+) -> Result<()> {
+    let parent_job = state.store.get_job(parent_job_id)?.job;
+    if !parent_job.browser_verification_required {
+        return Ok(());
+    }
+    let child_status = child_detail.job.browser_verification_status.as_str();
+    if !matches!(
+        child_status,
+        "passed" | "failed" | "not_performed" | "unavailable"
+    ) {
+        return Ok(());
+    }
+    let summary = if child_detail
+        .job
+        .browser_verification_summary
+        .trim()
+        .is_empty()
+    {
+        format!(
+            "Propagated browser verification outcome from delegated child {}.",
+            child_detail.job.id
+        )
+    } else {
+        child_detail.job.browser_verification_summary.clone()
+    };
+    let artifact_ids = append_unique_ids(
+        parent_job.browser_verification_artifact_ids,
+        &child_detail.job.browser_verification_artifact_ids,
+    );
+    state.store.update_job(
+        parent_job_id,
+        JobPatch {
+            browser_verification_status: Some(child_status.to_string()),
+            browser_verification_summary: Some(summary.clone()),
+            browser_verification_artifact_ids: Some(artifact_ids.clone()),
+            ..JobPatch::default()
+        },
+    )?;
+    let _ = state.store.append_job_event(JobEventRecord {
+        job_id: parent_job_id.to_string(),
+        worker_id: None,
+        event_type: "job.browser_verification.completed".to_string(),
+        status: child_status.to_string(),
+        summary: browser_verification_completion_label(child_status).to_string(),
+        detail: summary,
+        data_json: json!({
+            "status": child_status,
+            "artifact_ids": artifact_ids,
+            "source": "delegated_child_join",
+            "child_job_id": child_detail.job.id,
+        }),
+    });
+    Ok(())
 }
 
 fn is_pending_child_job_action(pending: &PendingToolAction) -> bool {
@@ -34009,6 +34069,151 @@ Thanks."#,
         );
         assert!(checkpoint.pending_action.is_none());
         assert!(checkpoint.next_prompt.is_some());
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn successful_child_join_propagates_browser_verification_to_parent() {
+        let state_dir = test_state_dir("successful-child-join-browser-verification");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, mut worker) =
+            create_parent_fanout_context(&state, "browser-child-join", &workspace_root, "");
+        state
+            .store
+            .update_job(
+                &parent_job_id,
+                JobPatch {
+                    browser_verification_required: Some(true),
+                    browser_verification_status: Some("pending".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("parent browser gate should persist");
+        let child_job_id = "successful-browser-delegated-child".to_string();
+        state
+            .store
+            .create_job(JobRecord {
+                id: child_job_id.clone(),
+                session_id: Some(session.session.id.clone()),
+                parent_job_id: Some(parent_job_id.clone()),
+                template_id: None,
+                task_class: Some(DELEGATED_SUBTASK_TASK_CLASS.to_string()),
+                title: "Child Successful browser delegated child".to_string(),
+                purpose: "successful browser delegated child".to_string(),
+                trigger_kind: "child_job".to_string(),
+                state: "completed".to_string(),
+                requested_by: "agent".to_string(),
+                prompt_excerpt: String::new(),
+                publication_intent_text: None,
+            })
+            .expect("child job should persist");
+        let child_worker_id = "successful-browser-delegated-child-worker".to_string();
+        state
+            .store
+            .create_worker(WorkerRecord {
+                id: child_worker_id.clone(),
+                job_id: child_job_id.clone(),
+                parent_worker_id: Some(worker.id.clone()),
+                title: "Browser child worker".to_string(),
+                lane: MAIN_EXECUTOR_LANE.to_string(),
+                state: "completed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "main-child-model".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: "test-key".to_string(),
+                provider_session_id: String::new(),
+                working_dir: workspace_root.display().to_string(),
+                read_roots: vec![workspace_root.display().to_string()],
+                write_roots: vec![workspace_root.display().to_string()],
+                max_steps: 10,
+                max_tool_calls: 10,
+                max_wall_clock_secs: 300,
+            })
+            .expect("child worker should persist");
+        state
+            .store
+            .update_job(
+                &child_job_id,
+                JobPatch {
+                    root_worker_id: Some(child_worker_id),
+                    result_summary: Some("Verified the delegated UI change.".to_string()),
+                    browser_verification_required: Some(true),
+                    browser_verification_status: Some("passed".to_string()),
+                    browser_verification_summary: Some("Clicked through delegated UI.".to_string()),
+                    browser_verification_artifact_ids: Some(vec![
+                        "child-browser-artifact".to_string(),
+                    ]),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child browser verification should persist");
+
+        let prompt = "Dogfood ladder rung: read_only. Spawn exactly one main child with task_class delegated_subtask. Root waits for that child, then answers with the child stdout.";
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: prompt.to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: Some(PendingToolAction {
+                action_kind: "child_jobs".to_string(),
+                tool_call_id: String::new(),
+                approval_id: None,
+                command_session_id: None,
+                child_job_ids: vec![child_job_id.clone()],
+                summary: "join successful browser delegated child".to_string(),
+                tool: String::new(),
+                args: Value::Null,
+            }),
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        state
+            .store
+            .write_worker_checkpoint(
+                &worker.id,
+                &serde_json::to_value(&checkpoint).expect("checkpoint should encode"),
+            )
+            .expect("checkpoint should persist");
+        let mut step = 1;
+        let mut tool_calls = 0;
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+
+        let disposition = handle_pending_action(
+            &state,
+            &session,
+            &parent_job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            &mut tool_calls,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("browser child join should be handled");
+
+        assert_eq!(disposition, LoopDisposition::Return);
+        let parent = state.store.get_job(&parent_job_id).expect("parent loads");
+        assert_eq!(parent.job.state, "completed");
+        assert_eq!(parent.job.browser_verification_status, "passed");
+        assert_eq!(
+            parent.job.browser_verification_summary,
+            "Clicked through delegated UI."
+        );
+        assert_eq!(
+            parent.job.browser_verification_artifact_ids,
+            vec!["child-browser-artifact".to_string()]
+        );
+        assert!(parent.events.iter().any(|event| {
+            event.event_type == "job.browser_verification.completed"
+                && event.data_json["source"] == "delegated_child_join"
+                && event.data_json["child_job_id"] == child_job_id
+        }));
 
         let _ = fs::remove_dir_all(&state_dir);
     }
