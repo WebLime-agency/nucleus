@@ -5937,7 +5937,12 @@ Return one JSON action for the next step. If the work is done, return final_answ
 }
 
 fn child_job_join_outcome(detail: &JobDetail) -> &'static str {
-    if detail.job.state == "completed" && detail.job.completion_status == "satisfied" {
+    if detail.job.state == "completed"
+        && matches!(
+            detail.job.completion_status.as_str(),
+            "satisfied" | "not_gated"
+        )
+    {
         return CHILD_OUTCOME_SUCCEEDED;
     }
     if detail.job.state == "canceled" {
@@ -24196,6 +24201,22 @@ Cleanup status: clean";
             result["events"][0]["data_json"]["final_response_metadata"]["cleanup_status"],
             "clean"
         );
+
+        let mut ungated_detail = detail;
+        ungated_detail.job.id = "child-ungated-outcome".to_string();
+        ungated_detail.job.task_class = None;
+        ungated_detail.job.publication_requested = false;
+        ungated_detail.job.publication_status = "not_requested".to_string();
+        ungated_detail.job.validation_status = "not_required".to_string();
+        ungated_detail.job.browser_verification_required = false;
+        ungated_detail.job.browser_verification_status = "not_required".to_string();
+        ungated_detail.job.cleanup_status = "not_required".to_string();
+        ungated_detail.job.completion_status = "not_gated".to_string();
+
+        let ungated_result =
+            child_job_result_json(&ungated_detail).expect("ungated child result should serialize");
+        assert_eq!(ungated_result["join_outcome"], "succeeded");
+        assert_eq!(ungated_result["completion_status"], "not_gated");
     }
 
     #[test]
