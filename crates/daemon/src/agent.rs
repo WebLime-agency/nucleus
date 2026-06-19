@@ -3983,9 +3983,6 @@ async fn run_job_loop(
         {
             return Ok(());
         }
-        if waiting_on_child_jobs && checkpoint.pending_action.is_some() {
-            continue;
-        }
 
         if worker_wall_clock_exceeded(&worker, unix_timestamp()) {
             complete_job_with_budget_checkpoint(
@@ -4030,6 +4027,10 @@ async fn run_job_loop(
             )
             .await?;
             return Ok(());
+        }
+
+        if waiting_on_child_jobs && checkpoint.pending_action.is_some() {
+            continue;
         }
 
         if !checkpoint.images.is_empty() && !worker_supports_vision_with_tools(&worker) {
@@ -5972,7 +5973,7 @@ fn is_single_successful_delegated_child_join(
 }
 
 fn child_join_final_answer(detail: &JobDetail) -> String {
-    let report = child_job_report_text(detail);
+    let report = child_job_full_report_text(detail);
     if !report.trim().is_empty() {
         return report.trim().to_string();
     }
@@ -6383,7 +6384,7 @@ fn format_duration(seconds: u64) -> Option<String> {
 }
 
 fn child_job_result_json(detail: &JobDetail) -> Result<Value> {
-    let report = child_job_report_text(detail);
+    let report = child_job_report_preview_text(detail);
     Ok(json!({
         "job_id": detail.job.id,
         "title": detail.job.title,
@@ -6447,13 +6448,24 @@ fn child_job_result_json(detail: &JobDetail) -> Result<Value> {
     }))
 }
 
-fn child_job_report_text(detail: &JobDetail) -> String {
+fn child_job_report_preview_text(detail: &JobDetail) -> String {
     detail
         .artifacts
         .iter()
         .find(|artifact| artifact.kind == "child-report")
         .map(|artifact| artifact.preview_text.clone())
         .unwrap_or_default()
+}
+
+fn child_job_full_report_text(detail: &JobDetail) -> String {
+    let Some(artifact) = detail
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == "child-report")
+    else {
+        return String::new();
+    };
+    fs::read_to_string(&artifact.path).unwrap_or_else(|_| artifact.preview_text.clone())
 }
 
 async fn complete_job_with_final_answer(
@@ -24023,6 +24035,48 @@ Cleanup status: clean";
             result["events"][0]["data_json"]["final_response_metadata"]["cleanup_status"],
             "clean"
         );
+    }
+
+    #[test]
+    fn child_join_final_answer_reads_full_child_report_artifact() {
+        let state_dir = test_state_dir("child-join-full-report");
+        fs::create_dir_all(&state_dir).expect("state dir should exist");
+        let report_path = state_dir.join("child-report.md");
+        let full_report = format!("{}-end", "full child report ".repeat(900));
+        fs::write(&report_path, &full_report).expect("report should persist");
+
+        let mut job = test_publication_job_summary("child-full-report");
+        job.title = "Child Full Report".to_string();
+        job.state = "completed".to_string();
+        job.result_summary = "short summary".to_string();
+        let detail = JobDetail {
+            job,
+            workers: Vec::new(),
+            child_jobs: Vec::new(),
+            tool_calls: Vec::new(),
+            approvals: Vec::new(),
+            artifacts: vec![ArtifactSummary {
+                id: "child-report-artifact".to_string(),
+                job_id: "child-full-report".to_string(),
+                worker_id: None,
+                tool_call_id: None,
+                command_session_id: None,
+                kind: "child-report".to_string(),
+                title: "Child report".to_string(),
+                path: report_path.display().to_string(),
+                mime_type: "text/markdown".to_string(),
+                size_bytes: full_report.len() as u64,
+                preview_text: "full child report ...".to_string(),
+                metadata_json: json!({}),
+                created_at: 0,
+            }],
+            command_sessions: Vec::new(),
+            events: Vec::new(),
+        };
+
+        assert_eq!(child_join_final_answer(&detail), full_report);
+
+        let _ = fs::remove_dir_all(&state_dir);
     }
 
     #[tokio::test]
