@@ -4856,8 +4856,14 @@ async fn handle_pending_action(
                 worker,
                 &child_details,
             )?;
+            let daemon_blocked_join = single_blocked_local_project_child_join(
+                state,
+                &parent_job,
+                worker,
+                &child_details,
+            )?;
             checkpoint.pending_action = None;
-            checkpoint.next_prompt = if daemon_completion_join {
+            checkpoint.next_prompt = if daemon_completion_join || daemon_blocked_join.is_some() {
                 None
             } else {
                 Some(build_child_job_results_prompt(&pending.summary, &results))
@@ -4875,22 +4881,30 @@ async fn handle_pending_action(
                 job_id: job_id.to_string(),
                 worker_id: Some(worker.id.clone()),
                 event_type: "child.jobs.joined".to_string(),
-                status: if daemon_completion_join { "completed" } else { "running" }.to_string(),
+                status: if daemon_completion_join {
+                    "completed"
+                } else if daemon_blocked_join.is_some() {
+                    "blocked"
+                } else {
+                    "running"
+                }
+                .to_string(),
                 summary: format!("Joined {} child jobs", child_details.len()),
                 detail: format!(
                     "{} child jobs completed and {} ended without success.",
                     completed_count, failed_count
                 ),
                 data_json: json!({
-                    "child_job_ids": pending.child_job_ids,
-                    "child_outcomes": child_outcomes,
-                    "child_join_evidence": child_join_evidence_rollup(state, &child_details)?,
-                    "join_decision": {
-                        "daemon_completed_parent": daemon_completion_join,
-                        "required_outcome": CHILD_OUTCOME_SUCCEEDED,
-                        "join_kind": if daemon_completion_join { "single_successful_delegated_child" } else { "prompt_join" },
-                        "next_action": if daemon_completion_join { "complete_parent" } else { "surface_blocker_or_distinct_recovery" },
-                        "parent_task_class": parent_job.task_class,
+                        "child_job_ids": pending.child_job_ids,
+                        "child_outcomes": child_outcomes,
+                        "child_join_evidence": child_join_evidence_rollup(state, &child_details)?,
+                        "join_decision": {
+                            "daemon_completed_parent": daemon_completion_join,
+                            "daemon_blocked_parent": daemon_blocked_join.is_some(),
+                            "required_outcome": CHILD_OUTCOME_SUCCEEDED,
+                            "join_kind": if daemon_completion_join { "single_successful_delegated_child" } else if daemon_blocked_join.is_some() { "single_blocked_local_project_child" } else { "prompt_join" },
+                            "next_action": if daemon_completion_join { "complete_parent" } else if daemon_blocked_join.is_some() { "block_parent" } else { "surface_blocker_or_distinct_recovery" },
+                            "parent_task_class": parent_job.task_class,
                     },
                 }),
             });
@@ -4904,6 +4918,21 @@ async fn handle_pending_action(
                     *tool_calls,
                     &pending.summary,
                     &child_details[0],
+                    &child_outcomes,
+                )
+                .await?;
+                return Ok(LoopDisposition::Return);
+            }
+            if let Some(blocked_join) = daemon_blocked_join {
+                complete_parent_from_blocked_local_project_child_join(
+                    state,
+                    session,
+                    job_id,
+                    worker,
+                    step.saturating_add(1),
+                    *tool_calls,
+                    &pending.summary,
+                    blocked_join,
                     &child_outcomes,
                 )
                 .await?;
@@ -6144,6 +6173,53 @@ fn is_single_successful_delegated_child_join(
         && !local_project_child_mutation_receipts(state, child)?.is_empty())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BlockedLocalProjectChildJoin<'a> {
+    child: &'a JobDetail,
+    missing_validation: bool,
+    missing_browser_verification: bool,
+}
+
+fn single_blocked_local_project_child_join<'a>(
+    state: &AppState,
+    parent_job: &JobSummary,
+    worker: &WorkerSummary,
+    child_details: &'a [JobDetail],
+) -> Result<Option<BlockedLocalProjectChildJoin<'a>>> {
+    if worker.parent_worker_id.is_some()
+        || parent_job.task_class.as_deref() != Some("local_project")
+        || child_details.len() != 1
+    {
+        return Ok(None);
+    }
+
+    let child = &child_details[0];
+    if child.job.executor_lane != MAIN_EXECUTOR_LANE
+        || child.job.task_class.as_deref() != Some("local_project")
+        || child_job_join_outcome(child) == CHILD_OUTCOME_SUCCEEDED
+        || local_project_child_mutation_receipts(state, child)?.is_empty()
+    {
+        return Ok(None);
+    }
+
+    let missing_validation = !local_project_child_has_validation_evidence(child);
+    let missing_browser_verification = child.job.browser_verification_required
+        && !matches!(
+            child.job.browser_verification_status.as_str(),
+            "passed" | "not_required"
+        );
+
+    if !missing_validation && !missing_browser_verification {
+        return Ok(None);
+    }
+
+    Ok(Some(BlockedLocalProjectChildJoin {
+        child,
+        missing_validation,
+        missing_browser_verification,
+    }))
+}
+
 fn local_project_child_has_validation_evidence(detail: &JobDetail) -> bool {
     detail.job.validation_status == "passed"
         || detail
@@ -6259,6 +6335,82 @@ async fn complete_parent_from_successful_delegated_child_join(
         &metadata,
         &[],
         &child_detail.command_sessions,
+    )
+    .await
+}
+
+async fn complete_parent_from_blocked_local_project_child_join(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &mut WorkerSummary,
+    step_count: usize,
+    tool_call_count: usize,
+    join_summary: &str,
+    blocked_join: BlockedLocalProjectChildJoin<'_>,
+    child_outcomes: &[Value],
+) -> Result<()> {
+    propagate_child_browser_verification_for_join(state, job_id, blocked_join.child)?;
+    let child = blocked_join.child;
+    let mut blockers = child.job.completion_blockers.clone();
+    if blocked_join.missing_validation
+        && !blockers
+            .iter()
+            .any(|blocker| normalized_delegation_text(blocker).contains("validation evidence"))
+    {
+        blockers.push(
+            "Delegated implementation mutated files without accepted validation/test evidence."
+                .to_string(),
+        );
+    }
+    if blocked_join.missing_browser_verification
+        && !blockers
+            .iter()
+            .any(|blocker| normalized_delegation_text(blocker).contains("browser verification"))
+    {
+        blockers.push("Browser verification is required for the delegated UI implementation but no accepted browser evidence was recorded.".to_string());
+    }
+    blockers.sort();
+    blockers.dedup();
+
+    let blocker_text = if blockers.is_empty() {
+        "delegated child completion gates were not satisfied".to_string()
+    } else {
+        blockers.join("; ")
+    };
+    let summary = format!(
+        "Blocked delegated local-project child {}: {}",
+        child.job.id, blocker_text
+    );
+    let final_answer = format!(
+        "Blocked: delegated child {} mutated project files, but the daemon could not accept completion evidence. {}",
+        child.job.id, blocker_text
+    );
+    let metadata = json!({
+        "daemon_child_join": {
+            "join_summary": join_summary,
+            "join_kind": "single_blocked_local_project_child",
+            "required_outcome": CHILD_OUTCOME_SUCCEEDED,
+            "child_outcomes": child_outcomes,
+            "child_job_id": child.job.id,
+            "missing_validation": blocked_join.missing_validation,
+            "missing_browser_verification": blocked_join.missing_browser_verification,
+        },
+        "validation_status": if blocked_join.missing_validation { "not_performed" } else { child.job.validation_status.as_str() },
+        "browser_verification_status": child.job.browser_verification_status.as_str(),
+    });
+
+    complete_job_with_final_answer(
+        state,
+        session,
+        job_id,
+        worker,
+        step_count,
+        tool_call_count,
+        &summary,
+        &final_answer,
+        &metadata,
+        &[],
     )
     .await
 }
@@ -6651,6 +6803,11 @@ async fn reuse_equivalent_child_jobs_if_any(
             worker,
             &child_details,
         )?;
+    let daemon_blocked_join = if all_terminal {
+        single_blocked_local_project_child_join(state, &parent.job, worker, &child_details)?
+    } else {
+        None
+    };
 
     *step += 1;
     *worker = state.store.update_worker(
@@ -6676,7 +6833,7 @@ async fn reuse_equivalent_child_jobs_if_any(
             .map(child_job_result_json)
             .collect::<Result<Vec<_>>>()?;
         checkpoint.pending_action = None;
-        checkpoint.next_prompt = if daemon_completion_join {
+        checkpoint.next_prompt = if daemon_completion_join || daemon_blocked_join.is_some() {
             None
         } else {
             Some(build_child_job_results_prompt(&reuse_summary, &results))
@@ -6702,7 +6859,16 @@ async fn reuse_equivalent_child_jobs_if_any(
         job_id: job_id.to_string(),
         worker_id: Some(worker.id.clone()),
         event_type: "child.jobs.reused".to_string(),
-        status: if all_terminal { "completed" } else { "running" }.to_string(),
+        status: if daemon_completion_join {
+            "completed"
+        } else if daemon_blocked_join.is_some() {
+            "blocked"
+        } else if all_terminal {
+            "completed"
+        } else {
+            "running"
+        }
+        .to_string(),
         summary: format!("Reused {} equivalent child job(s)", matched_child_ids.len()),
         detail: if all_terminal {
             format!(
@@ -6728,9 +6894,10 @@ async fn reuse_equivalent_child_jobs_if_any(
             "child_join_evidence": child_join_evidence_rollup(state, &child_details)?,
             "join_decision": {
                 "daemon_completed_parent": daemon_completion_join,
+                "daemon_blocked_parent": daemon_blocked_join.is_some(),
                 "required_outcome": CHILD_OUTCOME_SUCCEEDED,
-                "join_kind": if daemon_completion_join { "single_successful_delegated_child" } else if all_terminal { "prompt_join" } else { "wait_for_in_flight" },
-                "next_action": if daemon_completion_join { "complete_parent" } else if all_terminal { "surface_blocker_or_distinct_recovery" } else { "wait_for_existing_child" },
+                "join_kind": if daemon_completion_join { "single_successful_delegated_child" } else if daemon_blocked_join.is_some() { "single_blocked_local_project_child" } else if all_terminal { "prompt_join" } else { "wait_for_in_flight" },
+                "next_action": if daemon_completion_join { "complete_parent" } else if daemon_blocked_join.is_some() { "block_parent" } else if all_terminal { "surface_blocker_or_distinct_recovery" } else { "wait_for_existing_child" },
                 "parent_task_class": parent.job.task_class,
             },
         }),
@@ -6745,6 +6912,21 @@ async fn reuse_equivalent_child_jobs_if_any(
             tool_calls,
             summary,
             &child_details[0],
+            &child_outcomes,
+        )
+        .await?;
+        return Ok(Some(LoopDisposition::Return));
+    }
+    if let Some(blocked_join) = daemon_blocked_join {
+        complete_parent_from_blocked_local_project_child_join(
+            state,
+            session,
+            job_id,
+            worker,
+            *step,
+            tool_calls,
+            summary,
+            blocked_join,
             &child_outcomes,
         )
         .await?;
@@ -34576,7 +34758,7 @@ Thanks."#,
 
     #[tokio::test]
     async fn local_project_child_join_requires_validation_and_mutation_evidence() {
-        for (label, options, expected_outcome) in [
+        for (label, options, expected_outcome, daemon_blocks_parent) in [
             (
                 "missing-validation",
                 LocalProjectJoinChildOptions {
@@ -34585,6 +34767,7 @@ Thanks."#,
                     validation_exit_code: None,
                 },
                 "blocked_recoverable",
+                true,
             ),
             (
                 "failed-validation",
@@ -34594,6 +34777,7 @@ Thanks."#,
                     validation_exit_code: Some(1),
                 },
                 "blocked_terminal",
+                true,
             ),
             (
                 "missing-mutation",
@@ -34603,6 +34787,7 @@ Thanks."#,
                     validation_exit_code: Some(0),
                 },
                 "succeeded",
+                false,
             ),
             (
                 "blocked-child",
@@ -34612,6 +34797,7 @@ Thanks."#,
                     validation_exit_code: Some(0),
                 },
                 "blocked_recoverable",
+                false,
             ),
             (
                 "canceled-child",
@@ -34621,6 +34807,7 @@ Thanks."#,
                     validation_exit_code: Some(0),
                 },
                 "canceled",
+                false,
             ),
         ] {
             let state_dir = test_state_dir(&format!("local-project-child-join-{label}"));
@@ -34662,27 +34849,177 @@ Thanks."#,
             .await
             .expect("negative child join should be handled");
 
-            assert_eq!(disposition, LoopDisposition::Continue, "{label}");
+            assert_eq!(
+                disposition,
+                if daemon_blocks_parent {
+                    LoopDisposition::Return
+                } else {
+                    LoopDisposition::Continue
+                },
+                "{label}"
+            );
             let parent = state.store.get_job(&parent_job_id).expect("parent loads");
-            assert_eq!(parent.job.state, "running", "{label}");
+            assert_eq!(
+                parent.job.state,
+                if daemon_blocks_parent {
+                    "blocked"
+                } else {
+                    "running"
+                },
+                "{label}"
+            );
+            if daemon_blocks_parent {
+                assert_eq!(parent.job.completion_status, "blocked", "{label}");
+            }
             let join_event = parent
                 .events
                 .iter()
                 .find(|event| event.event_type == "child.jobs.joined")
                 .expect("join event should persist");
-            assert_eq!(join_event.status, "running", "{label}");
+            assert_eq!(
+                join_event.status,
+                if daemon_blocks_parent {
+                    "blocked"
+                } else {
+                    "running"
+                },
+                "{label}"
+            );
             assert_eq!(
                 join_event.data_json["join_decision"]["daemon_completed_parent"], false,
+                "{label}"
+            );
+            assert_eq!(
+                join_event.data_json["join_decision"]["daemon_blocked_parent"],
+                daemon_blocks_parent,
                 "{label}"
             );
             assert_eq!(
                 join_event.data_json["child_outcomes"][0]["join_outcome"], expected_outcome,
                 "{label}"
             );
-            assert!(checkpoint.next_prompt.is_some(), "{label}");
+            assert_eq!(
+                join_event.data_json["join_decision"]["next_action"],
+                if daemon_blocks_parent {
+                    "block_parent"
+                } else {
+                    "surface_blocker_or_distinct_recovery"
+                },
+                "{label}"
+            );
+            assert_eq!(
+                checkpoint.next_prompt.is_some(),
+                !daemon_blocks_parent,
+                "{label}"
+            );
 
             let _ = fs::remove_dir_all(&state_dir);
         }
+    }
+
+    #[tokio::test]
+    async fn blocked_ui_child_join_propagates_browser_blocker_without_root_browser_work() {
+        let state_dir = test_state_dir("blocked-ui-child-browser-join");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, mut worker) =
+            create_local_project_parent_join_context(&state, "blocked-ui-child", &workspace_root);
+        state
+            .store
+            .update_job(
+                &parent_job_id,
+                JobPatch {
+                    browser_verification_required: Some(true),
+                    browser_verification_status: Some("pending".to_string()),
+                    browser_verification_summary: Some(
+                        "Browser verification is required for this UI-renderable job.".to_string(),
+                    ),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("parent browser gate should persist");
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "blocked-ui-child-main",
+            LocalProjectJoinChildOptions {
+                state: "blocked",
+                mutation_receipt: true,
+                validation_exit_code: None,
+            },
+        );
+        state
+            .store
+            .update_job(
+                &child_job_id,
+                JobPatch {
+                    browser_verification_required: Some(true),
+                    browser_verification_status: Some("unavailable".to_string()),
+                    browser_verification_summary: Some(
+                        "Browser verification is required for this UI-renderable job, but Browser tools are not granted in this session mode."
+                            .to_string(),
+                    ),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child browser blocker should persist");
+        let mut checkpoint = child_join_checkpoint(
+            &session.session.id,
+            vec![child_job_id.clone()],
+            "join blocked UI child",
+        );
+        let mut step = 1;
+        let mut tool_calls = 0;
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+
+        let disposition = handle_pending_action(
+            &state,
+            &session,
+            &parent_job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            &mut tool_calls,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("blocked UI child join should complete parent as blocked");
+
+        assert_eq!(disposition, LoopDisposition::Return);
+        assert!(checkpoint.next_prompt.is_none());
+        let parent = state.store.get_job(&parent_job_id).expect("parent loads");
+        assert_eq!(parent.job.state, "blocked");
+        assert_eq!(parent.job.completion_status, "blocked");
+        assert_eq!(parent.job.browser_verification_status, "unavailable");
+        assert!(parent.job.completion_blockers.iter().any(|blocker| {
+            blocker.contains("Browser verification is required")
+                || blocker.contains("Browser verification is missing")
+        }));
+        let parent_worker = parent
+            .workers
+            .iter()
+            .find(|candidate| candidate.id == worker.id)
+            .expect("parent worker should persist");
+        assert_eq!(parent_worker.tool_call_count, 0);
+        let join_event = parent
+            .events
+            .iter()
+            .find(|event| event.event_type == "child.jobs.joined")
+            .expect("join event should persist");
+        assert_eq!(join_event.status, "blocked");
+        assert_eq!(
+            join_event.data_json["join_decision"]["next_action"],
+            "block_parent"
+        );
+        assert_eq!(
+            join_event.data_json["child_outcomes"][0]["join_outcome"],
+            CHILD_OUTCOME_BLOCKED_RECOVERABLE
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
     }
 
     #[tokio::test]
@@ -35193,7 +35530,7 @@ Thanks."#,
     }
 
     #[tokio::test]
-    async fn blocked_feature_child_reuses_scope_instead_of_spawning_duplicate_main_child() {
+    async fn blocked_feature_child_reuses_scope_and_blocks_parent_without_root_drift() {
         let state_dir = test_state_dir("blocked-feature-child-scope-reuse");
         let state = initialize_test_state(&state_dir);
         let workspace_root = state_dir.join("workspace");
@@ -35284,14 +35621,17 @@ Thanks."#,
         .await
         .expect("same-scope blocked child should be reused");
 
-        assert_eq!(disposition, LoopDisposition::Continue);
+        assert_eq!(disposition, LoopDisposition::Return);
         let parent = state.store.get_job(&parent_job_id).expect("parent loads");
+        assert_eq!(parent.job.state, "blocked");
+        assert_eq!(parent.job.completion_status, "blocked");
         assert_eq!(parent.child_jobs.len(), 1);
         let reuse_event = parent
             .events
             .iter()
             .find(|event| event.event_type == "child.jobs.reused")
             .expect("same-scope child reuse should persist");
+        assert_eq!(reuse_event.status, "blocked");
         assert_eq!(reuse_event.data_json["child_job_ids"][0], first_child_id);
         assert_eq!(
             reuse_event.data_json["match_kinds"][0],
@@ -35303,16 +35643,19 @@ Thanks."#,
         );
         assert_eq!(
             reuse_event.data_json["join_decision"]["next_action"],
-            "surface_blocker_or_distinct_recovery"
+            "block_parent"
         );
-        let next_prompt = checkpoint
-            .next_prompt
-            .as_deref()
-            .expect("blocked reuse should provide the existing child report");
-        assert!(next_prompt.contains("Do not spawn a duplicate implementation child"));
-        assert!(
-            next_prompt.contains("Mutation receipts alone are not accepted completion evidence")
+        assert_eq!(
+            reuse_event.data_json["join_decision"]["daemon_blocked_parent"],
+            true
         );
+        assert!(checkpoint.next_prompt.is_none());
+        let parent_worker = parent
+            .workers
+            .iter()
+            .find(|candidate| candidate.id == worker.id)
+            .expect("parent worker should persist");
+        assert_eq!(parent_worker.tool_call_count, 0);
 
         let _ = fs::remove_dir_all(&state_dir);
     }
