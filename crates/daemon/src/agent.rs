@@ -1000,6 +1000,103 @@ fn child_delegation_key(proposal: &ChildJobProposal) -> String {
     ))
 }
 
+fn child_delegation_scope_ids(proposal: &ChildJobProposal) -> Vec<String> {
+    let text = normalized_delegation_text(&format!("{}\n{}", proposal.title, proposal.prompt));
+    let bytes = text.as_bytes();
+    let mut ids = BTreeSet::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'#' {
+            if let Some((id, end)) = parse_scope_digits_after_marker(&text, index + 1) {
+                ids.insert(id);
+                index = end;
+                continue;
+            }
+        }
+        for marker in ["feature", "issue"] {
+            if marker_starts_at(&text, index, marker) {
+                if let Some((id, end)) =
+                    parse_scope_digits_after_marker(&text, index + marker.len())
+                {
+                    ids.insert(id);
+                    index = end;
+                    continue;
+                }
+            }
+        }
+        index += 1;
+    }
+    ids.into_iter().collect()
+}
+
+fn marker_starts_at(text: &str, index: usize, marker: &str) -> bool {
+    let Some(rest) = text.get(index..) else {
+        return false;
+    };
+    if !rest.starts_with(marker) {
+        return false;
+    }
+    let before_is_word = index > 0 && text.as_bytes()[index - 1].is_ascii_alphanumeric();
+    let after_index = index + marker.len();
+    let after_is_letter = text
+        .as_bytes()
+        .get(after_index)
+        .is_some_and(u8::is_ascii_alphabetic);
+    !before_is_word && !after_is_letter
+}
+
+fn parse_scope_digits_after_marker(text: &str, mut index: usize) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    while bytes
+        .get(index)
+        .is_some_and(|byte| matches!(byte, b' ' | b'_' | b'-' | b':' | b'#'))
+    {
+        index += 1;
+    }
+    let start = index;
+    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+        index += 1;
+    }
+    if start == index {
+        return None;
+    }
+    let digits = text[start..index].trim_start_matches('0');
+    Some((
+        if digits.is_empty() { "0" } else { digits }.to_string(),
+        index,
+    ))
+}
+
+fn proposed_child_scope_lane(proposal: &ChildJobProposal) -> &'static str {
+    if child_requests_utility_lane(proposal) {
+        ACTION_EXECUTOR_LANE
+    } else {
+        MAIN_EXECUTOR_LANE
+    }
+}
+
+fn child_delegation_scope_keys(proposal: &ChildJobProposal) -> Vec<String> {
+    child_delegation_scope_ids(proposal)
+        .into_iter()
+        .map(|scope_id| {
+            normalized_delegation_text(&format!(
+                "lane={}\ntask_class={}\nworking_dir={}\nscope_id={}",
+                proposed_child_scope_lane(proposal),
+                effective_child_task_class(proposal).unwrap_or_default(),
+                proposal.working_dir.as_deref().unwrap_or_default(),
+                scope_id,
+            ))
+        })
+        .collect()
+}
+
+fn child_delegation_scope_key(proposal: &ChildJobProposal) -> String {
+    child_delegation_scope_keys(proposal)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+}
+
 fn root_evidence_tool_call_count(detail: &JobDetail, worker_id: &str) -> usize {
     detail
         .tool_calls
@@ -4792,6 +4889,7 @@ async fn handle_pending_action(
                         "daemon_completed_parent": daemon_completion_join,
                         "required_outcome": CHILD_OUTCOME_SUCCEEDED,
                         "join_kind": if daemon_completion_join { "single_successful_delegated_child" } else { "prompt_join" },
+                        "next_action": if daemon_completion_join { "complete_parent" } else { "surface_blocker_or_distinct_recovery" },
                         "parent_task_class": parent_job.task_class,
                     },
                 }),
@@ -5799,6 +5897,8 @@ async fn create_child_job_with_limits(
     }
     let effective_task_class = effective_child_task_class(&proposal);
     let delegation_key = child_delegation_key(&proposal);
+    let delegation_scope_keys = child_delegation_scope_keys(&proposal);
+    let delegation_scope_key = delegation_scope_keys.first().cloned().unwrap_or_default();
     let parent_generation =
         parent_delegation_generation(&state.store.get_job(parent_job_id)?, &BTreeSet::new());
     // `working_dir` is per-child and scope-checked here. It is not a lock:
@@ -5875,6 +5975,8 @@ async fn create_child_job_with_limits(
             metadata_json: Some(json!({
                 "child_contract": effective_task_class.clone().unwrap_or_default(),
                 "delegation_key": delegation_key,
+                "delegation_scope_key": delegation_scope_key,
+                "delegation_scope_keys": delegation_scope_keys,
                 "parent_generation": parent_generation,
             })),
             ..JobPatch::default()
@@ -5931,7 +6033,7 @@ async fn create_child_job_with_limits(
 fn build_child_job_results_prompt(summary: &str, results: &[Value]) -> String {
     format!(
         "Child job results are ready.\nReason for the fan-out: {}\nStructured results:\n{}\n\
-Return one JSON action for the next step. If the work is done, return final_answer with a complete user-facing answer.",
+Return one JSON action for the next step. If a child outcome is blocked_recoverable because validation or browser evidence is missing after mutation, do not spawn an overlapping implementation child for the same feature scope; repair or validate the existing path if possible, otherwise surface one precise blocker. Mutation receipts alone are not accepted completion evidence. If the work is done, return final_answer with a complete user-facing answer.",
         summary,
         serde_json::to_string_pretty(results)
             .unwrap_or_else(|_| Value::Array(results.to_vec()).to_string())
@@ -5951,9 +6053,22 @@ fn child_job_join_outcome(detail: &JobDetail) -> &'static str {
         return CHILD_OUTCOME_CANCELED;
     }
     if detail.job.completion_status == "blocked" || detail.job.state == "failed" {
+        if child_completion_blockers_are_recoverable(detail) {
+            return CHILD_OUTCOME_BLOCKED_RECOVERABLE;
+        }
         return CHILD_OUTCOME_BLOCKED_TERMINAL;
     }
     CHILD_OUTCOME_BLOCKED_RECOVERABLE
+}
+
+fn child_completion_blockers_are_recoverable(detail: &JobDetail) -> bool {
+    detail.job.completion_blockers.iter().any(|blocker| {
+        let normalized = normalized_delegation_text(blocker);
+        normalized.contains("without successful validation evidence")
+            || normalized.contains("local validation evidence is still pending")
+            || normalized.contains("before browser verification completed")
+            || normalized.contains("browser verification is still pending")
+    })
 }
 
 fn child_job_join_outcome_json(detail: &JobDetail) -> Value {
@@ -6312,6 +6427,61 @@ fn parent_delegation_generation(detail: &JobDetail, exclude_child_ids: &BTreeSet
     parent_tool_changes + sibling_terminal_changes
 }
 
+#[derive(Clone)]
+struct ChildReuseRequest {
+    delegation_key: String,
+    scope_keys: Vec<String>,
+}
+
+#[derive(Clone)]
+struct ChildReuseCandidate {
+    parent_generation: u64,
+    rank: u8,
+    created_at: i64,
+    child_id: String,
+    match_kind: &'static str,
+}
+
+fn best_reuse_candidate_for_generation(
+    candidates: &[ChildReuseCandidate],
+    generation: u64,
+) -> Option<&ChildReuseCandidate> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.parent_generation == generation)
+        .min_by_key(|candidate| {
+            (
+                candidate.rank,
+                candidate.match_kind != "delegation_key",
+                candidate.created_at,
+                candidate.child_id.as_str(),
+            )
+        })
+}
+
+fn child_metadata_delegation_scope_keys(metadata: &Value) -> Vec<String> {
+    let mut keys = BTreeSet::new();
+    if let Some(key) = metadata
+        .get("delegation_scope_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    {
+        keys.insert(key.to_string());
+    }
+    if let Some(values) = metadata
+        .get("delegation_scope_keys")
+        .and_then(Value::as_array)
+    {
+        for value in values {
+            if let Some(key) = value.as_str().map(str::trim).filter(|key| !key.is_empty()) {
+                keys.insert(key.to_string());
+            }
+        }
+    }
+    keys.into_iter().collect()
+}
+
 async fn reuse_equivalent_child_jobs_if_any(
     state: &AppState,
     session: &SessionDetail,
@@ -6323,24 +6493,28 @@ async fn reuse_equivalent_child_jobs_if_any(
     summary: &str,
     jobs: &[ChildJobProposal],
 ) -> Result<Option<LoopDisposition>> {
-    let requested_keys = jobs.iter().map(child_delegation_key).collect::<Vec<_>>();
-    if requested_keys.is_empty() {
+    let requested_children = jobs
+        .iter()
+        .map(|proposal| ChildReuseRequest {
+            delegation_key: child_delegation_key(proposal),
+            scope_keys: child_delegation_scope_keys(proposal),
+        })
+        .collect::<Vec<_>>();
+    if requested_children.is_empty() {
         return Ok(None);
     }
     let parent = state.store.get_job(job_id)?;
-    let requested_key_set = requested_keys.iter().cloned().collect::<BTreeSet<_>>();
-    let mut candidates_by_key = BTreeMap::<String, Vec<(u64, u8, i64, String)>>::new();
+    let requested_key_set = requested_children
+        .iter()
+        .map(|request| request.delegation_key.clone())
+        .collect::<BTreeSet<_>>();
+    let requested_scope_set = requested_children
+        .iter()
+        .flat_map(|request| request.scope_keys.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let mut candidates_by_key = BTreeMap::<String, Vec<ChildReuseCandidate>>::new();
+    let mut candidates_by_scope = BTreeMap::<String, Vec<ChildReuseCandidate>>::new();
     for child in &parent.child_jobs {
-        let Some(key) = child
-            .metadata_json
-            .get("delegation_key")
-            .and_then(Value::as_str)
-        else {
-            continue;
-        };
-        if !requested_key_set.contains(key) {
-            continue;
-        }
         let Some(rank) = reusable_child_rank(&child.state) else {
             continue;
         };
@@ -6351,44 +6525,90 @@ async fn reuse_equivalent_child_jobs_if_any(
         else {
             continue;
         };
-        candidates_by_key.entry(key.to_string()).or_default().push((
+        let candidate = ChildReuseCandidate {
             parent_generation,
             rank,
-            child.created_at,
-            child.id.clone(),
-        ));
+            created_at: child.created_at,
+            child_id: child.id.clone(),
+            match_kind: "delegation_key",
+        };
+        if let Some(key) = child
+            .metadata_json
+            .get("delegation_key")
+            .and_then(Value::as_str)
+            .filter(|key| requested_key_set.contains(*key))
+        {
+            candidates_by_key
+                .entry(key.to_string())
+                .or_default()
+                .push(candidate.clone());
+        }
+        let child_scope_keys = child_metadata_delegation_scope_keys(&child.metadata_json);
+        for scope_key in child_scope_keys
+            .into_iter()
+            .filter(|scope_key| requested_scope_set.contains(scope_key))
+        {
+            let mut scope_candidate = candidate.clone();
+            scope_candidate.match_kind = "delegation_scope_key";
+            candidates_by_scope
+                .entry(scope_key)
+                .or_default()
+                .push(scope_candidate);
+        }
     }
-    if requested_keys
-        .iter()
-        .any(|key| !candidates_by_key.contains_key(key))
-    {
+    if requested_children.iter().any(|request| {
+        !candidates_by_key.contains_key(&request.delegation_key)
+            && !request
+                .scope_keys
+                .iter()
+                .any(|scope_key| candidates_by_scope.contains_key(scope_key))
+    }) {
         return Ok(None);
     }
 
     let candidate_generations = candidates_by_key
         .values()
-        .flat_map(|candidates| candidates.iter().map(|(generation, _, _, _)| *generation))
+        .chain(candidates_by_scope.values())
+        .flat_map(|candidates| {
+            candidates
+                .iter()
+                .map(|candidate| candidate.parent_generation)
+        })
         .collect::<BTreeSet<_>>();
-    let mut best_match: Option<(u32, u64, Vec<String>)> = None;
+    let mut best_match: Option<(u32, u64, Vec<String>, Vec<&'static str>)> = None;
     for generation in candidate_generations.iter().rev() {
         let mut generation_rank = 0u32;
-        let mut matched_child_ids = Vec::with_capacity(requested_keys.len());
-        for key in &requested_keys {
-            let Some((_, rank, _, child_id)) = candidates_by_key.get(key).and_then(|candidates| {
-                candidates
-                    .iter()
-                    .filter(|(candidate_generation, _, _, _)| candidate_generation == generation)
-                    .min_by_key(|(_, rank, created_at, child_id)| {
-                        (*rank, *created_at, child_id.as_str())
-                    })
-            }) else {
+        let mut matched_child_ids = Vec::with_capacity(requested_children.len());
+        let mut match_kinds = Vec::with_capacity(requested_children.len());
+        for request in &requested_children {
+            let exact = candidates_by_key
+                .get(&request.delegation_key)
+                .and_then(|candidates| {
+                    best_reuse_candidate_for_generation(candidates, *generation)
+                });
+            let scoped = candidates_by_scope
+                .iter()
+                .filter(|(scope_key, _)| request.scope_keys.contains(scope_key))
+                .filter_map(|(_, candidates)| {
+                    best_reuse_candidate_for_generation(candidates, *generation)
+                })
+                .min_by_key(|candidate| {
+                    (
+                        candidate.rank,
+                        candidate.created_at,
+                        candidate.child_id.as_str(),
+                    )
+                });
+            let Some(candidate) = exact.or(scoped) else {
                 matched_child_ids.clear();
+                match_kinds.clear();
                 break;
             };
-            generation_rank = generation_rank.saturating_add(*rank as u32);
-            matched_child_ids.push(child_id.clone());
+            generation_rank = generation_rank.saturating_add(candidate.rank as u32);
+            matched_child_ids.push(candidate.child_id.clone());
+            match_kinds.push(candidate.match_kind);
         }
-        if matched_child_ids.len() != requested_keys.len() {
+        if matched_child_ids.len() != requested_children.len() {
             continue;
         }
         matched_child_ids.sort();
@@ -6400,15 +6620,15 @@ async fn reuse_equivalent_child_jobs_if_any(
         }
         let replace = best_match
             .as_ref()
-            .is_none_or(|(best_rank, best_generation, _)| {
+            .is_none_or(|(best_rank, best_generation, _, _)| {
                 generation_rank < *best_rank
                     || (generation_rank == *best_rank && *generation > *best_generation)
             });
         if replace {
-            best_match = Some((generation_rank, *generation, matched_child_ids));
+            best_match = Some((generation_rank, *generation, matched_child_ids, match_kinds));
         }
     }
-    let Some((_, _, matched_child_ids)) = best_match else {
+    let Some((_, _, matched_child_ids, match_kinds)) = best_match else {
         return Ok(None);
     };
     let child_details = matched_child_ids
@@ -6448,7 +6668,7 @@ async fn reuse_equivalent_child_jobs_if_any(
             format!("Reusing equivalent child job result for: {summary}")
         } else {
             format!(
-                "Equivalent child job already ended without success for: {summary}. Do not spawn a duplicate; surface the blocker or choose a distinct recovery."
+                "Equivalent child job already owns this feature scope for: {summary}. Do not spawn a duplicate implementation child. If the blocker is missing validation or browser evidence after mutation, drive validation/browser repair for the existing child path or surface one precise blocker. Mutation receipts alone are not accepted completion evidence."
             )
         };
         let results = child_details
@@ -6495,13 +6715,22 @@ async fn reuse_equivalent_child_jobs_if_any(
         },
         data_json: json!({
             "child_job_ids": matched_child_ids,
-            "requested_keys": requested_keys,
+            "requested_keys": requested_children
+                .iter()
+                .map(|request| request.delegation_key.clone())
+                .collect::<Vec<_>>(),
+            "requested_scope_keys": requested_children
+                .iter()
+                .flat_map(|request| request.scope_keys.iter().cloned())
+                .collect::<Vec<_>>(),
+            "match_kinds": match_kinds,
             "child_outcomes": child_outcomes,
             "child_join_evidence": child_join_evidence_rollup(state, &child_details)?,
             "join_decision": {
                 "daemon_completed_parent": daemon_completion_join,
                 "required_outcome": CHILD_OUTCOME_SUCCEEDED,
                 "join_kind": if daemon_completion_join { "single_successful_delegated_child" } else if all_terminal { "prompt_join" } else { "wait_for_in_flight" },
+                "next_action": if daemon_completion_join { "complete_parent" } else if all_terminal { "surface_blocker_or_distinct_recovery" } else { "wait_for_existing_child" },
                 "parent_task_class": parent.job.task_class,
             },
         }),
@@ -22081,6 +22310,42 @@ mod tests {
     }
 
     #[test]
+    fn child_delegation_scope_key_normalizes_issue_and_feature_markers() {
+        let issue_scope = ChildJobProposal {
+            title: "Implement issue #161 activity nudge".to_string(),
+            prompt: "Add the UI change and validation for issue #161.".to_string(),
+            task_class: Some("local_project".to_string()),
+            working_dir: None,
+            route_id: None,
+        };
+        let feature_scope = ChildJobProposal {
+            title: "Finish activity nudge".to_string(),
+            prompt: "Update the session workspace display for feature_161 and verify it."
+                .to_string(),
+            task_class: Some("local_project".to_string()),
+            working_dir: None,
+            route_id: None,
+        };
+        let distinct_scope = ChildJobProposal {
+            title: "Finish activity nudge".to_string(),
+            prompt: "Update the session workspace display for feature_162 and verify it."
+                .to_string(),
+            task_class: Some("local_project".to_string()),
+            working_dir: None,
+            route_id: None,
+        };
+
+        assert_eq!(
+            child_delegation_scope_key(&issue_scope),
+            child_delegation_scope_key(&feature_scope)
+        );
+        assert_ne!(
+            child_delegation_scope_key(&issue_scope),
+            child_delegation_scope_key(&distinct_scope)
+        );
+    }
+
+    #[test]
     fn delegated_subtask_classifier_rejects_explicit_write_contracts() {
         let explicit_read_only = ChildJobProposal {
             title: "Read-only listing".to_string(),
@@ -34319,7 +34584,7 @@ Thanks."#,
                     mutation_receipt: true,
                     validation_exit_code: None,
                 },
-                "blocked_terminal",
+                "blocked_recoverable",
             ),
             (
                 "failed-validation",
@@ -34923,6 +35188,223 @@ Thanks."#,
                 && event.data_json["child_outcomes"][0]["join_outcome"] == "succeeded"
                 && event.data_json["join_decision"]["daemon_completed_parent"] == false
         }));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn blocked_feature_child_reuses_scope_instead_of_spawning_duplicate_main_child() {
+        let state_dir = test_state_dir("blocked-feature-child-scope-reuse");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, mut worker) = create_local_project_parent_join_context(
+            &state,
+            "blocked-feature-scope",
+            &workspace_root,
+        );
+
+        let first_proposal = ChildJobProposal {
+            title: "Implement feature 161 activity nudge".to_string(),
+            prompt:
+                "Implement issue #161 by adding the activity nudge helper and focused validation."
+                    .to_string(),
+            task_class: Some("local_project".to_string()),
+            working_dir: None,
+            route_id: None,
+        };
+        let first_child_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "feature-161-blocked-child",
+            LocalProjectJoinChildOptions {
+                state: "blocked",
+                mutation_receipt: true,
+                validation_exit_code: None,
+            },
+        );
+        state
+            .store
+            .update_job(
+                &first_child_id,
+                JobPatch {
+                    metadata_json: Some(json!({
+                        "child_contract": "local_project",
+                        "delegation_key": child_delegation_key(&first_proposal),
+                        "delegation_scope_key": child_delegation_scope_key(&first_proposal),
+                        "parent_generation": 0,
+                    })),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child delegation metadata should persist");
+
+        let second_proposal = ChildJobProposal {
+            title: "Finish the session activity UI feature".to_string(),
+            prompt: "Update the session workspace composer display for feature_161 and verify it."
+                .to_string(),
+            task_class: Some("local_project".to_string()),
+            working_dir: None,
+            route_id: None,
+        };
+        assert_ne!(
+            child_delegation_key(&first_proposal),
+            child_delegation_key(&second_proposal)
+        );
+        assert_eq!(
+            child_delegation_scope_key(&first_proposal),
+            child_delegation_scope_key(&second_proposal)
+        );
+
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "Dogfood ladder rung: feature_161. Delegate one main child, then converge without duplicate fanout.".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let mut step = 0;
+
+        let disposition = handle_child_job_proposal(
+            &state,
+            &session,
+            &parent_job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            0,
+            "continue implementing feature_161".to_string(),
+            vec![second_proposal],
+        )
+        .await
+        .expect("same-scope blocked child should be reused");
+
+        assert_eq!(disposition, LoopDisposition::Continue);
+        let parent = state.store.get_job(&parent_job_id).expect("parent loads");
+        assert_eq!(parent.child_jobs.len(), 1);
+        let reuse_event = parent
+            .events
+            .iter()
+            .find(|event| event.event_type == "child.jobs.reused")
+            .expect("same-scope child reuse should persist");
+        assert_eq!(reuse_event.data_json["child_job_ids"][0], first_child_id);
+        assert_eq!(
+            reuse_event.data_json["match_kinds"][0],
+            "delegation_scope_key"
+        );
+        assert_eq!(
+            reuse_event.data_json["child_outcomes"][0]["join_outcome"],
+            CHILD_OUTCOME_BLOCKED_RECOVERABLE
+        );
+        assert_eq!(
+            reuse_event.data_json["join_decision"]["next_action"],
+            "surface_blocker_or_distinct_recovery"
+        );
+        let next_prompt = checkpoint
+            .next_prompt
+            .as_deref()
+            .expect("blocked reuse should provide the existing child report");
+        assert!(next_prompt.contains("Do not spawn a duplicate implementation child"));
+        assert!(
+            next_prompt.contains("Mutation receipts alone are not accepted completion evidence")
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn blocked_feature_child_scope_reuse_requires_matching_scope_identifier() {
+        let state_dir = test_state_dir("blocked-feature-child-scope-reuse-distinct-id");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, mut worker) = create_local_project_parent_join_context(
+            &state,
+            "blocked-feature-distinct-scope",
+            &workspace_root,
+        );
+
+        let first_proposal = ChildJobProposal {
+            title: "Implement issue #161 activity nudge".to_string(),
+            prompt: "Implement the issue #161 UI change and validate it.".to_string(),
+            task_class: Some("local_project".to_string()),
+            working_dir: None,
+            route_id: None,
+        };
+        let first_child_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "feature-161-blocked-child",
+            LocalProjectJoinChildOptions {
+                state: "blocked",
+                mutation_receipt: true,
+                validation_exit_code: None,
+            },
+        );
+        state
+            .store
+            .update_job(
+                &first_child_id,
+                JobPatch {
+                    metadata_json: Some(json!({
+                        "child_contract": "local_project",
+                        "delegation_key": child_delegation_key(&first_proposal),
+                        "delegation_scope_key": child_delegation_scope_key(&first_proposal),
+                        "delegation_scope_keys": child_delegation_scope_keys(&first_proposal),
+                        "parent_generation": 0,
+                    })),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child delegation metadata should persist");
+
+        let second_proposal = ChildJobProposal {
+            title: "Implement feature_162 activity nudge".to_string(),
+            prompt: "Implement the distinct feature_162 UI change and validate it.".to_string(),
+            task_class: Some("local_project".to_string()),
+            working_dir: None,
+            route_id: None,
+        };
+        assert_ne!(
+            child_delegation_scope_key(&first_proposal),
+            child_delegation_scope_key(&second_proposal)
+        );
+
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "Dogfood ladder rung: feature_162.".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let mut step = 0;
+        let reuse = reuse_equivalent_child_jobs_if_any(
+            &state,
+            &session,
+            &parent_job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            0,
+            "continue implementing feature_162",
+            &[second_proposal],
+        )
+        .await
+        .expect("distinct-scope reuse check should not fail");
+
+        assert!(reuse.is_none());
+        assert_eq!(step, 0);
+        assert!(checkpoint.next_prompt.is_none());
 
         let _ = fs::remove_dir_all(&state_dir);
     }
