@@ -5993,6 +5993,7 @@ fn parent_allows_daemon_child_join_completion(
 ) -> bool {
     match parent_job.task_class.as_deref().map(str::trim) {
         Some(DELEGATED_SUBTASK_TASK_CLASS) => true,
+        Some("local_project") => checkpoint_has_explicit_daemon_child_join_contract(checkpoint),
         Some("") | None => checkpoint_has_explicit_daemon_child_join_contract(checkpoint),
         Some(_) => false,
     }
@@ -7213,12 +7214,22 @@ async fn record_context_integrity_detection_with_additional_command_sessions(
         }
     }
     let mut patch = context_integrity_patch(state, session, &current);
+    let cwd_evidence = if detail.command_sessions.is_empty()
+        && !additional_command_sessions.is_empty()
+    {
+        json!({
+            "status": "satisfied",
+            "reason": "no parent command sessions recorded; delegated child command sessions remain scoped to child worktrees",
+            "declared_working_dir": session.working_dir.trim(),
+            "observed_cwds": [],
+            "offending_command_session_ids": [],
+            "offending_cwds": [],
+        })
+    } else {
+        command_session_cwd_evidence(session, &detail.command_sessions)
+    };
     patch.command_session_cwd_evidence_json = Some(Some(
-        serde_json::to_string(&command_session_cwd_evidence(
-            session,
-            &detail.command_sessions,
-        ))
-        .unwrap_or_else(|_| "{}".to_string()),
+        serde_json::to_string(&cwd_evidence).unwrap_or_else(|_| "{}".to_string()),
     ));
     patch.metadata_json = Some(context_integrity_metadata_with_session_state(
         state, session, &current, job_id,
@@ -33748,6 +33759,151 @@ Thanks."#,
         );
         assert_eq!(child_detail.job.state, "completed");
         assert_eq!(child_detail.job.completion_status, "satisfied");
+        assert!(
+            child_detail
+                .tool_calls
+                .iter()
+                .any(|call| call.tool_id == "command.run" && call.status == "completed")
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn local_project_root_converges_after_successful_delegated_probe_child() {
+        let state_dir = test_state_dir("local-project-delegated-probe-converges");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let spawn_action = json!({
+            "kind": "spawn_child_jobs",
+            "summary": "delegate read-only command probe",
+            "jobs": [
+                {
+                    "title": "Command Probe",
+                    "prompt": "Run exactly this read-only command and report stdout: printf NUCLEUS_COMMAND_RUN_PROBE",
+                    "task_class": DELEGATED_SUBTASK_TASK_CLASS,
+                    "working_dir": null
+                }
+            ],
+        })
+        .to_string();
+        let (utility_base_url, utility_count, _utility_bodies, utility_server) =
+            spawn_dynamic_openai_server(1, move |_index, _body| {
+                DynamicOpenAiProviderResponse::content(spawn_action.clone())
+            })
+            .await;
+        let (main_base_url, main_count, _main_bodies, main_server) =
+            spawn_dynamic_openai_server(2, move |index, _body| {
+                if index == 0 {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"tool_call","summary":"run requested printf probe","tool":"command.run","args":{"command":"printf","args":["NUCLEUS_COMMAND_RUN_PROBE"],"cwd":".","timeout_secs":20}}"#,
+                    )
+                } else {
+                    DynamicOpenAiProviderResponse::content(
+                        r#"{"kind":"final_answer","summary":"probe done","final_answer":"NUCLEUS_COMMAND_RUN_PROBE"}"#,
+                    )
+                }
+            })
+            .await;
+        set_default_profile_utility_target(
+            &state,
+            "openai_compatible",
+            "utility-command-probe-model",
+            &utility_base_url,
+            "utility-key",
+        );
+        let session_id = "local-project-delegated-probe-session".to_string();
+        let mut session_record = test_session_record(
+            &session_id,
+            "Local project delegated probe",
+            &workspace_root,
+        );
+        session_record.model = "main-command-probe-model".to_string();
+        session_record.provider_base_url = main_base_url.clone();
+        session_record.provider_api_key = "main-key".to_string();
+        session_record.approval_mode = "trusted".to_string();
+        state
+            .store
+            .create_session(session_record)
+            .expect("session should persist");
+        let current = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+        let prompt = "Dogfood ladder rung: read_only. Spawn exactly one main child with task_class delegated_subtask. Root waits for that child, then answers with the child stdout.";
+
+        start_prompt_job(
+            state.clone(),
+            session_id.clone(),
+            SessionPromptRequest {
+                prompt: prompt.to_string(),
+                images: vec![],
+                task_class: Some("local_project".to_string()),
+                role: "main".to_string(),
+            },
+            current,
+            prompt.to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("prompt should queue");
+
+        let _ = wait_for_session_state(&state, &session_id, "active").await;
+        utility_server.await.expect("utility server should finish");
+        main_server.await.expect("main server should finish");
+        assert_eq!(utility_count.load(Ordering::SeqCst), 1);
+        assert_eq!(main_count.load(Ordering::SeqCst), 2);
+
+        let parent = latest_job_detail(&state, &session_id);
+        assert_eq!(parent.job.task_class.as_deref(), Some("local_project"));
+        assert_eq!(parent.job.state, "completed");
+        assert_eq!(parent.job.completion_status, "satisfied");
+        assert!(parent.job.completion_blockers.is_empty());
+        assert!(
+            parent
+                .job
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("delegated_child_join:"))
+        );
+        assert_eq!(parent.child_jobs.len(), 1);
+        let join_event = parent
+            .events
+            .iter()
+            .find(|event| event.event_type == "child.jobs.joined")
+            .expect("joined child event should persist");
+        assert_eq!(join_event.status, "completed");
+        assert_eq!(
+            join_event.data_json["child_outcomes"][0]["join_outcome"],
+            "succeeded"
+        );
+        assert_eq!(
+            join_event.data_json["join_decision"]["daemon_completed_parent"],
+            true
+        );
+        assert_eq!(
+            join_event.data_json["join_decision"]["parent_task_class"],
+            "local_project"
+        );
+
+        let child = parent.child_jobs.first().expect("child should exist");
+        assert_eq!(child.executor_lane, MAIN_EXECUTOR_LANE);
+        let child_detail = state.store.get_job(&child.id).expect("child should load");
+        assert_eq!(
+            child_detail.job.task_class.as_deref(),
+            Some(DELEGATED_SUBTASK_TASK_CLASS)
+        );
+        assert_eq!(child_detail.job.state, "completed");
+        assert_eq!(child_detail.job.completion_status, "satisfied");
+        assert!(
+            child_detail
+                .command_sessions
+                .iter()
+                .any(|session| session.command == "printf"
+                    && session.args == vec!["NUCLEUS_COMMAND_RUN_PROBE".to_string()]
+                    && session.exit_code == Some(0))
+        );
         assert!(
             child_detail
                 .tool_calls

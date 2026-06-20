@@ -9113,6 +9113,22 @@ fn apply_job_evidence_rollups(connection: &Connection, job: &mut JobSummary) -> 
         )
         .to_ascii_lowercase();
         let event_succeeded = is_successful_evidence_status(&event.status);
+        if event_succeeded
+            && event.event_type == "child.jobs.joined"
+            && event
+                .data_json
+                .pointer("/join_decision/daemon_completed_parent")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            && event
+                .data_json
+                .pointer("/join_decision/join_kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("single_successful_delegated_child")
+        {
+            evidence.push(format!("delegated_child_join:{}", event.summary));
+            evidence.push(format!("child_report:{}", event.summary));
+        }
         if event_succeeded && (event_text.contains("waiver") || event_text.contains("waived")) {
             evidence.push("waiver:command_failure".to_string());
             if contains_any(
@@ -13501,6 +13517,56 @@ and open a pull request to dev when it is ready."
             )
             .expect("validation status should persist");
         assert_eq!(local_project.completion_status, "satisfied");
+
+        let delegated_join_parent = store
+            .create_job(JobRecord {
+                id: "delegated-join-parent-job".to_string(),
+                session_id: Some("task-class-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("local_project".to_string()),
+                title: "Delegated join parent job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "prompt".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("delegated join parent should persist");
+        store
+            .append_job_event(JobEventRecord {
+                job_id: delegated_join_parent.id.clone(),
+                worker_id: None,
+                event_type: "child.jobs.joined".to_string(),
+                status: "completed".to_string(),
+                summary: "Joined 1 child jobs".to_string(),
+                detail: "1 child jobs completed and 0 ended without success.".to_string(),
+                data_json: json!({
+                    "join_decision": {
+                        "daemon_completed_parent": true,
+                        "join_kind": "single_successful_delegated_child"
+                    }
+                }),
+            })
+            .expect("delegated join event should persist");
+        let delegated_join_parent = store
+            .get_job(&delegated_join_parent.id)
+            .expect("delegated join parent should load")
+            .job;
+        assert_eq!(delegated_join_parent.completion_status, "satisfied");
+        assert!(
+            delegated_join_parent
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("delegated_child_join:"))
+        );
+        assert!(
+            delegated_join_parent
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("child_report:"))
+        );
 
         let deployment_with_git_status = store
             .create_job(JobRecord {
