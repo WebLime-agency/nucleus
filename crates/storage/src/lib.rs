@@ -9114,7 +9114,10 @@ fn apply_job_evidence_rollups(connection: &Connection, job: &mut JobSummary) -> 
         .to_ascii_lowercase();
         let event_succeeded = is_successful_evidence_status(&event.status);
         if event_succeeded
-            && event.event_type == "child.jobs.joined"
+            && matches!(
+                event.event_type.as_str(),
+                "child.jobs.joined" | "child.jobs.reused"
+            )
             && event
                 .data_json
                 .pointer("/join_decision/daemon_completed_parent")
@@ -13566,6 +13569,50 @@ and open a pull request to dev when it is ready."
                 .task_evidence
                 .iter()
                 .any(|evidence| evidence.starts_with("child_report:"))
+        );
+
+        let reused_join_parent = store
+            .create_job(JobRecord {
+                id: "reused-join-parent-job".to_string(),
+                session_id: Some("task-class-session".to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("local_project".to_string()),
+                title: "Reused join parent job".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "prompt".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("reused join parent should persist");
+        store
+            .append_job_event(JobEventRecord {
+                job_id: reused_join_parent.id.clone(),
+                worker_id: None,
+                event_type: "child.jobs.reused".to_string(),
+                status: "completed".to_string(),
+                summary: "Reused 1 equivalent child job(s)".to_string(),
+                detail: "1 child job(s) completed and 0 ended without success.".to_string(),
+                data_json: json!({
+                    "join_decision": {
+                        "daemon_completed_parent": true,
+                        "join_kind": "single_successful_delegated_child"
+                    }
+                }),
+            })
+            .expect("reused join event should persist");
+        let reused_join_parent = store
+            .get_job(&reused_join_parent.id)
+            .expect("reused join parent should load")
+            .job;
+        assert_eq!(reused_join_parent.completion_status, "satisfied");
+        assert!(
+            reused_join_parent
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("delegated_child_join:"))
         );
 
         let deployment_with_git_status = store
