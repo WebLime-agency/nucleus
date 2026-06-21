@@ -1776,7 +1776,51 @@ fn command_looks_like_validation(command: &str) -> bool {
         "just test",
         "just check",
     ];
-    command_matches_allowed_prefix(command, &allowed)
+    command_matches_allowed_prefix(command, &allowed) || command_is_focused_node_test(command)
+}
+
+fn command_is_focused_node_test(command: &str) -> bool {
+    let normalized = command
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    command_policy_candidates(&normalized)
+        .iter()
+        .filter_map(|candidate| shell_words(candidate).ok())
+        .any(|tokens| focused_node_test_tokens(&tokens))
+}
+
+fn focused_node_test_tokens(tokens: &[String]) -> bool {
+    if tokens.len() != 3 || tokens[0] != "node" || tokens[1] != "--test" {
+        return false;
+    }
+    let path = tokens[2].as_str();
+    if path.is_empty()
+        || path.starts_with('-')
+        || path
+            .chars()
+            .any(|character| matches!(character, '*' | '?' | '[' | ']' | '{' | '}'))
+    {
+        return false;
+    }
+    let file_name = Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let name = file_name.to_lowercase();
+    let has_test_marker = name.contains(".test.") || name.contains(".spec.");
+    let has_supported_extension = Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_lowercase().as_str(),
+                "js" | "mjs" | "cjs" | "ts" | "mts" | "cts"
+            )
+        })
+        .unwrap_or(false);
+    has_test_marker && has_supported_extension
 }
 
 fn command_session_looks_like_check_validation(command: &str) -> bool {
@@ -3265,6 +3309,39 @@ mod tests {
     }
 
     #[test]
+    fn tests_run_policy_allows_focused_node_test_file() {
+        let call = tool_call_with_args(
+            "tests.run",
+            json!({"command":"node","args":["--test","apps/web/src/lib/nucleus/session-ux.test.mjs"],"cwd":"."}),
+        );
+
+        let verdict = evaluate_tests_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+        assert!(verdict.approve, "unexpected denial: {verdict:?}");
+        assert!(command_looks_like_validation(
+            "node --test apps/web/src/lib/nucleus/session-ux.test.mjs"
+        ));
+    }
+
+    #[test]
+    fn tests_run_policy_rejects_unbounded_node_and_npm_exec_shapes() {
+        for args in [
+            json!({"command":"node","args":["apps/web/src/lib/nucleus/session-ux.test.mjs"],"cwd":"."}),
+            json!({"command":"node","args":["--test"],"cwd":"."}),
+            json!({"command":"node","args":["--test","apps/web/src/lib/nucleus/*.test.mjs"],"cwd":"."}),
+            json!({"command":"node","args":["--test","apps/web/src/lib/nucleus"],"cwd":"."}),
+            json!({"command":"npm","args":["--workspace","@nucleus/web","exec","--","node","--test","src/lib/nucleus/session-ux.test.mjs"],"cwd":"."}),
+        ] {
+            let call = tool_call_with_args("tests.run", args);
+
+            let verdict = evaluate_tests_run(&call, Path::new("/tmp/nucleus-dogfood-worktree"));
+
+            assert!(!verdict.approve, "unexpected approval for {call:?}");
+            assert!(verdict.reason.contains("allow-list"));
+        }
+    }
+
+    #[test]
     fn http_request_timeout_is_bounded_by_rung_timeout() {
         assert_eq!(http_request_timeout(0), Duration::from_secs(1));
         assert_eq!(http_request_timeout(5), Duration::from_secs(5));
@@ -3321,6 +3398,79 @@ mod tests {
         }));
 
         assert!(!tool_call_is_successful_test_run(&no_match));
+    }
+
+    #[test]
+    fn focused_node_test_evidence_is_accepted_when_exit_zero() {
+        let mut call = tool_call_with_args(
+            "tests.run",
+            json!({"command":"node","args":["--test","apps/web/src/lib/nucleus/session-ux.test.mjs"],"cwd":"."}),
+        );
+        call.status = "completed".to_string();
+        call.result_json = Some(json!({"exit_code": 0}));
+
+        assert!(tool_call_is_successful_test_run(&call));
+    }
+
+    #[test]
+    fn failed_broader_npm_test_is_not_accepted_as_validation() {
+        let mut call = tool_call_with_args(
+            "tests.run",
+            json!({"command":"npm","args":["--workspace","@nucleus/web","test","--","src/lib/nucleus/session-ux.test.mjs"],"cwd":"."}),
+        );
+        call.status = "completed".to_string();
+        call.result_json = Some(json!({"exit_code": 1}));
+
+        assert!(!tool_call_is_successful_test_run(&call));
+    }
+
+    #[test]
+    fn feature_161_accepts_delegated_focused_node_validation() {
+        let rung = test_rung(Acceptance::Feature161, 1);
+        let root = root_detail(
+            "completed",
+            "satisfied",
+            vec![child_summary("child", "completed", "satisfied")],
+        );
+        let mutation = tool_call("fs.apply_patch", "completed", None);
+        let mut validation = tool_call_with_args(
+            "tests.run",
+            json!({"command":"node","args":["--test","apps/web/src/lib/nucleus/session-ux.test.mjs"],"cwd":"."}),
+        );
+        validation.status = "completed".to_string();
+        validation.result_json = Some(json!({"exit_code": 0}));
+        let child = child_detail(
+            "child",
+            "completed",
+            "satisfied",
+            vec![mutation, validation],
+        );
+        let root_worker = Some(WorkerReport {
+            lane: "utility".to_string(),
+            model: "cx/gpt-mini".to_string(),
+            tool_calls: 0,
+        });
+
+        let reasons = acceptance_reasons(
+            &rung,
+            &root,
+            &[child],
+            &root_worker,
+            &PhaseReport {
+                passed: true,
+                reasons: Vec::new(),
+            },
+            &PhaseReport {
+                passed: true,
+                reasons: Vec::new(),
+            },
+            None,
+        );
+
+        assert!(
+            reasons.is_empty(),
+            "focused validation should satisfy feature_161: {reasons:?}"
+        );
     }
 
     #[test]
