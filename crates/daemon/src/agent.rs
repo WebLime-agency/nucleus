@@ -6106,8 +6106,8 @@ fn child_job_join_outcome_for_parent_join(
 ) -> Result<&'static str> {
     let outcome = child_job_join_outcome(detail);
     if outcome != CHILD_OUTCOME_SUCCEEDED
-        && detail.job.state == "completed"
         && detail.job.task_class.as_deref() == Some("local_project")
+        && matches!(detail.job.state.as_str(), "completed" | "blocked")
     {
         let mutation_receipts = local_project_child_mutation_receipts(state, detail)?;
         if !mutation_receipts.is_empty()
@@ -6194,7 +6194,7 @@ fn is_single_successful_delegated_child_join(
     let mutation_receipts = local_project_child_mutation_receipts(state, child)?;
     Ok(parent_job.task_class.as_deref() == Some("local_project")
         && child.job.task_class.as_deref() == Some("local_project")
-        && child.job.state == "completed"
+        && child_job_join_outcome_for_parent_join(state, child)? == CHILD_OUTCOME_SUCCEEDED
         && local_project_child_validation_evidence(child, &mutation_receipts).is_some()
         && !mutation_receipts.is_empty())
 }
@@ -6530,7 +6530,7 @@ fn child_join_evidence_rollup(state: &AppState, child_details: &[JobDetail]) -> 
                 "job_id": detail.job.id,
                 "task_class": detail.job.task_class,
                 "executor_lane": detail.job.executor_lane,
-                "join_outcome": child_job_join_outcome(detail),
+                "join_outcome": child_job_join_outcome_for_parent_join(state, detail)?,
                 "validation_evidence": validation_evidence.as_ref()
                     .map(|evidence| evidence.evidence.clone())
                     .unwrap_or_default(),
@@ -35595,14 +35595,14 @@ Thanks."#,
                 false,
             ),
             (
-                "blocked-child",
+                "blocked-child-no-validation",
                 LocalProjectJoinChildOptions {
                     state: "blocked",
                     mutation_receipt: true,
-                    validation_exit_code: Some(0),
+                    validation_exit_code: None,
                 },
                 "blocked_recoverable",
-                false,
+                true,
             ),
             (
                 "canceled-child",
@@ -36602,6 +36602,371 @@ Thanks."#,
             .find(|candidate| candidate.id == worker.id)
             .expect("parent worker should persist");
         assert_eq!(parent_worker.tool_call_count, 0);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn blocked_feature_child_with_later_focused_validation_reuse_completes_parent() {
+        let state_dir = test_state_dir("blocked-feature-focused-validation-reuse");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, mut worker) = create_local_project_parent_join_context(
+            &state,
+            "blocked-feature-focused-validation",
+            &workspace_root,
+        );
+
+        let first_proposal = ChildJobProposal {
+            title: "Implement feature_161 session UX".to_string(),
+            prompt: "Update feature_161 session UX and validate session-ux focused tests."
+                .to_string(),
+            task_class: Some("local_project".to_string()),
+            working_dir: None,
+            route_id: None,
+        };
+        let first_child_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "feature-161-live-blocked-child",
+            LocalProjectJoinChildOptions {
+                state: "blocked",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &first_child_id,
+            "apps/web/src/lib/nucleus/session-ux.js",
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &first_child_id,
+            "apps/web/src/lib/nucleus/session-ux.test.mjs",
+        );
+        append_tests_run_tool_call(
+            &state,
+            &first_child_id,
+            "npm-test-failed",
+            "failed",
+            1,
+            json!({"command": "npm", "args": ["test"]}),
+            5,
+        );
+        append_tests_run_command_session(
+            &state,
+            &session.session.id,
+            &first_child_id,
+            "npm-test-failed",
+            "failed",
+            1,
+            "npm",
+            vec!["test"],
+            &workspace_root,
+            5,
+        );
+        append_tests_run_tool_call(
+            &state,
+            &first_child_id,
+            "node-focused-validation",
+            "completed",
+            0,
+            json!({
+                "command": "node",
+                "args": ["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            }),
+            7,
+        );
+        state
+            .store
+            .update_job(
+                &first_child_id,
+                JobPatch {
+                    metadata_json: Some(json!({
+                        "child_contract": "local_project",
+                        "delegation_key": child_delegation_key(&first_proposal),
+                        "delegation_scope_key": child_delegation_scope_key(&first_proposal),
+                        "delegation_scope_keys": child_delegation_scope_keys(&first_proposal),
+                        "parent_generation": 0,
+                    })),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child delegation metadata should persist");
+        let child_before_reuse = state.store.get_job(&first_child_id).expect("child loads");
+        assert_eq!(child_before_reuse.job.state, "blocked");
+        assert_eq!(child_before_reuse.job.completion_status, "blocked");
+        assert!(
+            child_before_reuse
+                .job
+                .completion_blockers
+                .iter()
+                .any(|blocker| blocker.contains("Recent command failure blocks completion"))
+        );
+
+        let second_proposal = ChildJobProposal {
+            title: "Finish feature 161 session UX".to_string(),
+            prompt: "Update the session UX for feature #161 and validate the focused test."
+                .to_string(),
+            task_class: Some("local_project".to_string()),
+            working_dir: None,
+            route_id: None,
+        };
+        assert_eq!(
+            child_delegation_scope_key(&first_proposal),
+            child_delegation_scope_key(&second_proposal)
+        );
+
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "Dogfood ladder rung: feature_161. Delegate one main child, then converge without duplicate fanout.".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let mut step = 0;
+
+        let disposition = handle_child_job_proposal(
+            &state,
+            &session,
+            &parent_job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            0,
+            "continue implementing feature_161".to_string(),
+            vec![second_proposal],
+        )
+        .await
+        .expect("same-scope blocked child with focused validation should be reused");
+
+        assert_eq!(disposition, LoopDisposition::Return);
+        let parent = state.store.get_job(&parent_job_id).expect("parent loads");
+        assert_eq!(parent.job.state, "completed");
+        assert_eq!(parent.job.completion_status, "satisfied");
+        assert!(parent.job.completion_blockers.is_empty());
+        assert_eq!(parent.child_jobs.len(), 1);
+        assert!(
+            parent
+                .job
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("delegated_child_join:"))
+        );
+        let reuse_event = parent
+            .events
+            .iter()
+            .find(|event| event.event_type == "child.jobs.reused")
+            .expect("same-scope child reuse should persist");
+        assert_eq!(reuse_event.status, "completed");
+        assert_eq!(reuse_event.data_json["child_job_ids"][0], first_child_id);
+        assert_eq!(
+            reuse_event.data_json["match_kinds"][0],
+            "delegation_scope_key"
+        );
+        assert_eq!(
+            reuse_event.data_json["child_outcomes"][0]["join_outcome"],
+            CHILD_OUTCOME_SUCCEEDED
+        );
+        assert_eq!(
+            reuse_event.data_json["child_join_evidence"][0]["join_outcome"],
+            CHILD_OUTCOME_SUCCEEDED
+        );
+        assert_eq!(
+            reuse_event.data_json["child_join_evidence"][0]["validation_status"],
+            "passed"
+        );
+        assert!(
+            reuse_event.data_json["child_join_evidence"][0]["validation_evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("node-focused-validation"))
+        );
+        assert_eq!(
+            reuse_event.data_json["join_decision"]["daemon_completed_parent"],
+            true
+        );
+        assert_eq!(
+            reuse_event.data_json["join_decision"]["daemon_blocked_parent"],
+            false
+        );
+        assert_eq!(
+            reuse_event.data_json["join_decision"]["next_action"],
+            "complete_parent"
+        );
+        assert!(checkpoint.next_prompt.is_none());
+        let parent_worker = parent
+            .workers
+            .iter()
+            .find(|candidate| candidate.id == worker.id)
+            .expect("parent worker should persist");
+        assert_eq!(parent_worker.tool_call_count, 0);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn blocked_feature_child_reuse_blocks_when_latest_applicable_validation_failed() {
+        let state_dir = test_state_dir("blocked-feature-latest-validation-failed");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, mut worker) = create_local_project_parent_join_context(
+            &state,
+            "blocked-feature-latest-failed",
+            &workspace_root,
+        );
+
+        let first_proposal = ChildJobProposal {
+            title: "Implement feature_161 session UX".to_string(),
+            prompt: "Update feature_161 session UX and validate session-ux focused tests."
+                .to_string(),
+            task_class: Some("local_project".to_string()),
+            working_dir: None,
+            route_id: None,
+        };
+        let first_child_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "feature-161-latest-failed-child",
+            LocalProjectJoinChildOptions {
+                state: "blocked",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &first_child_id,
+            "apps/web/src/lib/nucleus/session-ux.js",
+        );
+        append_tests_run_tool_call(
+            &state,
+            &first_child_id,
+            "node-focused-validation-success",
+            "completed",
+            0,
+            json!({
+                "command": "node",
+                "args": ["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            }),
+            5,
+        );
+        append_tests_run_tool_call(
+            &state,
+            &first_child_id,
+            "node-focused-validation-failed",
+            "failed",
+            1,
+            json!({
+                "command": "node",
+                "args": ["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            }),
+            7,
+        );
+        append_tests_run_command_session(
+            &state,
+            &session.session.id,
+            &first_child_id,
+            "node-focused-validation-failed",
+            "failed",
+            1,
+            "node",
+            vec!["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            &workspace_root,
+            7,
+        );
+        state
+            .store
+            .update_job(
+                &first_child_id,
+                JobPatch {
+                    metadata_json: Some(json!({
+                        "child_contract": "local_project",
+                        "delegation_key": child_delegation_key(&first_proposal),
+                        "delegation_scope_key": child_delegation_scope_key(&first_proposal),
+                        "delegation_scope_keys": child_delegation_scope_keys(&first_proposal),
+                        "parent_generation": 0,
+                    })),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child delegation metadata should persist");
+
+        let second_proposal = ChildJobProposal {
+            title: "Finish feature 161 session UX".to_string(),
+            prompt: "Update the session UX for feature #161 and validate the focused test."
+                .to_string(),
+            task_class: Some("local_project".to_string()),
+            working_dir: None,
+            route_id: None,
+        };
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "Dogfood ladder rung: feature_161. Delegate one main child, then converge without duplicate fanout.".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let mut step = 0;
+
+        let disposition = handle_child_job_proposal(
+            &state,
+            &session,
+            &parent_job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            0,
+            "continue implementing feature_161".to_string(),
+            vec![second_proposal],
+        )
+        .await
+        .expect("same-scope child with latest failed validation should be reused and blocked");
+
+        assert_eq!(disposition, LoopDisposition::Return);
+        let parent = state.store.get_job(&parent_job_id).expect("parent loads");
+        assert_eq!(parent.job.state, "blocked");
+        assert_eq!(parent.job.completion_status, "blocked");
+        assert_eq!(parent.child_jobs.len(), 1);
+        let reuse_event = parent
+            .events
+            .iter()
+            .find(|event| event.event_type == "child.jobs.reused")
+            .expect("same-scope child reuse should persist");
+        assert_eq!(reuse_event.status, "blocked");
+        assert_eq!(
+            reuse_event.data_json["child_join_evidence"][0]["validation_status"],
+            "not_performed"
+        );
+        assert_eq!(
+            reuse_event.data_json["join_decision"]["daemon_completed_parent"],
+            false
+        );
+        assert_eq!(
+            reuse_event.data_json["join_decision"]["daemon_blocked_parent"],
+            true
+        );
+        assert!(checkpoint.next_prompt.is_none());
 
         let _ = fs::remove_dir_all(&state_dir);
     }
@@ -42264,6 +42629,51 @@ for line in sys.stdin:
                 completed_at: Some(timestamp + 1),
             })
             .expect("tests.run tool call should persist");
+    }
+
+    fn append_tests_run_command_session(
+        state: &AppState,
+        session_id: &str,
+        child_job_id: &str,
+        suffix: &str,
+        status: &str,
+        exit_code: i32,
+        command: &str,
+        args: Vec<&str>,
+        workspace_root: &Path,
+        timestamp: i64,
+    ) {
+        let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+        state
+            .store
+            .create_command_session(CommandSessionRecord {
+                id: format!("{child_job_id}-{suffix}-command"),
+                job_id: child_job_id.to_string(),
+                worker_id: format!("{child_job_id}-worker"),
+                tool_call_id: Some(format!("{child_job_id}-{suffix}")),
+                mode: "oneshot".to_string(),
+                title: "Nucleus-owned test run".to_string(),
+                state: status.to_string(),
+                command: command.to_string(),
+                args,
+                cwd: workspace_root.display().to_string(),
+                session_id: session_id.to_string(),
+                project_id: String::new(),
+                worktree_path: workspace_root.display().to_string(),
+                branch: "weblime/test".to_string(),
+                port: None,
+                env_json: json!({}),
+                network_policy: "inherit".to_string(),
+                timeout_secs: 120,
+                output_limit_bytes: 8192,
+                last_error: String::new(),
+                exit_code: Some(exit_code),
+                stdout_artifact_id: None,
+                stderr_artifact_id: None,
+                started_at: Some(timestamp),
+                completed_at: Some(timestamp + 1),
+            })
+            .expect("tests.run command session should persist");
     }
 
     fn mark_job_state(state: &AppState, job_id: &str, next_state: &str) {
