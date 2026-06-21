@@ -3324,6 +3324,52 @@ mod tests {
     }
 
     #[test]
+    fn feature_161_rejects_root_tool_drift_even_with_child_validation() {
+        let rung = test_rung(Acceptance::Feature161, 1);
+        let root = root_detail(
+            "completed",
+            "satisfied",
+            vec![child_summary("child", "completed", "satisfied")],
+        );
+        let mutation = tool_call("fs.apply_patch", "completed", None);
+        let validation = tool_call("tests.run", "completed", Some(0));
+        let child = child_detail(
+            "child",
+            "completed",
+            "satisfied",
+            vec![mutation, validation],
+        );
+        let root_worker = Some(WorkerReport {
+            lane: "utility".to_string(),
+            model: "cx/gpt-mini".to_string(),
+            tool_calls: 2,
+        });
+
+        let reasons = acceptance_reasons(
+            &rung,
+            &root,
+            &[child],
+            &root_worker,
+            &PhaseReport {
+                passed: true,
+                reasons: Vec::new(),
+            },
+            &PhaseReport {
+                passed: true,
+                reasons: Vec::new(),
+            },
+            None,
+        );
+
+        assert!(reasons.iter().any(|reason| {
+            reason == "root worker made 2 tool calls, expected approximately zero"
+        }));
+        assert!(!reasons.iter().any(|reason| {
+            reason == "feature rung lacked accepted implementation+validation evidence"
+        }));
+    }
+
+    #[test]
     fn command_session_validation_fallback_excludes_test_commands() {
         assert!(!command_session_looks_like_check_validation("cargo test"));
         assert!(!command_session_looks_like_check_validation("npm test"));
