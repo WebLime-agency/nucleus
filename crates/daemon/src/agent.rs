@@ -16260,12 +16260,10 @@ fn resolve_command_spec(
     restrict_to_test_commands: bool,
 ) -> Result<ResolvedCommandSpec> {
     let command = validate_command_value(worker, &command)?;
-    if restrict_to_test_commands && !is_supported_test_command(&command) {
-        bail!(
-            "tests.run only supports common test/build executables like cargo, npm, pnpm, yarn, bun, pytest, go, make, and just"
-        );
-    }
     let cwd = resolve_command_cwd(worker, cwd.as_deref())?;
+    if restrict_to_test_commands {
+        validate_tests_run_command_shape(worker, &command, &args, &cwd)?;
+    }
     let timeout_secs = timeout_secs
         .unwrap_or(COMMAND_DEFAULT_TIMEOUT_SECS)
         .clamp(1, COMMAND_MAX_TIMEOUT_SECS);
@@ -16581,6 +16579,117 @@ fn is_supported_test_command(command: &str) -> bool {
     matches!(
         executable,
         "cargo" | "npm" | "pnpm" | "yarn" | "bun" | "pytest" | "go" | "make" | "just"
+    )
+}
+
+fn validate_tests_run_command_shape(
+    worker: &WorkerSummary,
+    command: &str,
+    args: &[String],
+    cwd: &Path,
+) -> Result<()> {
+    let executable = Path::new(command)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(command);
+    if executable == "node" {
+        return validate_focused_node_test_command(worker, args, cwd);
+    }
+    if executable == "npm"
+        && npm_subcommand(args).is_some_and(|value| matches!(value, "exec" | "x"))
+    {
+        bail!(
+            "tests.run does not support npm exec; use a package test/build script or direct node --test for one in-worktree test file"
+        );
+    }
+    if is_supported_test_command(command) {
+        return Ok(());
+    }
+    bail!(
+        "tests.run only supports common test/build executables like cargo, npm, pnpm, yarn, bun, node --test, pytest, go, make, and just"
+    )
+}
+
+fn npm_subcommand(args: &[String]) -> Option<&str> {
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--workspace" | "-w" => index += 2,
+            "--workspaces" => index += 1,
+            value if value.starts_with("--workspace=") || value.starts_with("-w=") => index += 1,
+            "--" => index += 1,
+            value if value.starts_with('-') => index += 1,
+            value => return Some(value),
+        }
+    }
+    None
+}
+
+fn validate_focused_node_test_command(
+    worker: &WorkerSummary,
+    args: &[String],
+    cwd: &Path,
+) -> Result<()> {
+    if args.len() != 2 || args.first().map(String::as_str) != Some("--test") {
+        bail!("tests.run node support is limited to node --test <in-worktree test file>");
+    }
+    let test_path = args[1].trim();
+    if test_path.is_empty() || test_path.starts_with('-') || test_path_has_glob(test_path) {
+        bail!("node --test requires one explicit in-worktree test file path");
+    }
+    let raw_path = PathBuf::from(test_path);
+    let candidate = if raw_path.is_absolute() {
+        raw_path
+    } else {
+        cwd.join(raw_path)
+    };
+    let resolved = fs::canonicalize(normalize_lexical_path(&candidate))
+        .with_context(|| format!("failed to resolve node test file '{}'", candidate.display()))?;
+    if !resolved.is_file() {
+        bail!("node --test target '{}' is not a file", resolved.display());
+    }
+    if !is_focused_node_test_file(&resolved) {
+        bail!(
+            "node --test target '{}' must be a focused .test/.spec JavaScript or TypeScript file",
+            resolved.display()
+        );
+    }
+    let allowed_roots = worker
+        .read_roots
+        .iter()
+        .map(|root| {
+            fs::canonicalize(root)
+                .with_context(|| format!("failed to resolve read root '{}'", root))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !allowed_roots.iter().any(|root| resolved.starts_with(root)) {
+        bail!(
+            "node --test target '{}' is outside the worker read scope",
+            resolved.display()
+        );
+    }
+    Ok(())
+}
+
+fn test_path_has_glob(path: &str) -> bool {
+    path.chars()
+        .any(|character| matches!(character, '*' | '?' | '[' | ']' | '{' | '}'))
+}
+
+fn is_focused_node_test_file(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let name = file_name.to_ascii_lowercase();
+    if !(name.contains(".test.") || name.contains(".spec.")) {
+        return false;
+    }
+    matches!(
+        path.extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref(),
+        Some("js" | "mjs" | "cjs" | "ts" | "mts" | "cts")
     )
 }
 
@@ -23719,6 +23828,114 @@ mod tests {
             3,
             2,
         ));
+    }
+
+    #[test]
+    fn tests_run_preview_allows_focused_node_test_file() {
+        let state_dir = test_state_dir("focused-node-test-preview");
+        let state = initialize_test_state(&state_dir);
+        let (_, worker, _) = create_command_test_context(&state, "focused-node-test");
+        let test_file =
+            Path::new(&worker.working_dir).join("apps/web/src/lib/nucleus/session-ux.test.mjs");
+        fs::create_dir_all(test_file.parent().expect("test file parent should exist"))
+            .expect("test file parent should be created");
+        fs::write(&test_file, "import test from 'node:test';\n").expect("test file should write");
+
+        let preview = preview_tests_run(
+            &worker,
+            TestsRunArgs {
+                command: "node".to_string(),
+                args: vec![
+                    "--test".to_string(),
+                    "apps/web/src/lib/nucleus/session-ux.test.mjs".to_string(),
+                ],
+                cwd: None,
+                timeout_secs: Some(120),
+                output_limit_bytes: Some(8_192),
+                env: BTreeMap::new(),
+            },
+        )
+        .expect("focused node test should preview");
+
+        assert!(preview.detail.contains("node --test"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn tests_run_preview_rejects_unbounded_node_and_npm_exec_shapes() {
+        let state_dir = test_state_dir("focused-node-test-denials");
+        let state = initialize_test_state(&state_dir);
+        let (_, worker, _) = create_command_test_context(&state, "focused-node-denials");
+        let broad_dir = Path::new(&worker.working_dir).join("apps/web/src/lib/nucleus");
+        fs::create_dir_all(&broad_dir).expect("broad dir should exist");
+        let external_file = state_dir.join("outside.test.mjs");
+        fs::write(&external_file, "import test from 'node:test';\n")
+            .expect("external test file should write");
+
+        for (args, expected) in [
+            (
+                vec!["apps/web/src/lib/nucleus/session-ux.test.mjs".to_string()],
+                "node support is limited",
+            ),
+            (vec!["--test".to_string()], "node support is limited"),
+            (
+                vec![
+                    "--test".to_string(),
+                    "apps/web/src/lib/nucleus/*.test.mjs".to_string(),
+                ],
+                "one explicit",
+            ),
+            (
+                vec!["--test".to_string(), "apps/web/src/lib/nucleus".to_string()],
+                "not a file",
+            ),
+            (
+                vec!["--test".to_string(), external_file.display().to_string()],
+                "outside the worker read scope",
+            ),
+        ] {
+            let error = preview_tests_run(
+                &worker,
+                TestsRunArgs {
+                    command: "node".to_string(),
+                    args,
+                    cwd: None,
+                    timeout_secs: Some(120),
+                    output_limit_bytes: Some(8_192),
+                    env: BTreeMap::new(),
+                },
+            )
+            .expect_err("unsafe node test shape should be rejected");
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected error: {error}"
+            );
+        }
+
+        let npm_exec = preview_tests_run(
+            &worker,
+            TestsRunArgs {
+                command: "npm".to_string(),
+                args: vec![
+                    "--workspace".to_string(),
+                    "@nucleus/web".to_string(),
+                    "exec".to_string(),
+                    "--".to_string(),
+                    "node".to_string(),
+                    "--test".to_string(),
+                    "src/lib/nucleus/session-ux.test.mjs".to_string(),
+                ],
+                cwd: None,
+                timeout_secs: Some(120),
+                output_limit_bytes: Some(8_192),
+                env: BTreeMap::new(),
+            },
+        )
+        .expect_err("npm exec should stay rejected");
+        assert!(npm_exec.to_string().contains("npm exec"));
+
+        let _ = fs::remove_dir_all(&state_dir);
     }
 
     #[test]
