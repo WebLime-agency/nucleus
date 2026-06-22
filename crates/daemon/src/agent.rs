@@ -4081,7 +4081,23 @@ async fn run_job_loop(
             return Ok(());
         }
 
-        if worker_wall_clock_exceeded(&worker, unix_timestamp()) {
+        let local_project_recovery = handle_local_project_validation_recovery_before_budget(
+            state,
+            &session,
+            job_id,
+            &mut worker,
+            &mut checkpoint,
+            step,
+            tool_calls,
+        )
+        .await?;
+        if local_project_recovery == LocalProjectValidationRecoveryDisposition::Return {
+            return Ok(());
+        }
+
+        if local_project_recovery != LocalProjectValidationRecoveryDisposition::DeferBudget
+            && worker_wall_clock_exceeded(&worker, unix_timestamp())
+        {
             complete_job_with_budget_checkpoint(
                 state,
                 &session,
@@ -4096,7 +4112,10 @@ async fn run_job_loop(
             return Ok(());
         }
 
-        if worker.max_steps > 0 && step >= worker.max_steps {
+        if local_project_recovery != LocalProjectValidationRecoveryDisposition::DeferBudget
+            && worker.max_steps > 0
+            && step >= worker.max_steps
+        {
             complete_job_with_budget_checkpoint(
                 state,
                 &session,
@@ -4111,7 +4130,10 @@ async fn run_job_loop(
             return Ok(());
         }
 
-        if worker.max_tool_calls > 0 && tool_calls >= worker.max_tool_calls {
+        if local_project_recovery != LocalProjectValidationRecoveryDisposition::DeferBudget
+            && worker.max_tool_calls > 0
+            && tool_calls >= worker.max_tool_calls
+        {
             complete_job_with_budget_checkpoint(
                 state,
                 &session,
@@ -4500,6 +4522,27 @@ async fn run_job_loop(
                         "Requested explicit publication outcome metadata.",
                         "publication_outcome_missing",
                         &build_publication_outcome_retry_prompt(&summary, &final_answer),
+                        &final_answer,
+                    )
+                    .await?;
+                    continue;
+                }
+
+                if let Some(retry_prompt) =
+                    local_project_validation_recovery_prompt_for_final_answer(
+                        state, &detail, &worker, step, tool_calls,
+                    )?
+                {
+                    retry_worker_final_answer(
+                        state,
+                        job_id,
+                        &mut worker,
+                        &mut checkpoint,
+                        &mut step,
+                        tool_calls,
+                        "Requested focused local_project validation after mutation.",
+                        "local_project_validation_required_after_mutation",
+                        &retry_prompt,
                         &final_answer,
                     )
                     .await?;
@@ -6287,6 +6330,19 @@ fn latest_applicable_successful_tests_run<'a>(
     detail: &'a JobDetail,
     mutation_receipts: &[nucleus_protocol::MutationReceipt],
 ) -> Option<&'a nucleus_protocol::ToolCallSummary> {
+    latest_applicable_tests_run(detail, mutation_receipts).filter(|tool_call| {
+        tool_call.status == "completed"
+            && tool_call
+                .result_json
+                .as_ref()
+                .is_some_and(value_has_successful_test_run)
+    })
+}
+
+fn latest_applicable_tests_run<'a>(
+    detail: &'a JobDetail,
+    mutation_receipts: &[nucleus_protocol::MutationReceipt],
+) -> Option<&'a nucleus_protocol::ToolCallSummary> {
     let mutation_paths = mutation_receipts
         .iter()
         .flat_map(|receipt| receipt.paths.iter())
@@ -6318,15 +6374,7 @@ fn latest_applicable_successful_tests_run<'a>(
         if !tests_run_command_applies_to_mutation_paths(&command_text, &mutation_paths) {
             continue;
         }
-        if tool_call.status == "completed"
-            && tool_call
-                .result_json
-                .as_ref()
-                .is_some_and(value_has_successful_test_run)
-        {
-            return Some(tool_call);
-        }
-        return None;
+        return Some(tool_call);
     }
 
     None
@@ -7266,6 +7314,416 @@ fn format_duration(seconds: u64) -> Option<String> {
     } else {
         Some(format!("{secs}s"))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalProjectValidationRecoveryDisposition {
+    Continue,
+    DeferBudget,
+    Return,
+}
+
+async fn handle_local_project_validation_recovery_before_budget(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &mut WorkerSummary,
+    checkpoint: &mut WorkerCheckpoint,
+    step: usize,
+    tool_calls: usize,
+) -> Result<LocalProjectValidationRecoveryDisposition> {
+    let detail = state.store.get_job(job_id)?;
+    if !local_project_validation_recovery_applies(&detail, worker) {
+        return Ok(LocalProjectValidationRecoveryDisposition::Continue);
+    }
+
+    let mutation_receipts = local_project_child_mutation_receipts(state, &detail)?;
+    if mutation_receipts.is_empty() {
+        return Ok(LocalProjectValidationRecoveryDisposition::Continue);
+    }
+
+    if let Some(validation) = local_project_child_validation_evidence(&detail, &mutation_receipts) {
+        if local_project_validation_recovery_at_budget_edge(worker, step, tool_calls) {
+            complete_local_project_child_from_validation_evidence(
+                state,
+                session,
+                job_id,
+                worker,
+                step,
+                tool_calls,
+                &detail,
+                &mutation_receipts,
+                &validation,
+            )
+            .await?;
+            return Ok(LocalProjectValidationRecoveryDisposition::Return);
+        }
+        return Ok(LocalProjectValidationRecoveryDisposition::Continue);
+    }
+
+    if !local_project_validation_recovery_at_budget_edge(worker, step, tool_calls) {
+        return Ok(LocalProjectValidationRecoveryDisposition::Continue);
+    }
+
+    if latest_applicable_tests_run(&detail, &mutation_receipts).is_some() {
+        complete_local_project_child_with_validation_blocker(
+            state,
+            session,
+            job_id,
+            worker,
+            step,
+            tool_calls,
+            &detail,
+            &mutation_receipts,
+        )
+        .await?;
+        return Ok(LocalProjectValidationRecoveryDisposition::Return);
+    }
+
+    if !local_project_validation_recovery_prompted(&detail) {
+        if let Some(command) =
+            focused_tests_run_command_for_mutation_receipts(&mutation_receipts, &worker.working_dir)
+        {
+            checkpoint.next_prompt = Some(build_local_project_validation_recovery_prompt(
+                &mutation_receipts,
+                &command,
+            ));
+            state.store.write_worker_checkpoint(
+                &worker.id,
+                &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+            )?;
+            let _ = state.store.append_job_event(JobEventRecord {
+                job_id: job_id.to_string(),
+                worker_id: Some(worker.id.clone()),
+                event_type: "worker.validation_recovery".to_string(),
+                status: "prompted".to_string(),
+                summary: "Prioritized focused local_project validation after mutation.".to_string(),
+                detail: format!(
+                    "Mutation receipts require focused tests.run validation before completion: {} {}",
+                    command.command,
+                    command.args.join(" ")
+                ),
+                data_json: json!({
+                    "reason": "local_project_mutation_validation_required",
+                    "tool": "tests.run",
+                    "command": command.command,
+                    "args": command.args,
+                    "mutation_receipt_ids": mutation_receipts.iter().map(|receipt| receipt.id).collect::<Vec<_>>(),
+                    "mutation_paths": mutation_receipts.iter().flat_map(|receipt| receipt.paths.iter().cloned()).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>(),
+                }),
+            });
+            publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+            publish_worker_updated(state, worker).await;
+            return Ok(LocalProjectValidationRecoveryDisposition::DeferBudget);
+        }
+    }
+
+    complete_local_project_child_with_validation_blocker(
+        state,
+        session,
+        job_id,
+        worker,
+        step,
+        tool_calls,
+        &detail,
+        &mutation_receipts,
+    )
+    .await?;
+    Ok(LocalProjectValidationRecoveryDisposition::Return)
+}
+
+fn local_project_validation_recovery_applies(detail: &JobDetail, worker: &WorkerSummary) -> bool {
+    detail.job.task_class.as_deref() == Some("local_project")
+        && detail.job.parent_job_id.is_some()
+        && detail.job.executor_lane == MAIN_EXECUTOR_LANE
+        && worker.parent_worker_id.is_some()
+}
+
+fn local_project_validation_recovery_at_budget_edge(
+    worker: &WorkerSummary,
+    step: usize,
+    tool_calls: usize,
+) -> bool {
+    let step_edge = worker.max_steps > 0 && worker.max_steps.saturating_sub(step) <= 1;
+    let action_edge =
+        worker.max_tool_calls > 0 && worker.max_tool_calls.saturating_sub(tool_calls) <= 1;
+    step_edge || action_edge || worker_wall_clock_exceeded(worker, unix_timestamp())
+}
+
+fn local_project_validation_recovery_prompted(detail: &JobDetail) -> bool {
+    detail
+        .events
+        .iter()
+        .any(|event| event.event_type == "worker.validation_recovery" && event.status == "prompted")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FocusedTestsRunCommand {
+    command: String,
+    args: Vec<String>,
+}
+
+fn focused_tests_run_command_for_mutation_receipts(
+    mutation_receipts: &[nucleus_protocol::MutationReceipt],
+    working_dir: &str,
+) -> Option<FocusedTestsRunCommand> {
+    let mutation_paths = mutation_receipts
+        .iter()
+        .flat_map(|receipt| receipt.paths.iter())
+        .filter_map(|path| safe_relative_mutation_path(path))
+        .collect::<BTreeSet<_>>();
+
+    mutation_paths
+        .iter()
+        .find(|path| is_node_focused_test_path(path))
+        .cloned()
+        .or_else(|| focused_node_test_path_for_source_paths(&mutation_paths, working_dir))
+        .map(|path| FocusedTestsRunCommand {
+            command: "node".to_string(),
+            args: vec!["--test".to_string(), path],
+        })
+}
+
+fn safe_relative_mutation_path(path: &str) -> Option<String> {
+    let normalized = path.trim().replace('\\', "/");
+    if normalized.is_empty() || normalized.starts_with('/') {
+        return None;
+    }
+    let path = Path::new(&normalized);
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        )
+    }) {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn is_node_focused_test_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".test.mjs")
+        || lower.ends_with(".test.js")
+        || lower.ends_with(".spec.mjs")
+        || lower.ends_with(".spec.js")
+}
+
+fn focused_node_test_path_for_source_paths(
+    mutation_paths: &BTreeSet<String>,
+    working_dir: &str,
+) -> Option<String> {
+    for mutation_path in mutation_paths {
+        let path = Path::new(mutation_path);
+        let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !matches!(extension, "js" | "mjs") || is_node_focused_test_path(mutation_path) {
+            continue;
+        }
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        for suffix in ["test.mjs", "test.js", "spec.mjs", "spec.js"] {
+            let candidate = parent.join(format!("{stem}.{suffix}"));
+            let candidate = candidate.to_string_lossy().replace('\\', "/");
+            if mutation_paths.contains(&candidate)
+                || (!working_dir.trim().is_empty()
+                    && Path::new(working_dir).join(&candidate).is_file())
+            {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn build_local_project_validation_recovery_prompt(
+    mutation_receipts: &[nucleus_protocol::MutationReceipt],
+    command: &FocusedTestsRunCommand,
+) -> String {
+    let mutation_paths = mutation_receipts
+        .iter()
+        .flat_map(|receipt| receipt.paths.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    format!(
+        "Daemon validation recovery: this local_project child has daemon-owned mutation receipts for {} but no accepted focused validation evidence yet. Completion now requires one bounded tests.run command. Return exactly one JSON action for the next step using tests.run, not command.run: {{\"kind\":\"tool_call\",\"summary\":\"Run focused validation for local_project mutations\",\"tool\":\"tests.run\",\"args\":{{\"command\":\"{}\",\"args\":{},\"cwd\":\".\",\"timeout_secs\":120,\"output_limit_bytes\":8192}}}}. If this exact validation cannot be run, return final_answer with one precise blocker and validation_status unavailable.",
+        mutation_paths.join(", "),
+        command.command,
+        serde_json::to_string(&command.args).unwrap_or_else(|_| "[]".to_string())
+    )
+}
+
+fn local_project_validation_recovery_prompt_for_final_answer(
+    state: &AppState,
+    detail: &JobDetail,
+    worker: &WorkerSummary,
+    step: usize,
+    tool_calls: usize,
+) -> Result<Option<String>> {
+    if !local_project_validation_recovery_applies(detail, worker)
+        || !has_remaining_worker_budget(worker, step, tool_calls)
+        || local_project_validation_recovery_prompted(detail)
+    {
+        return Ok(None);
+    }
+    let mutation_receipts = local_project_child_mutation_receipts(state, detail)?;
+    if mutation_receipts.is_empty()
+        || local_project_child_validation_evidence(detail, &mutation_receipts).is_some()
+        || latest_applicable_tests_run(detail, &mutation_receipts).is_some()
+    {
+        return Ok(None);
+    }
+    Ok(
+        focused_tests_run_command_for_mutation_receipts(&mutation_receipts, &worker.working_dir)
+            .map(|command| {
+                build_local_project_validation_recovery_prompt(&mutation_receipts, &command)
+            }),
+    )
+}
+
+async fn complete_local_project_child_from_validation_evidence(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &mut WorkerSummary,
+    step: usize,
+    tool_calls: usize,
+    detail: &JobDetail,
+    mutation_receipts: &[nucleus_protocol::MutationReceipt],
+    validation: &LocalProjectChildValidationEvidence,
+) -> Result<()> {
+    let summary = "Completed local_project child after focused validation evidence.";
+    let final_answer = format!(
+        "Completed: daemon accepted local_project mutation receipts [{}] and focused validation evidence [{}]. validation_status: passed.",
+        mutation_receipts
+            .iter()
+            .map(|receipt| receipt.id.to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        validation.evidence.join("; ")
+    );
+    let mut additional_context_command_sessions = Vec::new();
+    if let Some(tool_call) = latest_applicable_successful_tests_run(detail, mutation_receipts) {
+        additional_context_command_sessions
+            .push(synthetic_command_session_for_tests_run(detail, tool_call));
+    }
+    state.store.update_job(
+        job_id,
+        JobPatch {
+            validation_status: Some("passed".to_string()),
+            ..JobPatch::default()
+        },
+    )?;
+    complete_job_with_final_answer_with_additional_context_commands(
+        state,
+        session,
+        job_id,
+        worker,
+        step.saturating_add(1),
+        tool_calls,
+        summary,
+        &final_answer,
+        &json!({ "validation_status": "passed" }),
+        &[],
+        &additional_context_command_sessions,
+    )
+    .await
+}
+
+async fn complete_local_project_child_with_validation_blocker(
+    state: &AppState,
+    session: &SessionDetail,
+    job_id: &str,
+    worker: &mut WorkerSummary,
+    step: usize,
+    tool_calls: usize,
+    detail: &JobDetail,
+    mutation_receipts: &[nucleus_protocol::MutationReceipt],
+) -> Result<()> {
+    let mutation_paths = mutation_receipts
+        .iter()
+        .flat_map(|receipt| receipt.paths.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let latest_validation = latest_applicable_tests_run(detail, mutation_receipts);
+    let (validation_status, blocker) = if let Some(tool_call) = latest_validation {
+        let command_text = tests_run_tool_call_command_text(tool_call);
+        if matches!(tool_call.status.as_str(), "completed" | "failed") {
+            (
+                "failed",
+                format!(
+                    "Latest applicable focused validation did not pass: tests.run {} `{}` exit_code={:?}.",
+                    tool_call.id,
+                    command_text,
+                    tool_call
+                        .result_json
+                        .as_ref()
+                        .and_then(|value| value.get("exit_code"))
+                        .and_then(Value::as_i64)
+                ),
+            )
+        } else {
+            (
+                "not_performed",
+                format!(
+                    "Latest applicable focused validation did not complete: tests.run {} `{}` status={}.",
+                    tool_call.id, command_text, tool_call.status
+                ),
+            )
+        }
+    } else if let Some(command) =
+        focused_tests_run_command_for_mutation_receipts(mutation_receipts, &worker.working_dir)
+    {
+        (
+            "not_performed",
+            format!(
+                "Required focused validation was not run after mutation. Expected tests.run command: {} {}.",
+                command.command,
+                command.args.join(" ")
+            ),
+        )
+    } else {
+        (
+            "unavailable",
+            format!(
+                "Required focused validation could not be inferred from mutation paths: {}.",
+                mutation_paths.join(", ")
+            ),
+        )
+    };
+    let summary = "Blocked local_project child before exhausting budget without validation.";
+    let final_answer = format!(
+        "Blocked: local_project child mutated files [{}], but completion requires successful focused tests.run validation. {}",
+        mutation_paths.join(", "),
+        blocker
+    );
+    state.store.update_job(
+        job_id,
+        JobPatch {
+            validation_status: Some(validation_status.to_string()),
+            ..JobPatch::default()
+        },
+    )?;
+    complete_job_with_final_answer(
+        state,
+        session,
+        job_id,
+        worker,
+        step.saturating_add(1),
+        tool_calls,
+        summary,
+        &final_answer,
+        &json!({ "validation_status": validation_status }),
+        &[],
+    )
+    .await
 }
 
 fn child_job_result_json(detail: &JobDetail) -> Result<Value> {
@@ -35275,6 +35733,407 @@ Thanks."#,
                 .iter()
                 .any(|session| session.command == "sh" && session.exit_code == Some(0))
         );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn local_project_child_validation_recovery_prompts_focused_tests_run_at_budget_edge() {
+        let state_dir = test_state_dir("feature-161-validation-recovery-prompt");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(workspace_root.join("apps/web/src/lib/nucleus"))
+            .expect("workspace should exist");
+        fs::write(
+            workspace_root.join("apps/web/src/lib/nucleus/session-ux.test.mjs"),
+            "import test from 'node:test';\n",
+        )
+        .expect("focused test should exist");
+        let (session, parent_job_id, _parent_worker) = create_local_project_parent_join_context(
+            &state,
+            "feature-161-validation-recovery-prompt",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "feature-161-recovery-child",
+            LocalProjectJoinChildOptions {
+                state: "running",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.js",
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.test.mjs",
+        );
+
+        let mut child_worker = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load")
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.job_id == child_job_id)
+            .expect("child worker should exist");
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "Implement feature_161 session UX and validate it.".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+
+        let disposition = handle_local_project_validation_recovery_before_budget(
+            &state,
+            &session,
+            &child_job_id,
+            &mut child_worker,
+            &mut checkpoint,
+            23,
+            23,
+        )
+        .await
+        .expect("recovery prompt should be written");
+
+        assert_eq!(
+            disposition,
+            LocalProjectValidationRecoveryDisposition::DeferBudget
+        );
+        let persisted_checkpoint: WorkerCheckpoint = serde_json::from_value(
+            state
+                .store
+                .read_worker_checkpoint(&child_worker.id)
+                .expect("checkpoint read should succeed")
+                .expect("checkpoint should exist"),
+        )
+        .expect("checkpoint should decode");
+        let prompt = persisted_checkpoint
+            .next_prompt
+            .expect("recovery prompt should be queued");
+        assert!(prompt.contains("\"tool\":\"tests.run\""));
+        assert!(prompt.contains("\"command\":\"node\""));
+        assert!(prompt.contains("\"--test\""));
+        assert!(prompt.contains("apps/web/src/lib/nucleus/session-ux.test.mjs"));
+
+        let child = state.store.get_job(&child_job_id).expect("child reloads");
+        let recovery_event = child
+            .events
+            .iter()
+            .find(|event| event.event_type == "worker.validation_recovery")
+            .expect("recovery event should persist");
+        assert_eq!(recovery_event.status, "prompted");
+        assert_eq!(recovery_event.data_json["tool"], "tests.run");
+        assert_eq!(recovery_event.data_json["command"], "node");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn local_project_child_validation_recovery_completes_after_focused_tests_run() {
+        let state_dir = test_state_dir("feature-161-validation-recovery-completes");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, _parent_worker) = create_local_project_parent_join_context(
+            &state,
+            "feature-161-validation-recovery-completes",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "feature-161-recovery-complete-child",
+            LocalProjectJoinChildOptions {
+                state: "running",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.js",
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.test.mjs",
+        );
+        append_tests_run_tool_call(
+            &state,
+            &child_job_id,
+            "node-focused-validation",
+            "completed",
+            0,
+            json!({
+                "command": "node",
+                "args": ["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            }),
+            5,
+        );
+
+        let mut child_worker = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load")
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.job_id == child_job_id)
+            .expect("child worker should exist");
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "Implement feature_161 session UX and validate it.".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+
+        let disposition = handle_local_project_validation_recovery_before_budget(
+            &state,
+            &session,
+            &child_job_id,
+            &mut child_worker,
+            &mut checkpoint,
+            24,
+            23,
+        )
+        .await
+        .expect("validated child should complete");
+
+        assert_eq!(
+            disposition,
+            LocalProjectValidationRecoveryDisposition::Return
+        );
+        let child = state.store.get_job(&child_job_id).expect("child reloads");
+        assert_eq!(child.job.state, "completed");
+        assert_eq!(child.job.completion_status, "satisfied");
+        assert_eq!(child.job.validation_status, "passed");
+        assert!(child.job.completion_blockers.is_empty());
+        assert!(
+            child
+                .job
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("validation:"))
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn local_project_child_validation_recovery_blocks_after_prompt_without_validation() {
+        let state_dir = test_state_dir("feature-161-validation-recovery-blocks");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, _parent_worker) = create_local_project_parent_join_context(
+            &state,
+            "feature-161-validation-recovery-blocks",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "feature-161-recovery-block-child",
+            LocalProjectJoinChildOptions {
+                state: "running",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.js",
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.test.mjs",
+        );
+        state
+            .store
+            .append_job_event(JobEventRecord {
+                job_id: child_job_id.clone(),
+                worker_id: Some(format!("{child_job_id}-worker")),
+                event_type: "worker.validation_recovery".to_string(),
+                status: "prompted".to_string(),
+                summary: "Prioritized focused local_project validation after mutation.".to_string(),
+                detail: "recovery already attempted".to_string(),
+                data_json: json!({"tool":"tests.run"}),
+            })
+            .expect("recovery event should persist");
+
+        let mut child_worker = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load")
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.job_id == child_job_id)
+            .expect("child worker should exist");
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "Implement feature_161 session UX and validate it.".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+
+        let disposition = handle_local_project_validation_recovery_before_budget(
+            &state,
+            &session,
+            &child_job_id,
+            &mut child_worker,
+            &mut checkpoint,
+            24,
+            23,
+        )
+        .await
+        .expect("unvalidated child should block");
+
+        assert_eq!(
+            disposition,
+            LocalProjectValidationRecoveryDisposition::Return
+        );
+        let child = state.store.get_job(&child_job_id).expect("child reloads");
+        assert_eq!(child.job.state, "blocked");
+        assert_eq!(child.job.completion_status, "blocked");
+        assert_eq!(child.job.validation_status, "not_performed");
+        assert!(!child.job.result_summary.contains("step budget"));
+        assert!(child.job.completion_blockers.iter().any(|blocker| {
+            blocker.contains(
+                "Local project completion was claimed without successful validation evidence",
+            )
+        }));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn local_project_child_validation_recovery_blocks_failed_latest_validation() {
+        let state_dir = test_state_dir("feature-161-validation-recovery-failed-latest");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, _parent_worker) = create_local_project_parent_join_context(
+            &state,
+            "feature-161-validation-recovery-failed-latest",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "feature-161-recovery-failed-child",
+            LocalProjectJoinChildOptions {
+                state: "running",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.js",
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.test.mjs",
+        );
+        append_tests_run_tool_call(
+            &state,
+            &child_job_id,
+            "node-focused-validation-failed",
+            "failed",
+            1,
+            json!({
+                "command": "node",
+                "args": ["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            }),
+            5,
+        );
+
+        let mut child_worker = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load")
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.job_id == child_job_id)
+            .expect("child worker should exist");
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "Implement feature_161 session UX and validate it.".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+
+        let disposition = handle_local_project_validation_recovery_before_budget(
+            &state,
+            &session,
+            &child_job_id,
+            &mut child_worker,
+            &mut checkpoint,
+            24,
+            23,
+        )
+        .await
+        .expect("failed latest validation should block");
+
+        assert_eq!(
+            disposition,
+            LocalProjectValidationRecoveryDisposition::Return
+        );
+        let child = state.store.get_job(&child_job_id).expect("child reloads");
+        assert_eq!(child.job.state, "blocked");
+        assert_eq!(child.job.completion_status, "blocked");
+        assert_eq!(child.job.validation_status, "failed");
+        assert!(
+            child
+                .job
+                .result_summary
+                .contains("Blocked local_project child")
+        );
+        let report = child_job_report_preview_text(&child);
+        assert!(report.contains("Latest applicable focused validation did not pass"));
 
         let _ = fs::remove_dir_all(&state_dir);
     }
