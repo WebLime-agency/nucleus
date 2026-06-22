@@ -6151,10 +6151,12 @@ fn child_job_join_outcome_for_parent_join(
     if outcome != CHILD_OUTCOME_SUCCEEDED
         && detail.job.task_class.as_deref() == Some("local_project")
         && matches!(detail.job.state.as_str(), "completed" | "blocked")
+        && local_project_child_browser_gate_satisfied(detail)
+        && local_project_child_join_override_blockers_are_recoverable(detail)
     {
         let mutation_receipts = local_project_child_mutation_receipts(state, detail)?;
         if !mutation_receipts.is_empty()
-            && local_project_child_validation_evidence(detail, &mutation_receipts).is_some()
+            && local_project_child_validation_evidence(state, detail, &mutation_receipts)?.is_some()
         {
             return Ok(CHILD_OUTCOME_SUCCEEDED);
         }
@@ -6238,8 +6240,33 @@ fn is_single_successful_delegated_child_join(
     Ok(parent_job.task_class.as_deref() == Some("local_project")
         && child.job.task_class.as_deref() == Some("local_project")
         && child_job_join_outcome_for_parent_join(state, child)? == CHILD_OUTCOME_SUCCEEDED
-        && local_project_child_validation_evidence(child, &mutation_receipts).is_some()
+        && local_project_child_browser_gate_satisfied(child)
+        && local_project_child_validation_evidence(state, child, &mutation_receipts)?.is_some()
         && !mutation_receipts.is_empty())
+}
+
+fn local_project_child_browser_gate_satisfied(detail: &JobDetail) -> bool {
+    !detail.job.browser_verification_required
+        || matches!(
+            detail.job.browser_verification_status.as_str(),
+            "passed" | "not_required"
+        )
+}
+
+fn local_project_child_join_override_blockers_are_recoverable(detail: &JobDetail) -> bool {
+    detail
+        .job
+        .clone()
+        .with_completion_gates()
+        .completion_gates
+        .iter()
+        .all(|gate| {
+            gate.state == "done"
+                || matches!(
+                    gate.id.as_str(),
+                    "validation" | "browser_verification" | "local_project_evidence"
+                )
+        })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6273,7 +6300,7 @@ fn single_blocked_local_project_child_join<'a>(
 
     let mutation_receipts = local_project_child_mutation_receipts(state, child)?;
     let missing_validation =
-        local_project_child_validation_evidence(child, &mutation_receipts).is_none();
+        local_project_child_validation_evidence(state, child, &mutation_receipts)?.is_none();
     let missing_browser_verification = child.job.browser_verification_required
         && !matches!(
             child.job.browser_verification_status.as_str(),
@@ -6297,10 +6324,119 @@ struct LocalProjectChildValidationEvidence {
     evidence: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LocalProjectChildValidationCompletionContext<'a> {
+    successful_tool_call: Option<&'a nucleus_protocol::ToolCallSummary>,
+}
+
+fn local_project_child_validation_completion_context<'a>(
+    state: &AppState,
+    detail: &'a JobDetail,
+    publication_patch: &mut PublicationOutcomePatch,
+) -> Result<Option<LocalProjectChildValidationCompletionContext<'a>>> {
+    if detail.job.task_class.as_deref() != Some("local_project")
+        || detail.job.parent_job_id.is_none()
+        || detail.job.executor_lane != MAIN_EXECUTOR_LANE
+    {
+        return Ok(None);
+    }
+
+    let mutation_receipts = local_project_child_mutation_receipts(state, detail)?;
+    if mutation_receipts.is_empty() {
+        return Ok(None);
+    }
+
+    let latest_validation = latest_applicable_tests_run(state, detail, &mutation_receipts)?;
+    let successful_tool_call = latest_validation.filter(|tool_call| {
+        tool_call.status == "completed"
+            && tool_call
+                .result_json
+                .as_ref()
+                .is_some_and(value_has_successful_test_run)
+    });
+    let validation_status = if successful_tool_call.is_some() {
+        "passed"
+    } else if latest_validation
+        .is_some_and(|tool_call| matches!(tool_call.status.as_str(), "completed" | "failed"))
+    {
+        "failed"
+    } else if latest_validation.is_some() {
+        "unavailable"
+    } else {
+        "not_performed"
+    };
+
+    publication_patch.validation_status = Some(validation_status.to_string());
+    Ok(Some(LocalProjectChildValidationCompletionContext {
+        successful_tool_call,
+    }))
+}
+
+fn local_project_child_process_evidence_override(
+    job: &nucleus_protocol::JobSummary,
+    context: &LocalProjectChildValidationCompletionContext<'_>,
+    process_evidence_json: Option<&str>,
+) -> Option<Value> {
+    if context.successful_tool_call.is_none()
+        || job.browser_verification_required
+        || job.browser_verification_status != "not_required"
+    {
+        return None;
+    }
+
+    let process_evidence = process_evidence_json
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .unwrap_or(Value::Null);
+    if process_evidence.get("status").and_then(Value::as_str) == Some("satisfied") {
+        return None;
+    }
+    let claims = process_evidence
+        .get("claims")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if claims.is_empty() {
+        return None;
+    }
+
+    let mut active_claims = Vec::new();
+    let mut ignored_browser_claims = Vec::new();
+    for claim in claims {
+        if claim.get("entity_type").and_then(Value::as_str) == Some("browser_sidecar") {
+            ignored_browser_claims.push(claim);
+        } else {
+            active_claims.push(claim);
+        }
+    }
+
+    if ignored_browser_claims.is_empty()
+        || active_claims.iter().any(|claim| {
+            matches!(
+                claim.get("result").and_then(Value::as_str),
+                Some("pending" | "blocked") | None
+            )
+        })
+    {
+        return None;
+    }
+
+    Some(json!({
+        "status": "satisfied",
+        "reason": "browser sidecar process claim ignored because browser verification is not required and focused local_project validation passed",
+        "claims": active_claims,
+        "ignored_claims": ignored_browser_claims,
+    }))
+}
+
 fn local_project_child_validation_evidence(
+    state: &AppState,
     detail: &JobDetail,
     mutation_receipts: &[nucleus_protocol::MutationReceipt],
-) -> Option<LocalProjectChildValidationEvidence> {
+) -> Result<Option<LocalProjectChildValidationEvidence>> {
+    let Some(tool_call) = latest_applicable_successful_tests_run(state, detail, mutation_receipts)?
+    else {
+        return Ok(None);
+    };
     let mut evidence = detail
         .job
         .task_evidence
@@ -6311,45 +6447,57 @@ fn local_project_child_validation_evidence(
     if detail.job.validation_status == "passed" {
         evidence.push("validation:validation status passed".to_string());
     }
-    if let Some(tool_call) = latest_applicable_successful_tests_run(detail, mutation_receipts) {
-        evidence.push(format!("validation:tests.run {} succeeded", tool_call.id));
-    }
+    evidence.push(format!("validation:tests.run {} succeeded", tool_call.id));
     evidence.sort();
     evidence.dedup();
     if evidence.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(LocalProjectChildValidationEvidence {
+        Ok(Some(LocalProjectChildValidationEvidence {
             status: "passed",
             evidence,
-        })
+        }))
     }
 }
 
 fn latest_applicable_successful_tests_run<'a>(
+    state: &AppState,
     detail: &'a JobDetail,
     mutation_receipts: &[nucleus_protocol::MutationReceipt],
-) -> Option<&'a nucleus_protocol::ToolCallSummary> {
-    latest_applicable_tests_run(detail, mutation_receipts).filter(|tool_call| {
-        tool_call.status == "completed"
-            && tool_call
-                .result_json
-                .as_ref()
-                .is_some_and(value_has_successful_test_run)
-    })
+) -> Result<Option<&'a nucleus_protocol::ToolCallSummary>> {
+    Ok(
+        latest_applicable_tests_run(state, detail, mutation_receipts)?.filter(|tool_call| {
+            tool_call.status == "completed"
+                && tool_call
+                    .result_json
+                    .as_ref()
+                    .is_some_and(value_has_successful_test_run)
+        }),
+    )
 }
 
 fn latest_applicable_tests_run<'a>(
+    state: &AppState,
     detail: &'a JobDetail,
     mutation_receipts: &[nucleus_protocol::MutationReceipt],
-) -> Option<&'a nucleus_protocol::ToolCallSummary> {
+) -> Result<Option<&'a nucleus_protocol::ToolCallSummary>> {
+    let tool_call_rowids = state
+        .store
+        .tool_call_rowids_for_job(&detail.job.id)?
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let tool_calls_by_id = detail
+        .tool_calls
+        .iter()
+        .map(|tool_call| (tool_call.id.as_str(), tool_call))
+        .collect::<BTreeMap<_, _>>();
     let mutation_paths = mutation_receipts
         .iter()
         .flat_map(|receipt| receipt.paths.iter())
         .map(String::as_str)
         .collect::<Vec<_>>();
     if mutation_paths.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let mut validation_calls = detail
@@ -6359,25 +6507,85 @@ fn latest_applicable_tests_run<'a>(
         .collect::<Vec<_>>();
     validation_calls.sort_by_key(|tool_call| {
         (
-            tool_call
-                .completed_at
-                .or(tool_call.started_at)
-                .unwrap_or(tool_call.created_at),
+            tool_call_observed_at(tool_call),
             tool_call.started_at.unwrap_or(tool_call.created_at),
             tool_call.created_at,
+            tool_call_rowids
+                .get(&tool_call.id)
+                .copied()
+                .unwrap_or_default(),
             tool_call.id.clone(),
         )
     });
 
     for tool_call in validation_calls.into_iter().rev() {
+        if !tool_call_is_after_mutation_receipts(
+            tool_call,
+            mutation_receipts,
+            &tool_calls_by_id,
+            &tool_call_rowids,
+        ) {
+            continue;
+        }
         let command_text = tests_run_tool_call_command_text(tool_call);
         if !tests_run_command_applies_to_mutation_paths(&command_text, &mutation_paths) {
             continue;
         }
-        return Some(tool_call);
+        return Ok(Some(tool_call));
     }
 
-    None
+    Ok(None)
+}
+
+fn tool_call_is_after_mutation_receipts(
+    tool_call: &nucleus_protocol::ToolCallSummary,
+    mutation_receipts: &[nucleus_protocol::MutationReceipt],
+    tool_calls_by_id: &BTreeMap<&str, &nucleus_protocol::ToolCallSummary>,
+    tool_call_rowids: &BTreeMap<String, i64>,
+) -> bool {
+    mutation_receipts.iter().all(|receipt| {
+        tool_call_is_after_mutation_receipt(tool_call, receipt, tool_calls_by_id, tool_call_rowids)
+    })
+}
+
+fn tool_call_is_after_mutation_receipt(
+    tool_call: &nucleus_protocol::ToolCallSummary,
+    receipt: &nucleus_protocol::MutationReceipt,
+    tool_calls_by_id: &BTreeMap<&str, &nucleus_protocol::ToolCallSummary>,
+    tool_call_rowids: &BTreeMap<String, i64>,
+) -> bool {
+    let validation_observed_at = tool_call_validation_started_at(tool_call);
+    let mutation_tool = tool_calls_by_id.get(receipt.tool_call_id.as_str()).copied();
+    let mutation_tool_observed_at = mutation_tool.map(tool_call_observed_at);
+    let mutation_observed_at = mutation_tool_observed_at
+        .map(|observed_at| observed_at.max(receipt.created_at))
+        .unwrap_or(receipt.created_at);
+
+    if validation_observed_at != mutation_observed_at {
+        return validation_observed_at > mutation_observed_at;
+    }
+
+    let Some(validation_rowid) = tool_call_rowids.get(&tool_call.id) else {
+        return false;
+    };
+    let Some(mutation_rowid) = tool_call_rowids.get(&receipt.tool_call_id) else {
+        return false;
+    };
+    validation_rowid > mutation_rowid
+}
+
+fn tool_call_observed_at(tool_call: &nucleus_protocol::ToolCallSummary) -> i64 {
+    tool_call
+        .completed_at
+        .into_iter()
+        .chain(tool_call.started_at)
+        .chain(std::iter::once(tool_call.created_at))
+        .max()
+        .unwrap_or(tool_call.created_at)
+}
+
+fn tool_call_validation_started_at(tool_call: &nucleus_protocol::ToolCallSummary) -> i64 {
+    tool_call.started_at.unwrap_or(tool_call.created_at)
 }
 
 fn synthetic_command_session_for_tests_run(
@@ -6432,14 +6640,14 @@ fn synthetic_command_session_for_tests_run(
 fn tests_run_tool_call_command_parts(
     tool_call: &nucleus_protocol::ToolCallSummary,
 ) -> (String, Vec<String>) {
-    let command = tool_call
-        .args_json
+    let args_json = normalize_tests_run_args(tool_call.args_json.clone())
+        .unwrap_or_else(|_| tool_call.args_json.clone());
+    let command = args_json
         .get("command")
         .and_then(Value::as_str)
         .unwrap_or("tests.run")
         .to_string();
-    let args = tool_call
-        .args_json
+    let args = args_json
         .get("args")
         .and_then(Value::as_array)
         .map(|args| {
@@ -6552,17 +6760,96 @@ fn local_project_child_mutation_receipts(
         .store
         .list_mutation_receipts_for_session(session_id)?
         .into_iter()
+        .filter(|receipt| receipt.job_id == detail.job.id)
         .filter(|receipt| {
-            receipt.job_id == detail.job.id
-                && receipt.expected_dirty
+            let tool_call = detail
+                .tool_calls
+                .iter()
+                .find(|tool_call| tool_call.id == receipt.tool_call_id);
+            receipt.expected_dirty
                 && !receipt.paths.is_empty()
-                && matches!(
-                    receipt.tool.as_str(),
-                    "fs.apply_patch" | "fs.write_text" | "python.run" | "command.run"
-                )
+                && local_project_child_mutation_receipt_is_material(receipt, tool_call)
         })
         .collect();
     Ok(receipts)
+}
+
+fn local_project_child_mutation_receipt_is_material(
+    receipt: &nucleus_protocol::MutationReceipt,
+    tool_call: Option<&nucleus_protocol::ToolCallSummary>,
+) -> bool {
+    match receipt.tool.as_str() {
+        "fs.apply_patch" | "fs.write_text" => true,
+        "python.run" | "command.run" => {
+            mutation_receipt_changes_session_state(receipt)
+                || !tool_call.is_some_and(tool_call_is_read_only_inspection)
+        }
+        _ => false,
+    }
+}
+
+fn tool_call_is_read_only_inspection(tool_call: &nucleus_protocol::ToolCallSummary) -> bool {
+    if tool_call.tool_id != "command.run" {
+        return false;
+    }
+    let args_json = normalize_command_run_args(tool_call.args_json.clone())
+        .unwrap_or_else(|_| tool_call.args_json.clone());
+    let command = args_json
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let args = args_json
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|args| {
+            args.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let executable = Path::new(command)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(command);
+    if executable == "git" {
+        return git_args_are_read_only_inspection(&args);
+    }
+    if matches!(executable, "sh" | "bash") && args.first().is_some_and(|arg| arg == "-lc") {
+        let script = args.get(1).map(String::as_str).unwrap_or_default().trim();
+        return shell_script_is_single_read_only_git_inspection(script);
+    }
+    false
+}
+
+fn shell_script_is_single_read_only_git_inspection(script: &str) -> bool {
+    let Some(mut tokens) = split_simple_shell_words(script) else {
+        return false;
+    };
+    if tokens
+        .first()
+        .is_some_and(|token| token == "exec" || token == "command")
+    {
+        tokens.remove(0);
+    }
+    tokens.first().is_some_and(|token| token == "git")
+        && git_args_are_read_only_inspection(&tokens[1..])
+}
+
+fn git_args_are_read_only_inspection(args: &[String]) -> bool {
+    args.first().is_some_and(|subcommand| {
+        matches!(
+            subcommand.as_str(),
+            "status" | "diff" | "log" | "show" | "rev-parse" | "branch"
+        )
+    })
+}
+
+fn mutation_receipt_changes_session_state(receipt: &nucleus_protocol::MutationReceipt) -> bool {
+    receipt.before_git_head != receipt.after_git_head
+        || receipt.before_git_branch != receipt.after_git_branch
+        || receipt.before_git_dirty != receipt.after_git_dirty
+        || receipt.before_git_untracked_count != receipt.after_git_untracked_count
 }
 
 fn child_join_evidence_rollup(state: &AppState, child_details: &[JobDetail]) -> Result<Vec<Value>> {
@@ -6570,10 +6857,8 @@ fn child_join_evidence_rollup(state: &AppState, child_details: &[JobDetail]) -> 
         .iter()
         .map(|detail| {
             let mutation_receipts = local_project_child_mutation_receipts(state, detail)?;
-            let validation_evidence = local_project_child_validation_evidence(
-                detail,
-                &mutation_receipts,
-            );
+            let validation_evidence =
+                local_project_child_validation_evidence(state, detail, &mutation_receipts)?;
             Ok(json!({
                 "job_id": detail.job.id,
                 "task_class": detail.job.task_class,
@@ -6652,7 +6937,7 @@ async fn complete_parent_from_successful_delegated_child_join(
     if child_detail.job.task_class.as_deref() == Some("local_project") {
         let mutation_receipts = local_project_child_mutation_receipts(state, child_detail)?;
         if let Some(tool_call) =
-            latest_applicable_successful_tests_run(child_detail, &mutation_receipts)
+            latest_applicable_successful_tests_run(state, child_detail, &mutation_receipts)?
         {
             additional_context_command_sessions.push(synthetic_command_session_for_tests_run(
                 child_detail,
@@ -7342,7 +7627,9 @@ async fn handle_local_project_validation_recovery_before_budget(
         return Ok(LocalProjectValidationRecoveryDisposition::Continue);
     }
 
-    if let Some(validation) = local_project_child_validation_evidence(&detail, &mutation_receipts) {
+    if let Some(validation) =
+        local_project_child_validation_evidence(state, &detail, &mutation_receipts)?
+    {
         if local_project_validation_recovery_at_budget_edge(worker, step, tool_calls) {
             complete_local_project_child_from_validation_evidence(
                 state,
@@ -7365,7 +7652,7 @@ async fn handle_local_project_validation_recovery_before_budget(
         return Ok(LocalProjectValidationRecoveryDisposition::Continue);
     }
 
-    if latest_applicable_tests_run(&detail, &mutation_receipts).is_some() {
+    if latest_applicable_tests_run(state, &detail, &mutation_receipts)?.is_some() {
         complete_local_project_child_with_validation_blocker(
             state,
             session,
@@ -7574,8 +7861,8 @@ fn local_project_validation_recovery_prompt_for_final_answer(
     }
     let mutation_receipts = local_project_child_mutation_receipts(state, detail)?;
     if mutation_receipts.is_empty()
-        || local_project_child_validation_evidence(detail, &mutation_receipts).is_some()
-        || latest_applicable_tests_run(detail, &mutation_receipts).is_some()
+        || local_project_child_validation_evidence(state, detail, &mutation_receipts)?.is_some()
+        || latest_applicable_tests_run(state, detail, &mutation_receipts)?.is_some()
     {
         return Ok(None);
     }
@@ -7609,7 +7896,9 @@ async fn complete_local_project_child_from_validation_evidence(
         validation.evidence.join("; ")
     );
     let mut additional_context_command_sessions = Vec::new();
-    if let Some(tool_call) = latest_applicable_successful_tests_run(detail, mutation_receipts) {
+    if let Some(tool_call) =
+        latest_applicable_successful_tests_run(state, detail, mutation_receipts)?
+    {
         additional_context_command_sessions
             .push(synthetic_command_session_for_tests_run(detail, tool_call));
     }
@@ -7652,7 +7941,7 @@ async fn complete_local_project_child_with_validation_blocker(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let latest_validation = latest_applicable_tests_run(detail, mutation_receipts);
+    let latest_validation = latest_applicable_tests_run(state, detail, mutation_receipts)?;
     let (validation_status, blocker) = if let Some(tool_call) = latest_validation {
         let command_text = tests_run_tool_call_command_text(tool_call);
         if matches!(tool_call.status.as_str(), "completed" | "failed") {
@@ -7866,6 +8155,20 @@ async fn complete_job_with_final_answer_with_additional_context_commands(
         &session.session.working_dir,
         &mut publication_patch,
     );
+    let local_project_child_validation =
+        local_project_child_validation_completion_context(state, &detail, &mut publication_patch)?;
+    let mut context_command_sessions = additional_context_command_sessions.to_vec();
+    if let Some(context) = local_project_child_validation.as_ref()
+        && let Some(tool_call) = context.successful_tool_call.as_ref()
+    {
+        let synthetic = synthetic_command_session_for_tests_run(&detail, tool_call);
+        if !context_command_sessions
+            .iter()
+            .any(|session| session.tool_call_id.as_deref() == Some(tool_call.id.as_str()))
+        {
+            context_command_sessions.push(synthetic);
+        }
+    }
     if detail.job.browser_verification_required
         && matches!(
             detail.job.browser_verification_status.as_str(),
@@ -7903,7 +8206,7 @@ async fn complete_job_with_final_answer_with_additional_context_commands(
             &session.session,
             job_id,
             Some(final_answer),
-            additional_context_command_sessions,
+            &context_command_sessions,
         )
         .await;
     state
@@ -7914,7 +8217,22 @@ async fn complete_job_with_final_answer_with_additional_context_commands(
             "closed",
         )
         .await;
-    let completion_job = completion_job_result?;
+    let mut completion_job = completion_job_result?;
+    if let Some(context) = local_project_child_validation.as_ref()
+        && let Some(process_evidence) = local_project_child_process_evidence_override(
+            &detail.job,
+            context,
+            completion_job.process_state_evidence_json.as_deref(),
+        )
+    {
+        completion_job = state.store.update_job(
+            job_id,
+            JobPatch {
+                process_state_evidence_json: Some(Some(process_evidence.to_string())),
+                ..JobPatch::default()
+            },
+        )?;
+    }
     reconcile_publication_browser_status_with_completion(&completion_job, &mut publication_patch);
     let projected_blocker = projected_completion_gate_blocker(&completion_job, &publication_patch);
     let terminal_job_state = if projected_blocker.is_some() {
@@ -12254,6 +12572,11 @@ fn projected_completion_gate_blocker(
     }
     if let Some(value) = publication_patch.validation_status.as_ref() {
         projected.validation_status = value.clone();
+        if projected.task_class.as_deref() == Some("local_project") && value != "passed" {
+            projected
+                .task_evidence
+                .retain(|evidence| !evidence.starts_with("validation:"));
+        }
     }
     if let Some(value) = publication_patch.browser_verification_status.as_ref() {
         projected.browser_verification_status = value.clone();
@@ -36412,6 +36735,1544 @@ Thanks."#,
     }
 
     #[tokio::test]
+    async fn local_project_child_terminalizes_after_focused_tests_run_with_browser_not_required() {
+        let state_dir = test_state_dir("feature-161-child-terminalizes-tests-run-no-browser");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, mut parent_worker) = create_local_project_parent_join_context(
+            &state,
+            "feature-161-tests-run-no-browser",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "feature-161-live-terminal-child",
+            LocalProjectJoinChildOptions {
+                state: "running",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        state
+            .store
+            .update_job(
+                &child_job_id,
+                JobPatch {
+                    browser_verification_required: Some(false),
+                    browser_verification_status: Some("not_required".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child browser status should persist");
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.js",
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.test.mjs",
+        );
+        append_tests_run_tool_call(
+            &state,
+            &child_job_id,
+            "node-focused-validation",
+            "completed",
+            0,
+            json!({
+                "command": "node",
+                "args": ["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            }),
+            5,
+        );
+
+        let mut child_worker = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load")
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.job_id == child_job_id)
+            .expect("child worker should exist");
+
+        complete_job_with_final_answer(
+            &state,
+            &session,
+            &child_job_id,
+            &mut child_worker,
+            4,
+            2,
+            "Implemented and validated the requested feature_161 session UX change.",
+            "Implemented and validated the requested feature_161 session UX change. node --test apps/web/src/lib/nucleus/session-ux.test.mjs completed successfully. Browser is ready.",
+            &json!({}),
+            &[],
+        )
+        .await
+        .expect("validated local_project child should terminalize");
+
+        let child_detail = state.store.get_job(&child_job_id).expect("child reloads");
+        assert_eq!(child_detail.job.state, "completed");
+        assert_eq!(child_detail.job.completion_status, "satisfied");
+        assert_eq!(child_detail.job.validation_status, "passed");
+        assert!(!child_detail.job.browser_verification_required);
+        assert_eq!(child_detail.job.browser_verification_status, "not_required");
+        assert!(child_detail.job.completion_blockers.is_empty());
+        assert!(
+            child_detail
+                .job
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("validation:"))
+        );
+        let process_evidence = child_detail
+            .job
+            .process_state_evidence_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .expect("child process evidence should record");
+        assert_eq!(process_evidence["status"], "satisfied");
+        assert_eq!(
+            process_evidence["ignored_claims"][0]["entity_type"],
+            "browser_sidecar"
+        );
+        assert!(process_evidence["claims"].as_array().unwrap().is_empty());
+
+        let mut checkpoint = child_join_checkpoint(
+            &session.session.id,
+            vec![child_job_id.clone()],
+            "join feature_161 terminalized child with focused tests.run",
+        );
+        let mut step = 1;
+        let mut tool_calls = 0;
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let disposition = handle_pending_action(
+            &state,
+            &session,
+            &parent_job_id,
+            &mut parent_worker,
+            &mut checkpoint,
+            &mut step,
+            &mut tool_calls,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("terminalized child join should complete parent");
+
+        assert_eq!(disposition, LoopDisposition::Return);
+        let parent = state.store.get_job(&parent_job_id).expect("parent loads");
+        assert_eq!(parent.job.state, "completed");
+        assert_eq!(parent.job.completion_status, "satisfied");
+        assert_eq!(parent.child_jobs.len(), 1);
+        let parent_worker = parent
+            .workers
+            .iter()
+            .find(|candidate| candidate.id == parent_worker.id)
+            .expect("parent worker should persist");
+        assert_eq!(parent_worker.tool_call_count, 0);
+        let join_event = parent
+            .events
+            .iter()
+            .find(|event| event.event_type == "child.jobs.joined")
+            .expect("join event should persist");
+        assert_eq!(join_event.status, "completed");
+        assert_eq!(
+            join_event.data_json["child_outcomes"][0]["join_outcome"],
+            "succeeded"
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn local_project_child_rejects_focused_validation_before_mutation_receipts() {
+        let state_dir = test_state_dir("feature-161-child-rejects-pre-mutation-validation");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, _parent_worker) = create_local_project_parent_join_context(
+            &state,
+            "feature-161-pre-mutation-validation",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "feature-161-stale-validation-child",
+            LocalProjectJoinChildOptions {
+                state: "running",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        state
+            .store
+            .update_job(
+                &child_job_id,
+                JobPatch {
+                    browser_verification_required: Some(false),
+                    browser_verification_status: Some("not_required".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child browser status should persist");
+        append_tests_run_tool_call(
+            &state,
+            &child_job_id,
+            "node-focused-validation-before-mutation",
+            "completed",
+            0,
+            json!({
+                "command": "node",
+                "args": ["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            }),
+            -2,
+        );
+        append_tests_run_command_session(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "node-focused-validation-before-mutation",
+            "completed",
+            0,
+            "node",
+            vec!["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            &workspace_root,
+            -2,
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.js",
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.test.mjs",
+        );
+
+        let mut child_worker = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load")
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.job_id == child_job_id)
+            .expect("child worker should exist");
+        complete_job_with_final_answer(
+            &state,
+            &session,
+            &child_job_id,
+            &mut child_worker,
+            4,
+            2,
+            "Implemented the local project change.",
+            "Implemented the change. node --test apps/web/src/lib/nucleus/session-ux.test.mjs completed successfully.",
+            &json!({}),
+            &[],
+        )
+        .await
+        .expect("child completion should persist");
+
+        let child_detail = state.store.get_job(&child_job_id).expect("child reloads");
+        assert_eq!(child_detail.job.state, "blocked");
+        assert_eq!(child_detail.job.completion_status, "blocked");
+        assert_eq!(child_detail.job.validation_status, "not_performed");
+        assert!(child_detail.job.completion_blockers.iter().any(|blocker| {
+            blocker.contains(
+                "Local project completion was claimed without successful validation evidence",
+            )
+        }));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn local_project_child_rejects_same_second_validation_before_mutation_receipts() {
+        let state_dir = test_state_dir("feature-161-child-rejects-same-second-stale-validation");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, _parent_worker) = create_local_project_parent_join_context(
+            &state,
+            "feature-161-same-second-stale-validation",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "feature-161-same-second-stale-child",
+            LocalProjectJoinChildOptions {
+                state: "running",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        state
+            .store
+            .update_job(
+                &child_job_id,
+                JobPatch {
+                    browser_verification_required: Some(false),
+                    browser_verification_status: Some("not_required".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child browser status should persist");
+        append_tests_run_tool_call(
+            &state,
+            &child_job_id,
+            "node-focused-validation-before-mutation",
+            "completed",
+            0,
+            json!({
+                "command": "node",
+                "args": ["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            }),
+            0,
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.js",
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.test.mjs",
+        );
+        align_local_project_validation_and_mutations_to_same_second(
+            &state,
+            &child_job_id,
+            "node-focused-validation-before-mutation",
+        );
+
+        let mut child_worker = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load")
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.job_id == child_job_id)
+            .expect("child worker should exist");
+        complete_job_with_final_answer(
+            &state,
+            &session,
+            &child_job_id,
+            &mut child_worker,
+            4,
+            2,
+            "Implemented the local project change.",
+            "Implemented the change. node --test apps/web/src/lib/nucleus/session-ux.test.mjs completed successfully.",
+            &json!({}),
+            &[],
+        )
+        .await
+        .expect("child completion should persist");
+
+        let child_detail = state.store.get_job(&child_job_id).expect("child reloads");
+        assert_eq!(child_detail.job.state, "blocked");
+        assert_eq!(child_detail.job.completion_status, "blocked");
+        assert_eq!(child_detail.job.validation_status, "not_performed");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn local_project_child_rejects_validation_started_before_mutation_receipts() {
+        let state_dir = test_state_dir("feature-161-child-rejects-validation-started-before");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, _parent_worker) = create_local_project_parent_join_context(
+            &state,
+            "feature-161-validation-started-before",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "feature-161-validation-started-before-child",
+            LocalProjectJoinChildOptions {
+                state: "running",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        state
+            .store
+            .update_job(
+                &child_job_id,
+                JobPatch {
+                    browser_verification_required: Some(false),
+                    browser_verification_status: Some("not_required".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child browser status should persist");
+        append_tests_run_tool_call(
+            &state,
+            &child_job_id,
+            "node-focused-validation-overlapping-mutation",
+            "completed",
+            0,
+            json!({
+                "command": "node",
+                "args": ["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            }),
+            0,
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.js",
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.test.mjs",
+        );
+        let detail = state.store.get_job(&child_job_id).expect("child reloads");
+        let mutation_receipts = local_project_child_mutation_receipts(&state, &detail)
+            .expect("mutation receipts should load");
+        let receipt_second = mutation_receipts
+            .iter()
+            .map(|receipt| receipt.created_at)
+            .max()
+            .expect("mutation receipts should exist");
+        for receipt in mutation_receipts {
+            set_tool_call_timestamp(&state, &receipt.tool_call_id, receipt_second);
+        }
+        set_tool_call_started_completed(
+            &state,
+            &format!("{child_job_id}-node-focused-validation-overlapping-mutation"),
+            receipt_second - 1,
+            receipt_second + 1,
+        );
+
+        let mut child_worker = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load")
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.job_id == child_job_id)
+            .expect("child worker should exist");
+        complete_job_with_final_answer(
+            &state,
+            &session,
+            &child_job_id,
+            &mut child_worker,
+            4,
+            2,
+            "Implemented the local project change.",
+            "Implemented the change. node --test apps/web/src/lib/nucleus/session-ux.test.mjs completed successfully.",
+            &json!({}),
+            &[],
+        )
+        .await
+        .expect("child completion should persist");
+
+        let child_detail = state.store.get_job(&child_job_id).expect("child reloads");
+        assert_eq!(child_detail.job.state, "blocked");
+        assert_eq!(child_detail.job.completion_status, "blocked");
+        assert_eq!(child_detail.job.validation_status, "not_performed");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn local_project_child_accepts_same_second_validation_after_mutation_receipts() {
+        let state_dir = test_state_dir("feature-161-child-accepts-same-second-validation");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, _parent_worker) = create_local_project_parent_join_context(
+            &state,
+            "feature-161-same-second-fresh-validation",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "feature-161-same-second-fresh-child",
+            LocalProjectJoinChildOptions {
+                state: "running",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        state
+            .store
+            .update_job(
+                &child_job_id,
+                JobPatch {
+                    browser_verification_required: Some(false),
+                    browser_verification_status: Some("not_required".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child browser status should persist");
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.js",
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.test.mjs",
+        );
+        append_tests_run_tool_call(
+            &state,
+            &child_job_id,
+            "node-focused-validation-after-mutation",
+            "completed",
+            0,
+            json!({
+                "command": "node",
+                "args": ["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            }),
+            0,
+        );
+        align_local_project_validation_and_mutations_to_same_second(
+            &state,
+            &child_job_id,
+            "node-focused-validation-after-mutation",
+        );
+
+        let mut child_worker = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load")
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.job_id == child_job_id)
+            .expect("child worker should exist");
+        complete_job_with_final_answer(
+            &state,
+            &session,
+            &child_job_id,
+            &mut child_worker,
+            4,
+            2,
+            "Implemented the local project change.",
+            "Implemented the change. node --test apps/web/src/lib/nucleus/session-ux.test.mjs completed successfully.",
+            &json!({}),
+            &[],
+        )
+        .await
+        .expect("child completion should persist");
+
+        let child_detail = state.store.get_job(&child_job_id).expect("child reloads");
+        assert_eq!(child_detail.job.state, "completed");
+        assert_eq!(child_detail.job.completion_status, "satisfied");
+        assert_eq!(child_detail.job.validation_status, "passed");
+        assert!(child_detail.job.completion_blockers.is_empty());
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn local_project_child_accepts_validation_in_delayed_receipt_second() {
+        let state_dir = test_state_dir("feature-161-child-accepts-delayed-receipt-validation");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, _parent_worker) = create_local_project_parent_join_context(
+            &state,
+            "feature-161-delayed-receipt-validation",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "feature-161-delayed-receipt-child",
+            LocalProjectJoinChildOptions {
+                state: "running",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        state
+            .store
+            .update_job(
+                &child_job_id,
+                JobPatch {
+                    browser_verification_required: Some(false),
+                    browser_verification_status: Some("not_required".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child browser status should persist");
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.js",
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.test.mjs",
+        );
+        append_tests_run_tool_call(
+            &state,
+            &child_job_id,
+            "node-focused-validation-delayed-receipt",
+            "completed",
+            0,
+            json!({
+                "command": "node",
+                "args": ["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            }),
+            0,
+        );
+        let detail = state.store.get_job(&child_job_id).expect("child reloads");
+        let mutation_receipts = local_project_child_mutation_receipts(&state, &detail)
+            .expect("mutation receipts should load");
+        let receipt_second = mutation_receipts
+            .iter()
+            .map(|receipt| receipt.created_at)
+            .max()
+            .expect("mutation receipts should exist");
+        for receipt in mutation_receipts {
+            set_tool_call_timestamp(&state, &receipt.tool_call_id, receipt_second - 1);
+        }
+        set_tool_call_timestamp(
+            &state,
+            &format!("{child_job_id}-node-focused-validation-delayed-receipt"),
+            receipt_second,
+        );
+
+        let mut child_worker = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load")
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.job_id == child_job_id)
+            .expect("child worker should exist");
+        complete_job_with_final_answer(
+            &state,
+            &session,
+            &child_job_id,
+            &mut child_worker,
+            4,
+            2,
+            "Implemented the local project change.",
+            "Implemented the change. node --test apps/web/src/lib/nucleus/session-ux.test.mjs completed successfully.",
+            &json!({}),
+            &[],
+        )
+        .await
+        .expect("child completion should persist");
+
+        let child_detail = state.store.get_job(&child_job_id).expect("child reloads");
+        assert_eq!(child_detail.job.state, "completed");
+        assert_eq!(child_detail.job.completion_status, "satisfied");
+        assert_eq!(child_detail.job.validation_status, "passed");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn local_project_child_accepts_normalized_tests_run_alias_args() {
+        let state_dir = test_state_dir("feature-161-child-accepts-normalized-tests-run-args");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, _parent_worker) = create_local_project_parent_join_context(
+            &state,
+            "feature-161-normalized-tests-run-args",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "feature-161-normalized-tests-run-child",
+            LocalProjectJoinChildOptions {
+                state: "running",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        state
+            .store
+            .update_job(
+                &child_job_id,
+                JobPatch {
+                    browser_verification_required: Some(false),
+                    browser_verification_status: Some("not_required".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child browser status should persist");
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.js",
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.test.mjs",
+        );
+        append_tests_run_tool_call(
+            &state,
+            &child_job_id,
+            "node-focused-validation-cmd-alias",
+            "completed",
+            0,
+            json!({
+                "cmd": ["node", "--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            }),
+            5,
+        );
+
+        let mut child_worker = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load")
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.job_id == child_job_id)
+            .expect("child worker should exist");
+        complete_job_with_final_answer(
+            &state,
+            &session,
+            &child_job_id,
+            &mut child_worker,
+            4,
+            2,
+            "Implemented the local project change.",
+            "Implemented the change. node --test apps/web/src/lib/nucleus/session-ux.test.mjs completed successfully. Browser is ready.",
+            &json!({}),
+            &[],
+        )
+        .await
+        .expect("child completion should persist");
+
+        let child_detail = state.store.get_job(&child_job_id).expect("child reloads");
+        assert_eq!(child_detail.job.state, "completed");
+        assert_eq!(child_detail.job.completion_status, "satisfied");
+        assert_eq!(child_detail.job.validation_status, "passed");
+        let process_evidence = child_detail
+            .job
+            .process_state_evidence_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .expect("child process evidence should record");
+        assert_eq!(process_evidence["status"], "satisfied");
+        assert_eq!(
+            process_evidence["ignored_claims"][0]["entity_type"],
+            "browser_sidecar"
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn local_project_child_ignores_non_mutating_command_receipt_after_validation() {
+        let state_dir = test_state_dir("feature-161-child-ignores-inspection-receipt");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, _parent_worker) = create_local_project_parent_join_context(
+            &state,
+            "feature-161-inspection-receipt",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "feature-161-inspection-receipt-child",
+            LocalProjectJoinChildOptions {
+                state: "running",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        state
+            .store
+            .update_job(
+                &child_job_id,
+                JobPatch {
+                    browser_verification_required: Some(false),
+                    browser_verification_status: Some("not_required".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child browser status should persist");
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.js",
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.test.mjs",
+        );
+        append_tests_run_tool_call(
+            &state,
+            &child_job_id,
+            "node-focused-validation-before-inspection",
+            "completed",
+            0,
+            json!({
+                "command": "node",
+                "args": ["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            }),
+            0,
+        );
+        append_non_mutating_command_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.js",
+        );
+        let detail = state.store.get_job(&child_job_id).expect("child reloads");
+        let inspection_receipt = state
+            .store
+            .list_mutation_receipts_for_session(&session.session.id)
+            .expect("receipts should load")
+            .into_iter()
+            .find(|receipt| receipt.job_id == detail.job.id && receipt.tool == "command.run")
+            .expect("inspection receipt should exist");
+        let inspection_second = inspection_receipt.created_at;
+        set_tool_call_timestamp(
+            &state,
+            &format!("{child_job_id}-node-focused-validation-before-inspection"),
+            inspection_second,
+        );
+        set_tool_call_timestamp(&state, &inspection_receipt.tool_call_id, inspection_second);
+
+        let mut child_worker = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load")
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.job_id == child_job_id)
+            .expect("child worker should exist");
+        complete_job_with_final_answer(
+            &state,
+            &session,
+            &child_job_id,
+            &mut child_worker,
+            4,
+            2,
+            "Implemented the local project change.",
+            "Implemented the change. node --test apps/web/src/lib/nucleus/session-ux.test.mjs completed successfully.",
+            &json!({}),
+            &[],
+        )
+        .await
+        .expect("child completion should persist");
+
+        let child_detail = state.store.get_job(&child_job_id).expect("child reloads");
+        assert_eq!(child_detail.job.state, "completed");
+        assert_eq!(child_detail.job.completion_status, "satisfied");
+        assert_eq!(child_detail.job.validation_status, "passed");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn local_project_child_rejects_dirty_to_dirty_command_mutation_after_validation() {
+        let state_dir = test_state_dir("feature-161-child-rejects-dirty-command-mutation");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, _parent_worker) = create_local_project_parent_join_context(
+            &state,
+            "feature-161-dirty-command-mutation",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "feature-161-dirty-command-mutation-child",
+            LocalProjectJoinChildOptions {
+                state: "running",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        state
+            .store
+            .update_job(
+                &child_job_id,
+                JobPatch {
+                    browser_verification_required: Some(false),
+                    browser_verification_status: Some("not_required".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child browser status should persist");
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.js",
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.test.mjs",
+        );
+        append_tests_run_tool_call(
+            &state,
+            &child_job_id,
+            "node-focused-validation-before-command-mutation",
+            "completed",
+            0,
+            json!({
+                "command": "node",
+                "args": ["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            }),
+            0,
+        );
+        append_dirty_to_dirty_command_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.js",
+        );
+        let command_receipt = state
+            .store
+            .list_mutation_receipts_for_session(&session.session.id)
+            .expect("receipts should load")
+            .into_iter()
+            .find(|receipt| receipt.job_id == child_job_id && receipt.tool == "command.run")
+            .expect("command mutation receipt should exist");
+        set_tool_call_timestamp(
+            &state,
+            &format!("{child_job_id}-node-focused-validation-before-command-mutation"),
+            command_receipt.created_at,
+        );
+        set_tool_call_timestamp(
+            &state,
+            &command_receipt.tool_call_id,
+            command_receipt.created_at,
+        );
+
+        let mut child_worker = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load")
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.job_id == child_job_id)
+            .expect("child worker should exist");
+        complete_job_with_final_answer(
+            &state,
+            &session,
+            &child_job_id,
+            &mut child_worker,
+            4,
+            2,
+            "Implemented the local project change.",
+            "Implemented the change. node --test apps/web/src/lib/nucleus/session-ux.test.mjs completed successfully.",
+            &json!({}),
+            &[],
+        )
+        .await
+        .expect("child completion should persist");
+
+        let child_detail = state.store.get_job(&child_job_id).expect("child reloads");
+        assert_eq!(child_detail.job.state, "blocked");
+        assert_eq!(child_detail.job.completion_status, "blocked");
+        assert_eq!(child_detail.job.validation_status, "not_performed");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn local_project_child_rejects_chained_inspection_prefix_command_mutation_after_validation()
+     {
+        let state_dir = test_state_dir("feature-161-child-rejects-chained-inspection-mutation");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, _parent_worker) = create_local_project_parent_join_context(
+            &state,
+            "feature-161-chained-inspection-mutation",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "feature-161-chained-inspection-mutation-child",
+            LocalProjectJoinChildOptions {
+                state: "running",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.js",
+        );
+        append_tests_run_tool_call(
+            &state,
+            &child_job_id,
+            "node-focused-validation-before-chained-command-mutation",
+            "completed",
+            0,
+            json!({
+                "command": "node",
+                "args": ["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            }),
+            0,
+        );
+        append_chained_inspection_prefix_command_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.js",
+        );
+        let command_receipt = state
+            .store
+            .list_mutation_receipts_for_session(&session.session.id)
+            .expect("receipts should load")
+            .into_iter()
+            .find(|receipt| receipt.job_id == child_job_id && receipt.tool == "command.run")
+            .expect("command mutation receipt should exist");
+        set_tool_call_timestamp(
+            &state,
+            &format!("{child_job_id}-node-focused-validation-before-chained-command-mutation"),
+            command_receipt.created_at,
+        );
+        set_tool_call_timestamp(
+            &state,
+            &command_receipt.tool_call_id,
+            command_receipt.created_at,
+        );
+
+        let mut child_worker = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load")
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.job_id == child_job_id)
+            .expect("child worker should exist");
+        complete_job_with_final_answer(
+            &state,
+            &session,
+            &child_job_id,
+            &mut child_worker,
+            4,
+            2,
+            "Implemented the local project change.",
+            "Implemented the change. node --test apps/web/src/lib/nucleus/session-ux.test.mjs completed successfully.",
+            &json!({}),
+            &[],
+        )
+        .await
+        .expect("child completion should persist");
+
+        let child_detail = state.store.get_job(&child_job_id).expect("child reloads");
+        assert_eq!(child_detail.job.state, "blocked");
+        assert_eq!(child_detail.job.completion_status, "blocked");
+        assert_eq!(child_detail.job.validation_status, "not_performed");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn local_project_child_terminalization_keeps_validation_and_browser_gates_strict() {
+        let state_dir = test_state_dir("feature-161-child-terminalization-strict-gates");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+
+        let complete_child = |child_job_id: &str,
+                              append_validation: Box<dyn Fn(&AppState, &str)>,
+                              browser_required: bool,
+                              final_answer: &str| {
+            let state = state.clone();
+            let workspace_root = workspace_root.clone();
+            let child_job_id = child_job_id.to_string();
+            let final_answer = final_answer.to_string();
+            async move {
+                let (session, parent_job_id, _parent_worker) =
+                    create_local_project_parent_join_context(
+                        &state,
+                        &format!("{child_job_id}-parent"),
+                        &workspace_root,
+                    );
+                create_local_project_join_child(
+                    &state,
+                    &session.session.id,
+                    &parent_job_id,
+                    &workspace_root,
+                    &child_job_id,
+                    LocalProjectJoinChildOptions {
+                        state: "running",
+                        mutation_receipt: false,
+                        validation_exit_code: None,
+                    },
+                );
+                state
+                    .store
+                    .update_job(
+                        &child_job_id,
+                        JobPatch {
+                            browser_verification_required: Some(browser_required),
+                            browser_verification_status: Some(
+                                if browser_required {
+                                    "pending"
+                                } else {
+                                    "not_required"
+                                }
+                                .to_string(),
+                            ),
+                            ..JobPatch::default()
+                        },
+                    )
+                    .expect("child browser status should persist");
+                append_local_project_mutation_receipt(
+                    &state,
+                    &session.session.id,
+                    &child_job_id,
+                    "apps/web/src/lib/nucleus/session-ux.js",
+                );
+                append_local_project_mutation_receipt(
+                    &state,
+                    &session.session.id,
+                    &child_job_id,
+                    "apps/web/src/lib/nucleus/session-ux.test.mjs",
+                );
+                append_validation(&state, &child_job_id);
+
+                let mut child_worker = state
+                    .store
+                    .get_job(&child_job_id)
+                    .expect("child should load")
+                    .workers
+                    .into_iter()
+                    .find(|candidate| candidate.job_id == child_job_id)
+                    .expect("child worker should exist");
+                complete_job_with_final_answer(
+                    &state,
+                    &session,
+                    &child_job_id,
+                    &mut child_worker,
+                    4,
+                    2,
+                    "Implemented the local project change.",
+                    &final_answer,
+                    &json!({}),
+                    &[],
+                )
+                .await
+                .expect("child completion should persist");
+                state.store.get_job(&child_job_id).expect("child reloads")
+            }
+        };
+
+        let failed_latest = complete_child(
+            "feature-161-failed-latest-child",
+            Box::new(|state, child_job_id| {
+                append_tests_run_tool_call(
+                    state,
+                    child_job_id,
+                    "node-focused-validation-passed",
+                    "completed",
+                    0,
+                    json!({
+                        "command": "node",
+                        "args": ["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+                    }),
+                    5,
+                );
+                append_tests_run_tool_call(
+                    state,
+                    child_job_id,
+                    "node-focused-validation-failed",
+                    "failed",
+                    1,
+                    json!({
+                        "command": "node",
+                        "args": ["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+                    }),
+                    7,
+                );
+            }),
+            false,
+            "Implemented the change. node --test apps/web/src/lib/nucleus/session-ux.test.mjs passed.",
+        )
+        .await;
+        assert_eq!(failed_latest.job.state, "blocked");
+        assert_eq!(failed_latest.job.completion_status, "blocked");
+        assert_eq!(failed_latest.job.validation_status, "failed");
+
+        let missing_validation = complete_child(
+            "feature-161-missing-validation-child",
+            Box::new(|_, _| {}),
+            false,
+            "Implemented the change. Browser is ready.",
+        )
+        .await;
+        assert_eq!(missing_validation.job.state, "blocked");
+        assert_eq!(missing_validation.job.completion_status, "blocked");
+        assert_eq!(missing_validation.job.validation_status, "not_performed");
+
+        let browser_required = complete_child(
+            "feature-161-browser-required-child",
+            Box::new(|state, child_job_id| {
+                append_tests_run_tool_call(
+                    state,
+                    child_job_id,
+                    "node-focused-validation",
+                    "completed",
+                    0,
+                    json!({
+                        "command": "node",
+                        "args": ["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+                    }),
+                    5,
+                );
+            }),
+            true,
+            "Implemented the change. node --test apps/web/src/lib/nucleus/session-ux.test.mjs completed successfully.",
+        )
+        .await;
+        assert_eq!(browser_required.job.state, "blocked");
+        assert_eq!(browser_required.job.completion_status, "blocked");
+        assert_eq!(browser_required.job.validation_status, "passed");
+        assert!(
+            browser_required
+                .job
+                .completion_blockers
+                .iter()
+                .any(|blocker| {
+                    blocker.contains("Browser verification") || blocker.contains("browser")
+                })
+        );
+
+        let real_port_claim = complete_child(
+            "feature-161-port-claim-child",
+            Box::new(|state, child_job_id| {
+                append_tests_run_tool_call(
+                    state,
+                    child_job_id,
+                    "node-focused-validation",
+                    "completed",
+                    0,
+                    json!({
+                        "command": "node",
+                        "args": ["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+                    }),
+                    5,
+                );
+            }),
+            false,
+            "Implemented the change. node --test apps/web/src/lib/nucleus/session-ux.test.mjs completed successfully. Port 5173 is ready.",
+        )
+        .await;
+        assert_eq!(real_port_claim.job.state, "blocked");
+        assert_eq!(real_port_claim.job.completion_status, "pending");
+        assert_eq!(real_port_claim.job.validation_status, "passed");
+        let process_evidence = real_port_claim
+            .job
+            .process_state_evidence_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .expect("process evidence should record");
+        assert_eq!(process_evidence["status"], "pending");
+        assert_eq!(process_evidence["claims"][0]["entity_type"], "port");
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn local_project_browser_blocked_child_does_not_complete_parent_join() {
+        let state_dir = test_state_dir("feature-161-browser-blocked-child-join");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, mut parent_worker) = create_local_project_parent_join_context(
+            &state,
+            "feature-161-browser-blocked-join",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "feature-161-browser-blocked-child",
+            LocalProjectJoinChildOptions {
+                state: "running",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        state
+            .store
+            .update_job(
+                &child_job_id,
+                JobPatch {
+                    browser_verification_required: Some(true),
+                    browser_verification_status: Some("pending".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child browser status should persist");
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.js",
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.test.mjs",
+        );
+        append_tests_run_tool_call(
+            &state,
+            &child_job_id,
+            "node-focused-validation-browser-pending",
+            "completed",
+            0,
+            json!({
+                "command": "node",
+                "args": ["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            }),
+            5,
+        );
+
+        let mut child_worker = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load")
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.job_id == child_job_id)
+            .expect("child worker should exist");
+        complete_job_with_final_answer(
+            &state,
+            &session,
+            &child_job_id,
+            &mut child_worker,
+            4,
+            2,
+            "Implemented the local project change.",
+            "Implemented the change. node --test apps/web/src/lib/nucleus/session-ux.test.mjs completed successfully.",
+            &json!({}),
+            &[],
+        )
+        .await
+        .expect("child completion should persist");
+        let child_detail = state.store.get_job(&child_job_id).expect("child reloads");
+        assert_eq!(child_detail.job.state, "blocked");
+        assert_eq!(child_detail.job.validation_status, "passed");
+
+        let mut checkpoint = child_join_checkpoint(
+            &session.session.id,
+            vec![child_job_id.clone()],
+            "join browser blocked local_project child",
+        );
+        let mut step = 1;
+        let mut tool_calls = 0;
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let disposition = handle_pending_action(
+            &state,
+            &session,
+            &parent_job_id,
+            &mut parent_worker,
+            &mut checkpoint,
+            &mut step,
+            &mut tool_calls,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("browser-blocked child join should block parent");
+
+        assert_eq!(disposition, LoopDisposition::Return);
+        let parent = state.store.get_job(&parent_job_id).expect("parent loads");
+        assert_eq!(parent.job.state, "blocked");
+        let join_event = parent
+            .events
+            .iter()
+            .find(|event| event.event_type == "child.jobs.joined")
+            .expect("join event should persist");
+        assert_eq!(join_event.status, "blocked");
+        assert_eq!(
+            join_event.data_json["join_decision"]["daemon_completed_parent"],
+            false
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn local_project_process_blocked_child_does_not_complete_parent_join() {
+        let state_dir = test_state_dir("feature-161-process-blocked-child-join");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, mut parent_worker) = create_local_project_parent_join_context(
+            &state,
+            "feature-161-process-blocked-join",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "feature-161-process-blocked-child",
+            LocalProjectJoinChildOptions {
+                state: "running",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.js",
+        );
+        append_tests_run_tool_call(
+            &state,
+            &child_job_id,
+            "node-focused-validation-process-pending",
+            "completed",
+            0,
+            json!({
+                "command": "node",
+                "args": ["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            }),
+            5,
+        );
+
+        let mut child_worker = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load")
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.job_id == child_job_id)
+            .expect("child worker should exist");
+        complete_job_with_final_answer(
+            &state,
+            &session,
+            &child_job_id,
+            &mut child_worker,
+            4,
+            2,
+            "Implemented the local project change.",
+            "Implemented the change. node --test apps/web/src/lib/nucleus/session-ux.test.mjs completed successfully. Port 5173 is ready.",
+            &json!({}),
+            &[],
+        )
+        .await
+        .expect("child completion should persist");
+        let child_detail = state.store.get_job(&child_job_id).expect("child reloads");
+        assert_eq!(child_detail.job.state, "blocked");
+        assert_eq!(child_detail.job.completion_status, "pending");
+        assert_eq!(child_detail.job.validation_status, "passed");
+        let process_evidence = child_detail
+            .job
+            .process_state_evidence_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .expect("process evidence should record");
+        assert_eq!(process_evidence["status"], "pending");
+        assert_eq!(process_evidence["claims"][0]["entity_type"], "port");
+
+        let mut checkpoint = child_join_checkpoint(
+            &session.session.id,
+            vec![child_job_id.clone()],
+            "join process blocked local_project child",
+        );
+        let mut step = 1;
+        let mut tool_calls = 0;
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let disposition = handle_pending_action(
+            &state,
+            &session,
+            &parent_job_id,
+            &mut parent_worker,
+            &mut checkpoint,
+            &mut step,
+            &mut tool_calls,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("process-blocked child join should stay with parent");
+
+        assert_eq!(disposition, LoopDisposition::Continue);
+        assert!(checkpoint.next_prompt.is_some());
+        let parent = state.store.get_job(&parent_job_id).expect("parent loads");
+        assert_eq!(parent.job.state, "running");
+        let join_event = parent
+            .events
+            .iter()
+            .find(|event| event.event_type == "child.jobs.joined")
+            .expect("join event should persist");
+        assert_eq!(join_event.status, "running");
+        assert_eq!(
+            join_event.data_json["join_decision"]["daemon_completed_parent"],
+            false
+        );
+        assert_eq!(
+            join_event.data_json["child_outcomes"][0]["join_outcome"],
+            CHILD_OUTCOME_BLOCKED_RECOVERABLE
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
     async fn local_project_child_join_rejects_failed_broad_tests_run_only() {
         let state_dir = test_state_dir("failed-broad-tests-run-child-join");
         let state = initialize_test_state(&state_dir);
@@ -43520,6 +45381,7 @@ for line in sys.stdin:
             } else {
                 "failed"
             };
+            let timestamp = test_event_timestamp(3);
             state
                 .store
                 .create_tool_call(ToolCallRecord {
@@ -43538,8 +45400,8 @@ for line in sys.stdin:
                     artifact_ids: Vec::new(),
                     error_class: String::new(),
                     error_detail: String::new(),
-                    started_at: Some(3),
-                    completed_at: Some(4),
+                    started_at: Some(timestamp),
+                    completed_at: Some(timestamp + 1),
                 })
                 .expect("tests.run tool call should persist");
             state
@@ -43572,10 +45434,22 @@ for line in sys.stdin:
                     exit_code: Some(exit_code),
                     stdout_artifact_id: None,
                     stderr_artifact_id: None,
-                    started_at: Some(3),
-                    completed_at: Some(4),
+                    started_at: Some(timestamp),
+                    completed_at: Some(timestamp + 1),
                 })
                 .expect("validation command session should persist");
+            state
+                .store
+                .update_job(
+                    child_job_id,
+                    JobPatch {
+                        validation_status: Some(
+                            if exit_code == 0 { "passed" } else { "failed" }.to_string(),
+                        ),
+                        ..JobPatch::default()
+                    },
+                )
+                .expect("validation status should persist");
         }
 
         child_job_id.to_string()
@@ -43631,6 +45505,162 @@ for line in sys.stdin:
             .expect("mutation receipt should persist");
     }
 
+    fn append_non_mutating_command_receipt(
+        state: &AppState,
+        session_id: &str,
+        child_job_id: &str,
+        path: &str,
+    ) {
+        let child_worker_id = format!("{child_job_id}-worker");
+        let tool_call_id = format!("{child_job_id}-git-status-inspection");
+        state
+            .store
+            .create_tool_call(ToolCallRecord {
+                id: tool_call_id.clone(),
+                job_id: child_job_id.to_string(),
+                worker_id: child_worker_id.clone(),
+                tool_id: "command.run".to_string(),
+                status: "completed".to_string(),
+                summary: "inspect dirty worktree".to_string(),
+                args_json: json!({"command": "git", "args": ["status", "--short"]}),
+                result_json: Some(json!({"exit_code": 0})),
+                policy_decision: None,
+                artifact_ids: Vec::new(),
+                error_class: String::new(),
+                error_detail: String::new(),
+                started_at: Some(unix_timestamp()),
+                completed_at: Some(unix_timestamp()),
+            })
+            .expect("inspection tool call should persist");
+        state
+            .store
+            .append_mutation_receipt(MutationReceiptRecord {
+                job_id: child_job_id.to_string(),
+                worker_id: child_worker_id,
+                tool_call_id,
+                session_id: session_id.to_string(),
+                tool: "command.run".to_string(),
+                approval_id: Some(format!("{child_job_id}-inspection-approval")),
+                paths: vec![path.to_string()],
+                before_git_head: "before".to_string(),
+                before_git_branch: "weblime/test".to_string(),
+                before_git_dirty: true,
+                before_git_untracked_count: 0,
+                after_git_head: "before".to_string(),
+                after_git_branch: "weblime/test".to_string(),
+                after_git_dirty: true,
+                after_git_untracked_count: 0,
+                expected_dirty: true,
+            })
+            .expect("inspection receipt should persist");
+    }
+
+    fn append_dirty_to_dirty_command_mutation_receipt(
+        state: &AppState,
+        session_id: &str,
+        child_job_id: &str,
+        path: &str,
+    ) {
+        let child_worker_id = format!("{child_job_id}-worker");
+        let tool_call_id = format!("{child_job_id}-command-mutates-dirty-file");
+        state
+            .store
+            .create_tool_call(ToolCallRecord {
+                id: tool_call_id.clone(),
+                job_id: child_job_id.to_string(),
+                worker_id: child_worker_id.clone(),
+                tool_id: "command.run".to_string(),
+                status: "completed".to_string(),
+                summary: "mutate an already dirty file".to_string(),
+                args_json: json!({
+                    "command": "sh",
+                    "args": ["-lc", format!("printf change >> {path}")],
+                }),
+                result_json: Some(json!({"exit_code": 0})),
+                policy_decision: None,
+                artifact_ids: Vec::new(),
+                error_class: String::new(),
+                error_detail: String::new(),
+                started_at: Some(unix_timestamp()),
+                completed_at: Some(unix_timestamp()),
+            })
+            .expect("command mutation tool call should persist");
+        state
+            .store
+            .append_mutation_receipt(MutationReceiptRecord {
+                job_id: child_job_id.to_string(),
+                worker_id: child_worker_id,
+                tool_call_id,
+                session_id: session_id.to_string(),
+                tool: "command.run".to_string(),
+                approval_id: Some(format!("{child_job_id}-command-mutation-approval")),
+                paths: vec![path.to_string()],
+                before_git_head: "before".to_string(),
+                before_git_branch: "weblime/test".to_string(),
+                before_git_dirty: true,
+                before_git_untracked_count: 0,
+                after_git_head: "before".to_string(),
+                after_git_branch: "weblime/test".to_string(),
+                after_git_dirty: true,
+                after_git_untracked_count: 0,
+                expected_dirty: true,
+            })
+            .expect("command mutation receipt should persist");
+    }
+
+    fn append_chained_inspection_prefix_command_mutation_receipt(
+        state: &AppState,
+        session_id: &str,
+        child_job_id: &str,
+        path: &str,
+    ) {
+        let child_worker_id = format!("{child_job_id}-worker");
+        let tool_call_id = format!("{child_job_id}-chained-inspection-command-mutates-dirty-file");
+        state
+            .store
+            .create_tool_call(ToolCallRecord {
+                id: tool_call_id.clone(),
+                job_id: child_job_id.to_string(),
+                worker_id: child_worker_id.clone(),
+                tool_id: "command.run".to_string(),
+                status: "completed".to_string(),
+                summary: "inspect then mutate an already dirty file".to_string(),
+                args_json: json!({
+                    "command": "sh",
+                    "args": ["-lc", format!("git status && printf change >> {path}")],
+                }),
+                result_json: Some(json!({"exit_code": 0})),
+                policy_decision: None,
+                artifact_ids: Vec::new(),
+                error_class: String::new(),
+                error_detail: String::new(),
+                started_at: Some(unix_timestamp()),
+                completed_at: Some(unix_timestamp()),
+            })
+            .expect("chained command mutation tool call should persist");
+        state
+            .store
+            .append_mutation_receipt(MutationReceiptRecord {
+                job_id: child_job_id.to_string(),
+                worker_id: child_worker_id,
+                tool_call_id,
+                session_id: session_id.to_string(),
+                tool: "command.run".to_string(),
+                approval_id: Some(format!("{child_job_id}-chained-command-mutation-approval")),
+                paths: vec![path.to_string()],
+                before_git_head: "before".to_string(),
+                before_git_branch: "weblime/test".to_string(),
+                before_git_dirty: true,
+                before_git_untracked_count: 0,
+                after_git_head: "before".to_string(),
+                after_git_branch: "weblime/test".to_string(),
+                after_git_dirty: true,
+                after_git_untracked_count: 0,
+                expected_dirty: true,
+            })
+            .expect("chained command mutation receipt should persist");
+    }
+
     fn append_tests_run_tool_call(
         state: &AppState,
         child_job_id: &str,
@@ -43640,6 +45670,7 @@ for line in sys.stdin:
         args_json: Value,
         timestamp: i64,
     ) {
+        let timestamp = test_event_timestamp(timestamp);
         state
             .store
             .create_tool_call(ToolCallRecord {
@@ -43661,6 +45692,60 @@ for line in sys.stdin:
             .expect("tests.run tool call should persist");
     }
 
+    fn align_local_project_validation_and_mutations_to_same_second(
+        state: &AppState,
+        child_job_id: &str,
+        validation_suffix: &str,
+    ) {
+        let detail = state.store.get_job(child_job_id).expect("child reloads");
+        let mutation_receipts = local_project_child_mutation_receipts(state, &detail)
+            .expect("mutation receipts should load");
+        let timestamp = mutation_receipts
+            .iter()
+            .map(|receipt| receipt.created_at)
+            .max()
+            .expect("mutation receipts should exist");
+        for receipt in mutation_receipts {
+            set_tool_call_timestamp(state, &receipt.tool_call_id, timestamp);
+        }
+        set_tool_call_timestamp(
+            state,
+            &format!("{child_job_id}-{validation_suffix}"),
+            timestamp,
+        );
+    }
+
+    fn set_tool_call_timestamp(state: &AppState, tool_call_id: &str, timestamp: i64) {
+        set_tool_call_started_completed(state, tool_call_id, timestamp, timestamp);
+    }
+
+    fn set_tool_call_started_completed(
+        state: &AppState,
+        tool_call_id: &str,
+        started_at: i64,
+        completed_at: i64,
+    ) {
+        state
+            .store
+            .update_tool_call(
+                tool_call_id,
+                ToolCallPatch {
+                    started_at: Some(Some(started_at)),
+                    completed_at: Some(Some(completed_at)),
+                    ..ToolCallPatch::default()
+                },
+            )
+            .expect("tool call timestamp should update");
+    }
+
+    fn test_event_timestamp(offset_or_timestamp: i64) -> i64 {
+        if offset_or_timestamp.abs() < 1_000_000_000 {
+            unix_timestamp().saturating_add(offset_or_timestamp)
+        } else {
+            offset_or_timestamp
+        }
+    }
+
     fn append_tests_run_command_session(
         state: &AppState,
         session_id: &str,
@@ -43674,6 +45759,7 @@ for line in sys.stdin:
         timestamp: i64,
     ) {
         let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+        let timestamp = test_event_timestamp(timestamp);
         state
             .store
             .create_command_session(CommandSessionRecord {
