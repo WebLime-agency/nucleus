@@ -9068,6 +9068,7 @@ fn command_claim_matches_session(
 
 fn command_claim_token_matches(required: &str, candidate: &str) -> bool {
     candidate == required
+        || (required == "test" && candidate == "--test")
         || candidate
             .strip_prefix(required)
             .is_some_and(|suffix| suffix.starts_with(':'))
@@ -30970,6 +30971,22 @@ Thanks."#,
             .expect("command prefix evidence should derive");
         assert_eq!(command_prefix["status"], "pending");
 
+        let mut node_test = test_command_session_with_cwd("cmd-node-test", "/tmp");
+        node_test.command = "node".to_string();
+        node_test.args = vec![
+            "--test".to_string(),
+            "apps/web/src/lib/nucleus/session-ux.test.mjs".to_string(),
+        ];
+        node_test.exit_code = Some(0);
+        node_test.completed_at = Some(45);
+        node_test.updated_at = 45;
+        let node_test_summary =
+            process_state_evidence(&state, &[node_test], "Result: 22 tests passed, 0 failed.")
+                .await
+                .expect("node --test result summary evidence should derive");
+        assert_eq!(node_test_summary["status"], "satisfied");
+        assert_eq!(node_test_summary["claims"][0]["matched"], true);
+
         let mut check_web = test_command_session_with_cwd("cmd-check-web", "/tmp");
         check_web.command = "npm".to_string();
         check_web.args = vec!["run".to_string(), "check:web".to_string()];
@@ -35376,6 +35393,160 @@ Thanks."#,
         assert_eq!(
             join_event.data_json["child_join_evidence"][0]["mutation_paths"][0],
             "apps/web/src/lib/nucleus/session-ux.js"
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn local_project_child_terminalizes_after_focused_validation_result_summary() {
+        let state_dir = test_state_dir("feature-161-child-terminalizes-validation-summary");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, mut parent_worker) = create_local_project_parent_join_context(
+            &state,
+            "feature-161-terminal-child",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "feature-161-terminal-child-main",
+            LocalProjectJoinChildOptions {
+                state: "running",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.js",
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.test.mjs",
+        );
+        append_tests_run_tool_call(
+            &state,
+            &child_job_id,
+            "node-focused-validation",
+            "completed",
+            0,
+            json!({
+                "command": "node",
+                "args": ["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            }),
+            5,
+        );
+        append_tests_run_command_session(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "node-focused-validation",
+            "completed",
+            0,
+            "node",
+            vec!["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            &workspace_root,
+            5,
+        );
+
+        let mut child_worker = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load")
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.job_id == child_job_id)
+            .expect("child worker should exist");
+
+        complete_job_with_final_answer(
+            &state,
+            &session,
+            &child_job_id,
+            &mut child_worker,
+            4,
+            2,
+            "Implemented and validated the requested smallest safe web-client session UX change.",
+            "Implemented and validated the requested smallest safe web-client session UX change. Result: 22 tests passed, 0 failed.",
+            &json!({}),
+            &[],
+        )
+        .await
+        .expect("validated local_project child should terminalize");
+
+        let child_detail = state.store.get_job(&child_job_id).expect("child reloads");
+        assert_eq!(child_detail.job.state, "completed");
+        assert_eq!(child_detail.job.completion_status, "satisfied");
+        assert!(child_detail.job.completion_blockers.is_empty());
+        assert!(
+            child_detail
+                .job
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("validation:"))
+        );
+        let process_evidence = child_detail
+            .job
+            .process_state_evidence_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .expect("child process evidence should record");
+        assert_eq!(process_evidence["status"], "satisfied");
+        assert_eq!(
+            process_evidence["claims"][0]["claim_text"],
+            "Result: 22 tests passed, 0 failed."
+        );
+        assert_eq!(process_evidence["claims"][0]["matched"], true);
+
+        let mut checkpoint = child_join_checkpoint(
+            &session.session.id,
+            vec![child_job_id.clone()],
+            "join feature_161 terminalized child",
+        );
+        let mut step = 1;
+        let mut tool_calls = 0;
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let disposition = handle_pending_action(
+            &state,
+            &session,
+            &parent_job_id,
+            &mut parent_worker,
+            &mut checkpoint,
+            &mut step,
+            &mut tool_calls,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("terminalized child join should complete parent");
+
+        assert_eq!(disposition, LoopDisposition::Return);
+        let parent = state.store.get_job(&parent_job_id).expect("parent loads");
+        assert_eq!(parent.job.state, "completed");
+        assert_eq!(parent.job.completion_status, "satisfied");
+        assert_eq!(parent.child_jobs.len(), 1);
+        let parent_worker = parent
+            .workers
+            .iter()
+            .find(|candidate| candidate.id == parent_worker.id)
+            .expect("parent worker should persist");
+        assert_eq!(parent_worker.tool_call_count, 0);
+        let join_event = parent
+            .events
+            .iter()
+            .find(|event| event.event_type == "child.jobs.joined")
+            .expect("join event should persist");
+        assert_eq!(join_event.status, "completed");
+        assert_eq!(
+            join_event.data_json["child_outcomes"][0]["join_outcome"],
+            "succeeded"
         );
 
         let _ = fs::remove_dir_all(&state_dir);
