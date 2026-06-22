@@ -3235,6 +3235,22 @@ impl StateStore {
         load_tool_call_summary(&connection, &record.id)
     }
 
+    pub fn tool_call_rowids_for_job(&self, job_id: &str) -> Result<Vec<(String, i64)>> {
+        let connection = self.connection.lock().expect("storage mutex poisoned");
+        let mut statement = connection.prepare(
+            "
+            SELECT id, rowid
+            FROM tool_calls
+            WHERE job_id = ?1
+            ",
+        )?;
+        let rows = statement.query_map(params![job_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to load tool call rowids")
+    }
+
     pub fn update_tool_call(
         &self,
         tool_call_id: &str,
@@ -9037,6 +9053,8 @@ fn apply_job_observability_rollups(connection: &Connection, job: &mut JobSummary
 
 fn apply_job_evidence_rollups(connection: &Connection, job: &mut JobSummary) -> Result<()> {
     let mut evidence = Vec::new();
+    let allow_validation_rollup =
+        job.task_class.as_deref() != Some("local_project") || job.validation_status == "passed";
     if job.session_id.is_some() {
         evidence.push("target_scope:session".to_string());
     }
@@ -9053,7 +9071,7 @@ fn apply_job_evidence_rollups(connection: &Connection, job: &mut JobSummary) -> 
         if command_session.state == "completed" && command_session.exit_code == Some(0) {
             let is_deployment_command =
                 is_deployment_command_session(&command_session.command, &command_session.args);
-            if is_validation_command(&command_text) {
+            if allow_validation_rollup && is_validation_command(&command_text) {
                 evidence.push(format!("validation:{label}"));
             }
             if is_deployment_command {
