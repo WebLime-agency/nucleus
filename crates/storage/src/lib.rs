@@ -9065,13 +9065,14 @@ fn apply_job_evidence_rollups(connection: &Connection, job: &mut JobSummary) -> 
         evidence.push("health_or_logs:browser verification artifacts".to_string());
     }
 
-    let command_sessions = load_command_sessions_for_job(connection, &job.id)?;
+    let command_sessions = load_command_session_evidence_rows_for_job(connection, &job.id)?;
     let latest_terminal_command_sessions =
         latest_terminal_command_sessions_by_identity(&command_sessions);
 
-    for command_session in &command_sessions {
+    for row in &command_sessions {
+        let command_session = &row.summary;
         let command_text = command_session_text(&command_session.command, &command_session.args);
-        let label = command_evidence_label(&command_session);
+        let label = command_evidence_label(command_session);
         if command_session.state == "completed" && command_session.exit_code == Some(0) {
             let is_deployment_command =
                 is_deployment_command_session(&command_session.command, &command_session.args);
@@ -9097,7 +9098,8 @@ fn apply_job_evidence_rollups(connection: &Connection, job: &mut JobSummary) -> 
         }
     }
 
-    for command_session in latest_terminal_command_sessions.values() {
+    for row in latest_terminal_command_sessions.values() {
+        let command_session = &row.summary;
         if is_failed_command_session(&command_session.state, command_session.exit_code) {
             let label = command_evidence_label(command_session);
             evidence.push(format!("failed_command:{label}"));
@@ -9246,24 +9248,57 @@ fn load_tool_call_evidence_rows(
         .context("failed to load tool-call evidence rows")
 }
 
+struct CommandSessionEvidenceRow {
+    rowid: i64,
+    summary: CommandSessionSummary,
+}
+
+fn load_command_session_evidence_rows_for_job(
+    connection: &Connection,
+    job_id: &str,
+) -> Result<Vec<CommandSessionEvidenceRow>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT rowid, id
+        FROM command_sessions
+        WHERE job_id = ?1
+        ORDER BY created_at ASC, rowid ASC
+        ",
+    )?;
+    let rows = statement.query_map(params![job_id], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to load command session evidence row ids")?
+        .into_iter()
+        .map(|(rowid, command_session_id)| {
+            Ok(CommandSessionEvidenceRow {
+                rowid,
+                summary: load_command_session_summary(connection, &command_session_id)?,
+            })
+        })
+        .collect()
+}
+
 fn is_failed_command_session(state: &str, exit_code: Option<i32>) -> bool {
     matches!(state, "failed" | "orphaned" | "canceled") || exit_code.is_some_and(|code| code != 0)
 }
 
 fn latest_terminal_command_sessions_by_identity<'a>(
-    command_sessions: &'a [CommandSessionSummary],
-) -> BTreeMap<Vec<String>, &'a CommandSessionSummary> {
-    let mut latest: BTreeMap<Vec<String>, &'a CommandSessionSummary> = BTreeMap::new();
-    for command_session in command_sessions {
+    command_sessions: &'a [CommandSessionEvidenceRow],
+) -> BTreeMap<Vec<String>, &'a CommandSessionEvidenceRow> {
+    let mut latest: BTreeMap<Vec<String>, &'a CommandSessionEvidenceRow> = BTreeMap::new();
+    for row in command_sessions {
+        let command_session = &row.summary;
         if !is_terminal_command_session(command_session) {
             continue;
         }
         let key = command_session_identity_key(command_session);
         let replace = latest.get(&key).is_none_or(|current| {
-            command_session_order_key(command_session) > command_session_order_key(current)
+            command_session_order_key(row) > command_session_order_key(current)
         });
         if replace {
-            latest.insert(key, command_session);
+            latest.insert(key, row);
         }
     }
     latest
@@ -9281,9 +9316,8 @@ fn command_session_identity_key(command_session: &CommandSessionSummary) -> Vec<
         .collect()
 }
 
-fn command_session_order_key(
-    command_session: &CommandSessionSummary,
-) -> (i64, i64, i64, i64, &str) {
+fn command_session_order_key(row: &CommandSessionEvidenceRow) -> (i64, i64, i64, i64, i64) {
+    let command_session = &row.summary;
     (
         command_session_observed_at(command_session),
         command_session
@@ -9291,7 +9325,7 @@ fn command_session_order_key(
             .unwrap_or(command_session.created_at),
         command_session.created_at,
         command_session.updated_at,
-        command_session.id.as_str(),
+        row.rowid,
     )
 }
 
@@ -14305,6 +14339,69 @@ and open a pull request to dev when it is ready."
     }
 
     #[test]
+    fn local_project_same_second_latest_failed_rerun_stays_blocked() {
+        let state_dir = test_state_dir("same-second-validation-rerun-failed");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let job_id = create_local_project_command_rollup_job(&store, "same-second-latest-failed");
+        let cwd = std::env::temp_dir();
+
+        append_rollup_command_session(
+            &store,
+            &job_id,
+            "node-focused-passed",
+            "completed",
+            0,
+            "node",
+            &["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            &cwd,
+            10,
+        );
+        append_rollup_command_session(
+            &store,
+            &job_id,
+            "node-focused-failed",
+            "failed",
+            1,
+            "node",
+            &["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            &cwd,
+            10,
+        );
+        force_command_session_timestamps(
+            &store,
+            &job_id,
+            &["node-focused-passed", "node-focused-failed"],
+            10,
+        );
+
+        let job = store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    validation_status: Some("passed".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("validation status should persist");
+
+        assert_eq!(job.completion_status, "blocked");
+        assert!(
+            job.task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("validation:Nucleus-owned test run")),
+            "earlier passing run should still emit validation evidence"
+        );
+        assert!(
+            job.task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("failed_command:Nucleus-owned test run")),
+            "same-second later inserted failed rerun should remain live"
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
     fn local_project_different_command_failure_is_not_superseded_by_success() {
         let state_dir = test_state_dir("different-command-validation-strictness");
         let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
@@ -15652,6 +15749,30 @@ and open a pull request to dev when it is ready."
                 completed_at: Some(timestamp + 1),
             })
             .expect("command session should persist");
+    }
+
+    fn force_command_session_timestamps(
+        store: &StateStore,
+        job_id: &str,
+        suffixes: &[&str],
+        timestamp: i64,
+    ) {
+        let connection = store.connection.lock().expect("storage mutex poisoned");
+        for suffix in suffixes {
+            connection
+                .execute(
+                    "
+                    UPDATE command_sessions
+                    SET started_at = ?1,
+                        completed_at = ?1,
+                        created_at = ?1,
+                        updated_at = ?1
+                    WHERE id = ?2
+                    ",
+                    params![timestamp, format!("{job_id}-{suffix}")],
+                )
+                .expect("command session timestamps should update");
+        }
     }
 
     fn test_session_record(
