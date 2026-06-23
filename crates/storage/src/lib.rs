@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     env, fs,
     io::Write,
     path::{Path, PathBuf},
@@ -9065,7 +9065,11 @@ fn apply_job_evidence_rollups(connection: &Connection, job: &mut JobSummary) -> 
         evidence.push("health_or_logs:browser verification artifacts".to_string());
     }
 
-    for command_session in load_command_sessions_for_job(connection, &job.id)? {
+    let command_sessions = load_command_sessions_for_job(connection, &job.id)?;
+    let latest_terminal_command_sessions =
+        latest_terminal_command_sessions_by_identity(&command_sessions);
+
+    for command_session in &command_sessions {
         let command_text = command_session_text(&command_session.command, &command_session.args);
         let label = command_evidence_label(&command_session);
         if command_session.state == "completed" && command_session.exit_code == Some(0) {
@@ -9090,7 +9094,12 @@ fn apply_job_evidence_rollups(connection: &Connection, job: &mut JobSummary) -> 
             if command_session.port.is_some() {
                 evidence.push(format!("port_state:{label}"));
             }
-        } else if is_failed_command_session(&command_session.state, command_session.exit_code) {
+        }
+    }
+
+    for command_session in latest_terminal_command_sessions.values() {
+        if is_failed_command_session(&command_session.state, command_session.exit_code) {
+            let label = command_evidence_label(command_session);
             evidence.push(format!("failed_command:{label}"));
         }
     }
@@ -9239,6 +9248,62 @@ fn load_tool_call_evidence_rows(
 
 fn is_failed_command_session(state: &str, exit_code: Option<i32>) -> bool {
     matches!(state, "failed" | "orphaned" | "canceled") || exit_code.is_some_and(|code| code != 0)
+}
+
+fn latest_terminal_command_sessions_by_identity<'a>(
+    command_sessions: &'a [CommandSessionSummary],
+) -> BTreeMap<Vec<String>, &'a CommandSessionSummary> {
+    let mut latest: BTreeMap<Vec<String>, &'a CommandSessionSummary> = BTreeMap::new();
+    for command_session in command_sessions {
+        if !is_terminal_command_session(command_session) {
+            continue;
+        }
+        let key = command_session_identity_key(command_session);
+        let replace = latest.get(&key).is_none_or(|current| {
+            command_session_order_key(command_session) > command_session_order_key(current)
+        });
+        if replace {
+            latest.insert(key, command_session);
+        }
+    }
+    latest
+}
+
+fn is_terminal_command_session(command_session: &CommandSessionSummary) -> bool {
+    command_session.state == "completed"
+        || is_failed_command_session(&command_session.state, command_session.exit_code)
+}
+
+fn command_session_identity_key(command_session: &CommandSessionSummary) -> Vec<String> {
+    std::iter::once(command_session.command.as_str())
+        .chain(command_session.args.iter().map(String::as_str))
+        .map(|part| part.trim().to_string())
+        .collect()
+}
+
+fn command_session_order_key(
+    command_session: &CommandSessionSummary,
+) -> (i64, i64, i64, i64, &str) {
+    (
+        command_session_observed_at(command_session),
+        command_session
+            .started_at
+            .unwrap_or(command_session.created_at),
+        command_session.created_at,
+        command_session.updated_at,
+        command_session.id.as_str(),
+    )
+}
+
+fn command_session_observed_at(command_session: &CommandSessionSummary) -> i64 {
+    command_session
+        .completed_at
+        .into_iter()
+        .chain(command_session.started_at)
+        .chain(std::iter::once(command_session.created_at))
+        .chain(std::iter::once(command_session.updated_at))
+        .max()
+        .unwrap_or(command_session.created_at)
 }
 
 fn command_session_text(command: &str, args: &[String]) -> String {
@@ -14143,6 +14208,160 @@ and open a pull request to dev when it is ready."
     }
 
     #[test]
+    fn local_project_same_command_failure_is_superseded_by_later_success() {
+        let state_dir = test_state_dir("same-command-validation-recovery");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let job_id = create_local_project_command_rollup_job(&store, "same-command-recovered");
+        let cwd = std::env::temp_dir();
+
+        append_rollup_command_session(
+            &store,
+            &job_id,
+            "node-focused-failed",
+            "failed",
+            1,
+            "node",
+            &["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            &cwd,
+            10,
+        );
+        append_rollup_command_session(
+            &store,
+            &job_id,
+            "node-focused-passed",
+            "completed",
+            0,
+            "node",
+            &["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            &cwd,
+            20,
+        );
+
+        let job = store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    validation_status: Some("passed".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("validation status should persist");
+
+        assert_eq!(job.completion_status, "satisfied");
+        assert!(
+            job.task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("validation:Nucleus-owned test run")),
+            "passing rerun should still emit validation evidence"
+        );
+        assert!(
+            !job.task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("failed_command:")),
+            "superseded failure should not remain live"
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn local_project_same_command_failure_without_later_success_stays_blocked() {
+        let state_dir = test_state_dir("same-command-validation-still-failed");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let job_id = create_local_project_command_rollup_job(&store, "same-command-still-failed");
+        let cwd = std::env::temp_dir();
+
+        append_rollup_command_session(
+            &store,
+            &job_id,
+            "node-focused-failed",
+            "failed",
+            1,
+            "node",
+            &["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            &cwd,
+            10,
+        );
+
+        let job = store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    validation_status: Some("passed".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("validation status should persist");
+
+        assert_eq!(job.completion_status, "blocked");
+        assert!(
+            job.task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("failed_command:Nucleus-owned test run")),
+            "unrecovered command failure should remain live"
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn local_project_different_command_failure_is_not_superseded_by_success() {
+        let state_dir = test_state_dir("different-command-validation-strictness");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let job_id = create_local_project_command_rollup_job(&store, "different-command-failed");
+        let cwd = std::env::temp_dir();
+
+        append_rollup_command_session(
+            &store,
+            &job_id,
+            "npm-test-failed",
+            "failed",
+            1,
+            "npm",
+            &["test"],
+            &cwd,
+            10,
+        );
+        append_rollup_command_session(
+            &store,
+            &job_id,
+            "node-focused-passed",
+            "completed",
+            0,
+            "node",
+            &["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            &cwd,
+            20,
+        );
+
+        let job = store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    validation_status: Some("passed".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("validation status should persist");
+
+        assert_eq!(job.completion_status, "blocked");
+        assert!(
+            job.task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("validation:Nucleus-owned test run")),
+            "passing focused command should still emit validation evidence"
+        );
+        assert!(
+            job.task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("failed_command:Nucleus-owned test run")),
+            "different failed command with the same title should remain live"
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
     fn task_class_command_classifiers_use_command_scoped_tokens() {
         assert!(!is_validation_command(&command_session_text(
             "git",
@@ -15337,6 +15556,102 @@ and open a pull request to dev when it is ready."
             .expect("time should be monotonic")
             .as_nanos();
         std::env::temp_dir().join(format!("nucleus-{label}-{}-{suffix}", std::process::id()))
+    }
+
+    fn create_local_project_command_rollup_job(store: &StateStore, job_id: &str) -> String {
+        let scratch_dir = store
+            .scratch_dir_for_session(job_id)
+            .expect("scratch dir should resolve");
+        store
+            .create_session(test_session_record(
+                job_id,
+                "Command rollup session",
+                "ad_hoc",
+                scratch_dir,
+            ))
+            .expect("session should persist");
+        store
+            .create_job(JobRecord {
+                id: job_id.to_string(),
+                session_id: Some(job_id.to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("local_project".to_string()),
+                title: "Local project command rollup".to_string(),
+                purpose: "test".to_string(),
+                trigger_kind: "session_prompt".to_string(),
+                state: "completed".to_string(),
+                requested_by: "user".to_string(),
+                prompt_excerpt: "prompt".to_string(),
+                publication_intent_text: None,
+            })
+            .expect("local project job should persist");
+        store
+            .create_worker(WorkerRecord {
+                id: format!("{job_id}-worker"),
+                job_id: job_id.to_string(),
+                parent_worker_id: None,
+                title: "Command rollup worker".to_string(),
+                lane: "utility".to_string(),
+                state: "completed".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "cx/gpt-5.4".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: std::env::temp_dir().display().to_string(),
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                max_steps: 8,
+                max_tool_calls: 8,
+                max_wall_clock_secs: 60,
+            })
+            .expect("worker should persist");
+        job_id.to_string()
+    }
+
+    fn append_rollup_command_session(
+        store: &StateStore,
+        job_id: &str,
+        suffix: &str,
+        state: &str,
+        exit_code: i32,
+        command: &str,
+        args: &[&str],
+        cwd: &std::path::Path,
+        timestamp: i64,
+    ) {
+        store
+            .create_command_session(CommandSessionRecord {
+                id: format!("{job_id}-{suffix}"),
+                job_id: job_id.to_string(),
+                worker_id: format!("{job_id}-worker"),
+                tool_call_id: None,
+                mode: "oneshot".to_string(),
+                title: "Nucleus-owned test run".to_string(),
+                state: state.to_string(),
+                command: command.to_string(),
+                args: args.iter().map(|arg| (*arg).to_string()).collect(),
+                cwd: cwd.display().to_string(),
+                session_id: job_id.to_string(),
+                project_id: String::new(),
+                worktree_path: cwd.display().to_string(),
+                branch: "weblime/test".to_string(),
+                port: None,
+                env_json: json!({}),
+                network_policy: "inherit".to_string(),
+                timeout_secs: 120,
+                output_limit_bytes: 8192,
+                last_error: String::new(),
+                exit_code: Some(exit_code),
+                stdout_artifact_id: None,
+                stderr_artifact_id: None,
+                started_at: Some(timestamp),
+                completed_at: Some(timestamp + 1),
+            })
+            .expect("command session should persist");
     }
 
     fn test_session_record(
