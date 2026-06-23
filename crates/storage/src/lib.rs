@@ -9310,7 +9310,9 @@ fn is_terminal_command_session(command_session: &CommandSessionSummary) -> bool 
 }
 
 fn command_session_identity_key(command_session: &CommandSessionSummary) -> Vec<String> {
-    std::iter::once(command_session.command.as_str())
+    std::iter::once(command_session.cwd.as_str())
+        .chain(std::iter::once(command_session.worktree_path.as_str()))
+        .chain(std::iter::once(command_session.command.as_str()))
         .chain(command_session.args.iter().map(String::as_str))
         .map(|part| part.trim().to_string())
         .collect()
@@ -14453,6 +14455,66 @@ and open a pull request to dev when it is ready."
                 .iter()
                 .any(|evidence| evidence.starts_with("failed_command:Nucleus-owned test run")),
             "different failed command with the same title should remain live"
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn local_project_same_command_in_different_cwd_is_not_superseded_by_success() {
+        let state_dir = test_state_dir("different-cwd-validation-strictness");
+        let store = StateStore::initialize_at(&state_dir).expect("store should initialize");
+        let job_id = create_local_project_command_rollup_job(&store, "different-cwd-failed");
+        let package_a = state_dir.join("workspace/packages/a");
+        let package_b = state_dir.join("workspace/packages/b");
+        fs::create_dir_all(&package_a).expect("package a should exist");
+        fs::create_dir_all(&package_b).expect("package b should exist");
+
+        append_rollup_command_session(
+            &store,
+            &job_id,
+            "package-a-npm-test-failed",
+            "failed",
+            1,
+            "npm",
+            &["test"],
+            &package_a,
+            10,
+        );
+        append_rollup_command_session(
+            &store,
+            &job_id,
+            "package-b-npm-test-passed",
+            "completed",
+            0,
+            "npm",
+            &["test"],
+            &package_b,
+            20,
+        );
+
+        let job = store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    validation_status: Some("passed".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("validation status should persist");
+
+        assert_eq!(job.completion_status, "blocked");
+        assert!(
+            job.task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("validation:Nucleus-owned test run")),
+            "passing command in another cwd should still emit validation evidence"
+        );
+        assert!(
+            job.task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("failed_command:Nucleus-owned test run")),
+            "failure in a different cwd should remain live"
         );
 
         let _ = fs::remove_dir_all(&state_dir);
