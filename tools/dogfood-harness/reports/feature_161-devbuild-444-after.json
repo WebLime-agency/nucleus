@@ -1,0 +1,386 @@
+{
+  "install": {
+    "url": "http://127.0.0.1:5252",
+    "version": "0.1.0",
+    "routes": {
+      "default_profile_id": "default",
+      "main_target": "route:local-openai",
+      "utility_target": "route:local-openai",
+      "profiles": [
+        {
+          "id": "default",
+          "title": "Default",
+          "is_default": true,
+          "main": {
+            "adapter": "openai_compatible",
+            "model": "cx/gpt-5.5",
+            "base_url": "http://127.0.0.1:20128/v1"
+          },
+          "utility": {
+            "adapter": "openai_compatible",
+            "model": "cx/gpt-5.4-mini",
+            "base_url": "http://127.0.0.1:20128/v1"
+          }
+        }
+      ]
+    }
+  },
+  "rungs": [
+    {
+      "name": "feature_161",
+      "session_id": "ba886eed-47f0-4473-8f11-2f7342a7c4a8",
+      "root_job_id": "e931cf65-76d0-443d-9c3d-fffdcd958f45",
+      "status": "FAIL",
+      "reasons": [
+        "cleanup: failed to delete session after retry: first=DELETE /api/sessions/ba886eed-47f0-4473-8f11-2f7342a7c4a8 failed with 400 Bad Request: {\"error\":\"bad_request\",\"message\":\"refusing to delete dirty managed worktree '/tmp/nucleus-444-state-after/worktrees/nucleus/ba886eed-47f0-4473-8f11-2f7342a7c4a8' (0 untracked file(s)); commit, clean, or archive it first\"}; second=DELETE /api/sessions/ba886eed-47f0-4473-8f11-2f7342a7c4a8 failed with 400 Bad Request: {\"error\":\"bad_request\",\"message\":\"refusing to delete dirty managed worktree '/tmp/nucleus-444-state-after/worktrees/nucleus/ba886eed-47f0-4473-8f11-2f7342a7c4a8' (0 untracked file(s)); commit, clean, or archive it first\"}"
+      ],
+      "phase1": {
+        "passed": true,
+        "reasons": []
+      },
+      "phase2": {
+        "passed": true,
+        "reasons": []
+      },
+      "root_final": {
+        "state": "completed",
+        "completion_status": "satisfied",
+        "result_summary": "Joined delegated child: implementation and focused validation complete",
+        "mutation_receipt_ids": [
+          29,
+          30
+        ]
+      },
+      "read_only_exact_probe_exit_0": null,
+      "root_worker": {
+        "lane": "utility",
+        "model": "cx/gpt-5.4-mini",
+        "tool_calls": 0
+      },
+      "children": [
+        {
+          "id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+          "task_class": "local_project",
+          "executor_lane": "main",
+          "executor_model": "cx/gpt-5.5",
+          "state": "completed",
+          "completion_status": "satisfied",
+          "completion_blockers": [],
+          "tool_calls": [
+            {
+              "tool_id": "project.inspect",
+              "args_summary": "inspect the active project",
+              "exit_code": null,
+              "status": "completed"
+            },
+            {
+              "tool_id": "command.run",
+              "args_summary": "sh -lc gh issue view 161 --json title,body,comments,state,url",
+              "exit_code": null,
+              "status": "denied"
+            },
+            {
+              "tool_id": "rg.search",
+              "args_summary": "search repository for feature_161 and activity message code",
+              "exit_code": null,
+              "status": "completed"
+            },
+            {
+              "tool_id": "fs.list",
+              "args_summary": "list web source and tests",
+              "exit_code": null,
+              "status": "completed"
+            },
+            {
+              "tool_id": "fs.read_text",
+              "args_summary": "read reasoning activity component",
+              "exit_code": null,
+              "status": "completed"
+            },
+            {
+              "tool_id": "fs.read_text",
+              "args_summary": "read session UX module",
+              "exit_code": null,
+              "status": "failed"
+            },
+            {
+              "tool_id": "fs.list",
+              "args_summary": "list nucleus lib files",
+              "exit_code": null,
+              "status": "completed"
+            },
+            {
+              "tool_id": "fs.read_text",
+              "args_summary": "read session UX code and tests",
+              "exit_code": null,
+              "status": "completed"
+            },
+            {
+              "tool_id": "fs.read_text",
+              "args_summary": "read session UX tests",
+              "exit_code": null,
+              "status": "completed"
+            },
+            {
+              "tool_id": "fs.apply_patch",
+              "args_summary": "add subtle rate-limited Nucleus activity messages",
+              "exit_code": null,
+              "status": "failed"
+            },
+            {
+              "tool_id": "fs.apply_patch",
+              "args_summary": "add subtle rate-limited Nucleus activity messages",
+              "exit_code": null,
+              "status": "completed"
+            },
+            {
+              "tool_id": "fs.apply_patch",
+              "args_summary": "patch session UX tests for rotating activity messages",
+              "exit_code": null,
+              "status": "completed"
+            },
+            {
+              "tool_id": "tests.run",
+              "args_summary": "sh -lc node --test apps/web/src/lib/nucleus/session-ux.test.mjs",
+              "exit_code": 0,
+              "status": "completed"
+            },
+            {
+              "tool_id": "git.diff",
+              "args_summary": "inspect current diff",
+              "exit_code": null,
+              "status": "completed"
+            }
+          ],
+          "tool_failures": [
+            {
+              "tool": "command.run",
+              "status": "denied",
+              "error_class": "approval_denied",
+              "error_detail": "command program is not on the safe read/build/test allow-list"
+            },
+            {
+              "tool": "fs.read_text",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "failed to resolve '/tmp/nucleus-444-state-after/worktrees/nucleus/ba886eed-47f0-4473-8f11-2f7342a7c4a8/apps/web/src/lib/nucleus/session-ux.ts'"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid fs.apply_patch args: missing edits array/object or top-level find/replace edit. Expected fs.apply_patch args: {\"path\":\"file\",\"edits\":[{\"find\":\"old text\",\"replace\":\"new text\",\"replace_all\":false}]}. Supported aliases: file, file_path, target_path; edit old/search/before -> find and new/replacement/after -> replace."
+            }
+          ]
+        }
+      ],
+      "counts": {
+        "children": 1,
+        "main_children": 1,
+        "utility_children": 0,
+        "fanout_detected": false
+      },
+      "approvals": {
+        "approved": [
+          {
+            "id": "e62652b5-9cf9-4c3f-ab3d-a00e70d9a511",
+            "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+            "tool": "fs.apply_patch",
+            "target_paths": [
+              "apps/web/src/lib/nucleus/session-ux.js"
+            ],
+            "reason": "worktree-local file mutation"
+          },
+          {
+            "id": "520d641e-0f50-4277-a20e-c8824a48cf45",
+            "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+            "tool": "fs.apply_patch",
+            "target_paths": [
+              "apps/web/src/lib/nucleus/session-ux.test.mjs"
+            ],
+            "reason": "worktree-local file mutation"
+          },
+          {
+            "id": "96a07284-89ca-4c2a-be57-043e67ab49d2",
+            "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+            "tool": "tests.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "bounded tests.run in worker worktree"
+          }
+        ],
+        "denied": [
+          {
+            "id": "7b50c58b-525c-457f-a82f-19f3340020f7",
+            "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+            "tool": "command.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "command program is not on the safe read/build/test allow-list"
+          }
+        ]
+      },
+      "cleanup": {
+        "root_cancel_attempted": true,
+        "session_deleted": false,
+        "evidence_preserved": false,
+        "reasons": [
+          "failed to delete session after retry: first=DELETE /api/sessions/ba886eed-47f0-4473-8f11-2f7342a7c4a8 failed with 400 Bad Request: {\"error\":\"bad_request\",\"message\":\"refusing to delete dirty managed worktree '/tmp/nucleus-444-state-after/worktrees/nucleus/ba886eed-47f0-4473-8f11-2f7342a7c4a8' (0 untracked file(s)); commit, clean, or archive it first\"}; second=DELETE /api/sessions/ba886eed-47f0-4473-8f11-2f7342a7c4a8 failed with 400 Bad Request: {\"error\":\"bad_request\",\"message\":\"refusing to delete dirty managed worktree '/tmp/nucleus-444-state-after/worktrees/nucleus/ba886eed-47f0-4473-8f11-2f7342a7c4a8' (0 untracked file(s)); commit, clean, or archive it first\"}"
+        ]
+      },
+      "key_events": [
+        {
+          "job_id": "e931cf65-76d0-443d-9c3d-fffdcd958f45",
+          "event_type": "child.jobs.spawned",
+          "status": "running",
+          "summary": "Spawned 1 child jobs"
+        },
+        {
+          "job_id": "e931cf65-76d0-443d-9c3d-fffdcd958f45",
+          "event_type": "child.jobs.joined",
+          "status": "completed",
+          "summary": "Joined 1 child jobs"
+        },
+        {
+          "job_id": "e931cf65-76d0-443d-9c3d-fffdcd958f45",
+          "event_type": "job.completed",
+          "status": "completed",
+          "summary": "Joined delegated child: implementation and focused validation complete"
+        },
+        {
+          "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed project.inspect"
+        },
+        {
+          "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for command.run"
+        },
+        {
+          "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+          "event_type": "approval.resolved",
+          "status": "denied",
+          "summary": "Denied read GitHub issue #161"
+        },
+        {
+          "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.list"
+        },
+        {
+          "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.list"
+        },
+        {
+          "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for fs.apply_patch"
+        },
+        {
+          "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved add subtle rate-limited Nucleus activity messages"
+        },
+        {
+          "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.apply_patch"
+        },
+        {
+          "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for fs.apply_patch"
+        },
+        {
+          "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved patch session UX tests for rotating activity messages"
+        },
+        {
+          "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.apply_patch"
+        },
+        {
+          "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for tests.run"
+        },
+        {
+          "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved run focused session UX tests"
+        },
+        {
+          "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+          "event_type": "command.session.updated",
+          "status": "completed",
+          "summary": "Completed Nucleus-owned test run"
+        },
+        {
+          "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed tests.run"
+        },
+        {
+          "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed git.diff"
+        },
+        {
+          "job_id": "6945ff80-3067-4e3e-96cd-4f4a7b9eeb59",
+          "event_type": "job.completed",
+          "status": "completed",
+          "summary": "implementation and focused validation complete"
+        }
+      ]
+    }
+  ],
+  "overall": {
+    "passed": 0,
+    "failed": 1,
+    "total": 1
+  }
+}
