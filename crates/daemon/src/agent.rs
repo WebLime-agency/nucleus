@@ -6923,6 +6923,12 @@ async fn complete_parent_from_successful_delegated_child_join(
     } else {
         child_join_final_answer(child_detail)
     };
+    terminalize_recovered_local_project_children(
+        state,
+        session,
+        std::slice::from_ref(child_detail),
+    )
+    .await?;
     propagate_child_browser_verification_for_join(state, job_id, child_detail)?;
     let metadata = json!({
         "daemon_child_join": {
@@ -7409,9 +7415,7 @@ async fn reuse_equivalent_child_jobs_if_any(
         .iter()
         .map(|child_job_id| state.store.get_job(child_job_id))
         .collect::<Result<Vec<_>>>()?;
-    if terminalize_recovered_local_project_children_for_reuse(state, session, &child_details)
-        .await?
-    {
+    if terminalize_recovered_local_project_children(state, session, &child_details).await? {
         child_details = matched_child_ids
             .iter()
             .map(|child_job_id| state.store.get_job(child_job_id))
@@ -7882,7 +7886,7 @@ fn local_project_validation_recovery_prompt_for_final_answer(
     )
 }
 
-async fn terminalize_recovered_local_project_children_for_reuse(
+async fn terminalize_recovered_local_project_children(
     state: &AppState,
     session: &SessionDetail,
     child_details: &[JobDetail],
@@ -36120,6 +36124,178 @@ Thanks."#,
                 .iter()
                 .any(|session| session.command == "sh" && session.exit_code == Some(0))
         );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn blocked_local_project_child_with_same_command_validation_rerun_terminalizes_on_join() {
+        let state_dir = test_state_dir("blocked-child-same-command-rerun-join");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, mut worker) = create_local_project_parent_join_context(
+            &state,
+            "blocked-child-same-command-rerun-join",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "feature-161-blocked-join-child",
+            LocalProjectJoinChildOptions {
+                state: "blocked",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.js",
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "apps/web/src/lib/nucleus/session-ux.test.mjs",
+        );
+        append_tests_run_tool_call(
+            &state,
+            &child_job_id,
+            "node-focused-validation-failed",
+            "failed",
+            1,
+            json!({
+                "command": "node",
+                "args": ["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            }),
+            5,
+        );
+        append_tests_run_command_session(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "node-focused-validation-failed",
+            "failed",
+            1,
+            "node",
+            vec!["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            &workspace_root,
+            5,
+        );
+        append_tests_run_tool_call(
+            &state,
+            &child_job_id,
+            "node-focused-validation-passed",
+            "completed",
+            0,
+            json!({
+                "command": "node",
+                "args": ["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            }),
+            7,
+        );
+        append_tests_run_command_session(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "node-focused-validation-passed",
+            "completed",
+            0,
+            "node",
+            vec!["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"],
+            &workspace_root,
+            7,
+        );
+        state
+            .store
+            .update_job(
+                &child_job_id,
+                JobPatch {
+                    validation_status: Some("passed".to_string()),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child validation status should persist");
+
+        let child_before_join = state.store.get_job(&child_job_id).expect("child loads");
+        assert_eq!(child_before_join.job.state, "blocked");
+        assert_eq!(child_before_join.job.completion_status, "satisfied");
+        assert!(child_before_join.job.completion_blockers.is_empty());
+        assert!(
+            !child_before_join
+                .job
+                .task_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("failed_command:")),
+            "later same-command success should suppress stale command failure evidence"
+        );
+        assert_eq!(
+            child_job_join_outcome_for_parent_join(&state, &child_before_join)
+                .expect("join outcome should compute"),
+            CHILD_OUTCOME_SUCCEEDED
+        );
+
+        let mut checkpoint = child_join_checkpoint(
+            &session.session.id,
+            vec![child_job_id.clone()],
+            "join recovered feature_161 child",
+        );
+        let mut step = 1;
+        let mut tool_calls = 0;
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+
+        let disposition = handle_pending_action(
+            &state,
+            &session,
+            &parent_job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            &mut tool_calls,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("recovered child join should complete parent and child");
+
+        assert_eq!(disposition, LoopDisposition::Return);
+        let parent = state.store.get_job(&parent_job_id).expect("parent loads");
+        assert_eq!(parent.job.state, "completed");
+        assert_eq!(parent.job.completion_status, "satisfied");
+        assert!(parent.job.completion_blockers.is_empty());
+        let join_event = parent
+            .events
+            .iter()
+            .find(|event| event.event_type == "child.jobs.joined")
+            .expect("join event should persist");
+        assert_eq!(join_event.status, "completed");
+        assert_eq!(
+            join_event.data_json["child_outcomes"][0]["join_outcome"],
+            CHILD_OUTCOME_SUCCEEDED
+        );
+        assert_eq!(
+            join_event.data_json["join_decision"]["daemon_completed_parent"],
+            true
+        );
+        assert!(
+            join_event.data_json["child_join_evidence"][0]["validation_evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("node-focused-validation-passed"))
+        );
+
+        let child_after_join = state.store.get_job(&child_job_id).expect("child reloads");
+        assert_eq!(child_after_join.job.state, "completed");
+        assert_eq!(child_after_join.job.completion_status, "satisfied");
+        assert!(child_after_join.job.completion_blockers.is_empty());
 
         let _ = fs::remove_dir_all(&state_dir);
     }

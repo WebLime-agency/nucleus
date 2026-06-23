@@ -1,0 +1,364 @@
+{
+  "install": {
+    "url": "http://127.0.0.1:5252",
+    "version": "0.1.0",
+    "routes": {
+      "default_profile_id": "default",
+      "main_target": "route:local-openai",
+      "utility_target": "route:local-openai",
+      "profiles": [
+        {
+          "id": "default",
+          "title": "Default",
+          "is_default": true,
+          "main": {
+            "adapter": "openai_compatible",
+            "model": "cx/gpt-5.5",
+            "base_url": "http://127.0.0.1:20128/v1"
+          },
+          "utility": {
+            "adapter": "openai_compatible",
+            "model": "cx/gpt-5.4-mini",
+            "base_url": "http://127.0.0.1:20128/v1"
+          }
+        }
+      ]
+    }
+  },
+  "rungs": [
+    {
+      "name": "feature_161",
+      "session_id": "df8f157c-1704-4997-89ef-1b383e58b506",
+      "root_job_id": "e38fa88a-aec7-42fb-a553-1d05bfc0dfed",
+      "status": "FAIL",
+      "reasons": [
+        "cleanup: failed to delete session after retry: first=DELETE /api/sessions/df8f157c-1704-4997-89ef-1b383e58b506 failed with 400 Bad Request: {\"error\":\"bad_request\",\"message\":\"refusing to delete dirty managed worktree '/tmp/nucleus-444-state/worktrees/nucleus/df8f157c-1704-4997-89ef-1b383e58b506' (0 untracked file(s)); commit, clean, or archive it first\"}; second=DELETE /api/sessions/df8f157c-1704-4997-89ef-1b383e58b506 failed with 400 Bad Request: {\"error\":\"bad_request\",\"message\":\"refusing to delete dirty managed worktree '/tmp/nucleus-444-state/worktrees/nucleus/df8f157c-1704-4997-89ef-1b383e58b506' (0 untracked file(s)); commit, clean, or archive it first\"}"
+      ],
+      "phase1": {
+        "passed": true,
+        "reasons": []
+      },
+      "phase2": {
+        "passed": true,
+        "reasons": []
+      },
+      "root_final": {
+        "state": "completed",
+        "completion_status": "satisfied",
+        "result_summary": "Joined delegated child: implemented and validated the focused activity-message change",
+        "mutation_receipt_ids": [
+          29,
+          30
+        ]
+      },
+      "read_only_exact_probe_exit_0": null,
+      "root_worker": {
+        "lane": "utility",
+        "model": "cx/gpt-5.4-mini",
+        "tool_calls": 0
+      },
+      "children": [
+        {
+          "id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+          "task_class": "local_project",
+          "executor_lane": "main",
+          "executor_model": "cx/gpt-5.5",
+          "state": "completed",
+          "completion_status": "satisfied",
+          "completion_blockers": [],
+          "tool_calls": [
+            {
+              "tool_id": "project.inspect",
+              "args_summary": "inspect active project status and workspace context",
+              "exit_code": null,
+              "status": "completed"
+            },
+            {
+              "tool_id": "rg.search",
+              "args_summary": "search web client for activity/status message logic",
+              "exit_code": null,
+              "status": "completed"
+            },
+            {
+              "tool_id": "fs.list",
+              "args_summary": "list repository top-level directories",
+              "exit_code": null,
+              "status": "completed"
+            },
+            {
+              "tool_id": "fs.list",
+              "args_summary": "list apps and clients directories",
+              "exit_code": null,
+              "status": "completed"
+            },
+            {
+              "tool_id": "fs.read_text",
+              "args_summary": "read reasoning activity component",
+              "exit_code": null,
+              "status": "completed"
+            },
+            {
+              "tool_id": "fs.read_text",
+              "args_summary": "read session UX logic and related tests",
+              "exit_code": null,
+              "status": "failed"
+            },
+            {
+              "tool_id": "fs.list",
+              "args_summary": "list nucleus web lib files",
+              "exit_code": null,
+              "status": "completed"
+            },
+            {
+              "tool_id": "fs.read_text",
+              "args_summary": "read session UX implementation",
+              "exit_code": null,
+              "status": "completed"
+            },
+            {
+              "tool_id": "fs.read_text",
+              "args_summary": "read session UX tests",
+              "exit_code": null,
+              "status": "completed"
+            },
+            {
+              "tool_id": "fs.apply_patch",
+              "args_summary": "add rate-limited Nucleus activity messages",
+              "exit_code": null,
+              "status": "failed"
+            },
+            {
+              "tool_id": "fs.apply_patch",
+              "args_summary": "add rate-limited Nucleus activity messages",
+              "exit_code": null,
+              "status": "completed"
+            },
+            {
+              "tool_id": "fs.apply_patch",
+              "args_summary": "update targeted session UX tests",
+              "exit_code": null,
+              "status": "completed"
+            },
+            {
+              "tool_id": "tests.run",
+              "args_summary": "sh -lc node --test apps/web/src/lib/nucleus/session-ux.test.mjs",
+              "exit_code": 0,
+              "status": "completed"
+            },
+            {
+              "tool_id": "git.diff",
+              "args_summary": "inspect working diff",
+              "exit_code": null,
+              "status": "completed"
+            }
+          ],
+          "tool_failures": [
+            {
+              "tool": "fs.read_text",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "failed to resolve '/tmp/nucleus-444-state/worktrees/nucleus/df8f157c-1704-4997-89ef-1b383e58b506/apps/web/src/lib/nucleus/session-ux.ts'"
+            },
+            {
+              "tool": "fs.apply_patch",
+              "status": "failed",
+              "error_class": "tool_error",
+              "error_detail": "invalid fs.apply_patch args: missing edits array/object or top-level find/replace edit. Expected fs.apply_patch args: {\"path\":\"file\",\"edits\":[{\"find\":\"old text\",\"replace\":\"new text\",\"replace_all\":false}]}. Supported aliases: file, file_path, target_path; edit old/search/before -> find and new/replacement/after -> replace."
+            }
+          ]
+        }
+      ],
+      "counts": {
+        "children": 1,
+        "main_children": 1,
+        "utility_children": 0,
+        "fanout_detected": false
+      },
+      "approvals": {
+        "approved": [
+          {
+            "id": "af7945fd-5724-4b3a-8d53-137945a9f382",
+            "job_id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+            "tool": "fs.apply_patch",
+            "target_paths": [
+              "apps/web/src/lib/nucleus/session-ux.js"
+            ],
+            "reason": "worktree-local file mutation"
+          },
+          {
+            "id": "70b3ae48-66f4-47e4-b35e-4e94943be486",
+            "job_id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+            "tool": "fs.apply_patch",
+            "target_paths": [
+              "apps/web/src/lib/nucleus/session-ux.test.mjs"
+            ],
+            "reason": "worktree-local file mutation"
+          },
+          {
+            "id": "cf1a19c4-fc27-4352-a025-53f92c8f8d70",
+            "job_id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+            "tool": "tests.run",
+            "target_paths": [
+              "."
+            ],
+            "reason": "bounded tests.run in worker worktree"
+          }
+        ],
+        "denied": []
+      },
+      "cleanup": {
+        "root_cancel_attempted": true,
+        "session_deleted": false,
+        "evidence_preserved": false,
+        "reasons": [
+          "failed to delete session after retry: first=DELETE /api/sessions/df8f157c-1704-4997-89ef-1b383e58b506 failed with 400 Bad Request: {\"error\":\"bad_request\",\"message\":\"refusing to delete dirty managed worktree '/tmp/nucleus-444-state/worktrees/nucleus/df8f157c-1704-4997-89ef-1b383e58b506' (0 untracked file(s)); commit, clean, or archive it first\"}; second=DELETE /api/sessions/df8f157c-1704-4997-89ef-1b383e58b506 failed with 400 Bad Request: {\"error\":\"bad_request\",\"message\":\"refusing to delete dirty managed worktree '/tmp/nucleus-444-state/worktrees/nucleus/df8f157c-1704-4997-89ef-1b383e58b506' (0 untracked file(s)); commit, clean, or archive it first\"}"
+        ]
+      },
+      "key_events": [
+        {
+          "job_id": "e38fa88a-aec7-42fb-a553-1d05bfc0dfed",
+          "event_type": "child.jobs.spawned",
+          "status": "running",
+          "summary": "Spawned 1 child jobs"
+        },
+        {
+          "job_id": "e38fa88a-aec7-42fb-a553-1d05bfc0dfed",
+          "event_type": "child.jobs.joined",
+          "status": "completed",
+          "summary": "Joined 1 child jobs"
+        },
+        {
+          "job_id": "e38fa88a-aec7-42fb-a553-1d05bfc0dfed",
+          "event_type": "job.completed",
+          "status": "completed",
+          "summary": "Joined delegated child: implemented and validated the focused activity-message change"
+        },
+        {
+          "job_id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed project.inspect"
+        },
+        {
+          "job_id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed rg.search"
+        },
+        {
+          "job_id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.list"
+        },
+        {
+          "job_id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.list"
+        },
+        {
+          "job_id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.list"
+        },
+        {
+          "job_id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.read_text"
+        },
+        {
+          "job_id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for fs.apply_patch"
+        },
+        {
+          "job_id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved add rate-limited Nucleus activity messages"
+        },
+        {
+          "job_id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.apply_patch"
+        },
+        {
+          "job_id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for fs.apply_patch"
+        },
+        {
+          "job_id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved update targeted session UX tests"
+        },
+        {
+          "job_id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed fs.apply_patch"
+        },
+        {
+          "job_id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+          "event_type": "approval.requested",
+          "status": "paused",
+          "summary": "Approval required for tests.run"
+        },
+        {
+          "job_id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+          "event_type": "approval.resolved",
+          "status": "approved",
+          "summary": "Approved run targeted session UX test"
+        },
+        {
+          "job_id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+          "event_type": "command.session.updated",
+          "status": "completed",
+          "summary": "Completed Nucleus-owned test run"
+        },
+        {
+          "job_id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed tests.run"
+        },
+        {
+          "job_id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+          "event_type": "tool.completed",
+          "status": "completed",
+          "summary": "Completed git.diff"
+        },
+        {
+          "job_id": "8ee96d00-0cd0-4e3d-967e-2e11c0a60c02",
+          "event_type": "job.completed",
+          "status": "completed",
+          "summary": "implemented and validated the focused activity-message change"
+        }
+      ]
+    }
+  ],
+  "overall": {
+    "passed": 0,
+    "failed": 1,
+    "total": 1
+  }
+}
