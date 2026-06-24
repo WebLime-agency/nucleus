@@ -2704,7 +2704,7 @@ fn child_failed_with_context_pressure_and_validation(child: &JobDetail) -> bool 
         && child_context_pressure_blockers_are_recoverable(child)
         && child_browser_gate_satisfied(child)
         && child_has_mutation(child)
-        && child_has_successful_test_run(child)
+        && child_has_daemon_join_validation_evidence(child)
 }
 
 fn child_context_pressure_blockers_are_recoverable(child: &JobDetail) -> bool {
@@ -2753,6 +2753,15 @@ fn child_has_successful_test_run(child: &JobDetail) -> bool {
             command_session_success(session)
                 && command_session_looks_like_check_validation(&command_session_text(session))
         })
+}
+
+fn child_has_daemon_join_validation_evidence(child: &JobDetail) -> bool {
+    child.tool_calls.iter().any(|call| {
+        call.tool_id == "tests.run"
+            && call.status == "completed"
+            && tool_result_exit_zero(call)
+            && command_looks_like_validation(&tool_call_command_text(call))
+    })
 }
 
 fn tool_call_is_successful_test_run(call: &ToolCallSummary) -> bool {
@@ -3861,6 +3870,36 @@ mod tests {
         assert_eq!(recovered_context_pressure.status, "PASS");
         assert!(recovered_context_pressure.phase1.passed);
         assert!(recovered_context_pressure.phase2.passed);
+
+        let mut command_validation = tool_call_with_args(
+            "command.run",
+            json!({"cmd":"sh -lc 'cargo test'","cwd":"."}),
+        );
+        command_validation.status = "completed".to_string();
+        command_validation.result_json = Some(json!({"exit_code": 0}));
+        assert!(tool_call_is_successful_test_run(&command_validation));
+        let mut command_validated_child = child_detail(
+            "child",
+            "failed",
+            "blocked",
+            vec![mutation.clone(), command_validation],
+        );
+        command_validated_child.job.completion_blockers =
+            failed_evidence_child.job.completion_blockers.clone();
+        let command_validated_context_pressure = build_rung_report(
+            &rung,
+            "session",
+            "root",
+            root_detail(
+                "completed",
+                "satisfied",
+                vec![child_summary("child", "failed", "blocked")],
+            ),
+            vec![command_validated_child],
+            ApprovalReport::default(),
+        );
+        assert_eq!(command_validated_context_pressure.status, "FAIL");
+        assert!(!command_validated_context_pressure.phase1.passed);
 
         let mut failed_with_command_blocker = failed_evidence_child.clone();
         failed_with_command_blocker
