@@ -9,6 +9,7 @@ pub const DEFAULT_CHILD_JOB_MAX_TOOL_CALLS: usize = 48;
 pub const MAX_CONFIGURED_JOB_STEPS: usize = 1_000;
 pub const MAX_CONFIGURED_JOB_TOOL_CALLS: usize = 2_000;
 pub const MAX_CONFIGURED_JOB_WALL_CLOCK_SECS: u64 = 86_400;
+const CONTEXT_PRESSURE_BLOCKER_MARKER: &str = "NUCLEUS_CONTEXT_PRESSURE_BLOCKER";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunBudgetSummary {
@@ -445,6 +446,7 @@ fn derive_completion_gates(job: &JobSummary) -> Vec<CompletionGateSummary> {
         && !job.browser_verification_required
         && job.cleanup_status != "cleanup_required"
         && !has_context_integrity_gate_state(job)
+        && !has_context_pressure_gate_state(job)
     {
         return Vec::new();
     }
@@ -492,6 +494,10 @@ fn derive_completion_gates(job: &JobSummary) -> Vec<CompletionGateSummary> {
 
     if has_process_state_gate_state(job) {
         gates.push(process_state_gate(job));
+    }
+
+    if has_context_pressure_gate_state(job) {
+        gates.push(context_pressure_gate(job));
     }
 
     if let Some(task_class) = task_class
@@ -929,6 +935,14 @@ fn has_context_integrity_gate_state(job: &JobSummary) -> bool {
         || has_process_state_gate_state(job)
 }
 
+fn has_context_pressure_gate_state(job: &JobSummary) -> bool {
+    job.last_error.contains(CONTEXT_PRESSURE_BLOCKER_MARKER)
+        || job
+            .metadata_json
+            .get("context_pressure")
+            .is_some_and(|value| value.to_string().contains(CONTEXT_PRESSURE_BLOCKER_MARKER))
+}
+
 fn has_worktree_base_gate_state(job: &JobSummary) -> bool {
     !matches!(
         job.worktree_base_status.trim(),
@@ -1184,6 +1198,33 @@ fn process_state_gate(job: &JobSummary) -> CompletionGateSummary {
         "context_integrity",
         required_evidence_for("context_integrity", &["process_state_evidence"]),
         process_state_evidence(&evidence_json),
+    )
+}
+
+fn context_pressure_gate(job: &JobSummary) -> CompletionGateSummary {
+    let context_pressure = job
+        .metadata_json
+        .get("context_pressure")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let reason = evidence_string(&context_pressure, "reason");
+    let summary = if reason.trim().is_empty() {
+        format!(
+            "{CONTEXT_PRESSURE_BLOCKER_MARKER}: prompt remained above the daemon context threshold after compaction."
+        )
+    } else if reason.contains(CONTEXT_PRESSURE_BLOCKER_MARKER) {
+        reason
+    } else {
+        format!("{CONTEXT_PRESSURE_BLOCKER_MARKER}: {reason}")
+    };
+    completion_gate(
+        "context_pressure",
+        "Context pressure",
+        "blocked",
+        summary,
+        "context_integrity",
+        required_evidence_for("context_integrity", &["context_pressure"]),
+        vec![format!("marker {CONTEXT_PRESSURE_BLOCKER_MARKER}")],
     )
 }
 

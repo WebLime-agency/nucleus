@@ -28,6 +28,7 @@ const DEFAULT_OUTPUT_PATH: &str = "tools/dogfood-harness/reports/latest.json";
 const MAX_HTTP_REQUEST_TIMEOUT_SECS: u64 = 30;
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 const TERMINAL_STATES: &[&str] = &["completed", "blocked", "failed", "canceled"];
+const CONTEXT_PRESSURE_BLOCKER_MARKER: &str = "NUCLEUS_CONTEXT_PRESSURE_BLOCKER";
 const KEY_EVENT_TERMS: &[&str] = &[
     "delegat",
     "gate",
@@ -2689,7 +2690,19 @@ fn job_tree_has_accepted_main_child(root: &JobDetail, child_details: &[JobDetail
 }
 
 fn child_accepted(child: &JobDetail) -> bool {
-    child.job.state == "completed" && child.job.completion_status != "blocked"
+    (child.job.state == "completed" && child.job.completion_status != "blocked")
+        || child_failed_with_context_pressure_and_validation(child)
+}
+
+fn child_failed_with_context_pressure_and_validation(child: &JobDetail) -> bool {
+    child.job.state == "failed"
+        && child
+            .job
+            .completion_blockers
+            .iter()
+            .any(|blocker| blocker.contains(CONTEXT_PRESSURE_BLOCKER_MARKER))
+        && child_has_mutation(child)
+        && child_has_successful_test_run(child)
 }
 
 fn child_blocked_on_validation_evidence(child: &JobDetail) -> bool {
@@ -3796,6 +3809,49 @@ mod tests {
         assert_eq!(completed.status, "PASS");
         assert!(completed.phase1.passed);
         assert!(completed.phase2.passed);
+
+        let mutation = tool_call("fs.apply_patch", "completed", None);
+        let validation = tool_call("tests.run", "completed", Some(0));
+        let mut failed_evidence_child = child_detail(
+            "child",
+            "failed",
+            "blocked",
+            vec![mutation.clone(), validation.clone()],
+        );
+        failed_evidence_child.job.completion_blockers.push(format!(
+            "{CONTEXT_PRESSURE_BLOCKER_MARKER}: prompt remained above threshold after compaction"
+        ));
+        let recovered_context_pressure = build_rung_report(
+            &rung,
+            "session",
+            "root",
+            root_detail(
+                "completed",
+                "satisfied",
+                vec![child_summary("child", "failed", "blocked")],
+            ),
+            vec![failed_evidence_child.clone()],
+            ApprovalReport::default(),
+        );
+        assert_eq!(recovered_context_pressure.status, "PASS");
+        assert!(recovered_context_pressure.phase1.passed);
+        assert!(recovered_context_pressure.phase2.passed);
+
+        let blocked_root_with_recovered_child = build_rung_report(
+            &rung,
+            "session",
+            "root",
+            root_detail(
+                "blocked",
+                "blocked",
+                vec![child_summary("child", "failed", "blocked")],
+            ),
+            vec![failed_evidence_child],
+            ApprovalReport::default(),
+        );
+        assert_eq!(blocked_root_with_recovered_child.status, "FAIL");
+        assert!(blocked_root_with_recovered_child.phase1.passed);
+        assert!(!blocked_root_with_recovered_child.phase2.passed);
 
         let root_not_converged = build_rung_report(
             &rung,

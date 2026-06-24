@@ -11,6 +11,10 @@ pub(crate) const PRESERVE_RECENT_TURNS: usize = 10;
 const MIN_COMPACTION_MESSAGES: usize = 4;
 const CHARS_PER_TOKEN: usize = 4;
 const FALLBACK_CONTEXT_CHARS: usize = 50_000;
+const MAX_COMPACTED_REPLACEMENT_RATIO_NUMERATOR: usize = 3;
+const MAX_COMPACTED_REPLACEMENT_RATIO_DENOMINATOR: usize = 4;
+const EMERGENCY_TRIM_TARGET_CHARS: usize = 1_200;
+const EMERGENCY_REFERENCE_LIMIT: usize = 24;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CompactionOutcome {
@@ -18,14 +22,24 @@ pub(crate) enum CompactionOutcome {
         turn_id_start: String,
         turn_id_end: String,
         original_messages: usize,
+        original_chars: usize,
         replacement_chars: usize,
+        preserved_tail_count: usize,
+        provider: String,
         model: String,
     },
     Skipped {
         reason: String,
+        preserved_tail_count: usize,
+        provider: String,
+        model: String,
     },
     Failed {
         reason: String,
+        preserved_tail_count: usize,
+        provider: String,
+        model: String,
+        error_class: String,
     },
 }
 
@@ -188,14 +202,19 @@ pub(crate) async fn compact_conversation(
     let Some(window) = select_compaction_window(checkpoint) else {
         return Ok(CompactionOutcome::Skipped {
             reason: "no safe compaction window".to_string(),
+            preserved_tail_count: PRESERVE_RECENT_TURNS,
+            provider: worker.provider.clone(),
+            model: worker.model.clone(),
         });
     };
 
-    let prompt = build_compaction_prompt(
-        &checkpoint.conversation[window.start..window.end],
-        window.start,
-    );
-    let result = execute_worker_text_turn(
+    let original_messages = &checkpoint.conversation[window.start..window.end];
+    let original_chars = original_messages
+        .iter()
+        .map(|message| message.content.len())
+        .sum::<usize>();
+    let prompt = build_compaction_prompt(original_messages, window.start);
+    let result = match execute_worker_text_turn(
         state,
         Some(session),
         worker,
@@ -206,7 +225,18 @@ pub(crate) async fn compact_conversation(
         cancel_rx,
     )
     .await
-    .context("conversation compaction model call failed")?;
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(CompactionOutcome::Failed {
+                reason: format!("conversation compaction model call failed: {error:#}"),
+                preserved_tail_count: PRESERVE_RECENT_TURNS,
+                provider: worker.provider.clone(),
+                model: worker.model.clone(),
+                error_class: "provider_call_failed".to_string(),
+            });
+        }
+    };
 
     let summary = match parse_compaction_summary(&result.content) {
         Ok(summary) => summary,
@@ -218,6 +248,10 @@ pub(crate) async fn compact_conversation(
             );
             return Ok(CompactionOutcome::Failed {
                 reason: format!("malformed compaction output: {error}"),
+                preserved_tail_count: PRESERVE_RECENT_TURNS,
+                provider: worker.provider.clone(),
+                model: worker.model.clone(),
+                error_class: "malformed_output".to_string(),
             });
         }
     };
@@ -228,6 +262,21 @@ pub(crate) async fn compact_conversation(
         &worker.model,
         &checkpoint.conversation[window.start..window.end],
     );
+    let replacement_chars = rendered.content.len();
+    let max_replacement_chars = original_chars
+        .saturating_mul(MAX_COMPACTED_REPLACEMENT_RATIO_NUMERATOR)
+        / MAX_COMPACTED_REPLACEMENT_RATIO_DENOMINATOR;
+    if replacement_chars >= original_chars || replacement_chars > max_replacement_chars {
+        return Ok(CompactionOutcome::Failed {
+            reason: format!(
+                "compaction summary exceeded budget: original_chars={original_chars}, replacement_chars={replacement_chars}, max_replacement_chars={max_replacement_chars}"
+            ),
+            preserved_tail_count: PRESERVE_RECENT_TURNS,
+            provider: worker.provider.clone(),
+            model: worker.model.clone(),
+            error_class: "summary_budget_exceeded".to_string(),
+        });
+    }
     checkpoint
         .conversation
         .splice(window.start..window.end, [rendered]);
@@ -236,9 +285,135 @@ pub(crate) async fn compact_conversation(
         turn_id_start: window.turn_id_start,
         turn_id_end: window.turn_id_end,
         original_messages: window.end.saturating_sub(window.start),
-        replacement_chars: checkpoint.conversation[window.start].content.len(),
+        original_chars,
+        replacement_chars,
+        preserved_tail_count: PRESERVE_RECENT_TURNS,
+        provider: worker.provider.clone(),
         model: worker.model.clone(),
     })
+}
+
+pub(crate) fn emergency_shrink_checkpoint(checkpoint: &mut WorkerCheckpoint) -> Option<String> {
+    let protected_tail_start = checkpoint
+        .conversation
+        .len()
+        .saturating_sub(PRESERVE_RECENT_TURNS);
+    let mut candidates = emergency_shrink_candidates(checkpoint, protected_tail_start, false);
+    if candidates.is_empty() {
+        candidates = emergency_shrink_candidates(checkpoint, protected_tail_start, true);
+    }
+    let index = candidates.into_iter().next()?;
+    let message = checkpoint.conversation.get_mut(index)?;
+    let original_chars = message.content.len();
+    let replacement = render_emergency_trimmed_message(index, message, original_chars);
+    if replacement.len() >= original_chars {
+        return None;
+    }
+    message.content = replacement;
+    message.images.clear();
+    Some(format!(
+        "emergency trimmed conversation-{index}; original_chars={original_chars}; replacement_chars={}",
+        message.content.len()
+    ))
+}
+
+fn emergency_shrink_candidates(
+    checkpoint: &WorkerCheckpoint,
+    protected_tail_start: usize,
+    include_tail: bool,
+) -> Vec<usize> {
+    let pending_anchor = checkpoint.pending_action.as_ref().and_then(|_| {
+        checkpoint
+            .conversation
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, message)| message.role == "assistant")
+            .map(|(index, _)| index)
+    });
+    checkpoint
+        .conversation
+        .iter()
+        .enumerate()
+        .filter(|(index, message)| {
+            if *index == 0 && message.role == "system" && !message.compacted {
+                return false;
+            }
+            if pending_anchor.is_some_and(|anchor| *index >= anchor) {
+                return false;
+            }
+            if !include_tail && *index >= protected_tail_start {
+                return false;
+            }
+            message.content.len() > EMERGENCY_TRIM_TARGET_CHARS
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn render_emergency_trimmed_message(
+    index: usize,
+    message: &CheckpointMessage,
+    original_chars: usize,
+) -> String {
+    let mut references = preserve_emergency_references(&message.content);
+    if references.is_empty() {
+        references.push("No structured identifiers were detected in the trimmed body.".to_string());
+    }
+    let mut excerpt = message
+        .content
+        .chars()
+        .take(EMERGENCY_TRIM_TARGET_CHARS / 2)
+        .collect::<String>();
+    if excerpt.trim().is_empty() {
+        excerpt = "(empty content)".to_string();
+    }
+    format!(
+        "[Context-pressure trimmed: conversation-{index}]\n\
+Daemon note: oversized historical tool or conversation output was deterministically truncated without a model call. Identifiers, paths, exit codes, and result hints detected below are preserved for continuity.\n\n\
+Role: {}\n\
+Original chars: {original_chars}\n\
+Preserved references:\n- {}\n\n\
+Leading excerpt:\n{}",
+        message.role,
+        references.join("\n- "),
+        excerpt.trim()
+    )
+}
+
+fn preserve_emergency_references(content: &str) -> Vec<String> {
+    let mut references = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized = trimmed.to_ascii_lowercase();
+        let looks_relevant = normalized.contains("exit_code")
+            || normalized.contains("exit code")
+            || normalized.contains("status")
+            || normalized.contains("result")
+            || normalized.contains("artifact")
+            || normalized.contains("command")
+            || normalized.contains("tool_call")
+            || normalized.contains("tool call")
+            || normalized.contains("session")
+            || trimmed.contains('/')
+            || trimmed.contains("#")
+            || trimmed.contains(".rs")
+            || trimmed.contains(".ts")
+            || trimmed.contains(".js")
+            || trimmed.contains(".svelte");
+        if looks_relevant {
+            references.push(trimmed.chars().take(240).collect::<String>());
+            if references.len() >= EMERGENCY_REFERENCE_LIMIT {
+                break;
+            }
+        }
+    }
+    references.sort();
+    references.dedup();
+    references
 }
 
 pub(crate) async fn audit_compaction_outcome(
@@ -251,7 +426,10 @@ pub(crate) async fn audit_compaction_outcome(
             turn_id_start,
             turn_id_end,
             original_messages,
+            original_chars,
             replacement_chars,
+            preserved_tail_count,
+            provider,
             model,
         } => {
             record_memory_audit(
@@ -260,19 +438,27 @@ pub(crate) async fn audit_compaction_outcome(
                 &worker.id,
                 "applied",
                 &format!(
-                    "Compacted {original_messages} checkpoint messages ({turn_id_start}..{turn_id_end}) via {model}; replacement_chars={replacement_chars}",
+                    "Compacted {original_messages} checkpoint messages ({turn_id_start}..{turn_id_end}) via provider={provider} model={model}; original_chars={original_chars}; replacement_chars={replacement_chars}; preserved_tail_count={preserved_tail_count}",
                 ),
             )
             .await;
         }
         CompactionOutcome::Skipped { .. } => {}
-        CompactionOutcome::Failed { reason } => {
+        CompactionOutcome::Failed {
+            reason,
+            preserved_tail_count,
+            provider,
+            model,
+            error_class,
+        } => {
             record_memory_audit(
                 state,
                 "memory.compaction.failed",
                 &worker.id,
                 "failed",
-                reason,
+                &format!(
+                    "{reason}; provider={provider}; model={model}; preserved_tail_count={preserved_tail_count}; error_class={error_class}"
+                ),
             )
             .await;
         }
