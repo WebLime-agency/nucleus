@@ -2755,12 +2755,163 @@ fn child_has_successful_test_run(child: &JobDetail) -> bool {
 }
 
 fn child_has_daemon_join_validation_evidence(child: &JobDetail) -> bool {
-    child.tool_calls.iter().any(|call| {
-        call.tool_id == "tests.run"
-            && call.status == "completed"
-            && tool_result_exit_zero(call)
-            && command_looks_like_validation(&tool_call_command_text(call))
+    let mutations = child
+        .tool_calls
+        .iter()
+        .enumerate()
+        .filter_map(|(index, call)| {
+            let paths = tool_call_mutation_paths(call);
+            (!paths.is_empty()).then_some((index, tool_call_observed_at(call), paths))
+        })
+        .collect::<Vec<_>>();
+    if mutations.is_empty() {
+        return false;
+    }
+    let mutation_paths = mutations
+        .iter()
+        .flat_map(|(_, _, paths)| paths.iter().map(String::as_str))
+        .collect::<Vec<_>>();
+    let latest_mutation_observed_at = mutations
+        .iter()
+        .map(|(_, observed_at, _)| *observed_at)
+        .max()
+        .unwrap_or_default();
+    let latest_mutation_index = mutations
+        .iter()
+        .map(|(index, _, _)| *index)
+        .max()
+        .unwrap_or_default();
+
+    child.tool_calls.iter().enumerate().any(|(index, call)| {
+        if call.tool_id != "tests.run" || call.status != "completed" || !tool_result_exit_zero(call)
+        {
+            return false;
+        }
+        let validation_started_at = tool_call_validation_started_at(call);
+        let validation_after_mutation = if validation_started_at != latest_mutation_observed_at {
+            validation_started_at > latest_mutation_observed_at
+        } else {
+            index > latest_mutation_index
+        };
+        validation_after_mutation
+            && tests_run_command_applies_to_mutation_paths(
+                &tool_call_command_text(call),
+                &mutation_paths,
+            )
     })
+}
+
+fn tool_call_mutation_paths(call: &ToolCallSummary) -> Vec<String> {
+    let fields: &[&str] = match call.tool_id.as_str() {
+        "fs.apply_patch" | "fs.write_text" => &["path"],
+        "fs.move" => &["from", "to", "source", "destination", "src", "dst"],
+        _ => return Vec::new(),
+    };
+    fields
+        .iter()
+        .filter_map(|field| call.args_json.get(*field))
+        .flat_map(json_string_values)
+        .filter(|path| !path.trim().is_empty())
+        .collect()
+}
+
+fn json_string_values(value: &Value) -> Vec<String> {
+    match value {
+        Value::String(value) => vec![value.clone()],
+        Value::Array(values) => values.iter().flat_map(json_string_values).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn tool_call_observed_at(call: &ToolCallSummary) -> i64 {
+    call.completed_at
+        .into_iter()
+        .chain(call.started_at)
+        .chain(std::iter::once(call.created_at))
+        .max()
+        .unwrap_or(call.created_at)
+}
+
+fn tool_call_validation_started_at(call: &ToolCallSummary) -> i64 {
+    call.started_at.unwrap_or(call.created_at)
+}
+
+fn tests_run_command_applies_to_mutation_paths(
+    command_text: &str,
+    mutation_paths: &[&str],
+) -> bool {
+    let normalized = command_text.to_ascii_lowercase();
+    if !command_looks_like_validation(&normalized) {
+        return false;
+    }
+    if command_is_project_wide_validation(&normalized) {
+        return true;
+    }
+    let command_paths = command_text
+        .split_whitespace()
+        .map(|token| {
+            token.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    '"' | '\'' | '`' | ',' | ';' | ':' | ')' | '(' | '[' | ']'
+                )
+            })
+        })
+        .filter(|token| token.contains('/') || token.contains('\\'))
+        .map(|token| token.replace('\\', "/"))
+        .collect::<Vec<_>>();
+    if command_paths.is_empty() {
+        return false;
+    }
+    mutation_paths.iter().any(|mutation_path| {
+        let mutation_path = mutation_path.replace('\\', "/");
+        command_paths.iter().any(|command_path| {
+            command_path == &mutation_path
+                || focused_test_path_matches_mutation_path(command_path, &mutation_path)
+        })
+    })
+}
+
+fn command_is_project_wide_validation(normalized: &str) -> bool {
+    [
+        "cargo test",
+        "cargo nextest",
+        "npm test",
+        "npm run test",
+        "npm run check",
+        "npm run build",
+        "pnpm test",
+        "pnpm check",
+        "pnpm build",
+        "bun test",
+        "bun run test",
+        "bun run check",
+        "bun run build",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn focused_test_path_matches_mutation_path(test_path: &str, mutation_path: &str) -> bool {
+    let test_path = Path::new(test_path);
+    let mutation_path = Path::new(mutation_path);
+    if test_path.parent() != mutation_path.parent() {
+        return false;
+    }
+    let Some(test_name) = test_path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let Some(mutation_stem) = mutation_path.file_stem().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    test_name == format!("{mutation_stem}.test.mjs")
+        || test_name == format!("{mutation_stem}.test.js")
+        || test_name == format!("{mutation_stem}.test.ts")
+        || test_name == format!("{mutation_stem}.test.tsx")
+        || test_name == format!("{mutation_stem}.spec.mjs")
+        || test_name == format!("{mutation_stem}.spec.js")
+        || test_name == format!("{mutation_stem}.spec.ts")
+        || test_name == format!("{mutation_stem}.spec.tsx")
 }
 
 fn tool_call_is_successful_test_run(call: &ToolCallSummary) -> bool {
@@ -3838,7 +3989,9 @@ mod tests {
         assert!(completed.phase1.passed);
         assert!(completed.phase2.passed);
 
-        let mutation = tool_call("fs.apply_patch", "completed", None);
+        let mut mutation =
+            tool_call_with_args("fs.apply_patch", json!({"path":"crates/core/src/lib.rs"}));
+        mutation.status = "completed".to_string();
         let validation = tool_call("tests.run", "completed", Some(0));
         let mut failed_evidence_child = child_detail(
             "child",
@@ -3899,6 +4052,59 @@ mod tests {
         );
         assert_eq!(command_validated_context_pressure.status, "FAIL");
         assert!(!command_validated_context_pressure.phase1.passed);
+
+        let stale_validated_child = child_detail(
+            "child",
+            "failed",
+            "blocked",
+            vec![validation.clone(), mutation.clone()],
+        );
+        let mut stale_validated_child = stale_validated_child;
+        stale_validated_child.job.completion_blockers =
+            failed_evidence_child.job.completion_blockers.clone();
+        let stale_validation_context_pressure = build_rung_report(
+            &rung,
+            "session",
+            "root",
+            root_detail(
+                "completed",
+                "satisfied",
+                vec![child_summary("child", "failed", "blocked")],
+            ),
+            vec![stale_validated_child],
+            ApprovalReport::default(),
+        );
+        assert_eq!(stale_validation_context_pressure.status, "FAIL");
+        assert!(!stale_validation_context_pressure.phase1.passed);
+
+        let mut unrelated_validation = tool_call_with_args(
+            "tests.run",
+            json!({"command":"node","args":["--test","apps/web/src/other.test.mjs"],"cwd":"."}),
+        );
+        unrelated_validation.status = "completed".to_string();
+        unrelated_validation.result_json = Some(json!({"exit_code": 0}));
+        let mut unrelated_validated_child = child_detail(
+            "child",
+            "failed",
+            "blocked",
+            vec![mutation.clone(), unrelated_validation],
+        );
+        unrelated_validated_child.job.completion_blockers =
+            failed_evidence_child.job.completion_blockers.clone();
+        let unrelated_validation_context_pressure = build_rung_report(
+            &rung,
+            "session",
+            "root",
+            root_detail(
+                "completed",
+                "satisfied",
+                vec![child_summary("child", "failed", "blocked")],
+            ),
+            vec![unrelated_validated_child],
+            ApprovalReport::default(),
+        );
+        assert_eq!(unrelated_validation_context_pressure.status, "FAIL");
+        assert!(!unrelated_validation_context_pressure.phase1.passed);
 
         let mut failed_with_context_pressure_text_blocker = failed_evidence_child.clone();
         failed_with_context_pressure_text_blocker
