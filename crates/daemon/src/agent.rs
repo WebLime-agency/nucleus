@@ -47,7 +47,8 @@ use super::{
 };
 use crate::compaction::{
     CompactionOutcome, audit_compaction_outcome, compact_conversation,
-    compaction_token_threshold_for_model, estimate_prompt_tokens, should_compact,
+    compaction_token_threshold_for_model, emergency_shrink_checkpoint, estimate_prompt_tokens,
+    should_compact,
 };
 use crate::runtime::{
     PromptStreamEvent, ProviderTurnResult, ProviderTurnTransport, RuntimeModelCapabilities,
@@ -77,6 +78,7 @@ const CHILD_OUTCOME_SUCCEEDED: &str = "succeeded";
 const CHILD_OUTCOME_BLOCKED_RECOVERABLE: &str = "blocked_recoverable";
 const CHILD_OUTCOME_BLOCKED_TERMINAL: &str = "blocked_terminal";
 const CHILD_OUTCOME_CANCELED: &str = "canceled";
+const CONTEXT_PRESSURE_BLOCKER_MARKER: &str = "NUCLEUS_CONTEXT_PRESSURE_BLOCKER";
 const CHILD_JOB_POLL_INTERVAL_MS: u64 = 250;
 const SESSION_HISTORY_TURN_LIMIT: usize = 8;
 const TOOL_OUTPUT_CHAR_LIMIT: usize = 8_000;
@@ -4182,6 +4184,7 @@ async fn run_job_loop(
         }
 
         let attach_initial_images = should_attach_initial_worker_images(&checkpoint);
+        let queued_prompt_for_compaction = checkpoint.next_prompt.clone();
         let prompt = checkpoint.next_prompt.take().unwrap_or_else(|| {
             let initial = build_initial_step_prompt(
                 &session.session,
@@ -4226,11 +4229,15 @@ async fn run_job_loop(
             &prompt_images,
             low_context_turn,
             cancel_rx,
+            queued_prompt_for_compaction.as_deref(),
         )
         .await
         {
             if *cancel_rx.borrow() {
                 return Ok(());
+            }
+            if text_has_context_pressure_blocker(&error.to_string()) {
+                return Err(error);
             }
             warn!(
                 ?error,
@@ -4886,12 +4893,9 @@ async fn handle_pending_action(
             .iter()
             .all(|detail| is_terminal_job_state(&detail.job.state));
         if all_complete {
-            let results = child_details
-                .iter()
-                .map(child_job_result_json)
-                .collect::<Result<Vec<_>>>()?;
             let parent_job = state.store.get_job(job_id)?.job;
             let child_outcomes = child_job_join_outcomes_json(state, &child_details)?;
+            let results = child_job_results_for_parent_join(state, &child_details)?;
             let daemon_completion_join = is_single_successful_delegated_child_join(
                 state,
                 &parent_job,
@@ -6143,6 +6147,30 @@ fn child_completion_blockers_are_recoverable(detail: &JobDetail) -> bool {
     })
 }
 
+fn child_failed_from_context_pressure(detail: &JobDetail) -> bool {
+    if detail.job.state != "failed" || !job_has_context_pressure_marker(&detail.job) {
+        return false;
+    }
+    true
+}
+
+fn child_context_pressure_join_blockers_are_recoverable(detail: &JobDetail) -> bool {
+    detail.job.completion_blockers.iter().all(|blocker| {
+        let normalized = normalized_delegation_text(blocker);
+        text_has_context_pressure_blocker(blocker)
+            || normalized.contains("without successful validation evidence")
+            || normalized.contains("local validation evidence is still pending")
+    })
+}
+
+fn job_has_context_pressure_marker(job: &JobSummary) -> bool {
+    text_has_context_pressure_blocker(&job.last_error)
+        || job
+            .metadata_json
+            .get("context_pressure")
+            .is_some_and(|value| text_has_context_pressure_blocker(&value.to_string()))
+}
+
 fn child_job_join_outcome_for_parent_join(
     state: &AppState,
     detail: &JobDetail,
@@ -6157,6 +6185,19 @@ fn child_job_join_outcome_for_parent_join(
         let mutation_receipts = local_project_child_mutation_receipts(state, detail)?;
         if !mutation_receipts.is_empty()
             && local_project_child_validation_evidence(state, detail, &mutation_receipts)?.is_some()
+        {
+            return Ok(CHILD_OUTCOME_SUCCEEDED);
+        }
+    }
+    if outcome != CHILD_OUTCOME_SUCCEEDED
+        && detail.job.task_class.as_deref() == Some("local_project")
+        && child_failed_from_context_pressure(detail)
+        && local_project_child_browser_gate_satisfied(detail)
+    {
+        let mutation_receipts = local_project_child_mutation_receipts(state, detail)?;
+        if !mutation_receipts.is_empty()
+            && local_project_child_validation_evidence(state, detail, &mutation_receipts)?.is_some()
+            && child_context_pressure_join_blockers_are_recoverable(detail)
         {
             return Ok(CHILD_OUTCOME_SUCCEEDED);
         }
@@ -7462,10 +7503,7 @@ async fn reuse_equivalent_child_jobs_if_any(
                 "Equivalent child job already owns this feature scope for: {summary}. Do not spawn a duplicate implementation child. If the blocker is missing validation or browser evidence after mutation, drive validation/browser repair for the existing child path or surface one precise blocker. Mutation receipts alone are not accepted completion evidence."
             )
         };
-        let results = child_details
-            .iter()
-            .map(child_job_result_json)
-            .collect::<Result<Vec<_>>>()?;
+        let results = child_job_results_for_parent_join(state, &child_details)?;
         checkpoint.pending_action = None;
         checkpoint.next_prompt = if daemon_completion_join || daemon_blocked_join.is_some() {
             None
@@ -8083,7 +8121,29 @@ async fn complete_local_project_child_with_validation_blocker(
     .await
 }
 
+fn child_job_results_for_parent_join(
+    state: &AppState,
+    details: &[JobDetail],
+) -> Result<Vec<Value>> {
+    details
+        .iter()
+        .map(|detail| {
+            child_job_result_json_with_join_outcome(
+                detail,
+                child_job_join_outcome_for_parent_join(state, detail)?,
+            )
+        })
+        .collect()
+}
+
 fn child_job_result_json(detail: &JobDetail) -> Result<Value> {
+    child_job_result_json_with_join_outcome(detail, child_job_join_outcome(detail))
+}
+
+fn child_job_result_json_with_join_outcome(
+    detail: &JobDetail,
+    join_outcome: &'static str,
+) -> Result<Value> {
     let report = child_job_report_preview_text(detail);
     Ok(json!({
         "job_id": detail.job.id,
@@ -8091,7 +8151,7 @@ fn child_job_result_json(detail: &JobDetail) -> Result<Value> {
         "state": detail.job.state,
         "completion_status": detail.job.completion_status,
         "completion_blockers": detail.job.completion_blockers,
-        "join_outcome": child_job_join_outcome(detail),
+        "join_outcome": join_outcome,
         "purpose": detail.job.purpose,
         "result_summary": detail.job.result_summary,
         "last_error": detail.job.last_error,
@@ -14254,6 +14314,25 @@ fn provider_supports_vision_with_tools(provider: &str) -> bool {
 
 const MAX_COMPACTION_PASSES: usize = 10;
 
+fn context_pressure_blocker(reason: impl AsRef<str>) -> anyhow::Error {
+    anyhow!("{}: {}", CONTEXT_PRESSURE_BLOCKER_MARKER, reason.as_ref())
+}
+
+fn text_has_context_pressure_blocker(text: &str) -> bool {
+    text.contains(CONTEXT_PRESSURE_BLOCKER_MARKER)
+}
+
+fn checkpoint_for_pre_turn_persistence(
+    checkpoint: &WorkerCheckpoint,
+    queued_prompt: Option<&str>,
+) -> WorkerCheckpoint {
+    let mut persisted = checkpoint.clone();
+    if persisted.next_prompt.is_none() {
+        persisted.next_prompt = queued_prompt.map(ToOwned::to_owned);
+    }
+    persisted
+}
+
 async fn compact_checkpoint_if_needed(
     state: &AppState,
     session: &SessionSummary,
@@ -14263,6 +14342,7 @@ async fn compact_checkpoint_if_needed(
     images: &[SessionTurnImage],
     low_context_turn: bool,
     cancel_rx: &mut watch::Receiver<bool>,
+    queued_prompt_for_persistence: Option<&str>,
 ) -> Result<()> {
     let threshold = compaction_token_threshold_for_model(&worker.model);
     for _ in 0..MAX_COMPACTION_PASSES {
@@ -14281,6 +14361,7 @@ async fn compact_checkpoint_if_needed(
             return Ok(());
         }
         let before_tokens = estimate_prompt_tokens(&compiled_turn);
+        let previous_checkpoint = checkpoint.clone();
 
         let outcome = compact_conversation(
             state,
@@ -14291,16 +14372,112 @@ async fn compact_checkpoint_if_needed(
             cancel_rx,
         )
         .await?;
-        audit_compaction_outcome(state, worker, &outcome).await;
-        match outcome {
+        match &outcome {
             CompactionOutcome::Applied { .. } => {
+                let Some(compiled_turn) = compile_worker_prompt_for_estimate(
+                    state,
+                    session,
+                    worker,
+                    checkpoint,
+                    prompt,
+                    images,
+                    low_context_turn,
+                ) else {
+                    return Ok(());
+                };
+                let after_tokens = estimate_prompt_tokens(&compiled_turn);
+                if after_tokens >= before_tokens {
+                    *checkpoint = previous_checkpoint;
+                    warn!(
+                        worker_id = worker.id.as_str(),
+                        before_tokens,
+                        after_tokens,
+                        threshold,
+                        "conversation compaction did not reduce prompt estimate; checkpoint rolled back",
+                    );
+                    record_memory_audit(
+                        state,
+                        "memory.compaction.failed",
+                        &worker.id,
+                        "failed",
+                        &format!(
+                            "Conversation compaction stopped because prompt estimate did not shrink before persistence (threshold={threshold}, before_tokens={before_tokens}, after_tokens={after_tokens})"
+                        ),
+                    )
+                    .await;
+                    return Err(context_pressure_blocker(format!(
+                        "compaction did not reduce prompt estimate (threshold={threshold}, before_tokens={before_tokens}, after_tokens={after_tokens})"
+                    )));
+                }
                 state.store.write_worker_checkpoint(
                     &worker.id,
-                    &serde_json::to_value(&*checkpoint)
-                        .context("failed to encode worker checkpoint")?,
+                    &serde_json::to_value(checkpoint_for_pre_turn_persistence(
+                        checkpoint,
+                        queued_prompt_for_persistence,
+                    ))
+                    .context("failed to encode worker checkpoint")?,
                 )?;
+                audit_compaction_outcome(state, worker, &outcome).await;
+                record_memory_audit(
+                    state,
+                    "memory.compaction.applied",
+                    &worker.id,
+                    "applied",
+                    &format!(
+                        "Conversation compaction reduced prompt estimate before persistence (threshold={threshold}, before_tokens={before_tokens}, after_tokens={after_tokens})"
+                    ),
+                )
+                .await;
             }
-            CompactionOutcome::Skipped { reason } => {
+            CompactionOutcome::Skipped { reason, .. } => {
+                if reason == "no safe compaction window" {
+                    if let Some(emergency_summary) = emergency_shrink_checkpoint(checkpoint) {
+                        let Some(compiled_turn) = compile_worker_prompt_for_estimate(
+                            state,
+                            session,
+                            worker,
+                            checkpoint,
+                            prompt,
+                            images,
+                            low_context_turn,
+                        ) else {
+                            return Ok(());
+                        };
+                        let after_tokens = estimate_prompt_tokens(&compiled_turn);
+                        if after_tokens < before_tokens {
+                            state.store.write_worker_checkpoint(
+                                &worker.id,
+                                &serde_json::to_value(checkpoint_for_pre_turn_persistence(
+                                    checkpoint,
+                                    queued_prompt_for_persistence,
+                                ))
+                                .context("failed to encode worker checkpoint")?,
+                            )?;
+                            record_memory_audit(
+                                state,
+                                "memory.compaction.applied",
+                                &worker.id,
+                                "applied",
+                                &format!(
+                                    "Emergency route-free context shrink reduced prompt estimate (threshold={threshold}, before_tokens={before_tokens}, after_tokens={after_tokens}; {emergency_summary})"
+                                ),
+                            )
+                            .await;
+                            continue;
+                        }
+                        *checkpoint = previous_checkpoint;
+                        record_memory_audit(
+                            state,
+                            "memory.compaction.failed",
+                            &worker.id,
+                            "failed",
+                            &format!(
+                                "Emergency route-free context shrink did not reduce prompt estimate (threshold={threshold}, before_tokens={before_tokens}, after_tokens={after_tokens}; {emergency_summary})"
+                            ),
+                        )
+                        .await;
+                    }
+                }
                 record_memory_audit(
                     state,
                     "memory.compaction.failed",
@@ -14311,41 +14488,68 @@ async fn compact_checkpoint_if_needed(
                     ),
                 )
                 .await;
-                return Ok(());
+                return Err(context_pressure_blocker(format!(
+                    "prompt remained over threshold after compaction skipped (threshold={threshold}, before_tokens={before_tokens}, reason={reason})"
+                )));
             }
-            CompactionOutcome::Failed { .. } => return Ok(()),
-        }
-
-        let Some(compiled_turn) = compile_worker_prompt_for_estimate(
-            state,
-            session,
-            worker,
-            checkpoint,
-            prompt,
-            images,
-            low_context_turn,
-        ) else {
-            return Ok(());
-        };
-        let after_tokens = estimate_prompt_tokens(&compiled_turn);
-        if after_tokens >= before_tokens {
-            warn!(
-                worker_id = worker.id.as_str(),
-                before_tokens,
-                after_tokens,
-                "conversation compaction did not reduce prompt estimate; stopping compaction loop",
-            );
-            record_memory_audit(
-                state,
-                "memory.compaction.failed",
-                &worker.id,
-                "failed",
-                &format!(
-                    "Conversation compaction stopped because prompt estimate did not shrink (before_tokens={before_tokens}, after_tokens={after_tokens})"
-                ),
-            )
-            .await;
-            return Ok(());
+            CompactionOutcome::Failed {
+                reason,
+                error_class,
+                ..
+            } => {
+                audit_compaction_outcome(state, worker, &outcome).await;
+                if error_class == "summary_budget_exceeded_image_payload" {
+                    if let Some(emergency_summary) = emergency_shrink_checkpoint(checkpoint) {
+                        let Some(compiled_turn) = compile_worker_prompt_for_estimate(
+                            state,
+                            session,
+                            worker,
+                            checkpoint,
+                            prompt,
+                            images,
+                            low_context_turn,
+                        ) else {
+                            return Ok(());
+                        };
+                        let after_tokens = estimate_prompt_tokens(&compiled_turn);
+                        if after_tokens < before_tokens {
+                            state.store.write_worker_checkpoint(
+                                &worker.id,
+                                &serde_json::to_value(checkpoint_for_pre_turn_persistence(
+                                    checkpoint,
+                                    queued_prompt_for_persistence,
+                                ))
+                                .context("failed to encode worker checkpoint")?,
+                            )?;
+                            record_memory_audit(
+                                state,
+                                "memory.compaction.applied",
+                                &worker.id,
+                                "applied",
+                                &format!(
+                                    "Emergency route-free context shrink reduced prompt estimate after image-payload summary budget failure (threshold={threshold}, before_tokens={before_tokens}, after_tokens={after_tokens}; {emergency_summary})"
+                                ),
+                            )
+                            .await;
+                            continue;
+                        }
+                        *checkpoint = previous_checkpoint;
+                        record_memory_audit(
+                            state,
+                            "memory.compaction.failed",
+                            &worker.id,
+                            "failed",
+                            &format!(
+                                "Emergency route-free context shrink after image-payload summary budget failure did not reduce prompt estimate (threshold={threshold}, before_tokens={before_tokens}, after_tokens={after_tokens}; {emergency_summary})"
+                            ),
+                        )
+                        .await;
+                    }
+                }
+                return Err(context_pressure_blocker(format!(
+                    "prompt remained over threshold after compaction failed (threshold={threshold}, before_tokens={before_tokens}, reason={reason})"
+                )));
+            }
         }
     }
     record_memory_audit(
@@ -14356,7 +14560,9 @@ async fn compact_checkpoint_if_needed(
         "Conversation compaction stopped after reaching the maximum pass limit",
     )
     .await;
-    Ok(())
+    Err(context_pressure_blocker(
+        "prompt remained over threshold after reaching the maximum compaction pass limit",
+    ))
 }
 
 fn compile_worker_prompt_for_estimate(
@@ -20997,6 +21203,22 @@ fn limit_text(value: String, max_chars: usize) -> String {
 async fn fail_job(state: &AppState, job_id: &str, error: &str) -> Result<()> {
     let detail = state.store.get_job(job_id)?;
     let is_root_job = detail.job.parent_job_id.is_none();
+    let mut metadata = detail.job.metadata_json.clone();
+    let context_pressure_metadata = if text_has_context_pressure_blocker(error) {
+        metadata["context_pressure"] = json!({
+            "marker": CONTEXT_PRESSURE_BLOCKER_MARKER,
+            "status": "blocked",
+            "reason": error,
+        });
+        Some(metadata)
+    } else if metadata.get("context_pressure").is_some() {
+        if let Some(object) = metadata.as_object_mut() {
+            object.remove("context_pressure");
+        }
+        Some(metadata)
+    } else {
+        None
+    };
     for child in &detail.child_jobs {
         if is_non_terminal_job_state(&child.state) {
             let _ = cancel_job(state.clone(), child.id.clone()).await;
@@ -21030,6 +21252,7 @@ async fn fail_job(state: &AppState, job_id: &str, error: &str) -> Result<()> {
                 .job
                 .publication_requested
                 .then(|| excerpt(error, 320)),
+            metadata_json: context_pressure_metadata,
             ..JobPatch::default()
         },
     )?;
@@ -29632,6 +29855,7 @@ Thanks."#,
             &[],
             false,
             &mut cancel_rx,
+            None,
         )
         .await
         .expect("compaction should not fail the turn");
@@ -29785,6 +30009,7 @@ Thanks."#,
             &[],
             true,
             &mut cancel_rx,
+            None,
         )
         .await
         .expect("low-context compaction should not fail the turn");
@@ -29807,7 +30032,7 @@ Thanks."#,
 
     #[tokio::test]
     async fn compact_checkpoint_rechecks_until_no_safe_window_remains() {
-        let state_dir = test_state_dir("worker-context-compaction-no-window");
+        let state_dir = test_state_dir("worker-context-compaction-no-shrink-rollback");
         let state = initialize_test_state(&state_dir);
         let workspace_root = PathBuf::from(
             state
@@ -29827,7 +30052,7 @@ Thanks."#,
         let (_, mut worker, _) = create_command_test_context(&state, "compact-no-window");
         let huge_summary_json = format!(
             r#"{{"summary":"{}","preserved_identifiers":[],"preserved_artifact_ids":[],"preserved_file_paths":[],"user_preferences_mentioned":[]}}"#,
-            "oversized compacted history ".repeat(900)
+            "oversized compacted history ".repeat(3_000)
         );
         let huge_summary_json: &'static str = Box::leak(huge_summary_json.into_boxed_str());
         let (base_url, server) =
@@ -29838,8 +30063,16 @@ Thanks."#,
         worker.working_dir = workspace_root.display().to_string();
 
         let mut checkpoint = long_test_checkpoint(&session.id, 52);
+        let original = checkpoint.conversation.clone();
+        state
+            .store
+            .write_worker_checkpoint(
+                &worker.id,
+                &serde_json::to_value(&checkpoint).expect("checkpoint should encode"),
+            )
+            .expect("original checkpoint should persist");
         let (_cancel_tx, mut cancel_rx) = watch::channel(false);
-        compact_checkpoint_if_needed(
+        let error = compact_checkpoint_if_needed(
             &state,
             &session,
             &worker,
@@ -29848,19 +30081,18 @@ Thanks."#,
             &[],
             false,
             &mut cancel_rx,
+            None,
         )
         .await
-        .expect("compaction should stop cleanly when no further safe window remains");
+        .expect_err("oversized compaction summary should surface context pressure");
 
+        assert!(error.to_string().contains(CONTEXT_PRESSURE_BLOCKER_MARKER));
+        assert_eq!(checkpoint.conversation, original);
         assert!(
-            checkpoint
+            !checkpoint
                 .conversation
                 .iter()
                 .any(|message| message.compacted)
-        );
-        assert!(
-            crate::compaction::select_compaction_window(&checkpoint).is_none(),
-            "second pass should discover that no safe compaction window remains"
         );
         let threshold = compaction_token_threshold_for_model(&worker.model);
         let compiled = compile_worker_prompt_for_estimate(
@@ -29875,8 +30107,93 @@ Thanks."#,
         .expect("prompt should compile after oversized compaction");
         assert!(
             should_compact(&compiled, threshold),
-            "oversized summary should still exceed the threshold"
+            "rolled back checkpoint should still exceed the threshold"
         );
+        let stored = state
+            .store
+            .read_worker_checkpoint(&worker.id)
+            .expect("checkpoint read should succeed")
+            .expect("checkpoint should be persisted");
+        assert!(
+            !serde_json::to_string(&stored)
+                .expect("checkpoint should serialize")
+                .contains("\"compacted\":true"),
+            "ineffective compaction must not persist a compacted checkpoint"
+        );
+        let audits = state.store.list_audit_events(20).expect("audit lists");
+        assert!(audits.iter().all(|event| {
+            !(event.kind == "memory.compaction.applied" && event.target == worker.id)
+        }));
+        assert!(audits.iter().any(|event| {
+            event.kind == "memory.compaction.failed"
+                && event.target == worker.id
+                && event.summary.contains("summary exceeded budget")
+        }));
+
+        server.await.expect("test server should finish");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn compact_checkpoint_no_safe_window_returns_context_pressure_blocker() {
+        let state_dir = test_state_dir("worker-context-compaction-no-window-blocker");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let session = state
+            .store
+            .create_session(test_session_record(
+                "compact-no-window-blocker-session",
+                "Compact no window blocker session",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+        let (_, mut worker, _) = create_command_test_context(&state, "compact-no-window-blocker");
+        worker.model = "test-model".to_string();
+        worker.working_dir = workspace_root.display().to_string();
+
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.id.clone(),
+            prompt_text: "Long running task".to_string(),
+            images: Vec::new(),
+            conversation: vec![CheckpointMessage {
+                role: "system".to_string(),
+                content: format!(
+                    "Nucleus worker action JSON contract. {}",
+                    "system pressure ".repeat(40_000)
+                ),
+                images: Vec::new(),
+                compacted: false,
+                compacted_range: None,
+            }],
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let error = compact_checkpoint_if_needed(
+            &state,
+            &session,
+            &worker,
+            &mut checkpoint,
+            "Continue the long running task.",
+            &[],
+            false,
+            &mut cancel_rx,
+            None,
+        )
+        .await
+        .expect_err("no safe shrink path should surface context pressure");
+
+        let message = error.to_string();
+        assert!(message.contains(CONTEXT_PRESSURE_BLOCKER_MARKER));
+        assert!(message.contains("no safe compaction window"));
         let audits = state.store.list_audit_events(20).expect("audit lists");
         assert!(audits.iter().any(|event| {
             event.kind == "memory.compaction.failed"
@@ -29884,7 +30201,105 @@ Thanks."#,
                 && event.summary.contains("no safe compaction window")
         }));
 
-        server.await.expect("test server should finish");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn emergency_compaction_failure_persists_queued_prompt_for_resume() {
+        let state_dir = test_state_dir("worker-context-compaction-preserve-next-prompt");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let session = state
+            .store
+            .create_session(test_session_record(
+                "compact-preserve-next-prompt-session",
+                "Compact preserve next prompt session",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+        let (_, mut worker, _) = create_command_test_context(&state, "compact-preserve-prompt");
+        worker.model = "test-model".to_string();
+        worker.working_dir = workspace_root.display().to_string();
+
+        let mut conversation = vec![CheckpointMessage {
+            role: "system".to_string(),
+            content: format!(
+                "Nucleus worker action JSON contract. {}",
+                "system pressure ".repeat(8_000)
+            ),
+            images: Vec::new(),
+            compacted: false,
+            compacted_range: None,
+        }];
+        conversation.push(CheckpointMessage {
+            role: "user".to_string(),
+            content: format!(
+                "old command output status=0 path=crates/daemon/src/agent.rs {}",
+                "old pressure ".repeat(8_000)
+            ),
+            images: Vec::new(),
+            compacted: false,
+            compacted_range: None,
+        });
+        conversation.extend((0..10).map(|index| CheckpointMessage {
+            role: if index % 2 == 0 { "assistant" } else { "user" }.to_string(),
+            content: format!(
+                "protected tail turn {index}. {}",
+                "tail pressure ".repeat(4_000)
+            ),
+            images: Vec::new(),
+            compacted: false,
+            compacted_range: None,
+        }));
+
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.id.clone(),
+            prompt_text: "Long running task".to_string(),
+            images: Vec::new(),
+            conversation,
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let queued_prompt = "Replay the pending child result prompt.";
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let error = compact_checkpoint_if_needed(
+            &state,
+            &session,
+            &worker,
+            &mut checkpoint,
+            queued_prompt,
+            &[],
+            false,
+            &mut cancel_rx,
+            Some(queued_prompt),
+        )
+        .await
+        .expect_err("remaining context pressure should fail after interim emergency shrink");
+
+        assert!(error.to_string().contains(CONTEXT_PRESSURE_BLOCKER_MARKER));
+        assert!(checkpoint.next_prompt.is_none());
+        let stored = state
+            .store
+            .read_worker_checkpoint(&worker.id)
+            .expect("checkpoint read should succeed")
+            .expect("interim emergency shrink should persist a checkpoint");
+        let stored: WorkerCheckpoint = serde_json::from_value(stored)
+            .expect("persisted checkpoint should decode as worker checkpoint");
+        assert_eq!(stored.next_prompt.as_deref(), Some(queued_prompt));
+        assert!(
+            stored.conversation[1]
+                .content
+                .contains("Context-pressure trimmed")
+        );
+
         let _ = fs::remove_dir_all(&state_dir);
     }
 
@@ -29917,7 +30332,7 @@ Thanks."#,
         let mut checkpoint = long_test_checkpoint(&session.id, 52);
         let original = checkpoint.conversation.clone();
         let (_cancel_tx, mut cancel_rx) = watch::channel(false);
-        compact_checkpoint_if_needed(
+        let error = compact_checkpoint_if_needed(
             &state,
             &session,
             &worker,
@@ -29926,10 +30341,12 @@ Thanks."#,
             &[],
             false,
             &mut cancel_rx,
+            None,
         )
         .await
-        .expect("malformed compaction output should not fail the turn");
+        .expect_err("malformed compaction output should surface context pressure");
 
+        assert!(error.to_string().contains(CONTEXT_PRESSURE_BLOCKER_MARKER));
         assert_eq!(checkpoint.conversation, original);
         assert!(
             !checkpoint
@@ -29943,6 +30360,64 @@ Thanks."#,
                 && event.target == worker.id
                 && event.summary.contains("malformed")
         }));
+
+        server.await.expect("test server should finish");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn compaction_model_call_failure_returns_context_pressure_without_main_fallback() {
+        let state_dir = test_state_dir("worker-context-compaction-call-failure");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let mut session_record = test_session_record(
+            "compact-call-failure-session",
+            "Compact call failure session",
+            &workspace_root,
+        );
+        session_record.model = "main-route-model".to_string();
+        session_record.provider_base_url = "http://127.0.0.1:9/v1".to_string();
+        let session = state
+            .store
+            .create_session(session_record)
+            .expect("session should persist");
+        let (_, mut worker, _) = create_command_test_context(&state, "compact-call-failure");
+        let (base_url, server) =
+            spawn_single_unauthorized_openai_server(r#"{"error":"Missing API key"}"#).await;
+        worker.provider = "openai_compatible".to_string();
+        worker.model = "utility-compaction-model".to_string();
+        worker.provider_base_url = base_url;
+        worker.working_dir = workspace_root.display().to_string();
+
+        let mut checkpoint = long_test_checkpoint(&session.id, 52);
+        let original = checkpoint.conversation.clone();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let error = compact_checkpoint_if_needed(
+            &state,
+            &session,
+            &worker,
+            &mut checkpoint,
+            "Continue the long running task.",
+            &[],
+            false,
+            &mut cancel_rx,
+            None,
+        )
+        .await
+        .expect_err("compaction call failure should surface context pressure");
+
+        let message = error.to_string();
+        assert!(message.contains(CONTEXT_PRESSURE_BLOCKER_MARKER));
+        assert!(message.contains("conversation compaction model call failed"));
+        assert!(!message.contains("Utility Worker route failed"));
+        assert!(!message.contains("main-route-model"));
+        assert_eq!(checkpoint.conversation, original);
 
         server.await.expect("test server should finish");
         let _ = fs::remove_dir_all(&state_dir);
@@ -35353,7 +35828,7 @@ Thanks."#,
         set_default_profile_utility_target(
             &state,
             "openai_compatible",
-            "utility-fanout-model",
+            "cx/gpt-5.5-fanout",
             &base_url,
             "utility-key",
         );
@@ -36239,6 +36714,18 @@ Thanks."#,
                 .expect("join outcome should compute"),
             CHILD_OUTCOME_SUCCEEDED
         );
+        assert_ne!(
+            child_job_join_outcome(&child_before_join),
+            CHILD_OUTCOME_SUCCEEDED,
+            "raw child outcome should still reflect the stored failed state"
+        );
+        let parent_join_results =
+            child_job_results_for_parent_join(&state, std::slice::from_ref(&child_before_join))
+                .expect("parent-join child result prompt payload should serialize");
+        assert_eq!(
+            parent_join_results[0]["join_outcome"],
+            CHILD_OUTCOME_SUCCEEDED
+        );
 
         let mut checkpoint = child_join_checkpoint(
             &session.session.id,
@@ -36296,6 +36783,295 @@ Thanks."#,
         assert_eq!(child_after_join.job.state, "completed");
         assert_eq!(child_after_join.job.completion_status, "satisfied");
         assert!(child_after_join.job.completion_blockers.is_empty());
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn failed_local_project_child_with_context_pressure_and_validation_completes_parent_join()
+    {
+        let state_dir = test_state_dir("failed-child-context-pressure-validated-join");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, mut worker) = create_local_project_parent_join_context(
+            &state,
+            "failed-context-pressure-join",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "failed-context-pressure-child",
+            LocalProjectJoinChildOptions {
+                state: "failed",
+                mutation_receipt: true,
+                validation_exit_code: Some(0),
+            },
+        );
+        let blocker = format!(
+            "{CONTEXT_PRESSURE_BLOCKER_MARKER}: prompt remained above threshold after compaction"
+        );
+        state
+            .store
+            .update_job(
+                &child_job_id,
+                JobPatch {
+                    validation_status: Some("not_performed".to_string()),
+                    last_error: Some(blocker.clone()),
+                    metadata_json: Some(json!({
+                        "context_pressure": {
+                            "marker": CONTEXT_PRESSURE_BLOCKER_MARKER,
+                            "status": "blocked",
+                            "reason": blocker,
+                        }
+                    })),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child context pressure marker should persist");
+
+        let child_before_join = state.store.get_job(&child_job_id).expect("child loads");
+        assert_eq!(child_before_join.job.state, "failed");
+        assert_eq!(child_before_join.job.completion_status, "blocked");
+        assert!(
+            child_before_join
+                .job
+                .completion_blockers
+                .iter()
+                .any(|blocker| { blocker.contains(CONTEXT_PRESSURE_BLOCKER_MARKER) })
+        );
+        assert!(
+            child_before_join
+                .job
+                .completion_blockers
+                .iter()
+                .any(|blocker| blocker.contains("without successful validation evidence")),
+            "successful tests.run evidence should allow this derived blocker during join"
+        );
+        assert_eq!(
+            child_job_join_outcome_for_parent_join(&state, &child_before_join)
+                .expect("join outcome should compute"),
+            CHILD_OUTCOME_SUCCEEDED
+        );
+
+        let mut checkpoint = child_join_checkpoint(
+            &session.session.id,
+            vec![child_job_id.clone()],
+            "join context pressure child with durable validation",
+        );
+        let mut step = 1;
+        let mut tool_calls = 0;
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+
+        let disposition = handle_pending_action(
+            &state,
+            &session,
+            &parent_job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            &mut tool_calls,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("context-pressure child join should complete parent from durable evidence");
+
+        assert_eq!(disposition, LoopDisposition::Return);
+        let parent = state.store.get_job(&parent_job_id).expect("parent loads");
+        assert_eq!(parent.job.state, "completed");
+        assert_eq!(parent.job.completion_status, "satisfied");
+        assert!(parent.job.completion_blockers.is_empty());
+        let child_after_join = state.store.get_job(&child_job_id).expect("child reloads");
+        assert_eq!(child_after_join.job.state, "failed");
+        assert_eq!(child_after_join.job.completion_status, "blocked");
+        let join_event = parent
+            .events
+            .iter()
+            .find(|event| event.event_type == "child.jobs.joined")
+            .expect("join event should persist");
+        assert_eq!(join_event.status, "completed");
+        assert_eq!(
+            join_event.data_json["child_outcomes"][0]["join_outcome"],
+            CHILD_OUTCOME_SUCCEEDED
+        );
+        assert_eq!(
+            join_event.data_json["join_decision"]["daemon_completed_parent"],
+            true
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn failed_local_project_child_context_pressure_without_validation_does_not_upgrade() {
+        let state_dir = test_state_dir("failed-child-context-pressure-no-validation");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, _) = create_local_project_parent_join_context(
+            &state,
+            "failed-context-pressure-no-validation",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "failed-context-pressure-no-validation-child",
+            LocalProjectJoinChildOptions {
+                state: "failed",
+                mutation_receipt: true,
+                validation_exit_code: None,
+            },
+        );
+        let blocker = format!(
+            "{CONTEXT_PRESSURE_BLOCKER_MARKER}: prompt remained above threshold after compaction"
+        );
+        state
+            .store
+            .update_job(
+                &child_job_id,
+                JobPatch {
+                    last_error: Some(blocker.clone()),
+                    metadata_json: Some(json!({
+                        "context_pressure": {
+                            "marker": CONTEXT_PRESSURE_BLOCKER_MARKER,
+                            "status": "blocked",
+                            "reason": blocker,
+                        }
+                    })),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("child context pressure marker should persist");
+
+        let child = state.store.get_job(&child_job_id).expect("child loads");
+        assert_ne!(
+            child_job_join_outcome_for_parent_join(&state, &child)
+                .expect("join outcome should compute"),
+            CHILD_OUTCOME_SUCCEEDED
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn context_pressure_join_rejects_unrelated_blocker_mentions() {
+        let mut detail = test_job_detail_with_prompt("context pressure blocker matching");
+        detail.job.completion_blockers = vec![
+            format!(
+                "{CONTEXT_PRESSURE_BLOCKER_MARKER}: prompt remained above threshold after compaction"
+            ),
+            "Local project completion was claimed without successful validation evidence."
+                .to_string(),
+        ];
+        assert!(child_context_pressure_join_blockers_are_recoverable(
+            &detail
+        ));
+
+        detail.job.completion_blockers.push(
+            "Recent command failure blocks completion: context pressure regression failed."
+                .to_string(),
+        );
+        assert!(!child_context_pressure_join_blockers_are_recoverable(
+            &detail
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_local_project_child_task_failure_with_validation_does_not_upgrade() {
+        let state_dir = test_state_dir("failed-child-task-failure-validated");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, _) = create_local_project_parent_join_context(
+            &state,
+            "failed-task-failure-validated",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "failed-task-failure-validated-child",
+            LocalProjectJoinChildOptions {
+                state: "failed",
+                mutation_receipt: true,
+                validation_exit_code: Some(0),
+            },
+        );
+        append_tests_run_tool_call(
+            &state,
+            &child_job_id,
+            "later-task-failure",
+            "failed",
+            1,
+            json!({
+                "command": "sh",
+                "args": ["-lc", "exit 1"],
+            }),
+            9,
+        );
+        append_tests_run_command_session(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "later-task-failure",
+            "failed",
+            1,
+            "sh",
+            vec!["-lc", "exit 1"],
+            &workspace_root,
+            9,
+        );
+        state
+            .store
+            .update_job(
+                &child_job_id,
+                JobPatch {
+                    last_error: Some(format!(
+                        "{CONTEXT_PRESSURE_BLOCKER_MARKER}: previous context-pressure failure"
+                    )),
+                    metadata_json: Some(json!({
+                        "context_pressure": {
+                            "marker": CONTEXT_PRESSURE_BLOCKER_MARKER,
+                            "status": "blocked",
+                            "reason": format!(
+                                "{CONTEXT_PRESSURE_BLOCKER_MARKER}: previous context-pressure failure"
+                            ),
+                        }
+                    })),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("stale context-pressure metadata should persist");
+        fail_job(
+            &state,
+            &child_job_id,
+            "task validation failed after implementation",
+        )
+        .await
+        .expect("non-context child failure should persist");
+
+        let child = state.store.get_job(&child_job_id).expect("child loads");
+        assert!(child.job.metadata_json.get("context_pressure").is_none());
+        assert!(
+            child
+                .job
+                .completion_blockers
+                .iter()
+                .any(|blocker| { blocker.contains("Recent command failure blocks completion") })
+        );
+        assert_ne!(
+            child_job_join_outcome_for_parent_join(&state, &child)
+                .expect("join outcome should compute"),
+            CHILD_OUTCOME_SUCCEEDED
+        );
 
         let _ = fs::remove_dir_all(&state_dir);
     }

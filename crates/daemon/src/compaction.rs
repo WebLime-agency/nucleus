@@ -11,6 +11,10 @@ pub(crate) const PRESERVE_RECENT_TURNS: usize = 10;
 const MIN_COMPACTION_MESSAGES: usize = 4;
 const CHARS_PER_TOKEN: usize = 4;
 const FALLBACK_CONTEXT_CHARS: usize = 50_000;
+const MAX_COMPACTED_REPLACEMENT_RATIO_NUMERATOR: usize = 3;
+const MAX_COMPACTED_REPLACEMENT_RATIO_DENOMINATOR: usize = 4;
+const EMERGENCY_TRIM_TARGET_CHARS: usize = 1_200;
+const EMERGENCY_REFERENCE_LIMIT: usize = 24;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CompactionOutcome {
@@ -18,14 +22,24 @@ pub(crate) enum CompactionOutcome {
         turn_id_start: String,
         turn_id_end: String,
         original_messages: usize,
+        original_chars: usize,
         replacement_chars: usize,
+        preserved_tail_count: usize,
+        provider: String,
         model: String,
     },
     Skipped {
         reason: String,
+        preserved_tail_count: usize,
+        provider: String,
+        model: String,
     },
     Failed {
         reason: String,
+        preserved_tail_count: usize,
+        provider: String,
+        model: String,
+        error_class: String,
     },
 }
 
@@ -188,14 +202,16 @@ pub(crate) async fn compact_conversation(
     let Some(window) = select_compaction_window(checkpoint) else {
         return Ok(CompactionOutcome::Skipped {
             reason: "no safe compaction window".to_string(),
+            preserved_tail_count: PRESERVE_RECENT_TURNS,
+            provider: worker.provider.clone(),
+            model: worker.model.clone(),
         });
     };
 
-    let prompt = build_compaction_prompt(
-        &checkpoint.conversation[window.start..window.end],
-        window.start,
-    );
-    let result = execute_worker_text_turn(
+    let original_messages = &checkpoint.conversation[window.start..window.end];
+    let original_chars = checkpoint_messages_payload_chars(original_messages);
+    let prompt = build_compaction_prompt(original_messages, window.start);
+    let result = match execute_worker_text_turn(
         state,
         Some(session),
         worker,
@@ -206,7 +222,18 @@ pub(crate) async fn compact_conversation(
         cancel_rx,
     )
     .await
-    .context("conversation compaction model call failed")?;
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(CompactionOutcome::Failed {
+                reason: format!("conversation compaction model call failed: {error:#}"),
+                preserved_tail_count: PRESERVE_RECENT_TURNS,
+                provider: worker.provider.clone(),
+                model: worker.model.clone(),
+                error_class: "provider_call_failed".to_string(),
+            });
+        }
+    };
 
     let summary = match parse_compaction_summary(&result.content) {
         Ok(summary) => summary,
@@ -218,6 +245,10 @@ pub(crate) async fn compact_conversation(
             );
             return Ok(CompactionOutcome::Failed {
                 reason: format!("malformed compaction output: {error}"),
+                preserved_tail_count: PRESERVE_RECENT_TURNS,
+                provider: worker.provider.clone(),
+                model: worker.model.clone(),
+                error_class: "malformed_output".to_string(),
             });
         }
     };
@@ -228,6 +259,21 @@ pub(crate) async fn compact_conversation(
         &worker.model,
         &checkpoint.conversation[window.start..window.end],
     );
+    let replacement_chars = checkpoint_message_payload_chars(&rendered);
+    let max_replacement_chars = original_chars
+        .saturating_mul(MAX_COMPACTED_REPLACEMENT_RATIO_NUMERATOR)
+        / MAX_COMPACTED_REPLACEMENT_RATIO_DENOMINATOR;
+    if replacement_chars >= original_chars || replacement_chars > max_replacement_chars {
+        return Ok(CompactionOutcome::Failed {
+            reason: format!(
+                "compaction summary exceeded budget: original_chars={original_chars}, replacement_chars={replacement_chars}, max_replacement_chars={max_replacement_chars}"
+            ),
+            preserved_tail_count: PRESERVE_RECENT_TURNS,
+            provider: worker.provider.clone(),
+            model: worker.model.clone(),
+            error_class: summary_budget_error_class(original_messages).to_string(),
+        });
+    }
     checkpoint
         .conversation
         .splice(window.start..window.end, [rendered]);
@@ -236,9 +282,191 @@ pub(crate) async fn compact_conversation(
         turn_id_start: window.turn_id_start,
         turn_id_end: window.turn_id_end,
         original_messages: window.end.saturating_sub(window.start),
-        replacement_chars: checkpoint.conversation[window.start].content.len(),
+        original_chars,
+        replacement_chars,
+        preserved_tail_count: PRESERVE_RECENT_TURNS,
+        provider: worker.provider.clone(),
         model: worker.model.clone(),
     })
+}
+
+pub(crate) fn emergency_shrink_checkpoint(checkpoint: &mut WorkerCheckpoint) -> Option<String> {
+    let protected_tail_start = checkpoint
+        .conversation
+        .len()
+        .saturating_sub(PRESERVE_RECENT_TURNS);
+    let candidates = emergency_shrink_candidates(checkpoint, protected_tail_start);
+    for index in candidates {
+        let Some(message) = checkpoint.conversation.get_mut(index) else {
+            continue;
+        };
+        let original_chars = emergency_message_payload_chars(message);
+        let replacement = render_emergency_trimmed_message(index, message, original_chars);
+        if replacement.len() >= original_chars {
+            continue;
+        }
+        message.content = replacement;
+        message.images.clear();
+        if let Some(range) = message.compacted_range.as_mut() {
+            range.images.clear();
+        }
+        return Some(format!(
+            "emergency trimmed conversation-{index}; original_chars={original_chars}; replacement_chars={}",
+            message.content.len()
+        ));
+    }
+    None
+}
+
+fn emergency_shrink_candidates(
+    checkpoint: &WorkerCheckpoint,
+    protected_tail_start: usize,
+) -> Vec<usize> {
+    let pending_anchor = checkpoint.pending_action.as_ref().and_then(|_| {
+        checkpoint
+            .conversation
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, message)| message.role == "assistant")
+            .map(|(index, _)| index)
+    });
+    checkpoint
+        .conversation
+        .iter()
+        .enumerate()
+        .filter(|(index, message)| {
+            if *index == 0 && message.role == "system" && !message.compacted {
+                return false;
+            }
+            if pending_anchor.is_some_and(|anchor| *index >= anchor) {
+                return false;
+            }
+            if *index >= protected_tail_start {
+                return false;
+            }
+            emergency_message_payload_chars(message) > EMERGENCY_TRIM_TARGET_CHARS
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn emergency_message_payload_chars(message: &CheckpointMessage) -> usize {
+    checkpoint_message_payload_chars(message)
+}
+
+fn checkpoint_messages_payload_chars(messages: &[CheckpointMessage]) -> usize {
+    messages
+        .iter()
+        .map(checkpoint_message_payload_chars)
+        .sum::<usize>()
+}
+
+fn checkpoint_message_payload_chars(message: &CheckpointMessage) -> usize {
+    message
+        .content
+        .len()
+        .saturating_add(checkpoint_message_image_payload_chars(message))
+}
+
+fn checkpoint_messages_image_payload_chars(messages: &[CheckpointMessage]) -> usize {
+    messages
+        .iter()
+        .map(checkpoint_message_image_payload_chars)
+        .sum::<usize>()
+}
+
+fn checkpoint_message_image_payload_chars(message: &CheckpointMessage) -> usize {
+    let direct_image_chars = message
+        .images
+        .iter()
+        .map(|image| image.data_url.len())
+        .sum::<usize>();
+    let compacted_image_chars = message
+        .compacted_range
+        .as_ref()
+        .map(|range| {
+            range
+                .images
+                .iter()
+                .map(|image| image.data_url.len())
+                .sum::<usize>()
+        })
+        .unwrap_or_default();
+    direct_image_chars.saturating_add(compacted_image_chars)
+}
+
+fn summary_budget_error_class(original_messages: &[CheckpointMessage]) -> &'static str {
+    if checkpoint_messages_image_payload_chars(original_messages) > 0 {
+        "summary_budget_exceeded_image_payload"
+    } else {
+        "summary_budget_exceeded"
+    }
+}
+
+fn render_emergency_trimmed_message(
+    index: usize,
+    message: &CheckpointMessage,
+    original_chars: usize,
+) -> String {
+    let mut references = preserve_emergency_references(&message.content);
+    if references.is_empty() {
+        references.push("No structured identifiers were detected in the trimmed body.".to_string());
+    }
+    let mut excerpt = message
+        .content
+        .chars()
+        .take(EMERGENCY_TRIM_TARGET_CHARS / 2)
+        .collect::<String>();
+    if excerpt.trim().is_empty() {
+        excerpt = "(empty content)".to_string();
+    }
+    format!(
+        "[Context-pressure trimmed: conversation-{index}]\n\
+Daemon note: oversized historical tool or conversation output was deterministically truncated without a model call. Identifiers, paths, exit codes, and result hints detected below are preserved for continuity.\n\n\
+Role: {}\n\
+Original chars: {original_chars}\n\
+Preserved references:\n- {}\n\n\
+Leading excerpt:\n{}",
+        message.role,
+        references.join("\n- "),
+        excerpt.trim()
+    )
+}
+
+fn preserve_emergency_references(content: &str) -> Vec<String> {
+    let mut references = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized = trimmed.to_ascii_lowercase();
+        let looks_relevant = normalized.contains("exit_code")
+            || normalized.contains("exit code")
+            || normalized.contains("status")
+            || normalized.contains("result")
+            || normalized.contains("artifact")
+            || normalized.contains("command")
+            || normalized.contains("tool_call")
+            || normalized.contains("tool call")
+            || normalized.contains("session")
+            || trimmed.contains('/')
+            || trimmed.contains("#")
+            || trimmed.contains(".rs")
+            || trimmed.contains(".ts")
+            || trimmed.contains(".js")
+            || trimmed.contains(".svelte");
+        if looks_relevant {
+            references.push(trimmed.chars().take(240).collect::<String>());
+            if references.len() >= EMERGENCY_REFERENCE_LIMIT {
+                break;
+            }
+        }
+    }
+    references.sort();
+    references.dedup();
+    references
 }
 
 pub(crate) async fn audit_compaction_outcome(
@@ -251,7 +479,10 @@ pub(crate) async fn audit_compaction_outcome(
             turn_id_start,
             turn_id_end,
             original_messages,
+            original_chars,
             replacement_chars,
+            preserved_tail_count,
+            provider,
             model,
         } => {
             record_memory_audit(
@@ -260,19 +491,27 @@ pub(crate) async fn audit_compaction_outcome(
                 &worker.id,
                 "applied",
                 &format!(
-                    "Compacted {original_messages} checkpoint messages ({turn_id_start}..{turn_id_end}) via {model}; replacement_chars={replacement_chars}",
+                    "Compacted {original_messages} checkpoint messages ({turn_id_start}..{turn_id_end}) via provider={provider} model={model}; original_chars={original_chars}; replacement_chars={replacement_chars}; preserved_tail_count={preserved_tail_count}",
                 ),
             )
             .await;
         }
         CompactionOutcome::Skipped { .. } => {}
-        CompactionOutcome::Failed { reason } => {
+        CompactionOutcome::Failed {
+            reason,
+            preserved_tail_count,
+            provider,
+            model,
+            error_class,
+        } => {
             record_memory_audit(
                 state,
                 "memory.compaction.failed",
                 &worker.id,
                 "failed",
-                reason,
+                &format!(
+                    "{reason}; provider={provider}; model={model}; preserved_tail_count={preserved_tail_count}; error_class={error_class}"
+                ),
             )
             .await;
         }
@@ -479,6 +718,241 @@ mod tests {
         let window =
             select_compaction_window_with_tail(&checkpoint, 2).expect("window should exist");
         assert_eq!(window.end, 12);
+    }
+
+    #[test]
+    fn summary_budget_class_counts_direct_and_compacted_images() {
+        let direct_image = nucleus_protocol::SessionTurnImage {
+            display_name: "direct.png".to_string(),
+            mime_type: "image/png".to_string(),
+            data_url: format!("data:image/png;base64,{}", "A".repeat(2_000)),
+        };
+        let compacted_image = nucleus_protocol::SessionTurnImage {
+            display_name: "compacted.png".to_string(),
+            mime_type: "image/png".to_string(),
+            data_url: format!("data:image/png;base64,{}", "B".repeat(3_000)),
+        };
+        let text_only = CheckpointMessage {
+            role: "tool".to_string(),
+            content: "short text".to_string(),
+            images: Vec::new(),
+            compacted: false,
+            compacted_range: None,
+        };
+        let direct = CheckpointMessage {
+            images: vec![direct_image.clone()],
+            ..text_only.clone()
+        };
+        let compacted = CheckpointMessage {
+            compacted_range: Some(CompactedRange {
+                turn_id_start: "conversation-1".to_string(),
+                turn_id_end: "conversation-1".to_string(),
+                images: vec![compacted_image.clone()],
+            }),
+            ..text_only.clone()
+        };
+
+        assert_eq!(
+            checkpoint_message_payload_chars(&direct),
+            direct.content.len() + direct_image.data_url.len()
+        );
+        assert_eq!(
+            checkpoint_message_payload_chars(&compacted),
+            compacted.content.len() + compacted_image.data_url.len()
+        );
+        assert_eq!(
+            summary_budget_error_class(&[text_only]),
+            "summary_budget_exceeded"
+        );
+        assert_eq!(
+            summary_budget_error_class(&[direct]),
+            "summary_budget_exceeded_image_payload"
+        );
+        assert_eq!(
+            summary_budget_error_class(&[compacted]),
+            "summary_budget_exceeded_image_payload"
+        );
+    }
+
+    #[test]
+    fn emergency_shrink_tries_later_candidates_when_first_does_not_shrink() {
+        let path_heavy = (0..24)
+            .map(|index| {
+                format!(
+                    "crates/daemon/src/some/extremely/deep/path/that/should/be/preserved/{index}/context_pressure_regression_file.rs"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(path_heavy.len() > EMERGENCY_TRIM_TARGET_CHARS);
+        let large_tool_output = format!(
+            "exit_code=0\n{}",
+            "large deterministic validation output line\n".repeat(500)
+        );
+        let original_first = path_heavy.clone();
+        let original_second_chars = large_tool_output.len();
+        let mut conversation = vec![
+            CheckpointMessage {
+                role: "system".to_string(),
+                content: "protected system".to_string(),
+                images: Vec::new(),
+                compacted: false,
+                compacted_range: None,
+            },
+            CheckpointMessage {
+                role: "tool".to_string(),
+                content: path_heavy,
+                images: Vec::new(),
+                compacted: false,
+                compacted_range: None,
+            },
+            CheckpointMessage {
+                role: "tool".to_string(),
+                content: large_tool_output,
+                images: vec![nucleus_protocol::SessionTurnImage {
+                    display_name: "image-1".to_string(),
+                    mime_type: "image/png".to_string(),
+                    data_url: "data:image/png;base64,AAAA".to_string(),
+                }],
+                compacted: false,
+                compacted_range: None,
+            },
+        ];
+        conversation.extend((0..PRESERVE_RECENT_TURNS).map(|index| CheckpointMessage {
+            role: "user".to_string(),
+            content: format!("recent protected turn {index}"),
+            images: Vec::new(),
+            compacted: false,
+            compacted_range: None,
+        }));
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: "session".to_string(),
+            prompt_text: String::new(),
+            images: Vec::new(),
+            conversation,
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+
+        let summary = emergency_shrink_checkpoint(&mut checkpoint)
+            .expect("later shrinkable candidate should be used");
+
+        assert!(summary.contains("conversation-2"));
+        assert_eq!(checkpoint.conversation[1].content, original_first);
+        assert!(checkpoint.conversation[2].content.len() < original_second_chars);
+        assert!(checkpoint.conversation[2].images.is_empty());
+    }
+
+    #[test]
+    fn emergency_shrink_trims_image_heavy_history() {
+        let large_image = nucleus_protocol::SessionTurnImage {
+            display_name: "old-screenshot.png".to_string(),
+            mime_type: "image/png".to_string(),
+            data_url: format!("data:image/png;base64,{}", "A".repeat(4_000)),
+        };
+        let compacted_image = nucleus_protocol::SessionTurnImage {
+            display_name: "compacted-screenshot.png".to_string(),
+            mime_type: "image/png".to_string(),
+            data_url: format!("data:image/png;base64,{}", "B".repeat(4_000)),
+        };
+        let mut conversation = vec![
+            CheckpointMessage {
+                role: "system".to_string(),
+                content: "protected system".to_string(),
+                images: Vec::new(),
+                compacted: false,
+                compacted_range: None,
+            },
+            CheckpointMessage {
+                role: "tool".to_string(),
+                content: "short historical screenshot result".to_string(),
+                images: vec![large_image],
+                compacted: true,
+                compacted_range: Some(CompactedRange {
+                    turn_id_start: "conversation-1".to_string(),
+                    turn_id_end: "conversation-1".to_string(),
+                    images: vec![compacted_image],
+                }),
+            },
+        ];
+        conversation.extend((0..PRESERVE_RECENT_TURNS).map(|index| CheckpointMessage {
+            role: "user".to_string(),
+            content: format!("recent protected turn {index}"),
+            images: Vec::new(),
+            compacted: false,
+            compacted_range: None,
+        }));
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: "session".to_string(),
+            prompt_text: String::new(),
+            images: Vec::new(),
+            conversation,
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+
+        let summary = emergency_shrink_checkpoint(&mut checkpoint)
+            .expect("image-heavy historical message should be shrinkable");
+
+        assert!(summary.contains("conversation-1"));
+        assert!(
+            checkpoint.conversation[1]
+                .content
+                .contains("Context-pressure trimmed")
+        );
+        assert!(checkpoint.conversation[1].images.is_empty());
+        assert!(
+            checkpoint.conversation[1]
+                .compacted_range
+                .as_ref()
+                .expect("compacted range should remain")
+                .images
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn emergency_shrink_preserves_protected_tail_when_no_safe_candidate_exists() {
+        let protected_large = "latest tool output line\n".repeat(500);
+        assert!(protected_large.len() > EMERGENCY_TRIM_TARGET_CHARS);
+        let original = protected_large.clone();
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: "session".to_string(),
+            prompt_text: String::new(),
+            images: Vec::new(),
+            conversation: vec![
+                CheckpointMessage {
+                    role: "system".to_string(),
+                    content: "protected system".to_string(),
+                    images: Vec::new(),
+                    compacted: false,
+                    compacted_range: None,
+                },
+                CheckpointMessage {
+                    role: "tool".to_string(),
+                    content: protected_large,
+                    images: vec![nucleus_protocol::SessionTurnImage {
+                        display_name: "image-1".to_string(),
+                        mime_type: "image/png".to_string(),
+                        data_url: "data:image/png;base64,AAAA".to_string(),
+                    }],
+                    compacted: false,
+                    compacted_range: None,
+                },
+            ],
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+
+        assert!(emergency_shrink_checkpoint(&mut checkpoint).is_none());
+        assert_eq!(checkpoint.conversation[1].content, original);
+        assert_eq!(checkpoint.conversation[1].images.len(), 1);
     }
 
     fn test_compiled_turn(user: String) -> CompiledTurn {
