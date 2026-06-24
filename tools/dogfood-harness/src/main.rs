@@ -2711,7 +2711,6 @@ fn child_context_pressure_blockers_are_recoverable(child: &JobDetail) -> bool {
     child.job.completion_blockers.iter().all(|blocker| {
         let lower = blocker.to_lowercase();
         blocker.contains(CONTEXT_PRESSURE_BLOCKER_MARKER)
-            || lower.contains("context pressure")
             || lower.contains("validation evidence")
             || lower.contains("completion was claimed without successful validation")
     })
@@ -3900,6 +3899,29 @@ mod tests {
         );
         assert_eq!(command_validated_context_pressure.status, "FAIL");
         assert!(!command_validated_context_pressure.phase1.passed);
+
+        let mut failed_with_context_pressure_text_blocker = failed_evidence_child.clone();
+        failed_with_context_pressure_text_blocker
+            .job
+            .completion_blockers
+            .push(
+                "Recent command failure blocks completion: context pressure regression failed."
+                    .to_string(),
+            );
+        let unrelated_context_pressure_text = build_rung_report(
+            &rung,
+            "session",
+            "root",
+            root_detail(
+                "completed",
+                "satisfied",
+                vec![child_summary("child", "failed", "blocked")],
+            ),
+            vec![failed_with_context_pressure_text_blocker],
+            ApprovalReport::default(),
+        );
+        assert_eq!(unrelated_context_pressure_text.status, "FAIL");
+        assert!(!unrelated_context_pressure_text.phase1.passed);
 
         let mut failed_with_command_blocker = failed_evidence_child.clone();
         failed_with_command_blocker
