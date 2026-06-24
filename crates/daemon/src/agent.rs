@@ -4184,6 +4184,7 @@ async fn run_job_loop(
         }
 
         let attach_initial_images = should_attach_initial_worker_images(&checkpoint);
+        let queued_prompt_for_compaction = checkpoint.next_prompt.clone();
         let prompt = checkpoint.next_prompt.take().unwrap_or_else(|| {
             let initial = build_initial_step_prompt(
                 &session.session,
@@ -4228,6 +4229,7 @@ async fn run_job_loop(
             &prompt_images,
             low_context_turn,
             cancel_rx,
+            queued_prompt_for_compaction.as_deref(),
         )
         .await
         {
@@ -14320,6 +14322,17 @@ fn text_has_context_pressure_blocker(text: &str) -> bool {
     text.contains(CONTEXT_PRESSURE_BLOCKER_MARKER)
 }
 
+fn checkpoint_for_pre_turn_persistence(
+    checkpoint: &WorkerCheckpoint,
+    queued_prompt: Option<&str>,
+) -> WorkerCheckpoint {
+    let mut persisted = checkpoint.clone();
+    if persisted.next_prompt.is_none() {
+        persisted.next_prompt = queued_prompt.map(ToOwned::to_owned);
+    }
+    persisted
+}
+
 async fn compact_checkpoint_if_needed(
     state: &AppState,
     session: &SessionSummary,
@@ -14329,6 +14342,7 @@ async fn compact_checkpoint_if_needed(
     images: &[SessionTurnImage],
     low_context_turn: bool,
     cancel_rx: &mut watch::Receiver<bool>,
+    queued_prompt_for_persistence: Option<&str>,
 ) -> Result<()> {
     let threshold = compaction_token_threshold_for_model(&worker.model);
     for _ in 0..MAX_COMPACTION_PASSES {
@@ -14397,8 +14411,11 @@ async fn compact_checkpoint_if_needed(
                 }
                 state.store.write_worker_checkpoint(
                     &worker.id,
-                    &serde_json::to_value(&*checkpoint)
-                        .context("failed to encode worker checkpoint")?,
+                    &serde_json::to_value(checkpoint_for_pre_turn_persistence(
+                        checkpoint,
+                        queued_prompt_for_persistence,
+                    ))
+                    .context("failed to encode worker checkpoint")?,
                 )?;
                 audit_compaction_outcome(state, worker, &outcome).await;
                 record_memory_audit(
@@ -14430,8 +14447,11 @@ async fn compact_checkpoint_if_needed(
                         if after_tokens < before_tokens {
                             state.store.write_worker_checkpoint(
                                 &worker.id,
-                                &serde_json::to_value(&*checkpoint)
-                                    .context("failed to encode worker checkpoint")?,
+                                &serde_json::to_value(checkpoint_for_pre_turn_persistence(
+                                    checkpoint,
+                                    queued_prompt_for_persistence,
+                                ))
+                                .context("failed to encode worker checkpoint")?,
                             )?;
                             record_memory_audit(
                                 state,
@@ -29783,6 +29803,7 @@ Thanks."#,
             &[],
             false,
             &mut cancel_rx,
+            None,
         )
         .await
         .expect("compaction should not fail the turn");
@@ -29936,6 +29957,7 @@ Thanks."#,
             &[],
             true,
             &mut cancel_rx,
+            None,
         )
         .await
         .expect("low-context compaction should not fail the turn");
@@ -30007,6 +30029,7 @@ Thanks."#,
             &[],
             false,
             &mut cancel_rx,
+            None,
         )
         .await
         .expect_err("oversized compaction summary should surface context pressure");
@@ -30111,6 +30134,7 @@ Thanks."#,
             &[],
             false,
             &mut cancel_rx,
+            None,
         )
         .await
         .expect_err("no safe shrink path should surface context pressure");
@@ -30124,6 +30148,105 @@ Thanks."#,
                 && event.target == worker.id
                 && event.summary.contains("no safe compaction window")
         }));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn emergency_compaction_failure_persists_queued_prompt_for_resume() {
+        let state_dir = test_state_dir("worker-context-compaction-preserve-next-prompt");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let session = state
+            .store
+            .create_session(test_session_record(
+                "compact-preserve-next-prompt-session",
+                "Compact preserve next prompt session",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+        let (_, mut worker, _) = create_command_test_context(&state, "compact-preserve-prompt");
+        worker.model = "test-model".to_string();
+        worker.working_dir = workspace_root.display().to_string();
+
+        let mut conversation = vec![CheckpointMessage {
+            role: "system".to_string(),
+            content: format!(
+                "Nucleus worker action JSON contract. {}",
+                "system pressure ".repeat(8_000)
+            ),
+            images: Vec::new(),
+            compacted: false,
+            compacted_range: None,
+        }];
+        conversation.push(CheckpointMessage {
+            role: "user".to_string(),
+            content: format!(
+                "old command output status=0 path=crates/daemon/src/agent.rs {}",
+                "old pressure ".repeat(8_000)
+            ),
+            images: Vec::new(),
+            compacted: false,
+            compacted_range: None,
+        });
+        conversation.extend((0..10).map(|index| CheckpointMessage {
+            role: if index % 2 == 0 { "assistant" } else { "user" }.to_string(),
+            content: format!(
+                "protected tail turn {index}. {}",
+                "tail pressure ".repeat(4_000)
+            ),
+            images: Vec::new(),
+            compacted: false,
+            compacted_range: None,
+        }));
+
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.id.clone(),
+            prompt_text: "Long running task".to_string(),
+            images: Vec::new(),
+            conversation,
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+        let queued_prompt = "Replay the pending child result prompt.";
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let error = compact_checkpoint_if_needed(
+            &state,
+            &session,
+            &worker,
+            &mut checkpoint,
+            queued_prompt,
+            &[],
+            false,
+            &mut cancel_rx,
+            Some(queued_prompt),
+        )
+        .await
+        .expect_err("remaining context pressure should fail after interim emergency shrink");
+
+        assert!(error.to_string().contains(CONTEXT_PRESSURE_BLOCKER_MARKER));
+        assert!(checkpoint.next_prompt.is_none());
+        let stored = state
+            .store
+            .read_worker_checkpoint(&worker.id)
+            .expect("checkpoint read should succeed")
+            .expect("interim emergency shrink should persist a checkpoint");
+        let stored: WorkerCheckpoint = serde_json::from_value(stored)
+            .expect("persisted checkpoint should decode as worker checkpoint");
+        assert_eq!(stored.next_prompt.as_deref(), Some(queued_prompt));
+        assert!(
+            stored.conversation[1]
+                .content
+                .contains("Context-pressure trimmed")
+        );
 
         let _ = fs::remove_dir_all(&state_dir);
     }
@@ -30166,6 +30289,7 @@ Thanks."#,
             &[],
             false,
             &mut cancel_rx,
+            None,
         )
         .await
         .expect_err("malformed compaction output should surface context pressure");
@@ -30231,6 +30355,7 @@ Thanks."#,
             &[],
             false,
             &mut cancel_rx,
+            None,
         )
         .await
         .expect_err("compaction call failure should surface context pressure");
