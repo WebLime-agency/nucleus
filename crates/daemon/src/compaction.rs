@@ -303,13 +303,16 @@ pub(crate) fn emergency_shrink_checkpoint(checkpoint: &mut WorkerCheckpoint) -> 
         let Some(message) = checkpoint.conversation.get_mut(index) else {
             continue;
         };
-        let original_chars = message.content.len();
+        let original_chars = emergency_message_payload_chars(message);
         let replacement = render_emergency_trimmed_message(index, message, original_chars);
         if replacement.len() >= original_chars {
             continue;
         }
         message.content = replacement;
         message.images.clear();
+        if let Some(range) = message.compacted_range.as_mut() {
+            range.images.clear();
+        }
         return Some(format!(
             "emergency trimmed conversation-{index}; original_chars={original_chars}; replacement_chars={}",
             message.content.len()
@@ -345,10 +348,34 @@ fn emergency_shrink_candidates(
             if *index >= protected_tail_start {
                 return false;
             }
-            message.content.len() > EMERGENCY_TRIM_TARGET_CHARS
+            emergency_message_payload_chars(message) > EMERGENCY_TRIM_TARGET_CHARS
         })
         .map(|(index, _)| index)
         .collect()
+}
+
+fn emergency_message_payload_chars(message: &CheckpointMessage) -> usize {
+    let direct_image_chars = message
+        .images
+        .iter()
+        .map(|image| image.data_url.len())
+        .sum::<usize>();
+    let compacted_image_chars = message
+        .compacted_range
+        .as_ref()
+        .map(|range| {
+            range
+                .images
+                .iter()
+                .map(|image| image.data_url.len())
+                .sum::<usize>()
+        })
+        .unwrap_or_default();
+    message
+        .content
+        .len()
+        .saturating_add(direct_image_chars)
+        .saturating_add(compacted_image_chars)
 }
 
 fn render_emergency_trimmed_message(
@@ -736,6 +763,76 @@ mod tests {
         assert_eq!(checkpoint.conversation[1].content, original_first);
         assert!(checkpoint.conversation[2].content.len() < original_second_chars);
         assert!(checkpoint.conversation[2].images.is_empty());
+    }
+
+    #[test]
+    fn emergency_shrink_trims_image_heavy_history() {
+        let large_image = nucleus_protocol::SessionTurnImage {
+            display_name: "old-screenshot.png".to_string(),
+            mime_type: "image/png".to_string(),
+            data_url: format!("data:image/png;base64,{}", "A".repeat(4_000)),
+        };
+        let compacted_image = nucleus_protocol::SessionTurnImage {
+            display_name: "compacted-screenshot.png".to_string(),
+            mime_type: "image/png".to_string(),
+            data_url: format!("data:image/png;base64,{}", "B".repeat(4_000)),
+        };
+        let mut conversation = vec![
+            CheckpointMessage {
+                role: "system".to_string(),
+                content: "protected system".to_string(),
+                images: Vec::new(),
+                compacted: false,
+                compacted_range: None,
+            },
+            CheckpointMessage {
+                role: "tool".to_string(),
+                content: "short historical screenshot result".to_string(),
+                images: vec![large_image],
+                compacted: true,
+                compacted_range: Some(CompactedRange {
+                    turn_id_start: "conversation-1".to_string(),
+                    turn_id_end: "conversation-1".to_string(),
+                    images: vec![compacted_image],
+                }),
+            },
+        ];
+        conversation.extend((0..PRESERVE_RECENT_TURNS).map(|index| CheckpointMessage {
+            role: "user".to_string(),
+            content: format!("recent protected turn {index}"),
+            images: Vec::new(),
+            compacted: false,
+            compacted_range: None,
+        }));
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: "session".to_string(),
+            prompt_text: String::new(),
+            images: Vec::new(),
+            conversation,
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+
+        let summary = emergency_shrink_checkpoint(&mut checkpoint)
+            .expect("image-heavy historical message should be shrinkable");
+
+        assert!(summary.contains("conversation-1"));
+        assert!(
+            checkpoint.conversation[1]
+                .content
+                .contains("Context-pressure trimmed")
+        );
+        assert!(checkpoint.conversation[1].images.is_empty());
+        assert!(
+            checkpoint.conversation[1]
+                .compacted_range
+                .as_ref()
+                .expect("compacted range should remain")
+                .images
+                .is_empty()
+        );
     }
 
     #[test]
