@@ -2804,7 +2804,16 @@ fn child_has_daemon_join_validation_evidence(child: &JobDetail) -> bool {
 fn tool_call_mutation_paths(call: &ToolCallSummary) -> Vec<String> {
     let fields: &[&str] = match call.tool_id.as_str() {
         "fs.apply_patch" | "fs.write_text" => &["path"],
-        "fs.move" => &["from", "to", "source", "destination", "src", "dst"],
+        "fs.move" => &[
+            "from_path",
+            "to_path",
+            "from",
+            "to",
+            "source",
+            "destination",
+            "src",
+            "dst",
+        ],
         _ => return Vec::new(),
     };
     fields
@@ -4022,6 +4031,43 @@ mod tests {
         assert_eq!(recovered_context_pressure.status, "PASS");
         assert!(recovered_context_pressure.phase1.passed);
         assert!(recovered_context_pressure.phase2.passed);
+
+        let mut canonical_move = tool_call_with_args(
+            "fs.move",
+            json!({"from_path":"crates/core/src/old.rs","to_path":"crates/core/src/new.rs"}),
+        );
+        canonical_move.status = "completed".to_string();
+        assert_eq!(
+            tool_call_mutation_paths(&canonical_move),
+            vec![
+                "crates/core/src/old.rs".to_string(),
+                "crates/core/src/new.rs".to_string()
+            ]
+        );
+        let canonical_move_validated_child = child_detail(
+            "child",
+            "failed",
+            "blocked",
+            vec![canonical_move, validation.clone()],
+        );
+        let mut canonical_move_validated_child = canonical_move_validated_child;
+        canonical_move_validated_child.job.completion_blockers =
+            failed_evidence_child.job.completion_blockers.clone();
+        let canonical_move_context_pressure = build_rung_report(
+            &rung,
+            "session",
+            "root",
+            root_detail(
+                "completed",
+                "satisfied",
+                vec![child_summary("child", "failed", "blocked")],
+            ),
+            vec![canonical_move_validated_child],
+            ApprovalReport::default(),
+        );
+        assert_eq!(canonical_move_context_pressure.status, "PASS");
+        assert!(canonical_move_context_pressure.phase1.passed);
+        assert!(canonical_move_context_pressure.phase2.passed);
 
         let mut command_validation = tool_call_with_args(
             "command.run",
