@@ -14328,6 +14328,7 @@ async fn allow_below_hard_context_ceiling_or_block(
     threshold: usize,
     hard_ceiling: usize,
     prompt_tokens: usize,
+    audit_kind: &'static str,
     audit_summary: impl AsRef<str>,
     blocker_reason: String,
 ) -> Result<()> {
@@ -14341,7 +14342,7 @@ async fn allow_below_hard_context_ceiling_or_block(
         );
         record_memory_audit(
             state,
-            "memory.compaction.skipped",
+            audit_kind,
             &worker.id,
             "skipped",
             audit_summary.as_ref(),
@@ -14517,6 +14518,7 @@ async fn compact_checkpoint_if_needed(
                         threshold,
                         hard_ceiling,
                         before_tokens,
+                        "memory.compaction.skipped",
                         format!(
                             "Conversation compaction skipped while prompt remained over the soft threshold but below the hard context ceiling (threshold={threshold}, hard_ceiling={hard_ceiling}, before_tokens={before_tokens}, reason={reason})"
                         ),
@@ -14600,6 +14602,7 @@ async fn compact_checkpoint_if_needed(
                     threshold,
                     hard_ceiling,
                     before_tokens,
+                    "memory.compaction.failed",
                     format!(
                         "Conversation compaction failed while prompt remained over the soft threshold but below the hard context ceiling (threshold={threshold}, hard_ceiling={hard_ceiling}, before_tokens={before_tokens}, reason={reason})"
                     ),
@@ -14645,6 +14648,7 @@ async fn compact_checkpoint_if_needed(
         threshold,
         hard_ceiling,
         final_tokens,
+        "memory.compaction.failed",
         format!(
             "Conversation compaction reached the maximum pass limit while prompt remained over the soft threshold but below the hard context ceiling (threshold={threshold}, hard_ceiling={hard_ceiling}, final_tokens={final_tokens})"
         ),
@@ -30540,6 +30544,85 @@ Thanks."#,
             event.kind == "memory.compaction.failed"
                 && event.target == worker.id
                 && event.summary.contains("malformed")
+        }));
+
+        server.await.expect("test server should finish");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn compact_checkpoint_failure_below_hard_ceiling_audits_failed_without_blocker() {
+        let state_dir = test_state_dir("worker-context-compaction-failed-under-hard-ceiling");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let session = state
+            .store
+            .create_session(test_session_record(
+                "compact-failed-under-hard-ceiling-session",
+                "Compact failed under hard ceiling session",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+        let (_, mut worker, _) = create_command_test_context(&state, "compact-failed-under-hard");
+        let (base_url, server) = spawn_response_sequence_openai_server(vec!["not-json"]).await;
+        worker.provider = "openai_compatible".to_string();
+        worker.model = "cx/gpt-5.4-mini".to_string();
+        worker.provider_base_url = base_url;
+        worker.working_dir = workspace_root.display().to_string();
+
+        let mut checkpoint = long_test_checkpoint(&session.id, 700);
+        let original = checkpoint.conversation.clone();
+        let threshold = compaction_token_threshold_for_model(&worker.model);
+        let hard_ceiling = hard_context_token_ceiling_for_model(&worker.model);
+        let compiled = compile_worker_prompt_for_estimate(
+            &state,
+            &session,
+            &worker,
+            &checkpoint,
+            "Continue the long running task.",
+            &[],
+            false,
+        )
+        .expect("prompt should compile for estimate");
+        let prompt_tokens = estimate_prompt_tokens(&compiled);
+        assert!(prompt_tokens > threshold);
+        assert!(prompt_tokens < hard_ceiling);
+
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        compact_checkpoint_if_needed(
+            &state,
+            &session,
+            &worker,
+            &mut checkpoint,
+            "Continue the long running task.",
+            &[],
+            false,
+            &mut cancel_rx,
+            None,
+        )
+        .await
+        .expect("failed compaction below hard ceiling should proceed without blocker");
+
+        assert_eq!(checkpoint.conversation, original);
+        let audits = state.store.list_audit_events(20).expect("audit lists");
+        assert!(audits.iter().any(|event| {
+            event.kind == "memory.compaction.failed"
+                && event.target == worker.id
+                && event.summary.contains("malformed compaction output")
+        }));
+        assert!(audits.iter().any(|event| {
+            event.kind == "memory.compaction.failed"
+                && event.target == worker.id
+                && event.summary.contains("below the hard context ceiling")
+        }));
+        assert!(audits.iter().all(|event| {
+            event.target != worker.id || event.kind != "memory.compaction.skipped"
         }));
 
         server.await.expect("test server should finish");
