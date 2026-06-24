@@ -302,19 +302,23 @@ pub(crate) fn emergency_shrink_checkpoint(checkpoint: &mut WorkerCheckpoint) -> 
     if candidates.is_empty() {
         candidates = emergency_shrink_candidates(checkpoint, protected_tail_start, true);
     }
-    let index = candidates.into_iter().next()?;
-    let message = checkpoint.conversation.get_mut(index)?;
-    let original_chars = message.content.len();
-    let replacement = render_emergency_trimmed_message(index, message, original_chars);
-    if replacement.len() >= original_chars {
-        return None;
+    for index in candidates {
+        let Some(message) = checkpoint.conversation.get_mut(index) else {
+            continue;
+        };
+        let original_chars = message.content.len();
+        let replacement = render_emergency_trimmed_message(index, message, original_chars);
+        if replacement.len() >= original_chars {
+            continue;
+        }
+        message.content = replacement;
+        message.images.clear();
+        return Some(format!(
+            "emergency trimmed conversation-{index}; original_chars={original_chars}; replacement_chars={}",
+            message.content.len()
+        ));
     }
-    message.content = replacement;
-    message.images.clear();
-    Some(format!(
-        "emergency trimmed conversation-{index}; original_chars={original_chars}; replacement_chars={}",
-        message.content.len()
-    ))
+    None
 }
 
 fn emergency_shrink_candidates(
@@ -665,6 +669,69 @@ mod tests {
         let window =
             select_compaction_window_with_tail(&checkpoint, 2).expect("window should exist");
         assert_eq!(window.end, 12);
+    }
+
+    #[test]
+    fn emergency_shrink_tries_later_candidates_when_first_does_not_shrink() {
+        let path_heavy = (0..24)
+            .map(|index| {
+                format!(
+                    "crates/daemon/src/some/extremely/deep/path/that/should/be/preserved/{index}/context_pressure_regression_file.rs"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(path_heavy.len() > EMERGENCY_TRIM_TARGET_CHARS);
+        let large_tool_output = format!(
+            "exit_code=0\n{}",
+            "large deterministic validation output line\n".repeat(500)
+        );
+        let original_first = path_heavy.clone();
+        let original_second_chars = large_tool_output.len();
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: "session".to_string(),
+            prompt_text: String::new(),
+            images: Vec::new(),
+            conversation: vec![
+                CheckpointMessage {
+                    role: "system".to_string(),
+                    content: "protected system".to_string(),
+                    images: Vec::new(),
+                    compacted: false,
+                    compacted_range: None,
+                },
+                CheckpointMessage {
+                    role: "tool".to_string(),
+                    content: path_heavy,
+                    images: Vec::new(),
+                    compacted: false,
+                    compacted_range: None,
+                },
+                CheckpointMessage {
+                    role: "tool".to_string(),
+                    content: large_tool_output,
+                    images: vec![nucleus_protocol::SessionTurnImage {
+                        display_name: "image-1".to_string(),
+                        mime_type: "image/png".to_string(),
+                        data_url: "data:image/png;base64,AAAA".to_string(),
+                    }],
+                    compacted: false,
+                    compacted_range: None,
+                },
+            ],
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+
+        let summary = emergency_shrink_checkpoint(&mut checkpoint)
+            .expect("later shrinkable candidate should be used");
+
+        assert!(summary.contains("conversation-2"));
+        assert_eq!(checkpoint.conversation[1].content, original_first);
+        assert!(checkpoint.conversation[2].content.len() < original_second_chars);
+        assert!(checkpoint.conversation[2].images.is_empty());
     }
 
     fn test_compiled_turn(user: String) -> CompiledTurn {
