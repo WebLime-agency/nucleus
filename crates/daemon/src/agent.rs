@@ -21117,13 +21117,18 @@ fn limit_text(value: String, max_chars: usize) -> String {
 async fn fail_job(state: &AppState, job_id: &str, error: &str) -> Result<()> {
     let detail = state.store.get_job(job_id)?;
     let is_root_job = detail.job.parent_job_id.is_none();
+    let mut metadata = detail.job.metadata_json.clone();
     let context_pressure_metadata = if text_has_context_pressure_blocker(error) {
-        let mut metadata = detail.job.metadata_json.clone();
         metadata["context_pressure"] = json!({
             "marker": CONTEXT_PRESSURE_BLOCKER_MARKER,
             "status": "blocked",
             "reason": error,
         });
+        Some(metadata)
+    } else if metadata.get("context_pressure").is_some() {
+        if let Some(object) = metadata.as_object_mut() {
+            object.remove("context_pressure");
+        }
         Some(metadata)
     } else {
         None
@@ -36803,13 +36808,32 @@ Thanks."#,
             .update_job(
                 &child_job_id,
                 JobPatch {
-                    last_error: Some("task validation failed after implementation".to_string()),
+                    last_error: Some(format!(
+                        "{CONTEXT_PRESSURE_BLOCKER_MARKER}: previous context-pressure failure"
+                    )),
+                    metadata_json: Some(json!({
+                        "context_pressure": {
+                            "marker": CONTEXT_PRESSURE_BLOCKER_MARKER,
+                            "status": "blocked",
+                            "reason": format!(
+                                "{CONTEXT_PRESSURE_BLOCKER_MARKER}: previous context-pressure failure"
+                            ),
+                        }
+                    })),
                     ..JobPatch::default()
                 },
             )
-            .expect("child task failure should persist");
+            .expect("stale context-pressure metadata should persist");
+        fail_job(
+            &state,
+            &child_job_id,
+            "task validation failed after implementation",
+        )
+        .await
+        .expect("non-context child failure should persist");
 
         let child = state.store.get_job(&child_job_id).expect("child loads");
+        assert!(child.job.metadata_json.get("context_pressure").is_none());
         assert!(
             child
                 .job
