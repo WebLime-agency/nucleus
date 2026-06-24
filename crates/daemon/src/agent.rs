@@ -48,7 +48,7 @@ use super::{
 use crate::compaction::{
     CompactionOutcome, audit_compaction_outcome, compact_conversation,
     compaction_token_threshold_for_model, emergency_shrink_checkpoint, estimate_prompt_tokens,
-    should_compact,
+    hard_context_token_ceiling_for_model, should_compact,
 };
 use crate::runtime::{
     PromptStreamEvent, ProviderTurnResult, ProviderTurnTransport, RuntimeModelCapabilities,
@@ -14322,6 +14322,37 @@ fn text_has_context_pressure_blocker(text: &str) -> bool {
     text.contains(CONTEXT_PRESSURE_BLOCKER_MARKER)
 }
 
+async fn allow_below_hard_context_ceiling_or_block(
+    state: &AppState,
+    worker: &WorkerSummary,
+    threshold: usize,
+    hard_ceiling: usize,
+    prompt_tokens: usize,
+    audit_summary: impl AsRef<str>,
+    blocker_reason: String,
+) -> Result<()> {
+    if prompt_tokens < hard_ceiling {
+        warn!(
+            worker_id = worker.id.as_str(),
+            threshold,
+            hard_ceiling,
+            prompt_tokens,
+            "conversation compaction did not reduce prompt below soft threshold, but prompt remains below hard context ceiling",
+        );
+        record_memory_audit(
+            state,
+            "memory.compaction.skipped",
+            &worker.id,
+            "skipped",
+            audit_summary.as_ref(),
+        )
+        .await;
+        return Ok(());
+    }
+
+    Err(context_pressure_blocker(blocker_reason))
+}
+
 fn checkpoint_for_pre_turn_persistence(
     checkpoint: &WorkerCheckpoint,
     queued_prompt: Option<&str>,
@@ -14345,6 +14376,8 @@ async fn compact_checkpoint_if_needed(
     queued_prompt_for_persistence: Option<&str>,
 ) -> Result<()> {
     let threshold = compaction_token_threshold_for_model(&worker.model);
+    let hard_ceiling = hard_context_token_ceiling_for_model(&worker.model);
+    let mut last_prompt_tokens = 0usize;
     for _ in 0..MAX_COMPACTION_PASSES {
         let Some(compiled_turn) = compile_worker_prompt_for_estimate(
             state,
@@ -14361,6 +14394,7 @@ async fn compact_checkpoint_if_needed(
             return Ok(());
         }
         let before_tokens = estimate_prompt_tokens(&compiled_turn);
+        last_prompt_tokens = before_tokens;
         let previous_checkpoint = checkpoint.clone();
 
         let outcome = compact_conversation(
@@ -14478,6 +14512,22 @@ async fn compact_checkpoint_if_needed(
                         .await;
                     }
                 }
+                if before_tokens < hard_ceiling {
+                    return allow_below_hard_context_ceiling_or_block(
+                        state,
+                        worker,
+                        threshold,
+                        hard_ceiling,
+                        before_tokens,
+                        format!(
+                            "Conversation compaction skipped while prompt remained over the soft threshold but below the hard context ceiling (threshold={threshold}, hard_ceiling={hard_ceiling}, before_tokens={before_tokens}, reason={reason})"
+                        ),
+                        format!(
+                            "prompt remained over threshold after compaction skipped (threshold={threshold}, before_tokens={before_tokens}, reason={reason})"
+                        ),
+                    )
+                    .await;
+                }
                 record_memory_audit(
                     state,
                     "memory.compaction.failed",
@@ -14546,23 +14596,48 @@ async fn compact_checkpoint_if_needed(
                         .await;
                     }
                 }
-                return Err(context_pressure_blocker(format!(
-                    "prompt remained over threshold after compaction failed (threshold={threshold}, before_tokens={before_tokens}, reason={reason})"
-                )));
+                return allow_below_hard_context_ceiling_or_block(
+                    state,
+                    worker,
+                    threshold,
+                    hard_ceiling,
+                    before_tokens,
+                    format!(
+                        "Conversation compaction failed while prompt remained over the soft threshold but below the hard context ceiling (threshold={threshold}, hard_ceiling={hard_ceiling}, before_tokens={before_tokens}, reason={reason})"
+                    ),
+                    format!(
+                        "prompt remained over threshold after compaction failed (threshold={threshold}, before_tokens={before_tokens}, reason={reason})"
+                    ),
+                )
+                .await;
             }
         }
     }
-    record_memory_audit(
+    if last_prompt_tokens >= hard_ceiling {
+        record_memory_audit(
+            state,
+            "memory.compaction.failed",
+            &worker.id,
+            "failed",
+            "Conversation compaction stopped after reaching the maximum pass limit",
+        )
+        .await;
+        return Err(context_pressure_blocker(
+            "prompt remained over threshold after reaching the maximum compaction pass limit",
+        ));
+    }
+    allow_below_hard_context_ceiling_or_block(
         state,
-        "memory.compaction.failed",
-        &worker.id,
-        "failed",
-        "Conversation compaction stopped after reaching the maximum pass limit",
+        worker,
+        threshold,
+        hard_ceiling,
+        last_prompt_tokens,
+        format!(
+            "Conversation compaction reached the maximum pass limit while prompt remained over the soft threshold but below the hard context ceiling (threshold={threshold}, hard_ceiling={hard_ceiling}, before_tokens={last_prompt_tokens})"
+        ),
+        "prompt remained over threshold after reaching the maximum compaction pass limit".to_string(),
     )
-    .await;
-    Err(context_pressure_blocker(
-        "prompt remained over threshold after reaching the maximum compaction pass limit",
-    ))
+    .await
 }
 
 fn compile_worker_prompt_for_estimate(
@@ -30135,7 +30210,96 @@ Thanks."#,
     }
 
     #[tokio::test]
-    async fn compact_checkpoint_no_safe_window_returns_context_pressure_blocker() {
+    async fn compact_checkpoint_no_safe_window_below_hard_ceiling_proceeds() {
+        let state_dir = test_state_dir("worker-context-compaction-no-window-proceeds");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = PathBuf::from(
+            state
+                .store
+                .workspace()
+                .expect("workspace should load")
+                .root_path,
+        );
+        let session = state
+            .store
+            .create_session(test_session_record(
+                "compact-no-window-proceeds-session",
+                "Compact no window proceeds session",
+                &workspace_root,
+            ))
+            .expect("session should persist");
+        let (_, mut worker, _) = create_command_test_context(&state, "compact-no-window-proceeds");
+        worker.model = "cx/gpt-5.4-mini".to_string();
+        worker.working_dir = workspace_root.display().to_string();
+
+        let mut checkpoint = system_only_pressure_checkpoint(&session.id, 25_000);
+        let original = checkpoint.clone();
+        let threshold = compaction_token_threshold_for_model(&worker.model);
+        let hard_ceiling = hard_context_token_ceiling_for_model(&worker.model);
+        let compiled = compile_worker_prompt_for_estimate(
+            &state,
+            &session,
+            &worker,
+            &checkpoint,
+            "Continue the long running task.",
+            &[],
+            false,
+        )
+        .expect("prompt should compile for estimate");
+        let prompt_tokens = estimate_prompt_tokens(&compiled);
+        assert!(
+            prompt_tokens > threshold,
+            "prompt estimate {prompt_tokens} should exceed soft threshold {threshold}"
+        );
+        assert!(
+            prompt_tokens < hard_ceiling,
+            "prompt estimate {prompt_tokens} should stay below hard ceiling {hard_ceiling}"
+        );
+
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        compact_checkpoint_if_needed(
+            &state,
+            &session,
+            &worker,
+            &mut checkpoint,
+            "Continue the long running task.",
+            &[],
+            false,
+            &mut cancel_rx,
+            None,
+        )
+        .await
+        .expect("prompt below hard ceiling should proceed without blocker");
+
+        assert_eq!(
+            serde_json::to_value(&checkpoint).expect("checkpoint should encode"),
+            serde_json::to_value(&original).expect("checkpoint should encode")
+        );
+        assert!(
+            state
+                .store
+                .read_worker_checkpoint(&worker.id)
+                .expect("checkpoint read should succeed")
+                .is_none(),
+            "unchanged checkpoint should not be persisted"
+        );
+        let audits = state.store.list_audit_events(20).expect("audit lists");
+        assert!(audits.iter().any(|event| {
+            event.kind == "memory.compaction.skipped"
+                && event.target == worker.id
+                && event.summary.contains("below the hard context ceiling")
+        }));
+        assert!(audits.iter().all(|event| {
+            !event.summary.contains(CONTEXT_PRESSURE_BLOCKER_MARKER)
+                && !(event.kind == "memory.compaction.failed" && event.target == worker.id)
+        }));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn compact_checkpoint_no_safe_window_over_hard_ceiling_returns_context_pressure_blocker()
+    {
         let state_dir = test_state_dir("worker-context-compaction-no-window-blocker");
         let state = initialize_test_state(&state_dir);
         let workspace_root = PathBuf::from(
@@ -30154,28 +30318,32 @@ Thanks."#,
             ))
             .expect("session should persist");
         let (_, mut worker, _) = create_command_test_context(&state, "compact-no-window-blocker");
-        worker.model = "test-model".to_string();
+        worker.model = "cx/gpt-5.4-mini".to_string();
         worker.working_dir = workspace_root.display().to_string();
 
-        let mut checkpoint = WorkerCheckpoint {
-            session_id: session.id.clone(),
-            prompt_text: "Long running task".to_string(),
-            images: Vec::new(),
-            conversation: vec![CheckpointMessage {
-                role: "system".to_string(),
-                content: format!(
-                    "Nucleus worker action JSON contract. {}",
-                    "system pressure ".repeat(40_000)
-                ),
-                images: Vec::new(),
-                compacted: false,
-                compacted_range: None,
-            }],
-            next_prompt: None,
-            pending_action: None,
-            browser_verification_final_answer_rejected: false,
-            patch_loop_guardrail_triggered: false,
-        };
+        let mut checkpoint = system_only_pressure_checkpoint(&session.id, 70_000);
+        let threshold = compaction_token_threshold_for_model(&worker.model);
+        let hard_ceiling = hard_context_token_ceiling_for_model(&worker.model);
+        let compiled = compile_worker_prompt_for_estimate(
+            &state,
+            &session,
+            &worker,
+            &checkpoint,
+            "Continue the long running task.",
+            &[],
+            false,
+        )
+        .expect("prompt should compile for estimate");
+        let prompt_tokens = estimate_prompt_tokens(&compiled);
+        assert!(
+            prompt_tokens > threshold,
+            "prompt estimate {prompt_tokens} should exceed soft threshold {threshold}"
+        );
+        assert!(
+            prompt_tokens >= hard_ceiling,
+            "prompt estimate {prompt_tokens} should reach hard ceiling {hard_ceiling}"
+        );
+
         let (_cancel_tx, mut cancel_rx) = watch::channel(false);
         let error = compact_checkpoint_if_needed(
             &state,
@@ -30189,7 +30357,7 @@ Thanks."#,
             None,
         )
         .await
-        .expect_err("no safe shrink path should surface context pressure");
+        .expect_err("prompt over hard ceiling should surface context pressure");
 
         let message = error.to_string();
         assert!(message.contains(CONTEXT_PRESSURE_BLOCKER_MARKER));
@@ -47330,6 +47498,31 @@ for line in sys.stdin:
             prompt_text: "Long running task".to_string(),
             images: Vec::new(),
             conversation,
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        }
+    }
+
+    fn system_only_pressure_checkpoint(
+        session_id: &str,
+        pressure_terms: usize,
+    ) -> WorkerCheckpoint {
+        WorkerCheckpoint {
+            session_id: session_id.to_string(),
+            prompt_text: "Long running task".to_string(),
+            images: Vec::new(),
+            conversation: vec![CheckpointMessage {
+                role: "system".to_string(),
+                content: format!(
+                    "Nucleus worker action JSON contract. {}",
+                    "system pressure ".repeat(pressure_terms)
+                ),
+                images: Vec::new(),
+                compacted: false,
+                compacted_range: None,
+            }],
             next_prompt: None,
             pending_action: None,
             browser_verification_final_answer_rejected: false,
