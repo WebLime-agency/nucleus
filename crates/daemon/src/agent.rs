@@ -6154,12 +6154,10 @@ fn child_failed_from_context_pressure(detail: &JobDetail) -> bool {
 
 fn child_context_pressure_join_blockers_are_recoverable(detail: &JobDetail) -> bool {
     detail.job.completion_blockers.iter().all(|blocker| {
+        let normalized = normalized_delegation_text(blocker);
         text_has_context_pressure_blocker(blocker)
-            || normalized_delegation_text(blocker).contains("context pressure")
-            || normalized_delegation_text(blocker)
-                .contains("without successful validation evidence")
-            || normalized_delegation_text(blocker)
-                .contains("local validation evidence is still pending")
+            || normalized.contains("without successful validation evidence")
+            || normalized.contains("local validation evidence is still pending")
     })
 }
 
@@ -36782,6 +36780,29 @@ Thanks."#,
         );
 
         let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn context_pressure_join_rejects_unrelated_blocker_mentions() {
+        let mut detail = test_job_detail_with_prompt("context pressure blocker matching");
+        detail.job.completion_blockers = vec![
+            format!(
+                "{CONTEXT_PRESSURE_BLOCKER_MARKER}: prompt remained above threshold after compaction"
+            ),
+            "Local project completion was claimed without successful validation evidence."
+                .to_string(),
+        ];
+        assert!(child_context_pressure_join_blockers_are_recoverable(
+            &detail
+        ));
+
+        detail.job.completion_blockers.push(
+            "Recent command failure blocks completion: context pressure regression failed."
+                .to_string(),
+        );
+        assert!(!child_context_pressure_join_blockers_are_recoverable(
+            &detail
+        ));
     }
 
     #[tokio::test]

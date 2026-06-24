@@ -298,10 +298,7 @@ pub(crate) fn emergency_shrink_checkpoint(checkpoint: &mut WorkerCheckpoint) -> 
         .conversation
         .len()
         .saturating_sub(PRESERVE_RECENT_TURNS);
-    let mut candidates = emergency_shrink_candidates(checkpoint, protected_tail_start, false);
-    if candidates.is_empty() {
-        candidates = emergency_shrink_candidates(checkpoint, protected_tail_start, true);
-    }
+    let candidates = emergency_shrink_candidates(checkpoint, protected_tail_start);
     for index in candidates {
         let Some(message) = checkpoint.conversation.get_mut(index) else {
             continue;
@@ -324,7 +321,6 @@ pub(crate) fn emergency_shrink_checkpoint(checkpoint: &mut WorkerCheckpoint) -> 
 fn emergency_shrink_candidates(
     checkpoint: &WorkerCheckpoint,
     protected_tail_start: usize,
-    include_tail: bool,
 ) -> Vec<usize> {
     let pending_anchor = checkpoint.pending_action.as_ref().and_then(|_| {
         checkpoint
@@ -346,7 +342,7 @@ fn emergency_shrink_candidates(
             if pending_anchor.is_some_and(|anchor| *index >= anchor) {
                 return false;
             }
-            if !include_tail && *index >= protected_tail_start {
+            if *index >= protected_tail_start {
                 return false;
             }
             message.content.len() > EMERGENCY_TRIM_TARGET_CHARS
@@ -688,6 +684,65 @@ mod tests {
         );
         let original_first = path_heavy.clone();
         let original_second_chars = large_tool_output.len();
+        let mut conversation = vec![
+            CheckpointMessage {
+                role: "system".to_string(),
+                content: "protected system".to_string(),
+                images: Vec::new(),
+                compacted: false,
+                compacted_range: None,
+            },
+            CheckpointMessage {
+                role: "tool".to_string(),
+                content: path_heavy,
+                images: Vec::new(),
+                compacted: false,
+                compacted_range: None,
+            },
+            CheckpointMessage {
+                role: "tool".to_string(),
+                content: large_tool_output,
+                images: vec![nucleus_protocol::SessionTurnImage {
+                    display_name: "image-1".to_string(),
+                    mime_type: "image/png".to_string(),
+                    data_url: "data:image/png;base64,AAAA".to_string(),
+                }],
+                compacted: false,
+                compacted_range: None,
+            },
+        ];
+        conversation.extend((0..PRESERVE_RECENT_TURNS).map(|index| CheckpointMessage {
+            role: "user".to_string(),
+            content: format!("recent protected turn {index}"),
+            images: Vec::new(),
+            compacted: false,
+            compacted_range: None,
+        }));
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: "session".to_string(),
+            prompt_text: String::new(),
+            images: Vec::new(),
+            conversation,
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+
+        let summary = emergency_shrink_checkpoint(&mut checkpoint)
+            .expect("later shrinkable candidate should be used");
+
+        assert!(summary.contains("conversation-2"));
+        assert_eq!(checkpoint.conversation[1].content, original_first);
+        assert!(checkpoint.conversation[2].content.len() < original_second_chars);
+        assert!(checkpoint.conversation[2].images.is_empty());
+    }
+
+    #[test]
+    fn emergency_shrink_preserves_protected_tail_when_no_safe_candidate_exists() {
+        let protected_large = "latest tool output line\n".repeat(500);
+        assert!(protected_large.len() > EMERGENCY_TRIM_TARGET_CHARS);
+        let original = protected_large.clone();
         let mut checkpoint = WorkerCheckpoint {
             session_id: "session".to_string(),
             prompt_text: String::new(),
@@ -702,14 +757,7 @@ mod tests {
                 },
                 CheckpointMessage {
                     role: "tool".to_string(),
-                    content: path_heavy,
-                    images: Vec::new(),
-                    compacted: false,
-                    compacted_range: None,
-                },
-                CheckpointMessage {
-                    role: "tool".to_string(),
-                    content: large_tool_output,
+                    content: protected_large,
                     images: vec![nucleus_protocol::SessionTurnImage {
                         display_name: "image-1".to_string(),
                         mime_type: "image/png".to_string(),
@@ -725,13 +773,9 @@ mod tests {
             patch_loop_guardrail_triggered: false,
         };
 
-        let summary = emergency_shrink_checkpoint(&mut checkpoint)
-            .expect("later shrinkable candidate should be used");
-
-        assert!(summary.contains("conversation-2"));
-        assert_eq!(checkpoint.conversation[1].content, original_first);
-        assert!(checkpoint.conversation[2].content.len() < original_second_chars);
-        assert!(checkpoint.conversation[2].images.is_empty());
+        assert!(emergency_shrink_checkpoint(&mut checkpoint).is_none());
+        assert_eq!(checkpoint.conversation[1].content, original);
+        assert_eq!(checkpoint.conversation[1].images.len(), 1);
     }
 
     fn test_compiled_turn(user: String) -> CompiledTurn {
