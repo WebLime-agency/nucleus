@@ -2701,8 +2701,28 @@ fn child_failed_with_context_pressure_and_validation(child: &JobDetail) -> bool 
             .completion_blockers
             .iter()
             .any(|blocker| blocker.contains(CONTEXT_PRESSURE_BLOCKER_MARKER))
+        && child_context_pressure_blockers_are_recoverable(child)
+        && child_browser_gate_satisfied(child)
         && child_has_mutation(child)
         && child_has_successful_test_run(child)
+}
+
+fn child_context_pressure_blockers_are_recoverable(child: &JobDetail) -> bool {
+    child.job.completion_blockers.iter().all(|blocker| {
+        let lower = blocker.to_lowercase();
+        blocker.contains(CONTEXT_PRESSURE_BLOCKER_MARKER)
+            || lower.contains("context pressure")
+            || lower.contains("validation evidence")
+            || lower.contains("completion was claimed without successful validation")
+    })
+}
+
+fn child_browser_gate_satisfied(child: &JobDetail) -> bool {
+    !child.job.browser_verification_required
+        || matches!(
+            child.job.browser_verification_status.as_str(),
+            "passed" | "not_required"
+        )
 }
 
 fn child_blocked_on_validation_evidence(child: &JobDetail) -> bool {
@@ -3818,9 +3838,14 @@ mod tests {
             "blocked",
             vec![mutation.clone(), validation.clone()],
         );
+        failed_evidence_child.job.completion_blockers.clear();
         failed_evidence_child.job.completion_blockers.push(format!(
             "{CONTEXT_PRESSURE_BLOCKER_MARKER}: prompt remained above threshold after compaction"
         ));
+        failed_evidence_child.job.completion_blockers.push(
+            "Local project completion was claimed without successful validation evidence."
+                .to_string(),
+        );
         let recovered_context_pressure = build_rung_report(
             &rung,
             "session",
@@ -3836,6 +3861,50 @@ mod tests {
         assert_eq!(recovered_context_pressure.status, "PASS");
         assert!(recovered_context_pressure.phase1.passed);
         assert!(recovered_context_pressure.phase2.passed);
+
+        let mut failed_with_command_blocker = failed_evidence_child.clone();
+        failed_with_command_blocker
+            .job
+            .completion_blockers
+            .push("Recent command failure blocks completion: cargo test failed.".to_string());
+        let unrecoverable_context_pressure = build_rung_report(
+            &rung,
+            "session",
+            "root",
+            root_detail(
+                "completed",
+                "satisfied",
+                vec![child_summary("child", "failed", "blocked")],
+            ),
+            vec![failed_with_command_blocker],
+            ApprovalReport::default(),
+        );
+        assert_eq!(unrecoverable_context_pressure.status, "FAIL");
+        assert!(!unrecoverable_context_pressure.phase1.passed);
+
+        let mut failed_with_browser_blocker = failed_evidence_child.clone();
+        failed_with_browser_blocker
+            .job
+            .browser_verification_required = true;
+        failed_with_browser_blocker.job.browser_verification_status = "not_performed".to_string();
+        failed_with_browser_blocker
+            .job
+            .completion_blockers
+            .push("Browser verification is still pending.".to_string());
+        let unsatisfied_browser_context_pressure = build_rung_report(
+            &rung,
+            "session",
+            "root",
+            root_detail(
+                "completed",
+                "satisfied",
+                vec![child_summary("child", "failed", "blocked")],
+            ),
+            vec![failed_with_browser_blocker],
+            ApprovalReport::default(),
+        );
+        assert_eq!(unsatisfied_browser_context_pressure.status, "FAIL");
+        assert!(!unsatisfied_browser_context_pressure.phase1.passed);
 
         let blocked_root_with_recovered_child = build_rung_report(
             &rung,

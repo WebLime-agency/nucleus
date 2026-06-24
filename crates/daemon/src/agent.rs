@@ -14344,8 +14344,7 @@ async fn compact_checkpoint_if_needed(
             cancel_rx,
         )
         .await?;
-        audit_compaction_outcome(state, worker, &outcome).await;
-        match outcome {
+        match &outcome {
             CompactionOutcome::Applied { .. } => {
                 let Some(compiled_turn) = compile_worker_prompt_for_estimate(
                     state,
@@ -14387,6 +14386,7 @@ async fn compact_checkpoint_if_needed(
                     &serde_json::to_value(&*checkpoint)
                         .context("failed to encode worker checkpoint")?,
                 )?;
+                audit_compaction_outcome(state, worker, &outcome).await;
                 record_memory_audit(
                     state,
                     "memory.compaction.applied",
@@ -14459,6 +14459,7 @@ async fn compact_checkpoint_if_needed(
                 )));
             }
             CompactionOutcome::Failed { reason, .. } => {
+                audit_compaction_outcome(state, worker, &outcome).await;
                 return Err(context_pressure_blocker(format!(
                     "prompt remained over threshold after compaction failed (threshold={threshold}, before_tokens={before_tokens}, reason={reason})"
                 )));
@@ -30026,6 +30027,9 @@ Thanks."#,
             "ineffective compaction must not persist a compacted checkpoint"
         );
         let audits = state.store.list_audit_events(20).expect("audit lists");
+        assert!(audits.iter().all(|event| {
+            !(event.kind == "memory.compaction.applied" && event.target == worker.id)
+        }));
         assert!(audits.iter().any(|event| {
             event.kind == "memory.compaction.failed"
                 && event.target == worker.id
