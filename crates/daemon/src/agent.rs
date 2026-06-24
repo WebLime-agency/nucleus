@@ -6148,13 +6148,21 @@ fn child_completion_blockers_are_recoverable(detail: &JobDetail) -> bool {
     })
 }
 
-fn child_failed_from_context_pressure_only(detail: &JobDetail) -> bool {
+fn child_failed_from_context_pressure(detail: &JobDetail) -> bool {
     if detail.job.state != "failed" || !job_has_context_pressure_marker(&detail.job) {
         return false;
     }
+    true
+}
+
+fn child_context_pressure_join_blockers_are_recoverable(detail: &JobDetail) -> bool {
     detail.job.completion_blockers.iter().all(|blocker| {
         text_has_context_pressure_blocker(blocker)
             || normalized_delegation_text(blocker).contains("context pressure")
+            || normalized_delegation_text(blocker)
+                .contains("without successful validation evidence")
+            || normalized_delegation_text(blocker)
+                .contains("local validation evidence is still pending")
     })
 }
 
@@ -6186,12 +6194,13 @@ fn child_job_join_outcome_for_parent_join(
     }
     if outcome != CHILD_OUTCOME_SUCCEEDED
         && detail.job.task_class.as_deref() == Some("local_project")
-        && child_failed_from_context_pressure_only(detail)
+        && child_failed_from_context_pressure(detail)
         && local_project_child_browser_gate_satisfied(detail)
     {
         let mutation_receipts = local_project_child_mutation_receipts(state, detail)?;
         if !mutation_receipts.is_empty()
             && local_project_child_validation_evidence(state, detail, &mutation_receipts)?.is_some()
+            && child_context_pressure_join_blockers_are_recoverable(detail)
         {
             return Ok(CHILD_OUTCOME_SUCCEEDED);
         }
@@ -36598,6 +36607,7 @@ Thanks."#,
             .update_job(
                 &child_job_id,
                 JobPatch {
+                    validation_status: Some("not_performed".to_string()),
                     last_error: Some(blocker.clone()),
                     metadata_json: Some(json!({
                         "context_pressure": {
@@ -36620,6 +36630,14 @@ Thanks."#,
                 .completion_blockers
                 .iter()
                 .any(|blocker| { blocker.contains(CONTEXT_PRESSURE_BLOCKER_MARKER) })
+        );
+        assert!(
+            child_before_join
+                .job
+                .completion_blockers
+                .iter()
+                .any(|blocker| blocker.contains("without successful validation evidence")),
+            "successful tests.run evidence should allow this derived blocker during join"
         );
         assert_eq!(
             child_job_join_outcome_for_parent_join(&state, &child_before_join)

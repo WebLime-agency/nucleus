@@ -937,10 +937,11 @@ fn has_context_integrity_gate_state(job: &JobSummary) -> bool {
 
 fn has_context_pressure_gate_state(job: &JobSummary) -> bool {
     job.last_error.contains(CONTEXT_PRESSURE_BLOCKER_MARKER)
-        || job
-            .metadata_json
-            .get("context_pressure")
-            .is_some_and(|value| value.to_string().contains(CONTEXT_PRESSURE_BLOCKER_MARKER))
+        || (job.state == "failed"
+            && job
+                .metadata_json
+                .get("context_pressure")
+                .is_some_and(|value| value.to_string().contains(CONTEXT_PRESSURE_BLOCKER_MARKER)))
 }
 
 fn has_worktree_base_gate_state(job: &JobSummary) -> bool {
@@ -4034,6 +4035,68 @@ mod tests {
                 }));
             }
         }
+    }
+
+    #[test]
+    fn context_pressure_metadata_gate_is_active_only_while_failed() {
+        let metadata = json!({
+            "context_pressure": {
+                "marker": CONTEXT_PRESSURE_BLOCKER_MARKER,
+                "status": "blocked",
+                "reason": format!(
+                    "{CONTEXT_PRESSURE_BLOCKER_MARKER}: prompt remained above threshold"
+                ),
+            }
+        });
+
+        let failed = JobSummary {
+            state: "failed".to_string(),
+            metadata_json: metadata.clone(),
+            ..task_class_job(
+                "local_project",
+                vec!["validation:cargo test passed".to_string()],
+            )
+        }
+        .with_completion_gates();
+        assert!(
+            failed
+                .completion_gates
+                .iter()
+                .any(|gate| gate.id == "context_pressure" && gate.state == "blocked")
+        );
+
+        let resumed_completed = JobSummary {
+            state: "completed".to_string(),
+            metadata_json: metadata,
+            ..task_class_job(
+                "local_project",
+                vec!["validation:cargo test passed".to_string()],
+            )
+        }
+        .with_completion_gates();
+        assert!(
+            !resumed_completed
+                .completion_gates
+                .iter()
+                .any(|gate| gate.id == "context_pressure")
+        );
+        assert_eq!(resumed_completed.completion_status, "satisfied");
+
+        let failed_error = JobSummary {
+            state: "failed".to_string(),
+            last_error: format!("{CONTEXT_PRESSURE_BLOCKER_MARKER}: compaction model call failed"),
+            ..task_class_job(
+                "local_project",
+                vec!["validation:cargo test passed".to_string()],
+            )
+        }
+        .with_completion_gates();
+        assert!(
+            failed_error
+                .completion_gates
+                .iter()
+                .any(|gate| gate.id == "context_pressure" && gate.state == "blocked")
+        );
     }
 
     #[test]
