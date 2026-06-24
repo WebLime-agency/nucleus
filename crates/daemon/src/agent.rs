@@ -14377,7 +14377,6 @@ async fn compact_checkpoint_if_needed(
 ) -> Result<()> {
     let threshold = compaction_token_threshold_for_model(&worker.model);
     let hard_ceiling = hard_context_token_ceiling_for_model(&worker.model);
-    let mut last_prompt_tokens = 0usize;
     for _ in 0..MAX_COMPACTION_PASSES {
         let Some(compiled_turn) = compile_worker_prompt_for_estimate(
             state,
@@ -14394,7 +14393,6 @@ async fn compact_checkpoint_if_needed(
             return Ok(());
         }
         let before_tokens = estimate_prompt_tokens(&compiled_turn);
-        last_prompt_tokens = before_tokens;
         let previous_checkpoint = checkpoint.clone();
 
         let outcome = compact_conversation(
@@ -14613,7 +14611,22 @@ async fn compact_checkpoint_if_needed(
             }
         }
     }
-    if last_prompt_tokens >= hard_ceiling {
+    let Some(compiled_turn) = compile_worker_prompt_for_estimate(
+        state,
+        session,
+        worker,
+        checkpoint,
+        prompt,
+        images,
+        low_context_turn,
+    ) else {
+        return Ok(());
+    };
+    if !should_compact(&compiled_turn, threshold) {
+        return Ok(());
+    }
+    let final_tokens = estimate_prompt_tokens(&compiled_turn);
+    if final_tokens >= hard_ceiling {
         record_memory_audit(
             state,
             "memory.compaction.failed",
@@ -14631,9 +14644,9 @@ async fn compact_checkpoint_if_needed(
         worker,
         threshold,
         hard_ceiling,
-        last_prompt_tokens,
+        final_tokens,
         format!(
-            "Conversation compaction reached the maximum pass limit while prompt remained over the soft threshold but below the hard context ceiling (threshold={threshold}, hard_ceiling={hard_ceiling}, before_tokens={last_prompt_tokens})"
+            "Conversation compaction reached the maximum pass limit while prompt remained over the soft threshold but below the hard context ceiling (threshold={threshold}, hard_ceiling={hard_ceiling}, final_tokens={final_tokens})"
         ),
         "prompt remained over threshold after reaching the maximum compaction pass limit".to_string(),
     )
