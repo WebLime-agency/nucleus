@@ -14492,8 +14492,60 @@ async fn compact_checkpoint_if_needed(
                     "prompt remained over threshold after compaction skipped (threshold={threshold}, before_tokens={before_tokens}, reason={reason})"
                 )));
             }
-            CompactionOutcome::Failed { reason, .. } => {
+            CompactionOutcome::Failed {
+                reason,
+                error_class,
+                ..
+            } => {
                 audit_compaction_outcome(state, worker, &outcome).await;
+                if error_class == "summary_budget_exceeded_image_payload" {
+                    if let Some(emergency_summary) = emergency_shrink_checkpoint(checkpoint) {
+                        let Some(compiled_turn) = compile_worker_prompt_for_estimate(
+                            state,
+                            session,
+                            worker,
+                            checkpoint,
+                            prompt,
+                            images,
+                            low_context_turn,
+                        ) else {
+                            return Ok(());
+                        };
+                        let after_tokens = estimate_prompt_tokens(&compiled_turn);
+                        if after_tokens < before_tokens {
+                            state.store.write_worker_checkpoint(
+                                &worker.id,
+                                &serde_json::to_value(checkpoint_for_pre_turn_persistence(
+                                    checkpoint,
+                                    queued_prompt_for_persistence,
+                                ))
+                                .context("failed to encode worker checkpoint")?,
+                            )?;
+                            record_memory_audit(
+                                state,
+                                "memory.compaction.applied",
+                                &worker.id,
+                                "applied",
+                                &format!(
+                                    "Emergency route-free context shrink reduced prompt estimate after image-payload summary budget failure (threshold={threshold}, before_tokens={before_tokens}, after_tokens={after_tokens}; {emergency_summary})"
+                                ),
+                            )
+                            .await;
+                            continue;
+                        }
+                        *checkpoint = previous_checkpoint;
+                        record_memory_audit(
+                            state,
+                            "memory.compaction.failed",
+                            &worker.id,
+                            "failed",
+                            &format!(
+                                "Emergency route-free context shrink after image-payload summary budget failure did not reduce prompt estimate (threshold={threshold}, before_tokens={before_tokens}, after_tokens={after_tokens}; {emergency_summary})"
+                            ),
+                        )
+                        .await;
+                    }
+                }
                 return Err(context_pressure_blocker(format!(
                     "prompt remained over threshold after compaction failed (threshold={threshold}, before_tokens={before_tokens}, reason={reason})"
                 )));

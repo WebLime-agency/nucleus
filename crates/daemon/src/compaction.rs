@@ -209,10 +209,7 @@ pub(crate) async fn compact_conversation(
     };
 
     let original_messages = &checkpoint.conversation[window.start..window.end];
-    let original_chars = original_messages
-        .iter()
-        .map(|message| message.content.len())
-        .sum::<usize>();
+    let original_chars = checkpoint_messages_payload_chars(original_messages);
     let prompt = build_compaction_prompt(original_messages, window.start);
     let result = match execute_worker_text_turn(
         state,
@@ -262,7 +259,7 @@ pub(crate) async fn compact_conversation(
         &worker.model,
         &checkpoint.conversation[window.start..window.end],
     );
-    let replacement_chars = rendered.content.len();
+    let replacement_chars = checkpoint_message_payload_chars(&rendered);
     let max_replacement_chars = original_chars
         .saturating_mul(MAX_COMPACTED_REPLACEMENT_RATIO_NUMERATOR)
         / MAX_COMPACTED_REPLACEMENT_RATIO_DENOMINATOR;
@@ -274,7 +271,7 @@ pub(crate) async fn compact_conversation(
             preserved_tail_count: PRESERVE_RECENT_TURNS,
             provider: worker.provider.clone(),
             model: worker.model.clone(),
-            error_class: "summary_budget_exceeded".to_string(),
+            error_class: summary_budget_error_class(original_messages).to_string(),
         });
     }
     checkpoint
@@ -355,6 +352,31 @@ fn emergency_shrink_candidates(
 }
 
 fn emergency_message_payload_chars(message: &CheckpointMessage) -> usize {
+    checkpoint_message_payload_chars(message)
+}
+
+fn checkpoint_messages_payload_chars(messages: &[CheckpointMessage]) -> usize {
+    messages
+        .iter()
+        .map(checkpoint_message_payload_chars)
+        .sum::<usize>()
+}
+
+fn checkpoint_message_payload_chars(message: &CheckpointMessage) -> usize {
+    message
+        .content
+        .len()
+        .saturating_add(checkpoint_message_image_payload_chars(message))
+}
+
+fn checkpoint_messages_image_payload_chars(messages: &[CheckpointMessage]) -> usize {
+    messages
+        .iter()
+        .map(checkpoint_message_image_payload_chars)
+        .sum::<usize>()
+}
+
+fn checkpoint_message_image_payload_chars(message: &CheckpointMessage) -> usize {
     let direct_image_chars = message
         .images
         .iter()
@@ -371,11 +393,15 @@ fn emergency_message_payload_chars(message: &CheckpointMessage) -> usize {
                 .sum::<usize>()
         })
         .unwrap_or_default();
-    message
-        .content
-        .len()
-        .saturating_add(direct_image_chars)
-        .saturating_add(compacted_image_chars)
+    direct_image_chars.saturating_add(compacted_image_chars)
+}
+
+fn summary_budget_error_class(original_messages: &[CheckpointMessage]) -> &'static str {
+    if checkpoint_messages_image_payload_chars(original_messages) > 0 {
+        "summary_budget_exceeded_image_payload"
+    } else {
+        "summary_budget_exceeded"
+    }
 }
 
 fn render_emergency_trimmed_message(
@@ -692,6 +718,60 @@ mod tests {
         let window =
             select_compaction_window_with_tail(&checkpoint, 2).expect("window should exist");
         assert_eq!(window.end, 12);
+    }
+
+    #[test]
+    fn summary_budget_class_counts_direct_and_compacted_images() {
+        let direct_image = nucleus_protocol::SessionTurnImage {
+            display_name: "direct.png".to_string(),
+            mime_type: "image/png".to_string(),
+            data_url: format!("data:image/png;base64,{}", "A".repeat(2_000)),
+        };
+        let compacted_image = nucleus_protocol::SessionTurnImage {
+            display_name: "compacted.png".to_string(),
+            mime_type: "image/png".to_string(),
+            data_url: format!("data:image/png;base64,{}", "B".repeat(3_000)),
+        };
+        let text_only = CheckpointMessage {
+            role: "tool".to_string(),
+            content: "short text".to_string(),
+            images: Vec::new(),
+            compacted: false,
+            compacted_range: None,
+        };
+        let direct = CheckpointMessage {
+            images: vec![direct_image.clone()],
+            ..text_only.clone()
+        };
+        let compacted = CheckpointMessage {
+            compacted_range: Some(CompactedRange {
+                turn_id_start: "conversation-1".to_string(),
+                turn_id_end: "conversation-1".to_string(),
+                images: vec![compacted_image.clone()],
+            }),
+            ..text_only.clone()
+        };
+
+        assert_eq!(
+            checkpoint_message_payload_chars(&direct),
+            direct.content.len() + direct_image.data_url.len()
+        );
+        assert_eq!(
+            checkpoint_message_payload_chars(&compacted),
+            compacted.content.len() + compacted_image.data_url.len()
+        );
+        assert_eq!(
+            summary_budget_error_class(&[text_only]),
+            "summary_budget_exceeded"
+        );
+        assert_eq!(
+            summary_budget_error_class(&[direct]),
+            "summary_budget_exceeded_image_payload"
+        );
+        assert_eq!(
+            summary_budget_error_class(&[compacted]),
+            "summary_budget_exceeded_image_payload"
+        );
     }
 
     #[test]
