@@ -4891,12 +4891,9 @@ async fn handle_pending_action(
             .iter()
             .all(|detail| is_terminal_job_state(&detail.job.state));
         if all_complete {
-            let results = child_details
-                .iter()
-                .map(child_job_result_json)
-                .collect::<Result<Vec<_>>>()?;
             let parent_job = state.store.get_job(job_id)?.job;
             let child_outcomes = child_job_join_outcomes_json(state, &child_details)?;
+            let results = child_job_results_for_parent_join(state, &child_details)?;
             let daemon_completion_join = is_single_successful_delegated_child_join(
                 state,
                 &parent_job,
@@ -7506,10 +7503,7 @@ async fn reuse_equivalent_child_jobs_if_any(
                 "Equivalent child job already owns this feature scope for: {summary}. Do not spawn a duplicate implementation child. If the blocker is missing validation or browser evidence after mutation, drive validation/browser repair for the existing child path or surface one precise blocker. Mutation receipts alone are not accepted completion evidence."
             )
         };
-        let results = child_details
-            .iter()
-            .map(child_job_result_json)
-            .collect::<Result<Vec<_>>>()?;
+        let results = child_job_results_for_parent_join(state, &child_details)?;
         checkpoint.pending_action = None;
         checkpoint.next_prompt = if daemon_completion_join || daemon_blocked_join.is_some() {
             None
@@ -8127,7 +8121,29 @@ async fn complete_local_project_child_with_validation_blocker(
     .await
 }
 
+fn child_job_results_for_parent_join(
+    state: &AppState,
+    details: &[JobDetail],
+) -> Result<Vec<Value>> {
+    details
+        .iter()
+        .map(|detail| {
+            child_job_result_json_with_join_outcome(
+                detail,
+                child_job_join_outcome_for_parent_join(state, detail)?,
+            )
+        })
+        .collect()
+}
+
 fn child_job_result_json(detail: &JobDetail) -> Result<Value> {
+    child_job_result_json_with_join_outcome(detail, child_job_join_outcome(detail))
+}
+
+fn child_job_result_json_with_join_outcome(
+    detail: &JobDetail,
+    join_outcome: &'static str,
+) -> Result<Value> {
     let report = child_job_report_preview_text(detail);
     Ok(json!({
         "job_id": detail.job.id,
@@ -8135,7 +8151,7 @@ fn child_job_result_json(detail: &JobDetail) -> Result<Value> {
         "state": detail.job.state,
         "completion_status": detail.job.completion_status,
         "completion_blockers": detail.job.completion_blockers,
-        "join_outcome": child_job_join_outcome(detail),
+        "join_outcome": join_outcome,
         "purpose": detail.job.purpose,
         "result_summary": detail.job.result_summary,
         "last_error": detail.job.last_error,
@@ -36521,6 +36537,18 @@ Thanks."#,
         assert_eq!(
             child_job_join_outcome_for_parent_join(&state, &child_before_join)
                 .expect("join outcome should compute"),
+            CHILD_OUTCOME_SUCCEEDED
+        );
+        assert_ne!(
+            child_job_join_outcome(&child_before_join),
+            CHILD_OUTCOME_SUCCEEDED,
+            "raw child outcome should still reflect the stored failed state"
+        );
+        let parent_join_results =
+            child_job_results_for_parent_join(&state, std::slice::from_ref(&child_before_join))
+                .expect("parent-join child result prompt payload should serialize");
+        assert_eq!(
+            parent_join_results[0]["join_outcome"],
             CHILD_OUTCOME_SUCCEEDED
         );
 
