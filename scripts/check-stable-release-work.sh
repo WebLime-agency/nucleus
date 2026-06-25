@@ -2,7 +2,6 @@
 set -euo pipefail
 
 source_ref="${1:-origin/main}"
-stable_tag_re='^v[0-9]+\.[0-9]+\.[0-9]+$'
 
 bootstrap_error() {
   cat >&2 <<'EOF'
@@ -16,11 +15,6 @@ EOF
 latest_tag="$(git tag --merged "${source_ref}" --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { print; exit }')"
 if [ -z "${latest_tag}" ]; then
   bootstrap_error
-  exit 1
-fi
-
-if ! [[ "${latest_tag}" =~ ${stable_tag_re} ]]; then
-  echo "::error::Latest matching release tag '${latest_tag}' is not an exact vMAJOR.MINOR.PATCH tag" >&2
   exit 1
 fi
 
