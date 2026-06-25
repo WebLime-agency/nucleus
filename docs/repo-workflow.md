@@ -89,7 +89,7 @@ Bootstrap rule:
 Managed release channel publishing:
 
 - workflow: `Publish Managed Release`
-- scheduled runs publish `nightly` from `dev`
+- scheduled runs publish `stable` from `main` when `main` has advanced past the latest stable `vX.Y.Z` tag; otherwise they complete as a no-op
 - manual `stable` runs default to `main`
 - manual `beta` and `nightly` runs default to `dev`
 - source refs can be overridden for recovery or staging, but public stable releases should normally come from promoted `main`
