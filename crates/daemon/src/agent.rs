@@ -7819,6 +7819,7 @@ fn focused_tests_run_command_for_mutation_receipts(
             command: "node".to_string(),
             args: vec!["--test".to_string(), path],
         })
+        .or_else(|| focused_cargo_test_command_for_source_paths(&mutation_paths, working_dir))
 }
 
 fn safe_relative_mutation_path(path: &str) -> Option<String> {
@@ -7874,6 +7875,123 @@ fn focused_node_test_path_for_source_paths(
                 return Some(candidate);
             }
         }
+    }
+    None
+}
+
+fn focused_cargo_test_command_for_source_paths(
+    mutation_paths: &BTreeSet<String>,
+    working_dir: &str,
+) -> Option<FocusedTestsRunCommand> {
+    let has_rust_source_mutation = mutation_paths.iter().any(|path| is_rust_source_path(path));
+    if working_dir.trim().is_empty() || !has_rust_source_mutation {
+        return None;
+    }
+
+    let mut package_names = BTreeSet::new();
+    for mutation_path in mutation_paths {
+        if !is_rust_source_path(mutation_path) {
+            continue;
+        }
+        let Some(package_name) = cargo_package_name_for_mutation_path(working_dir, mutation_path)
+        else {
+            return Some(FocusedTestsRunCommand {
+                command: "cargo".to_string(),
+                args: vec!["test".to_string()],
+            });
+        };
+        package_names.insert(package_name);
+    }
+
+    let mut args = vec!["test".to_string()];
+    for package_name in package_names {
+        args.push("-p".to_string());
+        args.push(package_name);
+    }
+    Some(FocusedTestsRunCommand {
+        command: "cargo".to_string(),
+        args,
+    })
+}
+
+fn is_rust_source_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"))
+}
+
+fn cargo_package_name_for_mutation_path(working_dir: &str, mutation_path: &str) -> Option<String> {
+    let working_dir = Path::new(working_dir);
+    let mutation_path = Path::new(mutation_path);
+    let mut current = mutation_path.parent()?;
+    loop {
+        let manifest_path = working_dir.join(current).join("Cargo.toml");
+        if manifest_path.is_file() {
+            if let Some(package_name) = cargo_package_name_from_manifest(&manifest_path) {
+                return Some(package_name);
+            }
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent;
+    }
+    None
+}
+
+fn cargo_package_name_from_manifest(manifest_path: &Path) -> Option<String> {
+    let contents = fs::read_to_string(manifest_path).ok()?;
+    let mut in_package = false;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            let section = trimmed
+                .split_once('#')
+                .map_or(trimmed, |(section, _)| section)
+                .trim();
+            in_package = section == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "name" {
+            continue;
+        }
+        return parse_toml_basic_string(value.trim());
+    }
+    None
+}
+
+fn parse_toml_basic_string(value: &str) -> Option<String> {
+    let mut chars = value.chars();
+    let quote = chars.next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let mut result = String::new();
+    let mut escaped = false;
+    for ch in chars {
+        if escaped {
+            result.push(ch);
+            escaped = false;
+            continue;
+        }
+        if quote == '"' && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            return Some(result);
+        }
+        result.push(ch);
     }
     None
 }
@@ -37446,6 +37564,250 @@ Thanks."#,
         let _ = fs::remove_dir_all(&state_dir);
     }
 
+    #[test]
+    fn focused_tests_run_command_infers_cargo_package_scope_for_rust_mutations() {
+        let state_dir = test_state_dir("focused-cargo-validation-command");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(workspace_root.join("crates/daemon/src"))
+            .expect("crate source directory should exist");
+        fs::write(
+            workspace_root.join("crates/daemon/Cargo.toml"),
+            "[package]\nname = \"nucleus-daemon\"\n",
+        )
+        .expect("crate manifest should exist");
+
+        let command = focused_tests_run_command_for_mutation_receipts(
+            &[test_mutation_receipt_with_paths(&[
+                "crates/daemon/src/worker_action.rs",
+            ])],
+            &workspace_root.display().to_string(),
+        )
+        .expect("cargo package command should be inferred");
+
+        assert_eq!(command.command, "cargo");
+        assert_eq!(command.args, vec!["test", "-p", "nucleus-daemon"]);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn focused_tests_run_command_infers_all_cargo_packages_for_rust_mutations() {
+        let state_dir = test_state_dir("focused-cargo-validation-command-multi-package");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(workspace_root.join("crates/core/src"))
+            .expect("core source directory should exist");
+        fs::create_dir_all(workspace_root.join("crates/daemon/src"))
+            .expect("daemon source directory should exist");
+        fs::write(
+            workspace_root.join("crates/core/Cargo.toml"),
+            "[package]\nname = \"nucleus-core\"\n",
+        )
+        .expect("core manifest should exist");
+        fs::write(
+            workspace_root.join("crates/daemon/Cargo.toml"),
+            "[package]\nname = \"nucleus-daemon\"\n",
+        )
+        .expect("daemon manifest should exist");
+
+        let command = focused_tests_run_command_for_mutation_receipts(
+            &[test_mutation_receipt_with_paths(&[
+                "crates/daemon/src/worker_action.rs",
+                "crates/core/src/lib.rs",
+            ])],
+            &workspace_root.display().to_string(),
+        )
+        .expect("cargo package command should be inferred");
+
+        assert_eq!(command.command, "cargo");
+        assert_eq!(
+            command.args,
+            vec!["test", "-p", "nucleus-core", "-p", "nucleus-daemon"]
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn focused_tests_run_command_prefers_node_focused_test_over_cargo() {
+        let state_dir = test_state_dir("focused-node-validation-command-precedence");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(workspace_root.join("crates/daemon/src"))
+            .expect("crate source directory should exist");
+        fs::write(
+            workspace_root.join("crates/daemon/Cargo.toml"),
+            "[package]\nname = \"nucleus-daemon\"\n",
+        )
+        .expect("crate manifest should exist");
+
+        let command = focused_tests_run_command_for_mutation_receipts(
+            &[test_mutation_receipt_with_paths(&[
+                "apps/web/src/lib/nucleus/session-ux.test.mjs",
+                "crates/daemon/src/worker_action.rs",
+            ])],
+            &workspace_root.display().to_string(),
+        )
+        .expect("node focused command should be inferred");
+
+        assert_eq!(command.command, "node");
+        assert_eq!(
+            command.args,
+            vec!["--test", "apps/web/src/lib/nucleus/session-ux.test.mjs"]
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn focused_tests_run_command_falls_back_to_workspace_cargo_test_for_unresolved_rust_path() {
+        let state_dir = test_state_dir("focused-cargo-validation-command-fallback");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+
+        let command = focused_tests_run_command_for_mutation_receipts(
+            &[test_mutation_receipt_with_paths(&["scratch/generated.rs"])],
+            &workspace_root.display().to_string(),
+        )
+        .expect("workspace cargo command should be inferred");
+
+        assert_eq!(command.command, "cargo");
+        assert_eq!(command.args, vec!["test"]);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn focused_tests_run_command_falls_back_to_workspace_when_any_rust_path_unresolved() {
+        let state_dir = test_state_dir("focused-cargo-validation-command-partial-fallback");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(workspace_root.join("crates/daemon/src"))
+            .expect("crate source directory should exist");
+        fs::create_dir_all(workspace_root.join("scratch")).expect("scratch directory should exist");
+        fs::write(
+            workspace_root.join("crates/daemon/Cargo.toml"),
+            "[package]\nname = \"nucleus-daemon\"\n",
+        )
+        .expect("crate manifest should exist");
+
+        let command = focused_tests_run_command_for_mutation_receipts(
+            &[test_mutation_receipt_with_paths(&[
+                "crates/daemon/src/worker_action.rs",
+                "scratch/generated.rs",
+            ])],
+            &workspace_root.display().to_string(),
+        )
+        .expect("workspace cargo command should be inferred");
+
+        assert_eq!(command.command, "cargo");
+        assert_eq!(command.args, vec!["test"]);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn local_project_child_validation_recovery_prompts_cargo_tests_run_at_budget_edge() {
+        let state_dir = test_state_dir("rust-validation-recovery-prompt");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(workspace_root.join("crates/daemon/src"))
+            .expect("workspace should exist");
+        fs::write(
+            workspace_root.join("crates/daemon/Cargo.toml"),
+            "[package]\nname = \"nucleus-daemon\"\n",
+        )
+        .expect("crate manifest should exist");
+        let (session, parent_job_id, _parent_worker) = create_local_project_parent_join_context(
+            &state,
+            "rust-validation-recovery-prompt",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "rust-recovery-child",
+            LocalProjectJoinChildOptions {
+                state: "running",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        append_local_project_mutation_receipt(
+            &state,
+            &session.session.id,
+            &child_job_id,
+            "crates/daemon/src/worker_action.rs",
+        );
+
+        let mut child_worker = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load")
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.job_id == child_job_id)
+            .expect("child worker should exist");
+        let mut checkpoint = WorkerCheckpoint {
+            session_id: session.session.id.clone(),
+            prompt_text: "Implement daemon recovery and validate it.".to_string(),
+            images: Vec::new(),
+            conversation: Vec::new(),
+            next_prompt: None,
+            pending_action: None,
+            browser_verification_final_answer_rejected: false,
+            patch_loop_guardrail_triggered: false,
+        };
+
+        let disposition = handle_local_project_validation_recovery_before_budget(
+            &state,
+            &session,
+            &child_job_id,
+            &mut child_worker,
+            &mut checkpoint,
+            23,
+            23,
+        )
+        .await
+        .expect("recovery prompt should be written");
+
+        assert_eq!(
+            disposition,
+            LocalProjectValidationRecoveryDisposition::DeferBudget
+        );
+        let persisted_checkpoint: WorkerCheckpoint = serde_json::from_value(
+            state
+                .store
+                .read_worker_checkpoint(&child_worker.id)
+                .expect("checkpoint read should succeed")
+                .expect("checkpoint should exist"),
+        )
+        .expect("checkpoint should decode");
+        let prompt = persisted_checkpoint
+            .next_prompt
+            .expect("recovery prompt should be queued");
+        assert!(prompt.contains("\"tool\":\"tests.run\""));
+        assert!(prompt.contains("\"command\":\"cargo\""));
+        assert!(prompt.contains("\"test\""));
+        assert!(prompt.contains("\"-p\""));
+        assert!(prompt.contains("\"nucleus-daemon\""));
+
+        let child = state.store.get_job(&child_job_id).expect("child reloads");
+        let recovery_event = child
+            .events
+            .iter()
+            .find(|event| event.event_type == "worker.validation_recovery")
+            .expect("recovery event should persist");
+        assert_eq!(recovery_event.status, "prompted");
+        assert_eq!(recovery_event.data_json["tool"], "tests.run");
+        assert_eq!(recovery_event.data_json["command"], "cargo");
+        assert_eq!(
+            recovery_event.data_json["args"],
+            json!(["test", "-p", "nucleus-daemon"])
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
     #[tokio::test]
     async fn local_project_child_validation_recovery_completes_after_focused_tests_run() {
         let state_dir = test_state_dir("feature-161-validation-recovery-completes");
@@ -46987,6 +47349,29 @@ for line in sys.stdin:
                 expected_dirty: true,
             })
             .expect("mutation receipt should persist");
+    }
+
+    fn test_mutation_receipt_with_paths(paths: &[&str]) -> nucleus_protocol::MutationReceipt {
+        nucleus_protocol::MutationReceipt {
+            id: 1,
+            job_id: "test-job".to_string(),
+            worker_id: "test-worker".to_string(),
+            tool_call_id: "test-tool-call".to_string(),
+            session_id: "test-session".to_string(),
+            tool: "fs.apply_patch".to_string(),
+            approval_id: Some("test-approval".to_string()),
+            paths: paths.iter().map(|path| (*path).to_string()).collect(),
+            before_git_head: "before".to_string(),
+            before_git_branch: "weblime/test".to_string(),
+            before_git_dirty: false,
+            before_git_untracked_count: 0,
+            after_git_head: "before".to_string(),
+            after_git_branch: "weblime/test".to_string(),
+            after_git_dirty: true,
+            after_git_untracked_count: 0,
+            expected_dirty: true,
+            created_at: 1,
+        }
     }
 
     fn append_non_mutating_command_receipt(
