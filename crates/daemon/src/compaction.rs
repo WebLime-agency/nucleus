@@ -11,6 +11,7 @@ pub(crate) const PRESERVE_RECENT_TURNS: usize = 10;
 const MIN_COMPACTION_MESSAGES: usize = 4;
 const CHARS_PER_TOKEN: usize = 4;
 const FALLBACK_CONTEXT_CHARS: usize = 50_000;
+const GPT_5_CONTEXT_CHARS: usize = 1_000_000;
 const MAX_COMPACTED_REPLACEMENT_RATIO_NUMERATOR: usize = 3;
 const MAX_COMPACTED_REPLACEMENT_RATIO_DENOMINATOR: usize = 4;
 const EMERGENCY_TRIM_TARGET_CHARS: usize = 1_200;
@@ -134,13 +135,18 @@ pub(crate) fn compaction_token_threshold_for_model(model: &str) -> usize {
     ((context_chars / CHARS_PER_TOKEN) * 60) / 100
 }
 
+pub(crate) fn hard_context_token_ceiling_for_model(model: &str) -> usize {
+    let context_tokens = estimated_context_chars_for_model(model) / CHARS_PER_TOKEN;
+    (context_tokens * 95) / 100
+}
+
 fn estimated_context_chars_for_model(model: &str) -> usize {
     let normalized = model.to_ascii_lowercase();
     if normalized.contains("claude") && normalized.contains("sonnet") {
         return 180_000;
     }
     if normalized.contains("gpt-5") {
-        return 100_000;
+        return GPT_5_CONTEXT_CHARS;
     }
     if normalized.contains("gpt-4.1") || normalized.contains("gpt-4o") {
         return 80_000;
@@ -655,6 +661,22 @@ mod tests {
         assert!(estimate_prompt_tokens(&turn) >= 20);
         assert!(should_compact(&turn, 5));
         assert!(!should_compact(&turn, usize::MAX));
+    }
+
+    #[test]
+    fn gpt5_class_routes_do_not_compact_24k_token_prompts() {
+        let turn = test_compiled_turn("x".repeat(24_000 * CHARS_PER_TOKEN));
+        let prompt_tokens = estimate_prompt_tokens(&turn);
+
+        for model in ["cx/gpt-5.4-mini", "cx/gpt-5.5"] {
+            let threshold = compaction_token_threshold_for_model(model);
+            assert!(
+                threshold > prompt_tokens,
+                "{model} threshold {threshold} should exceed prompt estimate {prompt_tokens}"
+            );
+            assert!(!should_compact(&turn, threshold));
+            assert!(hard_context_token_ceiling_for_model(model) > threshold);
+        }
     }
 
     #[test]
