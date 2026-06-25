@@ -7800,6 +7800,13 @@ struct FocusedTestsRunCommand {
     args: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CargoPackageResolution {
+    package_name: String,
+    package_manifest_path: String,
+    cargo_manifest_path: String,
+}
+
 fn focused_tests_run_command_for_mutation_receipts(
     mutation_receipts: &[nucleus_protocol::MutationReceipt],
     working_dir: &str,
@@ -7888,23 +7895,45 @@ fn focused_cargo_test_command_for_source_paths(
         return None;
     }
 
-    let mut package_names = BTreeSet::new();
+    let mut package_resolutions = BTreeSet::new();
     for mutation_path in mutation_paths {
         if !is_rust_source_path(mutation_path) {
             continue;
         }
-        let Some(package_name) = cargo_package_name_for_mutation_path(working_dir, mutation_path)
+        let Some(package_resolution) =
+            cargo_package_resolution_for_mutation_path(working_dir, mutation_path)
         else {
             return Some(FocusedTestsRunCommand {
                 command: "cargo".to_string(),
                 args: vec!["test".to_string()],
             });
         };
-        package_names.insert(package_name);
+        package_resolutions.insert(package_resolution);
+    }
+
+    let cargo_manifest_paths = package_resolutions
+        .iter()
+        .map(|resolution| resolution.cargo_manifest_path.clone())
+        .collect::<BTreeSet<_>>();
+    if cargo_manifest_paths.len() > 1 {
+        return Some(FocusedTestsRunCommand {
+            command: "cargo".to_string(),
+            args: vec!["test".to_string()],
+        });
     }
 
     let mut args = vec!["test".to_string()];
-    for package_name in package_names {
+    if let Some(manifest_path) = cargo_manifest_paths.iter().next() {
+        if manifest_path != "Cargo.toml" {
+            args.push("--manifest-path".to_string());
+            args.push(manifest_path.clone());
+        }
+    }
+    for package_name in package_resolutions
+        .into_iter()
+        .map(|resolution| resolution.package_name)
+        .collect::<BTreeSet<_>>()
+    {
         args.push("-p".to_string());
         args.push(package_name);
     }
@@ -7921,7 +7950,10 @@ fn is_rust_source_path(path: &str) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"))
 }
 
-fn cargo_package_name_for_mutation_path(working_dir: &str, mutation_path: &str) -> Option<String> {
+fn cargo_package_resolution_for_mutation_path(
+    working_dir: &str,
+    mutation_path: &str,
+) -> Option<CargoPackageResolution> {
     let working_dir = Path::new(working_dir);
     let mutation_path = Path::new(mutation_path);
     let mut current = mutation_path.parent()?;
@@ -7929,13 +7961,43 @@ fn cargo_package_name_for_mutation_path(working_dir: &str, mutation_path: &str) 
         let manifest_path = working_dir.join(current).join("Cargo.toml");
         if manifest_path.is_file() {
             if let Some(package_name) = cargo_package_name_from_manifest(&manifest_path) {
-                return Some(package_name);
+                let package_manifest_path = current
+                    .join("Cargo.toml")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let cargo_manifest_path =
+                    cargo_workspace_manifest_for_package_dir(working_dir, current)
+                        .unwrap_or_else(|| package_manifest_path.clone());
+                return Some(CargoPackageResolution {
+                    package_name,
+                    package_manifest_path,
+                    cargo_manifest_path,
+                });
             }
         }
         let Some(parent) = current.parent() else {
             break;
         };
         current = parent;
+    }
+    None
+}
+
+fn cargo_workspace_manifest_for_package_dir(
+    working_dir: &Path,
+    package_dir: &Path,
+) -> Option<String> {
+    let mut current = Some(package_dir);
+    while let Some(dir) = current {
+        let manifest_path = working_dir.join(dir).join("Cargo.toml");
+        if manifest_path.is_file() && cargo_manifest_defines_workspace(&manifest_path) {
+            return Some(dir.join("Cargo.toml").to_string_lossy().replace('\\', "/"));
+        }
+        current = dir.parent();
+    }
+    let manifest_path = working_dir.join("Cargo.toml");
+    if manifest_path.is_file() && cargo_manifest_defines_workspace(&manifest_path) {
+        return Some("Cargo.toml".to_string());
     }
     None
 }
@@ -7968,6 +8030,24 @@ fn cargo_package_name_from_manifest(manifest_path: &Path) -> Option<String> {
         return parse_toml_basic_string(value.trim());
     }
     None
+}
+
+fn cargo_manifest_defines_workspace(manifest_path: &Path) -> bool {
+    let contents = match fs::read_to_string(manifest_path) {
+        Ok(contents) => contents,
+        Err(_) => return false,
+    };
+    contents.lines().any(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return false;
+        }
+        let section = trimmed
+            .split_once('#')
+            .map_or(trimmed, |(section, _)| section)
+            .trim();
+        section == "[workspace]"
+    })
 }
 
 fn parse_toml_basic_string(value: &str) -> Option<String> {
@@ -37571,6 +37651,11 @@ Thanks."#,
         fs::create_dir_all(workspace_root.join("crates/daemon/src"))
             .expect("crate source directory should exist");
         fs::write(
+            workspace_root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/daemon\"]\n",
+        )
+        .expect("workspace manifest should exist");
+        fs::write(
             workspace_root.join("crates/daemon/Cargo.toml"),
             "[package]\nname = \"nucleus-daemon\"\n",
         )
@@ -37591,6 +37676,39 @@ Thanks."#,
     }
 
     #[test]
+    fn focused_tests_run_command_uses_manifest_path_for_nested_crate_without_root_manifest() {
+        let state_dir = test_state_dir("focused-cargo-validation-command-nested-manifest");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(workspace_root.join("backend/src"))
+            .expect("crate source directory should exist");
+        fs::write(
+            workspace_root.join("backend/Cargo.toml"),
+            "[package]\nname = \"backend\"\n",
+        )
+        .expect("nested crate manifest should exist");
+
+        let command = focused_tests_run_command_for_mutation_receipts(
+            &[test_mutation_receipt_with_paths(&["backend/src/lib.rs"])],
+            &workspace_root.display().to_string(),
+        )
+        .expect("nested cargo package command should be inferred");
+
+        assert_eq!(command.command, "cargo");
+        assert_eq!(
+            command.args,
+            vec![
+                "test",
+                "--manifest-path",
+                "backend/Cargo.toml",
+                "-p",
+                "backend"
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
     fn focused_tests_run_command_infers_all_cargo_packages_for_rust_mutations() {
         let state_dir = test_state_dir("focused-cargo-validation-command-multi-package");
         let workspace_root = state_dir.join("workspace");
@@ -37598,6 +37716,11 @@ Thanks."#,
             .expect("core source directory should exist");
         fs::create_dir_all(workspace_root.join("crates/daemon/src"))
             .expect("daemon source directory should exist");
+        fs::write(
+            workspace_root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/core\", \"crates/daemon\"]\n",
+        )
+        .expect("workspace manifest should exist");
         fs::write(
             workspace_root.join("crates/core/Cargo.toml"),
             "[package]\nname = \"nucleus-core\"\n",
@@ -37623,6 +37746,40 @@ Thanks."#,
             command.args,
             vec!["test", "-p", "nucleus-core", "-p", "nucleus-daemon"]
         );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn focused_tests_run_command_falls_back_for_disjoint_cargo_manifests() {
+        let state_dir = test_state_dir("focused-cargo-validation-command-disjoint-manifests");
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(workspace_root.join("backend/src"))
+            .expect("backend source directory should exist");
+        fs::create_dir_all(workspace_root.join("tools/cli/src"))
+            .expect("cli source directory should exist");
+        fs::write(
+            workspace_root.join("backend/Cargo.toml"),
+            "[package]\nname = \"backend\"\n",
+        )
+        .expect("backend manifest should exist");
+        fs::write(
+            workspace_root.join("tools/cli/Cargo.toml"),
+            "[package]\nname = \"tools-cli\"\n",
+        )
+        .expect("cli manifest should exist");
+
+        let command = focused_tests_run_command_for_mutation_receipts(
+            &[test_mutation_receipt_with_paths(&[
+                "backend/src/lib.rs",
+                "tools/cli/src/main.rs",
+            ])],
+            &workspace_root.display().to_string(),
+        )
+        .expect("workspace cargo fallback should be inferred");
+
+        assert_eq!(command.command, "cargo");
+        assert_eq!(command.args, vec!["test"]);
 
         let _ = fs::remove_dir_all(&state_dir);
     }
@@ -37710,6 +37867,11 @@ Thanks."#,
         let workspace_root = state_dir.join("workspace");
         fs::create_dir_all(workspace_root.join("crates/daemon/src"))
             .expect("workspace should exist");
+        fs::write(
+            workspace_root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/daemon\"]\n",
+        )
+        .expect("workspace manifest should exist");
         fs::write(
             workspace_root.join("crates/daemon/Cargo.toml"),
             "[package]\nname = \"nucleus-daemon\"\n",
