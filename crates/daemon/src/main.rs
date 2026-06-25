@@ -3,6 +3,7 @@ mod browser;
 mod compaction;
 mod error_display;
 mod host;
+mod io_boundary;
 mod memory_classifier;
 mod retry;
 mod runtime;
@@ -15,10 +16,12 @@ mod worker_action;
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
-    net::{IpAddr, SocketAddr},
+    future::Future,
+    net::{IpAddr, SocketAddr, TcpListener as StdTcpListener},
     path::{Path as FsPath, PathBuf},
     process::Command as StdCommand,
     sync::{Arc, OnceLock},
+    thread::JoinHandle,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -119,6 +122,8 @@ const MEMORY_TRUNCATION_NOTICE: &str = "\n[Memory entry truncated by Nucleus con
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(900);
 const INITIAL_UPDATE_CHECK_DELAY: Duration = Duration::from_secs(3);
 const RESTART_AFTER_RESPONSE_DELAY: Duration = Duration::from_millis(800);
+const CONTROL_PLANE_WORKER_THREADS: usize = 2;
+const CONTROL_PLANE_MAX_BLOCKING_THREADS: usize = 8;
 
 #[derive(Clone)]
 struct AppState {
@@ -194,18 +199,55 @@ async fn main() -> anyhow::Result<()> {
     agent::spawn_playbook_scheduler(state.clone());
     agent::spawn_wait_watcher(state.clone());
 
-    let listener = tokio::net::TcpListener::bind(&bind)
-        .await
+    let listener = StdTcpListener::bind(&bind)
         .with_context(|| format!("failed to bind daemon listener on {bind}"))?;
 
     info!(bind = %bind, banner = %product_banner(), "starting daemon");
 
-    axum::serve(listener, app(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("daemon server exited unexpectedly")?;
+    let server = spawn_control_plane_server(listener, app(state), shutdown_signal())?;
+    tokio::task::spawn_blocking(move || match server.join() {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!("control-plane server thread panicked")),
+    })
+    .await
+    .context("failed to join control-plane server thread")?
+    .context("daemon server exited unexpectedly")?;
 
     Ok(())
+}
+
+fn spawn_control_plane_server<S>(
+    listener: StdTcpListener,
+    router: Router,
+    shutdown: S,
+) -> anyhow::Result<JoinHandle<anyhow::Result<()>>>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name("nucleus-control-plane".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(CONTROL_PLANE_WORKER_THREADS)
+                .max_blocking_threads(CONTROL_PLANE_MAX_BLOCKING_THREADS)
+                .thread_name("nucleus-control-plane-worker")
+                .enable_all()
+                .build()
+                .context("failed to build control-plane runtime")?;
+
+            runtime.block_on(async move {
+                listener
+                    .set_nonblocking(true)
+                    .context("failed to configure control-plane listener")?;
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .context("failed to attach control-plane listener")?;
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(shutdown)
+                    .await
+                    .context("control-plane server exited unexpectedly")
+            })
+        })
+        .context("failed to spawn control-plane server thread")
 }
 
 fn app(state: AppState) -> Router {
@@ -10555,7 +10597,9 @@ mod tests {
     use serde_json::json;
     use std::{
         env, fs,
+        io::{Read, Write},
         path::{Path, PathBuf},
+        sync::{Barrier, mpsc},
         time::{SystemTime, UNIX_EPOCH},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10670,6 +10714,68 @@ mod tests {
             .expect("event channel should remain open");
 
         assert!(matches!(event, DaemonEvent::LocalJobsUpdated(jobs) if jobs.is_empty()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn control_plane_health_responds_while_job_runtime_worker_is_blocked() {
+        let (state_dir, state) = test_named_app_state("control-plane-runtime-isolation");
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener address should resolve");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = spawn_control_plane_server(listener, app(state), async move {
+            let _ = shutdown_rx.await;
+        })
+        .expect("control-plane server should spawn");
+
+        let gate = Arc::new(Barrier::new(2));
+        let (tx, rx) = mpsc::channel();
+        let client_gate = gate.clone();
+        let client = std::thread::spawn(move || {
+            client_gate.wait();
+            let started = Instant::now();
+            let result = read_health_over_tcp(addr).map(|body| (started.elapsed(), body));
+            tx.send(result).expect("health result should send");
+        });
+
+        let blocker_gate = gate.clone();
+        let blocker = tokio::spawn(async move {
+            blocker_gate.wait();
+            std::thread::sleep(Duration::from_millis(400));
+        });
+
+        tokio::task::yield_now().await;
+        blocker.await.expect("blocking job task should finish");
+
+        let (elapsed, response) = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("health response should be reported")
+            .expect("health response should succeed");
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "health response took {elapsed:?}: {response}"
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("Nucleus"), "{response}");
+
+        client.join().expect("health client thread should join");
+        shutdown_tx.send(()).expect("shutdown signal should send");
+        server
+            .join()
+            .expect("control-plane server thread should join")
+            .expect("control-plane server should stop cleanly");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    fn read_health_over_tcp(addr: SocketAddr) -> anyhow::Result<String> {
+        let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200))?;
+        stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        Ok(response)
     }
 
     #[test]
