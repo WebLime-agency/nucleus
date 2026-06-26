@@ -818,11 +818,10 @@ async fn require_api_auth(
     next: Next,
 ) -> Result<Response, ApiError> {
     let runtime = tokio::runtime::Handle::current();
+    let token = access_token(request.headers(), None)?;
     tokio::task::spawn_blocking(move || {
-        runtime.block_on(async move {
-            authorize_access(&state, request.headers(), None).await?;
-            Ok(next.run(request).await)
-        })
+        validate_access_token(&state.store, &token)?;
+        Ok(runtime.block_on(next.run(request)))
     })
     .await
     .map_err(|error| {
@@ -10379,19 +10378,27 @@ async fn authorize_access(
     headers: &HeaderMap,
     query_token: Option<&str>,
 ) -> Result<(), ApiError> {
-    let token = bearer_token(headers)
-        .or(query_token.map(str::trim).filter(|value| !value.is_empty()))
-        .ok_or_else(|| ApiError::unauthorized("Authentication required. Provide a bearer token."))?
-        .to_string();
-
+    let token = access_token(headers, query_token)?;
     let store = state.store.clone();
-    let valid = tokio::task::spawn_blocking(move || store.validate_access_token(&token))
+    tokio::task::spawn_blocking(move || validate_access_token(&store, &token))
         .await
         .map_err(|error| {
             ApiError::from(anyhow::anyhow!(
                 "blocking auth validation task panicked or was canceled: {error}"
             ))
         })?
+}
+
+fn access_token(headers: &HeaderMap, query_token: Option<&str>) -> Result<String, ApiError> {
+    Ok(bearer_token(headers)
+        .or(query_token.map(str::trim).filter(|value| !value.is_empty()))
+        .ok_or_else(|| ApiError::unauthorized("Authentication required. Provide a bearer token."))?
+        .to_string())
+}
+
+fn validate_access_token(store: &StateStore, token: &str) -> Result<(), ApiError> {
+    let valid = store
+        .validate_access_token(token)
         .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
 
     if valid {
@@ -10879,6 +10886,66 @@ mod tests {
             .store
             .hold_connection_mutex_for_test(Duration::from_millis(800), None);
         StatusCode::OK
+    }
+
+    async fn protected_ok_probe() -> StatusCode {
+        StatusCode::OK
+    }
+
+    #[tokio::test]
+    async fn protected_request_offload_does_not_deadlock_auth_validation() {
+        let (state_dir, state) = test_named_app_state("control-plane-protected-auth-deadlock");
+        let token = state
+            .store
+            .read_local_auth_token()
+            .expect("local auth token should load");
+        let protected_api = Router::new()
+            .route("/ok", get(protected_ok_probe))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_api_auth,
+            ));
+        let router = Router::new()
+            .route("/health", get(health))
+            .nest("/api/test", protected_api)
+            .with_state(state);
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener address should resolve");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = spawn_control_plane_server(listener, router, async move {
+            let _ = shutdown_rx.await;
+        })
+        .expect("control-plane server should spawn");
+
+        let mut clients = Vec::new();
+        for _ in 0..CONTROL_PLANE_MAX_BLOCKING_THREADS {
+            let token = token.clone();
+            clients.push(std::thread::spawn(move || {
+                let authorization = format!("Bearer {token}");
+                read_http_over_tcp_with_headers_and_timeout(
+                    addr,
+                    "/api/test/ok",
+                    &[("Authorization", authorization.as_str())],
+                    Duration::from_secs(2),
+                )
+            }));
+        }
+        for client in clients {
+            let response = client
+                .join()
+                .expect("protected client thread should join")
+                .expect("protected request should complete without auth deadlock");
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        }
+
+        shutdown_tx.send(()).expect("shutdown signal should send");
+        server
+            .join()
+            .expect("control-plane server thread should join")
+            .expect("control-plane server should stop cleanly");
+        let _ = fs::remove_dir_all(&state_dir);
     }
 
     #[tokio::test]
