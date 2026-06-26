@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 compute="${repo_root}/scripts/compute-release-version.sh"
+check_work="${repo_root}/scripts/check-stable-release-work.sh"
 update_files="${repo_root}/scripts/update-release-version-files.sh"
 
 tmpdir="$(mktemp -d)"
@@ -21,6 +22,13 @@ assert_eq() {
   if [ "${actual}" != "${expected}" ]; then
     fail "${label}: expected '${expected}', got '${actual}'"
   fi
+}
+
+output_value() {
+  local key="$1"
+  local file="$2"
+
+  awk -F= -v key="${key}" '$1 == key { print substr($0, index($0, "=") + 1); exit }' "${file}"
 }
 
 make_git_repo() {
@@ -51,6 +59,29 @@ run_compute_case "v0.1.0" "patch" "0.1.1" "auto-patch-010"
 run_compute_case "v0.1.0" "minor" "0.2.0" "auto-minor-010"
 run_compute_case "v0.1.0" "major" "1.0.0" "auto-major-010"
 run_compute_case "v0.4.7" "patch" "0.4.8" "auto-patch-047"
+
+no_new_work_dir="${tmpdir}/no-new-work"
+make_git_repo "${no_new_work_dir}"
+git -C "${no_new_work_dir}" tag -a "v0.1.0" -m "Release v0.1.0"
+git -C "${no_new_work_dir}" update-ref refs/remotes/origin/main HEAD
+no_new_work_output="${tmpdir}/no-new-work.out"
+(cd "${no_new_work_dir}" && "${check_work}" origin/main) >"${no_new_work_output}"
+assert_eq "false" "$(output_value should_publish "${no_new_work_output}")" "no-new-work should not publish"
+assert_eq "v0.1.0" "$(output_value latest_tag "${no_new_work_output}")" "no-new-work latest tag"
+
+new_work_dir="${tmpdir}/new-work"
+make_git_repo "${new_work_dir}"
+git -C "${new_work_dir}" tag -a "v0.1.0" -m "Release v0.1.0"
+printf 'new work\n' > "${new_work_dir}/FEATURE.md"
+git -C "${new_work_dir}" add FEATURE.md
+git -C "${new_work_dir}" commit -q -m "new work"
+git -C "${new_work_dir}" update-ref refs/remotes/origin/main HEAD
+new_work_output="${tmpdir}/new-work.out"
+(cd "${new_work_dir}" && "${check_work}" origin/main) >"${new_work_output}"
+assert_eq "true" "$(output_value should_publish "${new_work_output}")" "new-work should publish"
+assert_eq "v0.1.0" "$(output_value latest_tag "${new_work_output}")" "new-work latest tag"
+new_work_version="$(cd "${new_work_dir}" && VERSION_MODE=auto BUMP=patch "${compute}")"
+assert_eq "0.1.1" "${new_work_version}" "new-work version bump"
 
 exact_tag_dir="${tmpdir}/exact-tag-filter"
 make_git_repo "${exact_tag_dir}"
