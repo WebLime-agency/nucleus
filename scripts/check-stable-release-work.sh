@@ -21,6 +21,7 @@ fi
 source_sha="$(git rev-parse "${source_ref}^{commit}")"
 latest_tag_sha="$(git rev-list -n 1 "${latest_tag}")"
 
+# TODO(#486): Also account for prior post-tag publish failures before no-oping.
 if [ "${source_sha}" = "${latest_tag_sha}" ]; then
   should_publish="false"
 else

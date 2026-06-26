@@ -173,7 +173,7 @@ Defaults:
 - `stable` publishes from `main`
 - `beta` publishes from `dev`
 - `nightly` publishes from `dev`
-- scheduled runs publish `stable` from `main` when `main` has advanced past the latest stable `vX.Y.Z` tag; otherwise they complete as a no-op
+- scheduled runs publish `stable` from `main` when `main` has advanced past the latest stable `vX.Y.Z` tag; otherwise they complete as a no-op and write a no-op summary instead of a published-release summary
 
 The workflow:
 
