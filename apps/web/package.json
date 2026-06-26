@@ -1,7 +1,7 @@
 {
   "name": "@nucleus/web",
   "private": true,
-  "version": "0.1.35",
+  "version": "0.1.36",
   "type": "module",
   "scripts": {
     "dev": "NODE_OPTIONS=--max-http-header-size=65536 vite dev",
