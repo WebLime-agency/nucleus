@@ -1139,7 +1139,7 @@ fn path_like_value(token: &str) -> Option<PathBuf> {
     if token.starts_with('~') {
         return Some(PathBuf::from("/~"));
     }
-    if token.starts_with('/') || token.starts_with("../") || token == ".." {
+    if token.starts_with('/') || token.starts_with("../") || token == ".." || token.contains('/') {
         return Some(PathBuf::from(token));
     }
     if token.contains("/../") || token.ends_with("/..") {
@@ -1427,6 +1427,52 @@ mod tests {
             &root,
         );
         assert!(matches!(decision, ScopedApprovalDecision::Deny(_)));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denies_symlink_escape_for_command_path_argument() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "nucleus-policy-command-symlink-root-{}",
+            std::process::id()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "nucleus-policy-command-symlink-outside-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(root.join("src")).expect("worktree src should be created");
+        fs::create_dir_all(&outside).expect("outside root should be created");
+        fs::write(root.join("src/lib.rs"), "pub fn answer() -> u32 { 42 }\n")
+            .expect("in-worktree file should be created");
+        fs::write(outside.join("secret"), "outside\n").expect("outside file should be created");
+        symlink(&outside, root.join("link")).expect("symlink should be created");
+
+        let outside_decision = evaluate_autonomous_approval(
+            "command.run",
+            &json!({"command":"cat","args":["link/secret"],"cwd":"."}),
+            &root,
+        );
+        assert!(
+            matches!(outside_decision, ScopedApprovalDecision::Deny(_)),
+            "symlinked command path argument should be denied, got {outside_decision:?}"
+        );
+
+        let inside_decision = evaluate_autonomous_approval(
+            "command.run",
+            &json!({"command":"cat","args":["src/lib.rs"],"cwd":"."}),
+            &root,
+        );
+        assert!(
+            matches!(inside_decision, ScopedApprovalDecision::Allow(_)),
+            "in-worktree command path argument should stay allowed, got {inside_decision:?}"
+        );
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&outside);
