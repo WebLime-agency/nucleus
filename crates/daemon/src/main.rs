@@ -124,6 +124,7 @@ const INITIAL_UPDATE_CHECK_DELAY: Duration = Duration::from_secs(3);
 const RESTART_AFTER_RESPONSE_DELAY: Duration = Duration::from_millis(800);
 const CONTROL_PLANE_WORKER_THREADS: usize = 2;
 const CONTROL_PLANE_MAX_BLOCKING_THREADS: usize = 8;
+const CONTROL_PLANE_OFFLOAD_THREADS: usize = 16;
 
 #[derive(Clone)]
 struct AppState {
@@ -152,6 +153,7 @@ struct LocalJobsStreamCache {
 static LOCAL_JOBS_STREAM_CACHE: OnceLock<tokio::sync::Mutex<LocalJobsStreamCache>> =
     OnceLock::new();
 static SYSTEM_JOBS_ALLOWLIST_MUTATION_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+static CONTROL_PLANE_OFFLOAD_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 const SYSTEM_JOBS_ALLOWLIST_MAX_GLOBS: usize = 200;
 const SYSTEM_JOBS_ALLOWLIST_MAX_GLOB_BYTES: usize = 256;
 const SYSTEM_JOBS_ALLOWLIST_MAX_TOTAL_BYTES: usize = 16_000;
@@ -817,28 +819,40 @@ async fn require_api_auth(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let runtime = tokio::runtime::Handle::current();
     let token = access_token(request.headers(), None)?;
+    run_control_plane_offload("nucleus-protected-api", move |runtime| {
+        runtime.block_on(async move {
+            validate_access_token(&state.store, &token)?;
+            Ok(next.run(request).await)
+        })
+    })
+    .await
+    .map_err(ApiError::from)?
+}
+
+async fn run_control_plane_offload<F, T>(thread_name: &'static str, task: F) -> anyhow::Result<T>
+where
+    F: FnOnce(tokio::runtime::Handle) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let permit = CONTROL_PLANE_OFFLOAD_SEMAPHORE
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(CONTROL_PLANE_OFFLOAD_THREADS)))
+        .clone()
+        .acquire_owned()
+        .await
+        .context("control-plane offload semaphore was closed")?;
+    let runtime = tokio::runtime::Handle::current();
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
-        .name("nucleus-protected-api".to_string())
+        .name(thread_name.to_string())
         .spawn(move || {
-            let result = runtime.block_on(async move {
-                validate_access_token(&state.store, &token)?;
-                Ok(next.run(request).await)
-            });
+            let _permit = permit;
+            let result = task(runtime);
             let _ = tx.send(result);
         })
-        .map_err(|error| {
-            ApiError::from(anyhow::anyhow!(
-                "failed to spawn protected API request thread: {error}"
-            ))
-        })?;
-    rx.await.map_err(|error| {
-        ApiError::from(anyhow::anyhow!(
-            "protected API request thread exited without a response: {error}"
-        ))
-    })?
+        .with_context(|| format!("failed to spawn {thread_name} thread"))?;
+    rx.await
+        .with_context(|| format!("{thread_name} thread exited without a response"))
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -5743,27 +5757,51 @@ async fn send_initial_stream_snapshot(
     socket: &mut WebSocket,
     state: &AppState,
 ) -> anyhow::Result<()> {
-    let frame = state.host.system_telemetry_frame();
-    let overview = build_runtime_overview(state, frame.host_status.clone(), false).await?;
-    let audit = state.store.list_audit_events(DEFAULT_AUDIT_LIMIT)?;
+    let snapshot = build_initial_stream_snapshot(state.clone()).await?;
 
-    send_event(socket, DaemonEvent::OverviewUpdated(overview)).await?;
-    send_event(socket, DaemonEvent::AuditUpdated(audit)).await?;
-    send_event(socket, DaemonEvent::SystemUpdated(frame.system_stats)).await?;
-    match local_jobs_snapshot_if_configured(state).await {
-        Ok(Some(jobs)) => send_event(socket, DaemonEvent::LocalJobsUpdated(jobs)).await?,
-        Ok(None) => {}
-        Err(error) => {
-            warn!(error = %error, "failed to include local jobs in websocket initial snapshot")
-        }
+    send_event(socket, DaemonEvent::OverviewUpdated(snapshot.overview)).await?;
+    send_event(socket, DaemonEvent::AuditUpdated(snapshot.audit)).await?;
+    send_event(socket, DaemonEvent::SystemUpdated(snapshot.system_stats)).await?;
+    if let Some(jobs) = snapshot.local_jobs {
+        send_event(socket, DaemonEvent::LocalJobsUpdated(jobs)).await?;
     }
-    send_event(
-        socket,
-        DaemonEvent::UpdateUpdated(state.updates.current().await),
-    )
-    .await?;
+    send_event(socket, DaemonEvent::UpdateUpdated(snapshot.update_status)).await?;
 
     Ok(())
+}
+
+struct InitialStreamSnapshot {
+    overview: RuntimeOverview,
+    audit: Vec<AuditEvent>,
+    system_stats: SystemStats,
+    local_jobs: Option<Vec<LocalJobSummary>>,
+    update_status: UpdateStatus,
+}
+
+async fn build_initial_stream_snapshot(state: AppState) -> anyhow::Result<InitialStreamSnapshot> {
+    run_control_plane_offload("nucleus-ws-snapshot", move |runtime| {
+        runtime.block_on(async move {
+            let frame = state.host.system_telemetry_frame();
+            let overview = build_runtime_overview(&state, frame.host_status.clone(), false).await?;
+            let audit = state.store.list_audit_events(DEFAULT_AUDIT_LIMIT)?;
+            let local_jobs = match local_jobs_snapshot_if_configured(&state).await {
+                Ok(jobs) => jobs,
+                Err(error) => {
+                    warn!(error = %error, "failed to include local jobs in websocket initial snapshot");
+                    None
+                }
+            };
+            let update_status = state.updates.current().await;
+            Ok(InitialStreamSnapshot {
+                overview,
+                audit,
+                system_stats: frame.system_stats,
+                local_jobs,
+                update_status,
+            })
+        })
+    })
+    .await?
 }
 
 async fn send_event(socket: &mut WebSocket, event: DaemonEvent) -> anyhow::Result<()> {
@@ -10635,7 +10673,11 @@ mod tests {
         env, fs,
         io::{Read, Write},
         path::{Path, PathBuf},
-        sync::{Barrier, OnceLock, mpsc},
+        sync::{
+            Barrier, OnceLock,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
         time::{SystemTime, UNIX_EPOCH},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10912,6 +10954,29 @@ mod tests {
         StatusCode::OK
     }
 
+    #[derive(Clone)]
+    struct ProtectedOffloadLimitProbe {
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    }
+
+    async fn protected_offload_limit_probe(
+        axum::Extension(probe): axum::Extension<ProtectedOffloadLimitProbe>,
+    ) -> StatusCode {
+        let active = probe.active.fetch_add(1, Ordering::SeqCst) + 1;
+        probe.max_active.fetch_max(active, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(150));
+        probe.active.fetch_sub(1, Ordering::SeqCst);
+        StatusCode::OK
+    }
+
+    async fn websocket_snapshot_probe(State(state): State<AppState>) -> StatusCode {
+        build_initial_stream_snapshot(state)
+            .await
+            .expect("initial stream snapshot should build");
+        StatusCode::OK
+    }
+
     #[tokio::test]
     async fn protected_request_offload_does_not_deadlock_auth_validation() {
         let (state_dir, state) = test_named_app_state("control-plane-protected-auth-deadlock");
@@ -11013,6 +11078,138 @@ mod tests {
                 .join()
                 .expect("protected client thread should join")
                 .expect("protected request should complete without nested blocking deadlock");
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        }
+
+        shutdown_tx.send(()).expect("shutdown signal should send");
+        server
+            .join()
+            .expect("control-plane server thread should join")
+            .expect("control-plane server should stop cleanly");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn protected_request_offload_applies_backpressure() {
+        let (state_dir, state) = test_named_app_state("control-plane-protected-offload-bound");
+        let token = state
+            .store
+            .read_local_auth_token()
+            .expect("local auth token should load");
+        let probe = ProtectedOffloadLimitProbe {
+            active: Arc::new(AtomicUsize::new(0)),
+            max_active: Arc::new(AtomicUsize::new(0)),
+        };
+        let protected_api = Router::new()
+            .route("/limit", get(protected_offload_limit_probe))
+            .layer(axum::Extension(probe.clone()))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_api_auth,
+            ));
+        let router = Router::new()
+            .route("/health", get(health))
+            .nest("/api/test", protected_api)
+            .with_state(state);
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener address should resolve");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = spawn_control_plane_server(listener, router, async move {
+            let _ = shutdown_rx.await;
+        })
+        .expect("control-plane server should spawn");
+
+        let mut clients = Vec::new();
+        for _ in 0..(CONTROL_PLANE_OFFLOAD_THREADS + 4) {
+            let token = token.clone();
+            clients.push(std::thread::spawn(move || {
+                let authorization = format!("Bearer {token}");
+                read_http_over_tcp_with_headers_and_timeout(
+                    addr,
+                    "/api/test/limit",
+                    &[("Authorization", authorization.as_str())],
+                    Duration::from_secs(4),
+                )
+            }));
+        }
+        for client in clients {
+            let response = client
+                .join()
+                .expect("protected client thread should join")
+                .expect("protected request should complete with bounded offload");
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        }
+        assert!(
+            probe.max_active.load(Ordering::SeqCst) <= CONTROL_PLANE_OFFLOAD_THREADS,
+            "protected offload exceeded configured thread bound"
+        );
+
+        shutdown_tx.send(()).expect("shutdown signal should send");
+        server
+            .join()
+            .expect("control-plane server thread should join")
+            .expect("control-plane server should stop cleanly");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn control_plane_health_responds_while_websocket_snapshot_waits_on_storage() {
+        let (state_dir, state) = test_named_app_state("control-plane-ws-snapshot-storage");
+        let router = Router::new()
+            .route("/health", get(health))
+            .route("/test/ws-snapshot", get(websocket_snapshot_probe))
+            .with_state(state.clone());
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener address should resolve");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = spawn_control_plane_server(listener, router, async move {
+            let _ = shutdown_rx.await;
+        })
+        .expect("control-plane server should spawn");
+
+        let (lock_started_tx, lock_started_rx) = mpsc::channel();
+        let store = state.store.clone();
+        let storage_blocker = std::thread::spawn(move || {
+            store.hold_connection_mutex_for_test(Duration::from_millis(800), Some(lock_started_tx));
+        });
+        lock_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("storage lock holder should start");
+
+        let mut snapshot_clients = Vec::new();
+        for _ in 0..CONTROL_PLANE_WORKER_THREADS {
+            snapshot_clients.push(std::thread::spawn(move || {
+                read_http_over_tcp_with_headers_and_timeout(
+                    addr,
+                    "/test/ws-snapshot",
+                    &[],
+                    Duration::from_secs(2),
+                )
+            }));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+
+        let started = Instant::now();
+        let response = read_health_over_tcp(addr).expect("health response should succeed");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "health response took {elapsed:?}: {response}"
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+        storage_blocker
+            .join()
+            .expect("storage lock holder should join");
+        for client in snapshot_clients {
+            let response = client
+                .join()
+                .expect("snapshot client thread should join")
+                .expect("snapshot request should eventually complete");
             assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         }
 
