@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
+    future::Future,
     io::ErrorKind,
     net::TcpListener as StdTcpListener,
     path::{Component, Path, PathBuf},
@@ -3788,11 +3789,36 @@ fn is_non_terminal_tool_call_status(status: &str) -> bool {
 }
 
 fn spawn_job_task(state: AppState, job_id: String) {
-    tokio::spawn(async move {
-        if let Err(error) = run_job(state.clone(), job_id.clone()).await {
+    let run_state = state.clone();
+    let fail_state = state.clone();
+    spawn_on_job_runtime(&state, async move {
+        if let Err(error) = run_job(run_state, job_id.clone()).await {
             warn!(job_id = %job_id, error = %error, "hidden worker job crashed");
-            let _ = fail_job(&state, &job_id, &error.to_string()).await;
+            let _ = fail_job(&fail_state, &job_id, &error.to_string()).await;
         }
+    });
+}
+
+fn spawn_on_job_runtime<F>(state: &AppState, task: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    std::mem::drop(state.job_runtime.spawn(task));
+}
+
+#[cfg(test)]
+pub(crate) fn spawn_blocking_job_runtime_probe(
+    state: AppState,
+    duration: Duration,
+    started: std::sync::mpsc::Sender<String>,
+) {
+    spawn_on_job_runtime(&state, async move {
+        let thread_name = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_string();
+        let _ = started.send(thread_name);
+        std::thread::sleep(duration);
     });
 }
 
@@ -23418,12 +23444,28 @@ mod tests {
         env, fs,
         path::{Path, PathBuf},
         sync::{
-            Arc, Mutex as TestMutex,
+            Arc, Mutex as TestMutex, OnceLock,
             atomic::{AtomicUsize, Ordering},
         },
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
     use tokio::sync::broadcast;
+
+    fn test_job_runtime_handle() -> tokio::runtime::Handle {
+        static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+        tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+            RUNTIME
+                .get_or_init(|| {
+                    tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .enable_all()
+                        .build()
+                        .expect("test job runtime should build")
+                })
+                .handle()
+                .clone()
+        })
+    }
 
     #[test]
     fn apply_patch_edits_replaces_one_match() {
@@ -45953,6 +45995,7 @@ for line in sys.stdin:
         let (events, _) = broadcast::channel(8);
         AppState {
             version: "test".to_string(),
+            job_runtime: test_job_runtime_handle(),
             store: store.clone(),
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),

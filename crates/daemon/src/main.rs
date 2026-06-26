@@ -128,6 +128,7 @@ const CONTROL_PLANE_MAX_BLOCKING_THREADS: usize = 8;
 #[derive(Clone)]
 struct AppState {
     version: String,
+    job_runtime: tokio::runtime::Handle,
     store: Arc<StateStore>,
     host: Arc<HostEngine>,
     runtimes: Arc<RuntimeManager>,
@@ -165,8 +166,10 @@ async fn main() -> anyhow::Result<()> {
     let store = Arc::new(StateStore::initialize().context("failed to initialize state store")?);
     let updates = Arc::new(UpdateManager::new(instance.clone(), store.clone()));
     let (events, _) = broadcast::channel(32);
+    let job_runtime = tokio::runtime::Handle::current();
     let state = AppState {
         version: env!("CARGO_PKG_VERSION").to_string(),
+        job_runtime,
         store,
         host: Arc::new(HostEngine::new()),
         runtimes: Arc::new(RuntimeManager::default()),
@@ -10599,7 +10602,7 @@ mod tests {
         env, fs,
         io::{Read, Write},
         path::{Path, PathBuf},
-        sync::{Barrier, mpsc},
+        sync::{Barrier, OnceLock, mpsc},
         time::{SystemTime, UNIX_EPOCH},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10641,6 +10644,22 @@ mod tests {
             transport: Default::default(),
             action_contract: Default::default(),
         }
+    }
+
+    fn test_job_runtime_handle() -> tokio::runtime::Handle {
+        static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+        tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+            RUNTIME
+                .get_or_init(|| {
+                    tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .enable_all()
+                        .build()
+                        .expect("test job runtime should build")
+                })
+                .handle()
+                .clone()
+        })
     }
 
     #[test]
@@ -10768,11 +10787,115 @@ mod tests {
         let _ = fs::remove_dir_all(&state_dir);
     }
 
+    #[derive(Clone)]
+    struct BlockingJobProbeState {
+        started: mpsc::Sender<String>,
+    }
+
+    async fn spawn_blocking_job_runtime_probe_from_api(
+        State(state): State<AppState>,
+        axum::Extension(probe): axum::Extension<BlockingJobProbeState>,
+    ) -> StatusCode {
+        for _ in 0..CONTROL_PLANE_WORKER_THREADS {
+            agent::spawn_blocking_job_runtime_probe(
+                state.clone(),
+                Duration::from_millis(800),
+                probe.started.clone(),
+            );
+        }
+        StatusCode::ACCEPTED
+    }
+
+    #[tokio::test]
+    async fn control_plane_health_responds_while_api_started_job_runtime_workers_are_blocked() {
+        let (state_dir, mut state) =
+            test_named_app_state("control-plane-api-job-runtime-isolation");
+        let job_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(CONTROL_PLANE_WORKER_THREADS)
+            .thread_name("nucleus-test-job-runtime")
+            .enable_all()
+            .build()
+            .expect("test job runtime should build");
+        state.job_runtime = job_runtime.handle().clone();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let router = Router::new()
+            .route("/health", get(health))
+            .route(
+                "/api/test/blocking-job-runtime-probe",
+                get(spawn_blocking_job_runtime_probe_from_api),
+            )
+            .layer(axum::Extension(BlockingJobProbeState {
+                started: started_tx,
+            }))
+            .with_state(state);
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener address should resolve");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = spawn_control_plane_server(listener, router, async move {
+            let _ = shutdown_rx.await;
+        })
+        .expect("control-plane server should spawn");
+
+        let trigger = read_http_over_tcp(addr, "/api/test/blocking-job-runtime-probe")
+            .expect("probe API request should succeed");
+        assert!(trigger.starts_with("HTTP/1.1 202"), "{trigger}");
+
+        let mut probe_threads = Vec::new();
+        for _ in 0..CONTROL_PLANE_WORKER_THREADS {
+            probe_threads.push(
+                started_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("blocking job probe should start"),
+            );
+        }
+        assert!(
+            probe_threads
+                .iter()
+                .all(|name| name.starts_with("nucleus-test-job-runtime")),
+            "API-started job probes ran on unexpected threads: {probe_threads:?}"
+        );
+        assert!(
+            probe_threads
+                .iter()
+                .all(|name| !name.starts_with("nucleus-control-plane-worker")),
+            "API-started job probes ran on control-plane workers: {probe_threads:?}"
+        );
+
+        let started = Instant::now();
+        let response = read_health_over_tcp(addr).expect("health response should succeed");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "health response took {elapsed:?}: {response}"
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("Nucleus"), "{response}");
+
+        shutdown_tx.send(()).expect("shutdown signal should send");
+        server
+            .join()
+            .expect("control-plane server thread should join")
+            .expect("control-plane server should stop cleanly");
+        tokio::task::spawn_blocking(move || drop(job_runtime))
+            .await
+            .expect("test job runtime should drop outside async context");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
     fn read_health_over_tcp(addr: SocketAddr) -> anyhow::Result<String> {
+        read_http_over_tcp(addr, "/health")
+    }
+
+    fn read_http_over_tcp(addr: SocketAddr, path: &str) -> anyhow::Result<String> {
         let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200))?;
         stream.set_read_timeout(Some(Duration::from_millis(500)))?;
-        stream
-            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        )?;
         let mut response = String::new();
         stream.read_to_string(&mut response)?;
         Ok(response)
@@ -12529,6 +12652,7 @@ mod tests {
         let (events, _) = broadcast::channel(4);
         let state = AppState {
             version: "test".to_string(),
+            job_runtime: test_job_runtime_handle(),
             store: store.clone(),
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
@@ -12763,6 +12887,7 @@ mod tests {
         let (events, _) = broadcast::channel(4);
         let state = AppState {
             version: "test".to_string(),
+            job_runtime: test_job_runtime_handle(),
             store: store.clone(),
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
@@ -12973,6 +13098,7 @@ mod tests {
 
         let state = AppState {
             version: "test".to_string(),
+            job_runtime: test_job_runtime_handle(),
             store: store.clone(),
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
@@ -13020,6 +13146,7 @@ mod tests {
         let (events, _) = broadcast::channel(4);
         let state = AppState {
             version: "test".to_string(),
+            job_runtime: test_job_runtime_handle(),
             store: store.clone(),
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
@@ -13053,6 +13180,7 @@ mod tests {
         let (events, _) = broadcast::channel(4);
         let state = AppState {
             version: "test".to_string(),
+            job_runtime: test_job_runtime_handle(),
             store: store.clone(),
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
@@ -13468,6 +13596,7 @@ mod tests {
         let (events, _) = broadcast::channel(4);
         let state = AppState {
             version: "test".to_string(),
+            job_runtime: test_job_runtime_handle(),
             store: store.clone(),
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
@@ -13538,6 +13667,7 @@ mod tests {
 
         let state = AppState {
             version: "test".to_string(),
+            job_runtime: test_job_runtime_handle(),
             store: store.clone(),
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
@@ -13635,6 +13765,7 @@ mod tests {
 
         let state = AppState {
             version: "test".to_string(),
+            job_runtime: test_job_runtime_handle(),
             store: store.clone(),
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
@@ -14195,6 +14326,7 @@ mod tests {
         let (events, _) = broadcast::channel(4);
         AppState {
             version: "test".to_string(),
+            job_runtime: test_job_runtime_handle(),
             store: store.clone(),
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
@@ -14214,6 +14346,7 @@ mod tests {
         let (events, _) = broadcast::channel(4);
         let state = AppState {
             version: "test".to_string(),
+            job_runtime: test_job_runtime_handle(),
             store: store.clone(),
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
@@ -16180,6 +16313,7 @@ mod tests {
         let (events, _) = broadcast::channel(4);
         let state = AppState {
             version: "test".to_string(),
+            job_runtime: test_job_runtime_handle(),
             store: store.clone(),
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
@@ -16813,6 +16947,7 @@ for line in sys.stdin:
         let (events, _) = broadcast::channel(4);
         let state = AppState {
             version: "test".to_string(),
+            job_runtime: test_job_runtime_handle(),
             store: store.clone(),
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
