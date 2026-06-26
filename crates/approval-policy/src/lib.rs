@@ -417,7 +417,7 @@ fn evaluate_command_run(args: &Value, worktree: &Path) -> ScopedApprovalDecision
             vec![cwd.to_string()],
         );
     }
-    if command_has_external_path_reference(args, worktree) {
+    if command_has_external_path_reference(args, worktree, Path::new(cwd)) {
         return deny_decision(
             "command references a path outside the worker worktree",
             vec![cwd.to_string()],
@@ -545,7 +545,7 @@ fn evaluate_tests_run(args: &Value, worktree: &Path) -> ScopedApprovalDecision {
             vec![cwd.to_string()],
         );
     }
-    if normalized_command_has_external_path_reference(&command, args, worktree) {
+    if normalized_command_has_external_path_reference(&command, args, worktree, Path::new(cwd)) {
         return deny_decision(
             "tests.run command references a path outside the worker worktree",
             vec![cwd.to_string()],
@@ -1026,32 +1026,46 @@ pub fn shell_words(command: &str) -> Result<Vec<String>, String> {
     Ok(words)
 }
 
-fn command_has_external_path_reference(args: &Value, worktree: &Path) -> bool {
+fn command_has_external_path_reference(args: &Value, worktree: &Path, cwd: &Path) -> bool {
     let Some(command) = normalize_command_run_like_args(args) else {
-        return command_tokens_have_external_path_reference(command_tokens(args), worktree);
+        return command_tokens_have_external_path_reference(command_tokens(args), worktree, cwd);
     };
-    normalized_command_has_external_path_reference(&command, args, worktree)
+    normalized_command_has_external_path_reference(&command, args, worktree, cwd)
 }
 
 fn normalized_command_has_external_path_reference(
     command: &NormalizedCommandRun,
     args: &Value,
     worktree: &Path,
+    cwd: &Path,
 ) -> bool {
     let tokens = command_policy_command(command)
         .ok()
         .and_then(|command| shell_words(&command).ok())
         .unwrap_or_else(|| command_tokens(args));
-    command_tokens_have_external_path_reference(tokens, worktree)
+    command_tokens_have_external_path_reference(tokens, worktree, cwd)
 }
 
-fn command_tokens_have_external_path_reference(tokens: Vec<String>, worktree: &Path) -> bool {
+fn command_tokens_have_external_path_reference(
+    tokens: Vec<String>,
+    worktree: &Path,
+    cwd: &Path,
+) -> bool {
     tokens
         .iter()
         .enumerate()
         .filter(|(index, _)| *index != 0)
         .filter_map(|(_, token)| path_like_command_token(token))
+        .map(|path| command_path_argument_for_cwd(cwd, path))
         .any(|path| !path_is_inside_worktree(worktree, &path))
+}
+
+fn command_path_argument_for_cwd(cwd: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
 }
 
 fn args_have_external_path_reference(args: &Value, worktree: &Path) -> bool {
@@ -1528,6 +1542,52 @@ mod tests {
         assert!(
             matches!(inside_decision, ScopedApprovalDecision::Allow(_)),
             "bare in-worktree command path argument should stay allowed, got {inside_decision:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denies_cwd_relative_symlink_escape_for_command_path_argument() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "nucleus-policy-command-cwd-symlink-root-{}",
+            std::process::id()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "nucleus-policy-command-cwd-symlink-outside-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(root.join("src")).expect("worktree src should be created");
+        fs::create_dir_all(&outside).expect("outside root should be created");
+        fs::write(root.join("src/README"), "inside\n").expect("in-worktree file should be created");
+        fs::write(outside.join("secret"), "outside\n").expect("outside file should be created");
+        symlink(outside.join("secret"), root.join("src/secret"))
+            .expect("symlink should be created");
+
+        let outside_decision = evaluate_autonomous_approval(
+            "command.run",
+            &json!({"command":"cat","args":["secret"],"cwd":"src"}),
+            &root,
+        );
+        assert!(
+            matches!(outside_decision, ScopedApprovalDecision::Deny(_)),
+            "cwd-relative symlinked command path argument should be denied, got {outside_decision:?}"
+        );
+
+        let inside_decision = evaluate_autonomous_approval(
+            "command.run",
+            &json!({"command":"cat","args":["README"],"cwd":"src"}),
+            &root,
+        );
+        assert!(
+            matches!(inside_decision, ScopedApprovalDecision::Allow(_)),
+            "cwd-relative in-worktree command path argument should stay allowed, got {inside_decision:?}"
         );
 
         let _ = fs::remove_dir_all(&root);
