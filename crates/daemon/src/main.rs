@@ -817,8 +817,19 @@ async fn require_api_auth(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    authorize_access(&state, request.headers(), None).await?;
-    Ok(next.run(request).await)
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        runtime.block_on(async move {
+            authorize_access(&state, request.headers(), None).await?;
+            Ok(next.run(request).await)
+        })
+    })
+    .await
+    .map_err(|error| {
+        ApiError::from(anyhow::anyhow!(
+            "blocking protected API task panicked or was canceled: {error}"
+        ))
+    })?
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -10847,6 +10858,81 @@ mod tests {
         storage_blocker
             .join()
             .expect("storage lock holder should join");
+        for client in protected_clients {
+            let response = client
+                .join()
+                .expect("protected client thread should join")
+                .expect("protected request should eventually complete");
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        }
+
+        shutdown_tx.send(()).expect("shutdown signal should send");
+        server
+            .join()
+            .expect("control-plane server thread should join")
+            .expect("control-plane server should stop cleanly");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    async fn protected_storage_wait_probe(State(state): State<AppState>) -> StatusCode {
+        state
+            .store
+            .hold_connection_mutex_for_test(Duration::from_millis(800), None);
+        StatusCode::OK
+    }
+
+    #[tokio::test]
+    async fn control_plane_health_responds_while_protected_handlers_wait_on_storage() {
+        let (state_dir, state) = test_named_app_state("control-plane-post-auth-storage-isolation");
+        let token = state
+            .store
+            .read_local_auth_token()
+            .expect("local auth token should load");
+        let protected_api = Router::new()
+            .route("/storage-wait", get(protected_storage_wait_probe))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_api_auth,
+            ));
+        let router = Router::new()
+            .route("/health", get(health))
+            .nest("/api/test", protected_api)
+            .with_state(state);
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener address should resolve");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = spawn_control_plane_server(listener, router, async move {
+            let _ = shutdown_rx.await;
+        })
+        .expect("control-plane server should spawn");
+
+        let mut protected_clients = Vec::new();
+        for _ in 0..CONTROL_PLANE_WORKER_THREADS {
+            let token = token.clone();
+            protected_clients.push(std::thread::spawn(move || {
+                let authorization = format!("Bearer {token}");
+                read_http_over_tcp_with_headers_and_timeout(
+                    addr,
+                    "/api/test/storage-wait",
+                    &[("Authorization", authorization.as_str())],
+                    Duration::from_secs(2),
+                )
+            }));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+
+        let started = Instant::now();
+        let response = read_health_over_tcp(addr).expect("health response should succeed");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "health response took {elapsed:?}: {response}"
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("Nucleus"), "{response}");
+
         for client in protected_clients {
             let response = client
                 .join()
