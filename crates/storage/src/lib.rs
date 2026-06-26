@@ -4,6 +4,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::Mutex,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -1038,6 +1039,19 @@ impl StateStore {
         };
 
         Ok(hash_auth_token(token) == expected_hash)
+    }
+
+    #[doc(hidden)]
+    pub fn hold_connection_mutex_for_test(
+        &self,
+        duration: Duration,
+        locked: Option<std::sync::mpsc::Sender<()>>,
+    ) {
+        let _connection = self.connection.lock().expect("storage mutex poisoned");
+        if let Some(locked) = locked {
+            let _ = locked.send(());
+        }
+        std::thread::sleep(duration);
     }
 
     pub fn read_update_state(&self) -> Result<StoredUpdateState> {
