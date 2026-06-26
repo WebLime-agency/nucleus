@@ -133,7 +133,8 @@
     size_bytes: number;
   };
 
-  type SessionComposerMode = 'plan' | 'ask' | 'trusted';
+  type SessionApprovalMode = 'ask' | 'autonomous' | 'trusted';
+  type SessionComposerMode = 'plan' | SessionApprovalMode;
   type SessionRunBudgetMode = 'inherit' | 'standard' | 'extended' | 'marathon' | 'unbounded';
   type SessionDrawerMode = 'details' | 'browser';
   type BrowserViewportMode = 'fit' | 'mobile' | 'desktop' | 'wide';
@@ -165,7 +166,7 @@
     updatedAt: number;
   };
 
-  const COMPOSER_MODES: SessionComposerMode[] = ['plan', 'ask', 'trusted'];
+  const COMPOSER_MODES: SessionComposerMode[] = ['plan', 'ask', 'autonomous', 'trusted'];
   const RUN_BUDGET_MODES: SessionRunBudgetMode[] = [
     'inherit',
     'standard',
@@ -196,7 +197,7 @@
   let promptText = $state('');
   let draftTitle = $state('');
   let draftProfileId = $state('');
-  let draftApprovalMode = $state<'ask' | 'trusted'>('ask');
+  let draftApprovalMode = $state<SessionApprovalMode>('ask');
   let draftExecutionMode = $state<'act' | 'plan'>('act');
   let draftRunBudgetMode = $state<SessionRunBudgetMode>('inherit');
   let jobSummaries = $state<JobSummary[]>([]);
@@ -1888,7 +1889,8 @@
       return;
     }
 
-    const nextApprovalMode = mode === 'trusted' ? 'trusted' : 'ask';
+    const nextApprovalMode: SessionApprovalMode =
+      mode === 'trusted' || mode === 'autonomous' ? mode : 'ask';
     const nextExecutionMode = mode === 'plan' ? 'plan' : 'act';
     savingSession = true;
     composerModeMenuOpen = false;
@@ -1907,6 +1909,8 @@
       actionResultMessage =
         mode === 'plan'
           ? 'Plan mode enabled for this session.'
+          : mode === 'autonomous'
+            ? 'Nucleus can auto-run scoped worktree actions in this session.'
           : mode === 'trusted'
             ? 'Nucleus can run actions in this session.'
             : 'Nucleus will ask before commands and edits.';
@@ -2861,8 +2865,9 @@
     return parts.join(' · ');
   }
 
-  function normalizeApprovalMode(value: string | undefined): 'ask' | 'trusted' {
-    return value === 'trusted' ? 'trusted' : 'ask';
+  function normalizeApprovalMode(value: string | undefined): SessionApprovalMode {
+    if (value === 'trusted' || value === 'autonomous') return value;
+    return 'ask';
   }
 
   function normalizeExecutionMode(value: string | undefined): 'act' | 'plan' {
@@ -2883,7 +2888,7 @@
   }
 
   function setDraftComposerMode(mode: SessionComposerMode) {
-    draftApprovalMode = mode === 'trusted' ? 'trusted' : 'ask';
+    draftApprovalMode = mode === 'trusted' || mode === 'autonomous' ? mode : 'ask';
     draftExecutionMode = mode === 'plan' ? 'plan' : 'act';
   }
 
@@ -2896,7 +2901,7 @@
       return 'plan';
     }
 
-    return normalizeApprovalMode(session.approval_mode) === 'trusted' ? 'trusted' : 'ask';
+    return normalizeApprovalMode(session.approval_mode);
   }
 
   function draftComposerMode(): SessionComposerMode {
@@ -2904,17 +2909,19 @@
       return 'plan';
     }
 
-    return draftApprovalMode === 'trusted' ? 'trusted' : 'ask';
+    return draftApprovalMode;
   }
 
   function composerModeLabel(mode: SessionComposerMode) {
     if (mode === 'plan') return 'Plan';
+    if (mode === 'autonomous') return 'Scoped';
     if (mode === 'trusted') return 'Auto-Run';
     return 'Ask First';
   }
 
   function composerModeDescription(mode: SessionComposerMode) {
     if (mode === 'plan') return 'Draft a plan without taking actions.';
+    if (mode === 'autonomous') return 'Auto-run safe worktree edits and validation; block publication and network actions.';
     if (mode === 'trusted') return 'Run trusted actions without approval prompts.';
     return 'Ask before commands, edits, and other actions.';
   }
@@ -4044,7 +4051,7 @@
                       <DropdownMenu.RadioGroup
                         value={sessionComposerMode(selectedSession)}
                         onValueChange={(value) => {
-                          if (value === 'plan' || value === 'ask' || value === 'trusted') {
+                          if (value === 'plan' || value === 'ask' || value === 'autonomous' || value === 'trusted') {
                             void handleSelectComposerMode(value);
                           }
                         }}
@@ -4472,7 +4479,7 @@
                     {/each}
                   </Select>
                   <span class="block text-xs leading-5 text-zinc-500">
-                    Choose whether Nucleus plans first, asks before actions, or auto-runs trusted actions.
+                    Choose whether Nucleus plans first, asks, auto-runs scoped worktree actions, or auto-runs trusted actions.
                   </span>
                 </div>
 

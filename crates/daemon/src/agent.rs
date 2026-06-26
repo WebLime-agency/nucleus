@@ -12,6 +12,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
+use nucleus_approval_policy::{ScopedApprovalDecision, evaluate_autonomous_approval};
 use nucleus_protocol::{
     ApprovalRequestSummary, ArtifactSummary, BrowserActionRequest, BrowserNavigateRequest,
     BrowserSnapshot, CommandSessionSummary, CompiledTurn, CreatePlaybookRequest, DaemonEvent,
@@ -5309,15 +5310,19 @@ async fn handle_tool_call_proposal(
 
     ensure_worker_may_execute_actions(worker)?;
     *tool_calls += 1;
-    let policy = policy_for_tool_with_mode(&tool, &session.session.approval_mode);
+    let approval_gate = approval_gate_for_tool(&tool, &args, &session.session);
+    let policy = approval_gate.policy().clone();
     let tool_call_id = Uuid::new_v4().to_string();
-    let requires_approval = policy.decision == "require_approval";
+    let creates_approval_request = approval_gate.creates_approval_request();
+    let hard_denied = matches!(approval_gate, ApprovalGate::Deny { .. });
     let mut tool_call = state.store.create_tool_call(ToolCallRecord {
         id: tool_call_id.clone(),
         job_id: job_id.to_string(),
         worker_id: worker.id.clone(),
         tool_id: tool.clone(),
-        status: if requires_approval {
+        status: if hard_denied {
+            "denied".to_string()
+        } else if creates_approval_request {
             "pending_approval".to_string()
         } else {
             "queued".to_string()
@@ -5333,7 +5338,62 @@ async fn handle_tool_call_proposal(
         completed_at: None,
     })?;
 
-    if requires_approval {
+    if let ApprovalGate::Deny { reason, .. } = approval_gate {
+        let blocker = format!("Autonomous policy denied {tool}: {reason}");
+        checkpoint.pending_action = None;
+        checkpoint.next_prompt = Some(build_tool_denied_prompt(&tool, &summary, &blocker));
+        write_worker_checkpoint_for_job(
+            state,
+            &worker.id,
+            serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+        )
+        .await?;
+        state.store.update_tool_call(
+            &tool_call_id,
+            ToolCallPatch {
+                status: Some("denied".to_string()),
+                error_class: Some("autonomous_policy_denied".to_string()),
+                error_detail: Some(blocker.clone()),
+                completed_at: Some(Some(unix_timestamp())),
+                ..ToolCallPatch::default()
+            },
+        )?;
+        *step += 1;
+        *worker = state.store.update_worker(
+            &worker.id,
+            WorkerPatch {
+                state: Some("running".to_string()),
+                step_count: Some(*step),
+                tool_call_count: Some(*tool_calls),
+                last_error: Some(String::new()),
+                ..WorkerPatch::default()
+            },
+        )?;
+        let _ = state.store.append_job_event(JobEventRecord {
+            job_id: job_id.to_string(),
+            worker_id: Some(worker.id.clone()),
+            event_type: "tool.denied".to_string(),
+            status: "denied".to_string(),
+            summary: format!("Denied {tool}"),
+            detail: blocker,
+            data_json: json!({
+                "tool_id": tool,
+                "tool_call_id": tool_call_id,
+                "policy_decision": {
+                    "decision": policy.decision,
+                    "reason": policy.reason,
+                    "matched_rule": policy.matched_rule,
+                    "scope_kind": policy.scope_kind,
+                    "risk_level": policy.risk_level,
+                },
+            }),
+        });
+        publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
+        publish_worker_updated(state, worker).await;
+        return Ok(LoopDisposition::Continue);
+    }
+
+    if creates_approval_request {
         let preview = match preview_approval_tool(state, worker, &tool, &args) {
             Ok(preview) => preview,
             Err(error) => {
@@ -5372,6 +5432,11 @@ async fn handle_tool_call_proposal(
             )?;
         }
 
+        let auto_approval_note = match &approval_gate {
+            ApprovalGate::AutoApprove { note, .. } => Some(note.clone()),
+            _ => None,
+        };
+
         let approval = state.store.create_approval_request(ApprovalRequestRecord {
             id: Uuid::new_v4().to_string(),
             job_id: job_id.to_string(),
@@ -5404,6 +5469,45 @@ async fn handle_tool_call_proposal(
             serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
         )
         .await?;
+
+        if let Some(note) = auto_approval_note {
+            let resolved = state.store.update_approval_request(
+                &approval.id,
+                "approved",
+                Some(&note),
+                Some("system"),
+                Some(unix_timestamp()),
+            )?;
+            let _ = state.store.append_job_event(JobEventRecord {
+                job_id: job_id.to_string(),
+                worker_id: Some(worker.id.clone()),
+                event_type: "approval.resolved".to_string(),
+                status: "approved".to_string(),
+                summary: format!("Approved {}", approval.summary),
+                detail: note,
+                data_json: json!({
+                    "approval_id": resolved.id,
+                    "tool_call_id": resolved.tool_call_id,
+                    "resolved_by": resolved.resolved_by,
+                    "policy_decision": {
+                        "decision": policy.decision,
+                        "reason": policy.reason,
+                        "matched_rule": policy.matched_rule,
+                        "scope_kind": policy.scope_kind,
+                        "risk_level": policy.risk_level,
+                    },
+                }),
+            });
+            publish_approval_resolved(state, &resolved).await;
+            let pending = checkpoint
+                .pending_action
+                .clone()
+                .context("auto-approved action was not persisted in the worker checkpoint")?;
+            return execute_pending_tool_action(
+                state, session, job_id, worker, checkpoint, step, tool_calls, cancel_rx, pending,
+            )
+            .await;
+        }
 
         let pause_reason = format!("Waiting for approval to run {}.", tool);
         state.store.update_job(
@@ -21417,6 +21521,157 @@ fn policy_for_tool_with_mode(tool: &str, approval_mode: &str) -> PolicyDecisionR
     }
 }
 
+#[derive(Debug, Clone)]
+enum ApprovalGate {
+    Allow {
+        policy: PolicyDecisionRecord,
+    },
+    RequireApproval {
+        policy: PolicyDecisionRecord,
+    },
+    AutoApprove {
+        policy: PolicyDecisionRecord,
+        note: String,
+    },
+    Deny {
+        policy: PolicyDecisionRecord,
+        reason: String,
+    },
+}
+
+impl ApprovalGate {
+    fn policy(&self) -> &PolicyDecisionRecord {
+        match self {
+            ApprovalGate::Allow { policy }
+            | ApprovalGate::RequireApproval { policy }
+            | ApprovalGate::AutoApprove { policy, .. }
+            | ApprovalGate::Deny { policy, .. } => policy,
+        }
+    }
+
+    fn creates_approval_request(&self) -> bool {
+        matches!(
+            self,
+            ApprovalGate::RequireApproval { .. } | ApprovalGate::AutoApprove { .. }
+        )
+    }
+}
+
+fn approval_gate_for_tool(tool: &str, args: &Value, session: &SessionSummary) -> ApprovalGate {
+    if session.approval_mode == "autonomous" {
+        if let Some(worktree) = autonomous_policy_worktree(session) {
+            return autonomous_approval_gate(tool, args, &worktree);
+        }
+        let policy = policy_for_tool_with_mode(tool, "ask");
+        return if policy.decision == "require_approval" {
+            ApprovalGate::RequireApproval { policy }
+        } else {
+            ApprovalGate::Allow { policy }
+        };
+    }
+
+    let policy = policy_for_tool_with_mode(tool, &session.approval_mode);
+    if policy.decision == "require_approval" {
+        ApprovalGate::RequireApproval { policy }
+    } else {
+        ApprovalGate::Allow { policy }
+    }
+}
+
+fn autonomous_policy_worktree(session: &SessionSummary) -> Option<PathBuf> {
+    if session.workspace_mode != "isolated_worktree" {
+        return None;
+    }
+    let path = session.worktree_path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(path);
+    path.is_absolute().then_some(path)
+}
+
+fn autonomous_approval_gate(tool: &str, args: &Value, worktree: &Path) -> ApprovalGate {
+    match evaluate_autonomous_approval(tool, args, worktree) {
+        ScopedApprovalDecision::Allow(outcome) => {
+            let policy = autonomous_policy_record(
+                tool,
+                "allow",
+                outcome.reason.clone(),
+                format!("autonomous:allow:{tool}"),
+            );
+            if requires_approval_for_tool(tool) {
+                ApprovalGate::AutoApprove {
+                    policy,
+                    note: format!("Auto-approved by autonomous policy: {}.", outcome.reason),
+                }
+            } else {
+                ApprovalGate::Allow { policy }
+            }
+        }
+        ScopedApprovalDecision::Deny(outcome) => {
+            let policy = autonomous_policy_record(
+                tool,
+                "deny",
+                outcome.reason.clone(),
+                format!("autonomous:deny:{tool}"),
+            );
+            ApprovalGate::Deny {
+                policy,
+                reason: outcome.reason,
+            }
+        }
+        ScopedApprovalDecision::Escalate(outcome) => {
+            let policy = autonomous_policy_record(
+                tool,
+                "require_approval",
+                outcome.reason,
+                format!("autonomous:escalate:{tool}"),
+            );
+            ApprovalGate::RequireApproval { policy }
+        }
+    }
+}
+
+fn autonomous_policy_record(
+    tool: &str,
+    decision: &str,
+    reason: String,
+    matched_rule: String,
+) -> PolicyDecisionRecord {
+    PolicyDecisionRecord {
+        decision: decision.to_string(),
+        reason,
+        matched_rule,
+        scope_kind: if is_browser_tool(tool) {
+            "browser"
+        } else if is_mutating_tool(tool)
+            || matches!(
+                tool,
+                "fs.list" | "fs.read_text" | "rg.search" | "git.status" | "git.diff"
+            )
+        {
+            "path"
+        } else {
+            "process"
+        }
+        .to_string(),
+        risk_level: autonomous_policy_risk_level(tool, decision).to_string(),
+    }
+}
+
+fn autonomous_policy_risk_level(tool: &str, decision: &str) -> &'static str {
+    if decision == "deny" {
+        return "high";
+    }
+    if matches!(tool, "command.run" | "python.run" | "tests.run") {
+        return "medium";
+    }
+    if is_mutating_tool(tool) || is_browser_tool(tool) {
+        return "medium";
+    }
+    "low"
+}
+
 fn requires_approval_for_tool(tool: &str) -> bool {
     is_mutating_tool(tool)
         || is_browser_action_tool(tool)
@@ -23700,6 +23955,72 @@ mod tests {
             "session-trusted-actions:fs.write_text"
         );
         assert_eq!(mutation_policy.risk_level, "medium");
+    }
+
+    #[test]
+    fn autonomous_gate_preserves_ask_and_trusted_behavior() {
+        let ask_policy = policy_for_tool_with_mode("command.run", "ask");
+        assert_eq!(ask_policy.decision, "require_approval");
+        assert_eq!(ask_policy.matched_rule, "approval:command:command.run");
+
+        let trusted_policy = policy_for_tool_with_mode("command.run", "trusted");
+        assert_eq!(trusted_policy.decision, "allow");
+        assert_eq!(
+            trusted_policy.matched_rule,
+            "session-trusted-actions:command.run"
+        );
+
+        let mut scratch = scope_test_session(
+            "/tmp/nucleus-scratch",
+            "workspace_scratch",
+            "scratch_only",
+            Vec::new(),
+        );
+        scratch.approval_mode = "autonomous".to_string();
+        assert!(matches!(
+            approval_gate_for_tool("command.run", &json!({"command":"date"}), &scratch),
+            ApprovalGate::RequireApproval { .. }
+        ));
+
+        let mut worktree = scope_test_session(
+            "/tmp/nucleus-worktree",
+            "project_root",
+            "isolated_worktree",
+            Vec::new(),
+        );
+        worktree.approval_mode = "autonomous".to_string();
+        assert!(matches!(
+            approval_gate_for_tool("project.inspect", &json!({}), &worktree),
+            ApprovalGate::Allow { .. }
+        ));
+        assert!(matches!(
+            approval_gate_for_tool("fs.read_text", &json!({"path":"src/lib.rs"}), &worktree),
+            ApprovalGate::Allow { .. }
+        ));
+        assert!(matches!(
+            approval_gate_for_tool(
+                "command.run",
+                &json!({"command":"sh","args":["-lc","cargo test -p nucleus-core"],"cwd":"."}),
+                &worktree,
+            ),
+            ApprovalGate::AutoApprove { .. }
+        ));
+        assert!(matches!(
+            approval_gate_for_tool(
+                "command.run",
+                &json!({"command":"date","cwd":"."}),
+                &worktree
+            ),
+            ApprovalGate::RequireApproval { .. }
+        ));
+        assert!(matches!(
+            approval_gate_for_tool(
+                "command.run",
+                &json!({"command":"git","args":["push"],"cwd":"."}),
+                &worktree
+            ),
+            ApprovalGate::Deny { .. }
+        ));
     }
 
     #[test]
@@ -35025,6 +35346,238 @@ Thanks."#,
                 .any(|grant| grant.tool_id == "command.run")
         );
         assert!(!worker.title.contains("main"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn autonomous_session_auto_approves_safe_edit_and_test_with_receipt_approval() {
+        let state_dir = test_state_dir("autonomous-safe-edit-test");
+        let state = initialize_test_state(&state_dir);
+        let repo = init_autonomous_test_repo(&state_dir, "repo");
+        let session_id = "autonomous-safe-session".to_string();
+        state
+            .store
+            .create_session(autonomous_git_session_record(
+                &session_id,
+                "Autonomous safe edit",
+                &repo,
+            ))
+            .expect("session should persist");
+        let session = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+        let (job_id, mut worker) =
+            create_autonomous_tool_worker(&state, &session_id, &repo, "safe");
+        let mut checkpoint = test_checkpoint_with_prompt("Make the library return 42 and test it.");
+        checkpoint.session_id = session_id.clone();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let mut step = 0;
+        let mut tool_calls = 0;
+
+        let edit = handle_tool_call_proposal(
+            &state,
+            &session,
+            &job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            &mut tool_calls,
+            &mut cancel_rx,
+            "update library".to_string(),
+            "fs.write_text".to_string(),
+            json!({
+                "path":"src/lib.rs",
+                "content":"pub fn answer() -> u32 { 42 }\n\n#[test]\nfn answer_is_42() {\n    assert_eq!(answer(), 42);\n}\n",
+                "create_parent_dirs": false,
+            }),
+        )
+        .await
+        .expect("safe edit proposal should run");
+        assert!(matches!(edit, LoopDisposition::Continue));
+
+        let test_run = handle_tool_call_proposal(
+            &state,
+            &session,
+            &job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            &mut tool_calls,
+            &mut cancel_rx,
+            "run tests".to_string(),
+            "tests.run".to_string(),
+            json!({"command":"cargo test","cwd":".","timeout_secs":120,"output_limit_bytes":8192}),
+        )
+        .await
+        .expect("safe test proposal should run");
+        assert!(matches!(test_run, LoopDisposition::Continue));
+
+        assert_eq!(
+            fs::read_to_string(repo.join("src/lib.rs")).expect("updated lib should read"),
+            "pub fn answer() -> u32 { 42 }\n\n#[test]\nfn answer_is_42() {\n    assert_eq!(answer(), 42);\n}\n"
+        );
+        assert!(
+            state
+                .store
+                .list_pending_approvals()
+                .expect("pending approvals should load")
+                .is_empty(),
+            "safe autonomous actions should not leave pending approvals"
+        );
+
+        let detail = state.store.get_job(&job_id).expect("job should load");
+        assert_eq!(detail.approvals.len(), 2);
+        assert!(
+            detail
+                .approvals
+                .iter()
+                .all(|approval| approval.state == "approved")
+        );
+        assert!(
+            detail
+                .tool_calls
+                .iter()
+                .any(|call| { call.tool_id == "fs.write_text" && call.status == "completed" })
+        );
+        assert!(
+            detail
+                .tool_calls
+                .iter()
+                .any(|call| { call.tool_id == "tests.run" && call.status == "completed" })
+        );
+
+        let receipts = state
+            .store
+            .list_mutation_receipts_for_session(&session_id)
+            .expect("mutation receipts should load");
+        let edit_receipt = receipts
+            .iter()
+            .find(|receipt| receipt.tool == "fs.write_text")
+            .expect("safe edit should create mutation receipt");
+        assert!(
+            edit_receipt.approval_id.is_some(),
+            "auto-approved mutation receipt must retain approval_id"
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn autonomous_session_denies_dangerous_and_escalates_ambiguous_actions() {
+        let state_dir = test_state_dir("autonomous-deny-escalate");
+        let state = initialize_test_state(&state_dir);
+        let deny_repo = init_autonomous_test_repo(&state_dir, "deny-repo");
+        let deny_session_id = "autonomous-deny-session".to_string();
+        state
+            .store
+            .create_session(autonomous_git_session_record(
+                &deny_session_id,
+                "Autonomous deny",
+                &deny_repo,
+            ))
+            .expect("deny session should persist");
+        let deny_session = state
+            .store
+            .get_session(&deny_session_id)
+            .expect("deny session should load");
+        let (deny_job_id, mut deny_worker) =
+            create_autonomous_tool_worker(&state, &deny_session_id, &deny_repo, "deny");
+        let mut deny_checkpoint = test_checkpoint_with_prompt("Push the branch.");
+        deny_checkpoint.session_id = deny_session_id.clone();
+        let (_deny_cancel_tx, mut deny_cancel_rx) = watch::channel(false);
+        let mut deny_step = 0;
+        let mut deny_tool_calls = 0;
+
+        let denied = handle_tool_call_proposal(
+            &state,
+            &deny_session,
+            &deny_job_id,
+            &mut deny_worker,
+            &mut deny_checkpoint,
+            &mut deny_step,
+            &mut deny_tool_calls,
+            &mut deny_cancel_rx,
+            "push branch".to_string(),
+            "command.run".to_string(),
+            json!({"command":"git","args":["push"],"cwd":"."}),
+        )
+        .await
+        .expect("dangerous proposal should be denied");
+        assert!(matches!(denied, LoopDisposition::Continue));
+        let deny_detail = state
+            .store
+            .get_job(&deny_job_id)
+            .expect("deny job should load");
+        let denied_call = deny_detail
+            .tool_calls
+            .iter()
+            .find(|call| call.tool_id == "command.run")
+            .expect("denied command should be recorded");
+        assert_eq!(denied_call.status, "denied");
+        assert_eq!(denied_call.error_class, "autonomous_policy_denied");
+        assert!(denied_call.error_detail.contains("git-mutating"));
+        assert!(
+            state
+                .store
+                .list_mutation_receipts_for_session(&deny_session_id)
+                .expect("deny receipts should load")
+                .is_empty(),
+            "hard-denied command must not execute or mutate"
+        );
+
+        let escalate_repo = init_autonomous_test_repo(&state_dir, "escalate-repo");
+        let escalate_session_id = "autonomous-escalate-session".to_string();
+        state
+            .store
+            .create_session(autonomous_git_session_record(
+                &escalate_session_id,
+                "Autonomous escalate",
+                &escalate_repo,
+            ))
+            .expect("escalate session should persist");
+        let escalate_session = state
+            .store
+            .get_session(&escalate_session_id)
+            .expect("escalate session should load");
+        let (escalate_job_id, mut escalate_worker) =
+            create_autonomous_tool_worker(&state, &escalate_session_id, &escalate_repo, "escalate");
+        let mut escalate_checkpoint = test_checkpoint_with_prompt("Run date.");
+        escalate_checkpoint.session_id = escalate_session_id.clone();
+        let (_escalate_cancel_tx, mut escalate_cancel_rx) = watch::channel(false);
+        let mut escalate_step = 0;
+        let mut escalate_tool_calls = 0;
+
+        let escalated = handle_tool_call_proposal(
+            &state,
+            &escalate_session,
+            &escalate_job_id,
+            &mut escalate_worker,
+            &mut escalate_checkpoint,
+            &mut escalate_step,
+            &mut escalate_tool_calls,
+            &mut escalate_cancel_rx,
+            "show date".to_string(),
+            "command.run".to_string(),
+            json!({"command":"date","cwd":"."}),
+        )
+        .await
+        .expect("ambiguous proposal should pause for approval");
+        assert!(matches!(escalated, LoopDisposition::Return));
+        let approvals = state
+            .store
+            .list_pending_approvals()
+            .expect("pending approvals should load");
+        let approval = approvals
+            .iter()
+            .find(|approval| approval.job_id == escalate_job_id)
+            .expect("ambiguous command should create pending approval");
+        assert_eq!(approval.policy_decision.decision, "require_approval");
+        assert_eq!(
+            approval.policy_decision.matched_rule,
+            "autonomous:escalate:command.run"
+        );
 
         let _ = fs::remove_dir_all(&state_dir);
     }
@@ -48100,6 +48653,189 @@ for line in sys.stdin:
             execution_mode: "act".to_string(),
             run_budget_mode: "inherit".to_string(),
         }
+    }
+
+    fn autonomous_git_session_record(id: &str, title: &str, worktree: &Path) -> SessionRecord {
+        let mut record = test_session_record(id, title, worktree);
+        record.scope = "project".to_string();
+        record.project_id = "autonomous-project".to_string();
+        record.project_title = "Autonomous Project".to_string();
+        record.project_path = worktree.display().to_string();
+        record.working_dir_kind = "project_root".to_string();
+        record.workspace_mode = "isolated_worktree".to_string();
+        record.attachment_mode = "new_worktree".to_string();
+        record.worktree_id = id.to_string();
+        record.source_project_path = worktree.display().to_string();
+        record.git_root = worktree.display().to_string();
+        record.worktree_path = worktree.display().to_string();
+        record.git_branch = "dev".to_string();
+        record.git_base_ref = "dev".to_string();
+        record.git_head = git_stdout_simple(worktree, &["rev-parse", "HEAD"]);
+        record.git_dirty = false;
+        record.git_untracked_count = 0;
+        record.git_remote_tracking_branch = "origin/dev".to_string();
+        record.approval_mode = "autonomous".to_string();
+        record
+    }
+
+    fn init_autonomous_test_repo(root: &Path, label: &str) -> PathBuf {
+        let repo = root.join(label);
+        fs::create_dir_all(repo.join("src")).expect("repo src should exist");
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"autonomous-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest should write");
+        fs::write(repo.join("src/lib.rs"), "pub fn answer() -> u32 { 41 }\n")
+            .expect("lib should write");
+        run_git_simple(&repo, &["init", "-b", "dev"]);
+        run_git_simple(&repo, &["config", "user.email", "nucleus@example.test"]);
+        run_git_simple(&repo, &["config", "user.name", "Nucleus Test"]);
+        run_git_simple(&repo, &["add", "."]);
+        run_git_simple(&repo, &["commit", "-m", "initial"]);
+        let origin = root.join(format!("{label}-origin.git"));
+        run_git_simple(
+            root,
+            &["init", "--bare", origin.to_str().expect("origin path utf8")],
+        );
+        run_git_simple(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                origin.to_str().expect("origin path utf8"),
+            ],
+        );
+        run_git_simple(&repo, &["push", "-u", "origin", "dev"]);
+        repo
+    }
+
+    fn create_autonomous_tool_worker(
+        state: &AppState,
+        session_id: &str,
+        worktree: &Path,
+        label: &str,
+    ) -> (String, WorkerSummary) {
+        let job_id = format!("autonomous-{label}-job");
+        state
+            .store
+            .create_job(JobRecord {
+                id: job_id.clone(),
+                session_id: Some(session_id.to_string()),
+                parent_job_id: None,
+                template_id: None,
+                task_class: Some("local_project".to_string()),
+                title: format!("Autonomous {label}"),
+                purpose: "test autonomous approval gating".to_string(),
+                trigger_kind: "child_job".to_string(),
+                state: "running".to_string(),
+                requested_by: "test".to_string(),
+                prompt_excerpt: String::new(),
+                publication_intent_text: None,
+            })
+            .expect("autonomous job should persist");
+        let parent_worker_id = format!("autonomous-{label}-parent-worker");
+        state
+            .store
+            .create_worker(WorkerRecord {
+                id: parent_worker_id.clone(),
+                job_id: job_id.clone(),
+                parent_worker_id: None,
+                title: "Autonomous parent worker".to_string(),
+                lane: ACTION_EXECUTOR_LANE.to_string(),
+                state: "running".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "test-model".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: worktree.display().to_string(),
+                read_roots: vec![worktree.display().to_string()],
+                write_roots: vec![worktree.display().to_string()],
+                max_steps: 24,
+                max_tool_calls: 48,
+                max_wall_clock_secs: 120,
+            })
+            .expect("autonomous parent worker should persist");
+        let mut worker = state
+            .store
+            .create_worker(WorkerRecord {
+                id: format!("autonomous-{label}-worker"),
+                job_id: job_id.clone(),
+                parent_worker_id: Some(parent_worker_id.clone()),
+                title: "Autonomous child worker".to_string(),
+                lane: MAIN_EXECUTOR_LANE.to_string(),
+                state: "running".to_string(),
+                provider: "openai_compatible".to_string(),
+                model: "test-model".to_string(),
+                route_id: String::new(),
+                route_title: String::new(),
+                provider_base_url: String::new(),
+                provider_api_key: String::new(),
+                provider_session_id: String::new(),
+                working_dir: worktree.display().to_string(),
+                read_roots: vec![worktree.display().to_string()],
+                write_roots: vec![worktree.display().to_string()],
+                max_steps: 24,
+                max_tool_calls: 48,
+                max_wall_clock_secs: 120,
+            })
+            .expect("autonomous worker should persist");
+        let grants = root_worker_capabilities();
+        state
+            .store
+            .replace_tool_capability_grants(&worker.id, &grants)
+            .expect("autonomous worker grants should persist");
+        worker.capabilities = grant_records_to_summaries(grants);
+        state
+            .store
+            .update_job(
+                &job_id,
+                JobPatch {
+                    root_worker_id: Some(parent_worker_id),
+                    ..JobPatch::default()
+                },
+            )
+            .expect("job root worker should update");
+        (job_id, worker)
+    }
+
+    fn run_git_simple(cwd: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("git {} should run: {error}", args.join(" ")));
+        if !output.status.success() {
+            panic!(
+                "git {} failed\nstdout:\n{}\nstderr:\n{}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    fn git_stdout_simple(cwd: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("git {} should run: {error}", args.join(" ")));
+        if !output.status.success() {
+            panic!(
+                "git {} failed\nstdout:\n{}\nstderr:\n{}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
     fn test_git_session_record(

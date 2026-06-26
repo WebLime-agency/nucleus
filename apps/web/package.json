@@ -7,7 +7,7 @@
     "dev": "NODE_OPTIONS=--max-http-header-size=65536 vite dev",
     "build": "svelte-kit sync && vite build",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json && npm run test",
-    "test": "node --test src/lib/nucleus/*.test.mjs"
+    "test": "node --import tsx --test src/lib/nucleus/*.test.mjs"
   },
   "devDependencies": {
     "@internationalized/date": "^3.12.1",
@@ -22,6 +22,7 @@
     "svelte": "^5.39.3",
     "svelte-check": "^4.3.1",
     "tailwindcss": "^4.2.2",
+    "tsx": "^4.20.6",
     "typescript": "^5.9.3",
     "vite": "^7.1.7"
   },
