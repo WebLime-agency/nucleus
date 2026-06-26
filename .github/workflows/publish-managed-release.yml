@@ -54,7 +54,7 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: publish-managed-release-${{ github.event_name == 'schedule' && 'nightly' || github.event.inputs.channel || 'manual' }}
+  group: publish-managed-release-${{ github.event_name == 'schedule' && 'stable' || github.event.inputs.channel || 'manual' }}
   cancel-in-progress: false
 
 env:
@@ -93,7 +93,7 @@ jobs:
 
           channel="${INPUT_CHANNEL:-nightly}"
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            channel="nightly"
+            channel="stable"
           fi
 
           case "${channel}" in
@@ -120,6 +120,10 @@ jobs:
 
           release_pr_number=""
           release_pr_url=""
+          should_publish="true"
+          noop_message=""
+          latest_stable_tag=""
+          latest_stable_tag_sha=""
 
           if [ "${channel}" = "stable" ]; then
             origin_main_sha="$(git rev-parse origin/main)"
@@ -127,6 +131,32 @@ jobs:
             if [ "${selected_source_sha}" != "${origin_main_sha}" ]; then
               echo "::error::Stable releases must publish current origin/main. Promote the desired source to main before running the stable publish workflow."
               exit 1
+            fi
+
+            if [ "${{ github.event_name }}" = "schedule" ]; then
+              gate_output="$(mktemp)"
+              scripts/check-stable-release-work.sh origin/main | tee "${gate_output}"
+              should_publish="$(awk -F= '$1 == "should_publish" { print substr($0, index($0, "=") + 1); exit }' "${gate_output}")"
+              latest_stable_tag="$(awk -F= '$1 == "latest_tag" { print substr($0, index($0, "=") + 1); exit }' "${gate_output}")"
+              latest_stable_tag_sha="$(awk -F= '$1 == "latest_tag_sha" { print substr($0, index($0, "=") + 1); exit }' "${gate_output}")"
+
+              if [ "${should_publish}" = "false" ]; then
+                source_sha="$(awk -F= '$1 == "source_sha" { print substr($0, index($0, "=") + 1); exit }' "${gate_output}")"
+                noop_message="No new work on main since ${latest_stable_tag}; nothing to publish."
+                echo "${noop_message}"
+
+                {
+                  echo "channel=${channel}"
+                  echo "source_ref=${source_ref}"
+                  echo "source_sha=${source_sha}"
+                  echo "source_short=${source_sha:0:12}"
+                  echo "should_publish=false"
+                  echo "noop_message=${noop_message}"
+                  echo "latest_stable_tag=${latest_stable_tag}"
+                  echo "latest_stable_tag_sha=${latest_stable_tag_sha}"
+                } >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
             fi
 
             resolved_version="$(
@@ -251,6 +281,10 @@ jobs:
             echo "release_id=${release_id}"
             echo "release_pr_number=${release_pr_number}"
             echo "release_pr_url=${release_pr_url}"
+            echo "should_publish=${should_publish}"
+            echo "noop_message=${noop_message}"
+            echo "latest_stable_tag=${latest_stable_tag}"
+            echo "latest_stable_tag_sha=${latest_stable_tag_sha}"
             echo "retention_count=${retention_count}"
             echo "channel_tag=${channel_tag}"
             echo "manifest_name=${manifest_name}"
@@ -258,31 +292,38 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust
+        if: steps.release.outputs.should_publish == 'true'
         uses: Swatinem/rust-cache@v2
 
       - name: Setup Node
+        if: steps.release.outputs.should_publish == 'true'
         uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
 
       - name: Install dependencies
+        if: steps.release.outputs.should_publish == 'true'
         run: npm ci
 
       - name: Verify Rust
+        if: steps.release.outputs.should_publish == 'true'
         run: |
           cargo fmt --all --check
           cargo test --manifest-path Cargo.toml
 
       - name: Verify and build web
+        if: steps.release.outputs.should_publish == 'true'
         run: |
           npm run check:web
           npm run build:web
 
       - name: Build release binaries
+        if: steps.release.outputs.should_publish == 'true'
         run: cargo build --release -p nucleus-daemon -p nucleus-cli
 
       - name: Restore current channel manifest
+        if: steps.release.outputs.should_publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           CHANNEL_TAG: ${{ steps.release.outputs.channel_tag }}
@@ -299,6 +340,7 @@ jobs:
           fi
 
       - name: Package managed release
+        if: steps.release.outputs.should_publish == 'true'
         env:
           CHANNEL: ${{ steps.release.outputs.channel }}
           RELEASE_ID: ${{ steps.release.outputs.release_id }}
@@ -326,6 +368,7 @@ jobs:
 
       - name: Apply channel retention
         id: retention
+        if: steps.release.outputs.should_publish == 'true'
         env:
           MANIFEST_NAME: ${{ steps.release.outputs.manifest_name }}
           RETENTION_COUNT: ${{ steps.release.outputs.retention_count }}
@@ -353,6 +396,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Validate packaged install
+        if: steps.release.outputs.should_publish == 'true'
         env:
           CHANNEL: ${{ steps.release.outputs.channel }}
           MANIFEST_NAME: ${{ steps.release.outputs.manifest_name }}
@@ -386,7 +430,7 @@ jobs:
 
       - name: Push stable source tag
         id: stable_source_tag
-        if: steps.release.outputs.channel == 'stable'
+        if: steps.release.outputs.should_publish == 'true' && steps.release.outputs.channel == 'stable'
         env:
           VERSION: ${{ steps.release.outputs.version }}
           SOURCE_SHA: ${{ steps.release.outputs.source_sha }}
@@ -436,6 +480,7 @@ jobs:
 
       - name: Publish channel release
         id: publish_channel
+        if: steps.release.outputs.should_publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           CHANNEL: ${{ steps.release.outputs.channel }}
@@ -501,7 +546,7 @@ jobs:
           EOF
 
       - name: Roll back stable source refs after publish failure
-        if: ${{ failure() && steps.publish_channel.outcome == 'failure' && steps.release.outputs.channel == 'stable' && steps.stable_source_tag.outputs.pushed == 'true' }}
+        if: ${{ failure() && steps.release.outputs.should_publish == 'true' && steps.publish_channel.outcome == 'failure' && steps.release.outputs.channel == 'stable' && steps.stable_source_tag.outputs.pushed == 'true' }}
         env:
           VERSION: ${{ steps.release.outputs.version }}
           SOURCE_SHA: ${{ steps.release.outputs.source_sha }}
@@ -539,6 +584,7 @@ jobs:
           fi
 
       - name: Validate published install
+        if: steps.release.outputs.should_publish == 'true'
         env:
           CHANNEL: ${{ steps.release.outputs.channel }}
         run: |
@@ -575,6 +621,7 @@ jobs:
           test -d "${install_root}/current/node_modules/playwright-core"
 
       - name: Summarize release
+        if: steps.release.outputs.should_publish == 'true'
         env:
           CHANNEL: ${{ steps.release.outputs.channel }}
           RELEASE_ID: ${{ steps.release.outputs.release_id }}
@@ -591,4 +638,15 @@ jobs:
             echo "- Version: \`${VERSION}\`"
             echo "- Channel tag: \`${CHANNEL_TAG}\`"
             echo "- Manifest URL: \`${ARTIFACT_BASE_URL}/${MANIFEST_NAME}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summarize no-op
+        if: steps.release.outputs.should_publish == 'false'
+        env:
+          NOOP_MESSAGE: ${{ steps.release.outputs.noop_message }}
+        run: |
+          {
+            echo "## Managed Release No-op"
+            echo
+            echo "${NOOP_MESSAGE}"
           } >> "$GITHUB_STEP_SUMMARY"
