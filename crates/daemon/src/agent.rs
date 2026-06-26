@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
+    future::Future,
     io::ErrorKind,
     net::TcpListener as StdTcpListener,
     path::{Component, Path, PathBuf},
@@ -1525,10 +1526,12 @@ async fn continue_after_unavailable_main_delegation(
         "Delegation blocker:\n{}\n\nOriginal delegation reason: {}\nRequested summary: {}",
         detail, enforcement.reason, enforcement.summary
     ));
-    state.store.write_worker_checkpoint(
+    write_worker_checkpoint_for_job(
+        state,
         &worker.id,
-        &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
-    )?;
+        serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+    )
+    .await?;
     *step += 1;
     *worker = state.store.update_worker(
         &worker.id,
@@ -2759,9 +2762,12 @@ pub async fn start_prompt_job(
         browser_verification_final_answer_rejected: false,
         patch_loop_guardrail_triggered,
     };
-    state
-        .store
-        .write_worker_checkpoint(&root_worker_id, &serde_json::to_value(checkpoint).unwrap())?;
+    write_worker_checkpoint_for_job(
+        &state,
+        &root_worker_id,
+        serde_json::to_value(checkpoint).unwrap(),
+    )
+    .await?;
 
     let started = state.store.get_session(&session_id)?;
     let _ = publish_session_event(&state, started).await;
@@ -3637,10 +3643,12 @@ async fn resume_waiting_worker(
         compacted_range: None,
     });
     checkpoint.next_prompt = Some(build_wait_resume_prompt(wait, reason));
-    state.store.write_worker_checkpoint(
+    write_worker_checkpoint_for_job(
+        state,
         &worker.id,
-        &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
-    )?;
+        serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+    )
+    .await?;
     state.store.update_job(
         &worker.job_id,
         JobPatch {
@@ -3781,11 +3789,36 @@ fn is_non_terminal_tool_call_status(status: &str) -> bool {
 }
 
 fn spawn_job_task(state: AppState, job_id: String) {
-    tokio::spawn(async move {
-        if let Err(error) = run_job(state.clone(), job_id.clone()).await {
+    let run_state = state.clone();
+    let fail_state = state.clone();
+    spawn_on_job_runtime(&state, async move {
+        if let Err(error) = run_job(run_state, job_id.clone()).await {
             warn!(job_id = %job_id, error = %error, "hidden worker job crashed");
-            let _ = fail_job(&state, &job_id, &error.to_string()).await;
+            let _ = fail_job(&fail_state, &job_id, &error.to_string()).await;
         }
+    });
+}
+
+fn spawn_on_job_runtime<F>(state: &AppState, task: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    std::mem::drop(state.job_runtime.spawn(task));
+}
+
+#[cfg(test)]
+pub(crate) fn spawn_blocking_job_runtime_probe(
+    state: AppState,
+    duration: Duration,
+    started: std::sync::mpsc::Sender<String>,
+) {
+    spawn_on_job_runtime(&state, async move {
+        let thread_name = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_string();
+        let _ = started.send(thread_name);
+        std::thread::sleep(duration);
     });
 }
 
@@ -4771,6 +4804,19 @@ enum LoopDisposition {
     Return,
 }
 
+async fn write_worker_checkpoint_for_job(
+    state: &AppState,
+    worker_id: &str,
+    checkpoint: Value,
+) -> Result<()> {
+    let store = state.store.clone();
+    let worker_id = worker_id.to_string();
+    crate::io_boundary::run_job_blocking("write_worker_checkpoint", move || {
+        store.write_worker_checkpoint(&worker_id, &checkpoint)
+    })
+    .await
+}
+
 async fn retry_plan_mode_action(
     state: &AppState,
     job_id: &str,
@@ -4782,10 +4828,12 @@ async fn retry_plan_mode_action(
     attempted_action: &str,
 ) -> Result<()> {
     checkpoint.next_prompt = Some(build_plan_mode_retry_prompt(summary, attempted_action));
-    state.store.write_worker_checkpoint(
+    write_worker_checkpoint_for_job(
+        state,
         &worker.id,
-        &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
-    )?;
+        serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+    )
+    .await?;
     *step += 1;
     *worker = state.store.update_worker(
         &worker.id,
@@ -4915,10 +4963,12 @@ async fn handle_pending_action(
             } else {
                 Some(build_child_job_results_prompt(&pending.summary, &results))
             };
-            state.store.write_worker_checkpoint(
+            write_worker_checkpoint_for_job(
+                state,
                 &worker.id,
-                &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
-            )?;
+                serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+            )
+            .await?;
             let completed_count = child_details
                 .iter()
                 .filter(|detail| detail.job.state == "completed")
@@ -5088,11 +5138,13 @@ async fn handle_pending_action(
                     )
                     .as_str(),
                 ));
-                state.store.write_worker_checkpoint(
+                write_worker_checkpoint_for_job(
+                    state,
                     &worker.id,
-                    &serde_json::to_value(&checkpoint)
+                    serde_json::to_value(&checkpoint)
                         .context("failed to encode worker checkpoint")?,
-                )?;
+                )
+                .await?;
                 state.store.update_tool_call(
                     &pending.tool_call_id,
                     ToolCallPatch {
@@ -5148,11 +5200,13 @@ async fn handle_pending_action(
                     &pending.summary,
                     &result,
                 ));
-                state.store.write_worker_checkpoint(
+                write_worker_checkpoint_for_job(
+                    state,
                     &worker.id,
-                    &serde_json::to_value(&checkpoint)
+                    serde_json::to_value(&checkpoint)
                         .context("failed to encode worker checkpoint")?,
-                )?;
+                )
+                .await?;
                 state.store.update_tool_call(
                     &pending.tool_call_id,
                     ToolCallPatch {
@@ -5344,10 +5398,12 @@ async fn handle_tool_call_proposal(
             tool: tool.clone(),
             args,
         });
-        state.store.write_worker_checkpoint(
+        write_worker_checkpoint_for_job(
+            state,
             &worker.id,
-            &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
-        )?;
+            serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+        )
+        .await?;
 
         let pause_reason = format!("Waiting for approval to run {}.", tool);
         state.store.update_job(
@@ -5572,10 +5628,12 @@ async fn handle_child_job_proposal(
         tool: String::new(),
         args: Value::Null,
     });
-    state.store.write_worker_checkpoint(
+    write_worker_checkpoint_for_job(
+        state,
         &worker.id,
-        &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
-    )?;
+        serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+    )
+    .await?;
 
     let _ = state.store.append_job_event(JobEventRecord {
         job_id: job_id.to_string(),
@@ -5585,7 +5643,7 @@ async fn handle_child_job_proposal(
         summary: format!("Spawned {} child jobs", child_job_ids.len()),
         detail: summary.clone(),
         data_json: json!({
-            "child_job_ids": child_job_ids,
+            "child_job_ids": child_job_ids.clone(),
         }),
     });
     publish_job_updated(state, &state.store.get_job(job_id)?.job).await;
@@ -5600,6 +5658,9 @@ async fn handle_child_job_proposal(
         &[],
     )
     .await;
+    for child_job_id in child_job_ids {
+        spawn_job_task(state.clone(), child_job_id);
+    }
     Ok(LoopDisposition::Continue)
 }
 
@@ -5675,10 +5736,12 @@ async fn park_worker_wait(
         last_checked_at: None,
     };
     let wait_json = serde_json::to_value(&wait).context("failed to encode worker wait")?;
-    state.store.write_worker_checkpoint(
+    write_worker_checkpoint_for_job(
+        state,
         &worker.id,
-        &serde_json::to_value(checkpoint).context("failed to encode worker checkpoint")?,
-    )?;
+        serde_json::to_value(checkpoint).context("failed to encode worker checkpoint")?,
+    )
+    .await?;
     state.store.update_job(
         job_id,
         JobPatch {
@@ -5747,10 +5810,12 @@ async fn retry_worker_final_answer(
     rejected_final_answer: &str,
 ) -> Result<()> {
     checkpoint.next_prompt = Some(retry_prompt.to_string());
-    state.store.write_worker_checkpoint(
+    write_worker_checkpoint_for_job(
+        state,
         &worker.id,
-        &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
-    )?;
+        serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+    )
+    .await?;
     *step += 1;
     *worker = state.store.update_worker(
         &worker.id,
@@ -5788,10 +5853,12 @@ async fn record_worker_progress_update(
     detail: &str,
 ) -> Result<()> {
     checkpoint.next_prompt = progress_update_next_prompt();
-    state.store.write_worker_checkpoint(
+    write_worker_checkpoint_for_job(
+        state,
         &worker.id,
-        &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
-    )?;
+        serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+    )
+    .await?;
     *step += 1;
     *worker = state.store.update_worker(
         &worker.id,
@@ -5846,6 +5913,7 @@ async fn create_child_job(
         target_plan,
         limits,
         images,
+        false,
     )
     .await
 }
@@ -5962,6 +6030,7 @@ async fn create_child_job_with_limits(
     target_plan: ChildJobTargetPlan,
     limits: ChildJobRunLimits,
     images: &[SessionTurnImage],
+    autostart: bool,
 ) -> Result<String> {
     let title = proposal.title.trim();
     if title.is_empty() {
@@ -6094,15 +6163,19 @@ async fn create_child_job_with_limits(
         browser_verification_final_answer_rejected: false,
         patch_loop_guardrail_triggered: false,
     };
-    state.store.write_worker_checkpoint(
+    write_worker_checkpoint_for_job(
+        state,
         &child_worker.id,
-        &serde_json::to_value(checkpoint).context("failed to encode child worker checkpoint")?,
-    )?;
+        serde_json::to_value(checkpoint).context("failed to encode child worker checkpoint")?,
+    )
+    .await?;
 
     publish_job_created(state, &child_job).await;
     publish_worker_updated(state, &child_worker).await;
     publish_job_updated(state, &state.store.get_job(parent_job_id)?.job).await;
-    spawn_job_task(state.clone(), child_job_id.clone());
+    if autostart {
+        spawn_job_task(state.clone(), child_job_id.clone());
+    }
     Ok(child_job_id)
 }
 
@@ -7523,10 +7596,12 @@ async fn reuse_equivalent_child_jobs_if_any(
         });
         checkpoint.next_prompt = None;
     }
-    state.store.write_worker_checkpoint(
+    write_worker_checkpoint_for_job(
+        state,
         &worker.id,
-        &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
-    )?;
+        serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+    )
+    .await?;
     let _ = state.store.append_job_event(JobEventRecord {
         job_id: job_id.to_string(),
         worker_id: Some(worker.id.clone()),
@@ -7725,10 +7800,12 @@ async fn handle_local_project_validation_recovery_before_budget(
                 &mutation_receipts,
                 &command,
             ));
-            state.store.write_worker_checkpoint(
+            write_worker_checkpoint_for_job(
+                state,
                 &worker.id,
-                &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
-            )?;
+                serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+            )
+            .await?;
             let _ = state.store.append_job_event(JobEventRecord {
                 job_id: job_id.to_string(),
                 worker_id: Some(worker.id.clone()),
@@ -14640,14 +14717,16 @@ async fn compact_checkpoint_if_needed(
                         "compaction did not reduce prompt estimate (threshold={threshold}, before_tokens={before_tokens}, after_tokens={after_tokens})"
                     )));
                 }
-                state.store.write_worker_checkpoint(
+                write_worker_checkpoint_for_job(
+                    state,
                     &worker.id,
-                    &serde_json::to_value(checkpoint_for_pre_turn_persistence(
+                    serde_json::to_value(checkpoint_for_pre_turn_persistence(
                         checkpoint,
                         queued_prompt_for_persistence,
                     ))
                     .context("failed to encode worker checkpoint")?,
-                )?;
+                )
+                .await?;
                 audit_compaction_outcome(state, worker, &outcome).await;
                 record_memory_audit(
                     state,
@@ -14676,14 +14755,16 @@ async fn compact_checkpoint_if_needed(
                         };
                         let after_tokens = estimate_prompt_tokens(&compiled_turn);
                         if after_tokens < before_tokens {
-                            state.store.write_worker_checkpoint(
+                            write_worker_checkpoint_for_job(
+                                state,
                                 &worker.id,
-                                &serde_json::to_value(checkpoint_for_pre_turn_persistence(
+                                serde_json::to_value(checkpoint_for_pre_turn_persistence(
                                     checkpoint,
                                     queued_prompt_for_persistence,
                                 ))
                                 .context("failed to encode worker checkpoint")?,
-                            )?;
+                            )
+                            .await?;
                             record_memory_audit(
                                 state,
                                 "memory.compaction.applied",
@@ -14761,14 +14842,16 @@ async fn compact_checkpoint_if_needed(
                         };
                         let after_tokens = estimate_prompt_tokens(&compiled_turn);
                         if after_tokens < before_tokens {
-                            state.store.write_worker_checkpoint(
+                            write_worker_checkpoint_for_job(
+                                state,
                                 &worker.id,
-                                &serde_json::to_value(checkpoint_for_pre_turn_persistence(
+                                serde_json::to_value(checkpoint_for_pre_turn_persistence(
                                     checkpoint,
                                     queued_prompt_for_persistence,
                                 ))
                                 .context("failed to encode worker checkpoint")?,
-                            )?;
+                            )
+                            .await?;
                             record_memory_audit(
                                 state,
                                 "memory.compaction.applied",
@@ -16085,11 +16168,13 @@ async fn execute_pending_tool_action(
                         &pending.summary,
                         &tool_result,
                     ));
-                    state.store.write_worker_checkpoint(
+                    write_worker_checkpoint_for_job(
+                        state,
                         &worker.id,
-                        &serde_json::to_value(&checkpoint)
+                        serde_json::to_value(&checkpoint)
                             .context("failed to encode worker checkpoint")?,
-                    )?;
+                    )
+                    .await?;
                     let _ = state.store.append_job_event(JobEventRecord {
                         job_id: job_id.to_string(),
                         worker_id: Some(worker.id.clone()),
@@ -16154,10 +16239,12 @@ async fn execute_pending_tool_action(
             },
         );
         checkpoint.pending_action = None;
-        let _ = state.store.write_worker_checkpoint(
+        let _ = write_worker_checkpoint_for_job(
+            state,
             &worker.id,
-            &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
-        );
+            serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+        )
+        .await;
         return Ok(LoopDisposition::Return);
     }
 
@@ -16187,10 +16274,12 @@ async fn execute_pending_tool_action(
         &pending.summary,
         &tool_result,
     ));
-    state.store.write_worker_checkpoint(
+    write_worker_checkpoint_for_job(
+        state,
         &worker.id,
-        &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
-    )?;
+        serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+    )
+    .await?;
     let _ = state.store.append_job_event(JobEventRecord {
         job_id: job_id.to_string(),
         worker_id: Some(worker.id.clone()),
@@ -16247,10 +16336,12 @@ async fn record_recoverable_tool_failure(
         &pending.summary,
         &tool_result,
     ));
-    state.store.write_worker_checkpoint(
+    write_worker_checkpoint_for_job(
+        state,
         &worker.id,
-        &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
-    )?;
+        serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+    )
+    .await?;
 
     let user_failure = format!("{} failed: {}", pending.tool, error_detail);
     let current_detail = state.store.get_job(job_id)?;
@@ -19702,10 +19793,12 @@ async fn run_bounded_command_tool(
         .context("failed to transfer the command write lock")?;
     if let Some(pending) = checkpoint.pending_action.as_mut() {
         pending.command_session_id = Some(started.id.clone());
-        state.store.write_worker_checkpoint(
+        write_worker_checkpoint_for_job(
+            state,
             &worker.id,
-            &serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
-        )?;
+            serde_json::to_value(&checkpoint).context("failed to encode worker checkpoint")?,
+        )
+        .await?;
     }
     let completed =
         wait_for_command_session_completion(state, &started.id, cancel_rx, "command.run").await?;
@@ -22317,9 +22410,12 @@ async fn queue_playbook_job(
         browser_verification_final_answer_rejected: false,
         patch_loop_guardrail_triggered: false,
     };
-    state
-        .store
-        .write_worker_checkpoint(&root_worker_id, &serde_json::to_value(checkpoint).unwrap())?;
+    write_worker_checkpoint_for_job(
+        state,
+        &root_worker_id,
+        serde_json::to_value(checkpoint).unwrap(),
+    )
+    .await?;
 
     if let Ok(updated) = state.store.get_session(&session_id) {
         let _ = publish_session_event(state, updated).await;
@@ -23348,12 +23444,28 @@ mod tests {
         env, fs,
         path::{Path, PathBuf},
         sync::{
-            Arc, Mutex as TestMutex,
+            Arc, Mutex as TestMutex, OnceLock,
             atomic::{AtomicUsize, Ordering},
         },
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
     use tokio::sync::broadcast;
+
+    fn test_job_runtime_handle() -> tokio::runtime::Handle {
+        static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+        tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+            RUNTIME
+                .get_or_init(|| {
+                    tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .enable_all()
+                        .build()
+                        .expect("test job runtime should build")
+                })
+                .handle()
+                .clone()
+        })
+    }
 
     #[test]
     fn apply_patch_edits_replaces_one_match() {
@@ -44993,6 +45105,7 @@ Return one JSON action for the next step."
                 max_wall_clock_secs: configured_job_max_wall_clock_secs(),
             },
             &[],
+            true,
         )
         .await
         .expect("child job should be created");
@@ -45882,6 +45995,7 @@ for line in sys.stdin:
         let (events, _) = broadcast::channel(8);
         AppState {
             version: "test".to_string(),
+            job_runtime: test_job_runtime_handle(),
             store: store.clone(),
             host: Arc::new(HostEngine::new()),
             runtimes: Arc::new(RuntimeManager::default()),
