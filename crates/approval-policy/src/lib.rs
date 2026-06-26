@@ -1126,12 +1126,12 @@ fn path_like_command_token(token: &str) -> Option<PathBuf> {
         return raw
             .split('=')
             .skip(1)
-            .find_map(|value| path_like_value(value.trim()));
+            .find_map(|value| path_like_option_value(value.trim()));
     }
     path_like_value(raw)
 }
 
-fn path_like_value(token: &str) -> Option<PathBuf> {
+fn path_like_option_value(token: &str) -> Option<PathBuf> {
     let token = token.trim();
     if token.is_empty() || token.starts_with('-') {
         return None;
@@ -1146,6 +1146,17 @@ fn path_like_value(token: &str) -> Option<PathBuf> {
         return Some(PathBuf::from(token));
     }
     None
+}
+
+fn path_like_value(token: &str) -> Option<PathBuf> {
+    let token = token.trim();
+    if token.is_empty() || token.starts_with('-') {
+        return None;
+    }
+    if token.starts_with('~') {
+        return Some(PathBuf::from("/~"));
+    }
+    Some(PathBuf::from(token))
 }
 
 fn command_is_focused_node_test(command: &str) -> bool {
@@ -1472,6 +1483,51 @@ mod tests {
         assert!(
             matches!(inside_decision, ScopedApprovalDecision::Allow(_)),
             "in-worktree command path argument should stay allowed, got {inside_decision:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denies_bare_symlink_escape_for_command_path_argument() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "nucleus-policy-command-bare-symlink-root-{}",
+            std::process::id()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "nucleus-policy-command-bare-symlink-outside-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(&root).expect("worktree root should be created");
+        fs::create_dir_all(&outside).expect("outside root should be created");
+        fs::write(root.join("README"), "inside\n").expect("in-worktree file should be created");
+        fs::write(outside.join("secret"), "outside\n").expect("outside file should be created");
+        symlink(outside.join("secret"), root.join("secret")).expect("symlink should be created");
+
+        let outside_decision = evaluate_autonomous_approval(
+            "command.run",
+            &json!({"command":"cat","args":["secret"],"cwd":"."}),
+            &root,
+        );
+        assert!(
+            matches!(outside_decision, ScopedApprovalDecision::Deny(_)),
+            "bare symlinked command path argument should be denied, got {outside_decision:?}"
+        );
+
+        let inside_decision = evaluate_autonomous_approval(
+            "command.run",
+            &json!({"command":"cat","args":["README"],"cwd":"."}),
+            &root,
+        );
+        assert!(
+            matches!(inside_decision, ScopedApprovalDecision::Allow(_)),
+            "bare in-worktree command path argument should stay allowed, got {inside_decision:?}"
         );
 
         let _ = fs::remove_dir_all(&root);
