@@ -819,14 +819,24 @@ async fn require_api_auth(
 ) -> Result<Response, ApiError> {
     let runtime = tokio::runtime::Handle::current();
     let token = access_token(request.headers(), None)?;
-    tokio::task::spawn_blocking(move || {
-        validate_access_token(&state.store, &token)?;
-        Ok(runtime.block_on(next.run(request)))
-    })
-    .await
-    .map_err(|error| {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("nucleus-protected-api".to_string())
+        .spawn(move || {
+            let result = runtime.block_on(async move {
+                validate_access_token(&state.store, &token)?;
+                Ok(next.run(request).await)
+            });
+            let _ = tx.send(result);
+        })
+        .map_err(|error| {
+            ApiError::from(anyhow::anyhow!(
+                "failed to spawn protected API request thread: {error}"
+            ))
+        })?;
+    rx.await.map_err(|error| {
         ApiError::from(anyhow::anyhow!(
-            "blocking protected API task panicked or was canceled: {error}"
+            "protected API request thread exited without a response: {error}"
         ))
     })?
 }
@@ -10892,6 +10902,16 @@ mod tests {
         StatusCode::OK
     }
 
+    async fn protected_job_blocking_probe() -> StatusCode {
+        io_boundary::run_job_blocking("protected request test sleep", || {
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(())
+        })
+        .await
+        .expect("protected request blocking probe should complete");
+        StatusCode::OK
+    }
+
     #[tokio::test]
     async fn protected_request_offload_does_not_deadlock_auth_validation() {
         let (state_dir, state) = test_named_app_state("control-plane-protected-auth-deadlock");
@@ -10937,6 +10957,62 @@ mod tests {
                 .join()
                 .expect("protected client thread should join")
                 .expect("protected request should complete without auth deadlock");
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        }
+
+        shutdown_tx.send(()).expect("shutdown signal should send");
+        server
+            .join()
+            .expect("control-plane server thread should join")
+            .expect("control-plane server should stop cleanly");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn protected_request_offload_does_not_deadlock_nested_blocking_tasks() {
+        let (state_dir, state) = test_named_app_state("control-plane-protected-nested-blocking");
+        let token = state
+            .store
+            .read_local_auth_token()
+            .expect("local auth token should load");
+        let protected_api = Router::new()
+            .route("/job-blocking", get(protected_job_blocking_probe))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_api_auth,
+            ));
+        let router = Router::new()
+            .route("/health", get(health))
+            .nest("/api/test", protected_api)
+            .with_state(state);
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener address should resolve");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = spawn_control_plane_server(listener, router, async move {
+            let _ = shutdown_rx.await;
+        })
+        .expect("control-plane server should spawn");
+
+        let mut clients = Vec::new();
+        for _ in 0..CONTROL_PLANE_MAX_BLOCKING_THREADS {
+            let token = token.clone();
+            clients.push(std::thread::spawn(move || {
+                let authorization = format!("Bearer {token}");
+                read_http_over_tcp_with_headers_and_timeout(
+                    addr,
+                    "/api/test/job-blocking",
+                    &[("Authorization", authorization.as_str())],
+                    Duration::from_secs(2),
+                )
+            }));
+        }
+        for client in clients {
+            let response = client
+                .join()
+                .expect("protected client thread should join")
+                .expect("protected request should complete without nested blocking deadlock");
             assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         }
 
