@@ -817,7 +817,7 @@ async fn require_api_auth(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    authorize_access(&state, request.headers(), None)?;
+    authorize_access(&state, request.headers(), None).await?;
     Ok(next.run(request).await)
 }
 
@@ -5639,7 +5639,7 @@ async fn stream_socket(
     Query(query): Query<WebSocketAuthQuery>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    match authorize_access(&state, &headers, query.token.as_deref()) {
+    match authorize_access(&state, &headers, query.token.as_deref()).await {
         Ok(()) => ws.on_upgrade(move |socket| handle_stream_socket(socket, state)),
         Err(error) => {
             let reason = error.message.clone();
@@ -10363,22 +10363,27 @@ async fn shutdown_signal() {
     }
 }
 
-fn authorize_access(
+async fn authorize_access(
     state: &AppState,
     headers: &HeaderMap,
     query_token: Option<&str>,
 ) -> Result<(), ApiError> {
     let token = bearer_token(headers)
         .or(query_token.map(str::trim).filter(|value| !value.is_empty()))
-        .ok_or_else(|| {
-            ApiError::unauthorized("Authentication required. Provide a bearer token.")
-        })?;
+        .ok_or_else(|| ApiError::unauthorized("Authentication required. Provide a bearer token."))?
+        .to_string();
 
-    if state
-        .store
-        .validate_access_token(token)
-        .map_err(|error| ApiError::from(anyhow::Error::from(error)))?
-    {
+    let store = state.store.clone();
+    let valid = tokio::task::spawn_blocking(move || store.validate_access_token(&token))
+        .await
+        .map_err(|error| {
+            ApiError::from(anyhow::anyhow!(
+                "blocking auth validation task panicked or was canceled: {error}"
+            ))
+        })?
+        .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
+
+    if valid {
         return Ok(());
     }
 
@@ -10787,6 +10792,77 @@ mod tests {
         let _ = fs::remove_dir_all(&state_dir);
     }
 
+    #[tokio::test]
+    async fn control_plane_health_responds_while_protected_requests_wait_on_storage_auth() {
+        let (state_dir, state) = test_named_app_state("control-plane-auth-storage-isolation");
+        let token = state
+            .store
+            .read_local_auth_token()
+            .expect("local auth token should load");
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener address should resolve");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = spawn_control_plane_server(listener, app(state.clone()), async move {
+            let _ = shutdown_rx.await;
+        })
+        .expect("control-plane server should spawn");
+
+        let (lock_started_tx, lock_started_rx) = mpsc::channel();
+        let store = state.store.clone();
+        let storage_blocker = std::thread::spawn(move || {
+            store.hold_connection_mutex_for_test(Duration::from_millis(800), Some(lock_started_tx));
+        });
+        lock_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("storage lock holder should start");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let mut protected_clients = Vec::new();
+        for _ in 0..CONTROL_PLANE_WORKER_THREADS {
+            let token = token.clone();
+            protected_clients.push(std::thread::spawn(move || {
+                let authorization = format!("Bearer {token}");
+                read_http_over_tcp_with_headers_and_timeout(
+                    addr,
+                    "/api/overview",
+                    &[("Authorization", authorization.as_str())],
+                    Duration::from_secs(2),
+                )
+            }));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+
+        let started = Instant::now();
+        let response = read_health_over_tcp(addr).expect("health response should succeed");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "health response took {elapsed:?}: {response}"
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("Nucleus"), "{response}");
+
+        storage_blocker
+            .join()
+            .expect("storage lock holder should join");
+        for client in protected_clients {
+            let response = client
+                .join()
+                .expect("protected client thread should join")
+                .expect("protected request should eventually complete");
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        }
+
+        shutdown_tx.send(()).expect("shutdown signal should send");
+        server
+            .join()
+            .expect("control-plane server thread should join")
+            .expect("control-plane server should stop cleanly");
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
     #[derive(Clone)]
     struct BlockingJobProbeState {
         started: mpsc::Sender<String>,
@@ -10890,12 +10966,33 @@ mod tests {
     }
 
     fn read_http_over_tcp(addr: SocketAddr, path: &str) -> anyhow::Result<String> {
+        read_http_over_tcp_with_headers(addr, path, &[])
+    }
+
+    fn read_http_over_tcp_with_headers(
+        addr: SocketAddr,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<String> {
+        read_http_over_tcp_with_headers_and_timeout(addr, path, headers, Duration::from_millis(500))
+    }
+
+    fn read_http_over_tcp_with_headers_and_timeout(
+        addr: SocketAddr,
+        path: &str,
+        headers: &[(&str, &str)],
+        read_timeout: Duration,
+    ) -> anyhow::Result<String> {
         let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200))?;
-        stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+        stream.set_read_timeout(Some(read_timeout))?;
         write!(
             stream,
-            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
         )?;
+        for (name, value) in headers {
+            write!(stream, "{name}: {value}\r\n")?;
+        }
+        write!(stream, "\r\n")?;
         let mut response = String::new();
         stream.read_to_string(&mut response)?;
         Ok(response)
