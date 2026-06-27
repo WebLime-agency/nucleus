@@ -11342,17 +11342,25 @@ fn context_integrity_patch(
     session: &SessionSummary,
     job: &JobSummary,
 ) -> JobPatch {
-    let worktree_path = session_worktree_probe_path(session);
+    if session.workspace_mode.trim() == "scratch_only" {
+        return JobPatch {
+            worktree_base_status: Some("not_applicable".to_string()),
+            branch_repo_status: Some("not_applicable".to_string()),
+            worktree_base_reason: Some("scratch session has no git working contract".to_string()),
+            branch_repo_reason: Some("scratch session has no git working contract".to_string()),
+            ..JobPatch::default()
+        };
+    }
+
     let expected_origin_url = expected_project_origin_url(state, session);
     let expected_git_branch = session.git_branch.trim().to_string();
-    let base_ref = session_base_ref(session);
-    let base_ref_name = base_ref.display_ref();
     let mut patch = JobPatch {
-        worktree_base_ref: Some(base_ref_name.clone()),
         expected_origin_url: Some(expected_origin_url.clone()),
         expected_git_branch: Some(expected_git_branch.clone()),
         ..JobPatch::default()
     };
+
+    let worktree_path = session_worktree_probe_path(session);
 
     let Some(worktree_path) = worktree_path else {
         patch.worktree_base_status = Some("not_applicable_missing_context".to_string());
@@ -11421,6 +11429,17 @@ fn context_integrity_patch(
         patch.worktree_behind_by = Some(None);
         return patch;
     }
+
+    let base_ref = session_base_ref(session, Some(&worktree_path));
+    let Some(base_ref) = base_ref else {
+        patch.worktree_base_status = Some("pending".to_string());
+        patch.worktree_base_reason = Some("could not resolve canonical base ref".to_string());
+        patch.canonical_base_sha = Some(String::new());
+        patch.worktree_behind_by = Some(None);
+        return patch;
+    };
+    let base_ref_name = base_ref.display_ref();
+    patch.worktree_base_ref = Some(base_ref_name.clone());
 
     let canonical_display = base_ref.display_ref();
     let canonical_ref = format!("refs/remotes/{}/{}", base_ref.remote, base_ref.branch);
@@ -11523,36 +11542,90 @@ impl SessionBaseRef {
     }
 }
 
-fn session_base_ref(session: &SessionSummary) -> SessionBaseRef {
+fn session_base_ref(session: &SessionSummary, probe_path: Option<&Path>) -> Option<SessionBaseRef> {
     let base = session.git_base_ref.trim();
     if !base.is_empty() {
         if let Some(branch) = base.strip_prefix("refs/heads/") {
-            return SessionBaseRef::origin(branch);
+            return Some(SessionBaseRef::origin(branch));
         }
         if let Some((remote, branch)) = parse_remote_tracking_ref(base) {
-            return SessionBaseRef {
+            return Some(SessionBaseRef {
                 remote: remote.to_string(),
                 branch: branch.to_string(),
-            };
+            });
         }
         if let Some(branch) = base.strip_prefix("origin/") {
-            return SessionBaseRef::origin(branch);
+            return Some(SessionBaseRef::origin(branch));
         }
-        return SessionBaseRef::origin(base);
+        return Some(SessionBaseRef::origin(base));
     }
     let remote = session.git_remote_tracking_branch.trim();
     if !remote.is_empty() {
         if let Some((remote_name, branch)) =
             parse_remote_tracking_ref(remote).or_else(|| remote.split_once('/'))
         {
-            return SessionBaseRef {
+            return Some(SessionBaseRef {
                 remote: remote_name.to_string(),
                 branch: branch.to_string(),
-            };
+            });
         }
-        return SessionBaseRef::origin(remote);
+        return Some(SessionBaseRef::origin(remote));
     }
-    SessionBaseRef::origin("dev")
+    probe_path.and_then(resolve_default_session_base_ref)
+}
+
+fn resolve_default_session_base_ref(probe_path: &Path) -> Option<SessionBaseRef> {
+    if git_status(
+        probe_path,
+        &["rev-parse", "--verify", "refs/remotes/origin/dev"],
+    )
+    .is_ok()
+    {
+        return Some(SessionBaseRef::origin("dev"));
+    }
+
+    let dev_refspec = "+refs/heads/dev:refs/remotes/origin/dev";
+    match git_fetch_status(probe_path, &["fetch", "origin", dev_refspec]) {
+        Ok(()) => return Some(SessionBaseRef::origin("dev")),
+        Err(error) if git_fetch_missing_remote_ref(&error) => {}
+        // If the remote cannot be reached, keep dev as the conservative base so
+        // the freshness gate reports pending instead of falling through to main.
+        Err(_) => return Some(SessionBaseRef::origin("dev")),
+    }
+
+    if let Some(default_ref) = git_stdout(probe_path, &["symbolic-ref", "refs/remotes/origin/HEAD"])
+        .or_else(|| git_stdout(probe_path, &["rev-parse", "--abbrev-ref", "origin/HEAD"]))
+    {
+        let default_ref = default_ref.trim();
+        if let Some(branch) = default_ref.strip_prefix("refs/remotes/origin/") {
+            return Some(SessionBaseRef::origin(branch));
+        }
+        if let Some(branch) = default_ref.strip_prefix("origin/") {
+            return Some(SessionBaseRef::origin(branch));
+        }
+    }
+
+    if git_status(
+        probe_path,
+        &["rev-parse", "--verify", "refs/remotes/origin/main"],
+    )
+    .is_ok()
+    {
+        return Some(SessionBaseRef::origin("main"));
+    }
+
+    for branch in ["main", "master", "dev"] {
+        let local_ref = format!("refs/heads/{branch}");
+        if git_status(probe_path, &["rev-parse", "--verify", &local_ref]).is_ok() {
+            return Some(SessionBaseRef::origin(branch));
+        }
+    }
+
+    None
+}
+
+fn git_fetch_missing_remote_ref(error: &anyhow::Error) -> bool {
+    error.to_string().contains("couldn't find remote ref")
 }
 
 fn parse_remote_tracking_ref(value: &str) -> Option<(&str, &str)> {
@@ -11748,6 +11821,8 @@ fn git_fetch_status(cwd: &Path, args: &[&str]) -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
         .env("GIT_ASKPASS", "true")
         .env("SSH_ASKPASS", "true")
         .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
@@ -32657,39 +32732,225 @@ Thanks."#,
 
         session.git_remote_tracking_branch = "upstream/main".to_string();
         assert_eq!(
-            session_base_ref(&session),
-            SessionBaseRef {
+            session_base_ref(&session, None),
+            Some(SessionBaseRef {
                 remote: "upstream".to_string(),
                 branch: "main".to_string()
-            }
+            })
         );
 
         session.git_remote_tracking_branch = "refs/remotes/upstream/release/2026".to_string();
         assert_eq!(
-            session_base_ref(&session),
-            SessionBaseRef {
+            session_base_ref(&session, None),
+            Some(SessionBaseRef {
                 remote: "upstream".to_string(),
                 branch: "release/2026".to_string()
-            }
+            })
         );
 
         session.git_base_ref = "refs/remotes/upstream/main".to_string();
         assert_eq!(
-            session_base_ref(&session),
-            SessionBaseRef {
+            session_base_ref(&session, None),
+            Some(SessionBaseRef {
                 remote: "upstream".to_string(),
                 branch: "main".to_string()
-            }
+            })
         );
 
         session.git_base_ref = "release/2026".to_string();
         assert_eq!(
-            session_base_ref(&session),
-            SessionBaseRef {
+            session_base_ref(&session, None),
+            Some(SessionBaseRef {
                 remote: "origin".to_string(),
                 branch: "release/2026".to_string()
-            }
+            })
         );
+    }
+
+    #[test]
+    fn context_integrity_detection_marks_scratch_session_git_freshness_not_applicable() {
+        let state_dir = test_state_dir("context-integrity-scratch-main");
+        let state = initialize_test_state(&state_dir);
+        let repo = context_integrity_repo_on_branch(&state_dir, "scratch-main", "main");
+        let mut session = context_integrity_session(&repo);
+        session.workspace_mode = "scratch_only".to_string();
+        session.attachment_mode = "scratch".to_string();
+        session.worktree_path = String::new();
+        session.git_root = String::new();
+        session.git_branch = String::new();
+        session.git_base_ref = String::new();
+        session.git_remote_tracking_branch = String::new();
+        let job = test_publication_job_summary("context-scratch-main");
+
+        let scratch = context_integrity_patch(&state, &session, &job);
+        assert_eq!(
+            scratch.worktree_base_status.as_deref(),
+            Some("not_applicable")
+        );
+        assert_eq!(
+            scratch.branch_repo_status.as_deref(),
+            Some("not_applicable")
+        );
+
+        let gated_job = JobSummary {
+            worktree_base_status: scratch.worktree_base_status.unwrap_or_default(),
+            branch_repo_status: scratch.branch_repo_status.unwrap_or_default(),
+            ..job
+        }
+        .with_completion_gates();
+        assert!(
+            gated_job
+                .completion_gates
+                .iter()
+                .all(|gate| gate.id != "worktree_base_fresh" && gate.id != "branch_repo_consistent")
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn context_integrity_detection_resolves_main_default_without_dev_branch() {
+        let state_dir = test_state_dir("context-integrity-main-default");
+        let state = initialize_test_state(&state_dir);
+        let repo = context_integrity_repo_on_branch(&state_dir, "main-default", "main");
+        run_git_test(&repo.worktree, &["pull", "--ff-only", "origin", "main"]);
+        let mut session = context_integrity_session(&repo);
+        session.workspace_mode = "shared_project_root".to_string();
+        session.attachment_mode = "project_root".to_string();
+        session.worktree_path = String::new();
+        session.git_branch = "main".to_string();
+        session.git_base_ref = String::new();
+        session.git_remote_tracking_branch = String::new();
+        let job = test_publication_job_summary("context-main-default");
+
+        let fresh = context_integrity_patch(&state, &session, &job);
+        assert_eq!(fresh.worktree_base_ref.as_deref(), Some("main"));
+        assert_eq!(fresh.worktree_base_status.as_deref(), Some("satisfied"));
+        assert_eq!(fresh.worktree_behind_by, Some(Some(0)));
+        assert_eq!(fresh.branch_repo_status.as_deref(), Some("satisfied"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn context_integrity_detection_honors_base_waiver_before_unresolved_base() {
+        let state_dir = test_state_dir("context-integrity-waived-unresolved-base");
+        let state = initialize_test_state(&state_dir);
+        let repo = context_integrity_repo_on_branch(&state_dir, "waived-unresolved-base", "trunk");
+        run_git_test(
+            &repo.worktree,
+            &["symbolic-ref", "-d", "refs/remotes/origin/HEAD"],
+        );
+        assert!(git_stdout(&repo.worktree, &["rev-parse", "refs/remotes/origin/dev"]).is_none());
+        assert!(git_stdout(&repo.worktree, &["rev-parse", "refs/remotes/origin/main"]).is_none());
+        assert!(
+            git_stdout(
+                &repo.worktree,
+                &["symbolic-ref", "refs/remotes/origin/HEAD"]
+            )
+            .is_none()
+        );
+
+        let mut session = context_integrity_session(&repo);
+        session.workspace_mode = "shared_project_root".to_string();
+        session.attachment_mode = "project_root".to_string();
+        session.worktree_path = String::new();
+        session.git_branch = "trunk".to_string();
+        session.git_base_ref = String::new();
+        session.git_remote_tracking_branch = String::new();
+        let mut job = test_publication_job_summary("context-waived-unresolved-base");
+        job.metadata_json = json!({
+            "worktree_base_override": {
+                "reason": "intentional base waiver"
+            }
+        });
+
+        let waived = context_integrity_patch(&state, &session, &job);
+        assert_eq!(waived.worktree_base_status.as_deref(), Some("waived"));
+        assert_eq!(waived.worktree_base_ref.as_deref(), None);
+        assert_eq!(waived.worktree_behind_by, Some(None));
+        assert_eq!(waived.branch_repo_status.as_deref(), Some("satisfied"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn context_integrity_detection_prefers_dev_over_origin_head_main() {
+        let state_dir = test_state_dir("context-integrity-dev-over-head");
+        let state = initialize_test_state(&state_dir);
+        let repo = context_integrity_repo_on_branch(&state_dir, "dev-over-head", "main");
+        run_git_test(&repo.source, &["checkout", "-B", "dev"]);
+        fs::write(repo.source.join("dev.txt"), "dev\n").expect("dev file should write");
+        run_git_test(&repo.source, &["add", "dev.txt"]);
+        run_git_test(&repo.source, &["commit", "-m", "dev change"]);
+        run_git_test(&repo.source, &["push", "origin", "dev"]);
+        run_git_test(&repo.worktree, &["fetch", "origin", "dev"]);
+        run_git_test(&repo.worktree, &["checkout", "-B", "dev", "origin/dev"]);
+        let origin_head = git_stdout(
+            &repo.worktree,
+            &["symbolic-ref", "refs/remotes/origin/HEAD"],
+        )
+        .expect("origin HEAD should resolve");
+        assert_eq!(origin_head, "refs/remotes/origin/main");
+
+        let mut session = context_integrity_session(&repo);
+        session.workspace_mode = "shared_project_root".to_string();
+        session.attachment_mode = "project_root".to_string();
+        session.worktree_path = String::new();
+        session.git_branch = "dev".to_string();
+        session.git_base_ref = String::new();
+        session.git_remote_tracking_branch = String::new();
+        let job = test_publication_job_summary("context-dev-over-head");
+
+        let fresh = context_integrity_patch(&state, &session, &job);
+        assert_eq!(fresh.worktree_base_ref.as_deref(), Some("dev"));
+        assert_eq!(fresh.worktree_base_status.as_deref(), Some("satisfied"));
+        assert_eq!(fresh.worktree_behind_by, Some(Some(0)));
+        assert_eq!(fresh.branch_repo_status.as_deref(), Some("satisfied"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn context_integrity_detection_fetches_missing_origin_dev_before_origin_head_main() {
+        let state_dir = test_state_dir("context-integrity-fetch-dev-over-head");
+        let state = initialize_test_state(&state_dir);
+        let repo = context_integrity_repo_on_branch(&state_dir, "fetch-dev-over-head", "main");
+        run_git_test(&repo.source, &["checkout", "-B", "dev"]);
+        fs::write(repo.source.join("dev.txt"), "dev\n").expect("dev file should write");
+        run_git_test(&repo.source, &["add", "dev.txt"]);
+        run_git_test(&repo.source, &["commit", "-m", "dev change"]);
+        run_git_test(&repo.source, &["push", "origin", "dev"]);
+        run_git_test(&repo.worktree, &["fetch", "origin", "dev"]);
+        run_git_test(&repo.worktree, &["checkout", "-B", "dev", "origin/dev"]);
+        run_git_test(
+            &repo.worktree,
+            &["update-ref", "-d", "refs/remotes/origin/dev"],
+        );
+        assert!(git_stdout(&repo.worktree, &["rev-parse", "refs/remotes/origin/dev"]).is_none());
+        let origin_head = git_stdout(
+            &repo.worktree,
+            &["symbolic-ref", "refs/remotes/origin/HEAD"],
+        )
+        .expect("origin HEAD should resolve");
+        assert_eq!(origin_head, "refs/remotes/origin/main");
+
+        let mut session = context_integrity_session(&repo);
+        session.workspace_mode = "shared_project_root".to_string();
+        session.attachment_mode = "project_root".to_string();
+        session.worktree_path = String::new();
+        session.git_branch = "dev".to_string();
+        session.git_base_ref = String::new();
+        session.git_remote_tracking_branch = String::new();
+        let job = test_publication_job_summary("context-fetch-dev-over-head");
+
+        let fresh = context_integrity_patch(&state, &session, &job);
+        assert_eq!(fresh.worktree_base_ref.as_deref(), Some("dev"));
+        assert_eq!(fresh.worktree_base_status.as_deref(), Some("satisfied"));
+        assert_eq!(fresh.worktree_behind_by, Some(Some(0)));
+        assert_eq!(fresh.branch_repo_status.as_deref(), Some("satisfied"));
+
+        let _ = fs::remove_dir_all(&state_dir);
     }
 
     #[test]
@@ -49347,11 +49608,19 @@ for line in sys.stdin:
     }
 
     fn context_integrity_repo(root: &Path, label: &str) -> ContextIntegrityRepo {
+        context_integrity_repo_on_branch(root, label, "dev")
+    }
+
+    fn context_integrity_repo_on_branch(
+        root: &Path,
+        label: &str,
+        base_branch: &str,
+    ) -> ContextIntegrityRepo {
         let source = root.join(format!("{label}-source"));
         let origin = root.join(format!("{label}-origin.git"));
         let worktree = root.join(format!("{label}-worktree"));
         fs::create_dir_all(&source).expect("source repo dir should exist");
-        run_git_test(&source, &["init", "-b", "dev"]);
+        run_git_test(&source, &["init", "-b", base_branch]);
         run_git_test(&source, &["config", "user.email", "nucleus@example.test"]);
         run_git_test(&source, &["config", "user.name", "Nucleus Test"]);
         fs::write(source.join("file.txt"), "initial\n").expect("initial file should write");
@@ -49388,10 +49657,10 @@ for line in sys.stdin:
         fs::write(source.join("feature.txt"), "feature\n").expect("feature file should write");
         run_git_test(&source, &["add", "feature.txt"]);
         run_git_test(&source, &["commit", "-m", "feature"]);
-        run_git_test(&source, &["checkout", "dev"]);
+        run_git_test(&source, &["checkout", base_branch]);
         run_git_test(&source, &["merge", "--no-ff", "topic", "-m", "merge topic"]);
         let canonical_sha = git_stdout(&source, &["rev-parse", "HEAD"]).expect("canonical sha");
-        run_git_test(&source, &["push", "origin", "dev"]);
+        run_git_test(&source, &["push", "origin", base_branch]);
 
         ContextIntegrityRepo {
             source,
