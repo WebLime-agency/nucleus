@@ -86,3 +86,9 @@ For isolated worktree sessions, Nucleus records the source project path, git roo
 Shared checkout sessions should warn when branch or dirty state changes after session start, or when risky git commands such as `git switch`, `git checkout`, `git reset`, or `git clean` are attempted while another active session shares the checkout.
 
 Long-running dev servers and command sessions belong to the session/worktree/branch that started them. Another session must not assume a running server on the same port represents its own branch.
+
+## Autonomous Approval Mode
+
+Autonomous approval mode is approval gating, not an OS sandbox. When enabled for an isolated worktree, Nucleus may auto-run scoped edits plus build and test commands inside that worktree. Those commands execute with the operator's local privileges, and normal build systems can run worktree code such as build scripts, proc macros, package scripts, or test helpers.
+
+Autonomous mode is intended for repositories the operator already trusts. OS-sandboxed execution for less-trusted code is tracked separately in #494.

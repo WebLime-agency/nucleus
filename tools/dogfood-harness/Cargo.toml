@@ -12,10 +12,10 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+nucleus-approval-policy.workspace = true
 nucleus-protocol.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 url.workspace = true
-

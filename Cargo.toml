@@ -4,6 +4,7 @@ members = [
   "crates/adapters-claude",
   "crates/adapters-codex",
   "crates/adapters-system",
+  "crates/approval-policy",
   "crates/cli",
   "crates/core",
   "crates/daemon",
@@ -53,6 +54,7 @@ uuid = { version = "1", features = ["v4"] }
 nucleus-adapters-claude = { path = "crates/adapters-claude" }
 nucleus-adapters-codex = { path = "crates/adapters-codex" }
 nucleus-adapters-system = { path = "crates/adapters-system" }
+nucleus-approval-policy = { path = "crates/approval-policy" }
 nucleus-core = { path = "crates/core" }
 nucleus-protocol = { path = "crates/protocol" }
 nucleus-release = { path = "crates/release" }
