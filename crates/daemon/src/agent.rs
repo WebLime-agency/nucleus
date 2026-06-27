@@ -11307,17 +11307,6 @@ fn context_integrity_patch(
         return patch;
     }
 
-    let base_ref = session_base_ref(session, Some(&worktree_path));
-    let Some(base_ref) = base_ref else {
-        patch.worktree_base_status = Some("pending".to_string());
-        patch.worktree_base_reason = Some("could not resolve canonical base ref".to_string());
-        patch.canonical_base_sha = Some(String::new());
-        patch.worktree_behind_by = Some(None);
-        return patch;
-    };
-    let base_ref_name = base_ref.display_ref();
-    patch.worktree_base_ref = Some(base_ref_name.clone());
-
     let override_value = job.metadata_json.get("worktree_base_override");
     let override_present = override_value.is_some_and(|value| !value.is_null());
     let override_allowed_behind_value =
@@ -11336,6 +11325,17 @@ fn context_integrity_patch(
         patch.worktree_behind_by = Some(None);
         return patch;
     }
+
+    let base_ref = session_base_ref(session, Some(&worktree_path));
+    let Some(base_ref) = base_ref else {
+        patch.worktree_base_status = Some("pending".to_string());
+        patch.worktree_base_reason = Some("could not resolve canonical base ref".to_string());
+        patch.canonical_base_sha = Some(String::new());
+        patch.worktree_behind_by = Some(None);
+        return patch;
+    };
+    let base_ref_name = base_ref.display_ref();
+    patch.worktree_base_ref = Some(base_ref_name.clone());
 
     let canonical_display = base_ref.display_ref();
     let canonical_ref = format!("refs/remotes/{}/{}", base_ref.remote, base_ref.branch);
@@ -32442,6 +32442,48 @@ Thanks."#,
         assert_eq!(fresh.worktree_base_status.as_deref(), Some("satisfied"));
         assert_eq!(fresh.worktree_behind_by, Some(Some(0)));
         assert_eq!(fresh.branch_repo_status.as_deref(), Some("satisfied"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn context_integrity_detection_honors_base_waiver_before_unresolved_base() {
+        let state_dir = test_state_dir("context-integrity-waived-unresolved-base");
+        let state = initialize_test_state(&state_dir);
+        let repo = context_integrity_repo_on_branch(&state_dir, "waived-unresolved-base", "trunk");
+        run_git_test(
+            &repo.worktree,
+            &["symbolic-ref", "-d", "refs/remotes/origin/HEAD"],
+        );
+        assert!(git_stdout(&repo.worktree, &["rev-parse", "refs/remotes/origin/dev"]).is_none());
+        assert!(git_stdout(&repo.worktree, &["rev-parse", "refs/remotes/origin/main"]).is_none());
+        assert!(
+            git_stdout(
+                &repo.worktree,
+                &["symbolic-ref", "refs/remotes/origin/HEAD"]
+            )
+            .is_none()
+        );
+
+        let mut session = context_integrity_session(&repo);
+        session.workspace_mode = "shared_project_root".to_string();
+        session.attachment_mode = "project_root".to_string();
+        session.worktree_path = String::new();
+        session.git_branch = "trunk".to_string();
+        session.git_base_ref = String::new();
+        session.git_remote_tracking_branch = String::new();
+        let mut job = test_publication_job_summary("context-waived-unresolved-base");
+        job.metadata_json = json!({
+            "worktree_base_override": {
+                "reason": "intentional base waiver"
+            }
+        });
+
+        let waived = context_integrity_patch(&state, &session, &job);
+        assert_eq!(waived.worktree_base_status.as_deref(), Some("waived"));
+        assert_eq!(waived.worktree_base_ref.as_deref(), None);
+        assert_eq!(waived.worktree_behind_by, Some(None));
+        assert_eq!(waived.branch_repo_status.as_deref(), Some("satisfied"));
 
         let _ = fs::remove_dir_all(&state_dir);
     }
