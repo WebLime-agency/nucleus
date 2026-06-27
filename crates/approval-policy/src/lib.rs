@@ -613,13 +613,14 @@ fn stringify_paths(paths: Vec<PathBuf>) -> Vec<String> {
 fn path_is_inside_worktree(worktree: &Path, candidate: &Path) -> bool {
     let base = normalize_path(worktree);
     let joined = if candidate.is_absolute() {
-        normalize_path(candidate)
+        candidate.to_path_buf()
     } else {
-        normalize_path(&worktree.join(candidate))
+        worktree.join(candidate)
     };
     if let Ok(canonical_base) = fs::canonicalize(&base) {
         return canonical_path_is_inside(&canonical_base, &joined);
     }
+    let joined = normalize_path(&joined);
     joined == base || joined.starts_with(base)
 }
 
@@ -1586,6 +1587,16 @@ mod tests {
             "symlinked command path argument should be denied, got {outside_decision:?}"
         );
 
+        let parent_escape_decision = evaluate_autonomous_approval(
+            "command.run",
+            &json!({"command":"ls","args":["link/.."],"cwd":"."}),
+            &root,
+        );
+        assert!(
+            matches!(parent_escape_decision, ScopedApprovalDecision::Deny(_)),
+            "symlink parent command path argument should be denied, got {parent_escape_decision:?}"
+        );
+
         let inside_decision = evaluate_autonomous_approval(
             "command.run",
             &json!({"command":"cat","args":["src/lib.rs"],"cwd":"."}),
@@ -1594,6 +1605,16 @@ mod tests {
         assert!(
             matches!(inside_decision, ScopedApprovalDecision::Allow(_)),
             "in-worktree command path argument should stay allowed, got {inside_decision:?}"
+        );
+
+        let inside_parent_decision = evaluate_autonomous_approval(
+            "command.run",
+            &json!({"command":"ls","args":["src/.."],"cwd":"."}),
+            &root,
+        );
+        assert!(
+            matches!(inside_parent_decision, ScopedApprovalDecision::Allow(_)),
+            "normal in-worktree parent command path argument should stay allowed, got {inside_parent_decision:?}"
         );
 
         let _ = fs::remove_dir_all(&root);
