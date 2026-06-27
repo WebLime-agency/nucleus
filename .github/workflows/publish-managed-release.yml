@@ -124,6 +124,8 @@ jobs:
           noop_message=""
           latest_stable_tag=""
           latest_stable_tag_sha=""
+          latest_stable_tag_version=""
+          stable_manifest_status=""
 
           if [ "${channel}" = "stable" ]; then
             origin_main_sha="$(git rev-parse origin/main)"
@@ -135,14 +137,17 @@ jobs:
 
             if [ "${{ github.event_name }}" = "schedule" ]; then
               gate_output="$(mktemp)"
-              scripts/check-stable-release-work.sh origin/main | tee "${gate_output}"
+              stable_manifest_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/nucleus-channel-stable/manifest-stable.json"
+              scripts/check-stable-release-work.sh origin/main "${stable_manifest_url}" | tee "${gate_output}"
               should_publish="$(awk -F= '$1 == "should_publish" { print substr($0, index($0, "=") + 1); exit }' "${gate_output}")"
               latest_stable_tag="$(awk -F= '$1 == "latest_tag" { print substr($0, index($0, "=") + 1); exit }' "${gate_output}")"
+              latest_stable_tag_version="$(awk -F= '$1 == "latest_tag_version" { print substr($0, index($0, "=") + 1); exit }' "${gate_output}")"
               latest_stable_tag_sha="$(awk -F= '$1 == "latest_tag_sha" { print substr($0, index($0, "=") + 1); exit }' "${gate_output}")"
+              stable_manifest_status="$(awk -F= '$1 == "manifest_status" { print substr($0, index($0, "=") + 1); exit }' "${gate_output}")"
 
               if [ "${should_publish}" = "false" ]; then
                 source_sha="$(awk -F= '$1 == "source_sha" { print substr($0, index($0, "=") + 1); exit }' "${gate_output}")"
-                noop_message="No new work on main since ${latest_stable_tag}; nothing to publish."
+                noop_message="No new work on main since ${latest_stable_tag}, and the stable channel manifest already contains ${latest_stable_tag_version}; nothing to publish."
                 echo "${noop_message}"
 
                 {
@@ -154,17 +159,26 @@ jobs:
                   echo "noop_message=${noop_message}"
                   echo "latest_stable_tag=${latest_stable_tag}"
                   echo "latest_stable_tag_sha=${latest_stable_tag_sha}"
+                  echo "latest_stable_tag_version=${latest_stable_tag_version}"
+                  echo "stable_manifest_status=${stable_manifest_status}"
                 } >> "$GITHUB_OUTPUT"
                 exit 0
               fi
             fi
 
-            resolved_version="$(
-              VERSION_MODE="${INPUT_VERSION_MODE}" \
-              BUMP="${INPUT_BUMP}" \
-              VERSION="${INPUT_VERSION}" \
-              scripts/compute-release-version.sh
-            )"
+            # The bootstrap tag seeds auto-versioning; later missing manifests mean retry the tagged publish.
+            bootstrap_stable_tag="v0.1.0"
+            if [ "${{ github.event_name }}" = "schedule" ] && [ -n "${latest_stable_tag_version}" ] && [ "${latest_stable_tag}" != "${bootstrap_stable_tag}" ] && [ "${selected_source_sha}" = "${latest_stable_tag_sha}" ]; then
+              resolved_version="${latest_stable_tag_version}"
+              echo "Retrying stable publish for existing source tag ${latest_stable_tag}."
+            else
+              resolved_version="$(
+                VERSION_MODE="${INPUT_VERSION_MODE}" \
+                BUMP="${INPUT_BUMP}" \
+                VERSION="${INPUT_VERSION}" \
+                scripts/compute-release-version.sh
+              )"
+            fi
 
             scripts/update-release-version-files.sh "${resolved_version}"
 
@@ -285,6 +299,8 @@ jobs:
             echo "noop_message=${noop_message}"
             echo "latest_stable_tag=${latest_stable_tag}"
             echo "latest_stable_tag_sha=${latest_stable_tag_sha}"
+            echo "latest_stable_tag_version=${latest_stable_tag_version}"
+            echo "stable_manifest_status=${stable_manifest_status}"
             echo "retention_count=${retention_count}"
             echo "channel_tag=${channel_tag}"
             echo "manifest_name=${manifest_name}"
