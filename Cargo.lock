@@ -1051,6 +1051,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nucleus-approval-policy"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nucleus-cli"
 version = "0.1.36"
 dependencies = [
@@ -1088,6 +1096,7 @@ dependencies = [
  "futures-util",
  "httpdate",
  "libc",
+ "nucleus-approval-policy",
  "nucleus-core",
  "nucleus-protocol",
  "nucleus-release",
@@ -1114,6 +1123,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "nucleus-approval-policy",
  "nucleus-protocol",
  "reqwest",
  "serde",
