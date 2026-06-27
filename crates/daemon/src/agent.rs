@@ -11484,6 +11484,8 @@ fn resolve_default_session_base_ref(probe_path: &Path) -> Option<SessionBaseRef>
     match git_fetch_status(probe_path, &["fetch", "origin", dev_refspec]) {
         Ok(()) => return Some(SessionBaseRef::origin("dev")),
         Err(error) if git_fetch_missing_remote_ref(&error) => {}
+        // If the remote cannot be reached, keep dev as the conservative base so
+        // the freshness gate reports pending instead of falling through to main.
         Err(_) => return Some(SessionBaseRef::origin("dev")),
     }
 
@@ -11715,6 +11717,8 @@ fn git_fetch_status(cwd: &Path, args: &[&str]) -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
         .env("GIT_ASKPASS", "true")
         .env("SSH_ASKPASS", "true")
         .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
