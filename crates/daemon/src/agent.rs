@@ -11475,6 +11475,15 @@ fn session_base_ref(session: &SessionSummary, probe_path: Option<&Path>) -> Opti
 }
 
 fn resolve_default_session_base_ref(probe_path: &Path) -> Option<SessionBaseRef> {
+    if git_status(
+        probe_path,
+        &["rev-parse", "--verify", "refs/remotes/origin/dev"],
+    )
+    .is_ok()
+    {
+        return Some(SessionBaseRef::origin("dev"));
+    }
+
     if let Some(default_ref) = git_stdout(probe_path, &["symbolic-ref", "refs/remotes/origin/HEAD"])
         .or_else(|| git_stdout(probe_path, &["rev-parse", "--abbrev-ref", "origin/HEAD"]))
     {
@@ -11487,7 +11496,7 @@ fn resolve_default_session_base_ref(probe_path: &Path) -> Option<SessionBaseRef>
         }
     }
 
-    for branch in ["main", "dev"] {
+    for branch in ["main"] {
         let remote_ref = format!("refs/remotes/origin/{branch}");
         if git_status(probe_path, &["rev-parse", "--verify", &remote_ref]).is_ok() {
             return Some(SessionBaseRef::origin(branch));
@@ -32417,6 +32426,43 @@ Thanks."#,
 
         let fresh = context_integrity_patch(&state, &session, &job);
         assert_eq!(fresh.worktree_base_ref.as_deref(), Some("main"));
+        assert_eq!(fresh.worktree_base_status.as_deref(), Some("satisfied"));
+        assert_eq!(fresh.worktree_behind_by, Some(Some(0)));
+        assert_eq!(fresh.branch_repo_status.as_deref(), Some("satisfied"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn context_integrity_detection_prefers_dev_over_origin_head_main() {
+        let state_dir = test_state_dir("context-integrity-dev-over-head");
+        let state = initialize_test_state(&state_dir);
+        let repo = context_integrity_repo_on_branch(&state_dir, "dev-over-head", "main");
+        run_git_test(&repo.source, &["checkout", "-B", "dev"]);
+        fs::write(repo.source.join("dev.txt"), "dev\n").expect("dev file should write");
+        run_git_test(&repo.source, &["add", "dev.txt"]);
+        run_git_test(&repo.source, &["commit", "-m", "dev change"]);
+        run_git_test(&repo.source, &["push", "origin", "dev"]);
+        run_git_test(&repo.worktree, &["fetch", "origin", "dev"]);
+        run_git_test(&repo.worktree, &["checkout", "-B", "dev", "origin/dev"]);
+        let origin_head = git_stdout(
+            &repo.worktree,
+            &["symbolic-ref", "refs/remotes/origin/HEAD"],
+        )
+        .expect("origin HEAD should resolve");
+        assert_eq!(origin_head, "refs/remotes/origin/main");
+
+        let mut session = context_integrity_session(&repo);
+        session.workspace_mode = "shared_project_root".to_string();
+        session.attachment_mode = "project_root".to_string();
+        session.worktree_path = String::new();
+        session.git_branch = "dev".to_string();
+        session.git_base_ref = String::new();
+        session.git_remote_tracking_branch = String::new();
+        let job = test_publication_job_summary("context-dev-over-head");
+
+        let fresh = context_integrity_patch(&state, &session, &job);
+        assert_eq!(fresh.worktree_base_ref.as_deref(), Some("dev"));
         assert_eq!(fresh.worktree_base_status.as_deref(), Some("satisfied"));
         assert_eq!(fresh.worktree_behind_by, Some(Some(0)));
         assert_eq!(fresh.branch_repo_status.as_deref(), Some("satisfied"));
