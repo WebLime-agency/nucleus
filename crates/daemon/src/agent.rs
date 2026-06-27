@@ -11275,13 +11275,6 @@ fn context_integrity_patch(
         return patch;
     }
 
-    let base_ref = session_base_ref(session, Some(&worktree_path));
-    let base_ref_name = base_ref
-        .as_ref()
-        .map(SessionBaseRef::display_ref)
-        .unwrap_or_default();
-    patch.worktree_base_ref = Some(base_ref_name.clone());
-
     let observed_origin = git_stdout(&worktree_path, &["remote", "get-url", "origin"])
         .map(|url| redact_git_remote_url_userinfo(&url));
     let observed_branch = git_stdout(&worktree_path, &["symbolic-ref", "--short", "HEAD"])
@@ -11314,6 +11307,7 @@ fn context_integrity_patch(
         return patch;
     }
 
+    let base_ref = session_base_ref(session, Some(&worktree_path));
     let Some(base_ref) = base_ref else {
         patch.worktree_base_status = Some("pending".to_string());
         patch.worktree_base_reason = Some("could not resolve canonical base ref".to_string());
@@ -11321,6 +11315,8 @@ fn context_integrity_patch(
         patch.worktree_behind_by = Some(None);
         return patch;
     };
+    let base_ref_name = base_ref.display_ref();
+    patch.worktree_base_ref = Some(base_ref_name.clone());
 
     let override_value = job.metadata_json.get("worktree_base_override");
     let override_present = override_value.is_some_and(|value| !value.is_null());
@@ -11496,11 +11492,13 @@ fn resolve_default_session_base_ref(probe_path: &Path) -> Option<SessionBaseRef>
         }
     }
 
-    for branch in ["main"] {
-        let remote_ref = format!("refs/remotes/origin/{branch}");
-        if git_status(probe_path, &["rev-parse", "--verify", &remote_ref]).is_ok() {
-            return Some(SessionBaseRef::origin(branch));
-        }
+    if git_status(
+        probe_path,
+        &["rev-parse", "--verify", "refs/remotes/origin/main"],
+    )
+    .is_ok()
+    {
+        return Some(SessionBaseRef::origin("main"));
     }
 
     for branch in ["main", "master", "dev"] {
