@@ -5310,7 +5310,7 @@ async fn handle_tool_call_proposal(
 
     ensure_worker_may_execute_actions(worker)?;
     *tool_calls += 1;
-    let approval_gate = approval_gate_for_tool(&tool, &args, &session.session);
+    let approval_gate = approval_gate_for_tool_with_worker(&tool, &args, &session.session, worker);
     let policy = approval_gate.policy().clone();
     let tool_call_id = Uuid::new_v4().to_string();
     let creates_approval_request = approval_gate.creates_approval_request();
@@ -21558,9 +21558,32 @@ impl ApprovalGate {
 }
 
 fn approval_gate_for_tool(tool: &str, args: &Value, session: &SessionSummary) -> ApprovalGate {
+    approval_gate_for_tool_with_scope(tool, args, session, autonomous_policy_worktree(session))
+}
+
+fn approval_gate_for_tool_with_worker(
+    tool: &str,
+    args: &Value,
+    session: &SessionSummary,
+    worker: &WorkerSummary,
+) -> ApprovalGate {
+    approval_gate_for_tool_with_scope(
+        tool,
+        args,
+        session,
+        autonomous_policy_scope(session, worker),
+    )
+}
+
+fn approval_gate_for_tool_with_scope(
+    tool: &str,
+    args: &Value,
+    session: &SessionSummary,
+    autonomous_scope: Option<PathBuf>,
+) -> ApprovalGate {
     if session.approval_mode == "autonomous" {
-        if let Some(worktree) = autonomous_policy_worktree(session) {
-            return autonomous_approval_gate(tool, args, &worktree);
+        if let Some(scope) = autonomous_scope {
+            return autonomous_approval_gate(tool, args, &scope);
         }
         let policy = policy_for_tool_with_mode(tool, "ask");
         return if policy.decision == "require_approval" {
@@ -21578,6 +21601,19 @@ fn approval_gate_for_tool(tool: &str, args: &Value, session: &SessionSummary) ->
     }
 }
 
+fn autonomous_policy_scope(session: &SessionSummary, worker: &WorkerSummary) -> Option<PathBuf> {
+    let worktree = autonomous_policy_worktree(session)?;
+    let worker_dir = worker.working_dir.trim();
+    if worker_dir.is_empty() {
+        return Some(worktree);
+    }
+    let worker_dir = PathBuf::from(worker_dir);
+    if worker_dir.is_absolute() && path_is_inside_base(&worktree, &worker_dir) {
+        return Some(worker_dir);
+    }
+    None
+}
+
 fn autonomous_policy_worktree(session: &SessionSummary) -> Option<PathBuf> {
     if session.workspace_mode != "isolated_worktree" {
         return None;
@@ -21588,6 +21624,16 @@ fn autonomous_policy_worktree(session: &SessionSummary) -> Option<PathBuf> {
     }
     let path = PathBuf::from(path);
     path.is_absolute().then_some(path)
+}
+
+fn path_is_inside_base(base: &Path, candidate: &Path) -> bool {
+    let Ok(base) = fs::canonicalize(base) else {
+        return false;
+    };
+    let Ok(candidate) = fs::canonicalize(candidate) else {
+        return false;
+    };
+    candidate == base || candidate.starts_with(base)
 }
 
 fn autonomous_approval_gate(tool: &str, args: &Value, worktree: &Path) -> ApprovalGate {
@@ -35577,6 +35623,90 @@ Thanks."#,
         assert_eq!(
             approval.policy_decision.matched_rule,
             "autonomous:escalate:command.run"
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn autonomous_session_scopes_command_policy_to_worker_working_dir() {
+        use std::os::unix::fs::symlink;
+
+        let state_dir = test_state_dir("autonomous-worker-scope-command");
+        let state = initialize_test_state(&state_dir);
+        let repo = init_autonomous_test_repo(&state_dir, "worker-scope-repo");
+        let outside = state_dir.join("outside");
+        fs::create_dir_all(&outside).expect("outside directory should exist");
+        fs::write(outside.join("secret"), "outside\n").expect("outside secret should write");
+        symlink(outside.join("secret"), repo.join("src/secret"))
+            .expect("outside symlink should be created");
+
+        let session_id = "autonomous-worker-scope-session".to_string();
+        state
+            .store
+            .create_session(autonomous_git_session_record(
+                &session_id,
+                "Autonomous worker scope",
+                &repo,
+            ))
+            .expect("session should persist");
+        let session = state
+            .store
+            .get_session(&session_id)
+            .expect("session should load");
+        let (job_id, mut worker) =
+            create_autonomous_tool_worker(&state, &session_id, &repo, "worker-scope");
+        let narrowed = repo.join("src");
+        worker.working_dir = narrowed.display().to_string();
+        worker.read_roots = vec![narrowed.display().to_string()];
+        worker.write_roots = vec![narrowed.display().to_string()];
+
+        let mut checkpoint = test_checkpoint_with_prompt("Inspect the child scope.");
+        checkpoint.session_id = session_id.clone();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let mut step = 0;
+        let mut tool_calls = 0;
+
+        let denied = handle_tool_call_proposal(
+            &state,
+            &session,
+            &job_id,
+            &mut worker,
+            &mut checkpoint,
+            &mut step,
+            &mut tool_calls,
+            &mut cancel_rx,
+            "read child file".to_string(),
+            "command.run".to_string(),
+            json!({"command":"cat","args":["secret"],"cwd":"."}),
+        )
+        .await
+        .expect("scoped command proposal should be handled");
+        assert!(matches!(denied, LoopDisposition::Continue));
+
+        let detail = state.store.get_job(&job_id).expect("job should load");
+        let denied_call = detail
+            .tool_calls
+            .iter()
+            .find(|call| call.tool_id == "command.run")
+            .expect("denied command should be recorded");
+        assert_eq!(denied_call.status, "denied");
+        assert_eq!(denied_call.error_class, "autonomous_policy_denied");
+        assert!(
+            denied_call
+                .error_detail
+                .contains("outside the worker worktree"),
+            "denial should cite worker-scope containment: {}",
+            denied_call.error_detail
+        );
+        assert!(
+            state
+                .store
+                .list_mutation_receipts_for_session(&session_id)
+                .expect("receipts should load")
+                .is_empty(),
+            "worker-scope denial must not execute the command"
         );
 
         let _ = fs::remove_dir_all(&state_dir);
