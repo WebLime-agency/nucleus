@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   apply-area-label:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, weblime-ci]
     steps:
       - name: Apply selected area label
         uses: actions/github-script@v7

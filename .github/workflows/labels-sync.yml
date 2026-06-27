@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, weblime-ci]
     steps:
       - name: Checkout
         uses: actions/checkout@v4

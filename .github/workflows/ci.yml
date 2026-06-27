@@ -18,7 +18,7 @@ env:
 jobs:
   promotion:
     name: Promotion
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, weblime-ci]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -30,7 +30,7 @@ jobs:
 
   rust:
     name: Rust
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, weblime-ci]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -49,7 +49,7 @@ jobs:
 
   web:
     name: Web
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, weblime-ci]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
