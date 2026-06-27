@@ -9707,7 +9707,7 @@ fn normalize_session_approval_mode(value: Option<&str>) -> Result<String, ApiErr
         .filter(|value| !value.is_empty())
         .unwrap_or("ask");
     match mode {
-        "ask" | "trusted" => Ok(mode.to_string()),
+        "ask" | "trusted" | "autonomous" => Ok(mode.to_string()),
         other => Err(ApiError::bad_request(format!(
             "unsupported session approval mode '{other}'",
         ))),
@@ -10337,6 +10337,10 @@ fn describe_session_update(before: &SessionSummary, after: &SessionSummary) -> S
         return match after.approval_mode.as_str() {
             "trusted" => format!(
                 "Allowed Nucleus to run actions without approval in {} session '{}'.",
+                after.provider, after.title
+            ),
+            "autonomous" => format!(
+                "Enabled scoped autonomous approvals in {} session '{}'.",
                 after.provider, after.title
             ),
             _ => format!(
