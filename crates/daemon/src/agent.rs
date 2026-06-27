@@ -21611,6 +21611,19 @@ fn autonomous_policy_scope(session: &SessionSummary, worker: &WorkerSummary) -> 
     if worker_dir.is_absolute() && path_is_inside_base(&worktree, &worker_dir) {
         return Some(worker_dir);
     }
+    if worker_dir.is_absolute() {
+        warn!(
+            worktree = %worktree.display(),
+            worker_dir = %worker_dir.display(),
+            "autonomous approval scope fell back to ask mode because worker directory is outside the managed worktree"
+        );
+    } else {
+        warn!(
+            worktree = %worktree.display(),
+            worker_dir = %worker_dir.display(),
+            "autonomous approval scope fell back to ask mode because worker directory is relative"
+        );
+    }
     None
 }
 
@@ -21623,6 +21636,12 @@ fn autonomous_policy_worktree(session: &SessionSummary) -> Option<PathBuf> {
         return None;
     }
     let path = PathBuf::from(path);
+    if path.is_absolute() && !path.is_dir() {
+        warn!(
+            worktree = %path.display(),
+            "autonomous approval worktree path is not an existing directory"
+        );
+    }
     path.is_absolute().then_some(path)
 }
 

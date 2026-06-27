@@ -435,6 +435,12 @@ fn evaluate_command_run(args: &Value, worktree: &Path) -> ScopedApprovalDecision
             vec![cwd.to_string()],
         );
     }
+    if env_uses_cargo_exec_injection_flag(args) {
+        return deny_decision(
+            "command env uses cargo/rust exec-injection configuration flags",
+            vec![cwd.to_string()],
+        );
+    }
     if !command_looks_like_read_build_or_test(&policy_command) {
         return escalate(
             "command program is not on the safe read/build/test allow-list",
@@ -566,6 +572,12 @@ fn evaluate_tests_run(args: &Value, worktree: &Path) -> ScopedApprovalDecision {
     if command_uses_cargo_exec_injection_flag(&policy_command) {
         return deny_decision(
             "tests.run cargo/rust command uses exec-injection configuration flags",
+            vec![cwd.to_string()],
+        );
+    }
+    if env_uses_cargo_exec_injection_flag(args) {
+        return deny_decision(
+            "tests.run env uses cargo/rust exec-injection configuration flags",
             vec![cwd.to_string()],
         );
     }
@@ -942,6 +954,47 @@ fn command_uses_cargo_exec_injection_flag(command: &str) -> bool {
             || token == "-Z"
             || token.starts_with("-Z")
     })
+}
+
+fn env_uses_cargo_exec_injection_flag(args: &Value) -> bool {
+    let Some(env) = args.get("env").and_then(Value::as_object) else {
+        return false;
+    };
+    env.iter().any(|(key, value)| {
+        let Some(value) = value.as_str() else {
+            return false;
+        };
+        let key = key.to_ascii_uppercase();
+        match key.as_str() {
+            "RUSTFLAGS" => rustflags_tokens(value)
+                .iter()
+                .any(|token| is_cargo_exec_injection_token(token)),
+            "CARGO_ENCODED_RUSTFLAGS" => encoded_rustflags_tokens(value)
+                .iter()
+                .any(|token| is_cargo_exec_injection_token(token)),
+            _ => false,
+        }
+    })
+}
+
+fn rustflags_tokens(value: &str) -> Vec<String> {
+    shell_words(value).unwrap_or_else(|_| value.split_whitespace().map(str::to_string).collect())
+}
+
+fn encoded_rustflags_tokens(value: &str) -> Vec<String> {
+    value
+        .split('\u{1f}')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn is_cargo_exec_injection_token(token: &str) -> bool {
+    token == "--config"
+        || token.starts_with("--config=")
+        || token == "-Z"
+        || token.starts_with("-Z")
 }
 
 fn env_requests_external_git_diff(args: &Value) -> bool {
@@ -1808,6 +1861,74 @@ mod tests {
                 "plain cargo test forms should stay allowed, got {decision:?}"
             );
         }
+    }
+
+    #[test]
+    fn denies_cargo_exec_injection_flags_in_env() {
+        let denied_rustflags = evaluate_autonomous_approval(
+            "command.run",
+            &json!({
+                "command":"cargo",
+                "args":["test"],
+                "cwd":".",
+                "env":{"RUSTFLAGS":"--config build.rustc-wrapper=scripts/w"}
+            }),
+            worktree(),
+        );
+        match denied_rustflags {
+            ScopedApprovalDecision::Deny(outcome) => assert!(
+                outcome
+                    .reason
+                    .contains("env uses cargo/rust exec-injection"),
+                "RUSTFLAGS --config should be denied by env exec-injection hardening, got {outcome:?}"
+            ),
+            other => panic!("RUSTFLAGS --config should be denied, got {other:?}"),
+        }
+
+        let denied_encoded = evaluate_autonomous_approval(
+            "command.run",
+            &json!({
+                "command":"cargo",
+                "args":["test"],
+                "cwd":".",
+                "env":{"CARGO_ENCODED_RUSTFLAGS":"--config\u{1f}build.rustc-wrapper=scripts/w"}
+            }),
+            worktree(),
+        );
+        assert!(
+            matches!(denied_encoded, ScopedApprovalDecision::Deny(_)),
+            "encoded RUSTFLAGS --config should be denied, got {denied_encoded:?}"
+        );
+
+        let denied_tests_run = evaluate_autonomous_approval(
+            "tests.run",
+            &json!({
+                "command":"cargo",
+                "args":["test"],
+                "cwd":".",
+                "env":{"RUSTFLAGS":"-Zunstable-options"}
+            }),
+            worktree(),
+        );
+        assert!(
+            matches!(denied_tests_run, ScopedApprovalDecision::Deny(_)),
+            "tests.run RUSTFLAGS -Z should be denied, got {denied_tests_run:?}"
+        );
+
+        let allowed_plain_rustflags = evaluate_autonomous_approval(
+            "command.run",
+            &json!({
+                "command":"cargo",
+                "args":["test"],
+                "cwd":".",
+                "env":{"RUSTFLAGS":"-Awarnings"}
+            }),
+            worktree(),
+        );
+        assert!(
+            matches!(allowed_plain_rustflags, ScopedApprovalDecision::Allow(_)),
+            "ordinary RUSTFLAGS should stay allowed, got {allowed_plain_rustflags:?}"
+        );
     }
 
     #[test]
