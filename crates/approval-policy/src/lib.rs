@@ -429,6 +429,12 @@ fn evaluate_command_run(args: &Value, worktree: &Path) -> ScopedApprovalDecision
             vec![cwd.to_string()],
         );
     }
+    if command_uses_cargo_exec_injection_flag(&policy_command) {
+        return deny_decision(
+            "cargo/rust command uses exec-injection configuration flags",
+            vec![cwd.to_string()],
+        );
+    }
     if !command_looks_like_read_build_or_test(&policy_command) {
         return escalate(
             "command program is not on the safe read/build/test allow-list",
@@ -554,6 +560,12 @@ fn evaluate_tests_run(args: &Value, worktree: &Path) -> ScopedApprovalDecision {
     if env_has_external_path_reference(args, worktree, Path::new(cwd)) {
         return deny_decision(
             "tests.run env references a path outside the worker worktree",
+            vec![cwd.to_string()],
+        );
+    }
+    if command_uses_cargo_exec_injection_flag(&policy_command) {
+        return deny_decision(
+            "tests.run cargo/rust command uses exec-injection configuration flags",
             vec![cwd.to_string()],
         );
     }
@@ -907,6 +919,31 @@ fn command_uses_cargo_clippy_fix(command: &str) -> bool {
         && tokens.iter().any(|token| *token == "--fix")
 }
 
+fn command_uses_cargo_exec_injection_flag(command: &str) -> bool {
+    let tokens = shell_words(command)
+        .unwrap_or_else(|_| command.split_whitespace().map(str::to_string).collect());
+    let Some(program) = tokens.first() else {
+        return false;
+    };
+    let program = Path::new(program)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    if !matches!(
+        program.as_str(),
+        "cargo" | "rustc" | "rustdoc" | "clippy-driver"
+    ) {
+        return false;
+    }
+    tokens.iter().skip(1).any(|token| {
+        token == "--config"
+            || token.starts_with("--config=")
+            || token == "-Z"
+            || token.starts_with("-Z")
+    })
+}
+
 fn env_requests_external_git_diff(args: &Value) -> bool {
     let Some(env) = args.get("env").and_then(Value::as_object) else {
         return false;
@@ -1055,7 +1092,7 @@ fn command_tokens_have_external_path_reference(
         .iter()
         .enumerate()
         .filter(|(index, _)| *index != 0)
-        .filter_map(|(_, token)| path_like_command_token(token))
+        .flat_map(|(_, token)| path_like_command_token(token))
         .map(|path| command_path_argument_for_cwd(cwd, path))
         .any(|path| !path_is_inside_worktree(worktree, &path))
 }
@@ -1075,7 +1112,7 @@ fn args_have_external_path_reference(args: &Value, worktree: &Path, cwd: &Path) 
         .flatten()
         .filter_map(Value::as_str)
         .flat_map(|value| value.split_whitespace().map(clean_command_token))
-        .filter_map(|token| path_like_command_token(&token))
+        .flat_map(|token| path_like_command_token(&token))
         .map(|path| command_path_argument_for_cwd(cwd, path))
         .any(|path| !path_is_inside_worktree(worktree, &path))
 }
@@ -1087,7 +1124,7 @@ fn env_has_external_path_reference(args: &Value, worktree: &Path, cwd: &Path) ->
         .flat_map(|env| env.values())
         .filter_map(Value::as_str)
         .flat_map(env_path_tokens)
-        .filter_map(|token| path_like_command_token(&token))
+        .flat_map(|token| path_like_command_token(&token))
         .map(|path| command_path_argument_for_cwd(cwd, path))
         .any(|path| !path_is_inside_worktree(worktree, &path))
 }
@@ -1136,43 +1173,48 @@ fn clean_command_token(token: &str) -> String {
         .to_string()
 }
 
-fn path_like_command_token(token: &str) -> Option<PathBuf> {
+fn path_like_command_token(token: &str) -> Vec<PathBuf> {
     let raw = token.trim();
     if raw.starts_with('-') {
         return raw
-            .split('=')
-            .skip(1)
-            .find_map(|value| path_like_option_value(value.trim()));
+            .split_once('=')
+            .map(|(_, value)| path_like_value(value))
+            .unwrap_or_default();
     }
     path_like_value(raw)
 }
 
-fn path_like_option_value(token: &str) -> Option<PathBuf> {
-    let token = token.trim();
+fn path_like_option_value(token: &str) -> Vec<PathBuf> {
+    let token = clean_embedded_path_value(token);
     if token.is_empty() || token.starts_with('-') {
-        return None;
+        return Vec::new();
     }
     if token.starts_with('~') {
-        return Some(PathBuf::from("/~"));
+        return vec![PathBuf::from("/~")];
     }
-    if token.starts_with('/') || token.starts_with("../") || token == ".." || token.contains('/') {
-        return Some(PathBuf::from(token));
-    }
-    if token.contains("/../") || token.ends_with("/..") {
-        return Some(PathBuf::from(token));
-    }
-    None
+    vec![PathBuf::from(token)]
 }
 
-fn path_like_value(token: &str) -> Option<PathBuf> {
-    let token = token.trim();
+fn path_like_value(token: &str) -> Vec<PathBuf> {
+    let token = clean_embedded_path_value(token);
     if token.is_empty() || token.starts_with('-') {
-        return None;
+        return Vec::new();
     }
     if token.starts_with('~') {
-        return Some(PathBuf::from("/~"));
+        return vec![PathBuf::from("/~")];
     }
-    Some(PathBuf::from(token))
+    let mut paths = vec![PathBuf::from(token.clone())];
+    if let Some((_, value)) = token.split_once('=') {
+        paths.extend(path_like_option_value(value));
+    }
+    paths
+}
+
+fn clean_embedded_path_value(token: &str) -> String {
+    token
+        .trim()
+        .trim_matches(|ch| matches!(ch, '\'' | '"'))
+        .to_string()
 }
 
 fn command_is_focused_node_test(command: &str) -> bool {
@@ -1687,6 +1729,85 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn denies_embedded_equals_external_path_value() {
+        let root = std::env::temp_dir().join(format!(
+            "nucleus-policy-embedded-equals-root-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("scripts")).expect("scripts dir should be created");
+        fs::write(root.join("scripts/w"), "#!/bin/sh\nexit 0\n")
+            .expect("in-worktree wrapper should be created");
+
+        let outside_decision = evaluate_autonomous_approval(
+            "command.run",
+            &json!({
+                "command":"cargo",
+                "args":["test","--config","build.rustc-wrapper=\"/tmp/wrapper\""],
+                "cwd":".",
+            }),
+            &root,
+        );
+        match outside_decision {
+            ScopedApprovalDecision::Deny(outcome) => assert!(
+                outcome.reason.contains("outside the worker worktree"),
+                "embedded external value should be denied by path containment, got {outcome:?}"
+            ),
+            other => panic!("embedded external value should be denied, got {other:?}"),
+        }
+
+        let in_worktree_args = json!({
+            "command":"cargo",
+            "args":["test","--config","build.rustc-wrapper=scripts/w"],
+            "cwd":".",
+        });
+        assert!(
+            !command_has_external_path_reference(&in_worktree_args, &root, Path::new(".")),
+            "embedded in-worktree values should pass path containment before cargo hardening"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn denies_cargo_exec_injection_flags_but_allows_plain_cargo_tests() {
+        let denied_config = evaluate_autonomous_approval(
+            "command.run",
+            &json!({"command":"cargo","args":["test","--config","build.rustc-wrapper=scripts/w"],"cwd":"."}),
+            worktree(),
+        );
+        match denied_config {
+            ScopedApprovalDecision::Deny(outcome) => assert!(
+                outcome.reason.contains("exec-injection"),
+                "cargo --config should be denied by exec-injection hardening, got {outcome:?}"
+            ),
+            other => panic!("cargo --config should be denied, got {other:?}"),
+        }
+
+        let denied_unstable = evaluate_autonomous_approval(
+            "command.run",
+            &json!({"command":"cargo","args":["test","-Zunstable-options"],"cwd":"."}),
+            worktree(),
+        );
+        assert!(
+            matches!(denied_unstable, ScopedApprovalDecision::Deny(_)),
+            "cargo -Z should be denied, got {denied_unstable:?}"
+        );
+
+        for args in [json!(["test"]), json!(["test", "--quiet"])] {
+            let decision = evaluate_autonomous_approval(
+                "command.run",
+                &json!({"command":"cargo","args":args,"cwd":"."}),
+                worktree(),
+            );
+            assert!(
+                matches!(decision, ScopedApprovalDecision::Allow(_)),
+                "plain cargo test forms should stay allowed, got {decision:?}"
+            );
+        }
     }
 
     #[test]

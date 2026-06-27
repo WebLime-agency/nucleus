@@ -2921,7 +2921,7 @@
 
   function composerModeDescription(mode: SessionComposerMode) {
     if (mode === 'plan') return 'Draft a plan without taking actions.';
-    if (mode === 'autonomous') return 'Auto-run safe worktree edits and validation; block publication and network actions.';
+    if (mode === 'autonomous') return 'Auto-run scoped edits and worktree build/test code with your privileges; trusted repos only.';
     if (mode === 'trusted') return 'Run trusted actions without approval prompts.';
     return 'Ask before commands, edits, and other actions.';
   }
@@ -4479,7 +4479,7 @@
                     {/each}
                   </Select>
                   <span class="block text-xs leading-5 text-zinc-500">
-                    Choose whether Nucleus plans first, asks, auto-runs scoped worktree actions, or auto-runs trusted actions.
+                    Scoped mode runs worktree build/test code with your privileges; use it only for trusted repositories.
                   </span>
                 </div>
 
