@@ -4,7 +4,6 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::Mutex,
-    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -1042,9 +1041,10 @@ impl StateStore {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn hold_connection_mutex_for_test(
         &self,
-        duration: Duration,
+        duration: std::time::Duration,
         locked: Option<std::sync::mpsc::Sender<()>>,
     ) {
         let _connection = self.connection.lock().expect("storage mutex poisoned");
