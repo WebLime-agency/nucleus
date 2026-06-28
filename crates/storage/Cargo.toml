@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
 nucleus-protocol.workspace = true
 nucleus-core.workspace = true
