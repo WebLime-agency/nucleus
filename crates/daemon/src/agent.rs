@@ -111,6 +111,8 @@ const COMMAND_TRUNCATED_NOTE: &str = "[output truncated by the Nucleus budget]";
 const UI_RENDERABLE_TERMS: &[&str] = &[
     "ui",
     "visual",
+    "visually",
+    "rendered",
     "layout",
     "responsive",
     "interaction",
@@ -125,6 +127,28 @@ const UI_RENDERABLE_TERMS: &[&str] = &[
     "shadcn",
     "css",
     "page",
+    "pages",
+];
+const UI_RENDERABLE_PAGE_TERMS: &[&str] = &["page", "pages"];
+const UI_RENDERABLE_PLATFORM_PAGE_CONTEXT_TERMS: &[&str] = &[
+    "cloudflare pages",
+    "pages project",
+    "cloudflare workers",
+    "d1",
+    "wrangler",
+];
+const UI_RENDERABLE_PAGE_INTENT_TERMS: &[&str] = &[
+    "component",
+    "frontend",
+    "front-end",
+    "svelte",
+    "react",
+    "vue",
+    "next.js",
+    "astro",
+    "route",
+    "screen",
+    "view",
 ];
 // Text prompts led by these primary intents should be answered directly rather
 // than framed as UI implementation work just because they mention UI terms.
@@ -289,13 +313,41 @@ fn classify_prompt_ui_renderable(prompt: &str, image_count: usize) -> String {
         }
         return "true".to_string();
     }
-    if UI_RENDERABLE_TERMS
-        .iter()
-        .any(|term| normalized_contains_term(&normalized, term))
-    {
+    if has_ui_renderable_text_intent(&normalized) {
         return "true".to_string();
     }
     "false".to_string()
+}
+
+fn has_ui_renderable_text_intent(normalized: &str) -> bool {
+    if UI_RENDERABLE_TERMS
+        .iter()
+        .filter(|term| !UI_RENDERABLE_PAGE_TERMS.contains(term))
+        .any(|term| normalized_contains_term(normalized, term))
+    {
+        return true;
+    }
+
+    let mentions_page = contains_phrase(normalized, "page");
+    let mentions_pages = contains_phrase(normalized, "pages");
+    if !mentions_page && !mentions_pages {
+        return false;
+    }
+
+    if contains_any_phrase(normalized, UI_RENDERABLE_PAGE_INTENT_TERMS) {
+        return true;
+    }
+
+    let has_write_intent = contains_any_phrase(normalized, WRITE_DELEGATED_CHILD_PHRASES);
+    if mentions_page && has_write_intent {
+        return true;
+    }
+
+    if contains_any_phrase(normalized, UI_RENDERABLE_PLATFORM_PAGE_CONTEXT_TERMS) {
+        return false;
+    }
+
+    has_write_intent
 }
 
 fn mentions_non_ui_image_context(prompt: &str) -> bool {
@@ -929,6 +981,82 @@ const WRITE_DELEGATED_CHILD_PHRASES: &[&str] = &[
     "release",
     "ship",
     "merge",
+];
+
+const LOCAL_PROJECT_IMPLEMENTATION_OWNERSHIP_PHRASES: &[&str] = &[
+    "implement",
+    "implementation owner",
+    "change code",
+    "code change",
+    "make changes",
+    "write code",
+    "add code",
+    "create file",
+    "update file",
+    "run validation",
+    "run tests",
+];
+
+const LOCAL_PROJECT_IMPLEMENTATION_COMPLETION_PHRASES: &[&str] = &[
+    "i implemented",
+    "implemented the",
+    "implemented requested",
+    "i fixed",
+    "fixed the",
+    "fixed requested",
+    "i changed",
+    "changed the",
+    "changed requested",
+    "i updated",
+    "updated the",
+    "updated requested",
+    "i modified",
+    "modified the",
+    "modified requested",
+    "i edited",
+    "edited the",
+    "edited requested",
+    "i patched",
+    "patched the",
+    "patched requested",
+    "added code",
+    "added file",
+    "created file",
+    "wrote code",
+    "ran tests",
+    "tests passed",
+    "validation passed",
+    "validation_status: passed",
+];
+const LOCAL_PROJECT_IMPLEMENTATION_COMPLETION_START_VERBS: &[&str] = &[
+    "implemented",
+    "fixed",
+    "changed",
+    "updated",
+    "modified",
+    "edited",
+    "patched",
+    "configured",
+    "migrated",
+    "refactored",
+    "rewrote",
+    "generated",
+    "scaffolded",
+];
+const LOCAL_PROJECT_NON_IMPLEMENTATION_REPORT_OBJECTS: &[&str] = &[
+    "analysis",
+    "context",
+    "details",
+    "findings",
+    "investigation",
+    "note",
+    "notes",
+    "recommendation",
+    "recommendations",
+    "report",
+    "response",
+    "results",
+    "summary",
 ];
 
 fn normalized_delegation_text(value: &str) -> String {
@@ -6992,6 +7120,116 @@ fn local_project_child_mutation_receipts(
     Ok(receipts)
 }
 
+fn reclassify_read_only_child_completion_if_applicable(
+    state: &AppState,
+    detail: &JobDetail,
+    current: JobSummary,
+    summary: &str,
+    final_answer: &str,
+) -> Result<JobSummary> {
+    if !read_only_child_completion_reclassification_applies(state, detail, summary, final_answer)? {
+        return Ok(current);
+    }
+
+    let updated = state.store.update_job(
+        &detail.job.id,
+        JobPatch {
+            task_class: Some(Some(DELEGATED_SUBTASK_TASK_CLASS.to_string())),
+            validation_status: Some("not_performed".to_string()),
+            ..JobPatch::default()
+        },
+    )?;
+    if let Err(error) = state.store.append_job_event(JobEventRecord {
+        job_id: detail.job.id.clone(),
+        worker_id: detail.job.root_worker_id.clone(),
+        event_type: "job.task_class.reclassified".to_string(),
+        status: DELEGATED_SUBTASK_TASK_CLASS.to_string(),
+        summary: "Read-only child completion uses delegated sub-task gate.".to_string(),
+        detail: "The child used only read-only evidence tools and recorded no material mutation receipts, so local project validation is not required.".to_string(),
+        data_json: json!({
+            "from_task_class": "local_project",
+            "to_task_class": DELEGATED_SUBTASK_TASK_CLASS,
+            "reason": "read_only_child_completion",
+        }),
+    }) {
+        warn!(job_id = %detail.job.id, error = %error, "failed to append read-only child task-class reclassification event");
+    }
+    Ok(updated)
+}
+
+fn read_only_child_completion_reclassification_applies(
+    state: &AppState,
+    detail: &JobDetail,
+    summary: &str,
+    final_answer: &str,
+) -> Result<bool> {
+    if detail.job.parent_job_id.is_none()
+        || detail.job.task_class.as_deref() != Some("local_project")
+        || detail.tool_calls.is_empty()
+        || !detail
+            .tool_calls
+            .iter()
+            .all(tool_call_is_read_only_child_evidence)
+    {
+        return Ok(false);
+    }
+    if !local_project_child_mutation_receipts(state, detail)?.is_empty() {
+        return Ok(false);
+    }
+    if child_prompt_explicitly_owns_local_project_implementation(detail)
+        || final_answer_claims_local_project_implementation(summary, final_answer)
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn tool_call_is_read_only_child_evidence(tool_call: &nucleus_protocol::ToolCallSummary) -> bool {
+    if tool_call.status != "completed" {
+        return false;
+    }
+    matches!(
+        tool_call.tool_id.as_str(),
+        "project.inspect" | "fs.list" | "fs.read_text" | "rg.search" | "git.status" | "git.diff"
+    )
+}
+
+fn child_prompt_explicitly_owns_local_project_implementation(detail: &JobDetail) -> bool {
+    let text = normalized_delegation_text(&format!(
+        "{}\n{}\n{}",
+        detail.job.title, detail.job.purpose, detail.job.prompt_excerpt
+    ));
+    contains_any_phrase(&text, LOCAL_PROJECT_IMPLEMENTATION_OWNERSHIP_PHRASES)
+}
+
+fn final_answer_claims_local_project_implementation(summary: &str, final_answer: &str) -> bool {
+    let raw_text = format!("{summary}\n{final_answer}");
+    let text = normalized_delegation_text(&raw_text);
+    contains_any_phrase(&text, LOCAL_PROJECT_IMPLEMENTATION_COMPLETION_PHRASES)
+        || starts_with_local_project_completion_claim(&raw_text)
+}
+
+fn starts_with_local_project_completion_claim(text: &str) -> bool {
+    text.to_ascii_lowercase()
+        .split(|ch| matches!(ch, '\n' | '.' | '!' | '?'))
+        .any(|clause| {
+            let trimmed = clause.trim_start_matches(|ch: char| !ch.is_ascii_alphanumeric());
+            let mut tokens = trimmed
+                .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .filter(|token| !token.is_empty());
+            let Some(first) = tokens.next() else {
+                return false;
+            };
+            if !LOCAL_PROJECT_IMPLEMENTATION_COMPLETION_START_VERBS.contains(&first) {
+                return false;
+            }
+            let Some(second) = tokens.next() else {
+                return true;
+            };
+            !LOCAL_PROJECT_NON_IMPLEMENTATION_REPORT_OBJECTS.contains(&second)
+        })
+}
+
 fn local_project_child_mutation_receipt_is_material(
     receipt: &nucleus_protocol::MutationReceipt,
     tool_call: Option<&nucleus_protocol::ToolCallSummary>,
@@ -8740,6 +8978,15 @@ async fn complete_job_with_final_answer_with_additional_context_commands(
             },
         )?;
     }
+    // Tool calls are recorded during worker execution; completion may add
+    // derived evidence, but it must not create new child work for this check.
+    completion_job = reclassify_read_only_child_completion_if_applicable(
+        state,
+        &detail,
+        completion_job,
+        summary,
+        final_answer,
+    )?;
     reconcile_publication_browser_status_with_completion(&completion_job, &mut publication_patch);
     let projected_blocker = projected_completion_gate_blocker(&completion_job, &publication_patch);
     let terminal_job_state = if projected_blocker.is_some() {
@@ -24863,6 +25110,59 @@ mod tests {
 
     #[test]
     fn delegated_subtask_classifier_rejects_explicit_write_contracts() {
+        assert!(!contains_any_phrase(
+            "investigate the current implementation of workers support",
+            LOCAL_PROJECT_IMPLEMENTATION_OWNERSHIP_PHRASES
+        ));
+        assert!(!contains_any_phrase(
+            "investigate what tests exist for workers support",
+            LOCAL_PROJECT_IMPLEMENTATION_OWNERSHIP_PHRASES
+        ));
+        assert!(!contains_any_phrase(
+            "explain the existing validation logic",
+            LOCAL_PROJECT_IMPLEMENTATION_OWNERSHIP_PHRASES
+        ));
+        assert!(!contains_any_phrase(
+            "investigate what fix is needed for workers support",
+            LOCAL_PROJECT_IMPLEMENTATION_OWNERSHIP_PHRASES
+        ));
+        assert!(!contains_any_phrase(
+            "describe how to modify the d1 binding",
+            LOCAL_PROJECT_IMPLEMENTATION_OWNERSHIP_PHRASES
+        ));
+        assert!(contains_any_phrase(
+            "run tests for the package",
+            LOCAL_PROJECT_IMPLEMENTATION_OWNERSHIP_PHRASES
+        ));
+        assert!(contains_any_phrase(
+            "make changes to the package configuration",
+            LOCAL_PROJECT_IMPLEMENTATION_OWNERSHIP_PHRASES
+        ));
+        assert!(contains_any_phrase(
+            "act as the implementation owner for this package",
+            LOCAL_PROJECT_IMPLEMENTATION_OWNERSHIP_PHRASES
+        ));
+        assert!(final_answer_claims_local_project_implementation(
+            "D1 support update",
+            "Implemented support for D1 bindings."
+        ));
+        assert!(final_answer_claims_local_project_implementation(
+            "Routing update",
+            "Fixed login routing."
+        ));
+        assert!(!final_answer_claims_local_project_implementation(
+            "Investigation report",
+            "Updated findings below: the D1 binding is not configured yet."
+        ));
+        let mut command_branch_delete = test_tool_call_summary("command.run", json!({}));
+        command_branch_delete.args_json = json!({
+            "command": "git",
+            "args": ["branch", "-D", "stale-branch"],
+        });
+        assert!(!tool_call_is_read_only_child_evidence(
+            &command_branch_delete
+        ));
+
         let explicit_read_only = ChildJobProposal {
             title: "Read-only listing".to_string(),
             prompt: "List README.md and summarize findings.".to_string(),
@@ -31992,10 +32292,27 @@ Thanks."#,
             classify_prompt_ui_renderable("Fix the mobile sidebar dropdown layout", 0),
             "true"
         );
+        assert_eq!(
+            classify_prompt_ui_renderable(
+                "Investigate what this Cloudflare Pages project needs to support Cloudflare Workers and D1",
+                0,
+            ),
+            "false"
+        );
+        let cloudflare_patch = browser_verification_initial_patch(
+            &classify_prompt_ui_renderable(
+                "Investigate what this Cloudflare Pages project needs to support Cloudflare Workers and D1",
+                0,
+            ),
+            None,
+            true,
+        );
+        assert_eq!(cloudflare_patch.browser_verification_required, Some(false));
         for prompt in [
             "File an issue for the repo with a suggestion for the web UI: move the three-dots dropdown",
             "What do you think about the layout of the web UI?",
             "Draft a note about the sidebar behavior",
+            "Fix paged scrolling in the worker scheduler",
         ] {
             assert_eq!(classify_prompt_ui_renderable(prompt, 0), "false");
         }
@@ -32011,10 +32328,21 @@ Thanks."#,
             "Redesign the modal",
             "Review the mobile layout in the browser",
             "Please review this screenshot match",
+            "Implement this Svelte page layout and verify it in the browser",
+            "Implement the Svelte route for the Cloudflare Pages project",
+            "Fix the login page in the Cloudflare Pages project",
+            "Implement the service workers page cache strategy",
+            "Review this screenshot/page visually",
             "Implement my suggestion for the mobile layout",
             "Draft a CSS fix for the sidebar",
         ] {
             assert_eq!(classify_prompt_ui_renderable(prompt, 0), "true");
+            let patch = browser_verification_initial_patch(
+                &classify_prompt_ui_renderable(prompt, 0),
+                None,
+                true,
+            );
+            assert_eq!(patch.browser_verification_required, Some(true), "{prompt}");
         }
         assert_eq!(
             classify_prompt_ui_renderable("Refactor the Rust parser", 0),
@@ -39872,6 +40200,285 @@ Thanks."#,
                 "Local project completion was claimed without successful validation evidence",
             )
         }));
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn read_only_cleanliness_child_completes_without_validation() {
+        let state_dir = test_state_dir("read-only-cleanliness-child-completes");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, _parent_worker) = create_local_project_parent_join_context(
+            &state,
+            "read-only-cleanliness-child",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "read-only-cleanliness-child-job",
+            LocalProjectJoinChildOptions {
+                state: "running",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        let child_worker_id = format!("{child_job_id}-worker");
+        append_read_only_tool_call(&state, &child_job_id, &child_worker_id, "project.inspect");
+        append_read_only_tool_call(&state, &child_job_id, &child_worker_id, "git.status");
+        let mut child_worker = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load")
+            .workers
+            .into_iter()
+            .find(|worker| worker.id == child_worker_id)
+            .expect("child worker should load");
+
+        complete_job_with_final_answer(
+            &state,
+            &session,
+            &child_job_id,
+            &mut child_worker,
+            2,
+            2,
+            "Worktree cleanliness recommendation",
+            "The worktree inspection is complete. Recommendation: keep the existing branch clean before starting new implementation work.",
+            &json!({}),
+            &[],
+        )
+        .await
+        .expect("read-only child should complete");
+
+        let child = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load");
+        assert_eq!(child.job.state, "completed");
+        assert_eq!(child.job.validation_status, "not_performed");
+        assert_eq!(
+            child.job.task_class.as_deref(),
+            Some(DELEGATED_SUBTASK_TASK_CLASS)
+        );
+        assert!(
+            !child
+                .job
+                .completion_blockers
+                .iter()
+                .any(|blocker| { blocker.contains("without successful validation evidence") })
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn read_only_repo_investigation_child_completes_without_validation() {
+        let state_dir = test_state_dir("read-only-repo-investigation-child-completes");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, _parent_worker) = create_local_project_parent_join_context(
+            &state,
+            "read-only-repo-investigation-child",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "read-only-repo-investigation-child-job",
+            LocalProjectJoinChildOptions {
+                state: "running",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        let child_worker_id = format!("{child_job_id}-worker");
+        for tool in ["project.inspect", "fs.list", "rg.search", "fs.read_text"] {
+            append_read_only_tool_call(&state, &child_job_id, &child_worker_id, tool);
+        }
+        let mut child_worker = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load")
+            .workers
+            .into_iter()
+            .find(|worker| worker.id == child_worker_id)
+            .expect("child worker should load");
+
+        complete_job_with_final_answer(
+            &state,
+            &session,
+            &child_job_id,
+            &mut child_worker,
+            4,
+            4,
+            "Workers and D1 support investigation",
+            "The repository investigation is complete. Findings: the current Cloudflare Pages project needs a Workers entrypoint and D1 binding plan before support can be added.",
+            &json!({}),
+            &[],
+        )
+        .await
+        .expect("read-only investigation child should complete");
+
+        let child = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load");
+        assert_eq!(child.job.state, "completed");
+        assert_eq!(child.job.validation_status, "not_performed");
+        assert_eq!(
+            child.job.task_class.as_deref(),
+            Some(DELEGATED_SUBTASK_TASK_CLASS)
+        );
+        assert!(
+            !child
+                .job
+                .completion_blockers
+                .iter()
+                .any(|blocker| { blocker.contains("without successful validation evidence") })
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn read_only_child_claiming_implementation_still_requires_validation() {
+        let state_dir = test_state_dir("read-only-child-claiming-implementation-blocks");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, _parent_worker) = create_local_project_parent_join_context(
+            &state,
+            "read-only-child-claiming-implementation",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "read-only-child-claiming-implementation-job",
+            LocalProjectJoinChildOptions {
+                state: "running",
+                mutation_receipt: false,
+                validation_exit_code: None,
+            },
+        );
+        let child_worker_id = format!("{child_job_id}-worker");
+        append_read_only_tool_call(&state, &child_job_id, &child_worker_id, "project.inspect");
+        append_read_only_tool_call(&state, &child_job_id, &child_worker_id, "fs.read_text");
+        let mut child_worker = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load")
+            .workers
+            .into_iter()
+            .find(|worker| worker.id == child_worker_id)
+            .expect("child worker should load");
+
+        complete_job_with_final_answer(
+            &state,
+            &session,
+            &child_job_id,
+            &mut child_worker,
+            2,
+            2,
+            "D1 support update",
+            "Implemented support for D1 bindings.",
+            &json!({}),
+            &[],
+        )
+        .await
+        .expect("read-only implementation claim should terminalize as blocked");
+
+        let child = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load");
+        assert_eq!(child.job.state, "blocked");
+        assert_eq!(child.job.completion_status, "blocked");
+        assert_eq!(child.job.validation_status, "not_performed");
+        assert_eq!(child.job.task_class.as_deref(), Some("local_project"));
+        assert!(
+            child
+                .job
+                .completion_blockers
+                .iter()
+                .any(|blocker| { blocker.contains("without successful validation evidence") })
+        );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn mutating_child_still_requires_validation() {
+        let state_dir = test_state_dir("mutating-child-still-requires-validation");
+        let state = initialize_test_state(&state_dir);
+        let workspace_root = state_dir.join("workspace");
+        fs::create_dir_all(&workspace_root).expect("workspace should exist");
+        let (session, parent_job_id, _parent_worker) = create_local_project_parent_join_context(
+            &state,
+            "mutating-child-still-requires-validation",
+            &workspace_root,
+        );
+        let child_job_id = create_local_project_join_child(
+            &state,
+            &session.session.id,
+            &parent_job_id,
+            &workspace_root,
+            "mutating-child-still-requires-validation-job",
+            LocalProjectJoinChildOptions {
+                state: "running",
+                mutation_receipt: true,
+                validation_exit_code: None,
+            },
+        );
+        let child_worker_id = format!("{child_job_id}-worker");
+        let mut child_worker = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load")
+            .workers
+            .into_iter()
+            .find(|worker| worker.id == child_worker_id)
+            .expect("child worker should load");
+
+        complete_job_with_final_answer(
+            &state,
+            &session,
+            &child_job_id,
+            &mut child_worker,
+            2,
+            1,
+            "Implemented local project change",
+            "Implemented the requested local project change.",
+            &json!({}),
+            &[],
+        )
+        .await
+        .expect("mutating child should terminalize as blocked");
+
+        let child = state
+            .store
+            .get_job(&child_job_id)
+            .expect("child should load");
+        assert_eq!(child.job.state, "blocked");
+        assert_eq!(child.job.completion_status, "blocked");
+        assert_eq!(child.job.validation_status, "not_performed");
+        assert_eq!(child.job.task_class.as_deref(), Some("local_project"));
+        assert!(
+            child
+                .job
+                .completion_blockers
+                .iter()
+                .any(|blocker| { blocker.contains("without successful validation evidence") })
+        );
 
         let _ = fs::remove_dir_all(&state_dir);
     }
@@ -48588,6 +49195,39 @@ for line in sys.stdin:
                 expected_dirty: true,
             })
             .expect("mutation receipt should persist");
+    }
+
+    fn append_read_only_tool_call(
+        state: &AppState,
+        child_job_id: &str,
+        child_worker_id: &str,
+        tool_id: &str,
+    ) {
+        let args_json = match tool_id {
+            "fs.list" => json!({"path": ".", "recursive": false, "limit": 20}),
+            "fs.read_text" => json!({"path": "README.md", "limit": 4000}),
+            "rg.search" => json!({"pattern": "Cloudflare", "path": ".", "limit": 20}),
+            _ => json!({}),
+        };
+        state
+            .store
+            .create_tool_call(ToolCallRecord {
+                id: format!("{child_job_id}-{tool_id}").replace('.', "-"),
+                job_id: child_job_id.to_string(),
+                worker_id: child_worker_id.to_string(),
+                tool_id: tool_id.to_string(),
+                status: "completed".to_string(),
+                summary: format!("run read-only {tool_id}"),
+                args_json,
+                result_json: Some(json!({"status": "ok"})),
+                policy_decision: None,
+                artifact_ids: Vec::new(),
+                error_class: String::new(),
+                error_detail: String::new(),
+                started_at: Some(1),
+                completed_at: Some(2),
+            })
+            .expect("read-only tool call should persist");
     }
 
     fn test_mutation_receipt_with_paths(paths: &[&str]) -> nucleus_protocol::MutationReceipt {
