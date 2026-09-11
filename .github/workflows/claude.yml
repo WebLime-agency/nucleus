@@ -20,4 +20,5 @@ permissions:
 jobs:
   claude:
     uses: WebLime-agency/.github/.github/workflows/claude-mention-reusable.yml@9381ae7b41dccb4ac15133f7b22ba02e77e18b0f
-    secrets: inherit
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
