@@ -1,0 +1,14 @@
+name: Codex Review
+
+# Per-repo caller. All review logic lives in the org reusable workflow; this just
+# wires the @codex review trigger and forwards the shared Codex auth secret.
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  review:
+    uses: WebLime-agency/.github/.github/workflows/codex-review-reusable.yml@main
+    secrets:
+      CODEX_AUTH: ${{ secrets.CODEX_AUTH }}
